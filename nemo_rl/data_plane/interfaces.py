@@ -88,8 +88,8 @@ class ObservabilityConfig(TypedDict):
     re-checks it, so a value that changes between wire-in and wire-out is
     reported (``hash/mismatches``) instead of silently training on it. It
     reads every tensor byte a second time on both sides — budget roughly
-    1.2 ms per 18 MB moved, on each side — so leave it off outside of
-    debugging.
+    8 ms for a 12 MB jagged batch, on each side — so leave it off outside
+    of debugging.
     """
 
     enabled: bool

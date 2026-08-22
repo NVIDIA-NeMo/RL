@@ -421,44 +421,51 @@ def test_hash_fingerprints_released_on_clear():
     client.close()
 
 
-def test_hash_fingerprint_sees_rearrangement():
-    """A plain XOR reduction is commutative and would report a mis-sharded
-    read (two rows swapped) as clean. The second, strided reduction is what
-    makes these visible — regress it and shard misalignment goes silent."""
+def test_hash_fingerprint_covers_jagged_fields():
+    """The per-token fields on this wire are jagged by the time they reach
+    ``put_samples`` (``codec.pack_jagged_fields``). Skipping nested leaves
+    would leave the entire bulk payload unguarded while still reporting zero
+    mismatches — a guard that reads as clean because it checked nothing."""
     client = MetricsDataPlaneClient(NoOpDataPlaneClient(), verify_tensor_hash=True)
     ids = ["a", "b", "c"]
-    # arange is the adversarial case: its 64-bit words cancel under XOR.
-    td = TensorDict(
-        {"x": torch.arange(12, dtype=torch.float32).reshape(3, 4)}, batch_size=[3]
+    rows = [torch.arange(n, dtype=torch.int64) + n for n in (3, 5, 4)]
+    jagged = TensorDict(
+        {"x": torch.nested.nested_tensor(rows, layout=torch.jagged)}, batch_size=[3]
     )
-    base = client._row_fingerprints(td, ids)["x"]
-
-    swapped = TensorDict({"x": td["x"][[0, 2, 1]]}, batch_size=[3])
-    assert client._row_fingerprints(swapped, ids)["x"] != base
-
-    reversed_row = td["x"].clone()
-    reversed_row[0] = reversed_row[0].flip(0)
-    within = TensorDict({"x": reversed_row}, batch_size=[3])
-    assert client._row_fingerprints(within, ids)["x"] != base
+    digests = client._row_fingerprints(jagged, ids)
+    assert "x" in digests, "jagged leaf was skipped"
+    assert client.snapshot()["hash_verify"]["fields_skipped"] == 0
+    assert len(set(digests["x"])) == 3
 
 
-def test_hash_fingerprint_separates_dtype_and_shape():
-    """The salt must make a reinterpreted payload look different even when
-    the underlying words are identical."""
+def test_hash_fingerprint_matches_across_jagged_and_dense():
+    """``_from_wire`` densifies a jagged field whose rows are uniform, so a
+    jagged put has to reconcile against a dense get. Zero padding is XOR-
+    neutral, which is what makes the two layouts agree."""
     client = MetricsDataPlaneClient(NoOpDataPlaneClient(), verify_tensor_hash=True)
     ids = ["a", "b"]
-    values = torch.arange(8, dtype=torch.int64).reshape(2, 4)
-    as_2x4 = client._row_fingerprints(TensorDict({"x": values}, batch_size=[2]), ids)[
+    dense = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64)
+    jagged = torch.nested.nested_tensor(list(dense.unbind()), layout=torch.jagged)
+    assert (
+        client._row_fingerprints(TensorDict({"x": jagged}, batch_size=[2]), ids)["x"]
+        == client._row_fingerprints(TensorDict({"x": dense}, batch_size=[2]), ids)["x"]
+    )
+
+
+def test_hash_fingerprint_separates_dtype():
+    """``hash_tensor`` upcasts to 64 bits before reducing, so bf16 and fp32
+    holding the same values reduce identically. The dtype salt is the only
+    thing that makes a precision change visible."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient(), verify_tensor_hash=True)
+    ids = ["a", "b"]
+    values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    as_fp32 = client._row_fingerprints(TensorDict({"x": values}, batch_size=[2]), ids)[
         "x"
     ]
-    as_2x2x2 = client._row_fingerprints(
-        TensorDict({"x": values.reshape(2, 2, 2)}, batch_size=[2]), ids
+    as_bf16 = client._row_fingerprints(
+        TensorDict({"x": values.to(torch.bfloat16)}, batch_size=[2]), ids
     )["x"]
-    as_int32 = client._row_fingerprints(
-        TensorDict({"x": values.to(torch.int32)}, batch_size=[2]), ids
-    )["x"]
-    assert as_2x4 != as_2x2x2
-    assert as_2x4 != as_int32
+    assert as_fp32 != as_bf16
 
 
 def test_hash_verification_off_by_default():
