@@ -15,6 +15,7 @@
 """Real two-rank decision-consensus behavior tests."""
 
 import os
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -29,6 +30,25 @@ from nemo_rl.models.policy.workers.megatron_policy_worker import (
 def _init_torchrun_group() -> None:
     if not dist.is_initialized():
         dist.init_process_group(backend="gloo", init_method="env://")
+
+
+def test_disabled_draft_uses_no_decision_collectives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_torchrun_group()
+    all_reduce = MagicMock(side_effect=AssertionError("collective must not run"))
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+
+    assert (
+        validate_draft_update_decision_consensus(
+            None,
+            draft_enabled=False,
+            group=dist.group.WORLD,
+            device=torch.device("cpu"),
+        )
+        is None
+    )
+    all_reduce.assert_not_called()
 
 
 def test_full_decision_mismatch_raises_on_every_rank() -> None:
