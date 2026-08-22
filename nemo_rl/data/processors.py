@@ -800,7 +800,7 @@ def nemo_gym_data_processor(
                 "Gym video data requires a multimodal processor with "
                 "apply_chat_template and tokenizer attributes"
             )
-        from nemo_rl.environments.nemo_gym_video import (
+        from nemo_rl.environments.nemo_gym_multimodal import (
             nemo_gym_example_to_video_datum_spec,
         )
 
