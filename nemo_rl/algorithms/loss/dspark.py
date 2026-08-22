@@ -556,27 +556,27 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
                 device=draft_hidden.device,
             )
             previous_embeddings_fp32 = previous_embeddings.detach().float()
-            for vocab_start in range(
+            for chunk_start in range(
                 0,
                 local_vocab_size,
                 _VOCAB_GRADIENT_CHUNK_SIZE,
             ):
-                vocab_end = min(
-                    vocab_start + _VOCAB_GRADIENT_CHUNK_SIZE,
+                chunk_end = min(
+                    chunk_start + _VOCAB_GRADIENT_CHUNK_SIZE,
                     local_vocab_size,
                 )
-                gradient_chunk = logits_gradient_fp32[:, vocab_start:vocab_end]
+                gradient_chunk = logits_gradient_fp32[:, chunk_start:chunk_end]
                 tile_hidden_gradient.addmm_(
                     gradient_chunk,
-                    output_weight[vocab_start:vocab_end].detach().float(),
+                    output_weight[chunk_start:chunk_end].detach().float(),
                 )
-                markov_w2_gradient[vocab_start:vocab_end].addmm_(
+                markov_w2_gradient[chunk_start:chunk_end].addmm_(
                     gradient_chunk.T,
                     previous_embeddings_fp32,
                 )
                 tile_embedding_gradient.addmm_(
                     gradient_chunk,
-                    markov_w2[vocab_start:vocab_end].detach().float(),
+                    markov_w2[chunk_start:chunk_end].detach().float(),
                 )
             flat_hidden_gradient[start:end].copy_(tile_hidden_gradient)
             flat_embedding_gradient[start:end].copy_(tile_embedding_gradient)

@@ -347,3 +347,55 @@ def test_factory_rejects_body_without_sharded_state_contract() -> None:
             confidence_with_markov=False,
             dtype=torch.float64,
         )
+
+
+def test_factory_rejects_markov_confidence_without_confidence() -> None:
+    with pytest.raises(ValueError, match="requires confidence_enabled"):
+        build_dspark_provider(
+            body=_CheckpointIdentity(),
+            target_vocab_size=9,
+            draft_vocab_size=9,
+            hidden_size=5,
+            markov_rank=3,
+            confidence_enabled=False,
+            confidence_with_markov=True,
+        )
+
+
+def test_objective_stats_rejects_malformed_hidden_and_head() -> None:
+    provider = build_dspark_provider(
+        body=_CheckpointIdentity(),
+        target_vocab_size=9,
+        draft_vocab_size=9,
+        hidden_size=5,
+        markov_rank=3,
+        confidence_enabled=False,
+        confidence_with_markov=False,
+        dtype=torch.float64,
+    )
+    inputs = _provider_inputs()
+
+    bad = dict(inputs)
+    bad["draft_hidden"] = inputs["draft_hidden"].reshape(6, 5)
+    with pytest.raises(ValueError, match="blocks, slots, hidden"):
+        provider.objective_stats(**bad)
+
+    bad = dict(inputs)
+    bad["target_output_weight"] = inputs["target_output_weight"].reshape(-1)
+    with pytest.raises(ValueError, match="must be a matrix"):
+        provider.objective_stats(**bad)
+
+    bad = dict(inputs)
+    bad["target_output_weight"] = inputs["target_output_weight"][:, :4]
+    with pytest.raises(ValueError, match="local vocabulary and hidden size"):
+        provider.objective_stats(**bad)
+
+    bad = dict(inputs)
+    bad["target_output_weight"] = inputs["target_output_weight"].float()
+    with pytest.raises(ValueError, match="share a dtype"):
+        provider.objective_stats(**bad)
+
+    bad = dict(inputs)
+    bad["target_output_weight"] = inputs["target_output_weight"].to("meta")
+    with pytest.raises(ValueError, match="share a device"):
+        provider.objective_stats(**bad)
