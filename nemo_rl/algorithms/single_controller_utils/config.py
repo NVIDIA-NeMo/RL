@@ -807,4 +807,5 @@ class AdvantageConfig:
     sample_mask_field: str = "sample_mask"
     repeated_batch_fields: list[str] = field(default_factory=list)
     policy_logprobs_field: str = "prev_logprobs"
+    generation_logprobs_field: str = "generation_logprobs"
     reference_logprobs_field: str = "reference_policy_logprobs"
