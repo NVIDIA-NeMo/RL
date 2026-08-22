@@ -835,3 +835,66 @@ def test_cluster_series_declare_delta_or_level():
     assert "now/bytes_outstanding_mb" in metrics, "a level"
     assert "step/comm_volume_mb" in metrics, "a delta"
     client.close()
+
+
+def test_clear_frees_only_what_was_actually_live():
+    """A clear may name uids already dropped, or belonging to another
+    partition. Billing those releases bytes this partition never held:
+    clearing 50 live keys alongside 50 unknown ones freed two thirds of a
+    partition that had lost half its keys."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    ids = [f"u{i}" for i in range(100)]
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=100, consumer_tasks=["t"]
+    )
+    client.put_samples(
+        sample_ids=ids,
+        partition_id="p",
+        fields=TensorDict({"x": torch.zeros(100, 250)}, batch_size=[100]),
+    )
+    total = client.snapshot()["bytes_outstanding"]
+
+    client.clear_samples(
+        sample_ids=ids[:50] + [f"unknown{i}" for i in range(50)], partition_id="p"
+    )
+    assert client.snapshot()["bytes_outstanding"] == total // 2
+
+    client.clear_samples(sample_ids=ids[50:], partition_id="p")
+    assert client.snapshot()["bytes_outstanding"] == 0
+    client.close()
+
+
+def test_outstanding_reconciles_over_random_put_clear_sequences():
+    """Interleaved puts and partial clears must always land back at zero;
+    the pro-rata release is only sound if it does."""
+    import random
+
+    rng = random.Random(0)
+    for _ in range(50):
+        client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+        client.register_partition(
+            partition_id="p", fields=["x"], num_samples=5000, consumer_tasks=["t"]
+        )
+        live: set[str] = set()
+        for _ in range(rng.randint(1, 6)):
+            batch = list(
+                dict.fromkeys(
+                    f"k{rng.randint(0, 60)}" for _ in range(rng.randint(1, 20))
+                )
+            )
+            client.put_samples(
+                sample_ids=batch,
+                partition_id="p",
+                fields=TensorDict(
+                    {"x": torch.zeros(len(batch), 250)}, batch_size=[len(batch)]
+                ),
+            )
+            live |= set(batch)
+            if live and rng.random() < 0.5:
+                drop = rng.sample(sorted(live), k=rng.randint(1, len(live)))
+                client.clear_samples(sample_ids=drop, partition_id="p")
+                live -= set(drop)
+        if live:
+            client.clear_samples(sample_ids=sorted(live), partition_id="p")
+        assert client.snapshot()["bytes_outstanding"] == 0
+        client.close()
