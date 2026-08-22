@@ -350,8 +350,6 @@ def validate_draft_update_decision_consensus(
     device: torch.device | None = None,
 ) -> DraftUpdateDecision | None:
     """Validate one complete controller decision across every training rank."""
-    if decision is None and not draft_enabled:
-        return None
     reason_code = (
         0 if decision is None else _DRAFT_DECISION_REASON_CODES.get(decision.reason, -1)
     )

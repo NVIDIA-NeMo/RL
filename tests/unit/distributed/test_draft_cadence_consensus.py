@@ -15,8 +15,6 @@
 """Real two-rank decision-consensus behavior tests."""
 
 import os
-from unittest.mock import MagicMock
-
 import pytest
 import torch
 import torch.distributed as dist
@@ -32,12 +30,8 @@ def _init_torchrun_group() -> None:
         dist.init_process_group(backend="gloo", init_method="env://")
 
 
-def test_disabled_draft_uses_no_decision_collectives(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_disabled_draft_consensus_returns_none_on_every_rank() -> None:
     _init_torchrun_group()
-    all_reduce = MagicMock(side_effect=AssertionError("collective must not run"))
-    monkeypatch.setattr(dist, "all_reduce", all_reduce)
 
     assert (
         validate_draft_update_decision_consensus(
@@ -48,7 +42,31 @@ def test_disabled_draft_uses_no_decision_collectives(
         )
         is None
     )
-    all_reduce.assert_not_called()
+
+
+def test_draft_enabled_mismatch_raises_on_every_rank_after_collectives() -> None:
+    _init_torchrun_group()
+    rank = int(os.environ["RANK"])
+    decision = (
+        None
+        if rank == 0
+        else DraftUpdateDecision(
+            global_step=3,
+            decision_id=7,
+            update_requested=True,
+            draft_refit_requested=True,
+            reason="always",
+            observed_acceptance=None,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="draft-enabled mode mismatch across ranks"):
+        validate_draft_update_decision_consensus(
+            decision,
+            draft_enabled=rank == 1,
+            group=dist.group.WORLD,
+            device=torch.device("cpu"),
+        )
 
 
 def test_full_decision_mismatch_raises_on_every_rank() -> None:
