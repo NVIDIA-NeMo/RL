@@ -342,6 +342,70 @@ def test_cp2_dtype_bucket_owner_preflight(distributed_test_runner) -> None:
     distributed_test_runner(_run_cp2_dtype_bucket_owner_preflight, world_size=4)
 
 
+def _run_cp2_non_owner_payload_materialization_failure(
+    rank: int, world_size: int
+) -> None:
+    assert world_size == 4
+    pp_group, _cp_group, cp_rank = _lane_groups(rank)
+    pp_ranks = tuple(dist.get_process_group_ranks(pp_group))
+    owner_rank = pp_ranks[-1]
+    original_empty = torch.empty
+    original_broadcast = dist.broadcast
+    payload_broadcasts = 0
+
+    def fail_non_owner_bf16_bucket(*args: object, **kwargs: object) -> torch.Tensor:
+        size = args[0] if args else kwargs.get("size")
+        dtype = kwargs.get("dtype")
+        if rank != owner_rank and size == 5 and dtype == torch.bfloat16:
+            raise RuntimeError("injected non-owner payload allocation failure")
+        return original_empty(*args, **kwargs)
+
+    def count_payload_broadcasts(
+        tensor: torch.Tensor,
+        src: int,
+        group: dist.ProcessGroup | None = None,
+        **kwargs: object,
+    ) -> object:
+        nonlocal payload_broadcasts
+        if tensor.dtype in {torch.bfloat16, torch.float32}:
+            payload_broadcasts += 1
+        return original_broadcast(tensor, src=src, group=group, **kwargs)
+
+    torch.empty = fail_non_owner_bf16_bucket
+    dist.broadcast = count_payload_broadcasts
+    try:
+        _assert_lane_error_matches(
+            call=lambda: draft_utils.broadcast_draft_weights_from_pp_owner(
+                local_exporter=(
+                    (lambda: _current_export(refit_step=4))
+                    if rank == owner_rank
+                    else None
+                ),
+                metadata_only=False,
+                pp_group=pp_group,
+                expected_pp_size=2,
+                cp_rank=cp_rank,
+            ),
+            match="PAYLOAD_INVALID",
+            pp_group=pp_group,
+            original_all_reduce=dist.all_reduce,
+        )
+        assert payload_broadcasts == 0
+    finally:
+        torch.empty = original_empty
+        dist.broadcast = original_broadcast
+
+
+@pytest.mark.mcore
+def test_cp2_non_owner_payload_failure_reaches_every_lane_rank(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(
+        _run_cp2_non_owner_payload_materialization_failure,
+        world_size=4,
+    )
+
+
 class _EmptyBridge:
     def export_hf_weights(self, *_args: object, **_kwargs: object):
         return iter(())
