@@ -148,6 +148,45 @@ class DSparkMarkovHead(nn.Module):
 
             set_tensor_model_parallel_attributes(self.markov_w2.weight, True, 0, 1)
 
+    def embed_previous_tokens(
+        self,
+        *,
+        previous_token_ids: Tensor,
+        slot_valid: Tensor,
+    ) -> Tensor:
+        """Embed previous-token IDs without invalid lookups or replicated TP drift.
+
+        Invalid slots use token ID zero for the lookup; consumers must still apply
+        ``slot_valid`` to their outputs. When ``markov_w2`` is vocabulary-sharded,
+        backward sums embedding gradients across TP ranks because ``markov_w1`` is
+        replicated.
+        """
+        if previous_token_ids.shape != slot_valid.shape:
+            raise ValueError("slot_valid must match previous_token_ids")
+        if previous_token_ids.dtype != torch.int64:
+            raise TypeError("previous_token_ids must use torch.int64")
+        if slot_valid.dtype != torch.bool:
+            raise TypeError("slot_valid must be a boolean tensor")
+        if (
+            previous_token_ids.device != slot_valid.device
+            or self.markov_w1.weight.device != previous_token_ids.device
+        ):
+            raise ValueError("DSpark Markov inputs and weights must share a device")
+
+        safe_previous_token_ids = torch.where(
+            slot_valid,
+            previous_token_ids,
+            torch.zeros_like(previous_token_ids),
+        )
+        previous_embeddings = self.markov_w1(safe_previous_token_ids)
+        if self.local_draft_vocab_size != self.draft_vocab_size:
+            assert self.tensor_parallel_group is not None
+            previous_embeddings = _CopyToTensorParallelRegion.apply(
+                previous_embeddings,
+                self.tensor_parallel_group,
+            )
+        return previous_embeddings
+
     def forward(
         self,
         base_logits: Tensor,
@@ -172,30 +211,16 @@ class DSparkMarkovHead(nn.Module):
             )
         if not base_logits.dtype.is_floating_point:
             raise TypeError("base_logits must use a floating dtype")
-        if previous_token_ids.dtype != torch.int64:
-            raise TypeError("previous_token_ids must use torch.int64")
-        if slot_valid.dtype != torch.bool:
-            raise TypeError("slot_valid must be a boolean tensor")
         if (
-            previous_token_ids.device != base_logits.device
-            or slot_valid.device != base_logits.device
+            self.markov_w2.weight.device != base_logits.device
             or self.markov_w1.weight.device != base_logits.device
-            or self.markov_w2.weight.device != base_logits.device
         ):
             raise ValueError("DSpark Markov inputs and weights must share a device")
 
-        safe_previous_token_ids = torch.where(
-            slot_valid,
-            previous_token_ids,
-            torch.zeros_like(previous_token_ids),
+        previous_embeddings = self.embed_previous_tokens(
+            previous_token_ids=previous_token_ids,
+            slot_valid=slot_valid,
         )
-        previous_embeddings = self.markov_w1(safe_previous_token_ids)
-        if self.local_draft_vocab_size != self.draft_vocab_size:
-            assert self.tensor_parallel_group is not None
-            previous_embeddings = _CopyToTensorParallelRegion.apply(
-                previous_embeddings,
-                self.tensor_parallel_group,
-            )
         corrected_logits = base_logits + self.markov_w2(previous_embeddings)
         return torch.where(
             slot_valid.unsqueeze(-1),
