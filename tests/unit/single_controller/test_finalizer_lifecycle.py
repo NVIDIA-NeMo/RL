@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
@@ -53,6 +54,24 @@ class _RemoteFinalize:
         async def _result():
             if self._error is not None:
                 raise self._error
+            assert self._result is not None
+            return self._result
+
+        return _result()
+
+
+class _BlockingRemoteFinalize(_RemoteFinalize):
+    def __init__(self, *, result: FinalizedGroup) -> None:
+        super().__init__(result=result)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def remote(self, request: FinalizationRequest) -> Any:
+        self.calls.append(request)
+
+        async def _result() -> FinalizedGroup:
+            self.started.set()
+            await self.release.wait()
             assert self._result is not None
             return self._result
 
@@ -95,6 +114,7 @@ def _controller(actor: object) -> Any:
     ctrl._finalizer_waiters = 0
     ctrl._finalizer_unknown_outcomes = 0
     ctrl._finalizer_metrics_by_group = {}
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
     ctrl._dp_client = _DataPlaneClient()
@@ -140,6 +160,51 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
         staging_keys=["group_g0/call"],
     )
     assert ctrl._finalizer_metrics_by_group["group"]["finalize/group_ms"] == 1.0
+
+
+def test_checkpoint_waits_for_actor_publish_and_replay_index_commit() -> None:
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+    )
+
+    async def _scenario() -> list[str]:
+        order: list[str] = []
+        finalize = _BlockingRemoteFinalize(result=result)
+        ctrl = _controller(SimpleNamespace(finalize=finalize))
+
+        async def _commit(*args: Any, **kwargs: Any) -> None:
+            order.append("commit")
+
+        ctrl._buffer.commit_finalized = AsyncMock(side_effect=_commit)
+        finalize_task = asyncio.create_task(ctrl._finalize_with_actor(_request()))
+        await finalize.started.wait()
+
+        async def _checkpoint() -> None:
+            async with ctrl._data_plane_checkpoint_barrier.checkpoint():
+                order.append("checkpoint")
+
+        checkpoint_task = asyncio.create_task(_checkpoint())
+        await asyncio.sleep(0)
+        assert order == []
+
+        finalize.release.set()
+        await finalize_task
+        await checkpoint_task
+        return order
+
+    assert asyncio.run(_scenario()) == ["commit", "checkpoint"]
 
 
 def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:

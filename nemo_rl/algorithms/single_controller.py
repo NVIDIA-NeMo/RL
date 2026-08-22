@@ -459,10 +459,10 @@ class SingleControllerActor:
                     keys.append(record["staging_key"])
         return list(dict.fromkeys(keys))
 
-    async def _cleanup_known_finalization_request(
+    async def _cleanup_known_finalization_request_unlocked(
         self, request: "FinalizationRequest"
     ) -> None:
-        """Clear known request ownership after a pre-publication/known outcome."""
+        """Clear known ownership while holding a barrier mutation slot."""
         errors: list[BaseException] = []
         try:
             await self._call_dp(
@@ -501,8 +501,15 @@ class SingleControllerActor:
             )
         self._buffer.abort(request.group_id)
 
+    async def _cleanup_known_finalization_request(
+        self, request: "FinalizationRequest"
+    ) -> None:
+        """Clear known request ownership without racing a TQ checkpoint."""
+        async with self._data_plane_checkpoint_barrier.mutation():
+            await self._cleanup_known_finalization_request_unlocked(request)
+
     async def _finalize_with_actor(self, request: "FinalizationRequest") -> None:
-        """Submit one metadata request to the bounded fixed actor pool."""
+        """Finalize and index one group atomically with respect to TQ saves."""
         self._finalizer_waiters += 1
         queue_depth = max(
             0,
@@ -520,64 +527,81 @@ class SingleControllerActor:
         self._active_finalizers += 1
         active_actor_count = self._active_finalizers
         finalize_start = time.perf_counter()
+        rpc_submitted = False
+        actor_reusable = False
         try:
-            finalized = await actor.finalize.remote(request)
-        except BaseException:
-            self._finalizer_unknown_outcomes += 1
-            print(
-                "FATAL: finalizer actor RPC failed after submission; canonical "
-                f"publication outcome is unknown for group {request.group_id}. "
-                "Stopping validation without actor replacement or retry.",
-                flush=True,
-            )
-            raise
-        else:
-            self._available_finalizers.put_nowait(actor)
+            # The actor publishes canonical rows before returning metadata.
+            # Hold one local mutation slot across both that remote write and
+            # the matching replay-index transition. A checkpoint therefore
+            # observes either the complete group or neither half of it while
+            # tensor payloads remain outside the SingleController process.
+            async with self._data_plane_checkpoint_barrier.mutation():
+                try:
+                    rpc_submitted = True
+                    finalized = await actor.finalize.remote(request)
+                except BaseException:
+                    self._finalizer_unknown_outcomes += 1
+                    print(
+                        "FATAL: finalizer actor RPC failed after submission; canonical "
+                        f"publication outcome is unknown for group {request.group_id}. "
+                        "Stopping validation without actor replacement or retry.",
+                        flush=True,
+                    )
+                    raise
+                else:
+                    actor_reusable = True
+
+                if finalized.dropped:
+                    try:
+                        await self._cleanup_known_finalization_request_unlocked(request)
+                    except BaseException as cleanup_error:
+                        raise RuntimeError(
+                            "finalizer dropped the group and known-key cleanup failed "
+                            f"for group {request.group_id}"
+                        ) from cleanup_error
+                    raise RuntimeError(
+                        f"token capture: group {request.group_id} dropped "
+                        "(min_valid_fraction_per_group)"
+                    )
+                if finalized.meta is None:
+                    try:
+                        await self._cleanup_known_finalization_request_unlocked(request)
+                    except BaseException as cleanup_error:
+                        raise RuntimeError(
+                            "finalizer returned no metadata and known-key cleanup failed "
+                            f"for group {request.group_id}"
+                        ) from cleanup_error
+                    raise RuntimeError(
+                        "finalizer returned no metadata for non-dropped group "
+                        f"{request.group_id}"
+                    )
+                try:
+                    await self._buffer.commit_finalized(
+                        request.group_id,
+                        finalized.meta,
+                        finalized.group_min_wv,
+                        finalized.group_max_wv,
+                        staging_keys=finalized.staging_keys,
+                    )
+                except BaseException as commit_error:
+                    try:
+                        await self._cleanup_known_finalization_request_unlocked(request)
+                    except BaseException as cleanup_error:
+                        raise BaseExceptionGroup(
+                            "finalizer commit and known-key cleanup failed for "
+                            f"group {request.group_id}",
+                            [commit_error, cleanup_error],
+                        )
+                    raise
         finally:
             self._active_finalizers -= 1
+            # Cancellation before RPC submission leaves the actor untouched;
+            # a failed submitted RPC has unknown publication state and must
+            # not be reused. Every successful RPC makes the actor reusable,
+            # including when later validation or cleanup rejects the group.
+            if actor_reusable or not rpc_submitted:
+                self._available_finalizers.put_nowait(actor)
         finalize_total_ms = (time.perf_counter() - finalize_start) * 1000.0
-
-        if finalized.dropped:
-            try:
-                await self._cleanup_known_finalization_request(request)
-            except BaseException as cleanup_error:
-                raise RuntimeError(
-                    "finalizer dropped the group and known-key cleanup failed "
-                    f"for group {request.group_id}"
-                ) from cleanup_error
-            raise RuntimeError(
-                f"token capture: group {request.group_id} dropped "
-                "(min_valid_fraction_per_group)"
-            )
-        if finalized.meta is None:
-            try:
-                await self._cleanup_known_finalization_request(request)
-            except BaseException as cleanup_error:
-                raise RuntimeError(
-                    "finalizer returned no metadata and known-key cleanup failed "
-                    f"for group {request.group_id}"
-                ) from cleanup_error
-            raise RuntimeError(
-                f"finalizer returned no metadata for non-dropped group {request.group_id}"
-            )
-        try:
-            await self._buffer.commit_finalized(
-                request.group_id,
-                finalized.meta,
-                finalized.group_min_wv,
-                finalized.group_max_wv,
-                staging_keys=finalized.staging_keys,
-            )
-        except BaseException as commit_error:
-            try:
-                await self._cleanup_known_finalization_request(request)
-            except BaseException as cleanup_error:
-                raise BaseExceptionGroup(
-                    f"finalizer commit and known-key cleanup failed for "
-                    f"group {request.group_id}",
-                    [commit_error, cleanup_error],
-                )
-            raise
         finalized.metrics.update(
             {
                 "finalize/queue_wait_ms": queue_wait_ms,
@@ -588,8 +612,8 @@ class SingleControllerActor:
         )
         self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
 
-    async def _cleanup_consumed_metas(self, metas: list[KVBatchMeta]) -> None:
-        """Clear canonical rows and full-manifest staging keys after train success."""
+    async def _cleanup_consumed_metas_unlocked(self, metas: list[KVBatchMeta]) -> None:
+        """Clear consumed ownership while holding a barrier mutation slot."""
         canonical_by_partition: dict[str, list[str]] = {}
         staging_by_partition: dict[str, list[str]] = {}
         for meta in metas:
@@ -638,6 +662,11 @@ class SingleControllerActor:
                 errors.append(cleanup_error)
         if errors:
             raise BaseExceptionGroup("post-train DataPlane cleanup failed", errors)
+
+    async def _cleanup_consumed_metas(self, metas: list[KVBatchMeta]) -> None:
+        """Clear consumed rows without racing a native TQ checkpoint."""
+        async with self._data_plane_checkpoint_barrier.mutation():
+            await self._cleanup_consumed_metas_unlocked(metas)
 
     async def _validate_replay_inventory(
         self, replay_metadata: TQReplayMetadataState
@@ -1267,6 +1296,11 @@ class SingleControllerActor:
         )
         replay_metadata: Optional[TQReplayMetadataState] = None
         if self._master_config.data_plane.get("checkpointing_enabled"):
+            if self._finalizer_unknown_outcomes:
+                raise RuntimeError(
+                    "Refusing to save a native TQ checkpoint after an unknown "
+                    "finalizer publication outcome"
+                )
             # Commits and destructive clears take the same barrier. Generation
             # may continue while a snapshot is written, but completed groups
             # wait at commit, so TQ and the metadata sidecar describe exactly
