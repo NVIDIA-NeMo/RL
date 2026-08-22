@@ -34,6 +34,8 @@ class SetupTimingMetrics:
     generation_init_load_time_s: Optional[float] = None
 
     policy_init_time_s: Optional[float] = None
+    # PPO only: the critic shares the training GPUs, so it is built after the policy.
+    value_init_time_s: Optional[float] = None
     nemo_gym_init_time_s: Optional[float] = None
     collective_init_time_s: Optional[float] = None
 

@@ -36,10 +36,12 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.value import ValueConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 # ── User-facing SingleController configs ────────────────────────────────────
@@ -533,6 +535,41 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         return self
 
 
+class GAEConfig(BaseModel, extra="allow"):
+    """Generalized Advantage Estimation knobs for the SingleController PPO path.
+
+    Mirrors the ``ppo.adv_estimator`` block of the legacy PPO config. Only
+    ``gae`` is supported here: the SingleController's critic exists to feed
+    this estimator, and the value-free estimators all live under
+    ``grpo.adv_estimator``.
+    """
+
+    name: Literal["gae"] = "gae"
+    gae_lambda: float = 0.95
+    gae_gamma: float = 1.0
+    normalize_advantages: bool = True
+    # VAPO decoupled GAE. None for both = standard GAE (gae_lambda everywhere).
+    gae_lambda_value: Optional[float] = None
+    gae_lambda_policy: Optional[float] = None
+    # Length-adaptive lambda_policy = 1 - 1/(alpha * l). 0 disables it.
+    length_adaptive_alpha: float = 0.0
+
+
+class SingleControllerPPOConfig(BaseModel, extra="allow"):
+    """PPO-only settings. Its presence in the config selects the PPO path.
+
+    Everything PPO shares with GRPO -- batch sizing, epochs, staleness,
+    sequence-error masking -- stays under ``grpo``/``async_rl``, so this block
+    holds only what a critic adds.
+    """
+
+    adv_estimator: GAEConfig = Field(default_factory=GAEConfig)
+    # Critic-only warmup: policy training is skipped while the step index is
+    # below this, so the value head has useful predictions before the first
+    # policy update. 0 trains both from step 0.
+    policy_training_start_step: NonNegativeInt = 0
+
+
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
@@ -544,6 +581,22 @@ class MasterConfig(BaseModel, extra="allow"):
     checkpointing: CheckpointingConfig
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
+    # PPO extras. All three are absent on a GRPO run; ``ppo`` is the flag
+    # ``is_ppo_run`` keys off, and the other two are required alongside it.
+    ppo: Optional[SingleControllerPPOConfig] = None
+    value: Optional[ValueConfig] = None
+    value_loss_fn: Optional[MseValueLossConfig] = None
+
+
+def is_ppo_run(master_config: MasterConfig) -> bool:
+    """Whether this SingleController run trains a PPO critic alongside the policy.
+
+    Single source of truth for the flag: setup reads it to decide whether to
+    build the value model, and the controller reads it to decide whether the
+    train pump runs the critic stages. ``model_construct`` skips defaults, so
+    the attribute can genuinely be missing on a hand-built config.
+    """
+    return getattr(master_config, "ppo", None) is not None
 
 
 def validate_sampler_buffer_capacity(
@@ -675,6 +728,58 @@ def _validate_failure_settings(
         )
 
 
+def _validate_ppo_settings(master_config: MasterConfig) -> None:
+    """Reject PPO configs the SingleController path cannot honour."""
+    if not is_ppo_run(master_config):
+        # A value block without `ppo:` is inert -- nothing builds the critic --
+        # and a config carrying one is asking for PPO by every reading except
+        # the one the code uses. Say so rather than training GRPO silently.
+        for name in ("value", "value_loss_fn"):
+            if getattr(master_config, name, None) is not None:
+                raise ValueError(
+                    f"{name} is set but the `ppo:` block is absent, so this run "
+                    "trains GRPO and the value model would never be built. Add a "
+                    f"`ppo:` block, or remove `{name}:`."
+                )
+        return
+
+    for name in ("value", "value_loss_fn"):
+        if getattr(master_config, name, None) is None:
+            raise ValueError(
+                f"the `ppo:` block selects the PPO path, which needs `{name}:`. "
+                "See examples/configs/ppo_math_1B_megatron_single_controller.yaml."
+            )
+
+    async_config = master_config.async_rl
+    num_prompts_per_step = master_config.grpo.num_prompts_per_step
+    # The critic has no split (begin / microbatch / finish) API, so one
+    # train_from_meta call is one optimizer step. Streaming a step across
+    # several chunks would therefore step the critic once per chunk while the
+    # policy still steps once per RL step -- two different effective learning
+    # rates from one config. Require the full-batch chunking instead.
+    if async_config.min_groups_for_streaming_train != num_prompts_per_step:
+        raise ValueError(
+            "PPO on the SingleController path requires "
+            "async_rl.min_groups_for_streaming_train "
+            f"({async_config.min_groups_for_streaming_train}) == "
+            f"grpo.num_prompts_per_step ({num_prompts_per_step}) so that each RL "
+            "step is assembled from a single chunk: the critic steps its "
+            "optimizer once per chunk and the policy once per step."
+        )
+
+    rl_step_samples = (
+        num_prompts_per_step * master_config.grpo.num_generations_per_prompt
+    )
+    value_global_batch_size = master_config.value["train_global_batch_size"]
+    if rl_step_samples != value_global_batch_size:
+        raise ValueError(
+            "num_prompts_per_step * num_generations_per_prompt "
+            f"({rl_step_samples}) must equal value.train_global_batch_size "
+            f"({value_global_batch_size}) so that one RL step maps to exactly one "
+            "critic optimizer.step."
+        )
+
+
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     async_config = master_config.async_rl
@@ -757,6 +862,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "grpo.skip_reference_policy_logprobs_calculation=false, or set "
             "loss_fn.reference_policy_kl_penalty=0."
         )
+
+    _validate_ppo_settings(master_config)
 
     _validate_failure_settings(async_config, num_prompts_per_step)
 

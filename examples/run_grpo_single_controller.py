@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Async GRPO launcher driven by the SingleController actor.
+"""Async GRPO / PPO launcher driven by the SingleController actor.
 
 Builds the full SC actor args driver-side via setup_single_controller and hands them
 to SingleControllerActor. Mirrors run_grpo.py for config loading so the same YAML
-files apply. data_plane.enabled=true is mandatory.
+files apply. data_plane.enabled=true is mandatory. A config carrying a `ppo:` block
+additionally brings up the PPO critic and trains it alongside the policy.
 """
 
 import argparse
@@ -60,7 +61,7 @@ while current_dir in sys.path:
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Run async GRPO training via SingleController"
+        description="Run async GRPO / PPO training via SingleController"
     )
     parser.add_argument(
         "--config", type=str, default=None, help="Path to YAML config file"
@@ -161,7 +162,10 @@ def main() -> None:
         for resource_name, resource in (
             ("Generation", actor_args.gen_handle),
             ("Trainer", actor_args.trainer_handle),
+            ("Value", actor_args.value_handle),
         ):
+            if resource is None:
+                continue
             try:
                 resource.shutdown()
             except Exception as e:
