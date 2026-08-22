@@ -23,6 +23,7 @@ Key differences from megatron approach:
 - automodel_forward_backward uses PyTorch autograd instead of Megatron's pipeline
 """
 
+import inspect
 from collections import defaultdict
 from functools import partial
 from typing import Any, Callable, Iterator, Optional, Tuple, Union
@@ -57,6 +58,7 @@ from nemo_rl.models.automodel.data import (
     filter_multimodal_kwargs_for_model,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.dllm import dllm_config_from_policy
 
 # Union type for any post-processing function
 PostProcessingFunction = Union[
@@ -86,6 +88,33 @@ def _needs_kv_cache_for_shared_layers(model: nn.Module) -> bool:
     )
     num_kv_shared_layers = getattr(text_config, "num_kv_shared_layers", 0)
     return isinstance(num_kv_shared_layers, int) and num_kv_shared_layers > 0
+
+
+def _forward_accepts(model: nn.Module, name: str) -> bool:
+    """Reports whether ``model.forward()`` accepts a given keyword argument.
+
+    Mirrors ``nemo_automodel._transformers.capabilities._supports_seq_lens``:
+    a ``**kwargs`` in the signature counts as accepting anything, and an
+    uninspectable forward is assumed permissive so this never removes an
+    argument a model actually needs.
+
+    Args:
+        model: The model whose forward signature to inspect.
+        name: The keyword argument name to look for.
+
+    Returns:
+        True if the argument can be passed to ``model.forward()``.
+    """
+    forward = getattr(model, "forward", None)
+    if not callable(forward):
+        return True
+    try:
+        params = inspect.signature(forward).parameters
+    except (ValueError, TypeError):
+        return True
+    if name in params:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def model_forward(
@@ -141,6 +170,11 @@ def model_forward(
             model_args["mm_token_type_ids"] = torch.zeros_like(
                 processed_inputs.input_ids
             )
+
+    # Masked diffusion LMs (LLaDA) attend bidirectionally and derive positions
+    # internally, so their forward has no position_ids parameter at all.
+    if not _forward_accepts(model, "position_ids"):
+        del model_args["position_ids"]
 
     # Reward models don't support flash_attn_kwargs
     if is_reward_model:
@@ -315,6 +349,7 @@ def forward_with_post_processing_fn(
     global_valid_toks: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     sequence_dim: int = 1,
+    elbo_scorer: Optional[Callable[[ProcessedMicrobatch], torch.Tensor]] = None,
 ) -> Tuple[Any, dict[str, Any], ProcessedMicrobatch]:
     """Perform forward pass with pre-processed microbatch and apply post-processing.
 
@@ -354,6 +389,26 @@ def forward_with_post_processing_fn(
     # keeps use_cache=True for KV-sharing models under activation checkpointing
     # (NVIDIA-NeMo/Automodel#1705).
     use_cache = _needs_kv_cache_for_shared_layers(model)
+
+    # Masked diffusion policies are scored by an ELBO accumulated over several
+    # masked views of the sequence, so there is no single logits tensor to hand
+    # the loss. The accumulation stays differentiable through every forward, so
+    # backward flows through all quadrature points.
+    if elbo_scorer is not None:
+        elbo_logprobs = elbo_scorer(processed_mb)
+        assert isinstance(post_processing_fn, LossPostProcessor), (
+            "elbo_scorer is only supported for the training (loss) path; "
+            "get_logprobs accumulates the ELBO itself."
+        )
+        result, metrics = post_processing_fn(
+            logits=elbo_logprobs,
+            data_dict=data_dict,
+            processed_inputs=processed_inputs,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            sequence_dim=sequence_dim,
+        )
+        return result, metrics, processed_mb
 
     # Model forward pass
     outputs = model_forward(
@@ -450,6 +505,7 @@ def automodel_forward_backward(
     train_context_fn: Optional[Callable[[ProcessedInputs], Any]] = None,
     num_valid_microbatches: Optional[int] = None,
     on_microbatch_start: Optional[Callable[[int], None]] = None,
+    elbo_scorer: Optional[Callable[[ProcessedMicrobatch], torch.Tensor]] = None,
 ) -> list[Tuple[Any, dict[str, Any]]]:
     """Execute forward and backward passes for automodel.
 
@@ -514,6 +570,7 @@ def automodel_forward_backward(
                 global_valid_toks=global_valid_toks,
                 sampling_params=sampling_params,
                 sequence_dim=sequence_dim,
+                elbo_scorer=elbo_scorer,
             )
 
             # Check if this is a dummy batch
@@ -589,6 +646,9 @@ class LossPostProcessor:
         self.dp_size = dp_size
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
+        # dLLM policies hand the loss a pre-accumulated per-position ELBO
+        # instead of logits, so prepare_loss_input must not reduce it again.
+        self.precomputed_logprobs = dllm_config_from_policy(cfg) is not None
 
     def __call__(
         self,
@@ -623,7 +683,9 @@ class LossPostProcessor:
 
         # Wrap prepare_loss_input with sampling_params
         prepare_loss_input_wrapped = partial(
-            prepare_loss_input, sampling_params=self.sampling_params
+            prepare_loss_input,
+            sampling_params=self.sampling_params,
+            precomputed_logprobs=self.precomputed_logprobs,
         )
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
@@ -685,6 +747,11 @@ class LogprobsPostProcessor:
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
         self.logprob_chunk_size = cfg.get("logprob_chunk_size", None)
+        # Masked diffusion LMs score token i at position i; autoregressive
+        # models score token i+1. Absent a dllm policy this stays True, so every
+        # existing caller is unaffected.
+        dllm_cfg = dllm_config_from_policy(cfg)
+        self.shift_targets = True if dllm_cfg is None else dllm_cfg.shift_targets
 
     def __call__(
         self,
@@ -710,6 +777,13 @@ class LogprobsPostProcessor:
         """
         seq_len = processed_inputs.seq_len
         input_lengths = data_dict["input_lengths"]
+        # Ordinary training scores the model on its own input; corruption-based
+        # objectives feed a corrupted sequence and score the clean tokens.
+        score_ids = (
+            processed_inputs.input_ids
+            if processed_inputs.target_ids is None
+            else processed_inputs.target_ids
+        )
 
         if self.cp_size > 1:
             seq_index_tensor = (
@@ -723,7 +797,7 @@ class LogprobsPostProcessor:
             )
 
             input_ids_dtensor = DTensor.from_local(
-                processed_inputs.input_ids,
+                score_ids,
                 device_mesh=self.cp_mesh,
                 placements=[Shard(sequence_dim)],
             )
@@ -738,28 +812,34 @@ class LogprobsPostProcessor:
                 seq_index_tensor,
                 chunk_size=self.logprob_chunk_size,
                 sampling_params=self.sampling_params,  # top-k and top-p filtering
+                shift_targets=self.shift_targets,
             )
 
-            assert token_logprobs.shape[1] == seq_len - 1
+            assert token_logprobs.shape[1] == (
+                seq_len - 1 if self.shift_targets else seq_len
+            )
         else:
             if isinstance(logits, DTensor):
                 # DTensor path with TP sharding
                 token_logprobs = get_logprobs_from_vocab_parallel_logits(
                     logits,
-                    processed_inputs.input_ids,
+                    score_ids,
                     chunk_size=self.logprob_chunk_size,
                     sampling_params=self.sampling_params,  # top-k and top-p filtering
+                    shift_targets=self.shift_targets,
                 )
             else:
                 # Non-DTensor path (no TP sharding)
                 token_logprobs = self._compute_local_logprobs(
-                    logits, processed_inputs.input_ids
+                    logits, score_ids, shift_targets=self.shift_targets
                 )
 
-        # Prepend 0 for first token to maintain sequence length
-        token_logprobs = torch.cat(
-            [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
-        )
+        if self.shift_targets:
+            # Prepend 0 for first token to maintain sequence length. Position-
+            # aligned scoring drops no position, so it needs no such padding.
+            token_logprobs = torch.cat(
+                [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
+            )
 
         # Handle sequence packing unpacking or mask application
         if self.enable_seq_packing:
@@ -801,12 +881,17 @@ class LogprobsPostProcessor:
         self,
         logits: torch.Tensor,
         input_ids: torch.Tensor,
+        shift_targets: bool = True,
     ) -> torch.Tensor:
         """Compute logprobs locally without distributed processing.
 
         Args:
             logits: Model output logits
-            input_ids: Input token IDs
+            input_ids: Token IDs to score
+            shift_targets: If True (default), position ``i`` scores token ``i+1``
+                and the returned sequence is one shorter. If False, position
+                ``i`` scores token ``i`` and every position is kept -- the
+                masked diffusion convention.
 
         Returns:
             Token log probabilities
@@ -819,7 +904,9 @@ class LogprobsPostProcessor:
         # Input shapes:
         #   logits: [batch_size, sequence_length, vocab_size] - logits for each position
         #   token_ids: [batch_size, sequence_length] - actual tokens
-        next_tokens = input_ids[:, 1:].to(logits.device)
+        next_tokens = (input_ids[:, 1:] if shift_targets else input_ids).to(
+            logits.device
+        )
         target_seq_len = int(next_tokens.shape[1])
 
         if target_seq_len == 0:

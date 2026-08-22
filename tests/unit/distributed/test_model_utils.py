@@ -1583,3 +1583,87 @@ def test_distributed_vocab_topk_ops(
         worker_group.shutdown(force=True)
     finally:
         cluster.shutdown()
+
+
+@pytest.fixture
+def single_rank_gloo_group():
+    """A 1-rank CPU process group, so target alignment can be tested without GPUs."""
+    already_initialized = torch.distributed.is_initialized()
+    if not already_initialized:
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29513")
+        torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
+    try:
+        yield torch.distributed.group.WORLD
+    finally:
+        if not already_initialized:
+            torch.distributed.destroy_process_group()
+
+
+def _reference_logprobs(logits, targets):
+    """Position-aligned log probabilities: position i scores targets[i]."""
+    return (
+        torch.log_softmax(logits.float(), dim=-1)
+        .gather(-1, targets.unsqueeze(-1))
+        .squeeze(-1)
+    )
+
+
+def test_shift_targets_true_scores_the_next_token(single_rank_gloo_group):
+    """The autoregressive default: position i scores token i+1, dropping the last."""
+    torch.manual_seed(0)
+    batch, seq_len, vocab = 2, 7, 16
+    logits = torch.randn(batch, seq_len, vocab)
+    targets = torch.randint(0, vocab, (batch, seq_len))
+
+    actual = from_parallel_logits_to_logprobs(
+        logits, targets, 0, vocab, single_rank_gloo_group
+    )
+
+    assert actual.shape == (batch, seq_len - 1)
+    # Position i is scored against target i+1.
+    expected = (
+        torch.log_softmax(logits.float(), dim=-1)[:, :-1]
+        .gather(-1, targets[:, 1:].unsqueeze(-1))
+        .squeeze(-1)
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_shift_targets_false_scores_the_token_in_place(single_rank_gloo_group):
+    """Masked diffusion alignment: position i scores token i, keeping every position.
+
+    A dLLM predicts the token that was masked out *at* each position, so an
+    off-by-one here would silently score the wrong token at every position.
+    """
+    torch.manual_seed(0)
+    batch, seq_len, vocab = 2, 7, 16
+    logits = torch.randn(batch, seq_len, vocab)
+    targets = torch.randint(0, vocab, (batch, seq_len))
+
+    actual = from_parallel_logits_to_logprobs(
+        logits, targets, 0, vocab, single_rank_gloo_group, shift_targets=False
+    )
+
+    assert actual.shape == (batch, seq_len)
+    torch.testing.assert_close(
+        actual, _reference_logprobs(logits, targets), rtol=1e-5, atol=1e-5
+    )
+
+
+def test_shift_targets_default_is_unchanged_autoregressive_behavior(
+    single_rank_gloo_group,
+):
+    """Guards every existing caller: omitting the flag must change nothing."""
+    torch.manual_seed(0)
+    batch, seq_len, vocab = 3, 9, 32
+    logits = torch.randn(batch, seq_len, vocab)
+    targets = torch.randint(0, vocab, (batch, seq_len))
+
+    default = from_parallel_logits_to_logprobs(
+        logits, targets, 0, vocab, single_rank_gloo_group
+    )
+    explicit = from_parallel_logits_to_logprobs(
+        logits, targets, 0, vocab, single_rank_gloo_group, shift_targets=True
+    )
+    torch.testing.assert_close(default, explicit, rtol=0, atol=0)

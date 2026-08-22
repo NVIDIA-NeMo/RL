@@ -1,0 +1,19 @@
+defaults: ../../dllm_grpo_llada_8b.yaml
+grpo:
+  max_num_steps: 200
+  val_period: 20
+  val_at_start: true
+checkpointing:
+  checkpoint_dir: results/grpo-llada-8b-instruct-1n8g-fsdp2tp1-dllm
+policy:
+  tokenizer:
+    name: GSAI-ML/LLaDA-8B-Instruct
+  dtensor_cfg:
+    activation_checkpointing: true
+logger:
+  log_dir: logs/grpo-llada-8b-instruct-1n8g-fsdp2tp1-dllm
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-llada-8b-instruct-1n8g-fsdp2tp1-dllm

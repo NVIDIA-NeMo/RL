@@ -117,6 +117,13 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # If False (default), correction is applied at the token level as in the
     # original GRPO paper.
     sequence_level_importance_ratios: bool = False
+    # Whether the incoming log probabilities are position-aligned (position i
+    # scores token i, so the tensor is as long as the sequence) rather than
+    # next-token (position i scores token i+1, one shorter). Masked diffusion
+    # policies produce the former; autoregressive policies the latter. It
+    # decides whether the other per-token tensors drop their first column to
+    # line up, so a wrong value is a silent off-by-one across every position.
+    position_aligned_logprobs: bool = False
 
     # --- Clipping ---
     ratio_clip_min: float = 0.2
@@ -258,6 +265,7 @@ class ClippedPGLossFn(LossFunction):
 
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
+        self.position_aligned_logprobs = cfg.position_aligned_logprobs
         self.positive_example_nll_weight = cfg.positive_example_nll_weight
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
@@ -380,16 +388,21 @@ class ClippedPGLossFn(LossFunction):
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss function."""
         curr_logprobs = next_token_logprobs
-        token_mask = data["token_mask"][:, 1:]
+        # Next-token log probabilities are one shorter than the sequence, so
+        # every other per-token tensor drops its first column to line up.
+        # Position-aligned log probabilities keep every position, so nothing is
+        # dropped -- see ClippedPGLossConfig.position_aligned_logprobs.
+        aligned = slice(None) if self.position_aligned_logprobs else slice(1, None)
+        token_mask = data["token_mask"][:, aligned]
         sample_mask = data["sample_mask"]
-        advantages = data["advantages"][:, 1:]
+        advantages = data["advantages"][:, aligned]
         # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
         prev_logprobs = (
-            None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+            None if self.force_on_policy_ratio else data["prev_logprobs"][:, aligned]
         )
-        generation_logprobs = data["generation_logprobs"][:, 1:]
+        generation_logprobs = data["generation_logprobs"][:, aligned]
         if self.reference_policy_kl_penalty != 0:
-            reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
+            reference_policy_logprobs = data["reference_policy_logprobs"][:, aligned]
             curr_logprobs_unfiltered = data.get(
                 "curr_logprobs_unfiltered", curr_logprobs
             )

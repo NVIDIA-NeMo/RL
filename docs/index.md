@@ -305,6 +305,7 @@ guides/cispo.md
 guides/prorlv2.md
 guides/swe-rl-qwen3.md
 guides/grpo.md
+guides/dllm-rl.md
 guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
