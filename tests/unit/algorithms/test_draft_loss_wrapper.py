@@ -127,4 +127,10 @@ def test_draft_cross_entropy_loss_uses_streaming_path(
         token_mask * sample_mask.unsqueeze(-1),
     )
     stats.normalized.assert_called_once()
+    normalization_counts = stats.normalized.call_args.kwargs["normalization_counts"]
+    assert normalization_counts.shape == (1,)
+    torch.testing.assert_close(
+        normalization_counts,
+        global_valid.reshape(1),
+    )
     assert loss.item() == 2.0
