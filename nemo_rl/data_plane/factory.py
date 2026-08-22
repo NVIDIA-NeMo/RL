@@ -56,16 +56,16 @@ def build_data_plane_client(
 
     obs = cfg.get("observability") or {}
     if obs.get("enabled", False):
-        from nemo_rl.data_plane.observability import (
-            MetricsDataPlaneClient,
-            log_event,
-        )
+        from nemo_rl.data_plane.observability import MetricsDataPlaneClient
 
-        on_event = obs.get("callback") or log_event
+        # No default per-op sink. The metrics surface is ``get_step_metrics``,
+        # which the trainer logs once a step; a callback here fires on every
+        # single transfer. ``log_event`` is still exported for anyone who
+        # wants that, but it is opt-in via ``observability.callback``.
         # pyrefly: obs.get returns Any, can't narrow to the expected callback type.
         client = MetricsDataPlaneClient(  # type: ignore[bad-argument-type]
             client,
-            on_event=on_event,
+            on_event=obs.get("callback"),
             verify_tensor_hash=bool(obs.get("verify_tensor_hash")),
         )
     return client
