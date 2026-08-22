@@ -639,9 +639,7 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
     import torch
 
     fp8 = fp8_module
-    model = _grouped_expert_model(
-        fp8, monkeypatch, torch.bfloat16, wrap_language_model
-    )
+    model = _grouped_expert_model(fp8, monkeypatch, torch.bfloat16, wrap_language_model)
     loaded = []
     model.load_weights = lambda pairs: loaded.extend(pairs)
 
@@ -829,11 +827,16 @@ def test_load_weights_expands_grouped_experts_for_mxfp8(fp8_module, monkeypatch)
             value = entries[name]
             scale = entries[name + "_scale_from_checkpoint"]
             assert value.dtype == torch.float8_e4m3fn
-            expected = source[expert_id].to(torch.float8_e4m3fn)
+            # The refit path receives bf16 slabs, so expectations must follow
+            # the same fp32 -> bf16 -> e4m3 rounding chain as production.
+            expected = source[expert_id].to(torch.bfloat16).to(torch.float8_e4m3fn)
             assert torch.equal(value.float(), expected.float())
             assert scale.dtype == torch.uint8
             assert scale.shape == (*value.shape[:-1], value.shape[-1] // 32)
             assert torch.all(scale == 1)
-            assert torch.equal(quantized_inputs[quantize_call - 1], source[expert_id])
+            assert torch.equal(
+                quantized_inputs[quantize_call - 1],
+                source[expert_id].to(torch.bfloat16),
+            )
 
     assert len(quantized_inputs) == 6
