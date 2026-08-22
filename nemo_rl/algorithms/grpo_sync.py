@@ -70,6 +70,7 @@ from nemo_rl.algorithms.utils import (
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_performance_metrics,
+    sum_metric_values,
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
@@ -204,20 +205,6 @@ def _train_fields_for_step(
         if not (skip_prev_logprobs and field == "prev_logprobs")
         and not (skip_reference_logprobs and field == "reference_policy_logprobs")
     )
-
-
-def _sum_step_metric_values(values: np.ndarray | list[Any]) -> float:
-    """Sum metric payloads without asking NumPy to materialize CUDA tensors."""
-    if isinstance(values, np.ndarray):
-        return float(np.sum(values).item())
-
-    total = 0.0
-    for value in values:
-        if isinstance(value, torch.Tensor):
-            total += float(value.detach().sum().item())
-        else:
-            total += float(np.sum(value).item())
-    return total
 
 
 # ── DAPO non-zero-std dynamic sampling, slice-only ─────────────────────
@@ -1231,7 +1218,7 @@ def grpo_train_sync(
                     }:
                         metrics[k] = np.mean(v).item()
                     elif isinstance(v, (np.ndarray, list)):
-                        metrics[k] = _sum_step_metric_values(v)
+                        metrics[k] = sum_metric_values(v)
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
 

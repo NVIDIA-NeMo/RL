@@ -63,7 +63,6 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.grpo_sync import (
     _log_completed_draft_refit,
     _should_use_split_draft_training,
-    _sum_step_metric_values,
     _train_policy_from_meta,
     _train_fields_for_step,
     grpo_train_sync,
@@ -73,7 +72,10 @@ from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
 )
-from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+from nemo_rl.algorithms.utils import (
+    calculate_baseline_and_std_per_prompt,
+    sum_metric_values,
+)
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -5822,13 +5824,13 @@ def test_sum_step_metric_values_handles_torch_tensors(device: str) -> None:
         torch.tensor([2.0, 3.75], device=device),
     ]
 
-    assert _sum_step_metric_values(values) == pytest.approx(7.0)
+    assert sum_metric_values(values) == pytest.approx(7.0)
 
 
 def test_sum_step_metric_values_preserves_numpy_behavior() -> None:
     values = np.array([1.25, 2.0, 3.75])
 
-    assert _sum_step_metric_values(values) == pytest.approx(7.0)
+    assert sum_metric_values(values) == pytest.approx(7.0)
 
 
 @pytest.mark.parametrize(

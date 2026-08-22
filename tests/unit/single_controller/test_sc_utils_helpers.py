@@ -121,6 +121,21 @@ class TestAggregateStepMetrics:
         assert out["lr"] == pytest.approx(0.2)
         assert out["some_sum_metric"] == pytest.approx(6.0)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    def test_cuda_draft_loss_is_reduced_without_numpy_conversion(self) -> None:
+        result = {
+            "all_mb_metrics": {
+                "draft_loss": [
+                    torch.tensor(1.25, device="cuda"),
+                    torch.tensor(2.75, device="cuda"),
+                ]
+            }
+        }
+
+        out = aggregate_step_metrics(result)
+
+        assert out["draft_loss"] == pytest.approx(4.0)
+
     def test_min_max_all_inf_falls_back_to_neg_one(self) -> None:
         result = {
             "all_mb_metrics": {

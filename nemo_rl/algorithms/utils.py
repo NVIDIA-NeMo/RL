@@ -32,6 +32,20 @@ from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
 
 
+def sum_metric_values(values: np.ndarray | list[Any]) -> float:
+    """Sum metric payloads without asking NumPy to materialize CUDA tensors."""
+    if isinstance(values, np.ndarray):
+        return float(np.sum(values).item())
+
+    total = 0.0
+    for value in values:
+        if isinstance(value, torch.Tensor):
+            total += float(value.detach().sum().item())
+        else:
+            total += float(np.sum(value).item())
+    return total
+
+
 def get_gdpo_reward_component_keys(batch) -> list[str]:
     """Return batch keys that are named reward components (e.g. reward/correctness) in sorted order."""
     return sorted(
