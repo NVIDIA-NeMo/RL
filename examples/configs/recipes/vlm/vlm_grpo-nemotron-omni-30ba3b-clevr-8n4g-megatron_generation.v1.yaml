@@ -92,6 +92,14 @@ policy:
       expert_tensor_parallel_size: 1
       sequence_parallel: true
       moe_pad_experts_for_cuda_graph_inference: true
+      image_dynamic_resolution: true
+      megatron_inference_wrapper: megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper
+      multimodal_prompt_config:
+        image_spec: &media_prompt_spec
+          model_token: <image>
+          prefix: <img>
+          suffix: </img>
+        video_spec: *media_prompt_spec
     colocated:
       enabled: false
       resources:

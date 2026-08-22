@@ -232,10 +232,14 @@ class MegatronGeneration(GenerationInterface):
             "policy; when colocated, pass it to the training policy instead."
         )
 
-        # Dedicated inference may modify its policy config.
+        # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
+        # `self._policy_config` keeps a reference to the full PolicyConfig. Dedicated
+        # inference receives a copy because worker setup may modify it.
         self._policy_config = config if policy is not None else deepcopy(config)
         self.cfg: MCoreGenerationConfig = config["generation"]
+        # Populated after the first prepare_for_generation (which starts the HTTP server).
         self.dp_openai_server_base_urls: list[Optional[str]] = []
+        # Installed by setup via create_weight_synchronizer.
         self.weight_synchronizer: Optional["WeightSynchronizer"] = None
 
         if policy is not None:

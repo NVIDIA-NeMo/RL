@@ -59,10 +59,12 @@ class MCoreGenerationSpecificArgs(TypedDict):
     mamba_inference_conv_states_dtype: NotRequired[str]
 
     # Raw media preprocessing used by the OpenAI-compatible HTTP endpoint.
+    image_dynamic_resolution: NotRequired[bool]
     video_num_frames: NotRequired[int]
     video_temporal_patch_size: NotRequired[int]
     video_target_num_patches: NotRequired[int]
     multimodal_prompt_config: NotRequired[dict]
+    megatron_inference_wrapper: NotRequired[str]
 
     # KV cache lifecycle across suspend/resume:
     # - "persist": cache stays allocated; CUDA graphs remain valid (default)

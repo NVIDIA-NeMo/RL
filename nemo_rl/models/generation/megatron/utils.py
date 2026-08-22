@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from typing import Any
 
 import torch
-from megatron.core.inference.config import ImageProcessingConfig
+from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
 from megatron.core.inference.utils import device_memory_summary
 
 
@@ -73,6 +74,32 @@ def build_image_preprocessing_config(
         dynamic_resolution_max_patches=int(max_patches),
         pixel_mean=[float(value) for value in pixel_mean],
         pixel_std=[float(value) for value in pixel_std],
+    )
+
+
+def build_video_preprocessing_config(
+    image_config: ImageProcessingConfig | None,
+    generation_config: dict[str, Any],
+    *,
+    frame_manifest_magic: bytes,
+) -> VideoProcessingConfig | None:
+    """Build video preprocessing when explicitly enabled by generation config."""
+    temporal_patch_size = generation_config.get("video_temporal_patch_size")
+    if image_config is None or temporal_patch_size is None:
+        return None
+
+    target_num_patches = generation_config.get("video_target_num_patches")
+    if target_num_patches is not None:
+        image_config = replace(
+            image_config,
+            dynamic_resolution_max_patches=int(target_num_patches),
+        )
+
+    return VideoProcessingConfig(
+        image_config=image_config,
+        num_frames=int(generation_config["video_num_frames"]),
+        temporal_patch_size=int(temporal_patch_size),
+        frame_manifest_magic=frame_manifest_magic,
     )
 
 

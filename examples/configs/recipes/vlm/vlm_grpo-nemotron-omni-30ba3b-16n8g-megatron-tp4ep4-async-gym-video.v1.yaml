@@ -48,6 +48,15 @@ policy:
   make_sequence_length_divisible_by: 32
   generation:
     bad_words: []
+    mcore_generation_config:
+      image_dynamic_resolution: true
+      megatron_inference_wrapper: megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper
+      multimodal_prompt_config:
+        image_spec: &media_prompt_spec
+          model_token: <image>
+          prefix: <img>
+          suffix: </img>
+        video_spec: *media_prompt_spec
     vllm_cfg:
       reset_encoder_cache_after_weight_update: false
       video:

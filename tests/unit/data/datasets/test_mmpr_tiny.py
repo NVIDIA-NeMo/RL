@@ -285,7 +285,7 @@ class TestVLMProcessorMMPRTiny:
     def test_prompted_text_contains_boxed_literal_and_no_raw_dataset_string(
         self, tiny_image_path
     ):
-        result, _ = _run_processor(tiny_image_path)
+        result, processor = _run_processor(tiny_image_path)
         processed_text = processor.captured_call_text
 
         # Positive: literal \boxed{} must survive prompt formatting
@@ -310,7 +310,8 @@ class TestVLMProcessorMMPRTiny:
 
         # The stub's apply_chat_template joins message parts with spaces,
         # so the captured text passed to __call__ is the chat-templated string.
-        # Placeholder-style processors send their expanded token IDs to vLLM.
+        # Verify the apply_chat_template output through captured_call_text below;
+        # placeholder-style processors send expanded token IDs to vLLM.
         assert result["vllm_content"] is None
 
         # Verify exactly one <image> token in the final output
