@@ -450,6 +450,79 @@ def _step_deltas(snap: dict[str, Any], prev: dict[str, Any]) -> dict[str, float]
     }
 
 
+def _op_step_stats(
+    by_op: dict[str, Any], prev_ops: dict[str, Any]
+) -> dict[str, dict[str, float]]:
+    """This step's per-op detail, keyed by op, from two snapshots.
+
+    Shared by the single-process and cluster paths so the two cannot drift,
+    and used for both the emitted shares and the breakdown table -- one
+    computation, so a chart and the table beside it can never disagree.
+
+    ``max_ms`` comes from ``step_max_ms``, which the reader resets, rather
+    than from the cumulative ``max_ms``: a maximum is not differenceable, so
+    the cumulative one latches at the worst call ever seen and never comes
+    back down. Ops with no calls this step are absent, not zero.
+    """
+    out: dict[str, dict[str, float]] = {}
+    for op, st in by_op.items():
+        prev_op = prev_ops.get(op, {})
+        calls = st["calls"] - prev_op.get("calls", 0)
+        if calls <= 0:
+            continue
+        op_ms = st["wall_ms"] - prev_op.get("wall_ms", 0.0)
+        op_bytes = st["n_bytes"] - prev_op.get("n_bytes", 0)
+        row: dict[str, float] = {
+            "calls": calls,
+            "wall_ms": op_ms,
+            # Per call, which is the only form of this that describes the
+            # wire rather than the shape of the run: ``wall_ms`` is summed
+            # over concurrent processes and so scales with DP degree.
+            "mean_ms": op_ms / calls,
+            "max_ms": st.get("step_max_ms", 0.0),
+            "mb": op_bytes / 1e6,
+        }
+        step_hist = [
+            now - was
+            for now, was in zip(
+                st["latency_hist"],
+                prev_op.get("latency_hist") or [0] * len(st["latency_hist"]),
+            )
+        ]
+        row.update(_clamped_percentiles(step_hist, row["max_ms"]))
+        split = _latency_split(st["fit"], calls, op_bytes)
+        if split:
+            row["overhead_ms"], row["transfer_ms"] = split
+        out[op] = row
+    return out
+
+
+def _time_shares(per_op: dict[str, dict[str, float]]) -> dict[str, float]:
+    """Where this step's data-plane time went, as fractions of the total.
+
+    Two independent decompositions of one total, which is what makes a
+    bottleneck legible: **by op** (which call is expensive) and **by cause**
+    (fixed per-request overhead vs bandwidth). The by-op shares sum to 1.
+    The by-cause shares cover only the ops whose affine fit is identifiable
+    -- an op whose requests were all the same size cannot be split -- so
+    they sum to at most 1, and the gap is time that could not be attributed
+    rather than time that did not happen.
+    """
+    total = sum(r["wall_ms"] for r in per_op.values())
+    if total <= 0:
+        return {}
+    shares = {
+        f"step/share/by_op/{op}": r["wall_ms"] / total for op, r in per_op.items()
+    }
+    for cause in ("overhead", "transfer"):
+        attributed = sum(
+            r[f"{cause}_ms"] * r["calls"] for r in per_op.values() if f"{cause}_ms" in r
+        )
+        if attributed > 0:
+            shares[f"step/share/by_cause/{cause}"] = attributed / total
+    return shares
+
+
 def _latency_split(
     fit: dict[str, Any], calls: int, op_bytes: int
 ) -> tuple[float, float] | None:
@@ -551,7 +624,7 @@ _OP_SUM = (
     "sum_bytes_ms",
     "sum_ms_sq",
 )
-_OP_MAX = ("max_ms",)
+_OP_MAX = ("max_ms", "step_max_ms")
 
 
 def merge_snapshots(snapshots: "list[dict[str, Any]]") -> dict[str, Any]:
@@ -660,64 +733,68 @@ def cluster_step_metrics(
     metrics = _step_deltas(merged, prev)
     metrics.update(
         {
-            # ``wall_ms`` sums processes that ran concurrently, so it can
-            # exceed the step's own wall clock. Per process it reads as a
-            # duration in ms, like everything else here.
-            "step/wall_ms_per_process": wall_ms / n_procs,
-            "now/n_processes": n_procs,
-            "step/observability_overhead_ms": overhead_ms,
-            "step/observability_overhead_frac": (
-                overhead_ms / wall_ms if wall_ms > 0 else 0.0
+            # The one metric that says whether optimising the data plane is
+            # worth anything: per-op shares say where its time went, never
+            # whether it mattered against compute. ``wall_ms`` sums
+            # processes that ran concurrently, so dividing it by one step's
+            # wall clock exceeds 1 whenever they overlapped (measured 1.054
+            # across ten processes) -- correct arithmetic that reads as
+            # "105% of the step". Per process it is bounded and answers the
+            # question people actually ask of it.
+            "step/frac_of_step": (
+                (wall_ms / n_procs) / (step_time_s * 1e3) if step_time_s > 0 else 0.0
             ),
+            "now/n_processes": n_procs,
+            "step/self/overhead_ms": overhead_ms,
+            "step/self/frac": overhead_ms / wall_ms if wall_ms > 0 else 0.0,
         }
     )
-    prev_ops = prev.get("by_op", {})
-    for op, stats in merged["by_op"].items():
-        prev_op = prev_ops.get(op, {})
-        calls = stats["calls"] - prev_op.get("calls", 0)
-        if calls <= 0:
-            continue
-        metrics[f"step/{op}/calls"] = calls
-        op_wall_ms = stats["wall_ms"] - prev_op.get("wall_ms", 0.0)
-        # How long one call took, which is the only form of this that
-        # describes the wire rather than the shape of the run. ``wall_ms``
-        # is summed over concurrent processes, so it scales with DP degree;
-        # dividing by the process count instead just trades one arbitrary
-        # denominator for another. Per call is invariant to both, and
-        # comparable across runs and cluster sizes.
-        metrics[f"step/{op}/mean_ms"] = op_wall_ms / calls
-        metrics[f"step/{op}/wall_ms"] = op_wall_ms
-        metrics[f"step/{op}/max_ms"] = stats["max_ms"]
-        # Percentiles over THIS step's calls, summed across ranks, not over
-        # the lifetime: a cumulative percentile beside a step-scoped max is
-        # two different windows on one chart, and it showed a max below its
-        # own median. Emitted only when the window holds enough calls to
-        # out-resolve the buckets -- with a wide DP degree a step easily
-        # clears it, and on a narrow one the honest answer is silence.
-        step_hist = [
-            now - was
-            for now, was in zip(
-                stats["latency_hist"],
-                prev_op.get("latency_hist") or [0] * len(stats["latency_hist"]),
-            )
-        ]
-        # Off the step's histogram delta, not the cumulative one
-        # :func:`_derive_op_metrics` used.
-        for name, value in _clamped_percentiles(step_hist, stats["max_ms"]).items():
-            metrics[f"step/{op}/{name}"] = value
-        # The split belongs here more than on the driver path: this fit is
-        # over every rank's sufficient statistics, so it has far more
-        # samples and far more size variation -- and size variation is
-        # exactly what decides whether the split is identifiable at all.
-        split = _latency_split(
-            stats["fit"], calls, stats["n_bytes"] - prev_op.get("n_bytes", 0)
-        )
-        if split:
-            (
-                metrics[f"step/{op}/overhead_ms"],
-                metrics[f"step/{op}/transfer_ms"],
-            ) = split
+    per_op = _op_step_stats(merged["by_op"], prev.get("by_op", {}))
+    metrics.update(_time_shares(per_op))
+    for op, row in per_op.items():
+        for field_name, value in row.items():
+            metrics[f"step/{op}/{field_name}"] = value
     return metrics
+
+
+# What goes on a chart. Everything else this module computes is per-op
+# detail, which belongs in the breakdown table beside it: four ops times
+# eight fields is 32 series saying one thing, and a dashboard of 32 lines
+# does not answer "what is my bottleneck" -- a table sorted by share does.
+# The full dict is still returned, so the table and the series are derived
+# from one computation and cannot disagree.
+_HEADLINE = (
+    "step/wall_ms",
+    "step/frac_of_step",
+    "step/comm_volume_mb",
+    "now/bytes_outstanding_mb",
+    "now/n_processes",
+    "step/self/overhead_ms",
+    "step/self/frac",
+)
+_HEADLINE_PREFIXES = ("step/share/", "step/hash/", "step/self/")
+# ``step/<x>/<field>`` is the per-op shape, so these reserved middles must
+# not be mistaken for op tags -- ``step/self/overhead_ms`` was becoming a
+# "self" row in the breakdown table beside put and get.
+_RESERVED_NAMESPACES = frozenset({"share", "hash", "self"})
+
+
+def headline_series(metrics: dict[str, float]) -> dict[str, float]:
+    """The subset of ``metrics`` worth a time series.
+
+    Args:
+        metrics: A flat dict from :func:`cluster_step_metrics` or
+            :meth:`MetricsDataPlaneClient.get_step_metrics`.
+
+    Returns:
+        Totals, time shares, and hash counters -- the per-op detail is
+        dropped, since :func:`breakdown_table` presents it better.
+    """
+    return {
+        k: v
+        for k, v in metrics.items()
+        if k in _HEADLINE or k.startswith(_HEADLINE_PREFIXES)
+    }
 
 
 # Per-op columns worth a row in the breakdown, in the order they read.
@@ -726,14 +803,16 @@ def cluster_step_metrics(
 # row carries None where a series was withheld rather than a zero that
 # would read as a measurement.
 _BREAKDOWN_COLUMNS = (
+    "share_pct",
     "calls",
+    "wall_ms",
     "mean_ms",
     "max_ms",
-    "wall_ms",
-    "overhead_ms",
-    "transfer_ms",
     "p50_ms",
     "p90_ms",
+    "overhead_ms",
+    "transfer_ms",
+    "mb",
 )
 
 
@@ -745,7 +824,8 @@ def breakdown_table(
     A stack of line charts answers "how did put's wall time trend"; the
     question this feeds is "where did this step's time go, across ops, at a
     glance" -- which is a table, and reading it off eight separate charts is
-    the wrong tool.
+    the wrong tool. Rows are ordered by share of data-plane time, so the
+    bottleneck is the first line read.
 
     Built from the metrics dict that is logged rather than from the snapshot
     it came from, so the table and the series can never disagree: a value
@@ -758,19 +838,26 @@ def breakdown_table(
             :func:`cluster_step_metrics`.
 
     Returns:
-        ``(columns, rows)`` for :meth:`Logger.log_table`, ops sorted by
-        descending wall time so the expensive one is the first line read.
+        ``(columns, rows)`` for :meth:`Logger.log_table`.
     """
     per_op: dict[str, dict[str, float]] = {}
     for key, value in metrics.items():
         parts = key.split("/")
-        if len(parts) != 3 or parts[0] != "step":
-            continue
-        _, op, field = parts
-        if field in _BREAKDOWN_COLUMNS:
-            per_op.setdefault(op, {})[field] = value
+        if len(parts) == 4 and parts[:3] == ["step", "share", "by_op"]:
+            per_op.setdefault(parts[3], {})["share_pct"] = 100.0 * value
+        elif (
+            len(parts) == 3
+            and parts[0] == "step"
+            and parts[1] not in _RESERVED_NAMESPACES
+            and parts[2] in _BREAKDOWN_COLUMNS
+        ):
+            per_op.setdefault(parts[1], {})[parts[2]] = value
     rows = [
         [op, *(stats.get(col) for col in _BREAKDOWN_COLUMNS)]
+        # By wall time, which orders identically to share (share is wall
+        # time over the same total) and is present even when the shares
+        # are not -- a table built from a partial metrics dict still reads
+        # worst-first.
         for op, stats in sorted(
             per_op.items(), key=lambda kv: -kv[1].get("wall_ms", 0.0)
         )
@@ -923,7 +1010,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # differencing and unit-conversion logic.
         self._prev_snapshot: dict[str, Any] = {}
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, reset_step_window: bool = False) -> dict[str, Any]:
         """Return cumulative totals plus live byte / key outstanding counts.
 
         ``total_wall_ms`` is the aggregate data-plane cost; ``by_op`` breaks
@@ -931,6 +1018,15 @@ class MetricsDataPlaneClient(DataPlaneClient):
         backends can be compared without post-processing. Throughput is
         omitted for ops that move no payload (e.g. ``claim_meta``, whose
         wall time is producer wait, not transfer).
+
+        Args:
+            reset_step_window: Zero each op's ``step_max_ms`` after reading
+                it, opening a fresh window. A maximum cannot be differenced
+                out of a cumulative counter the way ``calls`` and
+                ``wall_ms`` can, so the only way to scope one to a step is
+                to reset it -- and the reader that consumes it is the one
+                that has to. Left off by default so an inspection snapshot
+                never disturbs the step series.
         """
         out = asdict(self._stats)
         out["n_keys_outstanding"] = sum(
@@ -944,6 +1040,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
         out["bytes_written"] = sum(by[o]["n_bytes"] for o in _WRITE_OPS if o in by)
         out["bytes_read"] = sum(by[o]["n_bytes"] for o in _READ_OPS if o in by)
         out["comm_volume_bytes"] = out["bytes_written"] + out["bytes_read"]
+        if reset_step_window:
+            for bucket in self._stats.by_op.values():
+                bucket.step_max_ms = 0.0
         return out
 
     def get_step_metrics(self, step_time_s: float) -> dict[str, float]:
@@ -957,14 +1056,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         data plane is worth anything: per-op shares only say where data-plane
         time went, never whether it mattered against compute.
         """
-        snap = self.snapshot()
+        # Reading the step maxima is what closes the window: the values
+        # just read are this step's, and anything after belongs to the next.
+        snap = self.snapshot(reset_step_window=True)
         prev = self._prev_snapshot
         self._prev_snapshot = snap
-        # Snapshot first, then open a fresh window: the values just read are
-        # this step's, and anything after this call belongs to the next one.
-        step_maxima = {op: b.step_max_ms for op, b in self._stats.by_op.items()}
-        for bucket in self._stats.by_op.values():
-            bucket.step_max_ms = 0.0
 
         wall_ms = snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
         # Every duration is ms and every volume is MB, with no exceptions:
@@ -978,15 +1074,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
         )
         if self._verify_tensor_hash:
             hv, prev_hv = snap["hash_verify"], prev.get("hash_verify", {})
-            metrics["step/hash/rows_checked"] = hv["rows_checked"] - prev_hv.get(
-                "rows_checked", 0
-            )
-            metrics["step/hash/rows_recorded"] = hv["rows_recorded"] - prev_hv.get(
-                "rows_recorded", 0
-            )
-            metrics["step/hash/rows_unverified"] = hv["rows_unverified"] - prev_hv.get(
-                "rows_unverified", 0
-            )
+            for name in ("rows_checked", "rows_recorded", "rows_unverified"):
+                metrics[f"step/hash/{name}"] = hv[name] - prev_hv.get(name, 0)
             metrics["step/hash/mismatches"] = hv["mismatches"] - prev_hv.get(
                 "mismatches", 0
             )
@@ -997,33 +1086,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
             metrics["step/hash/fields_skipped"] = hv["fields_skipped"] - prev_hv.get(
                 "fields_skipped", 0
             )
-        prev_ops = prev.get("by_op", {})
-        for op, st in snap["by_op"].items():
-            prev_op = prev_ops.get(op, {})
-            calls = st["calls"] - prev_op.get("calls", 0)
-            if calls <= 0:
-                continue
-            op_ms = st["wall_ms"] - prev_op.get("wall_ms", 0.0)
-            # Four series per op tag. Anything exactly derivable is left
-            # out rather than logged: mean is wall_ms/calls, and a dashboard
-            # can divide. ``snapshot()`` still carries the full picture,
-            # percentiles included, for a one-off inspection.
-            metrics[f"step/{op}/calls"] = calls
-            metrics[f"step/{op}/mean_ms"] = op_ms / calls
-            metrics[f"step/{op}/wall_ms"] = op_ms
-            # ``max_ms`` rather than p50/p90. Those come off a histogram
-            # that is never reset, so per step they were a lifetime figure
-            # that goes flat, quantised to bucket edges. The max is exact
-            # and says the same thing at the handful of calls per step.
-            metrics[f"step/{op}/max_ms"] = step_maxima.get(op, 0.0)
-            split = _latency_split(
-                st["fit"], calls, st["n_bytes"] - prev_op.get("n_bytes", 0)
-            )
-            if split:
-                (
-                    metrics[f"step/{op}/overhead_ms"],
-                    metrics[f"step/{op}/transfer_ms"],
-                ) = split
+        per_op = _op_step_stats(snap["by_op"], prev.get("by_op", {}))
+        metrics.update(_time_shares(per_op))
+        for op, row in per_op.items():
+            for field_name, value in row.items():
+                metrics[f"step/{op}/{field_name}"] = value
         return metrics
 
     def _record_put(self, partition_id: str, keys: list[str], n_bytes: int) -> None:

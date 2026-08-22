@@ -220,7 +220,9 @@ class TQPolicy(TQDriverMixin, Policy):
         snapshots: list[dict[str, Any]] = []
         client = getattr(self, "dp_client", None)
         if hasattr(client, "snapshot"):
-            snapshots.append(client.snapshot())
+            # reset_step_window: this call is the once-per-step reader, and
+            # a max only scopes to a step by being reset by its reader.
+            snapshots.append(client.snapshot(reset_step_window=True))
         try:
             # ``Policy.run_all_workers_single_data`` already does the
             # ``ray.get``. Pairing the worker-group call with
