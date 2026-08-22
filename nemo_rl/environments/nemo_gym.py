@@ -789,8 +789,7 @@ Depending on your data shape, you may want to change these values."""
         try:
             manifest = await self._control(
                 "GET",
-                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}"
-                f"/rollouts/{rollout_id}/manifest",
+                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/manifest",
             )
             receipt = self._assemble_receipt(
                 rollout_id,
@@ -871,10 +870,7 @@ Depending on your data shape, you may want to change these values."""
 
             try:
                 selection = select_terminal_call(
-                    [
-                        CallRecord.model_validate(record)
-                        for record in deduped.values()
-                    ]
+                    [CallRecord.model_validate(record) for record in deduped.values()]
                 )
             except ValueError:
                 selection_reason = "invalid_manifest_row"
@@ -890,7 +886,9 @@ Depending on your data shape, you may want to change these values."""
         ]
         failure_reason = None
         if poisoning_failures:
-            failure_reason = str(poisoning_failures[0].get("reason") or "capture_failed")
+            failure_reason = str(
+                poisoning_failures[0].get("reason") or "capture_failed"
+            )
         elif terminal_record is None:
             failure_reason = selection_reason or "missing_terminal_row"
         return {
