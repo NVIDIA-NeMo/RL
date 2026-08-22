@@ -795,6 +795,23 @@ def test_cluster_step_metrics_report_their_own_cost():
     client.close()
 
 
+def test_cluster_busy_fraction_is_bounded():
+    """``wall_ms`` is summed over processes that ran concurrently, so
+    dividing it by one step's wall clock exceeds 1 whenever they
+    overlapped — measured 1.054 across ten processes, which reads as
+    '105% of the step'. The mean per-process fraction is bounded."""
+    # Physical fixture: each rank spends 500 ms inside a 1 s step. A rank
+    # cannot spend longer in the data plane than the step lasted, so a
+    # fixture that implies it would be testing the arithmetic on impossible
+    # input rather than the metric.
+    ranks = [_rank_with([100.0] * 5) for _ in range(10)]
+    metrics = cluster_step_metrics(merge_snapshots(ranks), {}, 1.0)
+
+    assert "frac_of_step" not in metrics
+    assert 0.0 <= metrics["busy_frac_mean"] <= 1.0, metrics["busy_frac_mean"]
+    assert metrics["n_processes"] == 10
+
+
 def test_cluster_overhead_includes_the_collection_fan_out():
     """The fan-out is the larger half of the bill. Reporting only the per-op
     wrapper understated the real cost by ~19x in the cross-process e2e
@@ -817,3 +834,37 @@ def test_cluster_overhead_includes_the_collection_fan_out():
     )
     assert delta == pytest.approx(2.31, rel=1e-6)
     client.close()
+
+
+def _rank_with(latencies_ms):
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    now = monotonic()
+    for ms in latencies_ms:
+        client._emit("put", "p", 1, 1_000, now - ms / 1e3, "ok")
+    return client.snapshot()
+
+
+def test_cluster_percentiles_never_exceed_the_measured_max():
+    """Bucket interpolation spreads a bucket's samples uniformly across it,
+    so calls clustered low in a wide bucket read high: 160 calls of 120 ms
+    all land in (100, 250] and interpolate to a p50 of 175 — above every
+    call observed, and above the exact max reported beside it. The max is
+    the tighter bound, so the percentiles are clamped to it."""
+    merged = merge_snapshots([_rank_with([120.0] * 20) for _ in range(8)])
+    metrics = cluster_step_metrics(merged, {}, 1.0)
+
+    assert metrics["put/max_ms"] == pytest.approx(120.0, abs=2.0)
+    assert metrics["put/p50_ms"] <= metrics["put/max_ms"]
+    assert metrics["put/p99_ms"] <= metrics["put/max_ms"]
+    assert metrics["put/p50_ms"] <= metrics["put/p99_ms"]
+
+
+def test_cluster_percentiles_withheld_below_a_useful_sample_count():
+    """A percentile off a handful of calls is bucket geometry, not data.
+    Silence beats a number that looks like an answer."""
+    few = merge_snapshots([_rank_with([120.0] * 3) for _ in range(2)])  # 6 calls
+    many = merge_snapshots([_rank_with([120.0] * 20) for _ in range(8)])  # 160
+
+    assert "put/p50_ms" not in cluster_step_metrics(few, {}, 1.0)
+    assert "put/max_ms" in cluster_step_metrics(few, {}, 1.0), "max always works"
+    assert "put/p50_ms" in cluster_step_metrics(many, {}, 1.0)
