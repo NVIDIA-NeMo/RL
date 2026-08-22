@@ -365,7 +365,14 @@ def test_dspark_provider_maps_packed_cp_inputs_to_local_objective_slots(
             sequence_layout: object | None = None,
             context_parallel_group: object | None = None,
         ) -> Tensor:
-            del target_taps, plan
+            del target_taps
+            sample_rows = getattr(plan, "sample_rows")
+            assert isinstance(sample_rows, Tensor)
+            assert block_embeddings.shape == (
+                sample_rows.numel(),
+                config.block_size,
+                hidden_size,
+            )
             self.sequence_layout = sequence_layout
             self.context_parallel_group = context_parallel_group
             return block_embeddings * self.scale
@@ -398,11 +405,24 @@ def test_dspark_provider_maps_packed_cp_inputs_to_local_objective_slots(
     adapter = _Adapter()
     cp_group = object()
     tp_group = object()
+    gathered_mask_embeddings: list[Tensor] = []
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+
+    def gather_mask_embeddings(
+        local: Tensor,
+        *,
+        gather_dim: int,
+        group: object,
+    ) -> Tensor:
+        assert gather_dim == 0
+        assert group is tp_group
+        gathered_mask_embeddings.append(local)
+        return torch.cat((local, local + 100), dim=0)
+
     monkeypatch.setattr(
         "nemo_rl.models.megatron.draft.training.all_gather_tensor_autograd",
-        lambda local, *, gather_dim, group: torch.cat((local, local + 100), dim=0),
+        gather_mask_embeddings,
     )
     cp_local_length = layout.cp_global_positions.numel()
     captured = CapturedStates(
@@ -430,6 +450,7 @@ def test_dspark_provider_maps_packed_cp_inputs_to_local_objective_slots(
     assert output.sequence_layout is layout
     assert adapter.body.sequence_layout is layout
     assert adapter.body.context_parallel_group is cp_group
+    assert len(gathered_mask_embeddings) == 1
 
     target_logits = torch.randn(cp_local_length // layout.tp_size, 1, vocab_size)
     stats = provider.loss_stats(
