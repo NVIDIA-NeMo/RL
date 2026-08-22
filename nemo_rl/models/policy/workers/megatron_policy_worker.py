@@ -2673,8 +2673,9 @@ class MegatronPolicyWorkerImpl(
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield this CP/TP lane's draft weights from its last PP stage."""
         draft_model = self.draft_model
+        draft_cfg = self.cfg.get("draft")
         draft_enabled = draft_model is not None or bool(
-            self.cfg.get("draft", {}).get("enabled", False)
+            getattr(draft_cfg, "enabled", False)
         )
         if not draft_enabled:
             return

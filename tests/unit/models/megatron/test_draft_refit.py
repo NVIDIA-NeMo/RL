@@ -23,6 +23,7 @@ import torch
 import torch.distributed as dist
 
 from nemo_rl.models.megatron.draft import utils as draft_utils
+from nemo_rl.models.policy.draft_config import DFlashDraftConfig
 
 
 class _FalseyExporter:
@@ -412,16 +413,28 @@ class _EmptyBridge:
 
 
 def _draft_refit_worker(*, draft_model: object | None) -> Any:
+    import nemo_rl.models.megatron.draft as draft_module
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.cfg = {"draft": {"enabled": True}}
+    worker.cfg = {
+        "draft": DFlashDraftConfig(
+            enabled=True,
+            gamma=5,
+            anchors_per_sample=2,
+            mask_token_id=151669,
+            target_hidden_state_layer_ids=[1, 9, 17, 25, 33],
+        )
+    }
     worker.model = object()
     worker.megatron_bridge = _EmptyBridge()
     worker.refit_conversion_tasks = []
     worker.draft_model = draft_model
+    worker.draft_provider = SimpleNamespace(
+        export_weights=lambda model: draft_module.export_eagle_weights_to_hf(model)
+    )
     return worker
 
 

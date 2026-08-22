@@ -37,6 +37,22 @@ def test_optional_draft_config_does_not_start_update_probe() -> None:
     assert worker._maybe_start_draft_update_probe() is None
 
 
+def test_disabled_typed_dflash_config_has_no_refit_metadata() -> None:
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {
+        "draft": DFlashDraftConfig(
+            enabled=False,
+            gamma=5,
+            anchors_per_sample=2,
+            mask_token_id=151669,
+            target_hidden_state_layer_ids=[1, 9, 17, 25, 33],
+        )
+    }
+    worker.draft_model = None
+
+    assert tuple(worker._iter_draft_weights_for_refit(metadata_only=True)) == ()
+
+
 def _provider():
     provider = resolve_draft_speculator(
         DFlashDraftConfig(
