@@ -95,6 +95,13 @@ _READ_OPS = frozenset({"get", "get_data"})
 # few lines carry the identity of what broke.
 _MAX_HASH_MISMATCH_LOGS = 20
 
+# Calls needed in a window before a percentile off the histogram means
+# anything. Below this the interpolation returns bucket geometry: one sample
+# in (100, 250] yields p50 = 100 + 150*0.50 = 175 and p99 = 248.5 whatever
+# the call actually took. Reporting that next to an exact ``max_ms`` produced
+# a max below its own median.
+_MIN_SAMPLES_FOR_PERCENTILE = 50
+
 
 class _FieldDigest(NamedTuple):
     """One fingerprint per row, plus how far it can be trusted.
@@ -571,9 +578,18 @@ def cluster_step_metrics(
     """
     wall_ms = merged["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
     overhead_ms = merged["self_ms"] - prev.get("self_ms", 0.0) + collect_ms
+    # Not ``frac_of_step``: ``wall_ms`` here is the SUM over processes that
+    # ran concurrently, so dividing by one step's wall clock gives a number
+    # that exceeds 1 whenever they overlapped (measured 1.054 across ten
+    # processes) -- correct arithmetic, but it reads as "105% of the step".
+    # The mean fraction of the step a process spent in the data plane is
+    # bounded and answers the question people ask of it.
+    n_procs = max(merged.get("n_processes", 1), 1)
     metrics: dict[str, float] = {
         "wall_ms": wall_ms,
-        "frac_of_step": (wall_ms / 1e3 / step_time_s) if step_time_s > 0 else 0.0,
+        "busy_frac_mean": (
+            wall_ms / 1e3 / (step_time_s * n_procs) if step_time_s > 0 else 0.0
+        ),
         "comm_volume_mb": (
             merged["comm_volume_bytes"] - prev.get("comm_volume_bytes", 0)
         )
@@ -582,7 +598,7 @@ def cluster_step_metrics(
         / 1e6,
         "bytes_read_mb": (merged["bytes_read"] - prev.get("bytes_read", 0)) / 1e6,
         "bytes_outstanding_mb": merged["bytes_outstanding"] / 1e6,
-        "n_processes": merged.get("n_processes", 0),
+        "n_processes": n_procs,
         "observability_overhead_ms": overhead_ms,
         "observability_overhead_frac": (overhead_ms / wall_ms if wall_ms > 0 else 0.0),
     }
@@ -595,11 +611,33 @@ def cluster_step_metrics(
         metrics[f"{op}/calls"] = calls
         metrics[f"{op}/wall_ms"] = stats["wall_ms"] - prev_op.get("wall_ms", 0.0)
         metrics[f"{op}/max_ms"] = stats["max_ms"]
-        # Percentiles are worth reporting here and not per process: this
-        # histogram is the sum over every rank, so it is the real cluster
-        # distribution rather than one process's handful of calls.
-        metrics[f"{op}/p50_ms"] = stats["p50_ms"]
-        metrics[f"{op}/p99_ms"] = stats["p99_ms"]
+        # Percentiles over THIS step's calls, summed across ranks, not over
+        # the lifetime: a cumulative percentile beside a step-scoped max is
+        # two different windows on one chart, and it showed a max below its
+        # own median. Emitted only when the window holds enough calls to
+        # out-resolve the buckets -- with a wide DP degree a step easily
+        # clears it, and on a narrow one the honest answer is silence.
+        step_hist = [
+            now - was
+            for now, was in zip(
+                stats["latency_hist"],
+                prev_op.get("latency_hist") or [0] * len(stats["latency_hist"]),
+            )
+        ]
+        if sum(step_hist) >= _MIN_SAMPLES_FOR_PERCENTILE:
+            # Clamped to the exact max. Interpolation spreads a bucket's
+            # samples uniformly across it, so calls clustered low in a wide
+            # bucket read high -- 160 calls of 120 ms all land in (100, 250]
+            # and interpolate to a p50 of 175, above every call observed. A
+            # true percentile cannot exceed the maximum, and the maximum is
+            # measured exactly, so it is the tighter bound.
+            ceiling = stats["max_ms"]
+            metrics[f"{op}/p50_ms"] = min(
+                percentile_from_hist(step_hist, 0.50), ceiling
+            )
+            metrics[f"{op}/p99_ms"] = min(
+                percentile_from_hist(step_hist, 0.99), ceiling
+            )
     return metrics
 
 

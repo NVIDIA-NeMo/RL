@@ -456,6 +456,21 @@ affine fit, throughput — is recomputed from the merged totals, never
 averaged across ranks (averaging per-rank percentiles does not give a
 cluster percentile).
 
+Two things read differently in the cluster view and are named to say so:
+
+- **`busy_frac_mean`**, not `frac_of_step`. `wall_ms` is summed over
+  processes that ran concurrently, so dividing it by one step's wall clock
+  exceeds 1 whenever they overlapped (measured 1.054 across ten processes).
+  The mean fraction of the step a process spent in the data plane is
+  bounded and answers the question people ask of it.
+- **Percentiles are per step and clamped to the exact `max_ms`**, and are
+  withheld entirely below 50 calls in the window. Bucket interpolation
+  spreads a bucket's samples uniformly across it, so calls clustered low in
+  a wide bucket read high — 160 calls of 120 ms all land in `(100, 250]`
+  and interpolate to a p50 of 175, above every call observed and above the
+  max reported beside it. The max is measured exactly, so it is the tighter
+  bound.
+
 `grpo_train_sync` fans out to the driver and every policy worker, and logs
 the combined result under `data_plane/cluster/` instead of the driver's
 own. It falls back to `data_plane/driver/` when the fan-out finds only one
