@@ -456,13 +456,24 @@ affine fit, throughput — is recomputed from the merged totals, never
 averaged across ranks (averaging per-rank percentiles does not give a
 cluster percentile).
 
-Two things read differently in the cluster view and are named to say so:
+**Every series says what kind of number it is.** A per-step delta and an
+instantaneous level shared the `_mb` suffix and a chart, with nothing to
+tell them apart:
 
-- **`busy_frac_mean`**, not `frac_of_step`. `wall_ms` is summed over
+| namespace | meaning | example |
+|---|---|---|
+| `step/` | what happened during this step; resets | `step/comm_volume_mb` |
+| `now/` | what is true at this instant; persists | `now/bytes_outstanding_mb` |
+
+A rising `now/bytes_outstanding_mb` is not an accumulation bug — it is the
+leak signal the metric exists for: bytes put and never cleared.
+
+Two more read differently in the cluster view and are named to say so:
+
+- **`step/wall_ms_per_process`**, not a bare fraction. `wall_ms` sums
   processes that ran concurrently, so dividing it by one step's wall clock
-  exceeds 1 whenever they overlapped (measured 1.054 across ten processes).
-  The mean fraction of the step a process spent in the data plane is
-  bounded and answers the question people ask of it.
+  exceeded 1 whenever they overlapped (measured 1.054 across ten
+  processes). Per process it is a duration in ms, like everything else.
 - **Percentiles are per step and clamped to the exact `max_ms`**, and are
   withheld entirely below 50 calls in the window. Bucket interpolation
   spreads a bucket's samples uniformly across it, so calls clustered low in
