@@ -53,9 +53,11 @@ from nemo_rl.algorithms.grpo import (
     compute_and_apply_seq_logprob_error_masking,
 )
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.ppo import _compute_critic_metrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
+    is_ppo_run,
     validate_sampler_buffer_capacity,
     validate_single_controller_config,
 )
@@ -77,6 +79,7 @@ from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
 from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -137,6 +140,15 @@ class SingleControllerActor:
         self._dp_client = actor_args.dp_client
         self._gen: Generation = actor_args.gen_handle
         self._trainer: TQPolicy = actor_args.trainer_handle
+        # PPO: the critic, its loss, and the number of leading steps that train
+        # the critic only. All three are inert on a GRPO run. Same getattr
+        # rationale as _gen_fleet below -- None is the documented off state.
+        self._is_ppo: bool = is_ppo_run(master_config)
+        self._value: Optional[TQValue] = getattr(actor_args, "value_handle", None)
+        self._value_loss_fn = getattr(actor_args, "value_loss_fn", None)
+        self._policy_training_start_step: int = (
+            master_config.ppo.policy_training_start_step if self._is_ppo else 0
+        )
         self._dataloader = actor_args.dataloader
         self._weight_synchronizer = actor_args.weight_synchronizer
         self._advantage_estimator = actor_args.advantage_estimator
@@ -863,6 +875,16 @@ class SingleControllerActor:
             step_open = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
+            # Last (and, on the PPO path, only) critic train result of the step:
+            # validate_single_controller_config pins PPO to one chunk per step,
+            # so this is the step's critic update rather than a sample of it.
+            value_result: Optional[dict[str, Any]] = None
+            # PPO critic warmup: the policy is frozen -- neither trained nor
+            # transferred -- until the critic has had this many steps on its own.
+            # Always True outside the PPO path (the start step is pinned to 0).
+            is_policy_training_step = (
+                self._train_steps >= self._policy_training_start_step
+            )
 
             with self._timer.time("total_step_time"):
                 # Re-read on every iteration rather than once: a prompt stamped for this
@@ -940,6 +962,14 @@ class SingleControllerActor:
                         for _ in range(num_groups):
                             self._buffer_capacity.release()
 
+                    # PPO: the critic's pre-update prediction, which GAE
+                    # bootstraps from and MseValueLossFn clips against. Runs
+                    # before the logprob detour so only one model is resident
+                    # on the training GPUs at a time.
+                    if self._is_ppo:
+                        with self._timer.time("value_inference"):
+                            train_meta = await self._value_stage(train_meta)
+
                     # Compute prev_logprobs / ref_logprobs
                     if (
                         self._policy_logprobs_required
@@ -974,13 +1004,24 @@ class SingleControllerActor:
                             has_valid_training_tokens,
                         ) = await self._advantage_stage(train_meta)
 
+                    # PPO: critic first, then actor -- the same order as the
+                    # legacy PPO epoch loop, and the reason the policy is still
+                    # off the GPU here. One train_from_meta call is one critic
+                    # optimizer step, which the one-chunk-per-step rule
+                    # validate_single_controller_config enforces makes equal to
+                    # one step per RL step.
+                    if self._is_ppo and has_valid_training_tokens:
+                        with self._timer.time("value_training"):
+                            value_result = await self._value_train(train_meta)
+
                     # Filtering can leave a streaming chunk with no training tokens.
                     # Consume that chunk without F/B, then continue the same optimizer
                     # step with the next chunk. Always restore training mode because
                     # log-prob inference may have switched the model to inference mode.
-                    with self._timer.time("training_prep"):
-                        await asyncio.to_thread(self._trainer.prepare_for_training)
-                    if has_valid_training_tokens:
+                    if is_policy_training_step:
+                        with self._timer.time("training_prep"):
+                            await asyncio.to_thread(self._trainer.prepare_for_training)
+                    if has_valid_training_tokens and is_policy_training_step:
                         with self._timer.time("policy_training"):
                             if not step_open:
                                 await asyncio.to_thread(
@@ -1059,20 +1100,28 @@ class SingleControllerActor:
                     chunks_dispatched,
                     groups_dispatched,
                 )
-                if not step_open:
+                if not step_open and is_policy_training_step:
                     raise RuntimeError(
                         "SingleController has no valid response tokens after "
                         "filtering. Check grpo.seq_logprob_error_threshold to "
                         "avoid an optimizer step with an empty batch."
                     )
 
-                with self._timer.time("policy_training"):
-                    result = await asyncio.to_thread(self._trainer.finish_train_step)
-
-                step_metrics = aggregate_step_metrics(result)
+                if step_open:
+                    with self._timer.time("policy_training"):
+                        result = await asyncio.to_thread(
+                            self._trainer.finish_train_step
+                        )
+                    step_metrics = aggregate_step_metrics(result)
+                else:
+                    # Critic warmup only; nothing accumulated in the policy's
+                    # grad buffers, so there is no optimizer step to close.
+                    step_metrics = {}
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
+                if value_result is not None:
+                    step_metrics.update(_compute_critic_metrics(value_result))
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
 
                 self._trainer_version += 1
@@ -1111,7 +1160,8 @@ class SingleControllerActor:
                         else None
                     )
                     aborted_stale_inflight_groups = await self._sync_weights(
-                        calibration_data=calibration_data
+                        calibration_data=calibration_data,
+                        skip_transfer=not is_policy_training_step,
                     )
                     step_metrics.update(
                         {
@@ -1573,6 +1623,22 @@ class SingleControllerActor:
             tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
             checkpointing_cfg=self._master_config.checkpointing,
         )
+        if self._is_ppo:
+            # The critic writes synchronously, so unlike the policy above it is
+            # fully on disk when this returns and needs no finalize wait.
+            await asyncio.to_thread(self._value.prepare_for_training)
+            try:
+                await asyncio.to_thread(
+                    self._value.save_checkpoint,
+                    weights_path=os.path.join(checkpoint_path, "value", "weights"),
+                    optimizer_path=os.path.join(checkpoint_path, "value", "optimizer")
+                    if self._checkpointer.save_optimizer
+                    else None,
+                    tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
+                    checkpointing_cfg=self._master_config.checkpointing,
+                )
+            finally:
+                await asyncio.to_thread(self._value.finish_training)
         await asyncio.to_thread(
             torch.save,
             dataloader_state,
@@ -1608,6 +1674,7 @@ class SingleControllerActor:
         self,
         *,
         calibration_data: Optional[BatchedDataDict[Any]] = None,
+        skip_transfer: bool = False,
     ) -> int:
         """Pause new rollout dispatches, synchronize weights, resume.
 
@@ -1624,6 +1691,11 @@ class SingleControllerActor:
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
                 scales before synchronizing weights.
+            skip_transfer: Skip step 3 because the policy did not change this
+                step (PPO critic warmup). Everything else still runs: the gate,
+                the stale-rollout abort and the version bump are what keep the
+                staleness accounting correct, and they are independent of
+                whether any weights actually moved.
 
         Returns:
             The number of stale in-flight rollout groups aborted before the
@@ -1644,7 +1716,8 @@ class SingleControllerActor:
         t0 = time.monotonic()
         kv_scales = None
         if (
-            getattr(self._gen, "requires_kv_scale_sync", False)
+            not skip_transfer
+            and getattr(self._gen, "requires_kv_scale_sync", False)
             and calibration_data is not None
         ):
             print("▶ Computing KV cache scales...", flush=True)
@@ -1655,10 +1728,17 @@ class SingleControllerActor:
             )
             kv_scales = calibration_result["layers"]
 
-        await asyncio.to_thread(
-            self._weight_synchronizer.sync_weights,
-            kv_scales=kv_scales,
-        )
+        if skip_transfer:
+            print(
+                "▶ Critic warmup: skipping policy weight transfer "
+                "(policy frozen; generation already up to date)",
+                flush=True,
+            )
+        else:
+            await asyncio.to_thread(
+                self._weight_synchronizer.sync_weights,
+                kv_scales=kv_scales,
+            )
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would
@@ -1671,6 +1751,41 @@ class SingleControllerActor:
         self._rollout_manager.set_weight_version(self._trainer_version)
         self._rollout_permitted.set()
         return aborted_stale_inflight_groups
+
+    async def _value_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
+        """Run the PPO critic's forward pass over the selected chunk.
+
+        Tensors never touch SC: workers fetch the sequence columns from
+        DataPlane and commit the per-token prediction back under ``values``,
+        which the advantage stage then reads alongside the rewards. The critic
+        is loaded and offloaded around the call because it shares the training
+        GPUs with the policy.
+
+        Returns:
+            The batch metadata with the ``values`` column recorded on it.
+        """
+        await asyncio.to_thread(self._value.prepare_for_inference)
+        try:
+            await asyncio.to_thread(self._value.get_values_from_meta, meta)
+        finally:
+            await asyncio.to_thread(self._value.finish_inference)
+        return meta.with_fields([self._advantage_cfg.values_field])
+
+    async def _value_train(self, meta: KVBatchMeta) -> dict[str, Any]:
+        """Run one critic optimizer step against this chunk's GAE returns.
+
+        Returns:
+            The aggregated critic train result, shaped like ``Value.train``'s.
+        """
+        await asyncio.to_thread(self._value.prepare_for_training)
+        try:
+            return await asyncio.to_thread(
+                self._value.train_from_meta,
+                meta,
+                self._value_loss_fn,
+            )
+        finally:
+            await asyncio.to_thread(self._value.finish_training)
 
     async def _advantage_stage(self, meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
         """Fetch advantage inputs, compute advantages, and write them back.
@@ -1759,31 +1874,49 @@ class SingleControllerActor:
                 tensor_field(data, field_name)
             )
 
+        # GAE reads its logprobs under different keyword names than the
+        # group-relative estimators do, and additionally needs the critic's
+        # pre-update predictions.
+        policy_logprobs_key = "logprobs" if self._is_ppo else "logprobs_policy"
+        reference_logprobs_key = (
+            "reference_logprobs" if self._is_ppo else "logprobs_reference"
+        )
         kwargs: dict[str, torch.Tensor] = {}
         if self._policy_logprobs_required:
-            kwargs["logprobs_policy"] = tensor_field(
+            kwargs[policy_logprobs_key] = tensor_field(
                 data,
                 adv_cfg.policy_logprobs_field,
             )
         if self._reference_logprobs_required:
-            kwargs["logprobs_reference"] = tensor_field(
+            kwargs[reference_logprobs_key] = tensor_field(
                 data,
                 adv_cfg.reference_logprobs_field,
             )
+        if self._is_ppo:
+            kwargs["values"] = tensor_field(data, adv_cfg.values_field)
 
         # Training predicts token t from position t - 1, so token_mask[:, 1:]
         # is the exact mask used when global_valid_toks and the loss are built.
         has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
+        # Value-model estimators (GAE) hand back the critic's regression target
+        # alongside the advantages; the group-relative ones return a bare tensor.
+        returns: Optional[torch.Tensor] = None
         if has_valid_training_tokens:
-            advantages = self._advantage_estimator.compute_advantage(
+            result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
                 mask=mask,
                 repeated_batch=repeated_batch,
                 **kwargs,
             )
+            if isinstance(result, tuple):
+                advantages, returns = result
+            else:
+                advantages = result
         else:
             advantages = torch.zeros_like(mask)
+            if self._is_ppo:
+                returns = torch.zeros_like(mask)
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
         self._step_log_dict["masked_advantages"].append(
@@ -1793,6 +1926,10 @@ class SingleControllerActor:
         fields_to_put = {adv_cfg.output_field: advantages}
         if seq_logprob_error_threshold is not None:
             fields_to_put[adv_cfg.sample_mask_field] = sample_mask
+        new_fields = [adv_cfg.output_field]
+        if returns is not None:
+            fields_to_put[adv_cfg.returns_field] = returns
+            new_fields.append(adv_cfg.returns_field)
 
         await self._call_dp(
             "put_samples",
@@ -1801,7 +1938,7 @@ class SingleControllerActor:
             fields=fields_for_put(meta, fields_to_put),
         )
         return (
-            meta.with_fields([adv_cfg.output_field]),
+            meta.with_fields(new_fields),
             has_valid_training_tokens,
         )
 
@@ -1822,4 +1959,6 @@ class SingleControllerActor:
             fields.append(adv_cfg.generation_logprobs_field)
         if self._reference_logprobs_required:
             fields.append(adv_cfg.reference_logprobs_field)
+        if self._is_ppo:
+            fields.append(adv_cfg.values_field)
         return list(dict.fromkeys(fields))

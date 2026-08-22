@@ -916,3 +916,7 @@ class AdvantageConfig:
     policy_logprobs_field: str = "prev_logprobs"
     generation_logprobs_field: str = "generation_logprobs"
     reference_logprobs_field: str = "reference_policy_logprobs"
+    # PPO only: the critic's pre-update prediction (input) and GAE's
+    # regression target for it (output).
+    values_field: str = "values"
+    returns_field: str = "returns"

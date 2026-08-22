@@ -166,6 +166,27 @@ SC reads its async knobs from `async_rl:` and **requires `grpo.async_grpo: null`
 | *(no legacy equivalent — matches legacy `max_trajectory_age + 1` batches in flight)* | `max_inflight_prompts: num_prompts_per_step × (max_lookahead_versions + 1)` |
 | *(no legacy equivalent — legacy sizes its buffer to `num_prompts_per_step × max_trajectory_age_steps × 2`)* | `max_buffered_rollouts: num_prompts_per_step × (max_lookahead_versions + 1)` (tight; see the [Config → behavior map](#config--behavior-map) for per-sampler values) |
 
+## PPO on the SingleController
+
+Adding a `ppo:` block to an SC config trains a PPO critic alongside the policy; without it the same entrypoint runs GRPO. The block turns on three extra stages inside the train pump, in this order per step: the critic's forward pass (writing `values` to the data plane), GAE (writing `advantages` and `returns`), then one critic optimizer step — critic before actor, matching the legacy PPO epoch loop.
+
+A PPO config needs three blocks that a GRPO one does not:
+
+| Block | Purpose |
+| ----- | ------- |
+| `ppo.adv_estimator` | GAE parameters (`gae_lambda`, `gae_gamma`, the VAPO decoupled λs). Only `name: gae` is supported — the value-free estimators stay under `grpo.adv_estimator`. |
+| `value` | The critic's model / parallelism / batching config, same schema as legacy PPO's `value:`. |
+| `value_loss_fn` | `MseValueLossFn` settings (`scale`, `cliprange`). |
+
+`ppo.policy_training_start_step: N` reproduces the legacy critic warmup: for the first N steps the policy is neither trained nor transferred to generation, while the critic trains every step. The rollout version still advances during warmup, so staleness accounting is unaffected.
+
+Two constraints are enforced at setup:
+
+- `async_rl.min_groups_for_streaming_train` must equal `grpo.num_prompts_per_step`. The critic has no split (begin / microbatch / finish) train API, so one `train_from_meta` call is one optimizer step; streaming a step across several chunks would step the critic once per chunk while the policy steps once per RL step.
+- `value.train_global_batch_size` must equal `grpo.num_prompts_per_step × grpo.num_generations_per_prompt`, for the same reason the policy's must.
+
+Everything PPO shares with GRPO — batch sizing, staleness, sequence-error masking, fault tolerance — is configured exactly as above, under `grpo:` and `async_rl:`.
+
 ## Known Missing Features
 
 The SC path is still under active development. Feature gaps are tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625). Notable items:
