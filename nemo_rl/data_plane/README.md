@@ -415,10 +415,13 @@ YAML (`examples/configs/...`). The canonical exemplar is
 `enabled`, `impl`, `backend` and `claim_meta_poll_interval_s` are
 **required** when `enabled=true`. Backend sizing lives in a block named
 for the backend that reads it; only the block named by `backend` is
-consulted, and an absent block means that backend's defaults, which are
-declared on `SimpleStorageConfig` / `MooncakeCpuConfig` in
-`nemo_rl/data_plane/interfaces.py`. Recipes under
-`examples/configs/recipes/**/*.yaml` inherit all of it via `defaults:`.
+consulted. An absent `mooncake_cpu:` block means that backend's
+defaults, declared on `MooncakeCpuConfig` in
+`nemo_rl/data_plane/interfaces.py`. `simple:` is **not** optional —
+`num_storage_units` has no static default, since no single value is
+right across cluster sizes, so a `simple` run without the block fails
+validation. Recipes under `examples/configs/recipes/**/*.yaml` inherit
+all of it via `defaults:`.
 
 ```yaml
 data_plane:
