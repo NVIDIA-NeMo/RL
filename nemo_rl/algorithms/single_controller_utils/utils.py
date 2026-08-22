@@ -94,6 +94,7 @@ def reduce_advantage_pump_metrics(
     rewards: list[torch.Tensor],
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
+    seq_logprob_error_metrics: list[dict[str, float]] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -101,9 +102,12 @@ def reduce_advantage_pump_metrics(
         rewards: One tensor per advantage_stage call; each row a sample reward.
         masked_advantages: Token-masked advantages, one tensor per call.
         sequence_lengths: All input_lengths trained on this step.
+        seq_logprob_error_metrics: Sequence-error metrics and their aggregation
+            counts, one record per streaming chunk.
 
     Returns:
-        Dict with reward, advantages/{mean,max,min}, total_num_tokens.
+        Step-level reward, advantage, token-count, and optional sequence
+        log-probability error metrics.
     """
     out: dict[str, float] = {}
     if rewards:
@@ -120,7 +124,61 @@ def reduce_advantage_pump_metrics(
             out["advantages/min"] = 0.0
     if sequence_lengths:
         out["total_num_tokens"] = float(sum(sequence_lengths))
+    if seq_logprob_error_metrics:
+        out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     return out
+
+
+def _reduce_seq_logprob_error_metrics(
+    records: list[dict[str, float]],
+) -> dict[str, float]:
+    """Reduce sequence-error metrics across streaming chunks."""
+
+    def reduce_range(
+        *,
+        count_key: str,
+        max_key: str,
+        mean_key: str,
+        min_key: str,
+    ) -> dict[str, float]:
+        populated = [record for record in records if record[count_key] > 0]
+        count = sum(record[count_key] for record in populated)
+        if not count:
+            return {max_key: 0.0, mean_key: 0.0, min_key: 0.0}
+        return {
+            max_key: max(record[max_key] for record in populated),
+            mean_key: sum(record[mean_key] * record[count_key] for record in populated)
+            / count,
+            min_key: min(record[min_key] for record in populated),
+        }
+
+    reduced = reduce_range(
+        count_key="_num_valid_seqs_before",
+        max_key="max_seq_mult_prob_error",
+        mean_key="mean_seq_mult_prob_error",
+        min_key="min_seq_mult_prob_error",
+    )
+    reduced.update(
+        reduce_range(
+            count_key="_num_valid_seqs_after",
+            max_key="max_seq_mult_prob_error_after_mask",
+            mean_key="mean_seq_mult_prob_error_after_mask",
+            min_key="min_seq_mult_prob_error_after_mask",
+        )
+    )
+
+    masked_count = sum(record["num_masked_seqs_by_logprob_error"] for record in records)
+    reduced["num_masked_seqs_by_logprob_error"] = int(masked_count)
+    reduced["masked_correct_pct"] = (
+        sum(
+            record["masked_correct_pct"] * record["num_masked_seqs_by_logprob_error"]
+            for record in records
+        )
+        / masked_count
+        if masked_count
+        else 0.0
+    )
+    return reduced
 
 
 def tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:

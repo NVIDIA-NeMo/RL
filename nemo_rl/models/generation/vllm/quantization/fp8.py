@@ -410,6 +410,17 @@ def _get_module_from_param_name(model, name: str):
                 return current_module.routed_experts
             if isinstance(current_module, RoutedExperts):
                 return current_module
+            if part == "model" and not hasattr(current_module, part):
+                # Some HF/vLLM model classes expose the decoder directly (for
+                # example ``language_model``) while parameter names still carry
+                # vLLM's synthetic ``model.`` prefix.
+                continue
+            if part == "layers" and not hasattr(current_module, part):
+                # Qwen3.5-MoE VL exposes ``language_model`` as a CausalLM
+                # wrapper; its decoder stack lives under ``language_model.model``.
+                wrapped_model = getattr(current_module, "model", None)
+                if wrapped_model is not None and hasattr(wrapped_model, part):
+                    current_module = wrapped_model
             if isinstance(current_module, torch.nn.ModuleList):
                 current_module = current_module[int(part)]
             else:
@@ -468,6 +479,35 @@ def load_weights(weights, model_runner):
     model = model_runner.model
 
     for k, v in weights:
+        # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix
+        # (so `_is_fp8_weight` would skip them) and vLLM's grouped loader cannot
+        # load their per-block scales. Expand them into the per-expert FP8 (w13, w2 -> w1, w2, and w3)
+        # layout, then reshape to 2D [num_experts, out_features, in_features] -> [num_experts*out_features, in_features]
+        # so the block scales can be quantized and routed correctly.
+        if k.endswith("mlp.experts.gate_up_proj") or k.endswith(
+            "mlp.experts.down_proj"
+        ):
+            # Quantize only if vLLM built this layer's experts as FP8. Experts
+            # covered by ``ignored_layers`` (num_{first,last}_layers_in_bf16 /
+            # quantization_ignored_layer_kws) are built unquantized, with bf16
+            # w13/w2 and no ``*_weight_scale_inv`` params, so the per-expert
+            # FP8 + scale entries would have nowhere to load. Pass the grouped
+            # bf16 slab through instead; vLLM's fused expert mapping loads it
+            # directly, same as a bf16 refit.
+            experts_module = _get_module_from_param_name(model, k)
+            if (
+                isinstance(experts_module, RoutedExperts)
+                and experts_module.w13_weight.dtype == torch.float8_e4m3fn
+                and experts_module.w2_weight.dtype == torch.float8_e4m3fn
+            ):
+                if global_fp8_config.is_mx:
+                    raise NotImplementedError(
+                        "MXFP8 refit does not support grouped MoE expert weights."
+                    )
+                weights_quantized.extend(_expand_grouped_moe_expert_to_fp8(k, v))
+            else:
+                weights_quantized.append((k, v))
+            continue
         if not _is_fp8_weight(k, model):
             weights_quantized.append((k, v))
             continue
@@ -578,6 +618,98 @@ def cast_tensor_to_fp8_blockwise(
 
     # Convert to target format, but still in original precision container
     return fp_data, descale_fp
+
+
+def _quantize_grouped_experts_blockwise(grouped_moe_expert):
+    """Block-FP8 quantize a grouped MoE expert slab expert-by-expert.
+
+    Args:
+        grouped_moe_expert: A bf16 grouped expert weight of shape
+            ``[num_experts, out_features, in_features]`` (one unfused
+            projection, e.g. all experts' ``gate_proj``).
+
+    Returns:
+        A tuple ``(weight_fp8, scale_inv)`` where ``weight_fp8`` matches
+        ``grouped_moe_expert`` in shape with dtype ``float8_e4m3fn`` and ``scale_inv`` has
+        shape ``[num_experts, out_features // block0, in_features // block1]``.
+    """
+    block0, block1 = FP8_BLOCK_QUANT_KWARGS["weight_block_size"]
+    num_experts, out_features, in_features = grouped_moe_expert.shape
+    assert out_features % block0 == 0 and in_features % block1 == 0, (
+        f"Grouped expert shape {tuple(grouped_moe_expert.shape)} is not aligned to FP8 "
+        f"block size {(block0, block1)}; per-expert block quantization would "
+        "pad across expert boundaries."
+    )
+
+    # Quantize expert-by-expert rather than as one flat [E*out, in] tensor:
+    # the fp32 upcast and cast-internal copies then peak at 1/num_experts the
+    # size (4.75 GiB -> 2.25 GiB on the 35B-A3B gate_up slab), and this runs
+    # during refit next to a live vLLM allocation. Bitwise-identical to the
+    # flat path: the divisibility assert above means no 128-row block ever
+    # straddles an expert boundary, so per-block amax (and hence scales) see
+    # the same elements either way.
+    weight_fp8 = torch.empty_like(grouped_moe_expert, dtype=torch.float8_e4m3fn)
+    scale_inv = torch.empty(
+        (num_experts, out_features // block0, in_features // block1),
+        dtype=torch.float32,
+        device=grouped_moe_expert.device,
+    )
+    for expert_id in range(num_experts):
+        expert_fp8, expert_scale_inv = cast_tensor_to_fp8_blockwise(
+            grouped_moe_expert[expert_id].to(torch.float),
+            weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
+        )
+        weight_fp8[expert_id].copy_(expert_fp8)
+        scale_inv[expert_id].copy_(torch.squeeze(expert_scale_inv, dim=-1))
+    return weight_fp8, scale_inv
+
+
+def _expand_grouped_moe_expert_to_fp8(key, weight):
+    """Expand a grouped Qwen3.5 MoE expert slab into per-expert FP8 weights.
+
+    NeMo-RL's Megatron export streams the experts of ``Qwen3_5MoeFor*`` models
+    as two grouped slabs per layer (``mlp.experts.gate_up_proj`` and
+    ``mlp.experts.down_proj``). vLLM's grouped FusedMoE loader for these models
+    maps only the fused weight and has no path to load a per-block
+    ``weight_scale_inv``, so block-FP8 experts would silently run with an
+    identity (scale=1) block scale. Re-emitting the experts in the per-expert
+    layout that other FusedMoE checkpoints use
+    (``experts.{id}.{gate_proj,up_proj,down_proj}``) routes through vLLM's
+    standard expert mapping, which loads both the FP8 weight and its block scale
+    correctly.
+
+    Args:
+        key: The grouped expert parameter name, ending in
+            ``mlp.experts.gate_up_proj`` or ``mlp.experts.down_proj``.
+        weight: The bf16 grouped expert tensor. ``gate_up_proj`` is
+            ``[num_experts, 2 * intermediate, hidden]`` (gate then up along
+            dim 1); ``down_proj`` is ``[num_experts, hidden, intermediate]``.
+
+    Returns:
+        A list of ``(name, tensor)`` pairs: for every expert, the FP8 weight and
+        its ``_scale_inv`` for each unfused projection.
+    """
+    base, proj = key.rsplit(".", 1)
+    if proj == "gate_up_proj":
+        intermediate = weight.shape[1] // 2
+        shards = (
+            ("gate_proj", weight[:, :intermediate, :]),
+            ("up_proj", weight[:, intermediate:, :]),
+        )
+    else:
+        shards = (("down_proj", weight),)
+
+    entries = []
+    # gate/up are dim-1 slices; feed the views directly — per-expert rows stay
+    # consecutive because the export side hands over a contiguous slab, and a
+    # .contiguous() here would materialize a 0.5 GiB copy at refit peak.
+    for shard_name, grouped_moe_expert in shards:
+        weight_fp8, scale_inv = _quantize_grouped_experts_blockwise(grouped_moe_expert)
+        for expert_id in range(weight_fp8.shape[0]):
+            name = f"{base}.{expert_id}.{shard_name}.weight"
+            entries.append((name, weight_fp8[expert_id]))
+            entries.append((name + "_scale_inv", scale_inv[expert_id]))
+    return entries
 
 
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
