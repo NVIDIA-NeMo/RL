@@ -108,6 +108,18 @@ def _finite_acceptance(value: float | None) -> float | None:
     return numeric if math.isfinite(numeric) and 0.0 <= numeric <= 1.0 else None
 
 
+def _canonical_json(value: object) -> str:
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("checkpoint value is not canonical JSON") from error
+
+
 def _new_state(origin_step: int) -> DraftUpdateScheduleState:
     return DraftUpdateScheduleState(
         version=_STATE_VERSION,
@@ -158,18 +170,28 @@ class DraftUpdateScheduler:
             raise ValueError("origin_step must be a nonnegative integer")
         if restored is None:
             return cls(config, _new_state(origin_step))
+        if set(restored) != {"state_version", "config", "state"}:
+            raise ValueError("draft update schedule checkpoint schema mismatch")
         if (
             type(restored.get("state_version")) is not int
             or restored["state_version"] != _STATE_VERSION
         ):
             raise ValueError("unsupported draft update schedule state version")
-        if restored.get("config") != config.model_dump(mode="json"):
+        restored_config = restored.get("config")
+        expected_config = config.model_dump(mode="json")
+        if type(restored_config) is not dict or _canonical_json(
+            restored_config
+        ) != _canonical_json(expected_config):
             raise ValueError("resolved draft update schedule does not match checkpoint")
         restored_state = restored.get("state")
         if not isinstance(restored_state, Mapping):
             raise ValueError("draft update schedule state must be a mapping")
         validate_scheduler_state_invariants(config, restored_state)
         raw_state = dict(restored_state)
+        for field in ("acceptance_ewma", "reference_acceptance_ewma"):
+            value = raw_state[field]
+            if value is not None:
+                raw_state[field] = float(cast(float, value))
         raw_history = cast(list[object], raw_state.pop("decision_history"))
         history = tuple(
             DecisionHistoryEntry(
@@ -454,8 +476,12 @@ def validate_scheduler_state_invariants(
             raise ValueError(f"{field} must be a nonnegative integer or None")
     for field in ("acceptance_ewma", "reference_acceptance_ewma"):
         value = state[field]
-        if value is not None and _finite_acceptance(cast(float, value)) is None:
-            raise ValueError(f"{field} must be finite and within [0, 1]")
+        if value is not None:
+            if (
+                type(value) not in (int, float)
+                or _finite_acceptance(cast(float, value)) is None
+            ):
+                raise ValueError(f"{field} must be finite and within [0, 1]")
     if state["version"] != _STATE_VERSION:
         raise ValueError("unsupported scheduler state version")
     origin = cast(int, state["schedule_origin_step"])
@@ -550,8 +576,12 @@ def validate_scheduler_state_invariants(
         if set(entry) != expected_keys:
             raise ValueError("draft update decision history entry schema mismatch")
         expected_id = expected_first_id + offset
+        if type(entry["decision_id"]) is not int:
+            raise ValueError("history decision_id must be an integer")
         if entry["decision_id"] != expected_id:
             raise ValueError("draft update decision history is not contiguous")
+        if type(entry["global_step"]) is not int:
+            raise ValueError("history global_step must be an integer")
         if entry["global_step"] != origin + expected_id:
             raise ValueError("draft update decision history step is not contiguous")
         if type(entry["update_requested"]) is not bool:
@@ -788,6 +818,14 @@ def validate_decision_ledger_receipt(receipt: DecisionLedgerReceipt) -> None:
         raise ValueError("decision-ledger global_step sequence is not contiguous")
 
 
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def replace_bytes_fsync(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.recovery.tmp")
@@ -797,11 +835,7 @@ def replace_bytes_fsync(path: Path, payload: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -841,14 +875,17 @@ class DraftDecisionLedger:
         self._sealed_prefix_last_global_step = sealed_prefix_last_global_step
         self._last_global_step = sealed_prefix_last_global_step
         self._sealed_receipt: DecisionLedgerReceipt | None = None
+        self._known_suffix_size = 0
+        self._known_suffix_sha256 = hashlib.sha256()
+        self._directory_synced = False
         if self.path.exists():
             raise FileExistsError("decision-ledger suffix path already exists")
 
-    def append_closed(
+    def _validate_append(
         self,
         decision: DraftUpdateDecision,
         outcome: Mapping[str, bool],
-    ) -> None:
+    ) -> tuple[dict[str, object], bytes]:
         if self._sealed_receipt is not None:
             raise RuntimeError("cannot append to a sealed decision-ledger segment")
         if decision.decision_id != self.next_decision_id:
@@ -861,7 +898,53 @@ class DraftDecisionLedger:
             and decision.global_step != self._last_global_step + 1
         ):
             raise ValueError("decision-ledger global_step is not contiguous")
-        encoded = _encode_row(row)
+        return row, _encode_row(row)
+
+    def _sync_parent_directory(self) -> None:
+        if not self._directory_synced:
+            _fsync_directory(self.path.parent)
+            self._directory_synced = True
+
+    def _adopt_append(
+        self,
+        decision: DraftUpdateDecision,
+        encoded: bytes,
+    ) -> None:
+        if self._first_decision_id is None:
+            self._first_decision_id = decision.decision_id
+        self._entry_count += 1
+        self.next_decision_id += 1
+        self._last_global_step = decision.global_step
+        self._known_suffix_size += len(encoded)
+        self._known_suffix_sha256.update(encoded)
+
+    def _read_validated_known_prefix(self) -> tuple[bytes, bytes]:
+        if not self.path.exists():
+            if self._known_suffix_size != 0:
+                raise ValueError("decision-ledger suffix disappeared after append")
+            return b"", b""
+        raw = self.path.read_bytes()
+        if len(raw) < self._known_suffix_size:
+            raise ValueError("decision-ledger suffix is shorter than committed prefix")
+        known_prefix = raw[: self._known_suffix_size]
+        if hashlib.sha256(known_prefix).digest() != self._known_suffix_sha256.digest():
+            raise ValueError("decision-ledger committed prefix was modified")
+        return known_prefix, raw[self._known_suffix_size :]
+
+    def _durabilize_existing_suffix(self) -> None:
+        descriptor = os.open(self.path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        self._sync_parent_directory()
+
+    def append_closed(
+        self,
+        decision: DraftUpdateDecision,
+        outcome: Mapping[str, bool],
+    ) -> None:
+        _, encoded = self._validate_append(decision, outcome)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(
             self.path,
@@ -878,11 +961,8 @@ class DraftDecisionLedger:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        if self._first_decision_id is None:
-            self._first_decision_id = decision.decision_id
-        self._entry_count += 1
-        self.next_decision_id += 1
-        self._last_global_step = decision.global_step
+        self._sync_parent_directory()
+        self._adopt_append(decision, encoded)
 
     def append_closed_once(
         self,
@@ -890,11 +970,28 @@ class DraftDecisionLedger:
         outcome: Mapping[str, bool],
     ) -> None:
         if decision.decision_id == self.next_decision_id:
-            self.append_closed(decision, outcome)
-            return
+            _, encoded = self._validate_append(decision, outcome)
+            known_prefix, uncommitted_tail = self._read_validated_known_prefix()
+            if not uncommitted_tail:
+                self.append_closed(decision, outcome)
+                return
+            if uncommitted_tail == encoded:
+                self._durabilize_existing_suffix()
+                self._adopt_append(decision, encoded)
+                return
+            if encoded.startswith(uncommitted_tail):
+                replace_bytes_fsync(self.path, known_prefix + encoded)
+                self._directory_synced = True
+                self._adopt_append(decision, encoded)
+                return
+            raise ValueError(
+                "decision-ledger partial suffix does not match retried decision"
+            )
         if decision.decision_id > self.next_decision_id:
             raise ValueError("decision-ledger idempotent append has a gap")
+        _validate_outcome(decision, outcome)
         expected = {**asdict(decision), "outcome": dict(outcome)}
+        _decision_from_row(expected)
         matches: list[dict[str, object]] = []
         paths = [Path(receipt.path) for receipt in self.sealed_prefixes]
         if self.path.exists():
@@ -907,6 +1004,7 @@ class DraftDecisionLedger:
             )
         if matches != [expected]:
             raise ValueError("decision-ledger replay differs from closed entry")
+        return
 
     def truncate_to(self, ledger_high_water: int) -> None:
         if self._sealed_receipt is not None:
@@ -931,10 +1029,8 @@ class DraftDecisionLedger:
         )
         if [cast(int, row["decision_id"]) for row in retained] != expected_ids:
             raise ValueError("checkpoint-bound ledger prefix is absent or gapped")
-        replace_bytes_fsync(
-            self.path,
-            b"".join(_encode_row(row) for row in retained),
-        )
+        retained_payload = b"".join(_encode_row(row) for row in retained)
+        replace_bytes_fsync(self.path, retained_payload)
         self.next_decision_id = ledger_high_water + 1
         self._entry_count = len(retained)
         self._first_decision_id = (
@@ -945,6 +1041,9 @@ class DraftDecisionLedger:
             if retained
             else self._sealed_prefix_last_global_step
         )
+        self._known_suffix_size = len(retained_payload)
+        self._known_suffix_sha256 = hashlib.sha256(retained_payload)
+        self._directory_synced = True
 
     def seal_prefix(self) -> DecisionLedgerReceipt:
         if self._sealed_receipt is not None:
