@@ -33,18 +33,47 @@ from nemo_rl.models.generation.openai_server_utils import (
 logger = logging.getLogger(__name__)
 
 
-def _build_reasoning_parser(name: str, chat_template_kwargs: dict[str, Any]) -> Any:
-    from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+def _tokens_for_response_text(
+    token_ids: list[int], stop_token_ids: set[int]
+) -> list[int]:
+    text_token_end = len(token_ids)
+    while text_token_end and token_ids[text_token_end - 1] in stop_token_ids:
+        text_token_end -= 1
+    return token_ids if text_token_end == len(token_ids) else token_ids[:text_token_end]
 
-    if name == "deepseek-r1" and "enable_thinking" in chat_template_kwargs:
-        from tensorrt_llm.llmapi.reasoning_parser import DeepSeekR1Parser
 
-        return DeepSeekR1Parser(
-            reasoning_at_start=bool(chat_template_kwargs["enable_thinking"]),
-            chat_template_kwargs=chat_template_kwargs,
-        )
+def _ends_with_token_suffix(
+    token_ids: list[int], suffixes: tuple[tuple[int, ...], ...]
+) -> bool:
+    for suffix in suffixes:
+        suffix_len = len(suffix)
+        if suffix_len > len(token_ids):
+            continue
+        offset = len(token_ids) - suffix_len
+        for index, token_id in enumerate(suffix):
+            if token_ids[offset + index] != token_id:
+                break
+        else:
+            return True
+    return False
 
-    return ReasoningParserFactory.create_reasoning_parser(name, chat_template_kwargs)
+
+def _build_reasoning_parser(
+    name: str,
+    chat_template_kwargs: dict[str, Any],
+    *,
+    reasoning_at_start: bool = False,
+) -> Any:
+    from tensorrt_llm.llmapi.reasoning_parser import (
+        DeepSeekR1Parser,
+        ReasoningParserFactory,
+    )
+
+    parser = ReasoningParserFactory.create_reasoning_parser(name, chat_template_kwargs)
+    if isinstance(parser, DeepSeekR1Parser):
+        parser.reasoning_at_start = reasoning_at_start
+        parser.in_reasoning = reasoning_at_start
+    return parser
 
 
 def _build_sampling_params(
@@ -107,6 +136,10 @@ def create_app(
         **(default_chat_template_kwargs or {}),
     }
 
+    def _prompt_opens_reasoning(token_ids: list[int]) -> bool:
+        tail = tokenizer.decode(token_ids[-16:], skip_special_tokens=False)
+        return tail.rstrip().endswith("<think>")
+
     # Use the configured parser or infer one from the model config.
     _tool_parser_name = _resolve_tool_parser_name(tool_parser, model_name)
     _tool_parser_instance = _build_tool_parser(_tool_parser_name)
@@ -123,8 +156,7 @@ def create_app(
     if reasoning_parser is not None:
         _build_reasoning_parser(reasoning_parser, _server_template_kwargs)
 
-    # Match TRT-LLM's effective EOS set so this adapter can trim every returned
-    # stop token and its logprob together, preserving multi-turn continuity.
+    # Retain stop IDs in metadata but exclude them from parsed text.
     _eos_token_ids: set[int] = set(stop_token_ids or [])
 
     def _add_eos_token_ids(token_ids: Any) -> None:
@@ -170,14 +202,8 @@ def create_app(
         per_request_kwargs: dict[str, Any] = body.get("chat_template_kwargs") or {}
         effective_template_kwargs = {**_server_template_kwargs, **per_request_kwargs}
 
-        _active_reasoning_parser = (
-            _build_reasoning_parser(reasoning_parser, effective_template_kwargs)
-            if reasoning_parser is not None
-            else None
-        )
-
         try:
-            conversation, mm_coroutine, _ = parse_chat_messages_coroutines(
+            conversation, mm_coroutine, *_ = parse_chat_messages_coroutines(
                 messages, model_config
             )
             mm_data, mm_embeddings = await mm_coroutine
@@ -216,6 +242,21 @@ def create_app(
             model_prefix_token_ids=required_prefix_ids,
             template_prefix_token_ids=template_prefix_ids,
             template_token_ids=prompt_token_ids,
+            model_stop_token_ids=_eos_token_ids,
+        )
+
+        # Infer parser state from the exact engine prompt.
+        reasoning_at_start = reasoning_parser is not None and _prompt_opens_reasoning(
+            adj_prompt
+        )
+        _active_reasoning_parser = (
+            _build_reasoning_parser(
+                reasoning_parser,
+                effective_template_kwargs,
+                reasoning_at_start=reasoning_at_start,
+            )
+            if reasoning_parser is not None
+            else None
         )
 
         max_tokens_requested = (
@@ -272,14 +313,9 @@ def create_app(
                 else:
                     raise TypeError(f"Unsupported TRT-LLM logprob type: {type(lp)}")
 
-        # Strip trailing stop tokens TRT-LLM appends — apply_chat_template doesn't reproduce
-        # <|endoftext|>, so they'd break seen_token_ids contiguity. Trim logprobs in lockstep.
-        while gen_token_ids and gen_token_ids[-1] in _eos_token_ids:
-            gen_token_ids.pop()
-            if gen_logprobs:
-                gen_logprobs.pop()
-
-        gen_text = tokenizer.decode(gen_token_ids, skip_special_tokens=False)
+        # Parse without trailing stops; retain full response metadata.
+        text_token_ids = _tokens_for_response_text(gen_token_ids, _eos_token_ids)
+        gen_text = tokenizer.decode(text_token_ids, skip_special_tokens=False)
 
         finish_reason = "stop"
         if gen.finish_reason is not None:
