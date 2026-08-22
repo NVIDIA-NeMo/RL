@@ -22,6 +22,7 @@ import torch
 from nemo_rl.algorithms.loss.draft import DraftLossStats
 
 DRAFT_STEP_PAYLOAD_KEY = "_draft_step_payload"
+DRAFT_LOSS_METRIC_KEY = "draft_loss"
 
 
 @dataclass(frozen=True, slots=True)
