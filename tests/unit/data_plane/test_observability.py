@@ -898,3 +898,22 @@ def test_outstanding_reconciles_over_random_put_clear_sequences():
             client.clear_samples(sample_ids=sorted(live), partition_id="p")
         assert client.snapshot()["bytes_outstanding"] == 0
         client.close()
+
+
+def test_snapshot_percentiles_never_exceed_the_measured_max():
+    """The clamp lives in ``_derive_op_metrics``, not at one call site, so
+    ``snapshot()`` and ``merge_snapshots()`` inherit it. Without it five
+    register calls of 0.011 ms all land in (0, 0.1] and interpolate to a
+    p50 of 0.05 — four times the slowest call that happened — on a public
+    surface documented as the cumulative view."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    now = monotonic()
+    for _ in range(5):
+        client._emit("register", "p", 1, 0, now - 0.011 / 1e3, "ok")
+
+    for view in (client.snapshot(), merge_snapshots([client.snapshot()])):
+        stats = view["by_op"]["register"]
+        assert stats["p50_ms"] <= stats["max_ms"], stats
+        assert stats["p99_ms"] <= stats["max_ms"], stats
+        assert stats["p50_ms"] <= stats["p99_ms"], stats
+    client.close()

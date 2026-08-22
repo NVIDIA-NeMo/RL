@@ -444,8 +444,16 @@ def _derive_op_metrics(by_op: dict[str, Any], total_wall_ms: float) -> None:
         )
         stats["fit"] = fit_latency_bandwidth(stats)
         hist = stats["latency_hist"]
-        stats["p50_ms"] = percentile_from_hist(hist, 0.50)
-        stats["p99_ms"] = percentile_from_hist(hist, 0.99)
+        # Clamped to the exact max, here rather than at one call site, so
+        # every consumer of a snapshot inherits it. Bucket interpolation
+        # spreads a bucket's samples uniformly across it, so calls clustered
+        # low in a wide bucket read high -- five register calls of 0.011 ms
+        # all land in (0, 0.1] and interpolate to a p50 of 0.05, four times
+        # the slowest call that happened. A true percentile cannot exceed
+        # the maximum and the maximum is measured exactly.
+        ceiling = stats["max_ms"] if stats["max_ms"] > 0 else float("inf")
+        stats["p50_ms"] = min(percentile_from_hist(hist, 0.50), ceiling)
+        stats["p99_ms"] = min(percentile_from_hist(hist, 0.99), ceiling)
         # Tail/mean ratio: a mean hides MR churn and queueing, which show
         # up as p99 pulling away from the mean.
         stats["tail_ratio_p99_mean"] = (
@@ -641,13 +649,10 @@ def cluster_step_metrics(
             )
         ]
         if sum(step_hist) >= _MIN_SAMPLES_FOR_PERCENTILE:
-            # Clamped to the exact max. Interpolation spreads a bucket's
-            # samples uniformly across it, so calls clustered low in a wide
-            # bucket read high -- 160 calls of 120 ms all land in (100, 250]
-            # and interpolate to a p50 of 175, above every call observed. A
-            # true percentile cannot exceed the maximum, and the maximum is
-            # measured exactly, so it is the tighter bound.
-            ceiling = stats["max_ms"]
+            # Same clamp as :func:`_derive_op_metrics`, applied again here
+            # because this percentile comes off the step's histogram delta
+            # rather than the cumulative one that function derived.
+            ceiling = stats["max_ms"] if stats["max_ms"] > 0 else float("inf")
             metrics[f"step/{op}/p50_ms"] = min(
                 percentile_from_hist(step_hist, 0.50), ceiling
             )
