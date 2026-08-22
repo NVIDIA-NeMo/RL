@@ -33,6 +33,7 @@ from transformers import (
 )
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.data import (
@@ -203,6 +204,15 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         self.dp_size = distributed_manager.dp_size
         self.tp_size = distributed_manager.tp_size
         self.cp_size = distributed_manager.cp_size
+
+        # Value workers run in separate Ray processes, so the controller's PPO
+        # seed does not cover model construction here. Seed before creating the
+        # model so a missing HF regression head is initialized reproducibly.
+        set_seed(config["seed"])
+        print(
+            f"[Rank {self.rank}] Set DTensor value-model initialization seed "
+            f"to {config['seed']}"
+        )
 
         # Initialize checkpoint manager
         self._init_checkpoint_manager(
