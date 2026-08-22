@@ -447,6 +447,17 @@ class OpStats:
     # wall_ms non-linear in n_bytes, and a low R^2 is the signal to stop
     # trusting the overhead/bandwidth split.
     sum_ms_sq: float = 0.0
+    # Slowest single call, exact. The histogram below can only place a
+    # call in a bucket, so at the handful of calls an op makes in one step
+    # a percentile off it is bucket geometry rather than data -- p99 of one
+    # sample in (10, 25] is always 10 + 15*0.99 = 24.85. This is the
+    # per-step tail signal; the histogram is for the cumulative view.
+    max_ms: float = 0.0
+    # Same, but scoped to the current step: ``get_step_metrics`` zeroes it
+    # each time it reports. Without this the per-step series is the lifetime
+    # max, which is monotonic and goes flat the moment the worst call has
+    # been seen -- the same defect as logging a cumulative percentile.
+    step_max_ms: float = 0.0
     # Latency distribution over ALL statuses, matching calls/wall_ms: a
     # timeout is real tail latency the pipeline actually paid for.
     latency_hist: list[int] = field(
@@ -593,17 +604,27 @@ class MetricsDataPlaneClient(DataPlaneClient):
         snap = self.snapshot()
         prev = self._prev_snapshot
         self._prev_snapshot = snap
+        # Snapshot first, then open a fresh window: the values just read are
+        # this step's, and anything after this call belongs to the next one.
+        step_maxima = {op: b.step_max_ms for op, b in self._stats.by_op.items()}
+        for bucket in self._stats.by_op.values():
+            bucket.step_max_ms = 0.0
 
         wall_ms = snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
         vol = snap["comm_volume_bytes"] - prev.get("comm_volume_bytes", 0)
+        # Every duration is ms and every volume is MB, with no exceptions:
+        # a chart that mixes wall_s against p99_ms puts a 0.008 next to a
+        # 24.85 and reads as a bug in the data plane rather than in the
+        # axis. GB was the same problem one dimension over -- a realistic
+        # step moved 0.00017 GB.
         metrics: dict[str, float] = {
-            "wall_s": wall_ms / 1e3,
+            "wall_ms": wall_ms,
             "frac_of_step": (wall_ms / 1e3 / step_time_s) if step_time_s > 0 else 0.0,
-            "comm_volume_gb": vol / 1e9,
-            "bytes_written_gb": (snap["bytes_written"] - prev.get("bytes_written", 0))
-            / 1e9,
-            "bytes_read_gb": (snap["bytes_read"] - prev.get("bytes_read", 0)) / 1e9,
-            "bytes_outstanding_gb": snap["bytes_outstanding"] / 1e9,
+            "comm_volume_mb": vol / 1e6,
+            "bytes_written_mb": (snap["bytes_written"] - prev.get("bytes_written", 0))
+            / 1e6,
+            "bytes_read_mb": (snap["bytes_read"] - prev.get("bytes_read", 0)) / 1e6,
+            "bytes_outstanding_mb": snap["bytes_outstanding"] / 1e6,
         }
         if self._verify_tensor_hash:
             hv, prev_hv = snap["hash_verify"], prev.get("hash_verify", {})
@@ -631,16 +652,17 @@ class MetricsDataPlaneClient(DataPlaneClient):
             if calls <= 0:
                 continue
             op_ms = st["wall_ms"] - prev_op.get("wall_ms", 0.0)
-            # Five series per op tag, deliberately. Anything exactly
-            # derivable from these is left out rather than logged: mean is
-            # wall_s/calls, and a dashboard can divide. ``snapshot()`` still
-            # carries the full picture for a one-off inspection.
+            # Four series per op tag. Anything exactly derivable is left
+            # out rather than logged: mean is wall_ms/calls, and a dashboard
+            # can divide. ``snapshot()`` still carries the full picture,
+            # percentiles included, for a one-off inspection.
             metrics[f"{op}/calls"] = calls
-            metrics[f"{op}/wall_s"] = op_ms / 1e3
-            # Percentiles and the overhead/bandwidth fit are cumulative by
-            # construction (histogram buckets, regression sums) -- as-is.
-            metrics[f"{op}/p50_ms"] = st["p50_ms"]
-            metrics[f"{op}/p99_ms"] = st["p99_ms"]
+            metrics[f"{op}/wall_ms"] = op_ms
+            # ``max_ms`` rather than p50/p99. Those come off a histogram
+            # that is never reset, so per step they were a lifetime figure
+            # that goes flat, quantised to bucket edges. The max is exact
+            # and says the same thing at the handful of calls per step.
+            metrics[f"{op}/max_ms"] = step_maxima.get(op, 0.0)
             fit = st["fit"]
             if fit.get("model_trustworthy"):
                 # Only the actionable half of the fit: whether this op is
@@ -938,6 +960,10 @@ class MetricsDataPlaneClient(DataPlaneClient):
             bucket = stats.by_op[op] = OpStats()
         bucket.calls += 1
         bucket.wall_ms += wall_ms
+        if wall_ms > bucket.max_ms:
+            bucket.max_ms = wall_ms
+        if wall_ms > bucket.step_max_ms:
+            bucket.step_max_ms = wall_ms
         bucket.latency_hist[bisect_left(LATENCY_BUCKETS_MS, wall_ms)] += 1
         if status != "ok":
             bucket.errors += 1
