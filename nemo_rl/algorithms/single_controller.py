@@ -53,11 +53,10 @@ from nemo_rl.algorithms.draft_cadence_runtime import (
     CadenceTerminalEvidence,
     disabled_draft_schedule_payload,
     initialize_cadence_scheduler,
-    open_resume_decision_ledger,
+    initialize_or_recover_cadence_resume,
+    preflight_cadence_receipt_capability,
     produce_cadence_decision,
-    recover_draft_step_transactions,
     require_cadence_step_receipts,
-    resolve_cadence_schedule_config,
 )
 from nemo_rl.algorithms.draft_update_schedule import (
     DraftDecisionLedger,
@@ -237,19 +236,19 @@ class SingleControllerActor:
                 base_checkpoint_id=f"step_{self._save_state.current_step}",
             )
             draft_config = self._master_config.policy.get("draft")
-            schedule_config = resolve_cadence_schedule_config(draft_config)
             if self._last_checkpoint_path is not None:
-                resume = open_resume_decision_ledger(
-                    Path(self._last_checkpoint_path), self._cadence_writer.root
-                )
-                self._cadence_ledger = resume.ledger
-                self._cadence_scheduler = recover_draft_step_transactions(
-                    config=schedule_config,
+                resume = initialize_or_recover_cadence_resume(
+                    draft_config,
+                    saved=self._save_state.draft_update_schedule,
+                    origin_step=self._save_state.current_step,
                     checkpoint_path=Path(self._last_checkpoint_path),
+                    result_root=self._cadence_writer.root,
                     transaction_store=self._cadence_transactions,
                     decision_ledger=self._cadence_ledger,
                     save_state=self._save_state,
                 )
+                self._cadence_ledger = resume.ledger
+                self._cadence_scheduler = resume.scheduler
             else:
                 self._cadence_scheduler = initialize_cadence_scheduler(
                     draft_config,
@@ -1065,6 +1064,23 @@ class SingleControllerActor:
                         train_meta = await self._advantage_stage(train_meta)
 
                     # Train
+                    preflight_cadence_receipt_capability(
+                        self._cadence_scheduler,
+                        update_receipts_supported=bool(
+                            getattr(
+                                self._trainer,
+                                "supports_draft_update_receipts",
+                                False,
+                            )
+                        ),
+                        apply_receipts_supported=bool(
+                            getattr(
+                                self._weight_synchronizer,
+                                "supports_draft_apply_receipts",
+                                False,
+                            )
+                        ),
+                    )
                     with self._timer.time("training_prep"):
                         await asyncio.to_thread(self._trainer.prepare_for_training)
                     with self._timer.time("policy_training"):

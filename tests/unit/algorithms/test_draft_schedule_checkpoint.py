@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from nemo_rl.algorithms import draft_cadence_runtime as runtime_module
+from nemo_rl.algorithms import draft_update_schedule as schedule_module
 from nemo_rl.algorithms.draft_update_schedule import (
     AppliedDraftSnapshot,
     DraftDecisionLedger,
@@ -166,6 +167,7 @@ class CadenceTestRun:
             last_applied_refit_step=self.scheduler.state.last_applied_refit_step,
             acceptance_rate=observation,
         )
+        self.save_state.draft_terminal_evidence = self.terminal_evidence.state_dict()
         snapshot_path = self.root / f"applied-draft-v{decision.decision_id}.safetensors"
         transaction = self.transaction_store.begin(
             decision,
@@ -877,6 +879,79 @@ def test_resume_quarantines_written_post_checkpoint_suffix_before_replaying_101(
     assert resumed.ledger.next_decision_id == 101
     resumed.execute_step(101)
     assert resumed.entry(101)["decision_id"] == 101
+
+
+def test_ledger_quarantine_fsyncs_recovery_parent_before_first_move(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run = CadenceTestRun(tmp_path)
+    run.execute_step(1)
+    run.checkpoint(1)
+    run.execute_step(2)
+    fsynced: list[Path] = []
+    real_fsync = runtime_module._fsync_directory
+    real_move = runtime_module._move_ledger_to_quarantine
+
+    def record_fsync(path: Path) -> None:
+        fsynced.append(path.resolve())
+        real_fsync(path)
+
+    def assert_parent_then_move(source: Path, destination: Path) -> None:
+        assert (tmp_path / "recovery").resolve() in fsynced
+        real_move(source, destination)
+
+    monkeypatch.setattr(runtime_module, "_fsync_directory", record_fsync)
+    monkeypatch.setattr(
+        runtime_module, "_move_ledger_to_quarantine", assert_parent_then_move
+    )
+
+    resumed = run.restart_from_checkpoint(1)
+
+    assert resumed.ledger.next_decision_id == 2
+
+
+def test_transaction_quarantine_fsyncs_parent_before_first_move(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = FileDraftStepTransactionStore(tmp_path)
+    scheduler = DraftUpdateScheduler.create(
+        AlwaysDraftUpdateScheduleConfig(), origin_step=0
+    )
+    pre_scheduler_state = scheduler.state_dict()
+    decision = scheduler.decide(global_step=1, acceptance=None)
+    transaction = store.begin(decision, pre_scheduler_state=pre_scheduler_state)
+    store.resolve(
+        transaction,
+        decision=decision,
+        outcome=decision_outcome_payload(
+            decision,
+            update_attempted=True,
+            update_successful=False,
+            draft_refit_attempted=True,
+            draft_refit_successful=False,
+        ),
+        applied_snapshot=None,
+    )
+    fsynced: list[Path] = []
+    real_fsync = schedule_module._fsync_directory
+    real_replace = schedule_module.os.replace
+
+    def record_fsync(path: Path) -> None:
+        fsynced.append(path.resolve())
+        real_fsync(path)
+
+    def assert_parent_then_move(source: Path, destination: Path) -> None:
+        assert store.quarantine_root.resolve() in fsynced
+        real_replace(source, destination)
+
+    monkeypatch.setattr(schedule_module, "_fsync_directory", record_fsync)
+    monkeypatch.setattr(schedule_module.os, "replace", assert_parent_then_move)
+
+    store.discard_after_checkpoint(checkpoint_id="step_0", ledger_high_water=0)
+
+    assert list(
+        store.quarantine_root.glob("resume-*/transaction-quarantine-receipt.json")
+    )
 
 
 @pytest.mark.parametrize("crash_phase", ["after_intent", "before_receipt"])

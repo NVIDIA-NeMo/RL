@@ -66,11 +66,10 @@ from nemo_rl.algorithms.draft_cadence_runtime import (
     CadenceTerminalEvidence,
     disabled_draft_schedule_payload,
     initialize_cadence_scheduler,
-    open_resume_decision_ledger,
+    initialize_or_recover_cadence_resume,
+    preflight_cadence_receipt_capability,
     produce_cadence_decision,
-    recover_draft_step_transactions,
     require_cadence_step_receipts,
-    resolve_cadence_schedule_config,
 )
 from nemo_rl.algorithms.draft_update_schedule import (
     DraftDecisionLedger,
@@ -566,19 +565,19 @@ def grpo_train_sync(
         )
         resume_checkpoint = checkpointer.get_latest_checkpoint_path()
         draft_config = master_config.policy.get("draft")
-        schedule_config = resolve_cadence_schedule_config(draft_config)
         if resume_checkpoint is not None:
-            resume = open_resume_decision_ledger(
-                Path(resume_checkpoint), cadence_writer.root
-            )
-            cadence_ledger = resume.ledger
-            cadence_scheduler = recover_draft_step_transactions(
-                config=schedule_config,
+            resume = initialize_or_recover_cadence_resume(
+                draft_config,
+                saved=grpo_save_state.draft_update_schedule,
+                origin_step=grpo_save_state.current_step,
                 checkpoint_path=Path(resume_checkpoint),
+                result_root=cadence_writer.root,
                 transaction_store=cadence_transactions,
                 decision_ledger=cadence_ledger,
                 save_state=grpo_save_state,
             )
+            cadence_ledger = resume.ledger
+            cadence_scheduler = resume.scheduler
         else:
             cadence_scheduler = initialize_cadence_scheduler(
                 draft_config,
@@ -1105,6 +1104,15 @@ def grpo_train_sync(
                     },
                 )
 
+                preflight_cadence_receipt_capability(
+                    cadence_scheduler,
+                    update_receipts_supported=bool(
+                        getattr(policy, "supports_draft_update_receipts", False)
+                    ),
+                    apply_receipts_supported=bool(
+                        getattr(policy, "supports_draft_apply_receipts", False)
+                    ),
+                )
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):

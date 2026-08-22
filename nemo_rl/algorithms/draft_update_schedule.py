@@ -1676,6 +1676,7 @@ class FileDraftStepTransactionStore:
         if not artifacts:
             return
         recovery_dir.mkdir(exist_ok=False)
+        _fsync_directory(self.quarantine_root)
         _write_json_exclusive(
             recovery_dir / "transaction-quarantine-intent.json",
             {
@@ -1687,4 +1688,5 @@ class FileDraftStepTransactionStore:
                 "artifacts": artifacts,
             },
         )
+        _fsync_directory(self.quarantine_root)
         self._reconcile_quarantine(recovery_dir)

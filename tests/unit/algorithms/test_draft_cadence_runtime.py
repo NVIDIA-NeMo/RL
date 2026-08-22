@@ -11,13 +11,16 @@ from nemo_rl.algorithms.draft_cadence_runtime import (
     CadenceRuntimeWriter,
     CadenceTerminalEvidence,
     initialize_cadence_scheduler,
+    initialize_or_recover_cadence_resume,
     load_checkpoint_bundle,
+    preflight_cadence_receipt_capability,
     produce_cadence_decision,
     require_cadence_step_receipts,
 )
 from nemo_rl.algorithms.draft_update_schedule import (
     DraftDecisionLedger,
     DraftUpdateScheduler,
+    FileDraftStepTransactionStore,
     decision_outcome_payload,
 )
 from nemo_rl.models.policy.draft_config import (
@@ -125,6 +128,68 @@ def test_missing_task4_or_task5_receipt_fails_before_cadence_apply() -> None:
             },
             apply_receipt=None,
         )
+
+
+@pytest.mark.parametrize(
+    ("update_receipts_supported", "apply_receipts_supported", "message"),
+    [
+        (False, False, "update receipt capability"),
+        (True, False, "apply receipt capability"),
+    ],
+)
+def test_receipt_capability_preflight_does_not_mutate_scheduler(
+    update_receipts_supported: bool,
+    apply_receipts_supported: bool,
+    message: str,
+) -> None:
+    scheduler = DraftUpdateScheduler.create(
+        AlwaysDraftUpdateScheduleConfig(), origin_step=0
+    )
+    before = scheduler.state_dict()
+
+    with pytest.raises(RuntimeError, match=message):
+        preflight_cadence_receipt_capability(
+            scheduler,
+            update_receipts_supported=update_receipts_supported,
+            apply_receipts_supported=apply_receipts_supported,
+        )
+
+    assert scheduler.state_dict() == before
+    assert scheduler.decide(global_step=1, acceptance=None).decision_id == 1
+
+
+def test_legacy_always_resume_initializes_before_ledger_receipt_open(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "legacy-checkpoint" / "step_4"
+    checkpoint.mkdir(parents=True)
+    result_root = tmp_path / "cadence"
+    ledger = DraftDecisionLedger(result_root / "legacy-live.jsonl")
+    store = FileDraftStepTransactionStore(result_root, base_checkpoint_id="step_4")
+    save_state = SimpleNamespace(
+        draft_update_schedule=None,
+        applied_draft_snapshot=None,
+        draft_terminal_evidence=None,
+        draft_decision_ledger_prefixes=[],
+    )
+
+    resumed = initialize_or_recover_cadence_resume(
+        _dflash_config(enabled=True),
+        saved=None,
+        origin_step=4,
+        checkpoint_path=checkpoint,
+        result_root=result_root,
+        transaction_store=store,
+        decision_ledger=ledger,
+        save_state=save_state,
+    )
+
+    assert resumed.scheduler is not None
+    assert resumed.scheduler.state.schedule_origin_step == 4
+    assert resumed.ledger is ledger
+    assert resumed.quarantine_receipt_path is None
+    assert save_state.draft_update_schedule == resumed.scheduler.state_dict()
+    assert store.pending_intents() == ()
 
 
 def test_checkpoint_receipt_binds_all_training_components(tmp_path: Path) -> None:

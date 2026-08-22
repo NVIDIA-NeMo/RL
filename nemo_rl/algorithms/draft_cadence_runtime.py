@@ -83,6 +83,25 @@ def produce_cadence_decision(
     return scheduler.decide(global_step=global_step, acceptance=None)
 
 
+def preflight_cadence_receipt_capability(
+    scheduler: DraftUpdateScheduler | None,
+    *,
+    update_receipts_supported: bool,
+    apply_receipts_supported: bool,
+) -> None:
+    """Reject an incomplete Task3B stack before preparation or decision mutation."""
+    if scheduler is None:
+        return
+    if not update_receipts_supported:
+        raise RuntimeError(
+            "draft update receipt capability is required before policy preparation"
+        )
+    if not apply_receipts_supported:
+        raise RuntimeError(
+            "draft apply receipt capability is required before policy preparation"
+        )
+
+
 def require_cadence_step_receipts(
     decision: DraftUpdateDecision | None,
     *,
@@ -597,6 +616,7 @@ def open_resume_decision_ledger(
             recovery_parent / f"resume-{bundle['checkpoint_id']}-{recovery_id}"
         )
         recovery_dir.mkdir(exist_ok=False)
+        _fsync_directory(recovery_parent)
         candidates = sorted(
             {
                 *root.glob("draft-decision-ledger-after-step_*.jsonl"),
@@ -630,6 +650,7 @@ def open_resume_decision_ledger(
                 "new_suffix_path": str(suffix),
             },
         )
+        _fsync_directory(recovery_parent)
         receipt = reconcile_ledger_quarantine(recovery_dir, root)
     if receipt.get("checkpoint_id") != bundle["checkpoint_id"]:
         raise ValueError("ledger quarantine checkpoint mismatch")
@@ -740,6 +761,55 @@ def recover_draft_step_transactions(
         schedule,
         origin_step=int(checkpoint["completed_policy_steps"]),
         resuming_from_checkpoint=True,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CadenceResumeResult:
+    scheduler: DraftUpdateScheduler | None
+    ledger: DraftDecisionLedger
+    quarantine_receipt_path: Path | None
+
+
+def initialize_or_recover_cadence_resume(
+    draft_config: DraftConfig | None,
+    *,
+    saved: Mapping[str, object] | None,
+    origin_step: int,
+    checkpoint_path: Path,
+    result_root: Path,
+    transaction_store: DraftStepTransactionStore,
+    decision_ledger: DraftDecisionLedger,
+    save_state: Any,
+) -> CadenceResumeResult:
+    """Validate legacy schedule compatibility before opening cadence receipts."""
+    scheduler = initialize_cadence_scheduler(
+        draft_config,
+        saved,
+        origin_step=origin_step,
+        resuming_from_checkpoint=True,
+    )
+    receipt_path = checkpoint_path.resolve() / "cadence-checkpoint-receipt.json"
+    if not receipt_path.is_file():
+        save_state.draft_update_schedule = (
+            disabled_draft_schedule_payload()
+            if scheduler is None
+            else scheduler.state_dict()
+        )
+        return CadenceResumeResult(scheduler, decision_ledger, None)
+    opened = open_resume_decision_ledger(checkpoint_path, result_root)
+    schedule_config = resolve_cadence_schedule_config(draft_config)
+    recovered = recover_draft_step_transactions(
+        config=schedule_config,
+        checkpoint_path=checkpoint_path,
+        transaction_store=transaction_store,
+        decision_ledger=opened.ledger,
+        save_state=save_state,
+    )
+    return CadenceResumeResult(
+        recovered,
+        opened.ledger,
+        opened.quarantine_receipt_path,
     )
 
 
