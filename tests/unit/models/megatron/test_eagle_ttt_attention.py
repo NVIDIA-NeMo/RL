@@ -726,8 +726,9 @@ def test_cuda_packed_padding_output_and_gradients_match_dense_oracle(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("sequence", [8_192, 32_768])
-def test_cuda_long_context_has_no_saved_sequence_square_tensor(
-    sequence: int,
+@pytest.mark.parametrize("pass_count", [1, 4])
+def test_cuda_long_context_multi_pass_has_no_saved_sequence_square_tensor(
+    sequence: int, pass_count: int
 ) -> None:
     _load_symbols()
     module = sys.modules["nemo_rl.models.megatron.draft.eagle_ttt"]
@@ -742,6 +743,12 @@ def test_cuda_long_context_has_no_saved_sequence_square_tensor(
     )
     key = torch.randn_like(query, requires_grad=True)
     value = torch.randn_like(query, requires_grad=True)
+    branch_keys = tuple(
+        torch.randn_like(query, requires_grad=True) for _ in range(pass_count - 1)
+    )
+    branch_values = tuple(
+        torch.randn_like(query, requires_grad=True) for _ in range(pass_count - 1)
+    )
     layout = module.EagleTTTSequenceLayout.from_cu_seqlens(
         cu_seqlens=torch.tensor(
             [0, sequence // 2, sequence],
@@ -753,13 +760,18 @@ def test_cuda_long_context_has_no_saved_sequence_square_tensor(
     state = module.EagleTTTState.from_trunk(
         trunk_key=key,
         trunk_value=value,
-        pass_count=1,
+        pass_count=pass_count,
         max_passes=8,
         activation_budget_bytes=1 << 30,
     )
+    for branch_key, branch_value in zip(branch_keys, branch_values, strict=True):
+        state = state.append_branch(
+            branch_key=branch_key,
+            branch_value=branch_value,
+        )
     plan = module.EagleTTTAttentionPlan(
-        pass_index=0,
-        pass_count=1,
+        pass_index=pass_count - 1,
+        pass_count=pass_count,
         max_passes=8,
         sequence_length=sequence,
     )

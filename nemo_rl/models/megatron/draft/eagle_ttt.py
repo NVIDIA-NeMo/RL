@@ -15,8 +15,8 @@
 from __future__ import annotations
 
 import math
-from copy import deepcopy
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any, Iterator
@@ -1001,6 +1001,9 @@ class MCoreEagleTTTSession:
             raise RuntimeError("EAGLE TTT session is already active")
         if any(layer.context_parallel_size != 1 for layer in self.layers):
             raise ValueError("EAGLE TTT context parallel size must be one")
+        rotary_module = getattr(self.model, "rotary_pos_emb", None)
+        if not callable(rotary_module):
+            raise ValueError("EAGLE TTT session requires callable model.rotary_pos_emb")
         if (layout.batch_size, layout.sequence_length) != (
             storage_plan.batch_size,
             storage_plan.sequence_length,
@@ -1041,12 +1044,7 @@ class MCoreEagleTTTSession:
                     packed_seq_params=packed_seq_params,
                 )
                 armed.append(layer)
-            rotary_module = getattr(self.model, "rotary_pos_emb", None)
-            rotary_pos_emb = (
-                rotary_module(session_storage_plan.sequence_length)
-                if callable(rotary_module)
-                else None
-            )
+            rotary_pos_emb = rotary_module(session_storage_plan.sequence_length)
             for tensor in self._tensors(rotary_pos_emb):
                 resource_ledger.track_owned(tensor, category="rope")
         except BaseException:
