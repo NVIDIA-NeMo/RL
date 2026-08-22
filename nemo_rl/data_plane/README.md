@@ -431,11 +431,12 @@ data_plane:
   claim_meta_poll_interval_s: 0.5      # blocking-claim poll cadence
   simple:
     storage_capacity: 1000000          # max samples retained per partition
-    num_storage_units: 2               # storage shards
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
   mooncake_cpu:
     global_segment_size: 68719476736   # 64 GiB/process
     local_buffer_size:    4294967296   # 4 GiB/process
     reuse_registered_buffers: true     # reuse RDMA-registered buffers
+    staging_buffer_size:   268435456   # 256 MiB/pool slot; bigger transfers bypass the pool
   # observability:                     # NotRequired
   #   enabled: false
 ```
