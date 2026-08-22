@@ -264,7 +264,10 @@ def _run_tp_confidence_markov_gradient(
                 ).reshape(target_vocab_size, markov_rank)
                 / 17
             )
-            confidence_head.proj.weight.fill_(rank + 1)
+            # Real TP replication: proj is identical on every rank; the
+            # confidence-path gradient is therefore already complete per rank
+            # and must NOT be summed across the TP group.
+            confidence_head.proj.weight.fill_(1.0)
             confidence_head.proj.bias.zero_()
 
         previous_token_ids = torch.tensor([[1, -1, 4]], device=device)
@@ -277,6 +280,7 @@ def _run_tp_confidence_markov_gradient(
         markov_embeddings = head.embed_previous_tokens(
             previous_token_ids=previous_token_ids,
             slot_valid=slot_valid,
+            reduce_across_tensor_parallel=False,
         )
         confidence_logits = confidence_head(
             hidden_states,
@@ -288,8 +292,8 @@ def _run_tp_confidence_markov_gradient(
         assert confidence_logits[0, 1].item() == 0.0
         assert head.markov_w1.weight.grad is not None
         expected_gradient = torch.zeros_like(head.markov_w1.weight.grad)
-        expected_gradient[1] = sum(range(1, world_size + 1))
-        expected_gradient[4] = sum(range(1, world_size + 1))
+        expected_gradient[1] = 1.0
+        expected_gradient[4] = 1.0
         torch.testing.assert_close(
             head.markov_w1.weight.grad,
             expected_gradient,
@@ -496,7 +500,7 @@ def test_tp2_markov_head_sums_replicated_w1_gradients(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is required")
-def test_tp2_confidence_path_sanitizes_ids_and_sums_markov_gradients(
+def test_tp2_confidence_path_sanitizes_ids_without_tp_gradient_summing(
     tmp_path: Path,
 ) -> None:
     mp.spawn(
@@ -839,6 +843,7 @@ def test_heads_support_cuda_bfloat16_forward_and_backward() -> None:
     markov_embeddings = markov_head.embed_previous_tokens(
         previous_token_ids=previous_token_ids,
         slot_valid=slot_valid,
+        reduce_across_tensor_parallel=False,
     )
 
     corrected_logits = markov_head(

@@ -153,13 +153,20 @@ class DSparkMarkovHead(nn.Module):
         *,
         previous_token_ids: Tensor,
         slot_valid: Tensor,
+        reduce_across_tensor_parallel: bool,
     ) -> Tensor:
         """Embed previous-token IDs without invalid lookups or replicated TP drift.
 
         Invalid slots use token ID zero for the lookup; consumers must still apply
-        ``slot_valid`` to their outputs. When ``markov_w2`` is vocabulary-sharded,
-        backward sums embedding gradients across TP ranks because ``markov_w1`` is
-        replicated.
+        ``slot_valid`` to their outputs.
+
+        ``reduce_across_tensor_parallel`` must reflect the CONSUMER, not this
+        head: pass True when the embeddings feed a vocabulary-sharded weight
+        (each rank then holds a partial gradient that must be summed into the
+        replicated ``markov_w1``, as ``forward`` does for ``markov_w2``); pass
+        False when the consumer is TP-replicated (e.g. the confidence head's
+        ``proj``) -- every rank already computes the identical, complete
+        gradient there, and summing would over-count it by the TP world size.
         """
         if previous_token_ids.shape != slot_valid.shape:
             raise ValueError("slot_valid must match previous_token_ids")
@@ -179,7 +186,10 @@ class DSparkMarkovHead(nn.Module):
             torch.zeros_like(previous_token_ids),
         )
         previous_embeddings = self.markov_w1(safe_previous_token_ids)
-        if self.local_draft_vocab_size != self.draft_vocab_size:
+        if (
+            reduce_across_tensor_parallel
+            and self.local_draft_vocab_size != self.draft_vocab_size
+        ):
             assert self.tensor_parallel_group is not None
             previous_embeddings = _CopyToTensorParallelRegion.apply(
                 previous_embeddings,
@@ -220,6 +230,7 @@ class DSparkMarkovHead(nn.Module):
         previous_embeddings = self.embed_previous_tokens(
             previous_token_ids=previous_token_ids,
             slot_valid=slot_valid,
+            reduce_across_tensor_parallel=True,
         )
         corrected_logits = base_logits + self.markov_w2(previous_embeddings)
         return torch.where(
