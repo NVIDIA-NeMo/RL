@@ -159,7 +159,8 @@ class ObservabilityConfig(TypedDict):
     injected programmatically (callables don't round-trip through
     YAML) — set ``cfg["observability"]["callback"] = my_fn`` before
     :func:`build_data_plane_client` to plug into wandb / file / log.
-    Default callback prints one line per op for debug.
+    There is no default callback: per-step metrics reach the logger via
+    ``get_step_metrics``, so a per-op sink is opt-in.
 
     ``verify_tensor_hash`` is a correctness check, not a metric: each put
     records a per-row ``torch.hash_tensor`` fingerprint and each get
