@@ -80,6 +80,59 @@ def test_dflash_omitted_schedule_resolves_to_always_member_only() -> None:
     assert config.update_schedule.model_dump(mode="json") == {"mode": "always"}
 
 
+def test_dspark_omitted_schedule_resolves_to_always_member_only() -> None:
+    config = DSparkDraftConfig(
+        enabled=True,
+        block_size=7,
+        anchors_per_sample=4,
+        mask_token_id=151665,
+        target_hidden_state_layer_ids=[1, 17, 33],
+    )
+    assert config.update_schedule.model_dump(mode="json") == {"mode": "always"}
+
+
+def test_dflash_nested_fixed_schedule_selects_fixed_member() -> None:
+    config = DFlashDraftConfig(
+        enabled=True,
+        gamma=5,
+        anchors_per_sample=4,
+        mask_token_id=151665,
+        target_hidden_state_layer_ids=[1, 17, 33],
+        update_schedule={
+            "mode": "fixed",
+            "action": "sparse_update",
+            "fixed_interval": 10,
+        },
+    )
+    assert isinstance(config.update_schedule, FixedDraftUpdateScheduleConfig)
+
+
+def test_dspark_nested_adaptive_schedule_selects_adaptive_member() -> None:
+    config = DSparkDraftConfig(
+        enabled=True,
+        block_size=7,
+        anchors_per_sample=4,
+        mask_token_id=151665,
+        target_hidden_state_layer_ids=[1, 17, 33],
+        update_schedule={"mode": "adaptive"},
+    )
+    assert isinstance(config.update_schedule, AdaptiveDraftUpdateScheduleConfig)
+
+
+def test_nested_schedule_rejects_unknown_mode() -> None:
+    with pytest.raises(ValidationError, match="mode"):
+        DFlashDraftConfig.model_validate(
+            {
+                "enabled": True,
+                "gamma": 5,
+                "anchors_per_sample": 4,
+                "mask_token_id": 151665,
+                "target_hidden_state_layer_ids": [1, 17, 33],
+                "update_schedule": {"mode": "sometimes"},
+            }
+        )
+
+
 def test_eagle3_draft_config_preserves_legacy_defaults() -> None:
     from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
