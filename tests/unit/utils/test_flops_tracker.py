@@ -147,9 +147,9 @@ def test_glm_moe_dsa_flops_components():
         dsa_indexer_compute_layers=1,
     )
 
-    # Per input: 15,168 linear + 2,880 sparse attention + 960 indexer
+    # Per input: 15,168 linear + 2,880 sparse attention + 736 indexer
     # + 3,072 vocabulary projection FLOPs; gbs=2.
-    assert glm_moe_dsa(config) == 44_160
+    assert glm_moe_dsa(config) == 43_712
 
 
 def _glm_5_2_indexer_types() -> list[str]:
@@ -195,8 +195,11 @@ def test_glm_5_2_reused_indices_reduce_indexer_flops():
 
     actual_difference = glm_moe_dsa(glm_5_1_config) - glm_moe_dsa(glm_5_2_config)
     seq_len = glm_5_1_config.enc_seq_len
+    dense_causal_pairs = seq_len * (seq_len + 1) // 2
     projection_params = 2048 * 32 * 128 + 6144 * 128 + 6144 * 32
-    per_layer_indexer_flops = 2 * (seq_len * projection_params + seq_len**2 * 32 * 128)
+    per_layer_indexer_flops = 2 * (
+        seq_len * projection_params + dense_causal_pairs * 32 * 128
+    )
     assert actual_difference == (78 - 21) * per_layer_indexer_flops
 
 

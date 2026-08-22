@@ -352,9 +352,6 @@ class MegatronConfig(TypedDict):
     num_layers_in_first_pipeline_stage: int | None
     num_layers_in_last_pipeline_stage: int | None
     context_parallel_size: int
-    # Attention context-parallel communication type. Valid MCore values include
-    # "p2p", "all_gather", "a2a", and "a2a+p2p"; null uses MCore's default.
-    cp_comm_type: NotRequired[str | list[str] | None]
     # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
     # provider's checkpoint/default value.
     radio_force_cpe_eval_mode: NotRequired[bool]

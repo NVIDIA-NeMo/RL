@@ -528,6 +528,8 @@ def glm_moe_dsa(config: FLOPSConfig) -> float:
         + config.hs * config.dsa_indexer_head_dim
         + config.hs * config.dsa_indexer_n_heads
     )
+    # The indexer scores every causally valid query/key pair before selecting top-k.
+    dense_causal_pairs = seq_len * (seq_len + 1) // 2
     # This formula assumes dsa_indexer_loss_coeff=0.0, for which MCore runs the
     # indexer under no_grad. Count only its forward matmuls (2 FLOPs per FMA);
     # enabling indexer loss also requires accounting for the backward pass.
@@ -536,7 +538,9 @@ def glm_moe_dsa(config: FLOPSConfig) -> float:
         * config.dsa_indexer_compute_layers
         * (
             seq_len * indexer_projection_params
-            + (seq_len**2) * config.dsa_indexer_n_heads * config.dsa_indexer_head_dim
+            + dense_causal_pairs
+            * config.dsa_indexer_n_heads
+            * config.dsa_indexer_head_dim
         )
     )
 

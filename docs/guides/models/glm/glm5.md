@@ -21,7 +21,7 @@ GEMMs in the three shared layers.
 
 | Model | Training backend | Validated training parallelism | Generation backend | DSA kernel backends | Status |
 | --- | --- | --- | --- | --- | --- |
-| `zai-org/GLM-5.1` | Megatron | TP8 + PP8 + CP2 + EP64 | Colocated vLLM with TP32 + EP128 | cuDNN or TileLang | Functionally Ready |
+| `zai-org/GLM-5.1` | Megatron | TP8 + PP8 + CP1 + EP64 | Colocated vLLM with TP32 + EP128 | cuDNN or TileLang | Functionally Ready |
 | `zai-org/GLM-5.2` | Megatron | TP2 + PP8 + EP64 with CP8/CP32 | Colocated or non-colocated vLLM | cuDNN or TileLang | Functionally Ready |
 
 ## Validated Scope
@@ -38,7 +38,7 @@ GEMMs in the three shared layers.
   The reference GLM-5.2 recipes use cuDNN.
 - **Precision**: BF16 model training and generation.
 - **vLLM compatibility patch**: NeMo RL automatically applies a GLM-specific
-  [vLLM 0.25.1 compatibility patch](../../../nemo_rl/models/generation/vllm/patches.py)
+  [vLLM 0.25.1 compatibility patch](../../../../nemo_rl/models/generation/vllm/patches.py)
   that disables decoder-level sequence-parallel MoE for `glm_moe_dsa` while
   retaining MoE-local sequence parallelism. This restores correct iterative
   decoding for GLM-5.1 and GLM-5.2.
@@ -58,17 +58,17 @@ git submodule update --init --recursive
 uv sync --locked --extra mcore --extra vllm
 ```
 
-See the [installation guide](../../about/installation.md) for container and
+See the [installation guide](../../../about/installation.md) for container and
 bare-metal setup details.
 
 ### 2. Choose a Reference Recipe
 
 - **GLM-5.1, 2K, colocated**:
-  [`grpo-glm5.1-64n8g-megatron.yaml`](../../../examples/configs/recipes/llm/grpo-glm5.1-64n8g-megatron.yaml)
+  [`grpo-glm5.1-64n8g-megatron.yaml`](../../../../examples/configs/recipes/llm/grpo-glm5.1-64n8g-megatron.yaml)
 - **GLM-5.2, 6K, colocated**:
-  [`grpo-glm5.2-64n8g-megatron-6K-colocated.yaml`](../../../examples/configs/recipes/llm/grpo-glm5.2-64n8g-megatron-6K-colocated.yaml)
+  [`grpo-glm5.2-64n8g-megatron-6K-colocated.yaml`](../../../../examples/configs/recipes/llm/grpo-glm5.2-64n8g-megatron-6K-colocated.yaml)
 - **GLM-5.2, non-colocated (131K capacity)**:
-  [`grpo-glm5.2-72n8g-megatron-noncolocated.yaml`](../../../examples/configs/recipes/llm/grpo-glm5.2-72n8g-megatron-noncolocated.yaml)
+  [`grpo-glm5.2-72n8g-megatron-noncolocated.yaml`](../../../../examples/configs/recipes/llm/grpo-glm5.2-72n8g-megatron-noncolocated.yaml)
 
   > [!NOTE]
   > The 131K label describes training capacity, not current full-context GRPO
@@ -90,7 +90,7 @@ uv run examples/run_grpo.py \
 Replace the `--config` value with the path to any reference recipe listed
 above.
 
-See the [GRPO guide](../grpo.md) for algorithm and configuration details.
+See the [GRPO guide](../../grpo.md) for algorithm and configuration details.
 
 ## Long-Context Capacity and Validation
 
@@ -140,14 +140,14 @@ uv run examples/run_grpo.py \
 
 The locked NeMo RL environment includes both kernel dependencies. For
 bare-metal Megatron installations, also follow the
-[cuDNN setup guidance](../../about/installation.md#configure-cudnn-for-transformer-engine-bare-metal-only)
+[cuDNN setup guidance](../../../about/installation.md#configure-cudnn-for-transformer-engine-bare-metal-only)
 so Transformer Engine loads the pinned cuDNN version.
 
 ## Reference Training Curves
 
-Following curves show training run for GLM-5.2, 6K Sequence Length colocated using [this](../../../examples/configs/recipes/llm/grpo-glm5.2-64n8g-megatron-6K-colocated.yaml) recipe. 
+Following curves show training run for GLM-5.2, 6K Sequence Length colocated using [this](../../../../examples/configs/recipes/llm/grpo-glm5.2-64n8g-megatron-6K-colocated.yaml) recipe. 
 
-![GLM-5.2 GRPO training curves](../../assets/glm5.2_grpo_curve.png)
+![GLM-5.2 GRPO training curves](../../../assets/glm5.2_grpo_curve.png)
 
 ## Known Limitations
 

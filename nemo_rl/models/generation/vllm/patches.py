@@ -575,6 +575,12 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
     subsequent decode-token logprobs collapse. Keep vLLM's existing MoE-local
     sequence parallelism, but disable the new decoder-level optimization for
     ``glm_moe_dsa`` so the MoE gathers its output as it did in vLLM 0.24.
+
+    The upstream bug and proposed fix are tracked at
+    https://github.com/vllm-project/vllm/issues/50154 and
+    https://github.com/vllm-project/vllm/pull/50155. Remove this patch after
+    upgrading to a vLLM release containing the fix and validating iterative
+    GLM-5.1/5.2 decode with TP, DP, and EP all enabled.
     """
     try:
         file_to_patch = _get_vllm_file("model_executor/models/deepseek_v2.py")

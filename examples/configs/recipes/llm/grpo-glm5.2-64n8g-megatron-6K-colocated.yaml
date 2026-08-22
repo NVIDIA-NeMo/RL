@@ -33,6 +33,8 @@ checkpointing:
 
 policy:
   model_name: zai-org/GLM-5.2
+  # TODO: Remove this workaround after upgrading Transformers to a version that
+  # preserves GLM-5.2's qk_rope_head_dim when loading its config.
   hf_config_overrides:
     qk_rope_head_dim: 64
   train_global_batch_size: 128
@@ -54,7 +56,6 @@ policy:
     num_layers_in_first_pipeline_stage: 14
     num_layers_in_last_pipeline_stage: 16
     context_parallel_size: 8
-    cp_comm_type: all_gather
     sequence_parallel: true
     moe_router_dtype: fp32
     apply_rope_fusion: false
@@ -76,7 +77,6 @@ policy:
       overlap_param_gather: false
     env_vars:
       CUDA_DEVICE_MAX_CONNECTIONS: '1'
-    converter_type: GlmMoeDsaForCausalLM
     model_overrides:
       dsa_indexer_rope_interleaved: true
       dsa_indexer_rotate_activation: false
@@ -106,8 +106,10 @@ policy:
       max_num_batched_tokens: 4096
       max_num_seqs: null
       enable_chunked_prefill: true
-      attention_config:
-        backend: FLASHMLA_SPARSE
+
+      # On SM100, vLLM 0.25.1 auto-selects FlashInfer TRTLLM MoE. Its
+      # block-major expert layout requires native layerwise reload, which this
+      # branch's refit paths do not yet use. CUTLASS is refit-compatible on both.
       kernel_config:
         moe_backend: flashinfer_cutlass
       async_scheduling: false
