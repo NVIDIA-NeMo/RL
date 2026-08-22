@@ -34,6 +34,7 @@ from nemo_rl.data_plane.observability import (
     cluster_step_metrics,
     merge_snapshots,
     _estimate_encoded_bytes,
+    _QUANTILES,
     _td_bytes,
 )
 
@@ -331,7 +332,7 @@ def test_outstanding_bytes_reconcile_exactly():
 
 def test_step_metrics_use_one_unit_per_dimension():
     """Every duration is ms, every volume MB. A chart mixing `wall_s` with
-    `p99_ms` shows 0.008 beside 24.85 and reads as a data-plane bug rather
+    `p90_ms` shows 0.008 beside 24.85 and reads as a data-plane bug rather
     than an axis one."""
     client = MetricsDataPlaneClient(NoOpDataPlaneClient())
     client.register_partition(
@@ -350,8 +351,9 @@ def test_step_metrics_use_one_unit_per_dimension():
 
 def test_step_metrics_tail_is_exact_not_bucketed():
     """Per-step percentiles came off a histogram that is never reset, so
-    they went flat and quantised to bucket edges (p99 of a single sample in
-    (10, 25] is always 10 + 15*0.99 = 24.85). ``max_ms`` is exact and
+    they went flat and quantised to bucket edges (a tail quantile of a
+    single sample in (10, 25] always lands on the same interpolated
+    point). ``max_ms`` is exact and
     tracks the slowest call actually seen."""
     client = MetricsDataPlaneClient(NoOpDataPlaneClient())
     client.register_partition(
@@ -360,11 +362,11 @@ def test_step_metrics_tail_is_exact_not_bucketed():
     client._emit("put", "p", 1, 8, monotonic() - 0.030, "ok")  # a 30 ms call
     metrics = client.get_step_metrics(1.0)
 
-    assert "put/p99_ms" not in metrics and "step/put/p50_ms" not in metrics
+    assert "put/p90_ms" not in metrics and "step/put/p50_ms" not in metrics
     assert metrics["step/put/max_ms"] >= 30.0
     assert metrics["step/put/max_ms"] != pytest.approx(24.85, abs=0.5), "bucket edge"
     # and one call supports no percentile at all, in either view
-    assert "p99_ms" not in client.snapshot()["by_op"]["put"]
+    assert "p90_ms" not in client.snapshot()["by_op"]["put"]
     client.close()
 
 
@@ -831,8 +833,8 @@ def test_cluster_percentiles_never_exceed_the_measured_max():
 
     assert metrics["step/put/max_ms"] == pytest.approx(120.0, abs=2.0)
     assert metrics["step/put/p50_ms"] <= metrics["step/put/max_ms"]
-    assert metrics["step/put/p99_ms"] <= metrics["step/put/max_ms"]
-    assert metrics["step/put/p50_ms"] <= metrics["step/put/p99_ms"]
+    assert metrics["step/put/p90_ms"] <= metrics["step/put/max_ms"]
+    assert metrics["step/put/p50_ms"] <= metrics["step/put/p90_ms"]
 
 
 def test_cluster_percentiles_withheld_below_a_useful_sample_count():
@@ -945,8 +947,8 @@ def test_snapshot_percentiles_never_exceed_the_measured_max():
     for view in (client.snapshot(), merge_snapshots([client.snapshot()])):
         stats = view["by_op"]["register"]
         assert stats["p50_ms"] <= stats["max_ms"], stats
-        assert stats["p99_ms"] <= stats["max_ms"], stats
-        assert stats["p50_ms"] <= stats["p99_ms"], stats
+        assert stats["p90_ms"] <= stats["max_ms"], stats
+        assert stats["p50_ms"] <= stats["p90_ms"], stats
     client.close()
 
 
@@ -980,7 +982,7 @@ def test_breakdown_table_leaves_withheld_series_empty():
         {"step/put/calls": 3, "step/put/wall_ms": 5.0, "step/put/max_ms": 2.0}
     )
     row = rows[0]
-    assert row[columns.index("p99_ms")] is None
+    assert row[columns.index("p90_ms")] is None
     assert row[columns.index("overhead_ms")] is None
     assert row[columns.index("calls")] == 3
 
@@ -1046,10 +1048,14 @@ def test_cluster_per_op_time_is_reported_per_call():
 
 
 def test_each_quantile_waits_for_the_samples_it_needs():
-    """n samples resolve a quantile no higher than about 1 - 1/n, so a p99
-    wants 100 and a p50 only a couple. One threshold for both meant 48 calls
-    reported neither, when the median was perfectly real and only the p99
-    would have been the maximum wearing a percentile label."""
+    """Each quantile needs about four observations above its rank to mean
+    anything, so they cannot share one gate: 48 calls carry a real median
+    and no usable tail, and a single threshold for both reported neither.
+
+    The tail one is p90 rather than p99 for the same reason. A step holds
+    tens of calls, and a p99 off 58 of them equalled the maximum 80% of the
+    time -- ``max_ms`` under a more precise-sounding name.
+    """
 
     def metrics_for(n_calls):
         client = MetricsDataPlaneClient(NoOpDataPlaneClient())
@@ -1059,11 +1065,23 @@ def test_each_quantile_waits_for_the_samples_it_needs():
         return cluster_step_metrics(merge_snapshots([client.snapshot()]), {}, 1.0)
 
     assert "step/put/p50_ms" not in metrics_for(10), "too thin for either"
-    mid = metrics_for(48)
-    assert "step/put/p50_ms" in mid, "a median off 48 calls is real"
-    assert "step/put/p99_ms" not in mid, "a p99 off 48 calls is the max"
-    both = metrics_for(120)
-    assert "step/put/p50_ms" in both and "step/put/p99_ms" in both
+    mid = metrics_for(30)
+    assert "step/put/p50_ms" in mid, "a median off 30 calls is real"
+    assert "step/put/p90_ms" not in mid, "a p90 off 30 calls is not"
+    both = metrics_for(58)
+    assert "step/put/p50_ms" in both and "step/put/p90_ms" in both
+
+
+def test_no_quantile_finer_than_the_sample_size_can_resolve():
+    """Guard on the choice itself, not just the gate: reporting a p99 at
+    these per-step call counts would mean reporting the maximum twice."""
+    assert 0.99 not in {q for q, _, _ in _QUANTILES}
+    for q, name, min_samples in _QUANTILES:
+        above_the_rank = min_samples * (1 - q)
+        assert above_the_rank >= 4 - 1e-9, (
+            f"{name} is gated at {min_samples}, leaving only "
+            f"{above_the_rank:.1f} observations above its rank"
+        )
 
 
 class _JaggedEcho(NoOpDataPlaneClient):

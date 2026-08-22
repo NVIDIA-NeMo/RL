@@ -460,10 +460,10 @@ cluster percentile).
 `data_plane/{cluster,driver}/breakdown` — one row per op, ordered by wall
 time so the expensive one reads first:
 
-| op | calls | mean_ms | max_ms | wall_ms | overhead_ms | transfer_ms | p50_ms | p99_ms |
+| op | calls | mean_ms | max_ms | wall_ms | overhead_ms | transfer_ms | p50_ms | p90_ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| get | 200 | 11.17 | 16.0 | 2232 | 6.03 | 5.15 | 12.9 | 16.0 |
-| put | 48 | 23.66 | 31.9 | 1135 | 12.06 | 11.60 | — | — |
+| get | 200 | 11.17 | 16.0 | 2232 | 6.03 | 5.15 | 12.9 | 15.2 |
+| put | 48 | 23.66 | 31.9 | 1135 | 12.06 | 11.60 | 22.4 | 30.1 |
 
 Everything in ms on that row is **per call**, and the two split terms add
 to `mean_ms`: that `get` row reads "each call cost 11.17 ms, of which 6.03
@@ -545,7 +545,7 @@ can exceed 1, meaning measuring cost more than the operation measured — a
 signal worth seeing rather than hiding.
 
 **Units:** every duration is `_ms`, every volume is `_mb`, no exceptions —
-a chart mixing `wall_s` against `p99_ms` puts a 0.008 beside a 24.85 and
+a chart mixing `wall_s` against `p90_ms` puts a 0.008 beside a 24.85 and
 reads as a data-plane bug rather than an axis one.
 
 **Per step you get, per op tag:** `calls`, `wall_ms`, `max_ms`, and — when
@@ -557,13 +557,25 @@ shows the breakdown and the model error in one picture. The coefficients
 come from the cumulative fit (a model should be stable); the attribution is
 per step, applied to that step's calls and bytes. A ratio was tried first
 and was the wrong shape — cumulative and therefore flat, and unitless on an
-axis of milliseconds. Not percentiles — the
-histogram is cumulative by design, so a per-step p50 off it goes flat, and
-at the handful of calls an op makes in one step a p99 is bucket geometry
-rather than data (one sample in the `(10, 25]` bucket always yields
-`10 + 15*0.99 = 24.85`). `max_ms` is exact, scoped to the step, and says
-the same thing at that sample size. The percentiles remain in `snapshot()`,
-where the cumulative sample count justifies them.
+axis of milliseconds. Percentiles come off the *step's* histogram delta, not the
+cumulative one -- a per-step p50 off a histogram that is never reset goes
+flat -- and each is emitted only when the step holds enough calls to
+resolve it: **p50 at 20, p90 at 40**, roughly four observations above the
+rank (`n >= 4 / (1 - q)`). Below that the key is absent.
+
+The tail quantile is **p90, not p99**, because a step holds tens of calls,
+not thousands. A p99 needs ~100 samples before any observation lies above
+its rank at all; below that it collapses onto the largest one. Over a
+lognormal-with-tail draw at 58 calls -- what a DP-8 run actually puts per
+step -- the p99 equalled the maximum **80% of the time**, which is
+`max_ms` under a more precise-sounding name. The p90 off the same 58 never
+did on a smooth tail and 12% of the time on a bimodal one. A coarser
+quantile that is resolved beats a finer one that is not.
+
+`max_ms` stays alongside, exact and scoped to the step: it answers "did
+anything go wrong this step", where p90 answers "what does the tail look
+like". If the two diverge sharply, the op is bimodal -- a straggler rank
+or a cold buffer -- and the max is the number to chase.
 
 Measured against a no-op inner client on the payload the wire actually
 carries — 256 ragged rows, 12 MB, jagged per-token fields as

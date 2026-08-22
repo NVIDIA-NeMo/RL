@@ -95,12 +95,18 @@ _READ_OPS = frozenset({"get", "get_data"})
 # few lines carry the identity of what broke.
 _MAX_HASH_MISMATCH_LOGS = 20
 
-# Quantiles reported per op, each with the sample count it needs. n samples
-# resolve a quantile no higher than about 1 - 1/n, so a p99 wants 100 and a
-# p50 wants only a couple -- 20 for stability. One threshold for both was
-# why 48 calls reported neither, when the median was perfectly real and only
-# the p99 would have been the maximum wearing a percentile label.
-_QUANTILES = ((0.50, "p50_ms", 20), (0.99, "p99_ms", 100))
+# Quantiles reported per op, each with the sample count it needs: enough for
+# roughly four observations above the rank, or n >= 4 / (1 - q).
+#
+# The tail one is p90, not p99, because a step holds tens of calls, not
+# thousands. A p99 needs ~100 samples before any observation lies above its
+# rank at all, and below that it collapses onto the largest one -- measured
+# over a lognormal-with-tail draw, a p99 off 58 calls equalled the maximum
+# 80% of the time, which is ``max_ms`` under a more precise-sounding name.
+# p90 off the same 58 never did on a smooth tail and 12% of the time on a
+# bimodal one. A coarser quantile that is actually resolved beats a finer
+# one that is not.
+_QUANTILES = ((0.50, "p50_ms", 20), (0.90, "p90_ms", 40))
 
 
 class _FieldDigest(NamedTuple):
@@ -715,7 +721,7 @@ def cluster_step_metrics(
 
 # Per-op columns worth a row in the breakdown, in the order they read.
 # ``overhead_ms``/``transfer_ms`` are only present when the affine fit is
-# trustworthy, and ``p50_ms``/``p99_ms`` only above the sample gate, so a
+# trustworthy, and ``p50_ms``/``p90_ms`` only above the sample gate, so a
 # row carries None where a series was withheld rather than a zero that
 # would read as a measurement.
 _BREAKDOWN_COLUMNS = (
@@ -726,7 +732,7 @@ _BREAKDOWN_COLUMNS = (
     "overhead_ms",
     "transfer_ms",
     "p50_ms",
-    "p99_ms",
+    "p90_ms",
 )
 
 
@@ -804,7 +810,8 @@ class OpStats:
     sum_ms_sq: float = 0.0
     # Slowest single call, exact. The histogram below can only place a
     # call in a bucket, so at the handful of calls an op makes in one step
-    # a percentile off it is bucket geometry rather than data -- p99 of one
+    # a percentile off it is bucket geometry rather than data -- a tail
+    # quantile of one
     # sample in (10, 25] is always 10 + 15*0.99 = 24.85. This is the
     # per-step tail signal; the histogram is for the cumulative view.
     max_ms: float = 0.0
@@ -960,7 +967,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
 
         wall_ms = snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
         # Every duration is ms and every volume is MB, with no exceptions:
-        # a chart that mixes wall_s against p99_ms puts a 0.008 next to a
+        # a chart that mixes wall_s against p90_ms puts a 0.008 next to a
         # 24.85 and reads as a bug in the data plane rather than in the
         # axis. GB was the same problem one dimension over -- a realistic
         # step moved 0.00017 GB.
@@ -1003,7 +1010,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
             metrics[f"step/{op}/calls"] = calls
             metrics[f"step/{op}/mean_ms"] = op_ms / calls
             metrics[f"step/{op}/wall_ms"] = op_ms
-            # ``max_ms`` rather than p50/p99. Those come off a histogram
+            # ``max_ms`` rather than p50/p90. Those come off a histogram
             # that is never reset, so per step they were a lifetime figure
             # that goes flat, quantised to bucket edges. The max is exact
             # and says the same thing at the handful of calls per step.
