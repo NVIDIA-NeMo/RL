@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import gc
 import os
+import time
 import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -418,6 +419,7 @@ def _log_data_plane_metrics(
         return  # observability disabled -> plain adapter
 
     collect = getattr(policy, "collect_data_plane_snapshots", None)
+    collect_started = time.perf_counter()
     snapshots = collect() if callable(collect) else []
     if len(snapshots) > 1:
         # Cluster view: every rank's counters summed. Prefixed and reported
