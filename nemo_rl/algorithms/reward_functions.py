@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, TypeVar
 
 import torch
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -23,7 +23,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 
-class LengthAwareRewardConfig(BaseModel, extra="allow"):
+class ReasoningLengthRewardConfig(BaseModel, extra="allow"):
     """Configure reasoning-chain length reward for NeMo-Gym rollouts.
 
     The component reward is one through ``tau1``, decreases linearly to zero
@@ -32,7 +32,6 @@ class LengthAwareRewardConfig(BaseModel, extra="allow"):
     enabled.
     """
 
-    enabled: bool = False
     tau1: int = 4096
     tau2: int = 13000
     weight: float = 0.1
@@ -40,7 +39,7 @@ class LengthAwareRewardConfig(BaseModel, extra="allow"):
     reasoning_end_token_id: int | None = None
 
     @model_validator(mode="after")
-    def _validate_length_aware_reward(self) -> "LengthAwareRewardConfig":
+    def _validate_reasoning_length_reward(self) -> "ReasoningLengthRewardConfig":
         if self.tau1 < 0:
             raise ValueError(f"tau1 must be non-negative, got {self.tau1}")
         if self.tau2 <= self.tau1:
@@ -54,10 +53,6 @@ class LengthAwareRewardConfig(BaseModel, extra="allow"):
             raise ValueError(
                 "correctness-gated length-aware reward weight must be at most 1, "
                 f"got {self.weight}"
-            )
-        if self.enabled and self.reasoning_end_token_id is None:
-            raise ValueError(
-                "reasoning_end_token_id must be set when length-aware reward is enabled"
             )
         if self.reasoning_end_token_id is not None and self.reasoning_end_token_id < 0:
             raise ValueError(
@@ -127,7 +122,7 @@ def reasoning_chain_token_length(
 
 
 def apply_length_aware_reward(
-    results: list[dict[str, Any]], config: LengthAwareRewardConfig | None
+    results: list[dict[str, Any]], config: ReasoningLengthRewardConfig | None
 ) -> LengthAwareRewardMetrics:
     """Compose reasoning-chain length reward into NeMo-Gym scalar rewards.
 
@@ -138,7 +133,7 @@ def apply_length_aware_reward(
     Multi-component Gym rewards are rejected because a non-additive transform
     would otherwise violate the ``reward == sum(reward_components)`` contract.
     """
-    if config is None or not config.enabled:
+    if config is None:
         return LengthAwareRewardMetrics([], [])
 
     reasoning_end_token_id = config.reasoning_end_token_id
@@ -191,8 +186,8 @@ def apply_length_aware_reward(
 class RewardShapingConfig(BaseModel, extra="allow"):
     """Configuration for reward function processing.
 
-    This configuration enables custom reward shaping, currently supporting DAPO-style
-    penalties for responses that exceed the maximum response length threshold.
+    This configuration enables DAPO overlong or stop-properly shaping for
+    response-length processing.
     """
 
     enabled: bool = False
@@ -213,6 +208,46 @@ class RewardShapingConfig(BaseModel, extra="allow"):
     # When set to 1, no penalty is applied (default behavior).
     stop_properly_penalty_coef: float | None = None
 
+    @property
+    def response_length_enabled(self) -> bool:
+        """Whether batch-level DAPO or stop-properly shaping is active."""
+        return self.enabled
+
+
+class GRPORewardShapingConfig(RewardShapingConfig):
+    """Select response- or reasoning-length reward shaping for GRPO."""
+
+    mode: Literal["response_length", "reasoning_length"] = "response_length"
+
+    # Reasoning-chain parameters used when mode=reasoning_length. The end-token
+    # ID is model/tokenizer specific and must be set when that mode is enabled.
+    reasoning_length: ReasoningLengthRewardConfig = Field(
+        default_factory=ReasoningLengthRewardConfig
+    )
+
+    @model_validator(mode="after")
+    def _validate_reasoning_length_mode(self) -> "GRPORewardShapingConfig":
+        if (
+            self.enabled
+            and self.mode == "reasoning_length"
+            and self.reasoning_length.reasoning_end_token_id is None
+        ):
+            raise ValueError(
+                "reasoning_length.reasoning_end_token_id must be set when "
+                "reasoning-length reward shaping is enabled"
+            )
+        return self
+
+    @property
+    def response_length_enabled(self) -> bool:
+        """Whether batch-level DAPO or stop-properly shaping is active."""
+        return self.enabled and self.mode == "response_length"
+
+    @property
+    def reasoning_length_enabled(self) -> bool:
+        """Whether NeMo-Gym reasoning-chain shaping is active."""
+        return self.enabled and self.mode == "reasoning_length"
+
 
 def apply_reward_shaping(
     batch: BatchedDataDict, cfg: RewardShapingConfig
@@ -224,6 +259,11 @@ def apply_reward_shaping(
     rewards = batch["total_reward"]
     if not cfg.enabled:
         return batch
+    if not cfg.response_length_enabled:
+        raise ValueError(
+            "reasoning-length reward shaping must be applied to NeMo-Gym results "
+            "before batch-level reward processing"
+        )
 
     # Preserve the pre-shaping reward so downstream consumers (e.g. DAPO
     # dynamic sampling) can filter prompt groups on the raw task metric

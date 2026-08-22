@@ -53,8 +53,7 @@ from nemo_rl.algorithms.metric_utils import (
 )
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.reward_functions import (
-    LengthAwareRewardConfig,
-    RewardShapingConfig,
+    GRPORewardShapingConfig,
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
@@ -288,9 +287,8 @@ class GRPOConfig(BaseModel, extra="allow"):
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: float = 1.0
-    reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
-    length_aware_reward: LengthAwareRewardConfig = Field(
-        default_factory=LengthAwareRewardConfig
+    reward_shaping: GRPORewardShapingConfig = Field(
+        default_factory=GRPORewardShapingConfig
     )
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
@@ -738,7 +736,7 @@ def setup(
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
-    _raise_if_length_aware_reward_enabled_without_nemo_gym(
+    _raise_if_reasoning_length_reward_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
     nemo_gym_actor = None
@@ -1991,17 +1989,20 @@ def _raise_if_reward_penalties_enabled_without_nemo_gym(
     )
 
 
-def _raise_if_length_aware_reward_enabled_without_nemo_gym(
+def _raise_if_reasoning_length_reward_enabled_without_nemo_gym(
     master_config: MasterConfig,
     *,
     enable_nemo_gym: bool,
 ) -> None:
-    """Validate length-aware reward is only enabled with NeMo-Gym."""
-    if enable_nemo_gym or not master_config.grpo.length_aware_reward.enabled:
+    """Validate reasoning-length reward shaping is only used with NeMo-Gym."""
+    if (
+        enable_nemo_gym
+        or not master_config.grpo.reward_shaping.reasoning_length_enabled
+    ):
         return
 
     raise ValueError(
-        "grpo.length_aware_reward requires the NeMo-Gym path "
+        "grpo.reward_shaping mode=reasoning_length requires the NeMo-Gym path "
         "(env.should_use_nemo_gym=true); it is not supported with the native "
         "generation path."
     )
@@ -2980,9 +2981,7 @@ def grpo_train(
                             max_rollout_turns=None,
                             greedy=False,
                             effort_config=_get_effort_config(master_config),
-                            length_aware_reward_config=(
-                                master_config.grpo.length_aware_reward
-                            ),
+                            reward_shaping_config=master_config.grpo.reward_shaping,
                             reward_penalty_config=master_config.reward_penalties,
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                             mask_env_flagged_samples=should_mask_flagged_samples(
@@ -3051,7 +3050,7 @@ def grpo_train(
                     repeated_batch, master_config.grpo.reward_scaling
                 )
                 # Process rewards with custom reward function
-                if master_config.grpo.reward_shaping.enabled:
+                if master_config.grpo.reward_shaping.response_length_enabled:
                     repeated_batch = apply_reward_shaping(
                         repeated_batch, master_config.grpo.reward_shaping
                     )
@@ -3920,7 +3919,7 @@ def validate(
                     max_rollout_turns=None,
                     greedy=False,
                     effort_config=_get_effort_config(master_config),
-                    length_aware_reward_config=(master_config.grpo.length_aware_reward),
+                    reward_shaping_config=master_config.grpo.reward_shaping,
                     reward_penalty_config=master_config.reward_penalties,
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                     mask_env_flagged_samples=should_mask_flagged_samples(

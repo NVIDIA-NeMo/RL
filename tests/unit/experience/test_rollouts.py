@@ -26,7 +26,7 @@ from PIL import Image
 from transformers import AutoTokenizer
 
 import nemo_rl.experience.rollouts as rollouts_mod
-from nemo_rl.algorithms.reward_functions import LengthAwareRewardConfig
+from nemo_rl.algorithms.reward_functions import GRPORewardShapingConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
@@ -1778,9 +1778,10 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
 
     clock = {"now": 0.0}
     payload_calls = []
-    length_aware_reward_config = LengthAwareRewardConfig(
+    reward_shaping_config = GRPORewardShapingConfig(
         enabled=True,
-        reasoning_end_token_id=13,
+        mode="reasoning_length",
+        reasoning_length={"reasoning_end_token_id": 13},
     )
 
     class _FakeTimerContext:
@@ -1918,7 +1919,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
 
     def _postprocess_group(**kwargs):
         assert kwargs["log_full_result_tables"] is False
-        assert kwargs["length_aware_reward_config"] is length_aware_reward_config
+        assert kwargs["reward_shaping_config"] is reward_shaping_config
         task_index = int(kwargs["nemo_gym_rows"][0]["_ng_task_index"])
         for result, original_log in zip(
             kwargs["results"], kwargs["input_batch"]["message_log"]
@@ -1985,7 +1986,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
             },
             num_generations=2,
             log_full_result_tables=False,
-            length_aware_reward_config=length_aware_reward_config,
+            reward_shaping_config=reward_shaping_config,
             deduplicate_multimodal_data=True,
             debug_payload_metrics=True,
         ):
@@ -2155,13 +2156,16 @@ def test_postprocess_nemo_gym_group_applies_length_aware_reward():
         input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=False,
-        length_aware_reward_config=LengthAwareRewardConfig(
+        reward_shaping_config=GRPORewardShapingConfig(
             enabled=True,
-            tau1=1,
-            tau2=3,
-            weight=0.5,
-            composition="correctness_gated",
-            reasoning_end_token_id=13,
+            mode="reasoning_length",
+            reasoning_length={
+                "tau1": 1,
+                "tau2": 3,
+                "weight": 0.5,
+                "composition": "correctness_gated",
+                "reasoning_end_token_id": 13,
+            },
         ),
     )
 
@@ -2178,9 +2182,10 @@ def test_postprocess_nemo_gym_group_applies_length_aware_reward():
 
 def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
     input_batch = BatchedDataDict({"loss_multiplier": torch.ones(3)})
-    length_aware_reward_config = LengthAwareRewardConfig(
+    reward_shaping_config = GRPORewardShapingConfig(
         enabled=True,
-        reasoning_end_token_id=13,
+        mode="reasoning_length",
+        reasoning_length={"reasoning_end_token_id": 13},
     )
     expected = rollouts_mod.NemoGymRolloutResult(
         input_ids=torch.empty(0),
@@ -2195,7 +2200,7 @@ def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
         assert kwargs["log_full_result_tables"] is False
         assert kwargs["deduplicate_multimodal_data"] is True
         assert kwargs["debug_payload_metrics"] is True
-        assert kwargs["length_aware_reward_config"] is length_aware_reward_config
+        assert kwargs["reward_shaping_config"] is reward_shaping_config
         yield expected
 
     monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_stream)
@@ -2207,7 +2212,7 @@ def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
         task_to_env={},
         generation_config={},
         log_full_result_tables=False,
-        length_aware_reward_config=length_aware_reward_config,
+        reward_shaping_config=reward_shaping_config,
         deduplicate_multimodal_data=True,
         debug_payload_metrics=True,
     )

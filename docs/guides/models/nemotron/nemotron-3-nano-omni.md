@@ -221,10 +221,11 @@ The synchronous and asynchronous overlays are:
 - [2-node synchronous recipe](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-2n8g-megatron-tp4ep4-gym-video.v1.yaml)
 - [16-node asynchronous recipe](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml)
 
-The opt-in length-reward variants add a correctness-gated penalty based on the
-assistant reasoning-chain length before `</think>`. They keep incorrect
-responses at zero reward while reducing positive reward after 1,024 reasoning
-tokens, reaching the maximum 5% penalty at 4,096 tokens:
+The opt-in length-reward variants select `reasoning_length` under the existing
+`grpo.reward_shaping` configuration. The correctness-gated reward uses the
+assistant reasoning-chain length before `</think>`. It keeps incorrect responses
+at zero while reducing positive reward after 1,024 reasoning tokens, reaching
+the maximum 5% penalty at 4,096 tokens:
 
 - [2-node synchronous length-reward recipe](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-2n8g-megatron-tp4ep4-gym-video-length-reward.v1.yaml)
 - [16-node asynchronous length-reward recipe](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video-length-reward.v1.yaml)

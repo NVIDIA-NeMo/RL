@@ -17,7 +17,8 @@ import torch
 
 from nemo_rl.algorithms.grpo import RewardScalingConfig, scale_rewards
 from nemo_rl.algorithms.reward_functions import (
-    LengthAwareRewardConfig,
+    GRPORewardShapingConfig,
+    ReasoningLengthRewardConfig,
     RewardShapingConfig,
     apply_length_aware_reward,
     apply_reward_shaping,
@@ -45,14 +46,32 @@ def test_length_aware_regularization_reward_boundaries():
         {"tau1": 21, "tau2": 20},
         {"weight": -0.1},
         {"composition": "correctness_gated", "weight": 1.1},
-        {"enabled": True, "reasoning_end_token_id": None},
         {"reasoning_end_token_id": -1},
     ],
 )
-def test_length_aware_reward_config_rejects_invalid_values(kwargs):
+def test_reasoning_length_reward_config_rejects_invalid_values(kwargs):
     config_values = {"reasoning_end_token_id": 13, **kwargs}
     with pytest.raises(ValueError):
-        LengthAwareRewardConfig(**config_values)
+        ReasoningLengthRewardConfig(**config_values)
+
+
+def test_grpo_reward_shaping_requires_reasoning_end_token_for_active_mode():
+    with pytest.raises(ValueError, match="reasoning_end_token_id"):
+        GRPORewardShapingConfig(enabled=True, mode="reasoning_length")
+
+
+def test_grpo_reward_shaping_selects_one_processing_stage():
+    response_length = GRPORewardShapingConfig(enabled=True)
+    reasoning_length = GRPORewardShapingConfig(
+        enabled=True,
+        mode="reasoning_length",
+        reasoning_length={"reasoning_end_token_id": 13},
+    )
+
+    assert response_length.response_length_enabled is True
+    assert response_length.reasoning_length_enabled is False
+    assert reasoning_length.response_length_enabled is False
+    assert reasoning_length.reasoning_length_enabled is True
 
 
 def test_reasoning_chain_token_length_uses_end_token_and_counts_unfinished_turn():
@@ -75,8 +94,7 @@ def test_apply_length_aware_reward_correctness_gates_base_reward():
         }
         for base_reward in (1.0, 0.5, 0.0)
     ]
-    config = LengthAwareRewardConfig(
-        enabled=True,
+    config = ReasoningLengthRewardConfig(
         tau1=2,
         tau2=4,
         weight=0.2,
@@ -102,8 +120,7 @@ def test_apply_length_aware_reward_adds_component_when_configured():
             "full_result": {"reward": 0.0},
         }
     ]
-    config = LengthAwareRewardConfig(
-        enabled=True,
+    config = ReasoningLengthRewardConfig(
         tau1=2,
         tau2=4,
         weight=0.2,
@@ -130,7 +147,7 @@ def test_apply_length_aware_reward_rejects_multi_component_rewards():
             },
         },
     ]
-    config = LengthAwareRewardConfig(enabled=True, reasoning_end_token_id=13)
+    config = ReasoningLengthRewardConfig(reasoning_end_token_id=13)
 
     with pytest.raises(ValueError, match="reward_components"):
         apply_length_aware_reward(results, config)

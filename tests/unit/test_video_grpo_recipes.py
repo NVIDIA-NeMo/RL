@@ -37,7 +37,8 @@ def test_video_grpo_recipes_preserve_unmasked_sync_and_async_contracts():
         assert grpo["max_num_steps"] == 1_000_000
         assert grpo["seq_logprob_error_threshold"] is None
         assert grpo["async_grpo"]["enabled"] is async_enabled
-        assert grpo["length_aware_reward"]["enabled"] is False
+        assert grpo["reward_shaping"]["enabled"] is False
+        assert grpo["reward_shaping"]["mode"] == "response_length"
         assert policy["is_vlm"] is True
         assert vllm_cfg["video"] == {
             "sampling_style": "nemotron_vl",
@@ -65,8 +66,10 @@ def test_video_length_reward_recipes_preserve_arushi_experiment_contract():
 
     for recipe, async_enabled in ((async_recipe, True), (sync_recipe, False)):
         assert recipe["grpo"]["async_grpo"]["enabled"] is async_enabled
-        assert recipe["grpo"]["length_aware_reward"] == {
-            "enabled": True,
+        reward_shaping = recipe["grpo"]["reward_shaping"]
+        assert reward_shaping["enabled"] is True
+        assert reward_shaping["mode"] == "reasoning_length"
+        assert reward_shaping["reasoning_length"] == {
             "tau1": 1024,
             "tau2": 4096,
             "weight": 0.05,

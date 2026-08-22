@@ -1,10 +1,12 @@
 defaults: vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml
 grpo:
-  length_aware_reward:
+  reward_shaping:
     enabled: true
-    tau1: 1024
-    tau2: 4096
-    weight: 0.05
-    composition: correctness_gated
-    # Nemotron Omni's </think> special-token ID.
-    reasoning_end_token_id: 13
+    mode: reasoning_length
+    reasoning_length:
+      tau1: 1024
+      tau2: 4096
+      weight: 0.05
+      composition: correctness_gated
+      # Nemotron Omni's </think> special-token ID.
+      reasoning_end_token_id: 13

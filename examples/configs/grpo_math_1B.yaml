@@ -29,19 +29,21 @@ grpo:
   batch_multiplier: 1
   reward_shaping:
     enabled: false
+    # response_length preserves DAPO/stop-properly shaping;
+    # reasoning_length applies the nested Gym reasoning-chain reward.
+    mode: response_length
     overlong_buffer_length: 128
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}
     stop_properly_penalty_coef: null
-  # Optional NeMo-Gym reasoning-chain length reward. The end-token ID is
-  # model/tokenizer specific and is required when enabled.
-  length_aware_reward:
-    enabled: false
-    tau1: 4096
-    tau2: 13000
-    weight: 0.1
-    composition: additive
-    reasoning_end_token_id: null
+    # Used only when mode=reasoning_length. The end-token ID is
+    # model/tokenizer specific and is required when shaping is enabled.
+    reasoning_length:
+      tau1: 4096
+      tau2: 13000
+      weight: 0.1
+      composition: additive
+      reasoning_end_token_id: null
 
   # Advantage Estimator Configuration
   # Options: "grpo" (default) or "reinforce_plus_plus"

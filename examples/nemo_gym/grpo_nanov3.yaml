@@ -32,15 +32,15 @@ grpo:
   use_dynamic_sampling: False
   reward_shaping:
     enabled: False
-  # Optional reasoning-chain length reward for Gym rollouts. Set the
-  # model/tokenizer-specific reasoning end-token ID when enabling it.
-  length_aware_reward:
-    enabled: false
-    tau1: 4096
-    tau2: 13000
-    weight: 0.1
-    composition: additive
-    reasoning_end_token_id: null
+    mode: response_length
+    # Used only when mode=reasoning_length. Set the model/tokenizer-specific
+    # reasoning end-token ID when enabling reward shaping.
+    reasoning_length:
+      tau1: 4096
+      tau2: 13000
+      weight: 0.1
+      composition: additive
+      reasoning_end_token_id: null
   reward_scaling:
     enabled: False
 

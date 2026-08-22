@@ -27,17 +27,17 @@ grpo:
   batch_multiplier: 1
   reward_shaping:
     enabled: false
+    mode: response_length
     overlong_buffer_length: 128
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}
     stop_properly_penalty_coef: null
-  length_aware_reward:
-    enabled: false
-    tau1: 4096
-    tau2: 13000
-    weight: 0.1
-    composition: additive
-    reasoning_end_token_id: null
+    reasoning_length:
+      tau1: 4096
+      tau2: 13000
+      weight: 0.1
+      composition: additive
+      reasoning_end_token_id: null
 
   # Advantage Estimator Configuration
   # Options: "grpo" (default) or "reinforce_plus_plus"

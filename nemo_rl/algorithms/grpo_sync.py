@@ -692,7 +692,7 @@ def grpo_train_sync(
                         driver_carry,
                         master_config.grpo.reward_scaling,
                     )
-                    if master_config.grpo.reward_shaping.enabled:
+                    if master_config.grpo.reward_shaping.response_length_enabled:
                         driver_carry = apply_reward_shaping(
                             driver_carry,
                             master_config.grpo.reward_shaping,

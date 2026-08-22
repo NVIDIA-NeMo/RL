@@ -921,8 +921,8 @@ class AsyncTrajectoryCollector:
                 "stop_token_ids": None,
                 "stop_strings": None,
             }
-            length_aware_reward_config = (
-                self.master_config.grpo.length_aware_reward
+            reward_shaping_config = (
+                self.master_config.grpo.reward_shaping
                 if isinstance(self.master_config, GRPOMasterConfig)
                 else None
             )
@@ -940,7 +940,7 @@ class AsyncTrajectoryCollector:
                 ),
                 max_rollout_turns=None,
                 greedy=False,
-                length_aware_reward_config=length_aware_reward_config,
+                reward_shaping_config=reward_shaping_config,
                 reward_penalty_config=self.master_config.reward_penalties,
                 thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
                 mask_env_flagged_samples=should_mask_flagged_samples(
