@@ -66,7 +66,7 @@ def _tp2_world() -> Iterator[None]:
 
 
 @pytest.fixture
-def _pp2_world() -> Iterator[None]:
+def _four_rank_world() -> Iterator[None]:
     yield from _distributed_world(4)
 
 
@@ -253,7 +253,7 @@ def _assert_forward_gradient_parity(
         )
 
 
-def test_tp4_forward_and_gradient_parity(_pp2_world: None) -> None:
+def test_tp4_forward_and_gradient_parity(_four_rank_world: None) -> None:
     rank = torch.distributed.get_rank()
     tp_group = torch.distributed.group.WORLD
     singleton_groups = _singleton_groups(4)
@@ -505,8 +505,8 @@ def test_tp2_rejects_sequence_parallel_config(_tp2_world: None) -> None:
     assert parallel_config.sequence_parallel is True
 
 
-def test_tp2_pp2_last_stage_forward_gradient_and_replica_ids(
-    _pp2_world: None,
+def test_tp2_subgroup_forward_gradient_and_replica_ids(
+    _four_rank_world: None,
 ) -> None:
     rank = torch.distributed.get_rank()
     tp_groups = [
@@ -554,7 +554,7 @@ def test_tp2_pp2_last_stage_forward_gradient_and_replica_ids(
     torch.distributed.barrier()
 
 
-def test_tp2_pp2_rejects_context_parallel_config(_pp2_world: None) -> None:
+def test_tp2_subgroup_rejects_context_parallel_config(_four_rank_world: None) -> None:
     rank = torch.distributed.get_rank()
     tp_groups = [
         torch.distributed.new_group([0, 1]),

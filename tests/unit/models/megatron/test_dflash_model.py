@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import dataclasses
+
 import pytest
 import torch
 from megatron.core.model_parallel_config import ModelParallelConfig
@@ -416,6 +418,50 @@ def test_forward_rejects_mismatched_caller_owned_inputs() -> None:
             target_taps=torch.randn(1, 4, 2, 8),
             block_embeddings=torch.randn(1, 2, 8),
             plan=plan,
+        )
+
+
+def test_forward_rejects_device_dtype_and_index_type_mismatches() -> None:
+    body = DFlashBody(
+        _tiny_config(num_hidden_layers=1),
+        parallel_config=_fp32_parallel_config(),
+    )
+    plan = _plan(torch.ones((1, 4), dtype=torch.bool), gamma=2)
+    target_taps = torch.randn(1, 4, 2, 8)
+    block_embeddings = torch.randn(1, 3, 8)
+
+    with pytest.raises(ValueError, match="plan and inputs must share a device"):
+        body(
+            target_taps=target_taps.to("meta"),
+            block_embeddings=block_embeddings.to("meta"),
+            plan=plan,
+        )
+    with pytest.raises(ValueError, match="inputs must share a device"):
+        body(
+            target_taps=target_taps,
+            block_embeddings=block_embeddings.to("meta"),
+            plan=plan,
+        )
+    with pytest.raises(TypeError, match="inputs must share a dtype"):
+        body(
+            target_taps=target_taps,
+            block_embeddings=block_embeddings.to(torch.float64),
+            plan=plan,
+        )
+    with pytest.raises(TypeError, match="floating dtype"):
+        body(
+            target_taps=target_taps.to(torch.int64),
+            block_embeddings=block_embeddings.to(torch.int64),
+            plan=plan,
+        )
+    int32_plan = dataclasses.replace(
+        plan, query_positions=plan.query_positions.to(torch.int32)
+    )
+    with pytest.raises(TypeError, match="torch.int64"):
+        body(
+            target_taps=target_taps,
+            block_embeddings=block_embeddings,
+            plan=int32_plan,
         )
 
 

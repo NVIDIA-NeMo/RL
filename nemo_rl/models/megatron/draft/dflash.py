@@ -62,7 +62,16 @@ _INPUT_TYPE_ERROR_CODES = frozenset({4, 5, 6})
 
 @dataclass(frozen=True, slots=True)
 class DFlashBodyConfig:
-    """Checkpoint-compatible DFlash body dimensions."""
+    """Checkpoint-compatible DFlash body dimensions.
+
+    The defaults pin the public ``z-lab/Qwen3-8B-DFlash-b16`` artifact
+    (revision ``9b41424b7109f9c5413454f481b09a82b85333f4``); the schema is
+    asserted in ``tests/unit/models/megatron/test_dflash_checkpoint_schema.py``.
+    Every dimension listed in the constructor's partitioned-dimension check must
+    stay divisible by the tensor-parallel size -- ``num_key_value_heads`` (8) is
+    the binding constraint, so the pinned artifact supports at most TP=8 (there
+    is no KV-head-duplication fallback).
+    """
 
     hidden_size: int = 4096
     intermediate_size: int = 12288
@@ -442,7 +451,9 @@ class DFlashBody(_ShardedModule):
             value % self.tensor_parallel_size != 0 for value in partitioned_dimensions
         ):
             raise ValueError(
-                "DFlash dimensions must be divisible by tensor parallel size"
+                "DFlash dimensions must be divisible by tensor parallel size "
+                "(num_key_value_heads is the binding constraint: max TP=8 for "
+                "the pinned artifact)"
             )
         self.num_attention_heads_per_partition = (
             self.config.num_attention_heads // self.tensor_parallel_size
