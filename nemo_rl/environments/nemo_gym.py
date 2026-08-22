@@ -17,21 +17,18 @@ import subprocess
 import sys
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
-from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
 
 import ray
 import torch
-from PIL import Image
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.multimodal_utils import (
     attach_image_model_inputs_to_message,
     extract_input_media_sources_from_responses_messages,
-    normalize_media_in_examples,
-    resolve_to_image,
+    media_sources_equal,
     uses_image_placeholder,
 )
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
@@ -42,6 +39,11 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym_multimodal import (
+    _index_per_turn_images,
+    _without_initial_media_sources,
+    normalize_media_in_examples,
+)
 from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
@@ -282,28 +284,6 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     return is_invalid_tool_call, has_malformed_thinking
 
 
-########################################
-# Multimodal helpers
-########################################
-
-
-# WARNING: A function-call output beginning with HTTP(S) is accepted here and
-# passed to ``resolve_to_image``, which performs an outbound request during
-# postprocessing even when the tool result is not actually an image.
-_IMAGE_SRC_PREFIXES = ("data:image/", "http://", "https://", "file://")
-
-
-def _looks_like_image_src(src: str) -> bool:
-    """True when ``src`` plausibly points at an image the loader can open.
-
-    Guards against tool responses (e.g. ``{"x": 0.65, "y": 0.83}`` from a
-    click tool) that are strings but not image URLs. Without this, the
-    indexer forwards the JSON payload to ``resolve_to_image`` → PIL.open,
-    which treats it as a filesystem path and raises ``FileNotFoundError``.
-    """
-    return src.startswith(_IMAGE_SRC_PREFIXES)
-
-
 def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
     """Return nemo_gym's pad_dynamic_image_shapes from an env config, or False.
 
@@ -322,40 +302,6 @@ def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
     return bool(nemo_gym_config.get("pad_dynamic_image_shapes"))
 
 
-def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
-    """Pull PIL images out of a non-assistant Responses-API item.
-
-    Handles both content-list items (user / tool messages carrying
-    ``input_image``/``image``/``image_url`` parts) and ``function_call_output``
-    items whose ``output`` field is an image data URL. Tool outputs that are
-    non-image strings (e.g. structured JSON returned by tools like
-    ``click(x, y)``) contribute zero images to the bucket.
-    """
-    images: list[Image.Image] = []
-    if item.get("type") == "function_call_output":
-        src = item.get("output")
-        if isinstance(src, str) and _looks_like_image_src(src):
-            images.append(resolve_to_image(src))
-        return images
-    content = item.get("content") or []
-    if not isinstance(content, list):
-        return images
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        if part.get("type") not in ("input_image", "image", "image_url"):
-            continue
-        src = part.get("image") or part.get("image_url") or part.get("url")
-        if src is None:
-            continue
-        if isinstance(src, dict):
-            src = src.get("url")
-        if src is None:
-            continue
-        images.append(resolve_to_image(src))
-    return images
-
-
 def _is_trainable_output_item(item: dict) -> bool:
     """Report whether an output item becomes a trainable assistant turn.
 
@@ -364,120 +310,6 @@ def _is_trainable_output_item(item: dict) -> bool:
     two walks disagree and every later turn gets the wrong images.
     """
     return bool(item.get("generation_token_ids"))
-
-
-def _index_per_turn_images(
-    output: list[dict],
-    input_messages: list[dict] | None = None,
-) -> list[list[Image.Image]]:
-    """Bin server-returned images by the trainable turn that saw them.
-
-    Walks the Responses-API items in order and flushes ``pending`` into a
-    per-turn bucket each time it hits an item carrying truthy
-    ``generation_token_ids`` — matching the exact gate that
-    ``_postprocess_nemo_gym_to_nemo_rl_result`` uses to decide which items
-    become trainable turns. Every other item (user turns, tool messages,
-    ``function_call_output``, non-trainable reasoning) contributes its images
-    to ``pending`` for the next trainable turn. This ensures the returned list
-    has one entry per trainable turn, aligned with the postprocess loop's
-    ``turn_idx`` even when the trainable item's role is not ``assistant``
-    (e.g. a reasoning-only response, or a ``function_call``).
-
-    ``input_messages`` is the initial ``responses_create_params.input`` list —
-    images there (e.g. a single-shot user prompt for tool-based envs like
-    circle-click) are consumed by the first trainable turn's tokenized prompt
-    and must land in the first bucket. Agents like ``gym_v_agent`` that keep
-    ``input`` empty and inject observations as ``function_call_output`` items
-    are unaffected — the seed is a no-op when ``input_messages`` is empty.
-    """
-    per_turn: list[list[Image.Image]] = []
-    pending: list[Image.Image] = []
-    for item in input_messages or ():
-        if isinstance(item, dict) and item.get("role") != "assistant":
-            pending.extend(_extract_input_images_from_message(item))
-    for item in output:
-        if item.get(
-            "generation_token_ids"
-        ):  # trainable turn; empty generation_token_ids is skipped by the postprocess loop and must not consume a bucket
-            per_turn.append(pending)
-            pending = []
-        elif item.get("role") != "assistant":
-            pending.extend(_extract_input_images_from_message(item))
-    return per_turn
-
-
-def _media_sources_equal(
-    left: tuple[str, Any],
-    right: tuple[str, Any],
-) -> bool:
-    """Compare tagged media by string value or object identity."""
-    if left[0] != right[0]:
-        return False
-    left_source, right_source = left[1], right[1]
-    return (
-        left_source == right_source
-        if isinstance(left_source, str) and isinstance(right_source, str)
-        else left_source is right_source
-    )
-
-
-def _without_initial_media_sources(
-    messages: Any, initial_sources: list[Any]
-) -> tuple[Any, bool]:
-    """Copy Responses messages and remove one ordered copy of initial images and videos."""
-    if not isinstance(messages, list):
-        return messages, False
-
-    filtered = deepcopy(messages)
-    remaining_sources = list(initial_sources)
-    for message in filtered:
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-
-        filtered_content = []
-        for part in content:
-            part_sources = extract_input_media_sources_from_responses_messages(
-                [{"content": [part]}]
-            )
-            if (
-                remaining_sources
-                and len(part_sources) == 1
-                and _media_sources_equal(part_sources[0], remaining_sources[0])
-            ):
-                remaining_sources.pop(0)
-                continue
-            filtered_content.append(part)
-        message["content"] = filtered_content
-
-    return filtered, not remaining_sources
-
-
-def _attach_multimodal_data_to_user_message(
-    user_message: dict,
-    *,
-    images: list[Image.Image],
-    processor: Any,
-    pad_dynamic_image_shapes: bool = False,
-) -> None:
-    """Attach per-turn multimodal tensors to ``user_message``.
-
-    The processor is only invoked to extract multimodal tensors (pixel_values,
-    imgs_sizes, num_patches, etc.); its text output is discarded — vLLM's
-    tokens remain the trajectory. We therefore feed it the minimal placeholder
-    text it needs to count image regions: one ``processor.image_token`` per
-    image. Passing the vLLM-decoded text does not work because that text
-    already contains expanded ``<img>...<image>*N...</img>`` regions, and the
-    processor would try to re-expand every embedded ``<image>``.
-    """
-    attach_image_model_inputs_to_message(
-        user_message,
-        images=images,
-        processor=processor,
-        pad_dynamic_image_shapes=pad_dynamic_image_shapes,
-    )
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -507,7 +339,7 @@ class NemoGym(EnvironmentInterface):
             from nemo_rl.algorithms.utils import get_tokenizer
 
             self._processor = get_tokenizer(tokenizer_config, get_processor=True)
-            # _attach_multimodal_data_to_user_message assumes a placeholder-style
+            # attach_image_model_inputs_to_message assumes a placeholder-style
             # processor (imgs_sizes / num_frames reconstruction + pad_to_max_shape
             # PackedTensor build). A non-placeholder VLM would silently produce
             # wrong multimodal tensors — fail at actor construction instead.
@@ -515,7 +347,7 @@ class NemoGym(EnvironmentInterface):
                 "NemoGym multimodal path assumes a placeholder-style processor "
                 "(see _PLACEHOLDER_STYLE_PROCESSOR_NAMES in nemo_rl/data/multimodal_utils.py); "
                 f"got {type(self._processor).__name__}. Update "
-                "_attach_multimodal_data_to_user_message before enabling."
+                "attach_image_model_inputs_to_message before enabling."
             )
 
     def _require_spinup(self) -> None:
@@ -794,7 +626,7 @@ Depending on your data shape, you may want to change these values."""
             bool(raw_initial_sources)
             and len(agent_initial_sources) == len(raw_initial_sources)
             and all(
-                _media_sources_equal(agent_source, raw_source)
+                media_sources_equal(agent_source, raw_source)
                 for agent_source, raw_source in zip(
                     agent_initial_sources, raw_initial_sources
                 )
@@ -803,7 +635,7 @@ Depending on your data shape, you may want to change these values."""
         returned_media_matches_raw_input = len(returned_media_sources) == len(
             raw_initial_sources
         ) and all(
-            _media_sources_equal(returned_source, raw_source)
+            media_sources_equal(returned_source, raw_source)
             for returned_source, raw_source in zip(
                 returned_media_sources, raw_initial_sources
             )
@@ -911,7 +743,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 images_this_turn = (
                     per_turn_images[turn_idx] if turn_idx < len(per_turn_images) else []
                 )
-                _attach_multimodal_data_to_user_message(
+                attach_image_model_inputs_to_message(
                     user_message,
                     images=images_this_turn,
                     processor=processor,

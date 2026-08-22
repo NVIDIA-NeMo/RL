@@ -15,7 +15,7 @@
 from PIL import Image
 
 from nemo_rl.data.multimodal_utils import image_to_data_url
-from nemo_rl.environments.nemo_gym import (
+from nemo_rl.environments.nemo_gym_multimodal import (
     _extract_input_images_from_message,
     _index_per_turn_images,
 )

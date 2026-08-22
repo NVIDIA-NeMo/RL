@@ -805,6 +805,12 @@ class MegatronGenerationMixin:
         length = int(data["input_lengths"][index].item())
         prompt = data["input_ids"][index, :length].tolist()
         imgs, imgs_sizes, num_frames = self._sample_vision_tensors(data, index)
+        media_cache_keys = data.get("media_cache_key")
+        media_cache_key = (
+            media_cache_keys[index] if media_cache_keys is not None else None
+        )
+        if media_cache_key is not None and not isinstance(media_cache_key, str):
+            raise TypeError("media_cache_key entries must be strings or None.")
         if imgs is None:
             return prompt, None
 
@@ -831,10 +837,13 @@ class MegatronGenerationMixin:
             }
         else:
             modality_data = {"imgs": imgs, "imgs_sizes": imgs_sizes}
-        return prompt, {
+        multi_modal_data: dict[str, Any] = {
             modality: modality_data,
             "media_tokens_preexpanded": True,
         }
+        if media_cache_key is not None:
+            multi_modal_data["media_cache_key"] = media_cache_key
+        return prompt, multi_modal_data
 
     def _prepare_data_for_generation(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
