@@ -1242,8 +1242,6 @@ class VllmInternalWorkerExtension:
         ``pre`` allocates a temp recv buffer and ``post`` copies the TP-local
         slice back into the live merged param.
         """
-        packed_broadcast_preflight_consumer(self.model_update_group, 0)
-
         import os
         from collections import OrderedDict
 
@@ -1285,6 +1283,11 @@ class VllmInternalWorkerExtension:
         # outer except mirrors those transports' error contract as well.
         try:
             with self._weight_update_lifecycle("nccl_reshard") as finalize:
+                # A train-signaled preflight failure must follow the same
+                # raise-or-return-False contract and poison the worker like
+                # every other failure in this transport, so it runs inside
+                # the guard rather than ahead of it.
+                packed_broadcast_preflight_consumer(self.model_update_group, 0)
                 # Group params by PP stage so different stages' bulk reshards run
                 # concurrently on their own streams.  Non-PP = single stage 0 (params
                 # carry no "pp_stage" key), so this collapses to one stage / one stream.
