@@ -23,6 +23,7 @@ import torch.distributed as dist
 from nemo_rl.algorithms.draft_update_schedule import DraftUpdateDecision
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     validate_draft_enabled_consensus,
+    validate_draft_update_outcome_consensus,
     validate_draft_update_decision_consensus,
 )
 
@@ -130,6 +131,35 @@ def test_missing_required_decision_raises_on_every_rank_after_collectives() -> N
         validate_draft_update_decision_consensus(
             decision,
             draft_enabled=True,
+            group=dist.group.WORLD,
+            device=torch.device("cpu"),
+        )
+
+
+def test_second_dp_owner_failure_returns_false_on_every_rank() -> None:
+    _init_torchrun_group()
+    rank = int(os.environ["RANK"])
+
+    assert (
+        validate_draft_update_outcome_consensus(
+            run_draft=True,
+            local_owner=True,
+            local_update_successful=rank == 0,
+            group=dist.group.WORLD,
+            device=torch.device("cpu"),
+        )
+        is False
+    )
+
+
+def test_requested_update_without_owner_raises_on_every_rank() -> None:
+    _init_torchrun_group()
+
+    with pytest.raises(RuntimeError, match="no draft owner exists"):
+        validate_draft_update_outcome_consensus(
+            run_draft=True,
+            local_owner=False,
+            local_update_successful=False,
             group=dist.group.WORLD,
             device=torch.device("cpu"),
         )

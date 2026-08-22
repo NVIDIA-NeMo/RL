@@ -72,6 +72,8 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         out["draft_grad_norm"] = results[0]["draft_grad_norm"]
     if "draft_update_decision" in results[0]:
         out["draft_update_decision"] = results[0]["draft_update_decision"]
+    if "draft_update_successful" in results[0]:
+        out["draft_update_successful"] = results[0]["draft_update_successful"]
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
     for r in results:
         for k, v in r["all_mb_metrics"].items():

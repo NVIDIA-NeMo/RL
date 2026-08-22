@@ -21,6 +21,7 @@ from megatron.bridge.training.config import OptimizerConfigOverrideProviderConte
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import (
     OptimizerParamScheduler,
+    ParamGroupOverride,
     combine_param_group_overrides,
 )
 from pydantic import ValidationError
@@ -109,9 +110,35 @@ def test_draft_optimizer_override_is_opt_in() -> None:
 
     assert build_draft_optimizer_override_provider(None) is None
     assert (
-        build_draft_optimizer_override_provider(Eagle3DraftConfig(enabled=True)) is None
+        build_draft_optimizer_override_provider(Eagle3DraftConfig(enabled=True))
+        is not None
     )
     assert build_draft_optimizer_override_provider(configured_but_disabled) is None
+
+
+def test_enabled_draft_without_optimizer_uses_neutral_group_selector() -> None:
+    provider = build_draft_optimizer_override_provider(Eagle3DraftConfig(enabled=True))
+
+    assert provider is not None
+    overrides = provider.build_config_overrides(
+        OptimizerConfigOverrideProviderContext(
+            scheduler_config=MagicMock(),
+            optimizer_config=OptimizerConfig(
+                lr=2.0e-3,
+                min_lr=2.0e-4,
+                weight_decay=0.1,
+            ),
+            model=MagicMock(),
+        )
+    )
+
+    assert overrides is not None
+    draft_overrides = [
+        override
+        for key, override in overrides.items()
+        if key.predicate.name == "draft_parameter"
+    ]
+    assert draft_overrides == [ParamGroupOverride()]
 
 
 def test_draft_optimizer_provider_only_overrides_tagged_parameters() -> None:
