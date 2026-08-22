@@ -17,7 +17,7 @@ import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import torch
 import zmq
@@ -180,11 +180,19 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 
 class VllmInternalWorkerExtension:
+    # Per-PP-stage refit groups, None until init_nccl_reshard_comm_group builds them.
+    # Declared rather than sprung into existence so a rebuild can release the previous
+    # ones without probing, matching AbstractPolicyWorker.model_update_group. None and
+    # not {} because a mutable class-level default is shared by every instance.
+    pp_comm_groups: Optional[dict[int, Any]] = None
     # True once the MTP drafter has been served by a one-time disk load (see
     # load_mtp_weights_from_disk); refit then leaves those static weights alone.
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
+    # None until init_collective builds it. Declared so a rebuild can release the
+    # previous group without probing for the attribute's existence.
+    model_update_group: Any = None
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -241,7 +249,13 @@ class VllmInternalWorkerExtension:
             rank_prefix, world_size - train_world_size
         )
 
-        self.model_update_group = StatelessProcessGroup(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        # Rebuilding is the recovery path for a dead generation rank, so this runs more
+        # than once per job. Without the release, each rebuild would strand the previous
+        # NCCL communicator and its TCPStore for the life of the worker.
+        if self.model_update_group is not None:
+            self.model_update_group.abort()
+
+        self.model_update_group = StatelessProcessGroup(
             master_address=ip, port=port, rank=rank, world_size=world_size
         )
         # Free cached torch-allocator blocks so NCCL's P2P transport buffers
@@ -273,7 +287,12 @@ class VllmInternalWorkerExtension:
 
         # Free cached blocks so NCCL P2P buffers have headroom (see init_collective).
         torch.cuda.empty_cache()
-        self.pp_comm_groups = {}  # pyrefly: ignore[implicitly-defined-attribute]
+        # Aborted before the dict is dropped, not just dereferenced: garbage collecting
+        # the handle does not release the NCCL communicator or unbind the TCPStore, so
+        # a reshard run would strand one of each per PP stage per recovery.
+        for previous in (self.pp_comm_groups or {}).values():
+            previous.abort()
+        self.pp_comm_groups = {}
         for stage in range(pp_size):
             group = StatelessProcessGroup(
                 master_address=pp_ips[stage],
@@ -748,8 +767,32 @@ class VllmInternalWorkerExtension:
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
-    def update_weights_from_collective(self) -> bool:
-        """Update the model weights from collective communication."""
+    def update_weights_from_collective(
+        self, refit_timeout_s: float | None = None
+    ) -> bool:
+        """Update the model weights from collective communication.
+
+        Guarded for the same reason as the producer side: if a peer rank dies mid-refit
+        this blocks in NCCL forever. Note the buffers hold PARTIAL weights once aborted,
+        so the caller must not serve from this engine until a later refit completes.
+        """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+            hold_refit_for_fault_injection,
+        )
+
+        with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
+            hold_refit_for_fault_injection()
+            result = self._update_weights_from_collective()
+        if guard.fired:
+            raise RefitAborted(
+                f"refit receive exceeded {refit_timeout_s}s and was aborted; "
+                "this engine now holds partial weights and must not serve until refit"
+            )
+        return result
+
+    def _update_weights_from_collective(self) -> bool:
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."
@@ -1093,8 +1136,16 @@ class VllmInternalWorkerExtension:
 
         return mapping
 
-    def nccl_reshard_refit(self) -> bool:
-        """Receive weights from training workers via xferdtensor.
+    def nccl_reshard_refit(self, refit_timeout_s: float | None = None) -> bool:
+        """Receive weights from training workers via xferdtensor, under a deadline.
+
+        Guarded like the collective receive: a peer dying mid-refit blocks this in NCCL
+        forever, and the buffers hold PARTIAL weights once aborted, so the caller must
+        not serve from this engine until a later refit completes.
+
+        Both communicator families are handed to the watchdog -- the per-PP-stage bulk
+        groups and the shared model_update_group -- because the transfer uses them in
+        sequence and a hang can be in either.
 
         Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``,
         built once in ``prepare_nccl_reshard_refit_info``) provides the dst buffer:
@@ -1103,6 +1154,28 @@ class VllmInternalWorkerExtension:
         ``pre`` allocates a temp recv buffer and ``post`` copies the TP-local
         slice back into the live merged param.
         """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+            hold_refit_for_fault_injection,
+        )
+
+        groups = [
+            *(self.pp_comm_groups or {}).values(),
+            self.model_update_group,
+        ]
+        with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
+            hold_refit_for_fault_injection()
+            result = self._nccl_reshard_refit()
+        if guard.fired:
+            raise RefitAborted(
+                f"refit nccl_reshard receive exceeded {refit_timeout_s}s and was "
+                "aborted; this engine now holds partial weights and must not serve "
+                "until refit"
+            )
+        return result
+
+    def _nccl_reshard_refit(self) -> bool:
         import os
         from collections import OrderedDict
 
@@ -1148,6 +1221,15 @@ class VllmInternalWorkerExtension:
             min(int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")), len(stage_params)),
         )
 
+        # Narrowed once here rather than at each use: reaching this without the groups
+        # built is a wiring error, and a named failure beats a TypeError on a subscript.
+        pp_comm_groups = self.pp_comm_groups
+        if pp_comm_groups is None:
+            raise RuntimeError(
+                "nccl_reshard refit reached before init_nccl_reshard_comm_group built "
+                "the per-PP-stage groups"
+            )
+
         streams = [torch.cuda.Stream() for _ in range(num_streams)]
         events = {}
         for idx, (stage, params) in enumerate(stage_params.items()):
@@ -1156,7 +1238,7 @@ class VllmInternalWorkerExtension:
                 events[idx - num_streams].synchronize()
             stage_stream = streams[idx % num_streams]
             with torch.cuda.stream(stage_stream):
-                group = self.pp_comm_groups[stage]
+                group = pp_comm_groups[stage]
                 for p in params:
                     _recv_one_param(p, group, stage_stream)
                 ev = torch.cuda.Event()

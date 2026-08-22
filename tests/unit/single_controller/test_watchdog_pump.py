@@ -274,6 +274,43 @@ class TestGenerationFleetProbe:
         assert monitor.state_of(1) is ShardState.DEAD
         assert monitor.serving_shards() == [0]
 
+    def test_a_dead_actor_is_conclusive_on_the_first_round(self):
+        """A RayActorError is proof, not another ambiguous data point.
+
+        A probe timeout cannot tell a slow shard from a dead one, which is what the
+        counters are for. Ray reporting the actor dead can, so waiting for
+        unhealthy_threshold rounds only delays the verdict -- and the refit deadline can
+        expire inside that delay, which is exactly how job 5925668 aborted a hung refit
+        while the corpse was still SUSPECT. A threshold of 99 makes counting impossible.
+        """
+        monitor = GenerationFleetHealth(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=99)
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[True, False])
+        asyncio.run(_run_probe_ticks(ctrl, 2))
+        assert monitor.state_of(1) is ShardState.DEAD
+        assert monitor.absent_shards() == [1]
+
+    def test_a_timeout_is_still_counted_rather_than_trusted(self):
+        """The other half: an ambiguous failure must keep its benefit of the doubt.
+
+        A shard busy inside a refit stops answering probes without being dead. Treating
+        that like proof of death would condemn a healthy fleet on one slow round.
+        """
+        monitor = GenerationFleetHealth(
+            shard_count=1, policy=FleetHealthPolicy(unhealthy_threshold=99)
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[True])
+        ctrl._async_cfg.generation_fleet_health.probe_timeout_s = 0.001
+        ctrl._gen.worker_group.workers = [
+            SimpleNamespace(
+                is_alive=SimpleNamespace(remote=lambda: asyncio.sleep(10.0))
+            )
+        ]
+        asyncio.run(_run_probe_ticks(ctrl, 3))
+        assert monitor.state_of(0) is ShardState.SUSPECT
+        assert monitor.absent_shards() == []
+
     def test_fleet_state_is_published(self):
         monitor = GenerationFleetHealth(
             shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
@@ -297,6 +334,54 @@ class TestGenerationFleetProbe:
             policy=FleetHealthPolicy(unhealthy_threshold=1, min_healthy_shards=1),
         )
         ctrl = self._with_fleet(monitor, worker_alive=[False])
+
+        async def _main():
+            await _run_probe_ticks(ctrl, 3)
+            await ctrl._stall_watchdog_pump()
+
+        with pytest.raises(GenerationFleetExhausted):
+            asyncio.run(_main())
+
+    def test_a_tick_inside_a_recovery_does_not_end_the_run(self):
+        """Regression: the exhaustion check killed the recovery that was about to succeed.
+
+        _recover_from_failed_refit marks every serving shard partial, so the serving set
+        is empty by construction until the retry refit promotes them back -- across two
+        awaits that yield this loop. A watchdog tick landing in that window used to see
+        zero serving shards, raise GenerationFleetExhausted, and end the run while the
+        retry was still in flight, blaming an exhausted fleet for a recovery in progress.
+
+        The default tick is 30s and a rebuild plus a full refit can easily outlast it.
+        """
+        monitor = GenerationFleetHealth(
+            shard_count=1,
+            policy=FleetHealthPolicy(unhealthy_threshold=1, min_healthy_shards=1),
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[False])
+
+        async def _main():
+            await _run_probe_ticks(ctrl, 3)
+            with ctrl._recovery_window():
+                # _run_ticks, not the raw pump: the pump is `while True` and only ever
+                # returns by raising, so awaiting it directly here would hang forever --
+                # which is precisely what the fix makes it do, since the exhaustion check
+                # it used to raise from is now skipped inside this window.
+                await _run_ticks(ctrl, 3)
+
+        asyncio.run(_main())  # must not raise
+
+    def test_the_window_reopens_the_check_even_if_the_retry_raises(self):
+        """A leaked flag would disable the exhaustion check for the rest of the run."""
+        monitor = GenerationFleetHealth(
+            shard_count=1,
+            policy=FleetHealthPolicy(unhealthy_threshold=1, min_healthy_shards=1),
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[False])
+
+        with pytest.raises(RuntimeError, match="retry blew up"):
+            with ctrl._recovery_window():
+                raise RuntimeError("retry blew up")
+        assert ctrl._recovering_from_refit is False
 
         async def _main():
             await _run_probe_ticks(ctrl, 3)

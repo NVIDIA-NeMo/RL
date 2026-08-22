@@ -25,6 +25,12 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 class AbstractPolicyWorker:
     """Base class for policy workers with shared functionality."""
 
+    # None until init_collective builds it. Declared so a rebuild can release the
+    # previous group without probing for the attribute's existence.
+    model_update_group: Optional[Any] = None
+    # Same, for the per-PP-stage group the nccl_reshard transport builds.
+    pp_comm_group: Optional[Any] = None
+
     def init_collective(
         self,
         ip: str,
@@ -44,6 +50,12 @@ class AbstractPolicyWorker:
             nccl_peer: NCCL initialization protocol used by the inference workers
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
+
+        # Rebuilding is the recovery path for a dead generation rank, so this runs more
+        # than once per job. Without the release, each rebuild would strand the previous
+        # NCCL communicator and its TCPStore for the life of the worker.
+        if self.model_update_group is not None:
+            self.model_update_group.abort()
 
         self.model_update_group = StatelessProcessGroup(
             master_address=ip, port=port, rank=self.rank, world_size=world_size
@@ -71,6 +83,13 @@ class AbstractPolicyWorker:
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
+        # Released for the same reason init_collective releases model_update_group:
+        # _build re-runs both communicator families on every reconcile, so without this
+        # each recovery strands a NCCL communicator and a bound TCPStore per PP stage for
+        # the life of the worker.
+        if self.pp_comm_group is not None:
+            self.pp_comm_group.abort()
+
         self.pp_comm_group = StatelessProcessGroup(
             master_address=pp_ips[my_pp_stage],
             port=pp_ports[my_pp_stage],
@@ -97,7 +116,11 @@ class AbstractPolicyWorker:
             "prepare_nccl_reshard_refit_info is not implemented for this policy worker"
         )
 
-    def nccl_reshard_refit(self, kv_scales: Optional[dict[str, float]] = None) -> None:
+    def nccl_reshard_refit(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
+    ) -> None:
         """Transfer policy weights with NCCL reshard refit."""
         # This is a placeholder implementation.
         # Implementation should be located in each policy worker implementation.

@@ -287,6 +287,19 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     max_restart_attempts_per_shard: PositiveInt = 5
     # Serving shards below which the run cannot usefully continue.
     min_healthy_shards: PositiveInt = 1
+    # Deadline for one refit collective, after which each participating worker aborts its
+    # own communicator.
+    #
+    # With enabled=True the controller then rebuilds over the survivors and retries once.
+    # With enabled=False there is nothing to rebuild against, so the abort ends the run
+    # with RefitAborted -- still far better than hanging forever inside NCCL, but choose
+    # the deadline knowing there is no second chance.
+    #
+    # None disarms it: no watchdog thread is started and the refit path is byte-identical
+    # to before. Set it well above a healthy refit -- observed at ~1.9s for a 1.5B model on
+    # GB200 -- because the cost of firing early is aborting a run that was merely slow,
+    # while the cost of firing late is only that a wedge lasts longer before it is broken.
+    refit_timeout_s: Optional[PositiveFloat] = None
 
     @model_validator(mode="after")
     def _check_consistent(self) -> "FleetHealthConfig":

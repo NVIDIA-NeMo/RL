@@ -774,6 +774,8 @@ def setup_single_controller(
         train_cluster=train_cluster,
         inference_cluster=inference_cluster,
         refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+        # Only armed when configured; None leaves the refit path unchanged.
+        refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
     )
     weight_synchronizer.init_communicator()
     setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0

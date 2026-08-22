@@ -36,6 +36,7 @@ run on separate GPU clusters, so the phase transitions (offload / restore) are
 owned by the orchestrator, not here.
 """
 
+from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Any, Optional
 
@@ -43,6 +44,7 @@ import ray
 
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.membership import RefitMembership, plan_refit_membership
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     make_nccl_reshard_refit_info_wire_safe,
 )
@@ -77,11 +79,13 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         generation: Any,
         train_cluster: Any,
         inference_cluster: Any,
+        refit_timeout_s: Optional[float] = None,
     ):
         self._policy = policy
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
+        self._refit_timeout_s = refit_timeout_s
         self._stale = True
 
     def _train_parallelism(self) -> dict[str, int]:
@@ -115,8 +119,12 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             # Shard-to-shard reshard: train sends its TP/EP-local shards, gen
             # receives directly into its own (different) layout.  kv_scales ride
             # the misc packed-broadcast for FP8 KV cache.
-            futures_train = self._policy.nccl_reshard_refit(kv_scales=kv_scales)
-            futures_inference = self._generation.nccl_reshard_refit()
+            futures_train = self._policy.nccl_reshard_refit(
+                kv_scales=kv_scales, refit_timeout_s=self._refit_timeout_s
+            )
+            futures_inference = self._generation.nccl_reshard_refit(
+                refit_timeout_s=self._refit_timeout_s
+            )
 
             ray.get(futures_train)
             results = ray.get(futures_inference)
@@ -136,11 +144,38 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         return self._stale
 
     def init_communicator(self) -> None:
+        """Build both communicator families and the refit plan, over the whole fleet."""
+        dp_size = self._generation.worker_group.dp_size
+        self._build(
+            plan_refit_membership(
+                surviving_shards=list(range(dp_size)),
+                dp_size=dp_size,
+                total_gen_workers=len(self._generation.worker_group.workers),
+                train_world_size=self._train_cluster.world_size(),
+            )
+        )
+
+    def _build(self, membership: RefitMembership) -> None:
+        """Build everything this transport needs for the given fleet membership.
+
+        Shared by the initial build and by a rebuild after a shard is lost, deliberately.
+        All three pieces below are functions of the inference world size, so keeping two
+        copies of this arithmetic is how the communicators and the refit plan would come
+        to disagree -- and that disagreement is silent, because a mesh sized for the old
+        fleet still runs, it just writes the wrong slices. Sharing the path also means
+        every normal run exercises the rebuild code.
+        """
+        # First, so that everything below dispatches to the new membership. Step 3
+        # distributes the regenerated plan through prepare_nccl_reshard_refit_info,
+        # which consults it; setting it afterwards sends the new plan to the shard the
+        # rebuild just excluded.
+        self._generation.set_refit_membership(membership)
+
         train_parallelism = self._train_parallelism()
         gen_parallelism = self._gen_parallelism()
-        train_world_size = self._train_cluster.world_size()
-        inference_world_size = self._inference_cluster.world_size()
-        world_size = train_world_size + inference_world_size
+        train_world_size = membership.train_world_size
+        world_size = membership.world_size
+        inference_world_size = world_size - train_world_size
 
         # 1. model_update_group: shared channel for the misc packed-broadcast
         #    (and the FP8 KV-cache scales).  Same setup as the collective path.
@@ -148,9 +183,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         futures_train = self._policy.init_collective(
             ip, port, world_size, train_world_size=train_world_size
         )
-        futures_inference = self._generation.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
-        )
+        futures_inference = self._generation.rebuild_collective(membership, ip, port)
         ray.get(futures_train + futures_inference)
 
         # 2. Bulk-path comm group(s): one per PP stage, each spanning that
@@ -187,7 +220,8 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             sub_world_size=sub_world_size,
             ranks_in_group=ranks_in_group,
         )
-        futures_inference = self._generation.init_nccl_reshard_comm_group(
+        futures_inference = self._generation.rebuild_nccl_reshard_comm_group(
+            membership,
             pp_ips=pp_ips,
             pp_ports=pp_ports,
             pp_size=pp_size,
@@ -199,6 +233,12 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         # 3. Refit metadata.  Train builds backend-agnostic per-layer metadata
         #    (HF naming convention); gen maps it into its own fused layout
         #    (e.g. vLLM's w13/w2).
+        #
+        #    Regenerated, not reused, on a rebuild. Each parameter's destination
+        #    placements are derived from inference_world_size, so a plan built for the
+        #    old fleet would have survivors writing the slices the dead shard used to
+        #    own and leaving their own unwritten -- with no error, because a stale mesh
+        #    is still a valid mesh.
         nccl_reshard_refit_info = self._policy.prepare_nccl_reshard_refit_info(
             train_parallelism,
             gen_parallelism,
@@ -215,6 +255,43 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             nccl_reshard_refit_info
         )
         self._generation.prepare_nccl_reshard_refit_info(wire_refit_info)
+
+    def reconcile_communicator(self, absent_shards: Sequence[int]) -> bool:
+        """Rebuild both communicator families and regenerate the refit plan.
+
+        This transport is harder to recover than the plain broadcast, and the difference
+        is worth stating rather than discovering. Two families must be reconciled: the
+        shared ``model_update_group``, and the per-PP-stage bulk groups whose
+        ``sub_world_size`` is itself a function of the inference world size.
+
+        More importantly the bulk path is a mesh-to-mesh redistribute, not a broadcast:
+        ``prepare_nccl_reshard_refit_info`` derives each parameter's destination
+        placements from ``gen_world_size``, so every gen rank receives its own slice
+        rather than the same bytes. Dropping a rank therefore does not merely reduce the
+        number of receivers -- it orphans the slices that rank owned, and the survivors
+        would come back holding weights that were never written. Resizing the
+        communicators without regenerating the plan would corrupt the refit silently,
+        which is why the plan is regenerated rather than reused.
+        """
+        if not absent_shards:
+            return False
+
+        dp_size = self._generation.worker_group.dp_size
+        surviving = [idx for idx in range(dp_size) if idx not in set(absent_shards)]
+        membership = plan_refit_membership(
+            surviving_shards=surviving,
+            dp_size=dp_size,
+            total_gen_workers=len(self._generation.worker_group.workers),
+            train_world_size=self._train_cluster.world_size(),
+        )
+        print(
+            f"  refit: rebuilding nccl_reshard communicators without shards "
+            f"{sorted(absent_shards)}; gen world "
+            f"{len(surviving) * membership.workers_per_shard}",
+            flush=True,
+        )
+        self._build(membership)
+        return True
 
     def shutdown(self) -> None:
         # The NCCL process groups' lifecycle is managed by Ray actor teardown;

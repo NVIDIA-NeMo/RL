@@ -2479,11 +2479,45 @@ class MegatronPolicyWorkerImpl(
     def broadcast_weights_for_collective(
         self,
         kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
     ) -> None:
-        """Broadcast the weights for collective communication."""
+        """Broadcast the weights for collective communication.
+
+        A generation rank that dies mid-broadcast leaves this call blocked in NCCL with no
+        timeout and no error -- observed as both policy workers stuck in
+        ``packed_broadcast_producer -> cuda stream synchronize`` while the run sat wedged.
+        The watchdog is the only way out, because the controller cannot reach this actor
+        while its event loop is inside the collective. Disarmed unless refit_timeout_s is
+        set, so the default path is unchanged.
+        """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+        )
+
+        with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
+            self._broadcast_weights_for_collective(
+                kv_scales=kv_scales,
+                buffer_size_bytes=buffer_size_bytes,
+                num_buffers=num_buffers,
+            )
+        if guard.fired:
+            # The aborted collective returned cleanly, so this is the only signal there is.
+            raise RefitAborted(
+                f"refit broadcast exceeded {refit_timeout_s}s and was aborted; "
+                "a generation rank most likely stopped participating"
+            )
+
+    def _broadcast_weights_for_collective(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
+    ) -> None:
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
             iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
@@ -2815,18 +2849,43 @@ class MegatronPolicyWorkerImpl(
         return HFToLocalParamMap(specs=mapping)
 
     @torch.no_grad()
-    def nccl_reshard_refit(self, kv_scales=None):
-        """Transfer weights to generation workers via xferdtensor.
+    def nccl_reshard_refit(self, kv_scales=None, refit_timeout_s=None):
+        """Transfer weights to generation workers via xferdtensor, under a deadline.
 
-        Uses TP-local shards directly from Megatron parameters, bypassing
-        the Bridge's PP broadcast + TP gather.  The modified xferdtensor
-        reconstructs the full tensor from per-rank shards internally.
+        Guarded exactly like the collective producer, and for the same reason: a
+        generation rank that dies mid-refit leaves this blocked inside NCCL with no
+        error and no progress, and the controller cannot reach this actor to break it
+        because its event loop is inside the transfer.
+
+        BOTH communicator families are handed to the watchdog. This transport moves the
+        bulk over the per-PP-stage ``pp_comm_group`` and then broadcasts the remainder
+        over the shared ``model_update_group``, so the hang can be in either and nothing
+        here can tell which. Aborting both is safe -- abort() is idempotent -- and the
+        recovery rebuilds both anyway.
+
+        Disarmed unless refit_timeout_s is set, so the default path is unchanged.
 
         ``kv_scales`` (FP8 KV cache): the per-layer k/v(/q) scales ride the misc
         packed-broadcast as plain scale tensors (the is_nccl_reshard_param whitelist
         excludes ``.k_scale``/``.v_scale``/``.q_scale`` -> misc); the gen side finalizes
         them via ``_maybe_process_fp8_kv_cache``.  No out-of-band channel needed.
         """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+        )
+
+        groups = [getattr(self, "pp_comm_group", None), self.model_update_group]
+        with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
+            self._nccl_reshard_refit(kv_scales=kv_scales)
+        if guard.fired:
+            # The aborted transfer returned cleanly, so this is the only signal there is.
+            raise RefitAborted(
+                f"refit nccl_reshard exceeded {refit_timeout_s}s and was aborted; "
+                "a generation rank most likely stopped participating"
+            )
+
+    def _nccl_reshard_refit(self, kv_scales=None):
         # hf_to_local_param_map is built once in prepare_nccl_reshard_refit_info;
         # weight values change but the name → spec mapping is stable across
         # refits.

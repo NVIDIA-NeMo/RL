@@ -1,0 +1,381 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Recovering the refit after a generation shard dies during or around it.
+
+Two distinct failures land on this path, and job 5925668 hit one with each variant of
+the functional test:
+
+``RefitAborted``    a rank went silent inside the collective and a worker's watchdog
+                    broke it. Survivors hold partial weights.
+``RayActorError``   the collective completed and the shard died before its RPC
+                    returned. Survivors hold complete weights.
+
+What the tests here pin down is the ordering that made the first attempt fail on real
+hardware: the repair has to establish who is gone *itself*, rather than reading a health
+monitor whose verdict arrives on a probe schedule.
+"""
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+import ray.exceptions
+
+from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.distributed.refit_watchdog import RefitAborted
+from nemo_rl.models.generation.fleet_health import (
+    FleetHealthPolicy,
+    GenerationFleetHealth,
+    ShardState,
+)
+
+
+async def _completed(value=None):
+    return value
+
+
+async def _failed(error):
+    raise error
+
+
+class _Synchronizer:
+    """Fails the first sync, then succeeds. Records what it was reconciled to."""
+
+    def __init__(self, failure, *, rebuild_succeeds: bool = True) -> None:
+        self._failure = failure
+        self._rebuild_succeeds = rebuild_succeeds
+        self.sync_calls = 0
+        self.reconciled_with: list[list[int]] = []
+        # State of the fleet at the moment the retry ran, which is the only place the
+        # dead shard's exclusion can actually be observed.
+        self.absent_at_retry: list[int] | None = None
+        self._monitor = None
+
+    def bind(self, monitor) -> None:
+        self._monitor = monitor
+
+    def sync_weights(self, *, kv_scales=None):
+        del kv_scales
+        self.sync_calls += 1
+        if self.sync_calls == 1:
+            raise self._failure
+        if self._monitor is not None:
+            self.absent_at_retry = self._monitor.absent_shards()
+
+    def reconcile_communicator(self, absent):
+        self.reconciled_with.append(sorted(absent))
+        return bool(absent) and self._rebuild_succeeds
+
+
+def _make_controller(
+    failure,
+    *,
+    shard_count: int = 2,
+    dead_shards: tuple[int, ...] = (0,),
+    rebuild_succeeds: bool = True,
+    with_monitor: bool = True,
+):
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = SimpleNamespace(
+        recompute_kv_cache_after_weight_updates=False,
+        generation_fleet_health=SimpleNamespace(
+            probe_timeout_s=1.0, probe_interval_s=0.01
+        ),
+    )
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+
+    monitor = None
+    if with_monitor:
+        # unhealthy_threshold well above anything a single probe round could reach, so a
+        # DEAD verdict here can only have come from the conclusive path.
+        monitor = GenerationFleetHealth(
+            shard_count=shard_count,
+            policy=FleetHealthPolicy(unhealthy_threshold=99, min_healthy_shards=1),
+        )
+    ctrl._gen_fleet = monitor
+
+    sync = _Synchronizer(failure, rebuild_succeeds=rebuild_succeeds)
+    sync.bind(monitor)
+    ctrl._weight_synchronizer = sync
+
+    ctrl._gen = SimpleNamespace(
+        requires_kv_scale_sync=False,
+        invalidate_kv_cache=MagicMock(),
+        worker_group=SimpleNamespace(
+            get_dp_leader_worker_idx=lambda shard: shard,
+            workers=[
+                SimpleNamespace(
+                    is_alive=SimpleNamespace(
+                        remote=(
+                            (lambda: _failed(ray.exceptions.ActorDiedError()))
+                            if idx in dead_shards
+                            else (lambda: _completed(True))
+                        )
+                    )
+                )
+                for idx in range(shard_count)
+            ],
+        ),
+    )
+    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._trainer_version = 7
+    # _sync_weights now asks _should_use_nemo_gym before aborting stale in-flight
+    # rollouts (upstream #3263). An empty env dict selects the native path, and an
+    # empty registry makes _abort_stale_inflight a no-op -- neither is what this test
+    # is about, but both have to exist for it to reach the refit.
+    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._inflight_by_group_id = {}
+    return ctrl, monitor, sync
+
+
+ABORTED = RefitAborted("refit broadcast exceeded 60.0s and was aborted")
+
+
+class TestDeathInsideTheCollective:
+    """RefitAborted: the watchdog broke a collective a dead peer had stalled."""
+
+    def test_the_dead_shard_is_identified_without_waiting_for_probe_counters(self):
+        """The bug that made the first attempt fail on hardware.
+
+        The handler used to read absent_shards() straight from the monitor, whose verdict
+        is paced by probe rounds. The abort is an event and always won that race, so the
+        corpse was still SUSPECT, absent came back empty, and nothing was rebuilt.
+        unhealthy_threshold is 99 here: no amount of counting could produce this verdict.
+        """
+        ctrl, monitor, _ = _make_controller(ABORTED)
+        asyncio.run(ctrl._sync_weights())
+        assert monitor.state_of(0) is ShardState.DEAD
+
+    def test_the_rebuild_excludes_the_dead_shard(self):
+        ctrl, _, sync = _make_controller(ABORTED)
+        asyncio.run(ctrl._sync_weights())
+        assert sync.reconciled_with[-1] == [0]
+
+    def test_the_retry_runs_against_the_smaller_fleet(self):
+        """Ordering, not just the end state: the corpse must be gone *before* the retry.
+
+        Rebuilding after retrying would hang on the same missing rank.
+        """
+        ctrl, _, sync = _make_controller(ABORTED)
+        asyncio.run(ctrl._sync_weights())
+        assert sync.sync_calls == 2
+        assert sync.absent_at_retry == [0]
+
+    def test_survivors_are_pulled_from_service_then_given_back(self):
+        """Partial weights must not serve -- and must not be stranded either.
+
+        mark_weights_partial has no other exit, so without the promotion at the end of a
+        successful sync the recovery would finish with an empty serving set and the run
+        would die of an exhausted fleet: a worse failure than the one being repaired.
+        """
+        ctrl, monitor, _ = _make_controller(ABORTED)
+        asyncio.run(ctrl._sync_weights())
+        assert monitor.serving_shards() == [1]
+        assert monitor.state_of(1) is ShardState.HEALTHY
+
+    def test_the_dead_shard_is_not_laundered_into_stale(self):
+        """Regression: marking the corpse's weights partial hid it from the rebuild.
+
+        mark_weights_partial walks the *serving* shards, and a shard that has only just
+        died is still serving. STALE is deliberately not an absent state -- refitting a
+        STALE shard is how it stops being stale -- so a corpse moved there stays in the
+        refit membership and the rebuild puts it straight back into the collective.
+        """
+        ctrl, monitor, sync = _make_controller(ABORTED)
+        asyncio.run(ctrl._sync_weights())
+        assert monitor.state_of(0) is not ShardState.STALE
+        assert 0 not in monitor.serving_shards()
+        assert sync.reconciled_with[-1] == [0]
+
+    def test_a_recovery_does_not_clear_a_survivor_s_reported_failures(self):
+        """Regression: the recovery laundered a SUSPECT survivor back to HEALTHY.
+
+        consecutive_reported_failures is the only counter that can condemn a wedged
+        engine, and report_failure keeps it separate from the probe streak precisely
+        because such an engine still answers is_alive -- so an ok-probe must not clear
+        it. A refit used to.
+
+        The path: serving_shards() includes SUSPECT, so mark_weights_partial moves the
+        suspect survivor to STALE, and _promote_refit_shards then promotes every STALE
+        shard through report_refit, which zeroes the counters. Net effect, a shard
+        failing real generations could never reach unhealthy_threshold for as long as
+        refits kept happening.
+
+        Driven through the whole recovery on purpose: asserting against
+        _promote_refit_shards alone passes even with the bug present, because it is
+        mark_weights_partial -- in the other function -- that relabels SUSPECT to STALE.
+        """
+        ctrl, monitor, _ = _make_controller(ABORTED, shard_count=3, dead_shards=(0,))
+        # shard 2 is a survivor that was already failing generations
+        monitor.report_failure(2, RuntimeError("router: failed generation"))
+        monitor.report_failure(2, RuntimeError("router: failed generation"))
+        assert monitor.state_of(2) is ShardState.SUSPECT
+        before = monitor.snapshot()[2].consecutive_reported_failures
+        assert before == 2
+
+        asyncio.run(ctrl._sync_weights())
+
+        assert monitor.snapshot()[2].consecutive_reported_failures == before, (
+            "the refit cleared the streak that was about to condemn this shard"
+        )
+        assert monitor.state_of(2) is ShardState.SUSPECT
+        # the untroubled survivor is still promoted normally
+        assert monitor.state_of(1) is ShardState.HEALTHY
+
+    def test_an_untroubled_survivor_is_still_promoted_to_healthy(self):
+        """The restore must not become a blanket refusal to promote."""
+        ctrl, monitor, _ = _make_controller(ABORTED)
+        asyncio.run(ctrl._sync_weights())
+        assert monitor.state_of(1) is ShardState.HEALTHY
+        assert monitor.snapshot()[1].consecutive_reported_failures == 0
+
+
+class TestDeathAfterTheCollective:
+    """RayActorError: the broadcast completed and the shard died in the epilogue.
+
+    ray.get(futures_train) returned and ray.get(futures_inference) raised. The data
+    transfer had already succeeded, and the run died anyway.
+    """
+
+    def test_an_actor_death_is_recovered_rather_than_fatal(self):
+        ctrl, monitor, sync = _make_controller(ray.exceptions.ActorDiedError())
+        asyncio.run(ctrl._sync_weights())
+        assert sync.sync_calls == 2
+        assert monitor.state_of(0) is ShardState.DEAD
+        assert sync.reconciled_with[-1] == [0]
+
+    def test_survivors_keep_serving_because_nothing_is_partial(self):
+        """The distinction that makes this worth separating from the abort.
+
+        The collective finished, so the survivors' weights are complete. Marking them
+        partial would take a healthy fleet out of service over a transfer that worked.
+        """
+        ctrl, monitor, _ = _make_controller(ray.exceptions.ActorDiedError())
+        asyncio.run(ctrl._sync_weights())
+        assert monitor.state_of(1) is ShardState.HEALTHY
+
+
+class TestWhenRecoveryIsNotPossible:
+    def test_no_identifiable_absentee_fails_instead_of_retrying(self):
+        """A rank alive but not participating is not a membership problem.
+
+        There is no smaller fleet to rebuild over, so a retry would either die on the
+        aborted communicator or rebuild the full one and hang on the same silent rank --
+        recreating the wedge. Fail attributably instead.
+        """
+        ctrl, _, sync = _make_controller(ABORTED, dead_shards=())
+        with pytest.raises(RuntimeError, match="could be identified as absent"):
+            asyncio.run(ctrl._sync_weights())
+        assert sync.sync_calls == 1, "must not retry without a rebuilt communicator"
+
+    def test_a_failed_rebuild_is_not_retried_over(self):
+        ctrl, _, sync = _make_controller(ABORTED, rebuild_succeeds=False)
+        with pytest.raises(RuntimeError, match="could be identified as absent"):
+            asyncio.run(ctrl._sync_weights())
+        assert sync.sync_calls == 1
+
+    def test_without_fleet_health_the_original_failure_propagates(self):
+        """Inert by default: with no monitor there is nothing to reconcile against.
+
+        The error the caller sees must be the refit's own, not a recovery failure
+        layered on top of it.
+        """
+        ctrl, _, sync = _make_controller(
+            ray.exceptions.ActorDiedError(), with_monitor=False
+        )
+        with pytest.raises(ray.exceptions.ActorDiedError):
+            asyncio.run(ctrl._sync_weights())
+        assert sync.sync_calls == 1
+        assert sync.reconciled_with == []
+
+
+class TestTheHappyPathIsUntouched:
+    def test_a_clean_sync_neither_probes_nor_rebuilds(self):
+        ctrl, monitor, sync = _make_controller(None)
+        sync._failure = None
+
+        def _clean(*, kv_scales=None):
+            del kv_scales
+            sync.sync_calls += 1
+
+        sync.sync_weights = _clean
+        asyncio.run(ctrl._sync_weights())
+        assert sync.sync_calls == 1
+        assert monitor.serving_shards() == [0, 1]
+        # Reconciled before the collective as always, but with nothing absent.
+        assert sync.reconciled_with == [[], []]
+
+
+class TestTheRefitHoldHook:
+    """The fault-injection hook that makes "killed mid-refit" reproducible.
+
+    Timing alone cannot reach that window -- a refit here takes ~0.10s -- so job 5925668
+    aimed at the collective and hit the RPC epilogue instead, leaving the abort path
+    untested while reporting a result.
+    """
+
+    @staticmethod
+    def _hook():
+        from nemo_rl.distributed.refit_watchdog import (
+            hold_refit_for_fault_injection,
+        )
+
+        return hold_refit_for_fault_injection
+
+    def test_it_is_inert_when_unset(self, monkeypatch):
+        """Every real run takes this path, so it must cost nothing and change nothing."""
+        monkeypatch.delenv("NRL_REFIT_HOLD_FILE", raising=False)
+        self._hook()()  # must return immediately
+
+    def test_it_is_inert_when_the_file_is_absent(self, monkeypatch, tmp_path):
+        """Armed for the whole run, but only holds while the harness says so."""
+        monkeypatch.setenv("NRL_REFIT_HOLD_FILE", str(tmp_path / "nope"))
+        self._hook()()
+
+    def test_it_blocks_while_the_file_exists_and_returns_when_removed(
+        self, monkeypatch, tmp_path
+    ):
+        import threading
+
+        hold = tmp_path / "hold_refit"
+        hold.write_text("")
+        monkeypatch.setenv("NRL_REFIT_HOLD_FILE", str(hold))
+        monkeypatch.setenv("NRL_REFIT_HOLD_MAX_S", "10")
+
+        released = threading.Event()
+
+        def _run():
+            self._hook()()
+            released.set()
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        assert not released.wait(0.3), "must still be holding while the file is there"
+
+        hold.unlink()
+
+        assert released.wait(5.0), "must return once the harness removes the file"
+
+    def test_the_hold_is_bounded(self, monkeypatch, tmp_path):
+        """A harness that dies mid-test must not wedge the worker forever."""
+        hold = tmp_path / "hold_refit"
+        hold.write_text("")
+        monkeypatch.setenv("NRL_REFIT_HOLD_FILE", str(hold))
+        monkeypatch.setenv("NRL_REFIT_HOLD_MAX_S", "0.2")
+        self._hook()()
+        assert hold.exists(), "returned on the deadline, not because the file went away"

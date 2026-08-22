@@ -104,6 +104,8 @@ async_rl:
     on_dead_shard: fail_fast          # recovery modes arrive with the communicator rebuild
     max_restart_attempts_per_shard: 5
     min_healthy_shards: 1             # below this the run aborts
+    refit_timeout_s: null             # null disarms the watchdog entirely (no thread, refit path unchanged).
+                                      # Set well above a healthy refit (~1.9s for a 1.5B model on GB200).
 
   # NeMo-Gym-facing router in front of the generation fleet. Gym picks an endpoint by
   # round-robin over a list fixed at process start and never fails over, so it is handed
