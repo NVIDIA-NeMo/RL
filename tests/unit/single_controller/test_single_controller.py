@@ -313,13 +313,13 @@ class _MaskRecordingAdvantageEstimator:
         return rewards.unsqueeze(-1).expand_as(mask).clone()
 
 
-def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
+def test_advantage_stage_composes_loss_masks_after_full_group_advantages(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     batch_size, sequence_length = 4, 5
     generation_logprobs = torch.zeros(batch_size, sequence_length)
-    # exp(abs(1 - 0)) > the configured threshold of 2, so only row 2
-    # should be removed from the loss while the other rows remain trainable.
+    # Rows 1, 2, and 3 are removed by the environment, sequence-error,
+    # and overlong masks respectively. Row 0 remains trainable.
     generation_logprobs[2, 1:] = 1.0
     data = TensorDict(
         {
@@ -329,6 +329,8 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
             "total_reward": torch.tensor([0.0, 0.0, 1.0, 0.0]),
             "token_mask": torch.ones(batch_size, sequence_length),
             "sample_mask": torch.ones(batch_size),
+            "mask_sample": torch.tensor([False, True, False, False]),
+            "truncated": torch.tensor([False, False, False, True]),
             "prev_logprobs": torch.zeros(batch_size, sequence_length),
             "generation_logprobs": generation_logprobs,
         },
@@ -345,11 +347,12 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
+        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0, overlong_filtering=True)
     )
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
+        "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
     }
@@ -370,11 +373,11 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     assert data_plane.written_fields is not None
     assert torch.equal(
         data_plane.written_fields["sample_mask"],
-        torch.tensor([1.0, 1.0, 0.0, 1.0]),
+        torch.tensor([1.0, 0.0, 0.0, 0.0]),
     )
     assert estimator.mask is not None
-    assert estimator.mask[2].count_nonzero() == 0
-    assert estimator.mask[[0, 1, 3]].all()
+    assert estimator.mask.all()
+    assert ctrl._step_log_dict["num_mask_sample_filtered"] == [1]
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1
     assert metrics[0]["num_masked_seqs_by_logprob_error"] == 1
@@ -395,6 +398,8 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
             "total_reward": torch.tensor([0.0, 1.0]),
             "token_mask": torch.ones(batch_size, sequence_length),
             "sample_mask": torch.ones(batch_size),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.tensor([False, True]),
             "prev_logprobs": torch.zeros(batch_size, sequence_length),
             "generation_logprobs": generation_logprobs,
         },
@@ -411,11 +416,12 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+        grpo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
     )
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
+        "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
     }
@@ -436,6 +442,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     assert "sample_mask" not in data_plane.written_fields
     assert estimator.mask is not None
     assert estimator.mask.all()
+    assert ctrl._step_log_dict["num_mask_sample_filtered"] == [0]
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1
     assert metrics[0]["num_masked_seqs_by_logprob_error"] == 0
@@ -443,7 +450,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(math.e)
 
 
-def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
+def test_advantage_stage_computes_advantages_before_seq_mask_removes_whole_chunk(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     batch_size, sequence_length = 2, 5
@@ -455,13 +462,15 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
             "total_reward": torch.tensor([1.0, 0.0]),
             "token_mask": torch.ones(batch_size, sequence_length),
             "sample_mask": torch.ones(batch_size),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
             "prev_logprobs": torch.zeros(batch_size, sequence_length),
             "generation_logprobs": torch.ones(batch_size, sequence_length),
         },
         batch_size=[batch_size],
     )
     data_plane = _AdvantageDataPlane(data)
-    estimator = MagicMock()
+    estimator = _MaskRecordingAdvantageEstimator()
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
@@ -471,11 +480,12 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
+        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0, overlong_filtering=False)
     )
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
+        "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
     }
@@ -490,12 +500,13 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     capsys.readouterr()
 
     assert not has_valid_training_tokens
-    estimator.compute_advantage.assert_not_called()
+    assert estimator.mask is not None
+    assert estimator.mask.all()
     assert data_plane.written_fields is not None
     assert not data_plane.written_fields["sample_mask"].bool().any()
     assert torch.equal(
         data_plane.written_fields["advantages"],
-        torch.zeros(batch_size, sequence_length),
+        data["total_reward"].unsqueeze(-1).expand(batch_size, sequence_length),
     )
     assert "advantages" in (result_meta.fields or [])
 
@@ -510,6 +521,8 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
             "total_reward": torch.tensor([1.0, 0.0]),
             "token_mask": torch.ones(batch_size, sequence_length),
             "sample_mask": torch.zeros(batch_size),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
         },
         batch_size=[batch_size],
     )
@@ -524,11 +537,12 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+        grpo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
     )
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
+        "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
     }

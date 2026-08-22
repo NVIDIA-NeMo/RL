@@ -28,6 +28,8 @@ GLOBAL_FORWARD_PAD_SEQLEN = "global_forward_pad_seqlen"
 INPUT_IDS = "input_ids"
 INPUT_LENGTHS = "input_lengths"
 SAMPLE_MASK = "sample_mask"
+MASK_SAMPLE = "mask_sample"
+TRUNCATED = "truncated"
 META_IDX = "meta_idx"
 
 # Tensor fields in the train partition. Rollout writes the input
@@ -77,8 +79,10 @@ ROUTED_EXPERTS_FIELD = "routed_experts"
 PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
     {
         INPUT_LENGTHS,
+        MASK_SAMPLE,
         "total_reward",
         SAMPLE_MASK,
+        TRUNCATED,
     }
 )
 

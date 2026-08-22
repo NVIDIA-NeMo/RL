@@ -23,7 +23,7 @@ from tensordict import TensorDict
 
 from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTED_EXPERTS_FIELD, TRUNCATED
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
 
@@ -40,8 +40,9 @@ def record_to_train_batch(
         pad_value_dict: Field-name → pad value used by batched_message_log_to_flat_message.
 
     Returns:
-        BatchedDataDict with input_ids, input_lengths, generation_logprobs, token_mask,
-        sample_mask, prompt_ids_for_adv, total_reward, and optional routed_experts.
+        BatchedDataDict with input_ids, input_lengths, generation_logprobs,
+        token_mask, the final-loss sample_mask seed, raw environment/truncation
+        masks, prompt_ids_for_adv, total_reward, and optional routed_experts.
     """
     # Lazy imports: grpo and llm_message_utils transitively pull
     # experience.rollouts, so importing at module top risks a cycle.
@@ -80,6 +81,18 @@ def record_to_train_batch(
     total_reward = torch.tensor(
         [float(c.reward) for c in completions], dtype=torch.float32
     )
+    mask_sample = torch.tensor(
+        [
+            bool(
+                ((c.env_extras or {}).get("instance_config") or {}).get(
+                    MASK_SAMPLE, False
+                )
+            )
+            for c in completions
+        ],
+        dtype=torch.bool,
+    )
+    truncated = torch.tensor([c.truncated for c in completions], dtype=torch.bool)
     sample_mask = torch.ones(n, dtype=torch.float32)
 
     train_data: dict[str, Any] = {
@@ -88,6 +101,8 @@ def record_to_train_batch(
         "generation_logprobs": flat["generation_logprobs"],
         "token_mask": flat["token_loss_mask"],
         "sample_mask": sample_mask,
+        MASK_SAMPLE: mask_sample,
+        TRUNCATED: truncated,
         "prompt_ids_for_adv": prompt_flat["token_ids"],
         "total_reward": total_reward,
     }
