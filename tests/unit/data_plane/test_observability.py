@@ -1008,3 +1008,33 @@ def test_breakdown_table_leaves_withheld_series_empty():
 
 def test_breakdown_table_is_empty_when_nothing_ran():
     assert breakdown_table({"step/wall_ms": 0.0})[1] == []
+
+
+def test_cluster_view_carries_the_latency_split():
+    """The split was emitted on the driver path only, so the cluster view —
+    the one a real run logs — could never show it, and its table column was
+    always empty. The cluster fit is the better one besides: it is over
+    every rank's sufficient statistics, so it has far more samples and far
+    more size variation, and size variation is what decides whether the
+    split is identifiable at all."""
+    fixed_ms, mb_per_s = 6.0, 400.0
+    ranks = []
+    for rank in range(4):
+        client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+        now = monotonic()
+        for i in range(8):  # varied sizes, or the fit is unidentifiable
+            n_bytes = 100_000 * (i + 1 + rank)
+            wall_ms = fixed_ms + n_bytes / (mb_per_s * 1e3)
+            client._emit("get", "p", 1, n_bytes, now - wall_ms / 1e3, "ok")
+        ranks.append(client.snapshot())
+
+    metrics = cluster_step_metrics(merge_snapshots(ranks), {}, 1.0)
+    assert "step/get/overhead_ms" in metrics, "cluster view must carry the split"
+
+    total = metrics["step/get/overhead_ms"] + metrics["step/get/transfer_ms"]
+    assert total == pytest.approx(metrics["step/get/wall_ms"], rel=0.05)
+
+    columns, rows = breakdown_table(metrics)
+    row = rows[0]
+    assert row[columns.index("overhead_ms")] is not None
+    assert row[columns.index("transfer_ms")] is not None
