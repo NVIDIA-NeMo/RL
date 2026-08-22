@@ -63,6 +63,15 @@ def test_eagle3_draft_config_preserves_extra_legacy_keys() -> None:
     assert config.model_dump()["legacy_extension"] == 7
 
 
+def test_eagle3_draft_config_rejects_near_miss_typo_keys() -> None:
+    from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+
+    with pytest.raises(ValidationError, match="did you mean 'enabled'"):
+        Eagle3DraftConfig.model_validate({"enalbed": True})
+    with pytest.raises(ValidationError, match="did you mean 'loss_weight'"):
+        Eagle3DraftConfig.model_validate({"loss_wieght": 0.5})
+
+
 def test_eagle3_draft_config_rejects_unknown_speculator_type() -> None:
     from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
