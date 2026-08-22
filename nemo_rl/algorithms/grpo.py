@@ -114,6 +114,7 @@ from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    merge_hf_overrides,
     normalize_vllm_refit_config,
 )
 from nemo_rl.models.megatron.router_replay import (
@@ -494,8 +495,9 @@ def setup(
                 "policy.generation.backend='dynamo'; managed Dynamo drains "
                 "rollouts before layerwise weight refit"
             )
-        generation_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
-            policy_config.get("hf_config_overrides") or {}
+        merge_hf_overrides(
+            generation_config.setdefault("vllm_kwargs", {}),
+            hf_config_overrides=policy_config.get("hf_config_overrides"),
         )
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
@@ -1343,7 +1345,9 @@ def setup(
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
 
         ## make vllm hf overrides match the training policy
-        vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
+        merge_hf_overrides(
+            vllm_kwargs, hf_config_overrides=policy_config.get("hf_config_overrides")
+        )
 
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
