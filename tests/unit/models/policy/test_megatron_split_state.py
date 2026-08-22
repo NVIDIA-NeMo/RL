@@ -365,6 +365,18 @@ class TestTrainMicrobatch:
         w.train_microbatch(_fake_batch())
         assert mock_module_symbols["mfb"].call_count == 1
 
+    def test_enables_deferred_draft_normalization(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+
+        assert (
+            mock_module_symbols["lpp"].call_args.kwargs["defer_draft_normalization"]
+            is True
+        )
+
     def test_passes_placeholder_n_one_to_loss(self, mock_module_symbols):
         """The N=1 trick: loss must be called with global_valid_*=1 so it
         returns un-normalized sums; finish does the 1/N rescale."""
@@ -422,6 +434,26 @@ class TestTrainMicrobatch:
         w.train_microbatch(_fake_batch())
         w.train_microbatch(_fake_batch())
         w.optimizer.step.assert_not_called()
+
+    def test_invalid_draft_payload_restores_hooks_before_abort(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+        from nemo_rl.models.megatron.draft.step_state import DRAFT_STEP_PAYLOAD_KEY
+
+        mock_module_symbols["mfb"].return_value = [
+            {"loss": 1.0, DRAFT_STEP_PAYLOAD_KEY: object()}
+        ]
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+
+        with pytest.raises(TypeError, match="DraftStepPayload"):
+            w.train_microbatch(_fake_batch())
+
+        assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
+        assert w.model.config.finalize_model_grads_func is not None
+        w.abort_train_step()
+        assert w._train_step_state is None
 
 
 # ── finish_train_step ────────────────────────────────────────────────────
@@ -527,6 +559,170 @@ class TestFinish:
         # local_valid_seqs = 8 → inv_n = 1/8
         arg = w.model.scale_gradients.call_args.args[0]
         assert arg == pytest.approx(1.0 / 8.0, rel=1e-4)
+
+    def test_draft_uses_independent_denominator_and_existing_reduce(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.draft import DraftLossStats
+        from nemo_rl.algorithms.loss.interfaces import LossType
+        from nemo_rl.models.megatron.draft.step_state import (
+            DRAFT_STEP_PAYLOAD_KEY,
+            DraftStepState,
+        )
+
+        payload = DraftStepState.metric_payload(
+            DraftLossStats(
+                numerators=torch.tensor([4096.0]),
+                counts=torch.tensor([1024.0]),
+                weights=torch.ones(1),
+            )
+        )
+        mock_module_symbols["mfb"].return_value = [
+            {
+                "loss": 2048.0,
+                "draft_loss": torch.tensor(4096.0),
+                DRAFT_STEP_PAYLOAD_KEY: payload,
+            }
+        ]
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        draft_param = torch.nn.Parameter(torch.tensor(1.0))
+        draft_param.grad_norm_group = "draft"
+        draft_param.main_grad = torch.tensor(3.0)
+        w.model.parameters.return_value = iter([draft_param])
+        w.optimizer.grad_norms_by_group = {"draft": 0.25}
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())  # policy count = 2048
+        w.model.parameters.return_value = iter([draft_param])
+        metrics = w.finish_train_step()
+
+        reduced = mock_module_symbols["all_reduce"].call_args.args[0]
+        assert torch.equal(reduced, reduced.new_tensor([8.0, 2048.0, 1024.0]))
+        # policy scale 1/2048 followed by relative draft correction 2048/1024
+        assert draft_param.main_grad.item() == pytest.approx(6.0)
+        mb = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"][0]
+        assert mb["draft_loss"].item() == pytest.approx(4.0)
+        # Sync metrics report policy and draft losses separately. Preserve the
+        # policy-only `loss` contract while normalizing draft_loss independently.
+        assert mb["loss"] == pytest.approx(1.0)
+        assert mock_module_symbols["agg"].call_args.kwargs["losses"] == [1.0]
+        assert metrics["draft_grad_norm"].item() == pytest.approx(0.25)
+
+    def test_accumulates_draft_counts_across_streamed_chunks(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.draft import DraftLossStats
+        from nemo_rl.algorithms.loss.interfaces import LossType
+        from nemo_rl.models.megatron.draft.step_state import (
+            DRAFT_STEP_PAYLOAD_KEY,
+            DraftStepState,
+        )
+
+        def payload(numerator: float, count: float):
+            return DraftStepState.metric_payload(
+                DraftLossStats(
+                    numerators=torch.tensor([numerator]),
+                    counts=torch.tensor([count]),
+                    weights=torch.ones(1),
+                )
+            )
+
+        mock_module_symbols["mfb"].side_effect = [
+            [
+                {
+                    "loss": 2048.0,
+                    "draft_loss": torch.tensor(20.0),
+                    DRAFT_STEP_PAYLOAD_KEY: payload(20.0, 5.0),
+                }
+            ],
+            [
+                {
+                    "loss": 2048.0,
+                    "draft_loss": torch.tensor(60.0),
+                    DRAFT_STEP_PAYLOAD_KEY: payload(60.0, 15.0),
+                }
+            ],
+        ]
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        draft_param = torch.nn.Parameter(torch.tensor(1.0))
+        draft_param.grad_norm_group = "draft"
+        draft_param.main_grad = torch.tensor(3.0)
+        w.model.parameters.return_value = iter([draft_param])
+        w.optimizer.grad_norms_by_group = {"draft": 0.25}
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        w.train_microbatch(_fake_batch())
+        w.model.parameters.return_value = iter([draft_param])
+        w.finish_train_step()
+
+        reduced = mock_module_symbols["all_reduce"].call_args.args[0]
+        assert torch.equal(reduced, reduced.new_tensor([16.0, 4096.0, 20.0]))
+        assert draft_param.main_grad.item() == pytest.approx(614.4)
+        metrics = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"]
+        assert metrics[0]["draft_loss"].item() == pytest.approx(1.0)
+        assert metrics[1]["draft_loss"].item() == pytest.approx(3.0)
+
+    def test_zero_draft_count_zeroes_gradient_at_finish(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.draft import DraftLossStats
+        from nemo_rl.algorithms.loss.interfaces import LossType
+        from nemo_rl.models.megatron.draft.step_state import (
+            DRAFT_STEP_PAYLOAD_KEY,
+            DraftStepState,
+        )
+
+        mock_module_symbols["mfb"].return_value = [
+            {
+                "loss": 2048.0,
+                "draft_loss": torch.tensor(0.0),
+                DRAFT_STEP_PAYLOAD_KEY: DraftStepState.metric_payload(
+                    DraftLossStats(
+                        numerators=torch.zeros(1),
+                        counts=torch.zeros(1),
+                        weights=torch.ones(1),
+                    )
+                ),
+            }
+        ]
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        draft_param = torch.nn.Parameter(torch.tensor(1.0))
+        draft_param.grad_norm_group = "draft"
+        draft_param.main_grad = torch.tensor(3.0)
+        w.model.parameters.return_value = iter([draft_param])
+        w.optimizer.grad_norms_by_group = {"draft": 0.0}
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        w.model.parameters.return_value = iter([draft_param])
+        w.finish_train_step()
+
+        assert draft_param.main_grad.item() == 0.0
+        metrics = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"]
+        assert metrics[0]["draft_loss"].item() == 0.0
+
+    def test_without_draft_payload_reduces_only_policy_counts(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
+        w.finish_train_step()
+
+        reduced = mock_module_symbols["all_reduce"].call_args.args[0]
+        assert torch.equal(reduced, reduced.new_tensor([8.0, 2048.0]))
+
+    def test_without_draft_payload_still_reduces_draft_grad_norm(
+        self, mock_module_symbols
+    ):
+        """Non-owner PP ranks must join the draft grad-norm collective."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
+        w.optimizer.grad_norms_by_group = {}
+
+        w.finish_train_step()
+
+        reduce_calls = mock_module_symbols["rmax"].call_args_list
+        assert len(reduce_calls) == 3
+        assert reduce_calls[-1].args[0] is None
 
     def test_restores_grad_sync_func(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
