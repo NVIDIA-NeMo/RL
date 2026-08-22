@@ -66,7 +66,14 @@ class GRPOAdvantageEstimator:
         self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
         self.normalize_rewards = estimator_config.normalize_rewards
 
-    def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        std_rewards: torch.Tensor | None = None,
+        **kwargs,
+    ):
         """Compute GRPO advantages.
 
         Args:
@@ -74,6 +81,9 @@ class GRPOAdvantageEstimator:
             rewards: Tensor of shape [batch_size] containing reward for each sample.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
                   Used only for expanding advantages to token-level shape.
+            std_rewards: Optional raw reward tensor used only to compute the
+                normalization standard deviation. The baseline and advantage
+                numerator always use ``rewards``.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -84,6 +94,7 @@ class GRPOAdvantageEstimator:
             rewards,
             torch.ones_like(rewards),
             leave_one_out_baseline=self.use_leave_one_out_baseline,
+            std_rewards=std_rewards,
         )
         advantages = (rewards - baseline).unsqueeze(-1)
 

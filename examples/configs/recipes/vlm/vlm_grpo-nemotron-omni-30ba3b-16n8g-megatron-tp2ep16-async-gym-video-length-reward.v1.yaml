@@ -1,0 +1,59 @@
+defaults: vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml
+grpo:
+  num_prompts_per_step: 128
+  max_num_epochs: 1000000
+  val_period: 0
+  reward_shaping:
+    enabled: true
+    mode: reasoning_length
+    reasoning_length:
+      tau1: 1024
+      tau2: 4096
+      weight: 0.05
+      composition: correctness_gated
+      reasoning_end_token_id: 13
+checkpointing:
+  save_period: 2
+  keep_top_k: 5
+policy:
+  train_global_batch_size: 2048
+  max_total_sequence_length: 16384
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    activation_checkpointing: false
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 16
+    moe_shared_expert_overlap: true
+    optimizer:
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-08
+  generation:
+    max_new_tokens: 16384
+    vllm_cfg:
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.7
+      enforce_eager: false
+      video:
+        num_frames: 64
+    vllm_kwargs:
+      mm_processor_cache_gb: 4
+      max_num_seqs: 8
+      max_num_batched_tokens: 32768
+      limit_mm_per_prompt:
+        image: 64
+        video:
+          num_frames: 64
+      media_io_kwargs:
+        video:
+          num_frames: 64
+    colocated:
+      resources:
+        num_nodes: 8
+data:
+  shuffle: true
+  default:
+    num_frames: 64

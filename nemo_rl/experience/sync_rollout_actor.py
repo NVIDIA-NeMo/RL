@@ -259,6 +259,7 @@ class SyncRolloutActor:
                 if "nemo_gym" in cfg.env
                 and cfg.env["nemo_gym"].get("effort_levels") is not None
                 else None,
+                reward_shaping_config=cfg.grpo.reward_shaping,
                 reward_penalty_config=cfg.reward_penalties,
                 thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
                 deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
@@ -365,6 +366,8 @@ class SyncRolloutActor:
             # apply_reward_shaping on the driver without a TQ fetch.
             "response_token_lengths": decomposed["response_token_lengths"],
         }
+        if "unshaped_total_reward" in fb:
+            driver_carry["unshaped_total_reward"] = fb["unshaped_total_reward"]
         # GDPO multi-reward components: scale_rewards iterates these
         # keys driver-side and the GDPO advantage estimator reads them
         # from ``adv_inputs``. Plumb them through ``driver_carry``

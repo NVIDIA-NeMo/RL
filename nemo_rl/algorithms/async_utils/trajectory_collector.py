@@ -921,6 +921,11 @@ class AsyncTrajectoryCollector:
                 "stop_token_ids": None,
                 "stop_strings": None,
             }
+            reward_shaping_config = (
+                self.master_config.grpo.reward_shaping
+                if isinstance(self.master_config, GRPOMasterConfig)
+                else None
+            )
             async for rollout_result in run_async_nemo_gym_rollout(
                 policy_generation=self.policy_generation,
                 input_batch=repeated_batch,
@@ -935,6 +940,7 @@ class AsyncTrajectoryCollector:
                 ),
                 max_rollout_turns=None,
                 greedy=False,
+                reward_shaping_config=reward_shaping_config,
                 reward_penalty_config=self.master_config.reward_penalties,
                 thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
                 mask_env_flagged_samples=should_mask_flagged_samples(
