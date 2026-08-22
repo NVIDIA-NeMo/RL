@@ -14,9 +14,8 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import dataclasses
+from dataclasses import replace
 
 import pytest
 import torch
