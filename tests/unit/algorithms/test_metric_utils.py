@@ -25,7 +25,7 @@ from nemo_rl.algorithms.metric_utils import (
 
 
 class TestPrintSetupTimingSummary:
-    """print_setup_timing_summary has three code paths with assertions."""
+    """print_setup_timing_summary's code paths and assertions."""
 
     @staticmethod
     def _common_setup(**overrides) -> SetupTimingMetrics:
@@ -73,7 +73,7 @@ class TestPrintSetupTimingSummary:
         assert "reserve" not in out
 
     def test_grpo_asserts_generation_init_time_unset(self):
-        """grpo.py path forbids generation_init_time_s from being populated."""
+        """grpo.py without a reserve forbids generation_init_time_s from being populated."""
         metrics = self._common_setup(
             generation_init_time_s=15.0,
             vllm_init_time_s=15.0,
@@ -81,16 +81,18 @@ class TestPrintSetupTimingSummary:
         with pytest.raises(AssertionError):
             print_setup_timing_summary(metrics, gen_init_time_key="vllm_init_time_s")
 
-    def test_reserve_load_split_takes_precedence_over_gen_key(self, capsys):
-        """If reserve_time_s is set, the SC+gym-on branch wins even if a key is passed."""
+    def test_grpo_reserve_renders_reserve_load_split(self, capsys):
+        """grpo megatron+gym overlap decomposes exactly like the SC line."""
         metrics = self._common_setup(
-            generation_init_time_s=15.0,
+            megatron_generation_init_time_s=15.0,
+            generation_init_time_s=18.0,
             generation_init_reserve_time_s=3.0,
-            generation_init_load_time_s=12.0,
         )
-        print_setup_timing_summary(metrics, gen_init_time_key="vllm_init_time_s")
+        print_setup_timing_summary(
+            metrics, gen_init_time_key="megatron_generation_init_time_s"
+        )
         out = capsys.readouterr().out
-        assert "Generation init: 15.0s (reserve 3.0s + load 12.0s)" in out
+        assert "Generation init: 18.0s (reserve 3.0s + load 15.0s)" in out
 
     def test_optional_nemo_gym_and_teacher_lines(self, capsys):
         """nemo_gym_init_time_s and teacher_init_time_s only print when populated."""
