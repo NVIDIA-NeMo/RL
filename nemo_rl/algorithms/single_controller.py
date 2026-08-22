@@ -1094,10 +1094,13 @@ class SingleControllerActor:
                                 worker_receipt=None,
                                 apply_receipt=None,
                             )
+                            begin_kwargs: dict[str, Any] = {}
+                            if cadence_decision is not None:
+                                begin_kwargs["draft_update_decision"] = cadence_decision
                             await asyncio.to_thread(
                                 self._trainer.begin_train_step,
                                 self._loss_fn,
-                                draft_update_decision=cadence_decision,
+                                **begin_kwargs,
                             )
                             step_open = True
                         await asyncio.to_thread(

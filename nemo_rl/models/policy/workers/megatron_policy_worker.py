@@ -1453,6 +1453,8 @@ class MegatronPolicyWorkerImpl(
         self._collect_mtp_metrics(metrics, total_num_microbatches, mtp_grad_norm)
         if draft_grad_norm is not None:
             metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
+        if draft_update_decision is not None:
+            metrics["draft_update_decision"] = draft_update_decision
 
         # Skip FLOPs estimation when sequence packing is enabled: gbs counts original
         # samples but each packed sequence spans max_total_sequence_length tokens,
@@ -2211,6 +2213,9 @@ class MegatronPolicyWorkerImpl(
         }
         if draft_grad_norm is not None:
             metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
+        draft_update_decision = state["draft_update_decision"]
+        if draft_update_decision is not None:
+            metrics["draft_update_decision"] = draft_update_decision
 
         # MoE aux-loss metrics: same convention as sync train() — scale
         # by the total pipeline-microbatch count accumulated across all

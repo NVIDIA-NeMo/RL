@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 from nemo_rl.algorithms.draft_update_schedule import DraftUpdateDecision
 from nemo_rl.algorithms.grpo_sync import _train_policy_from_meta
-from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.models.policy.tq_policy import TQPolicy, _aggregate_train_results
 
 
 def _decision() -> DraftUpdateDecision:
@@ -96,3 +96,55 @@ def test_cp2_controller_fans_out_identical_draft_decision() -> None:
     call = policy.begin_train_step.call_args
     assert call.kwargs["draft_update_decision"] is decision
     policy.train_from_meta.assert_not_called()
+
+
+def test_cp1_disabled_cadence_preserves_legacy_call_shape() -> None:
+    policy = MagicMock()
+
+    with patch(
+        "nemo_rl.algorithms.grpo_sync._should_use_split_draft_training",
+        return_value=False,
+    ):
+        _train_policy_from_meta(
+            policy,
+            MagicMock(),
+            loss_fn=MagicMock(),
+            timer=None,
+            train_fields=("input_ids",),
+            master_config=MagicMock(),
+        )
+
+    assert "draft_update_decision" not in policy.train_from_meta.call_args.kwargs
+
+
+def test_cp2_disabled_cadence_preserves_legacy_call_shape() -> None:
+    policy = MagicMock()
+
+    with patch(
+        "nemo_rl.algorithms.grpo_sync._should_use_split_draft_training",
+        return_value=True,
+    ):
+        _train_policy_from_meta(
+            policy,
+            MagicMock(),
+            loss_fn=MagicMock(),
+            timer=None,
+            train_fields=("input_ids",),
+            master_config=MagicMock(),
+        )
+
+    assert "draft_update_decision" not in policy.begin_train_step.call_args.kwargs
+
+
+def test_split_finish_metrics_preserve_consensused_decision() -> None:
+    decision = _decision()
+    result = {
+        "global_loss": 1.0,
+        "grad_norm": 2.0,
+        "all_mb_metrics": {},
+        "draft_update_decision": decision,
+    }
+
+    aggregated = _aggregate_train_results([result])
+
+    assert aggregated["draft_update_decision"] is decision

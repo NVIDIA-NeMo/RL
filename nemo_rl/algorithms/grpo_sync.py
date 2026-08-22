@@ -171,12 +171,16 @@ def _train_policy_from_meta(
 ) -> dict[str, Any]:
     """Train one TQ step, using the split lifecycle required by packed CP."""
     if not _should_use_split_draft_training(master_config):
+        train_kwargs: dict[str, Any] = {
+            "loss_fn": loss_fn,
+            "timer": timer,
+            "train_fields": train_fields,
+        }
+        if draft_update_decision is not None:
+            train_kwargs["draft_update_decision"] = draft_update_decision
         return policy.train_from_meta(
             meta,
-            loss_fn=loss_fn,
-            timer=timer,
-            train_fields=train_fields,
-            draft_update_decision=draft_update_decision,
+            **train_kwargs,
         )
 
     split_methods = (
@@ -197,7 +201,10 @@ def _train_policy_from_meta(
         )
 
     try:
-        policy.begin_train_step(loss_fn, draft_update_decision=draft_update_decision)
+        begin_kwargs: dict[str, Any] = {}
+        if draft_update_decision is not None:
+            begin_kwargs["draft_update_decision"] = draft_update_decision
+        policy.begin_train_step(loss_fn, **begin_kwargs)
         policy.train_microbatches_from_meta(
             meta,
             timer=timer,
