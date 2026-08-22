@@ -136,7 +136,7 @@ def _make_unquantized_moe_model(moe_backend: str) -> SimpleNamespace:
 
 
 @pytest.mark.vllm
-def test_process_hpc_modules_after_loading(monkeypatch):
+def test_refresh_hpc_modules_after_layerwise_reload(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     class FakeHpcModule:
@@ -145,12 +145,10 @@ def test_process_hpc_modules_after_loading(monkeypatch):
 
     hpc_module = FakeHpcModule()
     other_module = object()
-    model = SimpleNamespace(
-        named_modules=lambda: [("", other_module), ("rope_norm", hpc_module)]
-    )
+    model = SimpleNamespace(modules=lambda: [other_module, hpc_module])
     monkeypatch.setattr("vllm.model_executor.layers.hpc.HpcModule", FakeHpcModule)
 
-    vllm_backend._process_hpc_modules_after_loading(model)
+    vllm_backend._refresh_hpc_modules_after_layerwise_reload(model)
 
     hpc_module.process_weights_after_loading.assert_called_once_with(model)
 
@@ -220,7 +218,7 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
     )
     monkeypatch.setattr(
         vllm_backend,
-        "_process_hpc_modules_after_loading",
+        "_refresh_hpc_modules_after_layerwise_reload",
         lambda reload_model: call_order.append(("hpc", reload_model)),
     )
     monkeypatch.setattr(
@@ -662,9 +660,9 @@ def test_sparse_delta_refit_rejected_for_native_trtllm_backend():
         vllm_config=SimpleNamespace(quant_config=None),
     )
 
-    with pytest.raises(RuntimeError, match="Sparse-delta refit does not support"):
+    with pytest.raises(RuntimeError, match="sparse-delta refit does not support"):
         ext.prepare_sparse_delta_refit_info({})
-    with pytest.raises(RuntimeError, match="Sparse-delta refit does not support"):
+    with pytest.raises(RuntimeError, match="sparse-delta refit does not support"):
         ext.update_weights_from_decoded_sparse_payload(b"")
 
 
@@ -1010,7 +1008,7 @@ def test_load_mtp_weights_from_disk_uses_layerwise_reload_for_trtllm(
     )
     monkeypatch.setattr(
         vllm_backend,
-        "_process_hpc_modules_after_loading",
+        "_refresh_hpc_modules_after_layerwise_reload",
         lambda model: call_order.append(("hpc", model)),
     )
     monkeypatch.setattr(
