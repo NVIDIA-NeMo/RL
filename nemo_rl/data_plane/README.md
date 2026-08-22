@@ -443,11 +443,14 @@ per-step delta already flattened for the logger.
 
 Measured against a no-op inner client on the payload the wire actually
 carries — 256 ragged rows, 12 MB, jagged per-token fields as
-`pack_jagged_fields` leaves them: **~99 µs per put, ~76 µs per get**, about
-0.15% of a 59 ms operation. Most of that is the byte walk over the
-`TensorDict`; the rest is the per-key attribution `clear_samples` needs to
-undo. `on_event` defaults to `None` when unset, in which case the per-op
-event dict is never built.
+`pack_jagged_fields` leaves them: **~37 µs per put, ~15 µs per get**, under
+0.1% of a 59 ms operation. What is left is dominated by the per-key
+attribution `clear_samples` needs to undo.
+
+Note that `enabled: true` also installs `log_event` as the default
+`on_event` sink, which emits one `logger.info` line per data-plane op. Pass
+`observability.callback` explicitly (or `None`) if you want the counters
+without the per-op log.
 
 `verify_tensor_hash: true` additionally records a `torch.hash_tensor`
 fingerprint on every put and re-checks it on every get, so a tensor that

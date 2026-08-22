@@ -293,6 +293,33 @@ def test_td_bytes_counts_wire_payload(name, td, expected):
     assert _td_bytes(td) == expected
 
 
+def test_td_bytes_jagged_matches_the_public_count():
+    """The nested fast path reads the packed values buffer instead of the
+    tensor's own (dispatched, ~16us) ``nbytes``. It must agree exactly."""
+    rows = [torch.arange(n, dtype=torch.int64) for n in (3, 7, 2, 5)]
+    jagged = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+    td = TensorDict({"x": jagged}, batch_size=[4])
+    assert _td_bytes(td) == jagged.nbytes == sum(r.nbytes for r in rows)
+
+
+def test_td_bytes_does_not_overcount_a_narrow_view():
+    """``torch.nested.narrow`` yields a tensor whose values buffer views a
+    larger allocation. Trusting the buffer there would silently inflate
+    ``n_bytes`` — and an inflated byte count is worse than a slow one, since
+    ``max_bytes_per_key_seen`` reads it as a wire regression."""
+    lengths = torch.tensor([3, 4, 5, 6])
+    narrowed = torch.nested.narrow(
+        torch.zeros(4, 10),
+        1,
+        torch.zeros(4, dtype=torch.int64),
+        lengths,
+        layout=torch.jagged,
+    )
+    assert narrowed._values.nbytes > narrowed.nbytes, "fixture must be a view"
+    td = TensorDict({"x": narrowed}, batch_size=[4])
+    assert _td_bytes(td) == narrowed.nbytes == int(lengths.sum()) * 4
+
+
 def test_td_bytes_nontensordata_is_not_broadcast():
     """``NonTensorData`` holds ONE object; counting it per batch row would
     inflate a 64-row put by 64x. Its bytes must not scale with batch size."""
