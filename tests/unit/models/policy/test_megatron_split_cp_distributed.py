@@ -145,8 +145,13 @@ def _run_context_parallel_finish_parity(rank: int, world_size: int) -> None:
     ):
         metrics = worker._finish_train_step_body(state)
 
-    assert draft_param.main_grad.item() == pytest.approx(614.4, rel=1e-5)
-    assert metrics["all_mb_metrics"]["draft_loss"][0].item() == pytest.approx(4.0)
+    actual_grad = draft_param.main_grad.item()
+    actual_metric = metrics["all_mb_metrics"]["draft_loss"][0].item()
+    assert actual_grad == pytest.approx(
+        614.4, rel=1e-5
+    ) and actual_metric == pytest.approx(4.0), (
+        f"CP{world_size} normalization mismatch: grad={actual_grad}, metric={actual_metric}"
+    )
     assert metrics["all_mb_metrics"]["loss"][0] == pytest.approx(1.0)
 
 
