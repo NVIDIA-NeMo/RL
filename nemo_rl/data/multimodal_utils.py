@@ -33,8 +33,11 @@ from transformers.video_utils import load_video
 
 VLLM_MULTIMODAL_DATA_KEYS = frozenset({"vllm_images", "vllm_videos", "vllm_audios"})
 NATIVE_MULTIMODAL_KEYS = frozenset({"vllm_content", *VLLM_MULTIMODAL_DATA_KEYS})
+IMAGE_CONTENT_TYPES = frozenset({"input_image", "image", "image_url"})
+VIDEO_CONTENT_TYPES = frozenset({"input_video", "video", "video_url"})
+AUDIO_CONTENT_TYPES = frozenset({"input_audio", "audio", "audio_url"})
 MULTIMODAL_CONTENT_TYPES = frozenset(
-    {"input_image", "image", "image_url", "video", "audio"}
+    {*IMAGE_CONTENT_TYPES, *VIDEO_CONTENT_TYPES, *AUDIO_CONTENT_TYPES}
 )
 
 # List of allowed placeholder strings for different media types in the dataset string
@@ -784,7 +787,15 @@ def extract_multimodal_model_inputs(
 
     extracted: dict[str, PackedTensor | torch.Tensor] = {}
     multimodal_keys = list(get_multimodal_keys_from_processor(processor))
-    for key in ("imgs_sizes", "num_frames"):
+    # TODO(rohitrango): Let ProcessorInterface declare model-specific media inputs.
+    # Some remote-code processors omit these inputs from model_input_names even
+    # though their model forward requires them.
+    for key in (
+        "imgs_sizes",
+        "num_frames",
+        "pixel_values_flat",
+        "image_num_patches",
+    ):
         if key in processed and key not in multimodal_keys:
             multimodal_keys.append(key)
     for key in multimodal_keys:
@@ -1053,16 +1064,25 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
             if not isinstance(content, list):
                 continue
             for part in content:
-                if not isinstance(part, dict) or part.get("type") != "input_image":
+                if (
+                    not isinstance(part, dict)
+                    or part.get("type") not in IMAGE_CONTENT_TYPES
+                ):
                     continue
-                url = part.get("image_url", "")
+                media_key = next(
+                    (key for key in ("image_url", "image", "url") if key in part),
+                    None,
+                )
+                if media_key is None:
+                    continue
+                url = part.get(media_key)
                 if isinstance(url, dict):
-                    url = url.get("url", "")
+                    url = url.get("url") or url.get("path") or ""
                 if not isinstance(url, str) or not url:
                     continue
                 if url.startswith(("http://", "https://", "data:")):
                     continue
-                part["image_url"] = image_to_data_url(resolve_to_image(url))
+                part[media_key] = image_to_data_url(resolve_to_image(url))
     return nemo_gym_examples
 
 
