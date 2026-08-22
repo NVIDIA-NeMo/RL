@@ -170,6 +170,9 @@ SC reads its async knobs from `async_rl:` and **requires `grpo.async_grpo: null`
 
 The SC path is still under active development. Feature gaps are tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625). Notable items:
 
+- Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo
+  Gym rollouts; multimodal/VLM MOPD is not yet supported. See
+  [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
 - Generation backend: only vLLM is supported and validated; Megatron generation, SGLang, and TRT-LLM have not been tested on SC.
 - Checkpointing and validation are not yet supported (setup raises if enabled).

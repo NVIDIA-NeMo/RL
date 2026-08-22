@@ -44,6 +44,18 @@ DP_TRAIN_FIELDS = (
     "sample_mask",
 )
 
+# Full known tensor schema for SingleController's long-lived rollout partition.
+# The initial rollout put writes the first seven payload fields; later stages add
+# student/reference logprobs, advantages, and the MOPD teacher column. Registering
+# their names once before concurrent producers start avoids TransferQueue's lazy
+# field-name registration race.
+SC_ROLLOUT_SCHEMA_FIELDS = (
+    *DP_TRAIN_FIELDS,
+    "prompt_ids_for_adv",
+    "total_reward",
+    "teacher_reference_logprobs",
+)
+
 # Subset fetched by logprob / ref-logprob workers.
 LP_SEED_FIELDS = (
     "input_ids",
