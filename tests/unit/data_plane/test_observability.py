@@ -986,3 +986,23 @@ def test_cluster_view_carries_the_latency_split():
     row = rows[0]
     assert row[columns.index("overhead_ms")] is not None
     assert row[columns.index("transfer_ms")] is not None
+
+
+def test_cluster_per_op_time_is_reported_both_ways():
+    """``step/{op}/wall_ms`` on the cluster path sums processes that ran
+    concurrently, so it is process-time — 200 gets of 11 ms across 8 ranks
+    reads 2233 ms while wall clock was 278. The same key on the driver path
+    is elapsed. Both figures ship: the sum attributes cost across ops, the
+    per-process one has the magnitude a reader expects of a millisecond."""
+    ranks = [_rank_with([10.0] * 5) for _ in range(8)]  # 40 calls, 400 ms summed
+    metrics = cluster_step_metrics(merge_snapshots(ranks), {}, 1.0)
+
+    assert metrics["step/put/wall_ms"] == pytest.approx(400.0, rel=0.1)
+    assert metrics["step/put/wall_ms_per_process"] == pytest.approx(50.0, rel=0.1)
+    assert metrics["step/put/wall_ms_per_process"] * metrics["now/n_processes"] == (
+        pytest.approx(metrics["step/put/wall_ms"])
+    )
+
+    columns, rows = breakdown_table(metrics)
+    assert "wall_ms_per_process" in columns
+    assert rows[0][columns.index("wall_ms_per_process")] is not None
