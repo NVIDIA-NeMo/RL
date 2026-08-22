@@ -1271,59 +1271,76 @@ class VllmInternalWorkerExtension:
             if spec.post is not None:
                 spec.post(ctx)
 
-        # Group params by PP stage so different stages' bulk reshards run
-        # concurrently on their own streams.  Non-PP = single stage 0 (params
-        # carry no "pp_stage" key), so this collapses to one stage / one stream.
-        stage_params = OrderedDict()
-        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
-            for p in self.nccl_reshard_refit_info["per_layer_params"][layer_name]:
-                stage_params.setdefault(p.get("pp_stage", 0), []).append(p)
-
-        num_streams = max(
-            1,
-            min(int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")), len(stage_params)),
-        )
-
-        streams = [torch.cuda.Stream() for _ in range(num_streams)]
-        events = {}
-        for idx, (stage, params) in enumerate(stage_params.items()):
-            # synchronize the last run in the same stream
-            if (idx - num_streams) in events:
-                events[idx - num_streams].synchronize()
-            stage_stream = streams[idx % num_streams]
-            with torch.cuda.stream(stage_stream):
-                group = self.pp_comm_groups[stage]
-                for p in params:
-                    _recv_one_param(p, group, stage_stream)
-                ev = torch.cuda.Event()
-                ev.record()
-                events[idx] = ev
-
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
         import time
 
-        with self._weight_update_lifecycle("nccl_reshard") as finalize:
-            misc_t0 = time.perf_counter()
-            self._receive_and_load_misc_params()
-            torch.cuda.synchronize()
-            if torch.distributed.get_rank() == 0:
-                print(
-                    f"[nccl_reshard_refit] misc recv+load (gen side): "
-                    f"{time.perf_counter() - misc_t0:.2f}s",
-                    flush=True,
+        # The bulk xferdtensor receive below writes directly into live vLLM
+        # params, so it must run inside the lifecycle guard: a mid-stream
+        # failure leaves the model partially overwritten and must mark the
+        # worker unusable, exactly like the ipc/collective transports. The
+        # outer except mirrors those transports' error contract as well.
+        try:
+            with self._weight_update_lifecycle("nccl_reshard") as finalize:
+                # Group params by PP stage so different stages' bulk reshards run
+                # concurrently on their own streams.  Non-PP = single stage 0 (params
+                # carry no "pp_stage" key), so this collapses to one stage / one stream.
+                stage_params = OrderedDict()
+                for layer_name in self.nccl_reshard_refit_info["layer_names"]:
+                    for p in self.nccl_reshard_refit_info["per_layer_params"][
+                        layer_name
+                    ]:
+                        stage_params.setdefault(p.get("pp_stage", 0), []).append(p)
+
+                num_streams = max(
+                    1,
+                    min(
+                        int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")),
+                        len(stage_params),
+                    ),
                 )
-            torch.cuda.empty_cache()
 
-            # Finalize post-load weight processing: dense Linear + attention/MLA,
-            # the per-MoE-backend w13 layout (FlashInfer CUTLASS/TRTLLM) that the
-            # canonical [gate; up] bulk write above defers to here, and the MTP
-            # drafter's mirror of the same. The FP8 KV-cache per-layer k/v scales
-            # are finalized by the lifecycle on exit.
-            finalize(False)
+                streams = [torch.cuda.Stream() for _ in range(num_streams)]
+                events = {}
+                for idx, (stage, params) in enumerate(stage_params.items()):
+                    # synchronize the last run in the same stream
+                    if (idx - num_streams) in events:
+                        events[idx - num_streams].synchronize()
+                    stage_stream = streams[idx % num_streams]
+                    with torch.cuda.stream(stage_stream):
+                        group = self.pp_comm_groups[stage]
+                        for p in params:
+                            _recv_one_param(p, group, stage_stream)
+                        ev = torch.cuda.Event()
+                        ev.record()
+                        events[idx] = ev
 
-            torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                misc_t0 = time.perf_counter()
+                self._receive_and_load_misc_params()
+                torch.cuda.synchronize()
+                if torch.distributed.get_rank() == 0:
+                    print(
+                        f"[nccl_reshard_refit] misc recv+load (gen side): "
+                        f"{time.perf_counter() - misc_t0:.2f}s",
+                        flush=True,
+                    )
+                torch.cuda.empty_cache()
+
+                # Finalize post-load weight processing: dense Linear + attention/MLA,
+                # the per-MoE-backend w13 layout (FlashInfer CUTLASS/TRTLLM) that the
+                # canonical [gate; up] bulk write above defers to here, and the MTP
+                # drafter's mirror of the same. The FP8 KV-cache per-layer k/v scales
+                # are finalized by the lifecycle on exit.
+                finalize(False)
+
+                torch.cuda.empty_cache()
+        except Exception as e:
+            if self._weight_update_errors_are_fatal():
+                raise
+            logger.exception(
+                "Error in VllmInternalWorkerExtension.nccl_reshard_refit: %s", e
+            )
+            return False
         return True
 
     def _receive_and_load_misc_params(self) -> None:

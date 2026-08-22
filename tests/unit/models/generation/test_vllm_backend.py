@@ -193,6 +193,42 @@ def test_partial_refit_failure_makes_worker_fail_closed(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=object(), vllm_config=SimpleNamespace(speculative_config=None)
+    )
+    ext.model_config = object()
+    ext.device = object()
+
+    class _ExplodingInfo:
+        def __getitem__(self, key):
+            raise RuntimeError("bulk receive failed")
+
+        def get(self, key, default=None):
+            raise RuntimeError("bulk receive failed")
+
+    ext.nccl_reshard_refit_info = _ExplodingInfo()
+    ext.hf_to_local_param_map = {}
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+
+    # A failure inside the bulk receive must not propagate (nonfatal contract,
+    # matching ipc/collective) but must poison the worker.
+    assert ext.nccl_reshard_refit() is False
+    assert ext._refit_unusable_reason is not None
+    assert "bulk receive failed" in ext._refit_unusable_reason
+
+    # Poisoned worker never reports success again.
+    assert ext.nccl_reshard_refit() is False
+
+
+@pytest.mark.vllm
 def test_fp8_kv_postprocess_failure_makes_worker_fail_closed(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
