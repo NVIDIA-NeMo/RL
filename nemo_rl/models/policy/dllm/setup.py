@@ -112,9 +112,10 @@ def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -
             "but the ELBO masks positions across the whole sequence. Set it to 1."
         )
 
-    # The dllm backend has no async engine, so _should_use_async_rollouts
-    # returns False for it. Asking for async_grpo would therefore run plain
-    # synchronous rollouts and silently ignore every async setting.
+    # The dllm backend has no async engine, so
+    # nemo_rl.models.generation.interfaces.should_use_async_rollouts returns
+    # False for it. Asking for async_grpo would therefore run plain synchronous
+    # rollouts and silently ignore every async setting.
     if grpo_cfg is not None:
         async_cfg = getattr(grpo_cfg, "async_grpo", None)
         if async_cfg is None and hasattr(grpo_cfg, "get"):

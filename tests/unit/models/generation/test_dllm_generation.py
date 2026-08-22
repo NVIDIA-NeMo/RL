@@ -172,3 +172,13 @@ class TestLifecycle:
     def test_prepare_refit_info_accepts_the_cross_backend_contract(self):
         backend, _ = make_backend()
         assert backend.prepare_refit_info({"anything": 1}) is None
+
+    def test_generation_blocks_training(self):
+        """Denoising runs in the training workers, so it always holds their GPUs."""
+        backend, _ = make_backend()
+        assert backend.blocks_training() is True
+
+    def test_waking_alone_serves_the_latest_weights(self):
+        """Rollouts read the training tensors, so there is no copy to refresh."""
+        backend, _ = make_backend()
+        assert backend.wake_carries_weight_updates() is True

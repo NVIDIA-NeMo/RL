@@ -102,6 +102,24 @@ class DllmGeneration(GenerationInterface):
         """Returns success: there is no inference engine to tear down."""
         return True
 
+    def blocks_training(self) -> bool:
+        """Reports that generation must stand down before a training step.
+
+        Denoising runs in the training workers themselves, so it always holds
+        the GPUs training needs. This backend is colocated by construction --
+        validate_dllm_policy rejects anything else -- so unlike
+        MegatronGeneration there is no non-colocated case to distinguish.
+        """
+        return True
+
+    def wake_carries_weight_updates(self) -> bool:
+        """Reports that waking alone serves the latest weights.
+
+        There is no separate copy to refresh: rollouts read the training
+        tensors outright, which is the second case the interface describes.
+        """
+        return True
+
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Accepts the cross-backend refit-prep contract; dLLM needs none of it."""
         pass

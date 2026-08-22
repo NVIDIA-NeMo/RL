@@ -1602,9 +1602,11 @@ def single_rank_gloo_group():
 
 def _reference_logprobs(logits, targets):
     """Position-aligned log probabilities: position i scores targets[i]."""
-    return torch.log_softmax(logits.float(), dim=-1).gather(
-        -1, targets.unsqueeze(-1)
-    ).squeeze(-1)
+    return (
+        torch.log_softmax(logits.float(), dim=-1)
+        .gather(-1, targets.unsqueeze(-1))
+        .squeeze(-1)
+    )
 
 
 def test_shift_targets_true_scores_the_next_token(single_rank_gloo_group):
