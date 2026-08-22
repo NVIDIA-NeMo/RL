@@ -980,15 +980,20 @@ class MetricsDataPlaneClient(DataPlaneClient):
         if live is None:
             return
         total = self._bytes_by_partition.get(partition_id, 0)
+        # Count what was actually live, not what the caller listed. A clear
+        # may name uids already dropped or belonging elsewhere, and billing
+        # those released bytes this partition never held: clearing 50 live
+        # keys alongside 50 unknown ones freed two thirds of a partition
+        # that had lost half its keys.
+        removed = len(live.intersection(keys)) if keys is not None else len(live)
         if keys is not None:
-            live -= live.intersection(keys)
+            live -= set(keys)
         if keys is None or not live:
             freed = total
             del self._keys_by_partition[partition_id]
             self._bytes_by_partition.pop(partition_id, None)
         else:
-            dropped = len(keys)
-            freed = total * dropped // (len(live) + dropped)
+            freed = total * removed // (len(live) + removed) if removed else 0
             self._bytes_by_partition[partition_id] = total - freed
         self._stats.bytes_outstanding -= freed
 
