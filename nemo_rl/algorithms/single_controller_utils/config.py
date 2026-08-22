@@ -569,6 +569,56 @@ class SingleControllerPPOConfig(BaseModel, extra="allow"):
     # policy update. 0 trains both from step 0.
     policy_training_start_step: NonNegativeInt = 0
 
+    @model_validator(mode="after")
+    def _reject_keys_that_live_under_grpo(self) -> "SingleControllerPPOConfig":
+        """Fail loudly on legacy ``ppo.*`` settings the SingleController reads elsewhere.
+
+        A config ported from run_ppo.py brings its whole ``ppo:`` block along, and
+        ``extra="allow"`` means every key SC does not define parses fine and then
+        does nothing -- so a run overriding ``ppo.max_num_steps=40`` would train
+        for whatever ``grpo.max_num_steps`` says instead. Name the destination
+        rather than letting the two disagree in silence.
+        """
+        relocated = (
+            "num_prompts_per_step",
+            "num_generations_per_prompt",
+            "max_num_epochs",
+            "max_num_steps",
+            "max_rollout_turns",
+            "val_period",
+            "val_batch_size",
+            "val_at_start",
+            "val_at_end",
+            "max_val_samples",
+            "skip_reference_policy_logprobs_calculation",
+            "seed",
+            "overlong_filtering",
+            "use_dynamic_sampling",
+            "dynamic_sampling_max_gen_batches",
+            "batch_multiplier",
+            "reward_shaping",
+            "reward_scaling",
+            "seq_logprob_error_threshold",
+        )
+        stale = [
+            f"  ppo.{key} -> grpo.{key}"
+            for key in relocated
+            if key in (self.model_extra or {})
+        ]
+        if "async_ppo" in (self.model_extra or {}):
+            stale.append("  ppo.async_ppo -> async_rl")
+        if "ppo_epochs" in (self.model_extra or {}):
+            stale.append(
+                "  ppo.ppo_epochs -> not supported; SC does one optimizer step per "
+                "RL step for both the policy and the critic"
+            )
+        if stale:
+            raise ValueError(
+                "these ppo keys are not read on the SingleController path:\n"
+                + "\n".join(stale)
+            )
+        return self
+
 
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig

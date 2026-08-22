@@ -300,6 +300,11 @@ tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-n
 # Megatron PPO with value SP + pipeline + context parallelism + sequence packing (TP2+SP+PP2+CP2) (Qwen2.5-1.5B, GSM8K)
 tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-pp2cp2-pack.sh
 
+# Asynchronous non-colocated Megatron PPO driven by the SingleController
+# (Qwen2.5-1.5B, GSM8K). Same work as the async recipe above -- 160 optimizer
+# steps over the same data -- with the critic on the TransferQueue data plane.
+tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-noncolocated-async-single-controller.sh
+
 ########
 # GDPO #
 ########

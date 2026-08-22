@@ -34,6 +34,9 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
+from nemo_rl.algorithms.single_controller_utils import (
+    MasterConfig as SingleControllerMasterConfig,
+)
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig as XTokenOffPolicyDistillationMasterConfig,
 )
@@ -145,6 +148,12 @@ def test_all_config_files_have_required_keys(config_file):
     elif "sft" in config_dict:
         master_config_class = SFTMasterConfig
         config_type = "sft"
+    elif "grpo" in config_dict and "ppo" in config_dict:
+        # SingleController PPO: the step config lives under ``grpo`` (SC reads it
+        # from there) and ``ppo`` carries only the critic extras, so neither the
+        # GRPO nor the legacy PPO schema describes it.
+        master_config_class = SingleControllerMasterConfig
+        config_type = "single_controller_ppo"
     elif "grpo" in config_dict:
         master_config_class = GRPOMasterConfig
         config_type = "grpo"
