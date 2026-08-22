@@ -399,9 +399,9 @@ def _log_data_plane_metrics(
     metrics = client.get_step_metrics(total_step_time)
     logger.log_metrics(metrics, step, prefix="data_plane")
     print(
-        f"  • data plane: {metrics['wall_s']:.2f}s "
+        f"  • data plane: {metrics['wall_ms']:.0f}ms "
         f"({100 * metrics['frac_of_step']:.1f}% of step), "
-        f"{metrics['comm_volume_gb']:.2f} GB moved"
+        f"{metrics['comm_volume_mb']:.1f} MB moved"
     )
 
 
