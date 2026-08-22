@@ -687,7 +687,9 @@ def test_update_weights_from_collective_processes_weights_after_loading(
         call_order.append("load")
         assert weights == [("model.weight", "weight-value")]
 
-    def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
+    def packed_broadcast_consumer(
+        iterator, group, src, post_unpack_func, num_buffers=None
+    ):
         call_order.append("broadcast")
         assert list(iterator) == [("model.weight", expected_state_info)]
         assert group is ext.model_update_group

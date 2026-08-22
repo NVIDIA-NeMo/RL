@@ -103,13 +103,19 @@ def _process_hpc_modules_after_loading(model: torch.nn.Module) -> None:
 
 def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
     """Return whether a model realized the unquantized TRTLLM MoE backend."""
-    # Import backend types only when inspecting a constructed vLLM model.
-    from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
-        UnquantizedMoeBackend,
-    )
-    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-        UnquantizedFusedMoEMethod,
-    )
+    # Import backend types only when inspecting a constructed vLLM model. The
+    # module layout is version-sensitive; on vLLM builds without the oracle
+    # package the TRTLLM backend cannot be realized, so absence means False
+    # rather than an ImportError on every unquantized-model refit.
+    try:
+        from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+            UnquantizedMoeBackend,
+        )
+        from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+            UnquantizedFusedMoEMethod,
+        )
+    except ImportError:
+        return False
 
     return any(
         isinstance(
