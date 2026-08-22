@@ -365,6 +365,35 @@ def test_step_metrics_tail_is_exact_not_bucketed():
     client.close()
 
 
+def test_latency_breakdown_stacks_to_wall_ms():
+    """The fit is reported as two ms components rather than a ratio, so a
+    chart can stack them against the measured ``wall_ms``.
+
+    A ratio would have been both flat (the fit is cumulative) and unitless
+    on an axis of milliseconds. These carry the coefficients from the
+    cumulative fit but attribute them to *this* step's calls and bytes.
+    """
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    fixed_ms, mb_per_s = 8.0, 500.0
+    now = monotonic()
+    for i in range(12):  # varied sizes, or the fit is unidentifiable
+        n_bytes = 50_000 * (i + 1)
+        wall_ms = fixed_ms + n_bytes / (mb_per_s * 1e3)
+        client._emit("put", "p", 1, n_bytes, now - wall_ms / 1e3, "ok")
+
+    metrics = client.get_step_metrics(1.0)
+    fit = client.snapshot()["by_op"]["put"]["fit"]
+    assert fit["model_trustworthy"], fit
+    assert fit["fixed_ms"] == pytest.approx(fixed_ms, rel=0.05)
+    assert fit["bandwidth_mb_s"] == pytest.approx(mb_per_s, rel=0.05)
+
+    # the two components are the split, in ms, and they add up
+    total = metrics["put/overhead_ms"] + metrics["put/transfer_ms"]
+    assert total == pytest.approx(metrics["put/wall_ms"], rel=0.05)
+    assert "put/overhead_frac" not in metrics, "a ratio is derivable from these"
+    client.close()
+
+
 def test_step_max_is_scoped_to_the_step():
     """A lifetime max is monotonic and goes flat the moment the worst call
     has been seen — the same defect as logging a cumulative percentile. The

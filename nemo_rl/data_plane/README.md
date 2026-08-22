@@ -445,8 +445,16 @@ per-step delta already flattened for the logger.
 a chart mixing `wall_s` against `p99_ms` puts a 0.008 beside a 24.85 and
 reads as a data-plane bug rather than an axis one.
 
-**Per step you get four series per op tag:** `calls`, `wall_ms`, `max_ms`
-and (when the fit is trustworthy) `overhead_frac`. Not percentiles — the
+**Per step you get, per op tag:** `calls`, `wall_ms`, `max_ms`, and — when
+the affine fit is trustworthy — `overhead_ms` and `transfer_ms`. Those last
+two are the split of the op's time into fixed per-request cost and
+bandwidth, in ms, and they *stack*: together they are the model's estimate
+of the step's `wall_ms`, so charting them against the measured `wall_ms`
+shows the breakdown and the model error in one picture. The coefficients
+come from the cumulative fit (a model should be stable); the attribution is
+per step, applied to that step's calls and bytes. A ratio was tried first
+and was the wrong shape — cumulative and therefore flat, and unitless on an
+axis of milliseconds. Not percentiles — the
 histogram is cumulative by design, so a per-step p50 off it goes flat, and
 at the handful of calls an op makes in one step a p99 is bucket geometry
 rather than data (one sample in the `(10, 25]` bucket always yields
