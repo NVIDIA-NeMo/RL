@@ -303,7 +303,7 @@ def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypa
     ext.model_config = None
     ext.device = torch.device("cpu")
     ext._uses_unquantized_flashinfer_trtllm = lambda: True
-    ext._validate_weight_update_compatibility = lambda: None
+    ext._validate_native_layerwise_refit = lambda: None
     ext._maybe_process_mtp_drafter_after_loading = MagicMock()
 
     monkeypatch.setattr(

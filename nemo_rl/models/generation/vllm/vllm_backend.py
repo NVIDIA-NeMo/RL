@@ -420,14 +420,14 @@ class VllmInternalWorkerExtension:
                 MoE backend while a co-trained MTP drafter is enabled (unsupported
                 by the native layerwise refit lifecycle).
         """
-        self._validate_weight_update_compatibility()
+        self._validate_native_layerwise_refit()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
     def prepare_sparse_delta_refit_info(
         self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]
     ) -> list[str]:
         """Reserve scratch space and report weights that require overwrite."""
-        self._validate_weight_update_compatibility("sparse_delta")
+        self._reject_unsupported_native_refit("sparse_delta")
         applier = self._get_sparse_delta_applier()
         return sorted(applier.discover_native_skips(state_dict_info))
 
@@ -749,26 +749,30 @@ class VllmInternalWorkerExtension:
             self._uses_unquantized_flashinfer_trtllm()
         )
 
-    def _validate_weight_update_compatibility(
-        self, transport: UnsupportedNativeRefitTransport | None = None
-    ) -> None:
-        """Reject native TRTLLM combinations without a safe reload lifecycle."""
+    def _validate_native_layerwise_refit(self) -> None:
+        """Reject unsupported features on the native layerwise reload path."""
         if not self._uses_unquantized_flashinfer_trtllm():
             return
-
-        if transport is not None:
-            label = transport.replace("_", "-")
-            raise RuntimeError(
-                f"{label} refit does not support the unquantized FlashInfer "
-                "TRTLLM MoE backend yet because it bypasses vLLM's native "
-                "layerwise reload lifecycle"
-            )
 
         if self._mtp_drafter_refit_enabled():
             raise RuntimeError(
                 "Unquantized FlashInfer TRTLLM refit does not yet support "
                 "a co-trained MTP drafter"
             )
+
+    def _reject_unsupported_native_refit(
+        self, transport: UnsupportedNativeRefitTransport
+    ) -> None:
+        """Reject transports that cannot run the native layerwise lifecycle."""
+        if not self._uses_unquantized_flashinfer_trtllm():
+            return
+
+        label = transport.replace("_", "-")
+        raise RuntimeError(
+            f"{label} refit does not support the unquantized FlashInfer "
+            "TRTLLM MoE backend yet because it bypasses vLLM's native "
+            "layerwise reload lifecycle"
+        )
 
     @contextmanager
     def _weight_update_lifecycle(
@@ -780,7 +784,7 @@ class VllmInternalWorkerExtension:
         subsequent exception therefore marks this worker permanently unusable.
         """
         if self._uses_native_layerwise_refit(transport):
-            self._validate_weight_update_compatibility()
+            self._validate_native_layerwise_refit()
             previous_failure = self._nrl_layerwise_reload_failure
             if previous_failure is not None:
                 raise RuntimeError(
@@ -988,7 +992,7 @@ class VllmInternalWorkerExtension:
     def update_weights_from_decoded_sparse_payload(
         self, *payloads: bytes | str
     ) -> dict[str, Any]:
-        self._validate_weight_update_compatibility("sparse_delta")
+        self._reject_unsupported_native_refit("sparse_delta")
         applier = self._get_sparse_delta_applier()
         return applier.update_weights_from_decoded_sparse_payload(*payloads)
 
@@ -1438,4 +1442,4 @@ class VllmInternalWorkerExtensionWithCheckpointEngine(
     """vLLM worker extension with checkpoint-engine refit support."""
 
     def _validate_checkpoint_engine_weight_update(self) -> None:
-        self._validate_weight_update_compatibility("checkpoint_engine")
+        self._reject_unsupported_native_refit("checkpoint_engine")
