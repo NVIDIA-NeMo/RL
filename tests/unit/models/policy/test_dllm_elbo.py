@@ -20,9 +20,9 @@ import pytest
 import torch
 
 from nemo_rl.models.policy.dllm import (
-    accumulate_elbo_logprobs,
     DllmConfig,
     SdmcElboEstimator,
+    accumulate_elbo_logprobs,
     get_quadrature,
     resolve_mask_id,
 )

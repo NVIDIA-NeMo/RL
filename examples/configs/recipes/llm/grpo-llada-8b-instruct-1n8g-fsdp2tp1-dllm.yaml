@@ -6,35 +6,14 @@ grpo:
 checkpointing:
   checkpoint_dir: results/grpo-llada-8b-instruct-1n8g-fsdp2tp1-dllm
 policy:
-  model_name: GSAI-ML/LLaDA-8B-Instruct
   tokenizer:
     name: GSAI-ML/LLaDA-8B-Instruct
-  train_global_batch_size: 256
-  train_micro_batch_size: 1
-  logprob_batch_size: 1
-  max_total_sequence_length: 1024
   dtensor_cfg:
-    enabled: true
-    tensor_parallel_size: 1
-    context_parallel_size: 1
     activation_checkpointing: true
-  dllm:
-    enabled: true
-    quadrature: gauss-2
-    mc_samples: 1
-    block_length: 32
-    diffusion_steps: 128
-  generation:
-    backend: dllm
-    max_new_tokens: 512
 logger:
   log_dir: logs/grpo-llada-8b-instruct-1n8g-fsdp2tp1-dllm
   wandb_enabled: true
   tensorboard_enabled: true
-  monitor_gpus: true
   wandb:
     project: nemo-rl
     name: grpo-llada-8b-instruct-1n8g-fsdp2tp1-dllm
-cluster:
-  gpus_per_node: 8
-  num_nodes: 1
