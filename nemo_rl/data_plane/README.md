@@ -464,10 +464,21 @@ processes, against a 6x wider view of the traffic. The fan-out is
 best-effort — a rank that cannot answer is dropped rather than failing the
 step.
 
-`observability_overhead_ms` reports what the measurement itself cost,
-summed over every process: the wrapper's wall time minus the time its inner
-client was working. It sits beside `wall_ms` so the bill is visible next to
-what it bought (measured ~0.05% of data-plane time).
+`observability_overhead_ms` reports what the measurement itself cost — the
+whole bill, both halves:
+
+- every process's wrapper time (its wall time minus the time its inner
+  client was working), and
+- the fan-out that gathered and merged the snapshots.
+
+The second is the larger. In the cross-process e2e the wrapper cost 0.13 ms
+and the fan-out 2.31 ms, so a figure covering only the first understated by
+19x. Measured whole: **~2.4 ms, about 0.9% of data-plane time** for 10
+processes.
+
+It is deliberately not clamped to 100%. Against a fast backend the ratio
+can exceed 1, meaning measuring cost more than the operation measured — a
+signal worth seeing rather than hiding.
 
 **Units:** every duration is `_ms`, every volume is `_mb`, no exceptions —
 a chart mixing `wall_s` against `p99_ms` puts a 0.008 beside a 24.85 and
