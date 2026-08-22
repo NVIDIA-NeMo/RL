@@ -424,6 +424,55 @@ def test_adaptive_forces_once_then_waits_for_evidence() -> None:
     assert state["forced_refits"] == 1
 
 
+def test_adaptive_forced_refit_waits_until_reference_evidence_exists() -> None:
+    scheduler = DraftUpdateScheduler.create(
+        AdaptiveDraftUpdateScheduleConfig(
+            min_interval=1,
+            max_interval=2,
+            min_observations=4,
+            ewma_alpha=1.0,
+        ),
+        origin_step=0,
+    )
+
+    assert _finish(scheduler, 1, 0.9) == (False, False)
+    forced = scheduler.decide(global_step=2, acceptance=None)
+    assert forced.reason == "max_interval"
+    scheduler.record_outcome(
+        forced,
+        update_attempted=True,
+        update_successful=True,
+        draft_refit_attempted=True,
+        draft_refit_successful=True,
+    )
+
+    for step, acceptance in ((3, 0.8), (4, 0.7)):
+        decision = scheduler.decide(global_step=step, acceptance=acceptance)
+        assert decision.reason == "none"
+        assert decision.update_requested is False
+        assert decision.draft_refit_requested is False
+        scheduler.record_outcome(
+            decision,
+            update_attempted=False,
+            update_successful=False,
+            draft_refit_attempted=False,
+            draft_refit_successful=False,
+        )
+        assert scheduler.state.reference_acceptance_ewma is None
+        assert scheduler.state.phase == "awaiting_post_refit_observation"
+
+    established = scheduler.decide(global_step=5, acceptance=0.6)
+
+    assert established.reason == "none"
+    assert established.update_requested is False
+    assert established.draft_refit_requested is False
+    assert scheduler.state.valid_observations == 4
+    assert scheduler.state.acceptance_ewma == pytest.approx(0.6)
+    assert scheduler.state.reference_acceptance_ewma == pytest.approx(0.6)
+    assert scheduler.state.phase == "monitoring"
+    assert scheduler.state.burst_updates == 0
+
+
 def test_adaptive_smoothed_degradation_burst_and_recovery_transitions() -> None:
     scheduler = DraftUpdateScheduler.create(
         AdaptiveDraftUpdateScheduleConfig(

@@ -284,21 +284,23 @@ class DraftUpdateScheduler:
             if observation is not None:
                 acceptance_ewma = self.state.acceptance_ewma
                 reference_ewma = self.state.reference_acceptance_ewma
-                if acceptance_ewma is None or reference_ewma is None:
+                if acceptance_ewma is None:
                     raise RuntimeError("adaptive state is missing acceptance evidence")
-                gap = reference_ewma - acceptance_ewma
-                if gap <= self.config.recovery_threshold:
-                    self.state.phase = "monitoring"
-                    self.state.burst_updates = 0
-                elif self.state.burst_updates >= self.config.max_burst_updates:
-                    raise RuntimeError(
-                        f"max_burst_updates={self.config.max_burst_updates} exhausted; "
-                        f"reference={reference_ewma}; current={acceptance_ewma}; "
-                        f"history={self.state.decision_history}"
-                    )
-                else:
-                    update, refit, reason = True, True, "adaptive_burst"
-                    self.state.phase = "training_burst"
+                if reference_ewma is not None:
+                    gap = reference_ewma - acceptance_ewma
+                    if gap <= self.config.recovery_threshold:
+                        self.state.phase = "monitoring"
+                        self.state.burst_updates = 0
+                    elif self.state.burst_updates >= self.config.max_burst_updates:
+                        raise RuntimeError(
+                            f"max_burst_updates={self.config.max_burst_updates} "
+                            f"exhausted; reference={reference_ewma}; "
+                            f"current={acceptance_ewma}; "
+                            f"history={self.state.decision_history}"
+                        )
+                    else:
+                        update, refit, reason = True, True, "adaptive_burst"
+                        self.state.phase = "training_burst"
         elif update_age >= self.config.max_interval:
             update, refit, forced, reason = True, True, True, "max_interval"
         elif (
