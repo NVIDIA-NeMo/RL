@@ -441,6 +441,19 @@ counts sum into one cluster-wide distribution) and byte volume. `snapshot()`
 returns the cumulative view; `get_step_metrics(step_time_s)` returns the
 per-step delta already flattened for the logger.
 
+**Scope: one process, not the cluster.** Every process builds its own
+client with its own counters — the driver, each policy worker, the rollout
+actor. `grpo_train_sync` logs the *driver's*, under `data_plane/driver/`.
+The driver issues about one op of each kind per step, so `calls` is small
+by construction; the bulk traffic is the rollout actor's `kv_first_write`
+and the workers' per-DP-rank `get_samples`, and neither appears in these
+series. Do not read `comm_volume_mb` as cluster-wide volume.
+
+`OpStats` is additive on purpose — the histogram buckets and the regression
+sufficient statistics from every rank sum into one cluster-wide view — but
+nothing collects them yet. That is an affordance the design leaves open,
+not a feature that exists.
+
 **Units:** every duration is `_ms`, every volume is `_mb`, no exceptions —
 a chart mixing `wall_s` against `p99_ms` puts a 0.008 beside a 24.85 and
 reads as a data-plane bug rather than an axis one.
