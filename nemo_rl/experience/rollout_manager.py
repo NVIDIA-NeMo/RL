@@ -61,6 +61,17 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 
 
+def _contains_post_write_enrichment_error(error: BaseException) -> bool:
+    """Whether an error, including a rollback ExceptionGroup, is post-write."""
+    if isinstance(error, PostWriteEnrichmentError):
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        return any(
+            _contains_post_write_enrichment_error(child) for child in error.exceptions
+        )
+    return False
+
+
 class RolloutOutcome(str, enum.Enum):
     """How :meth:`RolloutManager.generate_and_push` finished for one prompt."""
 
@@ -1292,7 +1303,7 @@ class RolloutManager:
                 # The rollout itself succeeded. Re-running generation cannot repair
                 # a required downstream stage (for example MOPD teacher inference),
                 # and would spend the rollout retry budget on the wrong subsystem.
-                if isinstance(error, PostWriteEnrichmentError):
+                if _contains_post_write_enrichment_error(error):
                     raise
                 reason = type(error).__name__
 

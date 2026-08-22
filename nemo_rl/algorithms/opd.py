@@ -254,14 +254,17 @@ class TQTeacherLogprobCoordinator:
 
     def _resolve_teacher(self, record: PromptGroupRecord) -> tuple[str, str]:
         extra_env_info = record.extra_env_info
-        if not isinstance(extra_env_info, dict):
-            raise ValueError(
-                "MOPD rollout is missing prompt-level extra_env_info with agent_ref"
-            )
-        agent_ref = extra_env_info.get("agent_ref")
+        agent_ref = (
+            extra_env_info.get("agent_ref")
+            if isinstance(extra_env_info, dict)
+            else None
+        )
         if not isinstance(agent_ref, dict):
             raise ValueError(
-                "MOPD rollout extra_env_info must contain an agent_ref mapping"
+                "on_policy_distillation is enabled but this prompt group has no "
+                "extra_env_info['agent_ref'] mapping to route it to a teacher. "
+                "SingleController MOPD requires the NeMo-Gym rollout path, and "
+                "regenerating this prompt cannot repair missing routing metadata."
             )
 
         teacher_model_by_agent_name = dict(
@@ -303,51 +306,54 @@ class TQTeacherLogprobCoordinator:
         remainder = actual_batch_size % dp_size
         padded_meta = meta
         temporary_sample_ids: list[str] = []
-        if remainder:
-            pad_count = dp_size - remainder
-            source_meta = meta.slice(actual_batch_size - 1, actual_batch_size)
-            source_data = read_columns(
-                self._dp_client,
-                source_meta,
-                select_fields=["input_ids", "input_lengths"],
-                pad_value_dict={"input_ids": 0},
-            )
-            input_ids = source_data["input_ids"]
-            input_lengths = source_data["input_lengths"]
-            if not isinstance(input_ids, torch.Tensor) or not isinstance(
-                input_lengths, torch.Tensor
-            ):
-                raise TypeError("MOPD teacher padding inputs must be tensors")
-            temporary_prefix = uuid.uuid4().hex
-            temporary_sample_ids = [
-                f"{meta.sample_ids[-1]}__teacher_pad_{temporary_prefix}_{index}"
-                for index in range(pad_count)
-            ]
-            pad_meta = KVBatchMeta(
-                partition_id=meta.partition_id,
-                task_name=meta.task_name,
-                sample_ids=temporary_sample_ids,
-                fields=["input_ids", "input_lengths"],
-                sequence_lengths=[meta.sequence_lengths[-1]] * pad_count,
-            )
-            write_columns(
-                self._dp_client,
-                pad_meta,
-                fields={
-                    "input_ids": input_ids.expand(pad_count, *input_ids.shape[1:]),
-                    "input_lengths": input_lengths.expand(
-                        pad_count, *input_lengths.shape[1:]
-                    ),
-                },
-            )
-            padded_meta = meta.concat(pad_meta)
-
-        lock_started_at = time.perf_counter()
         try:
+            if remainder:
+                pad_count = dp_size - remainder
+                source_meta = meta.slice(actual_batch_size - 1, actual_batch_size)
+                source_data = read_columns(
+                    self._dp_client,
+                    source_meta,
+                    select_fields=["input_ids", "input_lengths"],
+                    pad_value_dict={"input_ids": 0},
+                )
+                input_ids = source_data["input_ids"]
+                input_lengths = source_data["input_lengths"]
+                if not isinstance(input_ids, torch.Tensor) or not isinstance(
+                    input_lengths, torch.Tensor
+                ):
+                    raise TypeError("MOPD teacher padding inputs must be tensors")
+                temporary_prefix = uuid.uuid4().hex
+                temporary_sample_ids = [
+                    f"{meta.sample_ids[-1]}__teacher_pad_{temporary_prefix}_{index}"
+                    for index in range(pad_count)
+                ]
+                pad_meta = KVBatchMeta(
+                    partition_id=meta.partition_id,
+                    task_name=meta.task_name,
+                    sample_ids=temporary_sample_ids,
+                    fields=["input_ids", "input_lengths"],
+                    sequence_lengths=[meta.sequence_lengths[-1]] * pad_count,
+                )
+                # Keep this write inside the cleanup lifetime. A backend may
+                # write only some rows before reporting failure.
+                write_columns(
+                    self._dp_client,
+                    pad_meta,
+                    fields={
+                        "input_ids": input_ids.expand(pad_count, *input_ids.shape[1:]),
+                        "input_lengths": input_lengths.expand(
+                            pad_count, *input_lengths.shape[1:]
+                        ),
+                    },
+                )
+                padded_meta = meta.concat(pad_meta)
+
+            lock_started_at = time.perf_counter()
             with self._teacher_locks[group_alias]:
                 inference_started_at = time.perf_counter()
                 teacher.get_logprobs_from_meta(padded_meta)
-        except BaseException as inference_error:
+            inference_finished_at = time.perf_counter()
+        except BaseException as enrichment_error:
             if temporary_sample_ids:
                 try:
                     self._dp_client.clear_samples(
@@ -356,12 +362,11 @@ class TQTeacherLogprobCoordinator:
                     )
                 except BaseException as cleanup_error:
                     raise BaseExceptionGroup(
-                        f"teacher inference and temporary-row cleanup both failed "
+                        f"teacher enrichment and temporary-row cleanup both failed "
                         f"for group {group_alias!r}",
-                        [inference_error, cleanup_error],
+                        [enrichment_error, cleanup_error],
                     )
             raise
-        inference_finished_at = time.perf_counter()
         if temporary_sample_ids:
             self._dp_client.clear_samples(
                 sample_ids=temporary_sample_ids,
@@ -380,9 +385,22 @@ class TQTeacherLogprobCoordinator:
         """Write teacher logprobs before the replay-buffer slot becomes ready."""
         alias, group_alias = self._resolve_teacher(record)
         started_at = time.perf_counter()
-        lock_wait_s, inference_time_s = await asyncio.to_thread(
-            self._enrich_sync, meta, group_alias
+        # asyncio cannot cancel a running thread. Shield and explicitly drain
+        # it so replay-buffer rollback never clears rows while teacher workers
+        # are still fetching from or writing to those rows.
+        enrichment_task = asyncio.create_task(
+            asyncio.to_thread(self._enrich_sync, meta, group_alias)
         )
+        try:
+            lock_wait_s, inference_time_s = await asyncio.shield(enrichment_task)
+        except asyncio.CancelledError:
+            try:
+                await enrichment_task
+            except BaseException as drain_error:
+                raise asyncio.CancelledError(
+                    f"cancelled while draining teacher enrichment for {group_alias!r}"
+                ) from drain_error
+            raise
         total_time_s = time.perf_counter() - started_at
 
         teacher_model_by_agent_name = self._opd_cfg["teacher_model_by_agent_name"]

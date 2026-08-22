@@ -14,10 +14,15 @@
 
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN
+from nemo_rl.data_plane.schema import (
+    GLOBAL_FORWARD_PAD_SEQLEN,
+    MICRO_BATCH_INDICES,
+    MICRO_BATCH_LENGTHS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -101,6 +106,7 @@ def test_get_logprobs_from_meta_dispatches_tq_shards_to_teacher_workers():
     teacher = object.__new__(TeacherWorkerGroup)
     teacher.alias = "teacher"
     teacher.use_sequence_packing = False
+    teacher.use_dynamic_batches = False
     teacher.sequence_length_pad_multiple = 2
     teacher.sharding_annotations = Sharding()
     teacher.worker_group = worker_group
@@ -125,6 +131,71 @@ def test_get_logprobs_from_meta_dispatches_tq_shards_to_teacher_workers():
     worker_group.get_all_worker_results.assert_called_once_with("futures")
 
 
+def test_get_logprobs_from_meta_builds_global_dynamic_batch_plan(monkeypatch):
+    """Teacher presharding uses logprob tokens and ships one balanced global plan."""
+    import nemo_rl.models.policy.teacher_worker_group as teacher_module
+    from nemo_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
+
+    class Sharding:
+        def get_axis_size(self, axis):
+            assert axis == "data_parallel"
+            return 2
+
+    captured = {}
+    real_shard_meta_for_dp = teacher_module.shard_meta_for_dp
+
+    def capture_plan(meta, **kwargs):
+        captured.update(kwargs)
+        return real_shard_meta_for_dp(meta, **kwargs)
+
+    monkeypatch.setattr(teacher_module, "shard_meta_for_dp", capture_plan)
+    worker_group = MagicMock()
+    teacher = object.__new__(TeacherWorkerGroup)
+    teacher.alias = "teacher"
+    teacher.use_sequence_packing = False
+    teacher.use_dynamic_batches = True
+    teacher.sequence_length_pad_multiple = 1
+    teacher.dynamic_batching_args = {
+        "input_key": "input_ids",
+        "input_lengths_key": "input_lengths",
+        "sequence_length_round": 1,
+        "max_tokens_per_microbatch": 999,
+    }
+    teacher.cfg = {
+        "dynamic_batching": {
+            "enabled": True,
+            "train_mb_tokens": 999,
+            "logprob_mb_tokens": 10,
+            "sequence_length_round": 1,
+        }
+    }
+    teacher.sharding_annotations = Sharding()
+    teacher.worker_group = worker_group
+    teacher._micro_batch_size = 1
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["a", "b", "c", "d"],
+        fields=["input_ids", "input_lengths"],
+        sequence_lengths=[8, 1, 7, 2],
+    )
+
+    teacher.get_logprobs_from_meta(meta)
+
+    assert captured["sequence_packing_args"] is None
+    assert captured["dynamic_batching_args"]["max_tokens_per_microbatch"] == 10
+    shards = worker_group.run_all_workers_sharded_data.call_args.kwargs["meta"]
+    assert sorted(sample_id for shard in shards for sample_id in shard.sample_ids) == [
+        "a",
+        "b",
+        "c",
+        "d",
+    ]
+    assert all(MICRO_BATCH_INDICES in shard.extra_info for shard in shards)
+    assert all(MICRO_BATCH_LENGTHS in shard.extra_info for shard in shards)
+    assert len({len(shard.extra_info[MICRO_BATCH_LENGTHS]) for shard in shards}) == 1
+
+
 def test_teacher_worker_presharded_entrypoint_writes_teacher_tq_field():
     """The worker consumes its TQ shard and writes only the teacher delta."""
     from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
@@ -134,6 +205,7 @@ def test_teacher_worker_presharded_entrypoint_writes_teacher_tq_field():
 
         def __init__(self):
             self.written = None
+            self.received_batching_metadata = None
 
         def _fetch(self, meta):
             del meta
@@ -145,7 +217,11 @@ def test_teacher_worker_presharded_entrypoint_writes_teacher_tq_field():
             )
 
         def get_logprobs(self, data, micro_batch_size=None):
-            del data, micro_batch_size
+            del micro_batch_size
+            self.received_batching_metadata = (
+                data.micro_batch_indices,
+                data.micro_batch_lengths,
+            )
             return BatchedDataDict({"logprobs": torch.full((1, 3), 0.25)})
 
         def _write_back_result_field(self, meta, result, *, result_key, tq_field):
@@ -157,6 +233,10 @@ def test_teacher_worker_presharded_entrypoint_writes_teacher_tq_field():
         sample_ids=["a"],
         fields=["input_ids", "input_lengths"],
         sequence_lengths=[3],
+        extra_info={
+            MICRO_BATCH_INDICES: [[0]],
+            MICRO_BATCH_LENGTHS: [3],
+        },
     )
     worker = Worker()
 
@@ -166,3 +246,39 @@ def test_teacher_worker_presharded_entrypoint_writes_teacher_tq_field():
     assert worker.written[0] is meta
     assert torch.allclose(worker.written[1], torch.full((1, 3), 0.25))
     assert worker.written[2] == "teacher_reference_logprobs"
+    assert worker.received_batching_metadata == ([[0]], [3])
+
+
+def test_teacher_worker_rejects_local_dynamic_batch_planning():
+    """A missing driver plan fails instead of independently repacking each DP rank."""
+    from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
+
+    class Worker(TQWorkerMixin):
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "dynamic_batching": {
+                "enabled": True,
+                "sequence_length_round": 1,
+                "train_mb_tokens": 8,
+            },
+        }
+
+        def _fetch(self, meta):
+            del meta
+            return BatchedDataDict(
+                {
+                    "input_ids": torch.ones(1, 3, dtype=torch.long),
+                    "input_lengths": torch.tensor([3]),
+                }
+            )
+
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="teacher_lp:teacher",
+        sample_ids=["a"],
+        fields=["input_ids", "input_lengths"],
+        sequence_lengths=[3],
+    )
+
+    with pytest.raises(RuntimeError, match="driver-provided global"):
+        Worker().get_teacher_logprobs_presharded(meta)

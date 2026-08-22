@@ -27,7 +27,10 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
-from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller import (
+    SingleControllerActor,
+    _pooled_opd_metrics,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
@@ -326,7 +329,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     ctrl._advantage_estimator = FakeEstimator()
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
-    ctrl._opd_enabled = True
+    ctrl._teacher_logprobs_required = True
     ctrl._dp_client = FakeDataPlane()
     ctrl._step_log_dict = {
         "rewards": [],
@@ -334,6 +337,9 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         "sequence_lengths": [],
     }
     ctrl._advantage_metric_values = {}
+    ctrl._opd_stat_sum = 0.0
+    ctrl._opd_stat_sumsq = 0.0
+    ctrl._opd_stat_count = 0
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
@@ -358,9 +364,29 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         torch.full((2, 3), 0.25),
     )
     assert "advantages" in enriched.fields
-    assert ctrl._advantage_metric_values == {
-        "on_policy_distillation/teacher_student_logprob_gap_mean": [0.25]
-    }
+    assert ctrl._advantage_metric_values == {}
+    assert ctrl._opd_stat_sum == pytest.approx(1.5)
+    assert ctrl._opd_stat_sumsq == pytest.approx(0.375)
+    assert ctrl._opd_stat_count == 6
+
+
+def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None:
+    """A small streaming chunk cannot receive the same weight as a large one."""
+    # Chunk 1 has values [0, 2]; chunk 2 has [4]. Averaging chunk means
+    # would incorrectly produce 2.5. Exact pooling produces mean=2, std=2.
+    metrics = _pooled_opd_metrics(
+        stat_sum=6.0,
+        stat_sumsq=20.0,
+        count=3,
+    )
+
+    assert metrics == pytest.approx(
+        {
+            "on_policy_distillation/teacher_student_logprob_gap_mean": 2.0,
+            "on_policy_distillation/adv_mean": 2.0,
+            "on_policy_distillation/adv_std": 2.0,
+        }
+    )
 
 
 class _EmptySampler:
@@ -479,7 +505,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
-    ctrl._opd_enabled = False
+    ctrl._teacher_logprobs_required = False
     ctrl._advantage_estimator = None
     ctrl._partition_id = "rollout_data"
     ctrl._sampler = sampler
@@ -503,6 +529,9 @@ def _train_pump_controller(*, sampler) -> object:
         "sequence_lengths": [],
     }
     ctrl._advantage_metric_values = {}
+    ctrl._opd_stat_sum = 0.0
+    ctrl._opd_stat_sumsq = 0.0
+    ctrl._opd_stat_count = 0
     ctrl._teacher_coordinator = None
     return ctrl
 

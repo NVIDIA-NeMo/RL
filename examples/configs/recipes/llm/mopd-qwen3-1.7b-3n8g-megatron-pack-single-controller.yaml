@@ -4,8 +4,6 @@ defaults: ./mopd-qwen3-1.7b-3n8g-megatron-pack.yaml
 grpo:
   async_grpo: null
   val_period: 0
-  val_at_start: false
-  val_at_end: false
   # OPD needs the student pass, but not a separate frozen reference-policy pass.
   skip_reference_policy_logprobs_calculation: true
 
@@ -23,7 +21,6 @@ data_plane:
 checkpointing:
   checkpoint_dir: results/mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller
   metric_name: null
-  keep_top_k: 1
 
 logger:
   wandb:

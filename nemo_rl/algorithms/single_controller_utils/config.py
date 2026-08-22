@@ -761,6 +761,10 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "loss_fn.reference_policy_kl_penalty=0."
         )
 
+    # ``env`` is required in production configs, but model_construct-based unit
+    # configs can omit it. Only apply rollout-path validation when it is present.
+    env_config = getattr(master_config, "env", None)
+
     opd_enabled = opd_module.is_opd_enabled(master_config)
     if master_config.grpo.adv_estimator.name == "opd" and not opd_enabled:
         raise ValueError(
@@ -780,6 +784,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "SingleController MOPD currently requires "
                 "on_policy_distillation.non_colocated_teachers.enabled=true."
             )
+        if env_config is not None and not bool(env_config.get("should_use_nemo_gym")):
+            raise ValueError(
+                "on_policy_distillation requires env.should_use_nemo_gym=true: "
+                "teacher routing keys off the gym rollout path's per-agent "
+                "agent_ref."
+            )
         if not opd_config.teacher_model_by_agent_name:
             raise ValueError(
                 "on_policy_distillation.teacher_model_by_agent_name must contain "
@@ -794,13 +804,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     # wrong-path block is still a silent no-op, which is the failure this whole
     # restructure exists to remove. Only a check at setup actually closes it.
     #
-    # ``env`` is a required field, so a run built the production way -- through
-    # MasterConfig(**cfg), which validates -- always carries it. model_construct
-    # skips validation and only fills fields that have defaults, so a config
-    # assembled that way can genuinely lack the attribute, and without it the
-    # rollout path is unknowable. This check only reads it to decide which half of
-    # the block is inert, so skip rather than fail a construction over it.
-    env_config = getattr(master_config, "env", None)
     if env_config is not None:
         use_nemo_gym = bool(env_config.get("should_use_nemo_gym"))
         unused_name = "native" if use_nemo_gym else "nemo_gym"

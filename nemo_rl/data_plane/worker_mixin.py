@@ -535,8 +535,20 @@ class TQWorkerMixin:
         """Per-rank frozen-teacher logprob entrypoint for SingleController MOPD."""
         data = self._fetch(meta)
         cfg = getattr(self, "cfg", {})
-        if cfg.get("sequence_packing", {}).get("enabled", False):
-            data = self._attach_or_repack_pack_metadata(data, meta)
+        batching_enabled = bool(
+            cfg.get("sequence_packing", {}).get("enabled", False)
+            or cfg.get("dynamic_batching", {}).get("enabled", False)
+        )
+        extra = meta.extra_info or {}
+        if batching_enabled and not (
+            MICRO_BATCH_INDICES in extra and MICRO_BATCH_LENGTHS in extra
+        ):
+            raise RuntimeError(
+                "SingleController teacher batching requires driver-provided global "
+                "micro_batch_indices and micro_batch_lengths; local worker planning "
+                "can desynchronize data-parallel collectives."
+            )
+        data = self._attach_or_repack_pack_metadata(data, meta)
         result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
             data=data,
             micro_batch_size=micro_batch_size,

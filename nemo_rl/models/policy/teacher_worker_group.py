@@ -36,6 +36,7 @@ from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
+    DynamicBatchingArgs,
     SequencePackingArgs,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -245,6 +246,17 @@ class TeacherWorkerGroup:
             microbatch_order = cfg["sequence_packing"].get("microbatch_order")
             if microbatch_order is not None:
                 self.sequence_packing_args["microbatch_order"] = microbatch_order
+        if self.use_dynamic_batches:
+            self.dynamic_batching_args: DynamicBatchingArgs = {
+                "input_key": "input_ids",
+                "input_lengths_key": "input_lengths",
+                "sequence_length_round": cfg["dynamic_batching"][
+                    "sequence_length_round"
+                ],
+                "max_tokens_per_microbatch": cfg["dynamic_batching"][
+                    "logprob_mb_tokens"
+                ],
+            }
 
     def setup_data_plane(self, dp_cfg: DataPlaneConfig) -> None:
         """Attach every teacher worker to the already-bootstrapped TQ controller."""
@@ -275,16 +287,23 @@ class TeacherWorkerGroup:
             },
         )
         sequence_packing_args = None
+        dynamic_batching_args = None
         if self.use_sequence_packing:
             sequence_packing_args = dict(self.sequence_packing_args)
             sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
                 "sequence_packing"
+            ]["logprob_mb_tokens"]
+        elif self.use_dynamic_batches:
+            dynamic_batching_args = dict(self.dynamic_batching_args)
+            dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                "dynamic_batching"
             ]["logprob_mb_tokens"]
         dp_metas, _ = shard_meta_for_dp(
             teacher_meta,
             dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
             batch_size=None,
             sequence_packing_args=sequence_packing_args,
+            dynamic_batching_args=dynamic_batching_args,
         )
         futures = self.worker_group.run_all_workers_sharded_data(
             "get_teacher_logprobs_presharded",

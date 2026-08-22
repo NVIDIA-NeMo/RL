@@ -423,6 +423,198 @@ def test_tq_teacher_enrichment_pads_dp_and_writes_teacher_column(monkeypatch):
     assert metrics["on_policy_distillation/teacher_model_unique"] == 1.0
 
 
+def test_tq_teacher_enrichment_skips_padding_for_dp_divisible_batch(monkeypatch):
+    """DP-divisible teacher batches do not create or clean temporary TQ rows."""
+    import asyncio
+
+    from nemo_rl.algorithms import opd
+
+    teacher = _MockTeacherWorkerGroup(dp_size=2)
+    teacher.received_meta = None
+    teacher.get_logprobs_from_meta = lambda meta: setattr(
+        teacher, "received_meta", meta
+    )
+
+    class FakeDataPlane:
+        def clear_samples(self, **kwargs):
+            raise AssertionError(f"unexpected temporary-row cleanup: {kwargs}")
+
+    monkeypatch.setattr(
+        opd,
+        "read_columns",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("DP-divisible batches must not read a padding source")
+        ),
+    )
+    monkeypatch.setattr(
+        opd,
+        "write_columns",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("DP-divisible batches must not write padding rows")
+        ),
+    )
+    coordinator = opd.TQTeacherLogprobCoordinator(
+        dp_client=FakeDataPlane(),
+        teacher_worker_groups={"teacher": teacher},
+        alias_to_group_alias={"math": "teacher"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"math": "/ckpt/teacher"}
+        },
+    )
+    meta = _teacher_meta("group", batch_size=2, seq_len=5)
+
+    enriched = asyncio.run(coordinator.enrich(meta, _teacher_record("math")))
+
+    assert teacher.received_meta is meta
+    assert "teacher_reference_logprobs" in enriched.fields
+
+
+def test_tq_teacher_routing_rejects_missing_agent_ref_without_retry_hint():
+    """Missing Gym routing metadata gets a diagnostic that identifies the cause."""
+    from nemo_rl.algorithms import opd
+    from nemo_rl.experience.interfaces import PromptGroupRecord
+
+    coordinator = opd.TQTeacherLogprobCoordinator(
+        dp_client=object(),
+        teacher_worker_groups={"teacher": _MockTeacherWorkerGroup(dp_size=1)},
+        alias_to_group_alias={},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"teacher": "/ckpt/teacher"}
+        },
+    )
+    record = PromptGroupRecord(
+        prompt_idx=0,
+        prompt=[],
+        extra_env_info={},
+        metadata={},
+        completions=[],
+        rollout_metrics={},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="requires the NeMo-Gym rollout path.*cannot repair",
+    ):
+        coordinator._resolve_teacher(record)
+
+
+def test_tq_teacher_routing_uses_default_teacher_for_unmapped_agent():
+    """An unmapped Gym agent follows the configured default teacher alias."""
+    from nemo_rl.algorithms import opd
+
+    coordinator = opd.TQTeacherLogprobCoordinator(
+        dp_client=object(),
+        teacher_worker_groups={"default": _MockTeacherWorkerGroup(dp_size=1)},
+        alias_to_group_alias={"default": "default"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"default": "/ckpt/default"},
+            "default_teacher_alias": "default",
+        },
+    )
+
+    assert coordinator._resolve_teacher(_teacher_record("unmapped")) == (
+        "default",
+        "default",
+    )
+
+
+def test_tq_teacher_padding_rows_are_cleaned_when_write_partially_fails(monkeypatch):
+    """Temporary IDs enter cleanup scope before their first TQ write."""
+    import asyncio
+
+    from nemo_rl.algorithms import opd
+
+    cleared = []
+
+    class FakeDataPlane:
+        def clear_samples(self, sample_ids, partition_id):
+            cleared.append((list(sample_ids), partition_id))
+
+    monkeypatch.setattr(
+        opd,
+        "read_columns",
+        lambda *args, **kwargs: BatchedDataDict(
+            {
+                "input_ids": torch.ones(1, 3, dtype=torch.long),
+                "input_lengths": torch.tensor([3]),
+            }
+        ),
+    )
+
+    def partially_failing_write(_dp_client, meta, fields):
+        del fields
+        assert meta.sample_ids
+        raise RuntimeError("partial pad write")
+
+    monkeypatch.setattr(opd, "write_columns", partially_failing_write)
+    coordinator = opd.TQTeacherLogprobCoordinator(
+        dp_client=FakeDataPlane(),
+        teacher_worker_groups={"teacher": _MockTeacherWorkerGroup(dp_size=4)},
+        alias_to_group_alias={"math": "teacher"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"math": "/ckpt/teacher"}
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="partial pad write"):
+        asyncio.run(
+            coordinator.enrich(
+                _teacher_meta("group", batch_size=3, seq_len=3),
+                _teacher_record("math"),
+            )
+        )
+
+    assert len(cleared) == 1
+    assert len(cleared[0][0]) == 1
+    assert "__teacher_pad_" in cleared[0][0][0]
+
+
+def test_tq_teacher_enrichment_drains_background_thread_before_cancellation():
+    """Cancellation waits for teacher TQ activity to finish before propagating."""
+    import asyncio
+    import threading
+
+    from nemo_rl.algorithms import opd
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class BlockingTeacher(_MockTeacherWorkerGroup):
+        def get_logprobs_from_meta(self, meta):
+            del meta
+            started.set()
+            release.wait(timeout=2)
+            finished.set()
+
+    coordinator = opd.TQTeacherLogprobCoordinator(
+        dp_client=object(),
+        teacher_worker_groups={"teacher": BlockingTeacher(dp_size=1)},
+        alias_to_group_alias={"math": "teacher"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"math": "/ckpt/teacher"}
+        },
+    )
+
+    async def cancel_during_inference():
+        task = asyncio.create_task(
+            coordinator.enrich(
+                _teacher_meta("group", batch_size=1, seq_len=3),
+                _teacher_record("math"),
+            )
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_during_inference())
+    assert finished.is_set()
+
+
 def test_tq_teacher_enrichment_serializes_deduplicated_teacher(monkeypatch):
     """Two aliases sharing one physical teacher never overlap collectives."""
     import asyncio

@@ -158,7 +158,8 @@ def main() -> None:
                 except Exception as kill_error:
                     print(f"Env {env_name!r} kill failed: {kill_error}")
 
-        for teacher_alias, teacher in (actor_args.teacher_worker_groups or {}).items():
+        teacher_worker_groups = getattr(actor_args, "teacher_worker_groups", None) or {}
+        for teacher_alias, teacher in teacher_worker_groups.items():
             try:
                 teacher.shutdown()
             except Exception as e:

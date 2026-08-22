@@ -34,8 +34,8 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _create_advantage_estimator,
@@ -56,6 +56,10 @@ from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
+from nemo_rl.data_plane.schema import (
+    SC_ROLLOUT_SCHEMA_FIELDS,
+    fields_with_optional_routed_experts,
+)
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     _get_free_port_local,
@@ -749,6 +753,12 @@ def setup_single_controller(
     )
     colocated = generation_config["colocated"]["enabled"]
 
+    # Claim constrained training nodes before unconstrained inference or Gym
+    # tasks can consume them. This matters when inference topology alignment
+    # falls back while the training cluster remains topology-constrained.
+    if not colocated and master_config.cluster.get("segment_size") is not None:
+        train_cluster.get_placement_groups()
+
     # Claim teacher placement groups before deferred generation starts NeMo-Gym,
     # whose resource servers may otherwise opportunistically consume those GPUs.
     teacher_clusters: dict[str, RayVirtualCluster] = {}
@@ -930,6 +940,22 @@ def setup_single_controller(
     # ==========================
     # Connect-only DP client; TQPolicy already bootstrapped the controller.
     dp_client = build_data_plane_client(dp_config, bootstrap=False)
+    # SingleController reuses one partition for the run. Warm every known
+    # tensor field before rollout, policy, and teacher writers become
+    # concurrent; TransferQueue otherwise registers field names lazily.
+    dp_client.register_partition(
+        partition_id=partition_id,
+        fields=fields_with_optional_routed_experts(
+            SC_ROLLOUT_SCHEMA_FIELDS,
+            enabled=router_replay_enabled(policy_config),
+        ),
+        num_samples=(
+            master_config.async_rl.max_buffered_rollouts
+            * grpo_config.num_generations_per_prompt
+        ),
+        consumer_tasks=["prev_lp", "ref_lp", "train"],
+        grpo_group_size=grpo_config.num_generations_per_prompt,
+    )
 
     t0 = time.perf_counter()
     weight_synchronizer = create_weight_synchronizer(
