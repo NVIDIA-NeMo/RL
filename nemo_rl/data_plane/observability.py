@@ -417,6 +417,181 @@ def fit_latency_bandwidth(s: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _derive_op_metrics(by_op: dict[str, Any], total_wall_ms: float) -> None:
+    """Fill in the derived per-op fields, in place.
+
+    Shared by :meth:`MetricsDataPlaneClient.snapshot` and
+    :func:`merge_snapshots` so a cluster-wide view is derived by exactly the
+    same arithmetic as a single process -- percentiles off the (summed)
+    histogram, the fit off the (summed) sufficient statistics. Nothing
+    derived is ever averaged across processes.
+    """
+    for stats in by_op.values():
+        calls = stats["calls"]
+        wall_ms = stats["wall_ms"]
+        stats["mean_ms"] = wall_ms / calls if calls else 0.0
+        stats["mb_per_s"] = (
+            (stats["n_bytes"] / 1e6) / (wall_ms / 1e3) if wall_ms else 0.0
+        )
+        stats["pct_of_total_ms"] = (
+            100.0 * wall_ms / total_wall_ms if total_wall_ms else 0.0
+        )
+        stats["fit"] = fit_latency_bandwidth(stats)
+        hist = stats["latency_hist"]
+        stats["p50_ms"] = percentile_from_hist(hist, 0.50)
+        stats["p99_ms"] = percentile_from_hist(hist, 0.99)
+        # Tail/mean ratio: a mean hides MR churn and queueing, which show
+        # up as p99 pulling away from the mean.
+        stats["tail_ratio_p99_mean"] = (
+            stats["p99_ms"] / stats["mean_ms"] if stats["mean_ms"] > 0 else 0.0
+        )
+
+
+# Snapshot fields that combine by summing, by taking a maximum, and the
+# per-op ones of each kind. Everything else in a snapshot is derived and is
+# recomputed from the merged totals rather than merged itself.
+_SNAPSHOT_SUM = (
+    "total_bytes",
+    "total_keys",
+    "total_ops",
+    "total_wall_ms",
+    "bytes_outstanding",
+    "peak_bytes_outstanding",
+    "n_keys_outstanding",
+    "self_ms",
+)
+_SNAPSHOT_MAX = ("max_bytes_per_key_seen", "last_put_bytes_per_key")
+_OP_SUM = (
+    "calls",
+    "errors",
+    "wall_ms",
+    "n_bytes",
+    "n_keys",
+    "ok_wall_ms",
+    "sum_bytes_sq",
+    "sum_bytes_ms",
+    "sum_ms_sq",
+)
+_OP_MAX = ("max_ms", "step_max_ms")
+
+
+def merge_snapshots(snapshots: "list[dict[str, Any]]") -> dict[str, Any]:
+    """Combine per-process snapshots into one cluster-wide view.
+
+    This is what the accumulators were shaped for. Latency lives in fixed
+    histogram buckets and the latency/bandwidth model lives in sufficient
+    statistics precisely so both *add*: summing 256 per-rank histograms
+    gives the true cluster distribution, which averaging 256 per-rank
+    percentiles cannot. Everything derived — percentiles, throughput, the
+    affine fit — is recomputed from the merged totals, never averaged.
+
+    Counters sum. ``max_*`` fields take a maximum. ``peak_bytes_outstanding``
+    is the one approximation: summing per-process peaks assumes they
+    coincided, so it is an upper bound on true cluster peak occupancy.
+
+    Args:
+        snapshots: One :meth:`MetricsDataPlaneClient.snapshot` per process.
+
+    Returns:
+        A snapshot-shaped dict covering every process, plus ``n_processes``.
+    """
+    if not snapshots:
+        return {}
+    merged: dict[str, Any] = {k: 0 for k in _SNAPSHOT_SUM}
+    merged.update({k: 0 for k in _SNAPSHOT_MAX})
+    hashes = {
+        k: 0
+        for k in (
+            "rows_recorded",
+            "rows_checked",
+            "rows_unverified",
+            "mismatches",
+            "fields_skipped",
+        )
+    }
+    by_op: dict[str, dict[str, Any]] = {}
+
+    for snap in snapshots:
+        for key in _SNAPSHOT_SUM:
+            merged[key] += snap.get(key, 0)
+        for key in _SNAPSHOT_MAX:
+            merged[key] = max(merged[key], snap.get(key, 0))
+        for key in hashes:
+            hashes[key] += (snap.get("hash_verify") or {}).get(key, 0)
+        for op, stats in (snap.get("by_op") or {}).items():
+            acc = by_op.setdefault(
+                op,
+                {
+                    **{k: 0 for k in _OP_SUM},
+                    **{k: 0.0 for k in _OP_MAX},
+                    "latency_hist": [0] * (len(LATENCY_BUCKETS_MS) + 1),
+                },
+            )
+            for key in _OP_SUM:
+                acc[key] += stats.get(key, 0)
+            for key in _OP_MAX:
+                acc[key] = max(acc[key], stats.get(key, 0.0))
+            for i, count in enumerate(stats.get("latency_hist") or []):
+                acc["latency_hist"][i] += count
+
+    merged["by_op"] = by_op
+    merged["hash_verify"] = hashes
+    merged["n_processes"] = len(snapshots)
+    _derive_op_metrics(by_op, merged["total_wall_ms"])
+    merged["bytes_written"] = sum(by_op[o]["n_bytes"] for o in _WRITE_OPS if o in by_op)
+    merged["bytes_read"] = sum(by_op[o]["n_bytes"] for o in _READ_OPS if o in by_op)
+    merged["comm_volume_bytes"] = merged["bytes_written"] + merged["bytes_read"]
+    return merged
+
+
+def cluster_step_metrics(
+    merged: dict[str, Any], prev: dict[str, Any], step_time_s: float
+) -> dict[str, float]:
+    """Per-step cluster metrics from two merged snapshots.
+
+    The single-process equivalent of this lives on the client, which owns
+    its own previous reading. A cluster has no such owner, so the caller
+    holds ``prev`` and passes it back.
+
+    ``observability_overhead_ms`` is what the measurement itself cost,
+    summed over every process -- the wrapper's wall time minus the time its
+    inner client was working. It sits beside ``wall_ms`` so the bill is
+    visible next to what it bought.
+    """
+    wall_ms = merged["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
+    overhead_ms = merged["self_ms"] - prev.get("self_ms", 0.0)
+    metrics: dict[str, float] = {
+        "wall_ms": wall_ms,
+        "frac_of_step": (wall_ms / 1e3 / step_time_s) if step_time_s > 0 else 0.0,
+        "comm_volume_mb": (
+            merged["comm_volume_bytes"] - prev.get("comm_volume_bytes", 0)
+        )
+        / 1e6,
+        "bytes_written_mb": (merged["bytes_written"] - prev.get("bytes_written", 0))
+        / 1e6,
+        "bytes_read_mb": (merged["bytes_read"] - prev.get("bytes_read", 0)) / 1e6,
+        "bytes_outstanding_mb": merged["bytes_outstanding"] / 1e6,
+        "n_processes": merged.get("n_processes", 0),
+        "observability_overhead_ms": overhead_ms,
+        "observability_overhead_frac": (overhead_ms / wall_ms if wall_ms > 0 else 0.0),
+    }
+    prev_ops = prev.get("by_op", {})
+    for op, stats in merged["by_op"].items():
+        prev_op = prev_ops.get(op, {})
+        calls = stats["calls"] - prev_op.get("calls", 0)
+        if calls <= 0:
+            continue
+        metrics[f"{op}/calls"] = calls
+        metrics[f"{op}/wall_ms"] = stats["wall_ms"] - prev_op.get("wall_ms", 0.0)
+        metrics[f"{op}/max_ms"] = stats["max_ms"]
+        # Percentiles are worth reporting here and not per process: this
+        # histogram is the sum over every rank, so it is the real cluster
+        # distribution rather than one process's handful of calls.
+        metrics[f"{op}/p50_ms"] = stats["p50_ms"]
+        metrics[f"{op}/p99_ms"] = stats["p99_ms"]
+    return metrics
+
+
 def log_event(event: DataPlaneEvent) -> None:
     logger.info("data_plane_event: %s", event)
 
@@ -502,6 +677,11 @@ class DataPlaneStats:
     # sudden spike in ``max_bytes_per_key_seen``.
     max_bytes_per_key_seen: int = 0
     last_put_bytes_per_key: int = 0
+    # What measuring cost. Wall time spent inside this wrapper minus the
+    # time the inner client was actually working, so a reader can see the
+    # observability bill next to the thing it is observing rather than
+    # taking a benchmark's word for it.
+    self_ms: float = 0.0
     hash_verify: HashStats = field(default_factory=HashStats)
 
 
@@ -544,6 +724,10 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # of that same batch; the row count is what detects a shard read.
         self._batch_scope: dict[str, tuple[frozenset[str], int]] = {}
         self._hash_mismatches_logged = 0
+        # Set by ``_emit`` to the inner client's wall time for the op just
+        # run, so the wrapping methods can subtract it and bill the rest to
+        # ``self_ms``.
+        self._last_inner_ms = 0.0
         # Previous snapshot, for per-step deltas. Owned here rather than by a
         # caller: it is this client's prior reading, and keeping it here lets
         # every trainer use get_step_metrics() without copying the
@@ -563,25 +747,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         out["n_keys_outstanding"] = sum(
             len(k) for k in self._keys_by_partition.values()
         )
-        for op, s in out["by_op"].items():
-            s["mean_ms"] = s["wall_ms"] / s["calls"] if s["calls"] else 0.0
-            s["mb_per_s"] = (
-                (s["n_bytes"] / 1e6) / (s["wall_ms"] / 1e3) if s["wall_ms"] else 0.0
-            )
-            s["pct_of_total_ms"] = (
-                100.0 * s["wall_ms"] / self._stats.total_wall_ms
-                if self._stats.total_wall_ms
-                else 0.0
-            )
-            s["fit"] = fit_latency_bandwidth(s)
-            h = s["latency_hist"]
-            s["p50_ms"] = percentile_from_hist(h, 0.50)
-            s["p99_ms"] = percentile_from_hist(h, 0.99)
-            # Tail/mean ratio: a mean hides MR churn and queueing, which show
-            # up as p99 pulling away from the mean.
-            s["tail_ratio_p99_mean"] = (
-                s["p99_ms"] / s["mean_ms"] if s["mean_ms"] > 0 else 0.0
-            )
+        _derive_op_metrics(out["by_op"], self._stats.total_wall_ms)
         # Communication volume, derived from by_op so there is one source of
         # truth for bytes. Distinct from ``bytes_outstanding``, which is
         # occupancy (what is held) rather than traffic (what moved).
@@ -750,6 +916,16 @@ class MetricsDataPlaneClient(DataPlaneClient):
             freed = total * dropped // (len(live) + dropped)
             self._bytes_by_partition[partition_id] = total - freed
         self._stats.bytes_outstanding -= freed
+
+    def _bill_self(self, entered: float) -> None:
+        """Charge this wrapper for the time it spent that was not the RPC.
+
+        One ``monotonic`` per op on top of the two ``_run`` already takes.
+        Measuring the measurement is worth that: the alternative is asking a
+        reader to trust a benchmark run on some other machine.
+        """
+        elapsed_ms = (monotonic() - entered) * 1000.0
+        self._stats.self_ms += elapsed_ms - self._last_inner_ms
 
     # ── wire-in / wire-out fingerprinting (opt-in) ─────────────────────
 
@@ -949,6 +1125,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         status: EventStatus,
     ) -> None:
         wall_ms = (monotonic() - t0) * 1000.0
+        self._last_inner_ms = wall_ms
         on_event = self._on_event
         if on_event is not None:
             # Built lazily: with no sink registered nothing reads this dict.
@@ -1044,6 +1221,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         )
 
     def get_data(self, meta, select_fields=None):
+        entered = monotonic()
         out = self._run(
             "get_data",
             meta.partition_id,
@@ -1052,6 +1230,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         )
         if self._verify_tensor_hash:
             self._check_hashes(meta.partition_id, meta.sample_ids, out)
+        self._bill_self(entered)
         return out
 
     def check_consumption_status(self, partition_id, task_names):
@@ -1062,6 +1241,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         )
 
     def put_samples(self, sample_ids, partition_id, fields=None, tags=None):
+        entered = monotonic()
         n_bytes = _td_bytes(fields)
         # Materialize once: ``_run`` consumes its lambda and we also need
         # to attribute bytes per sample after success.
@@ -1084,9 +1264,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # here keeps the check's own cost out of the op's ``wall_ms``.
         if self._verify_tensor_hash:
             self._record_hashes(partition_id, sample_ids_list, fields)
+        self._bill_self(entered)
         return out
 
     def get_samples(self, sample_ids, partition_id, select_fields):
+        entered = monotonic()
         sample_ids_list = _as_list(sample_ids)
         out = self._run(
             "get",
@@ -1100,6 +1282,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         )
         if self._verify_tensor_hash:
             self._check_hashes(partition_id, sample_ids_list, out)
+        self._bill_self(entered)
         return out
 
     def list_sample_ids(self, partition_id: str) -> list[str]:
