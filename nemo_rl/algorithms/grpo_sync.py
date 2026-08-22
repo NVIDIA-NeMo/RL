@@ -65,8 +65,12 @@ from nemo_rl.algorithms.draft_cadence_runtime import (
     CadenceRuntimeWriter,
     CadenceTerminalEvidence,
     disabled_draft_schedule_payload,
+    initialize_cadence_scheduler,
     open_resume_decision_ledger,
+    produce_cadence_decision,
     recover_draft_step_transactions,
+    require_cadence_step_receipts,
+    resolve_cadence_schedule_config,
 )
 from nemo_rl.algorithms.draft_update_schedule import (
     DraftDecisionLedger,
@@ -552,8 +556,6 @@ def grpo_train_sync(
         else CadenceTerminalEvidence({}, {})
     )
     if cadence_writer is not None:
-        if grpo_save_state.draft_update_schedule is None:
-            grpo_save_state.draft_update_schedule = disabled_draft_schedule_payload()
         cadence_ledger: DraftDecisionLedger | None = DraftDecisionLedger(
             cadence_writer.root
             / f"draft-decision-ledger-after-step_{grpo_save_state.current_step}.jsonl"
@@ -563,20 +565,36 @@ def grpo_train_sync(
             base_checkpoint_id=f"step_{grpo_save_state.current_step}",
         )
         resume_checkpoint = checkpointer.get_latest_checkpoint_path()
+        draft_config = master_config.policy.get("draft")
+        schedule_config = resolve_cadence_schedule_config(draft_config)
         if resume_checkpoint is not None:
             resume = open_resume_decision_ledger(
                 Path(resume_checkpoint), cadence_writer.root
             )
             cadence_ledger = resume.ledger
-            recover_draft_step_transactions(
-                config=None,
+            cadence_scheduler = recover_draft_step_transactions(
+                config=schedule_config,
                 checkpoint_path=Path(resume_checkpoint),
                 transaction_store=cadence_transactions,
                 decision_ledger=cadence_ledger,
                 save_state=grpo_save_state,
             )
+        else:
+            cadence_scheduler = initialize_cadence_scheduler(
+                draft_config,
+                grpo_save_state.draft_update_schedule,
+                origin_step=grpo_save_state.current_step,
+                resuming_from_checkpoint=False,
+            )
+            grpo_save_state.draft_update_schedule = (
+                disabled_draft_schedule_payload()
+                if cadence_scheduler is None
+                else cadence_scheduler.state_dict()
+            )
     else:
         cadence_ledger = None
+        cadence_scheduler = None
+        resume_checkpoint = None
 
     def close_cadence_terminal() -> None:
         if cadence_writer is None:
@@ -1095,6 +1113,14 @@ def grpo_train_sync(
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
+                    cadence_decision = produce_cadence_decision(
+                        cadence_scheduler, global_step=total_steps + 1
+                    )
+                    require_cadence_step_receipts(
+                        cadence_decision,
+                        worker_receipt=None,
+                        apply_receipt=None,
+                    )
                     # Meta-driven train: workers fetch the union of
                     # rollout + driver-written + worker-written columns
                     # from TQ, train, return aggregated metrics via Ray.
@@ -1426,6 +1452,11 @@ def grpo_train_sync(
                                 },
                                 decision_ledger=cadence_ledger,
                                 terminal_evidence=cadence_evidence,
+                                resumed_from=(
+                                    None
+                                    if resume_checkpoint is None
+                                    else str(Path(resume_checkpoint).resolve())
+                                ),
                             )
 
             memory_tracker.snapshot_start_of_stage("Logging", dir())

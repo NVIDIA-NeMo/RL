@@ -28,7 +28,96 @@ from nemo_rl.algorithms.draft_update_schedule import (
     DraftUpdateScheduler,
     validate_decision_ledger_receipt,
 )
-from nemo_rl.models.policy.draft_config import DraftUpdateScheduleConfig
+from nemo_rl.models.policy.draft_config import DraftConfig, DraftUpdateScheduleConfig
+
+
+def resolve_cadence_schedule_config(
+    draft_config: DraftConfig | None,
+) -> DraftUpdateScheduleConfig | None:
+    """Resolve the online-draft schedule without changing fixed-draft controls."""
+    if draft_config is None or not draft_config.enabled:
+        return None
+    schedule = getattr(draft_config, "update_schedule", None)
+    if schedule is None:
+        raise ValueError(
+            "cadence runtime requires a provider-backed draft update schedule"
+        )
+    if schedule.mode == "adaptive":
+        raise ValueError(
+            "adaptive draft cadence requires selected-rollout acceptance provenance"
+        )
+    return cast(DraftUpdateScheduleConfig, schedule)
+
+
+def initialize_cadence_scheduler(
+    draft_config: DraftConfig | None,
+    saved: Mapping[str, object] | None,
+    *,
+    origin_step: int,
+    resuming_from_checkpoint: bool,
+) -> DraftUpdateScheduler | None:
+    """Create or restore the scheduler for a cadence-enabled controller."""
+    schedule = resolve_cadence_schedule_config(draft_config)
+    if schedule is None:
+        if saved is not None and saved != disabled_draft_schedule_payload():
+            raise ValueError(
+                "disabled draft cannot restore an enabled cadence schedule"
+            )
+        return None
+    from nemo_rl.algorithms.grpo import restore_draft_update_scheduler
+
+    return restore_draft_update_scheduler(
+        schedule,
+        saved,
+        origin_step=origin_step,
+        resuming_from_checkpoint=resuming_from_checkpoint,
+    )
+
+
+def produce_cadence_decision(
+    scheduler: DraftUpdateScheduler | None, *, global_step: int
+) -> DraftUpdateDecision | None:
+    """Produce one immutable decision; disabled/fixed-draft controls stay neutral."""
+    if scheduler is None:
+        return None
+    return scheduler.decide(global_step=global_step, acceptance=None)
+
+
+def require_cadence_step_receipts(
+    decision: DraftUpdateDecision | None,
+    *,
+    worker_receipt: Mapping[str, object] | None,
+    apply_receipt: Mapping[str, object] | None,
+) -> None:
+    """Fail closed until Task4/5 producers bind one decision to update and apply."""
+    if decision is None:
+        return
+    if (
+        not decision.update_requested
+        and not decision.draft_refit_requested
+        and worker_receipt is None
+        and apply_receipt is None
+    ):
+        raise RuntimeError(
+            "cadence decision outcome consumer is required before policy training"
+        )
+    if decision.update_requested and (
+        worker_receipt is None
+        or worker_receipt.get("successful") is not True
+        or worker_receipt.get("decision_id") != decision.decision_id
+        or worker_receipt.get("global_step") != decision.global_step
+    ):
+        raise RuntimeError(
+            "successful draft update receipt is required before cadence apply"
+        )
+    if decision.draft_refit_requested and (
+        apply_receipt is None
+        or apply_receipt.get("successful") is not True
+        or apply_receipt.get("version") != decision.decision_id
+    ):
+        raise RuntimeError(
+            "successful draft apply receipt is required before cadence publication"
+        )
 
 
 def write_json_exclusive_atomic(path: Path, payload: object) -> None:
@@ -479,10 +568,16 @@ def reconcile_ledger_quarantine(
 def open_resume_decision_ledger(
     checkpoint_path: Path, result_root: Path
 ) -> ResumeLedgerOpenResult:
-    bundle = load_checkpoint_bundle(checkpoint_path)
     root = result_root.resolve()
     root.mkdir(parents=True, exist_ok=True)
-    if checkpoint_path.resolve().name != bundle["checkpoint_id"]:
+    resolved_checkpoint = checkpoint_path.resolve()
+    expected_checkpoint_root = root / "checkpoints"
+    if resolved_checkpoint.parent != expected_checkpoint_root:
+        raise ValueError("resume checkpoint is outside cadence result root")
+    bundle = load_checkpoint_bundle(resolved_checkpoint)
+    if resolved_checkpoint.name != bundle["checkpoint_id"] or bundle.get(
+        "checkpoint_path"
+    ) != str(resolved_checkpoint):
         raise ValueError("resume checkpoint identity does not match cadence receipt")
     recovery_parent = root / "recovery"
     recovery_parent.mkdir(parents=True, exist_ok=True)
@@ -544,7 +639,7 @@ def open_resume_decision_ledger(
     prefixes: tuple[DecisionLedgerReceipt, ...] = ()
     if high_water:
         prefix = DecisionLedgerReceipt(
-            path=str(checkpoint_path.resolve() / str(binding["relative_path"])),
+            path=str(resolved_checkpoint / str(binding["relative_path"])),
             size_bytes=int(binding["size_bytes"]),
             sha256=str(binding["sha256"]),
             first_decision_id=int(binding["first_decision_id"]),

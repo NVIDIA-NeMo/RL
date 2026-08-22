@@ -49,15 +49,19 @@ import torch
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
 from nemo_rl.algorithms.draft_cadence_runtime import (
-    CadenceRuntimeConfig,
     CadenceRuntimeWriter,
     CadenceTerminalEvidence,
     disabled_draft_schedule_payload,
+    initialize_cadence_scheduler,
     open_resume_decision_ledger,
+    produce_cadence_decision,
     recover_draft_step_transactions,
+    require_cadence_step_receipts,
+    resolve_cadence_schedule_config,
 )
 from nemo_rl.algorithms.draft_update_schedule import (
     DraftDecisionLedger,
+    DraftUpdateScheduler,
     FileDraftStepTransactionStore,
 )
 from nemo_rl.algorithms.grpo import GRPOSaveState, _write_latest_checkpoint_status
@@ -211,12 +215,7 @@ class SingleControllerActor:
         self._last_checkpoint_path: Optional[str] = actor_args.last_checkpoint_path
         self._consumed_samples: int = actor_args.save_state.consumed_samples
         self._total_valid_tokens: int = actor_args.save_state.total_valid_tokens
-        raw_cadence_runtime = getattr(master_config, "cadence_runtime", None)
-        cadence_runtime = (
-            CadenceRuntimeConfig()
-            if raw_cadence_runtime is None
-            else CadenceRuntimeConfig.model_validate(raw_cadence_runtime)
-        )
+        cadence_runtime = master_config.cadence_runtime
         self._cadence_writer = (
             CadenceRuntimeWriter(cadence_runtime) if cadence_runtime.enabled else None
         )
@@ -225,11 +224,10 @@ class SingleControllerActor:
             if self._save_state.draft_terminal_evidence is not None
             else CadenceTerminalEvidence({}, {})
         )
+        self._cadence_ledger: DraftDecisionLedger | None
+        self._cadence_transactions: FileDraftStepTransactionStore | None
+        self._cadence_scheduler: DraftUpdateScheduler | None
         if self._cadence_writer is not None:
-            if self._save_state.draft_update_schedule is None:
-                self._save_state.draft_update_schedule = (
-                    disabled_draft_schedule_payload()
-                )
             self._cadence_ledger = DraftDecisionLedger(
                 self._cadence_writer.root
                 / f"draft-decision-ledger-after-step_{self._save_state.current_step}.jsonl"
@@ -238,21 +236,36 @@ class SingleControllerActor:
                 self._cadence_writer.root,
                 base_checkpoint_id=f"step_{self._save_state.current_step}",
             )
+            draft_config = self._master_config.policy.get("draft")
+            schedule_config = resolve_cadence_schedule_config(draft_config)
             if self._last_checkpoint_path is not None:
                 resume = open_resume_decision_ledger(
                     Path(self._last_checkpoint_path), self._cadence_writer.root
                 )
                 self._cadence_ledger = resume.ledger
-                recover_draft_step_transactions(
-                    config=None,
+                self._cadence_scheduler = recover_draft_step_transactions(
+                    config=schedule_config,
                     checkpoint_path=Path(self._last_checkpoint_path),
                     transaction_store=self._cadence_transactions,
                     decision_ledger=self._cadence_ledger,
                     save_state=self._save_state,
                 )
+            else:
+                self._cadence_scheduler = initialize_cadence_scheduler(
+                    draft_config,
+                    self._save_state.draft_update_schedule,
+                    origin_step=self._save_state.current_step,
+                    resuming_from_checkpoint=False,
+                )
+                self._save_state.draft_update_schedule = (
+                    disabled_draft_schedule_payload()
+                    if self._cadence_scheduler is None
+                    else self._cadence_scheduler.state_dict()
+                )
         else:
             self._cadence_ledger = None
             self._cadence_transactions = None
+            self._cadence_scheduler = None
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
@@ -1056,6 +1069,15 @@ class SingleControllerActor:
                         await asyncio.to_thread(self._trainer.prepare_for_training)
                     with self._timer.time("policy_training"):
                         if not step_open:
+                            cadence_decision = produce_cadence_decision(
+                                self._cadence_scheduler,
+                                global_step=self._train_steps + 1,
+                            )
+                            require_cadence_step_receipts(
+                                cadence_decision,
+                                worker_receipt=None,
+                                apply_receipt=None,
+                            )
                             await asyncio.to_thread(
                                 self._trainer.begin_train_step,
                                 self._loss_fn,

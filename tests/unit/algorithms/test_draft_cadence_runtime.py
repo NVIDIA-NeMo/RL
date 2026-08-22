@@ -4,18 +4,127 @@ import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from nemo_rl.algorithms.draft_cadence_runtime import (
     CadenceRuntimeConfig,
     CadenceRuntimeWriter,
     CadenceTerminalEvidence,
+    initialize_cadence_scheduler,
     load_checkpoint_bundle,
+    produce_cadence_decision,
+    require_cadence_step_receipts,
 )
 from nemo_rl.algorithms.draft_update_schedule import (
     DraftDecisionLedger,
     DraftUpdateScheduler,
     decision_outcome_payload,
 )
-from nemo_rl.models.policy.draft_config import AlwaysDraftUpdateScheduleConfig
+from nemo_rl.models.policy.draft_config import (
+    AdaptiveDraftUpdateScheduleConfig,
+    AlwaysDraftUpdateScheduleConfig,
+    DFlashDraftConfig,
+    DraftUpdateScheduleConfig,
+    FixedDraftUpdateScheduleConfig,
+)
+
+
+def _dflash_config(
+    *, enabled: bool, schedule: DraftUpdateScheduleConfig | None = None
+) -> DFlashDraftConfig:
+    return DFlashDraftConfig(
+        enabled=enabled,
+        gamma=5,
+        anchors_per_sample=1,
+        mask_token_id=0,
+        target_hidden_state_layer_ids=[1],
+        update_schedule=schedule or AlwaysDraftUpdateScheduleConfig(),
+    )
+
+
+def test_controller_scheduler_produces_one_immutable_always_decision() -> None:
+    scheduler = initialize_cadence_scheduler(
+        _dflash_config(enabled=True),
+        None,
+        origin_step=7,
+        resuming_from_checkpoint=False,
+    )
+
+    decision = produce_cadence_decision(scheduler, global_step=8)
+
+    assert decision is not None
+    assert decision.global_step == 8
+    assert decision.decision_id == 1
+    assert decision.update_requested is True
+    assert decision.draft_refit_requested is True
+    assert decision.applied_draft_version == 0
+
+
+def test_disabled_or_fixed_drafter_control_has_no_cadence_decision() -> None:
+    disabled = initialize_cadence_scheduler(
+        _dflash_config(enabled=False),
+        None,
+        origin_step=0,
+        resuming_from_checkpoint=False,
+    )
+
+    assert disabled is None
+    assert produce_cadence_decision(disabled, global_step=1) is None
+    assert produce_cadence_decision(None, global_step=1) is None
+
+
+def test_legacy_resume_compatibility_is_limited_to_always_schedule() -> None:
+    always = initialize_cadence_scheduler(
+        _dflash_config(enabled=True),
+        None,
+        origin_step=4,
+        resuming_from_checkpoint=True,
+    )
+    assert always is not None
+    assert always.state.schedule_origin_step == 4
+
+    with pytest.raises(ValueError, match="legacy checkpoint.*always"):
+        initialize_cadence_scheduler(
+            _dflash_config(
+                enabled=True,
+                schedule=FixedDraftUpdateScheduleConfig(
+                    mode="fixed", action="sparse_update", fixed_interval=10
+                ),
+            ),
+            None,
+            origin_step=4,
+            resuming_from_checkpoint=True,
+        )
+
+
+def test_adaptive_schedule_fails_before_decision_without_task7_provenance() -> None:
+    with pytest.raises(ValueError, match="acceptance provenance"):
+        initialize_cadence_scheduler(
+            _dflash_config(enabled=True, schedule=AdaptiveDraftUpdateScheduleConfig()),
+            None,
+            origin_step=0,
+            resuming_from_checkpoint=False,
+        )
+
+
+def test_missing_task4_or_task5_receipt_fails_before_cadence_apply() -> None:
+    scheduler = DraftUpdateScheduler.create(
+        AlwaysDraftUpdateScheduleConfig(), origin_step=0
+    )
+    decision = scheduler.decide(global_step=1, acceptance=None)
+
+    with pytest.raises(RuntimeError, match="update receipt"):
+        require_cadence_step_receipts(decision, worker_receipt=None, apply_receipt=None)
+    with pytest.raises(RuntimeError, match="apply receipt"):
+        require_cadence_step_receipts(
+            decision,
+            worker_receipt={
+                "successful": True,
+                "decision_id": 1,
+                "global_step": 1,
+            },
+            apply_receipt=None,
+        )
 
 
 def test_checkpoint_receipt_binds_all_training_components(tmp_path: Path) -> None:

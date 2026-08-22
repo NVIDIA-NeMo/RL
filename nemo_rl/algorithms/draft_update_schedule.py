@@ -494,9 +494,9 @@ def validate_scheduler_state_invariants(
                 type(value) not in (int, float)
                 or _finite_acceptance(cast(float, value)) is None
             ):
-                raise ValueError(f"{field} must be finite and within [0, 1]")
+                raise ValueError(f"{field} EWMA must be finite and within [0, 1]")
     if state["version"] != _STATE_VERSION:
-        raise ValueError("unsupported scheduler state version")
+        raise ValueError("unsupported inner state version")
     origin = cast(int, state["schedule_origin_step"])
     last_decided = cast(int, state["last_decided_step"])
     next_decision_id = cast(int, state["next_decision_id"])
@@ -504,7 +504,7 @@ def validate_scheduler_state_invariants(
         raise ValueError("last_decided_step precedes schedule_origin_step")
     closed_decisions = last_decided - origin
     if next_decision_id != closed_decisions + 1:
-        raise ValueError("next_decision_id does not match last_decided_step")
+        raise ValueError("decision cursor does not match last decided step")
     attempted_updates = cast(int, state["attempted_updates"])
     successful_updates = cast(int, state["successful_updates"])
     failed_updates = cast(int, state["failed_updates"])
@@ -513,12 +513,12 @@ def validate_scheduler_state_invariants(
     successful_refits = cast(int, state["successful_refits"])
     failed_refits = cast(int, state["failed_refits"])
     skipped_refits = cast(int, state["skipped_refits"])
+    if successful_updates > attempted_updates:
+        raise ValueError("successful updates exceed attempted updates")
     if successful_updates + failed_updates != attempted_updates:
-        raise ValueError(
-            "successful_updates and failed_updates must equal attempted_updates"
-        )
+        raise ValueError("attempted updates outcome partition mismatch")
     if attempted_updates + skipped_updates != closed_decisions:
-        raise ValueError("update counters do not match the closed decision count")
+        raise ValueError("update partition does not match closed decisions")
     if successful_refits + failed_refits != attempted_refits:
         raise ValueError(
             "successful_refits and failed_refits must equal attempted_refits"
@@ -526,7 +526,7 @@ def validate_scheduler_state_invariants(
     if attempted_refits + skipped_refits != closed_decisions:
         raise ValueError("refit counters do not match the closed decision count")
     if cast(int, state["forced_updates"]) > successful_updates:
-        raise ValueError("forced_updates exceeds successful_updates")
+        raise ValueError("forced updates exceed successful updates")
     if cast(int, state["forced_refits"]) > successful_refits:
         raise ValueError("forced_refits exceeds successful_refits")
     for field, successes in (
@@ -535,15 +535,19 @@ def validate_scheduler_state_invariants(
     ):
         value = cast(int | None, state[field])
         if (value is None) != (successes == 0):
-            raise ValueError(f"{field} does not match successful outcome count")
+            raise ValueError(
+                f"{field.replace('_', ' ')} does not match successful outcome count"
+            )
         if value is not None and not origin < value <= last_decided:
-            raise ValueError(f"{field} is outside the decided step range")
+            raise ValueError(
+                f"{field.replace('_', ' ')} is outside the decided step range"
+            )
     last_refit_step = cast(int | None, state["last_applied_refit_step"])
     expected_applied_version = (
         0 if last_refit_step is None else last_refit_step - origin
     )
     if state["applied_draft_version"] != expected_applied_version:
-        raise ValueError("applied_draft_version does not match last_applied_refit_step")
+        raise ValueError("applied draft version does not match last applied refit step")
     phase = state["phase"]
     if phase not in (
         "monitoring",
@@ -567,7 +571,7 @@ def validate_scheduler_state_invariants(
             raise ValueError("non-adaptive schedule contains adaptive state")
     else:
         if (valid_observations == 0) != (acceptance_ewma is None):
-            raise ValueError("adaptive observation count and EWMA disagree")
+            raise ValueError("valid observations require acceptance EWMA")
         if reference_ewma is not None and valid_observations < config.min_observations:
             raise ValueError("adaptive reference EWMA lacks minimum observations")
         if burst_updates > config.max_burst_updates:
@@ -575,12 +579,12 @@ def validate_scheduler_state_invariants(
         if phase == "awaiting_post_refit_observation" and (
             burst_updates == 0 or last_refit_step is None
         ):
-            raise ValueError("adaptive awaiting phase lacks a successful refit")
+            raise ValueError("awaiting phase requires an applied refit")
     history = state["decision_history"]
     if not isinstance(history, list) or len(history) > _HISTORY_LIMIT:
         raise ValueError("draft update decision history must be a bounded list")
     if len(history) != min(_HISTORY_LIMIT, closed_decisions):
-        raise ValueError("draft update decision history length is not canonical")
+        raise ValueError("decision history must be nonempty and canonical")
     expected_first_id = max(1, closed_decisions - len(history) + 1)
     for offset, entry in enumerate(history):
         if not isinstance(entry, Mapping):
@@ -1338,8 +1342,15 @@ class FileDraftStepTransactionStore:
     ) -> None:
         self.root = result_dir.resolve() / "draft-step-transactions"
         self.root.mkdir(parents=True, exist_ok=True)
+        self.quarantine_root = self.root / "quarantine"
+        self.quarantine_root.mkdir(exist_ok=True)
         self.base_checkpoint_id = base_checkpoint_id
         self.crash_after = crash_after
+        for recovery_dir in self.quarantine_root.glob("resume-*"):
+            if (recovery_dir / "transaction-quarantine-intent.json").is_file() and not (
+                recovery_dir / "transaction-quarantine-receipt.json"
+            ).is_file():
+                self._reconcile_quarantine(recovery_dir)
 
     def _path(self, transaction_id: str, kind: str) -> Path:
         return self.root / f"{transaction_id}.{kind}.json"
@@ -1585,10 +1596,95 @@ class FileDraftStepTransactionStore:
         if resolved.transaction.base_checkpoint_id != checkpoint_id:
             raise ValueError("draft-step resolution is not bound to checkpoint")
 
+    def _reconcile_quarantine(self, recovery_dir: Path) -> Mapping[str, object]:
+        intent_path = recovery_dir / "transaction-quarantine-intent.json"
+        payload = json.loads(intent_path.read_text())
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("state") != "intent"
+            or not isinstance(payload.get("checkpoint_id"), str)
+            or type(payload.get("ledger_high_water")) is not int
+            or not isinstance(payload.get("artifacts"), list)
+        ):
+            raise ValueError("invalid draft-step transaction quarantine intent")
+        for artifact in cast(list[object], payload["artifacts"]):
+            if not isinstance(artifact, Mapping):
+                raise ValueError("invalid draft-step quarantine artifact")
+            source = Path(str(artifact.get("original_path"))).resolve()
+            destination = Path(str(artifact.get("quarantine_path"))).resolve()
+            if (
+                source.parent != self.root
+                or destination.parent != recovery_dir.resolve()
+            ):
+                raise ValueError("draft-step quarantine path escapes transaction roots")
+            source_exists = source.is_file()
+            destination_exists = destination.is_file()
+            if source_exists == destination_exists:
+                raise RuntimeError(
+                    "draft-step quarantine has ambiguous source/destination state"
+                )
+            if source_exists:
+                raw = source.read_bytes()
+                if (
+                    artifact.get("size_bytes") != len(raw)
+                    or artifact.get("sha256") != hashlib.sha256(raw).hexdigest()
+                ):
+                    raise ValueError("draft-step quarantine source digest mismatch")
+                os.replace(source, destination)
+            raw = destination.read_bytes()
+            if (
+                artifact.get("size_bytes") != len(raw)
+                or artifact.get("sha256") != hashlib.sha256(raw).hexdigest()
+            ):
+                raise ValueError("draft-step quarantine destination digest mismatch")
+        for directory in (self.root, self.quarantine_root, recovery_dir):
+            _fsync_directory(directory)
+        receipt = {
+            **payload,
+            "state": "resolved",
+            "receipt_path": str(
+                (recovery_dir / "transaction-quarantine-receipt.json").resolve()
+            ),
+        }
+        _write_json_exclusive(
+            recovery_dir / "transaction-quarantine-receipt.json", receipt
+        )
+        return receipt
+
     def discard_after_checkpoint(
         self, *, checkpoint_id: str, ledger_high_water: int
     ) -> None:
-        for transaction in self._intents().values():
-            if transaction.decision.decision_id > ledger_high_water:
-                for path in self.root.glob(f"{transaction.transaction_id}.*.json"):
-                    path.unlink()
+        transactions = tuple(
+            transaction
+            for transaction in self._intents().values()
+            if transaction.decision.decision_id > ledger_high_water
+        )
+        artifacts: list[dict[str, object]] = []
+        recovery_id = uuid.uuid4().hex
+        recovery_dir = self.quarantine_root / f"resume-{checkpoint_id}-{recovery_id}"
+        for transaction in transactions:
+            for path in sorted(self.root.glob(f"{transaction.transaction_id}.*.json")):
+                raw = path.read_bytes()
+                artifacts.append(
+                    {
+                        "original_path": str(path.resolve()),
+                        "quarantine_path": str((recovery_dir / path.name).resolve()),
+                        "size_bytes": len(raw),
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                    }
+                )
+        if not artifacts:
+            return
+        recovery_dir.mkdir(exist_ok=False)
+        _write_json_exclusive(
+            recovery_dir / "transaction-quarantine-intent.json",
+            {
+                "schema_version": 1,
+                "state": "intent",
+                "checkpoint_id": checkpoint_id,
+                "ledger_high_water": ledger_high_water,
+                "recovery_id": recovery_id,
+                "artifacts": artifacts,
+            },
+        )
+        self._reconcile_quarantine(recovery_dir)
