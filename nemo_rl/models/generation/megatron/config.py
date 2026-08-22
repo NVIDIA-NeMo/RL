@@ -63,6 +63,14 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # TODO: Unify `kv_cache_management_mode` and `recompute_kv_cache_after_weight_updates`.
     kv_cache_management_mode: Literal["persist", "offload"]
 
+    # Dynamic-batching scheduler mode. Options:
+    # - 'legacy': resolve the previous forward pass before preparing the next one.
+    # - 'async': overlap the scheduling phases by preparing the next forward pass
+    #   before resolving the previous one, hiding scheduler CPU time behind GPU
+    #   compute. mcore falls back to legacy ordering for any step that cannot
+    #   overlap (prefill, paused requests, KV-cache pressure).
+    async_sched_mode: NotRequired[Literal["legacy", "async"]]
+
     logging_step_interval: NotRequired[int]
 
 
