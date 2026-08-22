@@ -734,6 +734,34 @@ def test_cluster_step_metrics_report_their_own_cost():
 
     assert metrics["n_processes"] == 1
     assert metrics["observability_overhead_ms"] > 0, "measuring is never free"
-    assert 0.0 <= metrics["observability_overhead_frac"] <= 1.0
+    # Deliberately not clamped to 1. Against this no-op inner client the RPC
+    # is instant, so measuring costs more than the thing measured and the
+    # ratio exceeds 100% -- which is exactly the signal worth surfacing.
+    # Against a real backend it lands near 0.01.
+    assert metrics["observability_overhead_frac"] > 0
     assert "wall_ms" in metrics and "comm_volume_mb" in metrics
+    client.close()
+
+
+def test_cluster_overhead_includes_the_collection_fan_out():
+    """The fan-out is the larger half of the bill. Reporting only the per-op
+    wrapper understated the real cost by ~19x in the cross-process e2e
+    (0.13 ms reported against 2.44 ms actually spent)."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["t"]
+    )
+    client.put_samples(
+        sample_ids=["a"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.zeros(1, 8)}, batch_size=[1]),
+    )
+    merged = merge_snapshots([client.snapshot()])
+    without = cluster_step_metrics(merged, {}, 1.0)
+    with_gather = cluster_step_metrics(merged, {}, 1.0, collect_ms=2.31)
+
+    delta = (
+        with_gather["observability_overhead_ms"] - without["observability_overhead_ms"]
+    )
+    assert delta == pytest.approx(2.31, rel=1e-6)
     client.close()

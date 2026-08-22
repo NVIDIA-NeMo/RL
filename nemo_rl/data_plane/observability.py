@@ -544,7 +544,10 @@ def merge_snapshots(snapshots: "list[dict[str, Any]]") -> dict[str, Any]:
 
 
 def cluster_step_metrics(
-    merged: dict[str, Any], prev: dict[str, Any], step_time_s: float
+    merged: dict[str, Any],
+    prev: dict[str, Any],
+    step_time_s: float,
+    collect_ms: float = 0.0,
 ) -> dict[str, float]:
     """Per-step cluster metrics from two merged snapshots.
 
@@ -552,13 +555,22 @@ def cluster_step_metrics(
     its own previous reading. A cluster has no such owner, so the caller
     holds ``prev`` and passes it back.
 
-    ``observability_overhead_ms`` is what the measurement itself cost,
-    summed over every process -- the wrapper's wall time minus the time its
-    inner client was working. It sits beside ``wall_ms`` so the bill is
-    visible next to what it bought.
+    ``observability_overhead_ms`` is the whole bill for measuring: every
+    process's wrapper time (its wall time minus the time its inner client
+    was working) plus ``collect_ms``, the fan-out that gathered and merged
+    the snapshots. Both halves matter and the second is the larger -- the
+    per-op wrapper costs tenths of a millisecond while the fan-out costs a
+    couple, so a figure covering only the first understates by an order of
+    magnitude and is worse than no figure at all.
+
+    Args:
+        merged: Cluster-wide snapshot from :func:`merge_snapshots`.
+        prev: The previous merged snapshot, for differencing.
+        step_time_s: Step wall time, for ``frac_of_step``.
+        collect_ms: Wall time the caller spent gathering and merging.
     """
     wall_ms = merged["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
-    overhead_ms = merged["self_ms"] - prev.get("self_ms", 0.0)
+    overhead_ms = merged["self_ms"] - prev.get("self_ms", 0.0) + collect_ms
     metrics: dict[str, float] = {
         "wall_ms": wall_ms,
         "frac_of_step": (wall_ms / 1e3 / step_time_s) if step_time_s > 0 else 0.0,
@@ -1285,6 +1297,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         return out
 
     def clear_samples(self, sample_ids, partition_id):
+        entered = monotonic()
         sample_ids_list = _as_list(sample_ids)
         n_keys = len(sample_ids_list) if sample_ids_list is not None else 0
         self._run(
@@ -1294,6 +1307,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
             n_keys=n_keys,
         )
         self._record_clear(partition_id, sample_ids_list)
+        self._bill_self(entered)
 
     def close(self) -> None:
         self._run(
