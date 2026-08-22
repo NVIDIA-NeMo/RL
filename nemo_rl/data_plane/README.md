@@ -460,10 +460,17 @@ cluster percentile).
 `data_plane/{cluster,driver}/breakdown` — one row per op, ordered by wall
 time so the expensive one reads first:
 
-| op | calls | wall_ms | max_ms | overhead_ms | transfer_ms | p50_ms | p99_ms |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| get | 200 | 2233 | 16.01 | 1207 | 1026 | 12.9 | 16.01 |
-| put | 48 | 1135 | 31.9 | 579.3 | 556.1 | — | — |
+| op | calls | wall_ms | wall_ms_per_process | max_ms | overhead_ms | transfer_ms | p50_ms | p99_ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| get | 200 | 2232 | 279 | 16.0 | 1207 | 1025 | 12.9 | 16.0 |
+| put | 48 | 1135 | 141.9 | 31.9 | 579.2 | 556.1 | — | — |
+
+**Every time on the cluster path is summed across processes that ran
+concurrently** — so it is process-time, not elapsed. 200 gets of 11 ms
+across 8 ranks reads 2232 ms while the wall clock was 279. The same key on
+the driver path, where there is one process, is elapsed. Both ship:
+`wall_ms` attributes cost across ops, `wall_ms_per_process` carries the
+magnitude a reader expects of a millisecond.
 
 `overhead_ms` and `transfer_ms` stack to the measured `wall_ms` — that row
 reads "2233 ms of get was 1207 ms of fixed per-call cost and 1026 ms of
