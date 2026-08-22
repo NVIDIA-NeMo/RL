@@ -1310,3 +1310,69 @@ def test_breakdown_table_ignores_reserved_namespaces():
     )
     assert [r[0] for r in rows] == ["put"], rows
     assert columns[0] == "op"
+
+
+def test_hash_counters_reach_both_scopes():
+    """``_log_data_plane_metrics`` prefers the cluster path whenever the
+    fan-out reaches more than one process -- every real run -- and the
+    cluster path emitted no hash counters at all. With verify_tensor_hash
+    on, ``mismatches`` never reached the logger: a guard whose findings are
+    not reported is not a guard."""
+    client = _hash_client(_CorruptingClient(field="ids", row=2))
+    ids = [f"u{i}" for i in range(4)]
+    client.put_samples(sample_ids=ids, partition_id="p", fields=_hash_fields())
+    client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids", "lp"])
+
+    merged = merge_snapshots([client.snapshot(reset_step_window=True)])
+    cluster = cluster_step_metrics(merged, {}, 1.0)
+    assert cluster["step/hash/mismatches"] == 1
+    assert "step/hash/fields_skipped" in cluster, "abstentions visible too"
+    assert headline_series(cluster)["step/hash/mismatches"] == 1, "and charted"
+    client.close()
+
+
+def test_hash_counters_absent_when_the_guard_is_off():
+    """Five always-zero series on every run that never asked for the guard
+    would read as "checked, nothing wrong" rather than "not checked"."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    client._emit("put", "p", 1, 1_000, monotonic() - 0.005, "ok")
+    merged = merge_snapshots([client.snapshot(reset_step_window=True)])
+
+    assert not [k for k in cluster_step_metrics(merged, {}, 1.0) if "hash" in k]
+    assert not [k for k in client.get_step_metrics(1.0) if "hash" in k]
+    client.close()
+
+
+def test_measuring_cost_is_reported_in_both_scopes():
+    """``step/self/*`` was cluster-only, so the single-process fallback
+    silently lacked the one number that says what observability cost."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["t"]
+    )
+    client.put_samples(
+        sample_ids=["a"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.zeros(1, 512)}, batch_size=[1]),
+    )
+    driver = client.get_step_metrics(1.0)
+
+    assert driver["step/self/overhead_ms"] > 0, "measuring is never free"
+    assert "step/self/frac" in driver
+    assert "step/self/overhead_ms" in headline_series(driver)
+    client.close()
+
+
+def test_write_and_read_volume_are_not_computed_for_nobody():
+    """They were dropped by headline_series, charted by nobody, and absent
+    from the table -- while per-op ``mb`` already splits the same traffic
+    finer (put's is the write volume, get's the read volume)."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    client._emit("put", "p", 1, 4_000, monotonic() - 0.005, "ok")
+    metrics = client.get_step_metrics(1.0)
+
+    assert "step/bytes_written_mb" not in metrics
+    assert "step/bytes_read_mb" not in metrics
+    assert metrics["step/comm_volume_mb"] > 0, "the total is still reported"
+    assert metrics["step/put/mb"] == pytest.approx(0.004), "and split per op"
+    client.close()
