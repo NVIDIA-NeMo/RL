@@ -710,6 +710,9 @@ class TestFinish:
         assert len(mock_module_symbols["all_reduce"].call_args_list) == 3
         aggregated_draft_loss = aggregated["all_mb_metrics"]["draft_loss"]
         assert len(aggregated_draft_loss) == 1
+        assert draft_param.main_grad.item() == pytest.approx(
+            3.0 * 2048.0 * len(cp_numerators) / global_count
+        )
         assert aggregated_draft_loss[0].item() == pytest.approx(
             global_numerator / global_count
         )
