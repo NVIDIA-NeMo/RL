@@ -318,3 +318,45 @@ class TestSetupBuildsTheCritic:
         assert actor_args.value_loss_fn is None
         assert timing.value_init_time_s is None
         patched_ppo_factories["policy"].offload_to_cpu.assert_not_called()
+
+
+class TestTrainClusterSizing:
+    """The critic is a second worker group on the training GPUs."""
+
+    def test_non_colocated_train_cluster_admits_policy_and_critic(self):
+        mc = _ppo_master_config()
+        mc.policy["generation"]["colocated"] = {
+            "enabled": False,
+            "resources": {"gpus_per_node": 1, "num_nodes": 1},
+        }
+        mc.cluster = {"num_nodes": 1, "gpus_per_node": 2}
+
+        with patch.object(sc_setup_mod, "RayVirtualCluster") as mock_cluster:
+            sc_setup_mod._build_clusters(mc)
+
+        train_call = mock_cluster.call_args_list[0]
+        assert train_call.kwargs["name"] == "sc_train_cluster"
+        assert train_call.kwargs["max_colocated_worker_groups"] == 2
+
+    def test_grpo_non_colocated_train_cluster_stays_at_one(self):
+        mc = _make_master_config()
+        mc.policy["generation"]["colocated"] = {
+            "enabled": False,
+            "resources": {"gpus_per_node": 1, "num_nodes": 1},
+        }
+        mc.cluster = {"num_nodes": 1, "gpus_per_node": 2}
+
+        with patch.object(sc_setup_mod, "RayVirtualCluster") as mock_cluster:
+            sc_setup_mod._build_clusters(mc)
+
+        assert mock_cluster.call_args_list[0].kwargs["max_colocated_worker_groups"] == 1
+
+    def test_colocated_cluster_adds_generation_on_top(self):
+        mc = _ppo_master_config()
+        mc.cluster = {"num_nodes": 1, "gpus_per_node": 8}
+
+        with patch.object(sc_setup_mod, "RayVirtualCluster") as mock_cluster:
+            sc_setup_mod._build_clusters(mc)
+
+        # policy + critic + vLLM
+        assert mock_cluster.call_args.kwargs["max_colocated_worker_groups"] == 3
