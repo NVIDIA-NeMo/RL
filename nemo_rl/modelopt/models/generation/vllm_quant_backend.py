@@ -622,12 +622,19 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             for buf in attached:
                 del buf.weight_loader
 
-    def _load_weights(self, weights):
+    def _load_weights(self, weights, *, coverage=None):
         """Load pre-folded weights and activation-quantizer amax buffers.
 
         Weights arrive already folded from the Megatron side (weight_quantizer
         applied during export), so no fold_weight step is needed here.
+
+        ``coverage`` follows the base signature; the full delivered name set is
+        recorded here (real-quant deliberately filters some scale entries out
+        of the actual load, but they are still handled).
         """
+        if coverage is not None:
+            weights = list(weights)
+            coverage.record_loaded(tuple(name for name, _ in weights))
         if self._is_real_quant_model():
             weights = list(weights)
             source_storage_ptrs = {

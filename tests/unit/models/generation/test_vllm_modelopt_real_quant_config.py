@@ -614,7 +614,7 @@ def _patch_real_quant_load(monkeypatch, backend, forwarded=None):
         monkeypatch.setattr(
             backend.VllmInternalWorkerExtension,
             "_load_weights",
-            lambda self, weights: forwarded.extend(weights) or "loaded",
+            lambda self, weights, coverage=None: forwarded.extend(weights) or "loaded",
         )
 
 
@@ -1386,7 +1386,7 @@ def test_real_quant_pre_ack_fence_is_device_wide_and_load_does_not_fence(
     monkeypatch.setattr(
         backend.VllmInternalWorkerExtension,
         "_load_weights",
-        lambda _self, _weights: events.append("load") or "loaded",
+        lambda _self, _weights, coverage=None: events.append("load") or "loaded",
     )
     monkeypatch.setattr(
         backend,
@@ -1998,7 +1998,7 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     extension.zmq_socket = FakeSocket()
     extension.state_dict_info = state_dict_info
     extension.maybe_init_zmq = lambda: None
-    extension._load_weights = lambda _weights: None
+    extension._load_weights = lambda _weights, coverage=None: None
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
         "_is_real_quant_model",
