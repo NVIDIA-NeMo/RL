@@ -33,6 +33,22 @@ from nemo_rl.models.policy.draft_config import DSparkDraftConfig
 pytestmark = pytest.mark.mcore
 
 
+class _SequenceParallelEmbedding(torch.nn.Module):
+    reduce_scatter_embeddings = True
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        assert input_ids.shape[1] % 2 == 0
+        local_sequence_length = input_ids.shape[1] // 2
+        return torch.arange(
+            local_sequence_length * input_ids.shape[0] * self.hidden_size,
+            dtype=torch.float32,
+        ).reshape(local_sequence_length, input_ids.shape[0], self.hidden_size)
+
+
 def _config() -> DSparkDraftConfig:
     return DSparkDraftConfig(
         enabled=True,
@@ -285,7 +301,9 @@ def test_dspark_export_uses_runtime_names_without_target_owned_weights(
     )
 
 
-def test_dspark_provider_maps_packed_cp_inputs_to_local_objective_slots() -> None:
+def test_dspark_provider_maps_packed_cp_inputs_to_local_objective_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     hidden_size, vocab_size = 4, 32
     config = _config().model_copy(
         update={
@@ -325,7 +343,7 @@ def test_dspark_provider_maps_packed_cp_inputs_to_local_objective_slots() -> Non
         def __init__(self) -> None:
             super().__init__()
             self.embedding = SimpleNamespace(
-                word_embeddings=torch.nn.Embedding(vocab_size, hidden_size)
+                word_embeddings=_SequenceParallelEmbedding(hidden_size)
             )
             self.output_layer = torch.nn.Linear(hidden_size, vocab_size, bias=False)
             self.share_embeddings_and_output_weights = False
@@ -379,6 +397,13 @@ def test_dspark_provider_maps_packed_cp_inputs_to_local_objective_slots() -> Non
     target = _Target()
     adapter = _Adapter()
     cp_group = object()
+    tp_group = object()
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(
+        "nemo_rl.models.megatron.draft.training.all_gather_tensor_autograd",
+        lambda local, *, gather_dim, group: torch.cat((local, local + 100), dim=0),
+    )
     cp_local_length = layout.cp_global_positions.numel()
     captured = CapturedStates(
         hidden_states=torch.randn(cp_local_length, 1, 2 * hidden_size),
@@ -398,7 +423,7 @@ def test_dspark_provider_maps_packed_cp_inputs_to_local_objective_slots() -> Non
         optimizer_step=9,
         sequence_layout=layout,
         context_parallel_group=cp_group,
-        tensor_parallel_group=object(),
+        tensor_parallel_group=tp_group,
     )
     output = data["dspark_output"]
     assert isinstance(output, DSparkForwardOutput)

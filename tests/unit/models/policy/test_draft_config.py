@@ -331,3 +331,19 @@ def test_qwen3_8b_dflash_recipe_pairs_public_drafter_with_exact_target() -> None
         "backend": "eager",
         "cudagraph_mode": "PIECEWISE",
     }
+
+
+def test_qwen3_8b_dspark_recipe_keeps_cuda_graphs_with_eager_backend() -> None:
+    path = (
+        REPO_ROOT
+        / "examples/configs/recipes/llm/grpo-qwen3-8b-1n8g-megatron-dspark.yaml"
+    )
+    raw = OmegaConf.to_container(load_config(path), resolve=True)
+
+    config = MasterConfig(**raw)
+
+    assert config.policy["generation"]["vllm_cfg"]["enforce_eager"] is False
+    assert config.policy["generation"]["vllm_kwargs"]["compilation_config"] == {
+        "backend": "eager",
+        "cudagraph_mode": "PIECEWISE",
+    }
