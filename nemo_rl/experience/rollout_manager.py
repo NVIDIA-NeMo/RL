@@ -16,6 +16,7 @@ import asyncio
 import copy
 import enum
 import json
+import statistics
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -41,8 +42,11 @@ from nemo_rl.experience.failures import (
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollouts import (
+    EffortLevelsConfig,
+    _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
     _dummy_routed_experts_for_tokens,
+    _EffortShapingMetrics,
     _find_routed_experts_template,
     _tensorize_by_key,
     attach_static_multimodal_payload,
@@ -749,6 +753,8 @@ class AsyncNemoGymRolloutImpl:
         # Shared with the owning RolloutManager so row-level re-dispatches are visible
         # in the same counters as everything else. None when constructed directly.
         stats: Optional[RolloutStats] = None,
+        # Length-based reward shaping for low-effort prompts; None disables it.
+        effort_config: Optional[EffortLevelsConfig] = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -765,6 +771,7 @@ class AsyncNemoGymRolloutImpl:
             else RolloutRetryPolicy.single_attempt()
         ).max_gym_row_attempts
         self._stats = stats
+        self._effort_config = effort_config
 
         self._validate_init_params()
 
@@ -985,6 +992,10 @@ class AsyncNemoGymRolloutImpl:
                 raise failure from last_error
 
             completed_results = [result for result in results if result is not None]
+            # Shape rewards for low-effort prompts before completions are built.
+            shaping = _apply_effort_shaping(
+                completed_results, inputs, self._effort_config
+            )
             # All N rollouts share the same input prompt; tensorize one copy.
             prompt_message_log = completed_results[0]["input_message_log"]
             _tensorize_by_key(prompt_message_log, "token_ids")
@@ -996,7 +1007,7 @@ class AsyncNemoGymRolloutImpl:
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):
             rollout_metrics = self._compute_rollout_metrics(
-                completions, inputs[0]["agent_ref"]["name"]
+                completions, inputs[0]["agent_ref"]["name"], shaping
             )
 
         rollout_metrics.update(env_timing_metrics)
@@ -1034,6 +1045,7 @@ class AsyncNemoGymRolloutImpl:
         self,
         completions: list[Completion],
         agent_name: str,
+        shaping: _EffortShapingMetrics,
     ) -> dict[str, Any]:
         """Aggregate per-sample and per-agent metrics."""
         # Prepare lists of values for each metric.
@@ -1105,6 +1117,31 @@ class AsyncNemoGymRolloutImpl:
         rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
             "gen_tokens_per_sample/mean"
         ]
+
+        # Length-based reward shaping metrics for low-effort prompts. Empty lists
+        # (shaping disabled or no matching prompt) leave rollout_metrics untouched.
+        if shaping.length_rewards_low:
+            rollout_metrics["mean_length_reward_low"] = sum(
+                shaping.length_rewards_low
+            ) / len(shaping.length_rewards_low)
+        if shaping.rewards_low:
+            rollout_metrics["mean_reward_low"] = sum(shaping.rewards_low) / len(
+                shaping.rewards_low
+            )
+        if shaping.low_lengths:
+            rollout_metrics["mean_length_low"] = sum(shaping.low_lengths) / len(
+                shaping.low_lengths
+            )
+            rollout_metrics["median_length_low"] = float(
+                statistics.median(shaping.low_lengths)
+            )
+        if shaping.high_lengths:
+            rollout_metrics["mean_length_high"] = sum(shaping.high_lengths) / len(
+                shaping.high_lengths
+            )
+            rollout_metrics["median_length_high"] = float(
+                statistics.median(shaping.high_lengths)
+            )
         return rollout_metrics
 
 
@@ -1125,6 +1162,7 @@ class RolloutManager:
         tq_buffer: Optional[TQReplayBuffer] = None,
         timeouts: Optional[RolloutTimeouts] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
+        effort_config: Optional[EffortLevelsConfig] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1166,6 +1204,7 @@ class RolloutManager:
             # Only the NeMo-Gym impl reads these; the native impl absorbs them via kwargs.
             retry_policy=self._retry_policy,
             stats=self._stats,
+            effort_config=effort_config,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
