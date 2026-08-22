@@ -210,6 +210,25 @@ class TestTQPolicySplitFanout:
         train_meta = mock_shard.call_args.args[0]
         assert train_meta.fields == [*DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD]
 
+    def test_train_microbatches_honors_narrowed_train_fields(self):
+        p, _ = _make_tq_policy()
+        meta = _meta()
+        narrowed_fields = tuple(
+            field for field in DP_TRAIN_FIELDS if field != "prev_logprobs"
+        )
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            p.train_microbatches_from_meta(meta, train_fields=narrowed_fields)
+
+        train_meta = mock_shard.call_args.args[0]
+        assert train_meta.fields == list(narrowed_fields)
+
     def test_finish_dedupes_replica_twins(self):
         """TP/CP twins return identical metric copies; aggregating without
         the is_replica_leader filter inflates every per-token metric."""

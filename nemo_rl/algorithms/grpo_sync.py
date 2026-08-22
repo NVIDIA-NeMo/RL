@@ -118,6 +118,76 @@ def _raise_if_message_level_advantage_penalties_enabled(
     )
 
 
+def _should_use_split_draft_training(master_config: MasterConfig) -> bool:
+    """Select the proven packed Megatron CP path for block-draft training."""
+    policy_config = master_config.policy
+    draft_config = policy_config.get("draft")
+    megatron_config = policy_config.get("megatron_cfg")
+    sequence_packing = policy_config.get("sequence_packing")
+    if draft_config is None or megatron_config is None:
+        return False
+    return bool(
+        draft_config.enabled
+        and draft_config.speculator_type in ("dflash", "dspark")
+        and megatron_config.get("enabled") is True
+        and int(megatron_config.get("context_parallel_size", 1)) > 1
+        and megatron_config.get("sequence_parallel") is True
+        and sequence_packing is not None
+        and sequence_packing.get("enabled") is True
+    )
+
+
+def _train_policy_from_meta(
+    policy: TQPolicy,
+    meta: KVBatchMeta,
+    *,
+    loss_fn: LossFunction,
+    timer: Timer | None,
+    train_fields: tuple[str, ...],
+    master_config: MasterConfig,
+) -> dict[str, Any]:
+    """Train one TQ step, using the split lifecycle required by packed CP."""
+    if not _should_use_split_draft_training(master_config):
+        return policy.train_from_meta(
+            meta,
+            loss_fn=loss_fn,
+            timer=timer,
+            train_fields=train_fields,
+        )
+
+    split_methods = (
+        "begin_train_step",
+        "train_microbatches_from_meta",
+        "finish_train_step",
+        "abort_train_step",
+    )
+    missing_methods = [
+        method
+        for method in split_methods
+        if not callable(getattr(policy, method, None))
+    ]
+    if missing_methods:
+        raise RuntimeError(
+            "packed context-parallel DFlash/DSpark training requires the TQ split "
+            f"training API; missing: {', '.join(missing_methods)}"
+        )
+
+    try:
+        policy.begin_train_step(loss_fn)
+        policy.train_microbatches_from_meta(
+            meta,
+            timer=timer,
+            train_fields=train_fields,
+        )
+        return policy.finish_train_step()
+    except BaseException as train_error:
+        try:
+            policy.abort_train_step()
+        except BaseException as abort_error:
+            train_error.add_note(f"split training abort also failed: {abort_error!r}")
+        raise
+
+
 def _train_fields_for_step(skip_prev_logprobs: bool) -> tuple[str, ...]:
     """Fields workers fetch this step; ``prev_logprobs`` is dropped when skipped."""
     return tuple(
@@ -952,11 +1022,13 @@ def grpo_train_sync(
                     # Meta-driven train: workers fetch the union of
                     # rollout + driver-written + worker-written columns
                     # from TQ, train, return aggregated metrics via Ray.
-                    train_results = policy.train_from_meta(
+                    train_results = _train_policy_from_meta(
+                        policy,
                         meta,
                         loss_fn=loss_fn,
                         timer=timer,
                         train_fields=train_fields,
+                        master_config=master_config,
                     )
                     draft_config = master_config.policy.get("draft")
                     if draft_config is not None and draft_config.enabled:
