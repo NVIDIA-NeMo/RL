@@ -459,18 +459,18 @@ cluster percentile).
 **What gets charted is the bottleneck, not the detail.** Four ops times
 eight fields is 32 series saying one thing, and a dashboard of 32 lines
 does not answer "where is my time going". So the emitted series are the
-totals and `time_pct`, with the per-op detail in a table beside them:
+totals and `pct_of_dataplane`, with the per-op detail in a table beside them:
 
 | series | what it answers |
 |---|---|
 | `step/frac_of_step` | is the data plane worth optimising at all? |
-| `step/time_pct/by_op/{put,get,clear,register}` | which call is expensive? |
-| `step/time_pct/by_cause/{fixed_overhead,transfer}` | is that fixed per-request cost, or moving bytes? |
+| `step/pct_of_dataplane/by_op/{put,get,clear,register}` | which call is expensive? |
+| `step/pct_of_dataplane/by_cause/{fixed_overhead,transfer}` | is that fixed per-request cost, or moving bytes? |
 | `step/wall_ms`, `step/comm_volume_mb` | how much time and traffic |
 | `now/bytes_outstanding_mb`, `now/n_processes` | occupancy, fan-out width |
 | `step/self/{overhead_ms,frac}` | what measuring cost |
 
-**`time_pct` is a percentage of data-plane time, not of the step.** The
+**`pct_of_dataplane` is a percentage of data-plane time, not of the step.** The
 denominator is `sum(wall_ms)` over the ops that ran, so
 `by_op/put = 43` reads "43% of the time spent inside the data plane went to
 put". Whether that time mattered against compute is the *other* metric:
@@ -479,8 +479,8 @@ a workload can be 43% put and still not be worth touching.
 
 ```
 step/frac_of_step               0.87    the data plane is 87% of the step, so it matters
-step/time_pct/by_op/put        43.0     and within it, put is the largest piece
-step/time_pct/by_cause/...
+step/pct_of_dataplane/by_op/put        43.0     and within it, put is the largest piece
+step/pct_of_dataplane/by_cause/...
     fixed_overhead             53.1     that time is mostly per-request cost,
     transfer                   17.6     not bandwidth -- batch, don't tune the wire
 ```
@@ -499,9 +499,9 @@ and the wrong one for "what blocked the step".
 
 **A per-op breakdown table** carries the detail, under
 `data_plane/{cluster,driver}/breakdown` — one row per op, ordered by
-`time_pct` so the bottleneck is the first line read:
+`pct_of_dataplane` so the bottleneck is the first line read:
 
-| op | time_pct | calls | wall_ms | mean_ms | max_ms | p50_ms | p90_ms | overhead_ms | transfer_ms | mb |
+| op | pct_of_dataplane | calls | wall_ms | mean_ms | max_ms | p50_ms | p90_ms | overhead_ms | transfer_ms | mb |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | put | 43.0 | 2 | 53.9 | 26.9 | 29.4 | — | — | 19.4 | 6.39 | 1.32 |
 | get | 30.9 | 2 | 38.7 | 19.4 | 21.5 | — | — | 13.8 | 4.63 | 1.03 |
@@ -522,7 +522,7 @@ while the wall clock was 279. Dividing by the process count only trades one
 arbitrary denominator for another. Per call is invariant to both DP degree
 and batch size: the same workload at 8 and at 32 ranks reports 11.16 and
 11.06 ms while `wall_ms` quadruples. Use `mean_ms` to compare runs and
-cluster sizes, `time_pct` to attribute cost across ops within one step.
+cluster sizes, `pct_of_dataplane` to attribute cost across ops within one step.
 
 A stack of line charts answers "how did put's wall time trend"; this
 answers "where did the step go", which is a table. Cells are empty rather
