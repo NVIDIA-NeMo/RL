@@ -84,7 +84,8 @@ def _wanted_engine_env() -> dict[str, str]:
         # on RoCE each rail is its own subnet, so a cross-rail pair has no
         # route. Measured on the gb200 CI runners: every cross-rail pair failed,
         # no same-rail pair ever did. InfiniBand routes cross-rail, so it is
-        # left alone.
+        # left alone. Mooncake reads this presence-only (config.cpp:318), so
+        # `=0` enables it too — unsetting it is the only way to disable it.
         wanted["MC_ENABLE_DEST_DEVICE_AFFINITY"] = "1"
     return wanted
 
