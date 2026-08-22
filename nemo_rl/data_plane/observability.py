@@ -447,23 +447,27 @@ def _step_deltas(snap: dict[str, Any], prev: dict[str, Any]) -> dict[str, float]
 def _latency_split(
     fit: dict[str, Any], calls: int, op_bytes: int
 ) -> tuple[float, float] | None:
-    """This step's time split into fixed overhead and transfer, in ms.
+    """One call's time split into fixed overhead and transfer, in ms.
 
-    The two stack: together they are the model's estimate of the op's
-    ``wall_ms``, so charting them against the measured value shows the split
-    and how well the model holds. The *coefficients* come from the
-    cumulative fit and should be stable -- that is what a fitted model is
-    for -- while the *attribution* is per step, applied to this step's calls
-    and bytes.
+    Per call, like ``mean_ms``, and for the same reason: the extensive form
+    scales with DP degree and batch size and so describes the shape of the
+    run rather than the wire. Per call the overhead term *is* the fitted
+    per-request constant -- a property of the backend, comparable against a
+    hardware number -- and the transfer term is that bandwidth at this
+    step's mean request size.
+
+    The two stack to ``mean_ms``, so charting them against it shows the
+    split and how well the affine model holds, in the same units and the
+    same scale as everything else per-op.
 
     ``None`` when the fit is not trustworthy, which includes the common RL
     case of near-uniform request sizes where the split is mathematically
     unrecoverable.
     """
-    if not fit.get("model_trustworthy"):
+    if not fit.get("model_trustworthy") or calls <= 0:
         return None
     ms_per_byte = 1.0 / (fit["bandwidth_mb_s"] * 1e3)
-    return fit["fixed_ms"] * calls, ms_per_byte * op_bytes
+    return fit["fixed_ms"], ms_per_byte * (op_bytes / calls)
 
 
 def _clamped_percentiles(hist: list[int], max_ms: float) -> tuple[float, float] | None:
