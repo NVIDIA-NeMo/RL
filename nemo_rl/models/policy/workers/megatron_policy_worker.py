@@ -16,6 +16,7 @@ import gc
 import logging
 import os
 import re
+import socket
 import time
 import warnings
 from collections import OrderedDict, defaultdict
@@ -57,6 +58,7 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.held_port import receive_held_socket
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.megatron_worker import (
@@ -424,6 +426,7 @@ class MegatronPolicyWorkerImpl(
         *,
         worker_sharding_annotations: NamedSharding,
         skip_weight_load: bool = False,
+        reserved_http_server_port: Optional[int] = None,
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
@@ -458,6 +461,15 @@ class MegatronPolicyWorkerImpl(
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
+
+        # Adopt the driver-reserved OpenAI server socket before any heavy init.
+        # The port holder has kept it bound and listening since reservation, so
+        # there was no window in which the pre-published URL could be stolen.
+        self._reserved_http_server_socket: Optional[socket.socket] = None
+        if reserved_http_server_port is not None and self.rank == 0:
+            self._reserved_http_server_socket = receive_held_socket(
+                reserved_http_server_port
+            )
 
         # Step 1: Setup distributed
         setup_distributed()
