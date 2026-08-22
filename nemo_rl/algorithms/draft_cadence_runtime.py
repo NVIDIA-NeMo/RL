@@ -791,6 +791,10 @@ def initialize_or_recover_cadence_resume(
     )
     receipt_path = checkpoint_path.resolve() / "cadence-checkpoint-receipt.json"
     if not receipt_path.is_file():
+        if saved is not None:
+            raise ValueError(
+                "saved cadence state requires a cadence checkpoint receipt"
+            )
         save_state.draft_update_schedule = (
             disabled_draft_schedule_payload()
             if scheduler is None

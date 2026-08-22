@@ -192,6 +192,47 @@ def test_legacy_always_resume_initializes_before_ledger_receipt_open(
     assert store.pending_intents() == ()
 
 
+def test_saved_schedule_resume_requires_cadence_receipt(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint" / "step_4"
+    checkpoint.mkdir(parents=True)
+    result_root = tmp_path / "cadence"
+    ledger = DraftDecisionLedger(result_root / "live.jsonl")
+    store = FileDraftStepTransactionStore(result_root, base_checkpoint_id="step_4")
+    scheduler = DraftUpdateScheduler.create(
+        AlwaysDraftUpdateScheduleConfig(), origin_step=0
+    )
+    for step in range(1, 5):
+        decision = scheduler.decide(global_step=step, acceptance=None)
+        scheduler.record_outcome(
+            decision,
+            update_attempted=True,
+            update_successful=True,
+            draft_refit_attempted=True,
+            draft_refit_successful=True,
+        )
+    save_state = SimpleNamespace(
+        draft_update_schedule=scheduler.state_dict(),
+        applied_draft_snapshot=None,
+        draft_terminal_evidence=None,
+        draft_decision_ledger_prefixes=[],
+    )
+
+    with pytest.raises(ValueError, match="saved cadence state requires.*receipt"):
+        initialize_or_recover_cadence_resume(
+            _dflash_config(enabled=True),
+            saved=scheduler.state_dict(),
+            origin_step=4,
+            checkpoint_path=checkpoint,
+            result_root=result_root,
+            transaction_store=store,
+            decision_ledger=ledger,
+            save_state=save_state,
+        )
+
+    assert ledger.next_decision_id == 1
+    assert store.pending_intents() == ()
+
+
 def test_checkpoint_receipt_binds_all_training_components(tmp_path: Path) -> None:
     """Changing a checkpoint member must make it unusable as a resume authority."""
     root = tmp_path / "cadence"
