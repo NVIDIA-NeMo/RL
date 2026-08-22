@@ -106,6 +106,32 @@ class TQValue(TQDriverMixin, Value):
 
     # ── 1-hop entrypoints (KVBatchMeta in, no re-fan-out) ──────────────────
 
+    def _isolated_meta(
+        self,
+        meta: KVBatchMeta,
+        *,
+        fields: list[str],
+        task_name: str,
+    ) -> KVBatchMeta:
+        """Narrow ``meta`` for a critic dispatch and stamp its own pad target.
+
+        The pad target is minted onto ``extra_info`` and is idempotent per meta,
+        so stamping the caller's meta would make whichever model runs first
+        decide the forward pad for the other. The critic runs first in the SC
+        train pump, and its ``sequence_length_round`` need not satisfy the
+        policy's divisibility requirement -- so copy ``extra_info`` and stamp
+        the copy. Nothing is lost: the write-back packs per-token columns to
+        real row lengths, not to the pad.
+        """
+        isolated = replace(
+            meta,
+            fields=fields,
+            task_name=task_name,
+            extra_info=dict(meta.extra_info),
+        )
+        self._stamp_pad_seqlen(isolated)
+        return isolated
+
     def get_values_from_meta(
         self,
         meta: KVBatchMeta,
@@ -125,9 +151,8 @@ class TQValue(TQDriverMixin, Value):
             micro_batch_size: Inference micro batch size; None uses the config default.
             timer: Optional timer for nested ``get_values/*`` measurements.
         """
-        self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("logprob_mb_tokens")
-        value_meta = replace(
+        value_meta = self._isolated_meta(
             meta,
             fields=list(VALUE_SEED_FIELDS),
             task_name="value_fwd",
@@ -182,9 +207,8 @@ class TQValue(TQDriverMixin, Value):
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
 
-        self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
-        train_meta = replace(
+        train_meta = self._isolated_meta(
             meta,
             fields=list(DP_VALUE_TRAIN_FIELDS),
             task_name="value_train",

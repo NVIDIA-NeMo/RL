@@ -29,7 +29,11 @@ import pytest
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import DP_VALUE_TRAIN_FIELDS, VALUE_SEED_FIELDS
+from nemo_rl.data_plane.schema import (
+    DP_VALUE_TRAIN_FIELDS,
+    GLOBAL_FORWARD_PAD_SEQLEN,
+    VALUE_SEED_FIELDS,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.models.value.tq_value import TQValue
 
@@ -212,3 +216,29 @@ class TestTQValueFanout:
             out = v.train_from_meta(meta, loss_fn="LF")
 
         assert out["all_mb_metrics"]["loss"] == [0.1, 0.2]
+
+
+class TestPadTargetIsolation:
+    """The critic runs before the policy in the SC train pump, and the pad
+    target is minted once per meta -- so stamping the caller's meta would let
+    the critic's sequence_length_round decide the policy's forward padding."""
+
+    def test_dispatch_does_not_stamp_the_callers_meta(self):
+        v, _ = _make_tq_value()
+        v.use_dynamic_batches = False
+        v.use_sequence_packing = False
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["s0", "s1"],
+            sequence_lengths=[7, 9],
+        )
+        with patch(
+            "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+            return_value=([meta, meta], None),
+        ) as mock_shard:
+            v.get_values_from_meta(meta)
+
+        assert GLOBAL_FORWARD_PAD_SEQLEN not in meta.extra_info
+        # ...but the dispatched meta carries one, so DP ranks still agree.
+        assert GLOBAL_FORWARD_PAD_SEQLEN in mock_shard.call_args.args[0].extra_info
