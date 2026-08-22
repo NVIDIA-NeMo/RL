@@ -158,19 +158,18 @@ def _pop_partition_keys(
 def _tensor_bytes(v: torch.Tensor) -> int:
     """Wire bytes of one tensor leaf, rectangular or nested.
 
-    A nested tensor's own ``nbytes`` (and ``numel``/``element_size``) route
-    through ``__torch_function__`` and measure ~16 us per leaf; its packed
-    values buffer answers the same question in ~0.1 us. Every per-token
-    field on this wire is nested, so that difference is paid four or five
-    times per transfer.
+    A nested tensor's ``nbytes`` dispatches through ``__torch_function__``;
+    its packed values buffer answers the same question without dispatching,
+    and every per-token field on this wire is nested.
 
-    Guarded twice, because a wrong byte count is worse than a slow one. If
-    ``_values`` is ever absent the public attribute still answers. And a
-    buffer holding more elements than the offsets describe means the tensor
-    views a larger allocation (``torch.nested.narrow``), where the buffer
-    would overcount — nothing in ``nemo_rl`` builds one, since all four
-    construction sites use the compacting ``as_nested_tensor``, but this is
-    handed whatever a caller passes.
+    Two guards, because a wrong byte count is worse than a slow one:
+
+    * ``_values`` is a bound *method* on every dense tensor, so the first
+      check is on the type, not for absence — ``buf is None`` would be wrong.
+    * A buffer holding more elements than the offsets describe means the
+      tensor views a larger allocation (``torch.nested.narrow``), where the
+      buffer overcounts. Nothing here builds one, but this is handed
+      whatever a caller passes.
     """
     buf = getattr(v, "_values", None)
     if type(buf) is not torch.Tensor:
@@ -269,7 +268,7 @@ def _estimate_encoded_bytes(obj: Any, budget: list[int]) -> int:
             total += _estimate_encoded_bytes(v, budget)
         return total
     if isinstance(obj, torch.Tensor):
-        return obj.numel() * obj.element_size()
+        return _tensor_bytes(obj)
     # Unknown type -> pickle/cloudpickle Ext. Cheap proxy; the real size
     # would need an actual dumps(), which is what we are avoiding.
     return 64
@@ -309,8 +308,8 @@ def _nontensor_stack_bytes(stack: NonTensorStack, budget: list[int]) -> int:
 def _td_bytes(td: TensorDict | None, max_nodes: int = 10_000) -> int:
     """Payload bytes of a TensorDict, as the wire will see them.
 
-    Tensor leaves count ``numel * element_size``, which equals
-    ``t.contiguous().nbytes`` -- the size mooncake registers and sends.
+    Tensor leaves count ``nbytes`` (see :func:`_tensor_bytes`), which is the
+    size mooncake registers and sends.
     Non-tensor leaves are estimated with :func:`_estimate_encoded_bytes`,
     since TQ ships them over a separate msgpack path. Both kinds are counted
     in a single ``items()`` pass; ``keys()`` + ``get()`` would re-resolve
