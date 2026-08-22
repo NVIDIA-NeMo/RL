@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -109,7 +110,13 @@ class CadenceTestRun:
         return sum(row["decision_id"] == decision_id for row in self._rows())
 
     def entries_after(self, decision_id: int) -> list[dict[str, object]]:
-        return [row for row in self._rows() if int(row["decision_id"]) > decision_id]
+        rows = []
+        for row in self._rows():
+            row_decision_id = row["decision_id"]
+            assert type(row_decision_id) is int
+            if row_decision_id > decision_id:
+                rows.append(row)
+        return rows
 
     def decision_for_step(self, step: int) -> DraftUpdateDecision:
         return self.scheduler.decide(global_step=step, acceptance=None)
@@ -602,7 +609,9 @@ def test_draft_step_transaction_recovers_matching_scheduler_snapshot_and_ledger(
     restored = run.restart_from_checkpoint(1)
     bundle = load_checkpoint_bundle(tmp_path / "checkpoints" / "step_1")
     assert bundle["checkpoint_id"] == "step_1"
-    assert set(bundle["components"]) == {"model", "optimizer", "dataloader_rng"}
+    checkpoint_components = bundle["components"]
+    assert isinstance(checkpoint_components, Mapping)
+    assert set(checkpoint_components) == {"model", "optimizer", "dataloader_rng"}
     assert bundle["draft_update_schedule"]["state"]["applied_draft_version"] == 1
     assert bundle["applied_draft_snapshot"]["version"] == 1
     assert bundle["ledger_high_water"] == 1
@@ -791,8 +800,10 @@ def test_disabled_fixed_control_checkpoint_has_explicit_empty_ledger(
         terminal_evidence=CadenceTerminalEvidence({}, {}),
     )
     bundle = load_checkpoint_bundle(checkpoint)
-    assert bundle["draft_update_schedule"]["mode"] == "disabled"
-    assert scheduler_decision_high_water(bundle["draft_update_schedule"]) == 0
+    schedule_payload = bundle["draft_update_schedule"]
+    assert isinstance(schedule_payload, Mapping)
+    assert schedule_payload["mode"] == "disabled"
+    assert scheduler_decision_high_water(schedule_payload) == 0
     assert bundle["decision_ledger"] == {
         "relative_path": "draft-decision-ledger.jsonl",
         "size_bytes": 0,
