@@ -8,8 +8,15 @@
 # (last working omni artifact) with:
 #   * data: interleaved joint jsonl (text curriculum order preserved, vision
 #     rows Bresenham-interleaved ~2:1; shuffle stays false everywhere)
-#   * cluster: 26 -> 30 nodes (+4 for the non-colocated text teacher,
-#     TP8/EP16/CP2 as proven in the text MOPD runs)
+#   * cluster: 26 -> 38 nodes: +4 text teacher (TP8/EP16/CP2, proven text
+#     shape), gen fleet 8 -> 16 nodes (64 GPUs, the text run's fleet scale —
+#     required for 131k generations), train 16 nodes (one TP8xCP8 instance)
+#   * SETTINGS ENVELOPE (max of text OPD and vision OPD, per user request):
+#     seqlen 16384 -> 131072, max_new_tokens = seqlen, policy CP 2 -> 8
+#     (text run's shape for 131k; UNPROVEN with the omni vision encoder —
+#     primer gates it), logprob_chunk_size 2048. Vision-side settings kept:
+#     image cap 10, vLLM gpu_mem 0.5 + enforce_eager (proven omni plumbing),
+#     lr 2e-6 flat, GBS 512 = 256x2, token_level_loss.
 #   * env.nemo_gym: text agent stack from
 #     examples/nemo_gym/nemotron-3-super/mopd_super_text_32n_131k_tp8_v10mix60_gbs512.yaml
 #     (config_paths, judge base_url stubs, skip_verification: true — requires
@@ -22,7 +29,7 @@ checkpointing:
   checkpoint_dir: results/mopd-super-omni-joint-opd-hsg
   keep_top_k: 1000
 cluster:
-  num_nodes: 30
+  num_nodes: 38
   gpus_per_node: 4
 grpo:
   num_prompts_per_step: 256
@@ -43,19 +50,25 @@ loss_fn:
   use_kl_in_reward: false
 policy:
   train_global_batch_size: 512
+  # envelope: text OPD's sequence length (long text prompts/gens untruncated);
+  # vision rows are far shorter and simply pack tighter.
+  max_total_sequence_length: 131072
+  logprob_chunk_size: 2048
   tokenizer:
     chat_template_kwargs:
       enable_thinking: true
       truncate_history_thinking: false
   megatron_cfg:
+    # text run's CP for 131k activations (omni base is CP2 at 16k).
+    context_parallel_size: 8
     optimizer:
       lr: 2.0e-06
       min_lr: 2.0e-06
   generation:
-    max_new_tokens: 16384
+    max_new_tokens: ${policy.max_total_sequence_length}
     colocated:
       resources:
-        num_nodes: 8
+        num_nodes: 16
         gpus_per_node: 4
     vllm_cfg:
       gpu_memory_utilization: 0.5

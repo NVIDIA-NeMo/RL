@@ -11,7 +11,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export EXP_NAME="${EXP_NAME:-mopd-super-omni-joint-opd-hsg-001}"
-export CONFIG_PATH="${CONFIG_PATH:-examples/configs/recipes/vlm/mopd-nemotron-super-omni-joint-opd-30n4g-hsg.v1.yaml}"
+export CONFIG_PATH="${CONFIG_PATH:-examples/configs/recipes/vlm/mopd-nemotron-super-omni-joint-opd-38n4g-hsg.v1.yaml}"
 export MODEL_PATH="${MODEL_PATH:-/lustre/fsw/portfolios/llmservice/users/adithyare/code/main_branch_unified_opd/vlm_run_resources/vlm_student}"
 # vision teacher (routes string_match_simple_agent)
 export VLM_TEACHER_PATH="${VLM_TEACHER_PATH:-/lustre/fsw/portfolios/llmservice/users/adithyare/code/main_branch_unified_opd/vlm_run_resources/vlm_teacher}"
