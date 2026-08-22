@@ -190,6 +190,13 @@ def test_observability_records_realistic_rollout_put() -> None:
 # ── byte accounting ────────────────────────────────────────────────────
 
 
+def _jagged(rows):
+    return TensorDict(
+        {"x": torch.nested.nested_tensor(rows, layout=torch.jagged)},
+        batch_size=[len(rows)],
+    )
+
+
 @pytest.mark.parametrize(
     "name,td,expected",
     [
@@ -245,16 +252,13 @@ def test_td_bytes_jagged_matches_the_public_count():
     """The nested fast path reads the packed values buffer instead of the
     tensor's own (dispatched, ~16us) ``nbytes``. It must agree exactly."""
     rows = [torch.arange(n, dtype=torch.int64) for n in (3, 7, 2, 5)]
-    jagged = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
-    td = TensorDict({"x": jagged}, batch_size=[4])
-    assert _td_bytes(td) == jagged.nbytes == sum(r.nbytes for r in rows)
+    td = _jagged(rows)
+    assert _td_bytes(td) == td["x"].nbytes == sum(r.nbytes for r in rows)
 
 
 def test_td_bytes_does_not_overcount_a_narrow_view():
     """``torch.nested.narrow`` yields a tensor whose values buffer views a
-    larger allocation. Trusting the buffer there would silently inflate
-    ``n_bytes`` — and an inflated byte count is worse than a slow one, since
-    ``max_bytes_per_key_seen`` reads it as a wire regression."""
+    larger allocation; trusting it would silently inflate ``n_bytes``."""
     lengths = torch.tensor([3, 4, 5, 6])
     narrowed = torch.nested.narrow(
         torch.zeros(4, 10),
@@ -446,13 +450,6 @@ def test_hash_fingerprints_released_on_clear():
     client.clear_samples(sample_ids=ids, partition_id="p")
     assert client._hash_by_partition == {}
     client.close()
-
-
-def _jagged(rows):
-    return TensorDict(
-        {"x": torch.nested.nested_tensor(rows, layout=torch.jagged)},
-        batch_size=[len(rows)],
-    )
 
 
 def test_hash_fingerprint_covers_jagged_fields():
