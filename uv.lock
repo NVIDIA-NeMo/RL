@@ -4244,6 +4244,25 @@ codec = [
 ]
 
 [[package]]
+name = "nemo-lens"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "opentelemetry-api" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/94/9f/c32809fdb5c375218d8dc4f5762133c0be63a791ced8654a4f2408822513/nemo_lens-0.1.0.tar.gz", hash = "sha256:044621a6d877739e0bc69aced2f2f2a5c565eadc3f9070b99af72bb57abd73aa", size = 46741, upload-time = "2026-07-03T00:49:47.303Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8a/e4/23f7b705bd4102be32f92e651ad5dece122d93e09b8518d3df8c17fd2f6b/nemo_lens-0.1.0-py3-none-any.whl", hash = "sha256:87eca2609dfd41db8f663d943c0c83153e209c1a880bcab816750b6a4f841d58", size = 51451, upload-time = "2026-07-03T00:49:46.109Z" },
+]
+
+[package.optional-dependencies]
+sdk = [
+    { name = "opentelemetry-exporter-otlp-proto-grpc" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-sdk" },
+]
+
+[[package]]
 name = "nemo-rl"
 source = { editable = "." }
 dependencies = [
@@ -4262,6 +4281,7 @@ dependencies = [
     { name = "mlflow" },
     { name = "mooncake-transfer-engine-cuda13" },
     { name = "nccl4py" },
+    { name = "nemo-lens", extra = ["sdk"] },
     { name = "ninja" },
     { name = "nixl" },
     { name = "num2words" },
@@ -4467,6 +4487,7 @@ requires-dist = [
     { name = "nccl4py", marker = "sys_platform != 'darwin'" },
     { name = "nemo-automodel", extras = ["moe"], marker = "extra == 'automodel'", editable = "3rdparty/Automodel-workspace/Automodel" },
     { name = "nemo-gym", marker = "extra == 'nemo-gym'", editable = "3rdparty/Gym-workspace/Gym" },
+    { name = "nemo-lens", extras = ["sdk"], specifier = ">=0.1.0" },
     { name = "ninja" },
     { name = "nixl", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==1.3.0" },
     { name = "num2words", specifier = ">=0.5.14" },

@@ -29,6 +29,7 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -106,6 +107,12 @@ def main() -> None:
         print(
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
+
+    # Initialise telemetry on the driver BEFORE init_ray() so the resolved
+    # NEMO_RL_OTEL_* settings are snapshotted into the Ray runtime_env and
+    # inherited by every worker. No-op unless nemo-lens is installed and
+    # telemetry is on.
+    init_telemetry_driver(config, algorithm="grpo")
 
     with rl_init_timer.time("ray_connect"):
         init_ray()
@@ -252,6 +259,11 @@ def main() -> None:
             policy_generation.shutdown()
         except Exception as error:
             print(f"Error shutting down generation: {error}", flush=True)
+        # After the generation shutdown above, which is where the vLLM workers
+        # flush their own spans, and before Ray is torn down: the OTel SDK's
+        # atexit hook is registered ahead of Ray's, so it would otherwise run
+        # after it. No-op when telemetry is inactive.
+        shutdown_telemetry()
 
 
 if __name__ == "__main__":

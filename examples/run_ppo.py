@@ -24,6 +24,7 @@ from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -122,6 +123,12 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
+    # Initialise telemetry on the driver BEFORE init_ray() so the resolved
+    # NEMO_RL_OTEL_* settings are snapshotted into the Ray runtime_env and
+    # inherited by every worker. No-op unless nemo-lens is installed and
+    # telemetry is on.
+    init_telemetry_driver(config, algorithm="ppo")
+
     init_ray()
 
     # setup tokenizer
@@ -161,43 +168,49 @@ def main() -> None:
     if async_ppo_enabled:
         _validate_async_ppo_config(config, policy_generation)
 
-    with checkpointer:
-        if async_ppo_enabled:
-            print("🚀 Running asynchronous PPO training")
-            async_ppo_train(
-                policy,
-                policy_generation,
-                value_model,
-                dataloader,
-                val_dataloader,
-                tokenizer,
-                loss_fn,
-                value_loss_fn,
-                task_to_env,
-                val_task_to_env,
-                logger,
-                checkpointer,
-                ppo_state,
-                master_config,
-            )
-        else:
-            print("🚀 Running synchronous PPO training")
-            ppo_train(
-                policy,
-                policy_generation,
-                value_model,
-                dataloader,
-                val_dataloader,
-                tokenizer,
-                loss_fn,
-                value_loss_fn,
-                task_to_env,
-                val_task_to_env,
-                logger,
-                checkpointer,
-                ppo_state,
-                master_config,
-            )
+    try:
+        with checkpointer:
+            if async_ppo_enabled:
+                print("🚀 Running asynchronous PPO training")
+                async_ppo_train(
+                    policy,
+                    policy_generation,
+                    value_model,
+                    dataloader,
+                    val_dataloader,
+                    tokenizer,
+                    loss_fn,
+                    value_loss_fn,
+                    task_to_env,
+                    val_task_to_env,
+                    logger,
+                    checkpointer,
+                    ppo_state,
+                    master_config,
+                )
+            else:
+                print("🚀 Running synchronous PPO training")
+                ppo_train(
+                    policy,
+                    policy_generation,
+                    value_model,
+                    dataloader,
+                    val_dataloader,
+                    tokenizer,
+                    loss_fn,
+                    value_loss_fn,
+                    task_to_env,
+                    val_task_to_env,
+                    logger,
+                    checkpointer,
+                    ppo_state,
+                    master_config,
+                )
+    finally:
+        # Flush on the failure paths too, and before Ray is torn down: the
+        # OTel SDK's atexit hook is registered ahead of Ray's and so would
+        # otherwise run after it. No-op when telemetry is inactive.
+        shutdown_telemetry()
 
 
 if __name__ == "__main__":
