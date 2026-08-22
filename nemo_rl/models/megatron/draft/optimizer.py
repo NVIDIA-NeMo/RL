@@ -60,6 +60,11 @@ class DraftOptimizerConfigOverrideProvider(OptimizerConfigOverrideProvider):
         if minimum_lr is not None:
             draft_override["min_lr"] = minimum_lr
         if self.draft_optimizer.weight_decay is not None:
+            # Megatron's standard overrides still set wd_mult=0.0 for norm/bias
+            # and 1-D draft params, and the scheduler multiplies:
+            # weight_decay = get_wd(group) * wd_mult. So this override changes
+            # decay only for weight matrices; draft norms/biases stay at 0,
+            # matching the main model's convention.
             draft_override["start_wd"] = self.draft_optimizer.weight_decay
             draft_override["end_wd"] = self.draft_optimizer.weight_decay
 
