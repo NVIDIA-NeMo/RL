@@ -428,9 +428,277 @@ data_plane:
   claim_meta_poll_interval_s: 0.5      # blocking-claim poll cadence
   global_segment_size: 549755813888    # 512 GiB — used when backend == "mooncake_cpu"
   local_buffer_size:   68719476736     # 64 GiB  — used when backend == "mooncake_cpu"
-  # observability:                     # NotRequired
-  #   enabled: false
+  observability:                       # NotRequired
+    enabled: true                      # per-op timing / latency percentiles / volume
+    verify_tensor_hash: false          # debug: wire-in vs wire-out tensor check
 ```
+
+### Observability
+
+`enabled: true` wraps the adapter in `MetricsDataPlaneClient`, which records
+per-op wall time, latency percentiles (fixed-bucket histogram, so per-rank
+counts sum into one cluster-wide distribution) and byte volume. `snapshot()`
+returns the cumulative view; `get_step_metrics(step_time_s)` returns the
+per-step delta already flattened for the logger.
+
+**Scope: one process, not the cluster.** Every process builds its own
+client with its own counters — the driver, each policy worker, the rollout
+actor. `grpo_train_sync` logs the *driver's*, under `data_plane/driver/`.
+The driver issues about one op of each kind per step, so `calls` is small
+by construction; the bulk traffic is the rollout actor's `kv_first_write`
+and the workers' per-DP-rank `get_samples`, and neither appears in these
+series. Do not read `comm_volume_mb` as cluster-wide volume.
+
+`OpStats` is additive on purpose, and `merge_snapshots()` uses it: the
+histogram buckets and the regression sufficient statistics from every rank
+*sum* into one cluster-wide view. Everything derived — percentiles, the
+affine fit, throughput — is recomputed from the merged totals, never
+averaged across ranks (averaging per-rank percentiles does not give a
+cluster percentile).
+
+**What gets charted is the bottleneck, not the detail.** Four ops times
+eight fields is 32 series saying one thing, and a dashboard of 32 lines
+does not answer "where is my time going". So the emitted series are the
+totals and `time_pct`, with the per-op detail in a table beside them:
+
+| series | what it answers |
+|---|---|
+| `step/frac_of_step` | is the data plane worth optimising at all? |
+| `step/time_pct/by_op/{put,get,clear,register}` | which call is expensive? |
+| `step/time_pct/by_cause/{fixed_overhead,transfer}` | is that fixed per-request cost, or moving bytes? |
+| `step/wall_ms`, `step/comm_volume_mb` | how much time and traffic |
+| `now/bytes_outstanding_mb`, `now/n_processes` | occupancy, fan-out width |
+| `step/self/{overhead_ms,frac}` | what measuring cost |
+
+**`time_pct` is a percentage of data-plane time, not of the step.** The
+denominator is `sum(wall_ms)` over the ops that ran, so
+`by_op/put = 43` reads "43% of the time spent inside the data plane went to
+put". Whether that time mattered against compute is the *other* metric:
+`frac_of_step` divides by the step's own wall clock. Read them together —
+a workload can be 43% put and still not be worth touching.
+
+```
+step/frac_of_step               0.87    the data plane is 87% of the step, so it matters
+step/time_pct/by_op/put        43.0     and within it, put is the largest piece
+step/time_pct/by_cause/...
+    fixed_overhead             53.1     that time is mostly per-request cost,
+    transfer                   17.6     not bandwidth -- batch, don't tune the wire
+```
+
+Two decompositions of one total, because either alone leaves the next
+question unanswered. `by_op` sums to 100 by construction. `by_cause` sums
+to *at most* 100: only ops with an identifiable affine fit can be split, so
+the remainder (here 29%, the `register` and `clear` calls that move no
+bytes) is time that could not be attributed rather than time that did not
+happen.
+
+On the cluster path `wall_ms` is summed over processes that ran
+concurrently, so these are percentages of aggregate **process-time**, not of
+elapsed time. That is the right denominator for "what should I optimise"
+and the wrong one for "what blocked the step".
+
+**A per-op breakdown table** carries the detail, under
+`data_plane/{cluster,driver}/breakdown` — one row per op, ordered by
+`time_pct` so the bottleneck is the first line read:
+
+| op | time_pct | calls | wall_ms | mean_ms | max_ms | p50_ms | p90_ms | overhead_ms | transfer_ms | mb |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| put | 43.0 | 2 | 53.9 | 26.9 | 29.4 | — | — | 19.4 | 6.39 | 1.32 |
+| get | 30.9 | 2 | 38.7 | 19.4 | 21.5 | — | — | 13.8 | 4.63 | 1.03 |
+| register | 17.1 | 1 | 21.4 | 21.4 | 21.4 | — | — | — | — | 0 |
+| clear | 8.93 | 1 | 11.2 | 11.2 | 11.2 | — | — | — | — | 0 |
+
+Everything in ms on that row is **per call** except `wall_ms`, and the two
+split terms add to `mean_ms`: that `put` row reads "each call cost 26.9 ms,
+of which 19.4 was fixed per-request overhead and 6.39 was bandwidth at this
+step's mean request size". Per call the overhead term *is* the fitted
+constant, so it is comparable against a hardware number. `calls`,
+`wall_ms` and `mb` are the only extensive columns.
+
+**Per-call figures describe the wire; sums describe the run.** `wall_ms` on the cluster
+path is summed over processes that ran concurrently, so it is process-time
+and scales with DP degree — 200 gets of 11 ms across 8 ranks reads 2232
+while the wall clock was 279. Dividing by the process count only trades one
+arbitrary denominator for another. Per call is invariant to both DP degree
+and batch size: the same workload at 8 and at 32 ranks reports 11.16 and
+11.06 ms while `wall_ms` quadruples. Use `mean_ms` to compare runs and
+cluster sizes, `time_pct` to attribute cost across ops within one step.
+
+A stack of line charts answers "how did put's wall time trend"; this
+answers "where did the step go", which is a table. Cells are empty rather
+than zero where a series was withheld (a percentile below the sample gate,
+a fit that is not trustworthy) — a zero would read as a measurement. It is
+built from the same metrics dict that is logged, so the table and the
+series cannot disagree. Only wandb renders it; other backends skip it.
+
+**Every series says what kind of number it is.** A per-step delta and an
+instantaneous level shared the `_mb` suffix and a chart, with nothing to
+tell them apart:
+
+| namespace | meaning | example |
+|---|---|---|
+| `step/` | what happened during this step; resets | `step/comm_volume_mb` |
+| `now/` | what is true at this instant; persists | `now/bytes_outstanding_mb` |
+
+A rising `now/bytes_outstanding_mb` is not an accumulation bug — it is the
+leak signal the metric exists for: bytes put and never cleared.
+
+Two more read differently in the cluster view and are named to say so:
+
+- **`step/frac_of_step` is per process.** `wall_ms` sums processes that ran
+  concurrently, so dividing it by one step's wall clock exceeded 1 whenever
+  they overlapped (measured 1.054 across ten processes) and read as "105%
+  of the step". Divided per process it is the mean share of the step a
+  process spent in the data plane, which is what the name claims.
+- **`step/{op}/max_ms` is scoped to the step by being reset**, not by being
+  differenced. A maximum cannot be recovered from two cumulative readings
+  the way `calls` and `wall_ms` can, so the reader that consumes it zeroes
+  it — `snapshot(reset_step_window=True)`, which the once-per-step
+  collector passes and an inspection snapshot does not. Without that the
+  cluster path reported the lifetime max: after one 50 ms call every later
+  step still read 50 ms.
+
+`grpo_train_sync` fans out to the driver and every policy worker, and logs
+the combined result under `data_plane/cluster/` instead of the driver's
+own. **It does not reach the rollout actor**, which builds its own client
+and is not on the worker group — so `kv_first_write`, the write of the
+whole rollout, is not in these totals. It falls back to `data_plane/driver/` when the fan-out finds only one
+process. Measured: **~2.4 ms and ~1 kB per process per step** for 10
+processes, against a 6x wider view of the traffic. The fan-out is
+best-effort — a rank that cannot answer is dropped rather than failing the
+step.
+
+`step/self/overhead_ms` reports what the measurement itself cost — the
+whole bill, both halves:
+
+- every process's wrapper time (its wall time minus the time its inner
+  client was working), and
+- the fan-out that gathered and merged the snapshots.
+
+The second is the larger. In the cross-process e2e the wrapper cost 0.13 ms
+and the fan-out 2.31 ms, so a figure covering only the first understated by
+19x. Measured whole: **~2.4 ms, about 0.9% of data-plane time** for 10
+processes.
+
+It is deliberately not clamped to 100%. Against a fast backend the ratio
+can exceed 1, meaning measuring cost more than the operation measured — a
+signal worth seeing rather than hiding.
+
+**Units:** every duration is `_ms`, every volume is `_mb`, no exceptions —
+a chart mixing `wall_s` against `p90_ms` puts a 0.008 beside a 24.85 and
+reads as a data-plane bug rather than an axis one.
+
+**Per step you get, per op tag:** `calls`, `wall_ms`, `max_ms`, and — when
+the affine fit is trustworthy — `overhead_ms` and `transfer_ms`. Those last
+two are the split of the op's time into fixed per-request cost and
+bandwidth, in ms, and they *stack*: together they are the model's estimate
+of the step's `wall_ms`, so charting them against the measured `wall_ms`
+shows the breakdown and the model error in one picture. The coefficients
+come from the cumulative fit (a model should be stable); the attribution is
+per step, applied to that step's calls and bytes. A ratio was tried first
+and was the wrong shape — cumulative and therefore flat, and unitless on an
+axis of milliseconds. Percentiles come off the *step's* histogram delta, not the
+cumulative one -- a per-step p50 off a histogram that is never reset goes
+flat -- and each is emitted only when the step holds enough calls to
+resolve it: **p50 at 20, p90 at 40**, roughly four observations above the
+rank (`n >= 4 / (1 - q)`). Below that the key is absent.
+
+The tail quantile is **p90, not p99**, because a step holds tens of calls,
+not thousands. A p99 needs ~100 samples before any observation lies above
+its rank at all; below that it collapses onto the largest one. Over a
+lognormal-with-tail draw at 58 calls -- what a DP-8 run actually puts per
+step -- the p99 equalled the maximum **80% of the time**, which is
+`max_ms` under a more precise-sounding name. The p90 off the same 58 never
+did on a smooth tail and 12% of the time on a bimodal one. A coarser
+quantile that is resolved beats a finer one that is not.
+
+`max_ms` stays alongside, exact and scoped to the step: it answers "did
+anything go wrong this step", where p90 answers "what does the tail look
+like". If the two diverge sharply, the op is bimodal -- a straggler rank
+or a cold buffer -- and the max is the number to chase.
+
+Measured against a no-op inner client on the payload the wire actually
+carries — 256 ragged rows, 12 MB, jagged per-token fields as
+`pack_jagged_fields` leaves them: **~37 µs per put, ~15 µs per get**, under
+0.1% of a 59 ms operation. What is left is dominated by the per-key
+attribution `clear_samples` needs to undo.
+
+This is **on in the exemplar config**, which is where a v1 `TypedDict`
+default lives — so recipes inheriting `grpo_math_1B.yaml` get it, and a
+config with no `observability:` block still falls back to `False` at the
+factory. It only engages when `data_plane.enabled` is true either way, so
+it costs nothing for runs that don't use the data plane. There is
+no default per-op sink: `get_step_metrics()` is the surface, and
+`grpo_train_sync` logs it once a step under the `data_plane/` prefix — so
+the series reach whatever backends the run has enabled (wandb, TensorBoard,
+MLflow). Roughly 5-8 series per distinct op tag. Set
+`observability.callback` if you additionally want a hook on every transfer;
+`log_event` is exported for that.
+
+`verify_tensor_hash: true` additionally records a `torch.hash_tensor`
+fingerprint on every put and re-checks it on every get, so a tensor that
+changes between wire-in and wire-out is reported (`hash/mismatches`)
+instead of being trained on silently.
+
+Two granularities, because torch has no ragged hash kernel:
+
+| leaf | digest | scope |
+|---|---|---|
+| rectangular rows — dense, or jagged with uniform lengths | one per row, `hash_tensor(..., dim=1)` | per sample id; survives shard reads |
+| genuinely ragged rows | one over the values buffer, XORed per row with that row's length | per batch; a shard read reports unverified |
+
+The split is on the *rows*, not the layout. A jagged leaf whose rows happen
+to be uniform is already a rectangle — its values buffer reshapes to one as
+a view — so it takes the per-row path for free. Only a leaf with rows of
+differing lengths falls back, and giving *those* per-row digests would mean
+padding each out to a rectangle first: on a realistically ragged batch that
+rectangle is 3.5× the real payload and costs 13× more, to answer a question
+the buffer digest already answers.
+
+Whichever scheme a put used is recorded per field and replayed on the read,
+so the two sides always compute the same thing. A field written with
+uniform rows that comes back ragged is a divergence in the row lengths
+themselves, and is reported as a mismatch.
+
+**Detection is not attribution, and the difference is the whole point of
+the split.** The same corruption, injected into an 8-row batch:
+
+| corruption | ragged leaf | rectangular leaf |
+|---|---|---|
+| 1 element changed in `u3` | caught, flags **all 8 rows** | caught, names **`u3`** |
+| `u5` zeroed | caught, flags all 8 rows | caught, names `u5` |
+| `u3`↔`u4` swapped | caught only if their lengths differ | caught, names `u3`,`u4` |
+| nothing | clean | clean |
+
+A ragged digest covers the whole values buffer, so any change moves every
+row's value: it says *this batch is wrong*, never *this sample is wrong*.
+On rollout data straight out of generation that is the normal resolution
+for the token-aligned fields — you learn a step's transfer diverged and
+have to bisect for the row yourself. Anything uniform-width (a densified
+read, `advantages` written at full width, a shard whose rows agree) names
+the sample.
+
+Verified by injecting corruption into the round trip. Caught: a
+single-element change in every dtype, a truncated row, a zeroed row, a
+bf16→fp32 precision change, and a row served from the wrong sample — with
+**zero false alarms** over a 500-row randomized soak, every shard grouping
+from 1 to 256, reversed id order, field subsets and delta writes. Known
+limits, measured rather than assumed:
+
+- A batch-scoped digest is an XOR reduction over one shared buffer, and XOR
+  cannot see a permutation of what it reduces. On a ragged field a
+  **mis-shard** (two rows swapped) is therefore caught only when the two
+  rows differ in length — 60/60 on ragged rollout data, where lengths rarely
+  collide. Rows of uniform width catch it unconditionally, per row. The same
+  blind spot hides a reordering *within* a row: 0/200 for a two-token swap
+  in `input_ids`, and 18/200 for moving two set bits in a bool mask.
+- It reads every tensor byte again on both sides — ~2.4 ms for a 12 MB
+  jagged batch, on put and again on get. Keep it to debugging runs.
+- Only rows this process wrote can be checked. A consumer-side client
+  reports them under `hash/rows_unverified` rather than counting them
+  clean, and `hash/fields_skipped` reports any leaf it could not compare
+  — watch that one, since a guard that quietly stops covering a field still
+  reports zero mismatches.
 
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
