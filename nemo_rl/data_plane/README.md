@@ -441,6 +441,19 @@ counts sum into one cluster-wide distribution) and byte volume. `snapshot()`
 returns the cumulative view; `get_step_metrics(step_time_s)` returns the
 per-step delta already flattened for the logger.
 
+**Units:** every duration is `_ms`, every volume is `_mb`, no exceptions —
+a chart mixing `wall_s` against `p99_ms` puts a 0.008 beside a 24.85 and
+reads as a data-plane bug rather than an axis one.
+
+**Per step you get four series per op tag:** `calls`, `wall_ms`, `max_ms`
+and (when the fit is trustworthy) `overhead_frac`. Not percentiles — the
+histogram is cumulative by design, so a per-step p50 off it goes flat, and
+at the handful of calls an op makes in one step a p99 is bucket geometry
+rather than data (one sample in the `(10, 25]` bucket always yields
+`10 + 15*0.99 = 24.85`). `max_ms` is exact, scoped to the step, and says
+the same thing at that sample size. The percentiles remain in `snapshot()`,
+where the cumulative sample count justifies them.
+
 Measured against a no-op inner client on the payload the wire actually
 carries — 256 ragged rows, 12 MB, jagged per-token fields as
 `pack_jagged_fields` leaves them: **~37 µs per put, ~15 µs per get**, under

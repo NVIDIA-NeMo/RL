@@ -21,6 +21,8 @@ built-in sinks.
 
 from __future__ import annotations
 
+from time import monotonic
+
 import pytest
 import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict
@@ -373,6 +375,62 @@ def test_outstanding_bytes_reconcile_exactly():
     assert client.snapshot()["bytes_outstanding"] == 7 * 5 * 4
     client.clear_samples(sample_ids=ids, partition_id="p")
     assert client.snapshot()["bytes_outstanding"] == 0
+    client.close()
+
+
+def test_step_metrics_use_one_unit_per_dimension():
+    """Every duration is ms, every volume MB. A chart mixing `wall_s` with
+    `p99_ms` shows 0.008 beside 24.85 and reads as a data-plane bug rather
+    than an axis one."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=2, consumer_tasks=["t"]
+    )
+    client.put_samples(
+        sample_ids=["a", "b"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.zeros(2, 3)}, batch_size=[2]),
+    )
+    keys = set(client.get_step_metrics(1.0))
+    assert not [k for k in keys if k.endswith(("_s", "_gb", "_kb", "_us"))], keys
+    assert "wall_ms" in keys and "comm_volume_mb" in keys
+    client.close()
+
+
+def test_step_metrics_tail_is_exact_not_bucketed():
+    """Per-step percentiles came off a histogram that is never reset, so
+    they went flat and quantised to bucket edges (p99 of a single sample in
+    (10, 25] is always 10 + 15*0.99 = 24.85). ``max_ms`` is exact and
+    tracks the slowest call actually seen."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["t"]
+    )
+    client._emit("put", "p", 1, 8, monotonic() - 0.030, "ok")  # a 30 ms call
+    metrics = client.get_step_metrics(1.0)
+
+    assert "put/p99_ms" not in metrics and "put/p50_ms" not in metrics
+    assert metrics["put/max_ms"] >= 30.0
+    assert metrics["put/max_ms"] != pytest.approx(24.85, abs=0.5), "bucket edge"
+    # the cumulative view still carries percentiles for one-off inspection
+    assert "p99_ms" in client.snapshot()["by_op"]["put"]
+    client.close()
+
+
+def test_step_max_is_scoped_to_the_step():
+    """A lifetime max is monotonic and goes flat the moment the worst call
+    has been seen — the same defect as logging a cumulative percentile. The
+    reported max must fall again when a step is quicker."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    client._emit("put", "p", 1, 8, monotonic() - 0.050, "ok")  # slow step
+    slow = client.get_step_metrics(1.0)["put/max_ms"]
+    client._emit("put", "p", 1, 8, monotonic() - 0.001, "ok")  # quick step
+    quick = client.get_step_metrics(1.0)["put/max_ms"]
+
+    assert slow >= 50.0
+    assert quick < slow, "step max must reset, not carry the lifetime worst"
+    # the lifetime worst is still available for a one-off look
+    assert client.snapshot()["by_op"]["put"]["max_ms"] >= 50.0
     client.close()
 
 
