@@ -460,17 +460,19 @@ cluster percentile).
 `data_plane/{cluster,driver}/breakdown` — one row per op, ordered by wall
 time so the expensive one reads first:
 
-| op | calls | wall_ms | wall_ms_per_process | max_ms | overhead_ms | transfer_ms | p50_ms | p99_ms |
+| op | calls | mean_ms | max_ms | wall_ms | overhead_ms | transfer_ms | p50_ms | p99_ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| get | 200 | 2232 | 279 | 16.0 | 1207 | 1025 | 12.9 | 16.0 |
-| put | 48 | 1135 | 141.9 | 31.9 | 579.2 | 556.1 | — | — |
+| get | 200 | 11.16 | 16.0 | 2232 | 1207 | 1025 | 12.9 | 16.0 |
+| put | 48 | 23.66 | 31.9 | 1135 | 579.2 | 556.1 | — | — |
 
-**Every time on the cluster path is summed across processes that ran
-concurrently** — so it is process-time, not elapsed. 200 gets of 11 ms
-across 8 ranks reads 2232 ms while the wall clock was 279. The same key on
-the driver path, where there is one process, is elapsed. Both ship:
-`wall_ms` attributes cost across ops, `wall_ms_per_process` carries the
-magnitude a reader expects of a millisecond.
+**`mean_ms` is the one that describes the wire.** `wall_ms` on the cluster
+path is summed over processes that ran concurrently, so it is process-time
+and scales with DP degree — 200 gets of 11 ms across 8 ranks reads 2232
+while the wall clock was 279. Dividing by the process count only trades one
+arbitrary denominator for another. Per call is invariant to both DP degree
+and batch size: the same workload at 8 and at 32 ranks reports 11.16 and
+11.06 ms while `wall_ms` quadruples. Use `mean_ms` to compare runs and
+cluster sizes, `wall_ms` to attribute cost across ops within one step.
 
 `overhead_ms` and `transfer_ms` stack to the measured `wall_ms` — that row
 reads "2233 ms of get was 1207 ms of fixed per-call cost and 1026 ms of
