@@ -587,6 +587,7 @@ def _sp_packed_params_mismatch_worker(
         dist.destroy_process_group()
 
 
+@pytest.mark.mcore
 @pytest.mark.skipif(
     not torch.distributed.is_nccl_available() or torch.cuda.device_count() < _TP_SIZE,
     reason="two CUDA devices and NCCL are required",
@@ -606,6 +607,7 @@ def test_real_mcore_tp2_sequence_parallel_matches_global_oracle(
     )
 
 
+@pytest.mark.mcore
 @pytest.mark.skipif(
     not torch.distributed.is_nccl_available() or torch.cuda.device_count() < _TP_SIZE,
     reason="two CUDA devices and NCCL are required",
@@ -623,6 +625,7 @@ def test_real_mcore_tp2_sequence_parallel_packed_mismatch_agrees_and_resets(
     )
 
 
+@pytest.mark.mcore
 @pytest.mark.skipif(
     not torch.distributed.is_nccl_available() or torch.cuda.device_count() < _TP_SIZE,
     reason="two CUDA devices and NCCL are required",

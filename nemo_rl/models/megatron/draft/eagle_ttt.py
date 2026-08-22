@@ -486,7 +486,12 @@ class EagleTTTState:
         max_passes: int,
         activation_budget_bytes: int,
     ) -> EagleTTTState:
-        """Validate the complete bound before retaining any supplied tensor."""
+        """Validate the per-layer multi-pass K/V bound before retaining tensors.
+
+        The complete bound across layers, hidden taps, rope, and loss rows is
+        enforced by the provider's storage plan and, at runtime, by the
+        resource ledger; this check covers only this layer's K/V retention.
+        """
         _validate_kv_pair(trunk_key, trunk_value, name="trunk")
         EagleTTTStoragePlan(
             batch_size=trunk_key.shape[0],
@@ -563,6 +568,16 @@ class EagleTTTCoreAttention(torch.nn.Module):
         if attention_type != "self":
             raise ValueError("EAGLE TTT only supports self attention")
         self.layer_number = layer_number
+        recompute_granularity = getattr(config, "recompute_granularity", None)
+        if recompute_granularity is not None:
+            # Activation recompute re-enters this forward during backward, which
+            # violates the one-shot begin_pass/forward/finish_pass lifecycle and
+            # would corrupt the retained multi-pass state on re-entry.
+            raise ValueError(
+                "EAGLE TTT is incompatible with activation recompute "
+                f"(recompute_granularity={recompute_granularity!r}); disable "
+                "recompute for the draft decoder stack"
+            )
         self.context_parallel_size = int(getattr(config, "context_parallel_size", 1))
         self.sequence_parallel = bool(getattr(config, "sequence_parallel", False))
         self.softmax_scale = softmax_scale
@@ -1509,7 +1524,8 @@ def eagle_ttt_attention(
             raise ValueError("sequence layout must match query batch and sequence axes")
         if layout.valid_tokens.device != query.device:
             raise ValueError("sequence layout and query must share a device")
-    _expand_gqa(state.trunk_key, query_heads=query.shape[1])
+    if query.shape[1] % state.trunk_key.shape[1] != 0:
+        raise ValueError("query heads must be divisible by key/value heads")
 
     attention_scale = scale if scale is not None else 1.0 / math.sqrt(query.shape[-1])
     if query.is_cuda and query.dtype != torch.float64:
