@@ -163,8 +163,10 @@ class MegatronGeneration(GenerationInterface):
             skip_weight_load=skip_weight_load,
         )
 
-        # Start the persistent inference engine + HTTP server during construction.
-        self.prepare_for_generation()
+        # Skip-load models do not have their final refit weight buffers yet. Defer
+        # engine initialization so CUDA graphs capture the persistent buffers.
+        if not skip_weight_load:
+            self.prepare_for_generation()
 
     def init_collective(
         self,
@@ -297,7 +299,7 @@ class MegatronGeneration(GenerationInterface):
         )
 
     def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
-        """Pre-initialize NVShmem collectively after CUDA graph capture.
+        """Pre-initialize NVShmem collectively outside CUDA graph capture.
 
         Must be called simultaneously on both training and inference workers.
         """
