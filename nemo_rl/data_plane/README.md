@@ -469,6 +469,7 @@ totals and `percent_of_dataplane`, with the per-op detail in a table beside them
 | `step/wall_ms`, `step/comm_volume_mb` | how much time and traffic |
 | `now/bytes_outstanding_mb`, `now/n_processes` | occupancy, fan-out width |
 | `step/self/{overhead_ms,frac}` | what measuring cost |
+| `step/hash/*` | only with `verify_tensor_hash` on |
 
 **`percent_of_dataplane` is a percentage of data-plane time, not of the step.** The
 denominator is `sum(wall_ms)` over the ops that ran, so
