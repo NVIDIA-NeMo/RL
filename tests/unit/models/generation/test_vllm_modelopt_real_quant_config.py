@@ -1700,7 +1700,7 @@ def test_real_quant_reload_keeps_vllm_config_active_during_layerwise_processing(
         # reconstructs its kernel during the yielded weight-load phase.
         assert config_mod.get_current_vllm_config() is vllm_config
         calls.append("load")
-        finish()
+        finish(False)
 
     assert config_mod.current is None
     assert calls == [
