@@ -216,6 +216,7 @@ project-includes = [
   "nemo_rl/models/generation/vllm/worker_utils.py",
   "nemo_rl/models/huggingface/__init__.py",
   "nemo_rl/models/megatron/__init__.py",
+  "nemo_rl/models/megatron/draft/dspark.py",
   "nemo_rl/models/megatron/draft/__init__.py",
   "nemo_rl/models/megatron/memory_saver.py",
   "nemo_rl/models/policy/__init__.py",
