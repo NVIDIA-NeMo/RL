@@ -617,6 +617,9 @@ def recover_draft_step_transactions(
                 checkpoint_snapshot = checkpoint["applied_draft_snapshot"]
                 if checkpoint_snapshot != asdict(resolution.applied_snapshot):
                     raise ValueError("checkpoint snapshot differs from transaction")
+    # The newly opened suffix is deliberately truncated to the validated receipt
+    # boundary before post-checkpoint transaction files are quarantined/discarded.
+    decision_ledger.truncate_to(high_water)
     transaction_store.discard_after_checkpoint(
         checkpoint_id=checkpoint_id, ledger_high_water=high_water
     )
@@ -746,6 +749,25 @@ class CadenceRuntimeWriter:
         disabled = schedule.get("mode") == "disabled"
         if disabled and schedule != disabled_draft_schedule_payload():
             raise ValueError("disabled draft schedule payload is not neutral")
+        if not disabled:
+            raw_snapshot = save_state.applied_draft_snapshot
+            if not isinstance(raw_snapshot, Mapping) or set(raw_snapshot) != {
+                "version",
+                "path",
+                "size_bytes",
+                "sha256",
+            }:
+                raise ValueError(
+                    "enabled checkpoint requires an applied draft snapshot"
+                )
+            snapshot = AppliedDraftSnapshot(**dict(raw_snapshot))
+            raw_snapshot_bytes = Path(snapshot.path).read_bytes()
+            if (
+                snapshot.version != schedule["state"].get("applied_draft_version")
+                or snapshot.size_bytes != len(raw_snapshot_bytes)
+                or snapshot.sha256 != hashlib.sha256(raw_snapshot_bytes).hexdigest()
+            ):
+                raise ValueError("applied draft snapshot version or digest mismatch")
         ledger = seal_checkpoint_ledger(
             decision_ledger,
             expected / "draft-decision-ledger.jsonl",

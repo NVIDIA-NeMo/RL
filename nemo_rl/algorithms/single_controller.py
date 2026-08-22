@@ -53,8 +53,13 @@ from nemo_rl.algorithms.draft_cadence_runtime import (
     CadenceRuntimeWriter,
     CadenceTerminalEvidence,
     disabled_draft_schedule_payload,
+    open_resume_decision_ledger,
+    recover_draft_step_transactions,
 )
-from nemo_rl.algorithms.draft_update_schedule import DraftDecisionLedger
+from nemo_rl.algorithms.draft_update_schedule import (
+    DraftDecisionLedger,
+    FileDraftStepTransactionStore,
+)
 from nemo_rl.algorithms.grpo import GRPOSaveState, _write_latest_checkpoint_status
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -229,8 +234,25 @@ class SingleControllerActor:
                 self._cadence_writer.root
                 / f"draft-decision-ledger-after-step_{self._save_state.current_step}.jsonl"
             )
+            self._cadence_transactions = FileDraftStepTransactionStore(
+                self._cadence_writer.root,
+                base_checkpoint_id=f"step_{self._save_state.current_step}",
+            )
+            if self._last_checkpoint_path is not None:
+                resume = open_resume_decision_ledger(
+                    Path(self._last_checkpoint_path), self._cadence_writer.root
+                )
+                self._cadence_ledger = resume.ledger
+                recover_draft_step_transactions(
+                    config=None,
+                    checkpoint_path=Path(self._last_checkpoint_path),
+                    transaction_store=self._cadence_transactions,
+                    decision_ledger=self._cadence_ledger,
+                    save_state=self._save_state,
+                )
         else:
             self._cadence_ledger = None
+            self._cadence_transactions = None
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
@@ -359,6 +381,19 @@ class SingleControllerActor:
                 # rollout pump leaves the train pump to drain committed groups.
                 await rollout_task
             await train_task
+            if self._cadence_writer is not None:
+                await asyncio.to_thread(self._checkpointer.finalize_pending)
+                final_checkpoint = self._checkpointer.get_latest_checkpoint_path()
+                if final_checkpoint is None:
+                    raise RuntimeError(
+                        "enabled cadence runtime requires a final checkpoint"
+                    )
+                close_successful_training(
+                    runtime_writer=self._cadence_writer,
+                    current_step=self._train_steps,
+                    final_checkpoint_path=Path(final_checkpoint),
+                    terminal_evidence=self._cadence_terminal_evidence,
+                )
         finally:
             for task in tasks:
                 task.cancel()
@@ -1623,6 +1658,12 @@ class SingleControllerActor:
             buffer_state,
             os.path.join(checkpoint_path, "replay_buffer.pt"),
         )
+        # Rename happens in the background once the async weight writes
+        # finish; flushed at the next save or on exit.
+        self._checkpointer.begin_finalization(
+            checkpoint_path,
+            wait_fn=self._trainer.finalize_async_save,
+        )
         if self._cadence_writer is not None:
             if self._cadence_ledger is None:
                 raise RuntimeError("enabled cadence runtime has no decision ledger")
@@ -1630,28 +1671,23 @@ class SingleControllerActor:
                 raise RuntimeError(
                     "enabled cadence runtime requires optimizer checkpoints"
                 )
-            # A cadence receipt is a resume authority, so asynchronous policy writes
-            # must be complete before it hashes any checkpoint component.
-            await asyncio.to_thread(self._trainer.finalize_async_save)
+            await asyncio.to_thread(self._checkpointer.finalize_pending)
+            final_checkpoint = self._checkpointer.get_latest_checkpoint_path()
+            if final_checkpoint is None:
+                raise RuntimeError("cadence finalization did not produce a checkpoint")
             self._cadence_ledger = self._cadence_writer.checkpoint_closed(
                 current_step=self._train_steps,
-                checkpoint_path=Path(checkpoint_path),
+                checkpoint_path=Path(final_checkpoint),
                 save_state=save_state,
                 component_paths={
-                    "model": Path(checkpoint_path) / "policy" / "weights",
-                    "optimizer": Path(checkpoint_path) / "policy" / "optimizer",
-                    "dataloader_rng": Path(checkpoint_path) / "train_dataloader.pt",
+                    "model": Path(final_checkpoint) / "policy" / "weights",
+                    "optimizer": Path(final_checkpoint) / "policy" / "optimizer",
+                    "dataloader_rng": Path(final_checkpoint) / "train_dataloader.pt",
                 },
                 decision_ledger=self._cadence_ledger,
                 terminal_evidence=self._cadence_terminal_evidence,
                 resumed_from=self._last_checkpoint_path,
             )
-        # Rename happens in the background once the async weight writes
-        # finish; flushed at the next save or on exit.
-        self._checkpointer.begin_finalization(
-            checkpoint_path,
-            wait_fn=self._trainer.finalize_async_save,
-        )
         await asyncio.to_thread(
             _write_latest_checkpoint_status,
             self._checkpointer,

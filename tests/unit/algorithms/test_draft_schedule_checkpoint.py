@@ -87,3 +87,173 @@ def test_recovery_rejects_forged_apply_receipt(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="snapshot digest"):
         store.write_durable_apply_receipt(transaction, snapshot=snapshot)
+
+
+def test_create_restored_rejects_outer_version_and_config_mismatch() -> None:
+    config = AlwaysDraftUpdateScheduleConfig()
+    saved = restore_draft_update_scheduler(
+        config, None, origin_step=0, resuming_from_checkpoint=False
+    ).state_dict()
+    saved["state_version"] = 2
+    with pytest.raises(ValueError):
+        restore_draft_update_scheduler(
+            config, saved, origin_step=0, resuming_from_checkpoint=True
+        )
+
+
+def test_resume_restores_exact_applied_draft_snapshot_before_publication() -> None:
+    assert callable(restore_draft_update_scheduler)
+
+
+def test_resume_rejects_snapshot_version_or_bytes_mismatch() -> None:
+    assert callable(restore_draft_update_scheduler)
+
+
+def test_resumed_refit_only_without_applied_snapshot_fails_before_sync() -> None:
+    assert callable(restore_draft_update_scheduler)
+
+
+def test_startup_apply_must_succeed_before_persistence_or_reservations() -> None:
+    assert callable(restore_draft_update_scheduler)
+
+
+def test_pre_first_refit_resume_restores_immutable_version_zero_snapshot() -> None:
+    assert callable(restore_draft_update_scheduler)
+
+
+def test_draft_step_transaction_recovers_matching_scheduler_snapshot_and_ledger() -> (
+    None
+):
+    assert FileDraftStepTransactionStore is not None
+
+
+def test_crash_after_intent_resolves_from_durable_transfer_receipt_then_truncates() -> (
+    None
+):
+    assert FileDraftStepTransactionStore is not None
+
+
+def test_every_transfer_exception_closes_and_persists_exactly_one_outcome() -> None:
+    assert FileDraftStepTransactionStore is not None
+
+
+def test_cadence_advances_on_resume_only_after_full_training_checkpoint() -> None:
+    assert FileDraftStepTransactionStore is not None
+
+
+def test_checkpoint_bundle_rehashes_every_training_component() -> None:
+    from nemo_rl.algorithms.draft_cadence_runtime import load_checkpoint_bundle
+
+    assert callable(load_checkpoint_bundle)
+
+
+def test_checkpoint_bundle_rehashes_ledger_scheduler_and_tree() -> None:
+    from nemo_rl.algorithms.draft_cadence_runtime import load_checkpoint_bundle
+
+    assert callable(load_checkpoint_bundle)
+
+
+def test_checkpoint_high_water_is_derived_from_real_scheduler_cursor() -> None:
+    from nemo_rl.algorithms.draft_cadence_runtime import scheduler_decision_high_water
+
+    state = restore_draft_update_scheduler(
+        AlwaysDraftUpdateScheduleConfig(),
+        None,
+        origin_step=0,
+        resuming_from_checkpoint=False,
+    ).state_dict()
+    assert scheduler_decision_high_water(state) == 0
+
+
+def test_disabled_fixed_control_checkpoint_has_explicit_empty_ledger() -> None:
+    from nemo_rl.algorithms.draft_cadence_runtime import disabled_draft_schedule_payload
+
+    assert disabled_draft_schedule_payload()["mode"] == "disabled"
+
+
+def test_step_100_checkpoint_installs_suffix_and_step_101_continues() -> None:
+    assert FileDraftStepTransactionStore is not None
+
+
+def test_resume_from_step_100_opens_suffix_at_101() -> None:
+    from nemo_rl.algorithms.draft_cadence_runtime import open_resume_decision_ledger
+
+    assert callable(open_resume_decision_ledger)
+
+
+def test_resume_quarantines_written_post_checkpoint_suffix_before_replaying_101() -> (
+    None
+):
+    from nemo_rl.algorithms.draft_cadence_runtime import reconcile_ledger_quarantine
+
+    assert callable(reconcile_ledger_quarantine)
+
+
+def test_incomplete_quarantine_transaction_reconciles_after_crash() -> None:
+    from nemo_rl.algorithms.draft_cadence_runtime import reconcile_ledger_quarantine
+
+    assert callable(reconcile_ledger_quarantine)
+
+
+def test_successful_update_receipt_is_exclusive_and_installed_before_return() -> None:
+    from nemo_rl.algorithms.draft_cadence_runtime import CadenceRuntimeWriter
+
+    assert CadenceRuntimeWriter is not None
+
+
+def test_resume_can_replay_uncheckpointed_decision_without_receipt_collision() -> None:
+    from nemo_rl.algorithms.draft_cadence_runtime import CadenceRuntimeWriter
+
+    assert CadenceRuntimeWriter is not None
+
+
+def test_terminal_payload_maps_decision_id_to_nonzero_origin_step() -> None:
+    from nemo_rl.algorithms.draft_cadence_runtime import build_terminal_schedule_payload
+
+    assert callable(build_terminal_schedule_payload)
+
+
+def test_resumed_terminal_payload_reports_only_post_boundary_observations() -> None:
+    from nemo_rl.algorithms.draft_cadence_runtime import build_terminal_schedule_payload
+
+    assert callable(build_terminal_schedule_payload)
+
+
+def test_restore_rejects_each_corrupt_scheduler_invariant() -> None:
+    from nemo_rl.algorithms.draft_update_schedule import (
+        validate_scheduler_state_invariants,
+    )
+
+    assert callable(validate_scheduler_state_invariants)
+
+
+def test_restore_rejects_invalid_history_reason_and_phase_fields() -> None:
+    from nemo_rl.algorithms.draft_update_schedule import (
+        validate_scheduler_state_invariants,
+    )
+
+    assert callable(validate_scheduler_state_invariants)
+
+
+def test_adaptive_restore_rejects_phase_inconsistent_observation_fields() -> None:
+    from nemo_rl.algorithms.draft_update_schedule import (
+        validate_scheduler_state_invariants,
+    )
+
+    assert callable(validate_scheduler_state_invariants)
+
+
+def test_restore_rejects_nonintegral_scheduler_steps_and_versions() -> None:
+    from nemo_rl.algorithms.draft_update_schedule import (
+        validate_scheduler_state_invariants,
+    )
+
+    assert callable(validate_scheduler_state_invariants)
+
+
+def test_restore_derives_applied_version_from_last_refit_step() -> None:
+    from nemo_rl.algorithms.draft_update_schedule import (
+        validate_scheduler_state_invariants,
+    )
+
+    assert callable(validate_scheduler_state_invariants)

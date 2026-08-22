@@ -34,6 +34,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     SamplerConfig,
     required_buffer_capacity_for_config,
 )
+from nemo_rl.algorithms.draft_cadence_runtime import CadenceRuntimeConfig
 from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.data import DataConfig
@@ -544,6 +545,7 @@ class MasterConfig(BaseModel, extra="allow"):
     checkpointing: CheckpointingConfig
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
+    cadence_runtime: CadenceRuntimeConfig = Field(default_factory=CadenceRuntimeConfig)
 
 
 def validate_sampler_buffer_capacity(

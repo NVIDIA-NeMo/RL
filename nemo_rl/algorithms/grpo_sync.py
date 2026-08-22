@@ -65,8 +65,13 @@ from nemo_rl.algorithms.draft_cadence_runtime import (
     CadenceRuntimeWriter,
     CadenceTerminalEvidence,
     disabled_draft_schedule_payload,
+    open_resume_decision_ledger,
+    recover_draft_step_transactions,
 )
-from nemo_rl.algorithms.draft_update_schedule import DraftDecisionLedger
+from nemo_rl.algorithms.draft_update_schedule import (
+    DraftDecisionLedger,
+    FileDraftStepTransactionStore,
+)
 from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
 )
@@ -553,6 +558,23 @@ def grpo_train_sync(
             cadence_writer.root
             / f"draft-decision-ledger-after-step_{grpo_save_state.current_step}.jsonl"
         )
+        cadence_transactions = FileDraftStepTransactionStore(
+            cadence_writer.root,
+            base_checkpoint_id=f"step_{grpo_save_state.current_step}",
+        )
+        resume_checkpoint = checkpointer.get_latest_checkpoint_path()
+        if resume_checkpoint is not None:
+            resume = open_resume_decision_ledger(
+                Path(resume_checkpoint), cadence_writer.root
+            )
+            cadence_ledger = resume.ledger
+            recover_draft_step_transactions(
+                config=None,
+                checkpoint_path=Path(resume_checkpoint),
+                transaction_store=cadence_transactions,
+                decision_ledger=cadence_ledger,
+                save_state=grpo_save_state,
+            )
     else:
         cadence_ledger = None
 
@@ -1365,6 +1387,10 @@ def grpo_train_sync(
                                 wrapped_dataloader.state_dict(),
                                 os.path.join(checkpoint_path, "train_dataloader.pt"),
                             )
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
                         if cadence_writer is not None:
                             if cadence_ledger is None:
                                 raise RuntimeError(
@@ -1378,28 +1404,29 @@ def grpo_train_sync(
                                 raise RuntimeError(
                                     "enabled cadence runtime requires optimizer checkpoints"
                                 )
-                            policy.finalize_async_save()
+                            checkpointer.finalize_pending()
+                            final_checkpoint = checkpointer.get_latest_checkpoint_path()
+                            if final_checkpoint is None:
+                                raise RuntimeError(
+                                    "cadence finalization did not produce a checkpoint"
+                                )
                             cadence_ledger = cadence_writer.checkpoint_closed(
                                 current_step=total_steps + 1,
-                                checkpoint_path=Path(checkpoint_path),
+                                checkpoint_path=Path(final_checkpoint),
                                 save_state=grpo_save_state,
                                 component_paths={
-                                    "model": Path(checkpoint_path)
+                                    "model": Path(final_checkpoint)
                                     / "policy"
                                     / "weights",
-                                    "optimizer": Path(checkpoint_path)
+                                    "optimizer": Path(final_checkpoint)
                                     / "policy"
                                     / "optimizer",
-                                    "dataloader_rng": Path(checkpoint_path)
+                                    "dataloader_rng": Path(final_checkpoint)
                                     / "train_dataloader.pt",
                                 },
                                 decision_ledger=cadence_ledger,
                                 terminal_evidence=cadence_evidence,
                             )
-                        checkpointer.begin_finalization(
-                            checkpoint_path,
-                            wait_fn=policy.finalize_async_save,
-                        )
 
             memory_tracker.snapshot_start_of_stage("Logging", dir())
             # Per-step log_data jsonl. The 1-hop driver holds per-token
