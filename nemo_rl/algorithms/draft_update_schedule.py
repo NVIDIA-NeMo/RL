@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import os
+import uuid
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -1178,7 +1179,13 @@ class ResolvedDraftStepTransaction:
 
 
 class DraftStepTransactionStore(Protocol):
-    def begin(self, decision: DraftUpdateDecision) -> DraftStepTransaction: ...
+    def begin(
+        self,
+        decision: DraftUpdateDecision,
+        *,
+        pre_scheduler_state: Mapping[str, object] | None = None,
+        expected_snapshot_path: Path | None = None,
+    ) -> DraftStepTransaction: ...
     def resolve(
         self,
         transaction: DraftStepTransaction,
@@ -1207,6 +1214,12 @@ class DraftStepTransactionStore(Protocol):
     def lookup_durable_apply_receipt(
         self, transaction: DraftStepTransaction
     ) -> Mapping[str, object] | None: ...
+    def write_durable_apply_receipt(
+        self,
+        transaction: DraftStepTransaction,
+        *,
+        snapshot: AppliedDraftSnapshot,
+    ) -> Mapping[str, object]: ...
     def resolve_intent_for_recovery(
         self,
         transaction: DraftStepTransaction,
@@ -1335,14 +1348,30 @@ class FileDraftStepTransactionStore:
         if self.crash_after == point:
             raise RuntimeError(f"injected crash after {point}")
 
-    def begin(self, decision: DraftUpdateDecision) -> DraftStepTransaction:
-        transaction_id = f"decision_{decision.decision_id}-{hashlib.sha256(_encode_row(asdict(decision))).hexdigest()[:16]}"
+    def begin(
+        self,
+        decision: DraftUpdateDecision,
+        *,
+        pre_scheduler_state: Mapping[str, object] | None = None,
+        expected_snapshot_path: Path | None = None,
+    ) -> DraftStepTransaction:
+        transaction_id = f"decision_{decision.decision_id}-{uuid.uuid4().hex}"
         transaction = DraftStepTransaction(
             transaction_id=transaction_id,
             decision=decision,
             base_checkpoint_id=self.base_checkpoint_id,
-            pre_scheduler_sha256="",
-            expected_snapshot_path=None,
+            pre_scheduler_sha256=hashlib.sha256(
+                _canonical_json(
+                    asdict(decision)
+                    if pre_scheduler_state is None
+                    else pre_scheduler_state
+                ).encode()
+            ).hexdigest(),
+            expected_snapshot_path=(
+                None
+                if expected_snapshot_path is None
+                else str(expected_snapshot_path.resolve())
+            ),
         )
         _write_json_exclusive(
             self._path(transaction_id, "intent"),
@@ -1468,6 +1497,35 @@ class FileDraftStepTransactionStore:
         path = self._path(transaction.transaction_id, "apply")
         return json.loads(path.read_text()) if path.is_file() else None
 
+    def write_durable_apply_receipt(
+        self,
+        transaction: DraftStepTransaction,
+        *,
+        snapshot: AppliedDraftSnapshot,
+    ) -> Mapping[str, object]:
+        """Write receipt evidence which restart re-hashes independently."""
+        raw = Path(snapshot.path).read_bytes()
+        if (
+            snapshot.version != transaction.decision.decision_id
+            or (
+                transaction.expected_snapshot_path is not None
+                and snapshot.path != transaction.expected_snapshot_path
+            )
+            or snapshot.size_bytes != len(raw)
+            or snapshot.sha256 != hashlib.sha256(raw).hexdigest()
+        ):
+            raise ValueError("durable apply receipt snapshot digest mismatch")
+        receipt: dict[str, object] = {
+            "schema_version": 1,
+            "successful": True,
+            "transaction_id": transaction.transaction_id,
+            "decision_id": transaction.decision.decision_id,
+            "snapshot": asdict(snapshot),
+        }
+        _write_json_exclusive(self._path(transaction.transaction_id, "apply"), receipt)
+        self._maybe_crash("outcome")
+        return receipt
+
     def resolve_intent_for_recovery(
         self,
         transaction: DraftStepTransaction,
@@ -1479,12 +1537,30 @@ class FileDraftStepTransactionStore:
         )
         snapshot: AppliedDraftSnapshot | None = None
         if successful:
-            raw_snapshot = apply_receipt.get("applied_snapshot")
+            raw_snapshot = apply_receipt.get("snapshot")
+            if (
+                apply_receipt.get("schema_version") != 1
+                or apply_receipt.get("transaction_id") != transaction.transaction_id
+                or apply_receipt.get("decision_id") != transaction.decision.decision_id
+                or not isinstance(raw_snapshot, Mapping)
+            ):
+                raise ValueError("durable apply receipt does not match transaction")
             if not isinstance(raw_snapshot, Mapping):
                 raise ValueError("durable apply receipt has no snapshot")
             snapshot = AppliedDraftSnapshot(
                 **cast(dict[str, object], dict(raw_snapshot))
             )
+            raw = Path(snapshot.path).read_bytes()
+            if (
+                snapshot.version != transaction.decision.decision_id
+                or (
+                    transaction.expected_snapshot_path is not None
+                    and snapshot.path != transaction.expected_snapshot_path
+                )
+                or snapshot.size_bytes != len(raw)
+                or snapshot.sha256 != hashlib.sha256(raw).hexdigest()
+            ):
+                raise ValueError("durable apply receipt snapshot digest mismatch")
         outcome = decision_outcome_payload(
             transaction.decision,
             update_attempted=transaction.decision.update_requested,

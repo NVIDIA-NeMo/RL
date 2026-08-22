@@ -20,6 +20,7 @@ from typing import Any, Mapping, Self, cast
 from pydantic import BaseModel, model_validator
 
 from nemo_rl.algorithms.draft_update_schedule import (
+    AppliedDraftSnapshot,
     DecisionLedgerReceipt,
     DraftDecisionLedger,
     DraftStepTransactionStore,
@@ -378,6 +379,29 @@ def load_checkpoint_bundle(checkpoint_path: Path) -> Mapping[str, object]:
             raise ValueError("disabled draft checkpoint ledger must be exactly empty")
     elif not rows:
         raise ValueError("enabled draft checkpoint ledger cannot be empty")
+    if not disabled:
+        raw_snapshot = receipt.get("applied_draft_snapshot")
+        if not isinstance(raw_snapshot, Mapping) or set(raw_snapshot) != {
+            "version",
+            "path",
+            "size_bytes",
+            "sha256",
+        }:
+            raise ValueError("enabled draft checkpoint requires an applied snapshot")
+        try:
+            snapshot = AppliedDraftSnapshot(**dict(raw_snapshot))
+            raw_snapshot_bytes = Path(snapshot.path).read_bytes()
+        except (OSError, TypeError) as error:
+            raise ValueError("applied draft snapshot is unreadable") from error
+        applied_version = schedule["state"].get("applied_draft_version")
+        if (
+            type(snapshot.version) is not int
+            or snapshot.version != applied_version
+            or type(snapshot.size_bytes) is not int
+            or snapshot.size_bytes != len(raw_snapshot_bytes)
+            or snapshot.sha256 != hashlib.sha256(raw_snapshot_bytes).hexdigest()
+        ):
+            raise ValueError("applied draft snapshot version or digest mismatch")
     if receipt.get("checkpoint_tree_sha256") != sha256_tree(
         root, exclude={"cadence-checkpoint-receipt.json"}
     ):
@@ -458,8 +482,8 @@ def open_resume_decision_ledger(
     bundle = load_checkpoint_bundle(checkpoint_path)
     root = result_root.resolve()
     root.mkdir(parents=True, exist_ok=True)
-    if root not in checkpoint_path.resolve().parents:
-        raise ValueError("resume checkpoint is outside cadence result root")
+    if checkpoint_path.resolve().name != bundle["checkpoint_id"]:
+        raise ValueError("resume checkpoint identity does not match cadence receipt")
     recovery_parent = root / "recovery"
     recovery_parent.mkdir(parents=True, exist_ok=True)
     incomplete = [
@@ -512,6 +536,8 @@ def open_resume_decision_ledger(
             },
         )
         receipt = reconcile_ledger_quarantine(recovery_dir, root)
+    if receipt.get("checkpoint_id") != bundle["checkpoint_id"]:
+        raise ValueError("ledger quarantine checkpoint mismatch")
     binding = bundle["decision_ledger"]
     assert isinstance(binding, Mapping)
     high_water = int(bundle["ledger_high_water"])
@@ -557,6 +583,11 @@ def recover_draft_step_transactions(
         raise ValueError("disabled draft resume must have no scheduler transactions")
     if not disabled and config is None:
         raise ValueError("enabled draft resume requires schedule config")
+    checkpoint_ledger = checkpoint["decision_ledger"]
+    assert isinstance(checkpoint_ledger, Mapping)
+    ledger_rows = _read_ledger(
+        checkpoint_path.resolve() / str(checkpoint_ledger["relative_path"])
+    )
     known = {item.transaction.transaction_id: item for item in resolutions}
     if len(known) != len(resolutions):
         raise ValueError("duplicate draft-step transaction resolution")
@@ -573,6 +604,19 @@ def recover_draft_step_transactions(
     for resolution in known.values():
         if resolution.decision.decision_id <= high_water:
             transaction_store.validate_checkpoint_contains(checkpoint_id, resolution)
+            row = ledger_rows[resolution.decision.decision_id - 1]
+            if (
+                row.get("decision_id") != resolution.decision.decision_id
+                or row.get("global_step") != resolution.decision.global_step
+                or row.get("outcome") != dict(resolution.outcome)
+            ):
+                raise ValueError(
+                    "checkpoint ledger differs from transaction resolution"
+                )
+            if resolution.applied_snapshot is not None:
+                checkpoint_snapshot = checkpoint["applied_draft_snapshot"]
+                if checkpoint_snapshot != asdict(resolution.applied_snapshot):
+                    raise ValueError("checkpoint snapshot differs from transaction")
     transaction_store.discard_after_checkpoint(
         checkpoint_id=checkpoint_id, ledger_high_water=high_water
     )
@@ -792,19 +836,40 @@ def build_terminal_schedule_payload(
     if not isinstance(schedule, Mapping):
         raise ValueError("terminal checkpoint lacks schedule state")
     current_step = int(checkpoint["current_step"])
+    zero_fields = {
+        key: 0
+        for key in (
+            "attempted_updates",
+            "successful_updates",
+            "failed_updates",
+            "skipped_updates",
+            "attempted_refits",
+            "successful_refits",
+            "failed_refits",
+            "skipped_refits",
+            "forced_updates",
+            "forced_refits",
+        )
+    }
     if schedule.get("mode") == "disabled":
         if evidence.update_receipts_by_decision or evidence.observations_by_refit_step:
             raise ValueError("disabled draft cannot have terminal events")
         return {
             "mode": "disabled",
             "current_step": current_step,
+            **zero_fields,
+            "policy_refit_count": current_step,
             "decision_ids": [],
             "global_steps": [],
             "updated_steps": [],
             "refit_steps": [],
+            "forced_update_steps": [],
+            "forced_refit_steps": [],
             "update_receipts": [],
             "post_event_observations": [],
+            "pending_post_event_steps": [],
             "refit_versions": [],
+            "decision_reasons": [],
             "decision_ledger_segments": [],
             "not_applicable_metrics": [
                 "applied_draft_version",
@@ -813,13 +878,15 @@ def build_terminal_schedule_payload(
             ],
         }
     ledger = checkpoint.get("decision_ledger")
-    if not isinstance(ledger, Mapping):
-        raise ValueError("terminal checkpoint lacks decision ledger")
+    config = schedule.get("config")
+    if not isinstance(ledger, Mapping) or not isinstance(config, Mapping):
+        raise ValueError("terminal checkpoint lacks schedule config or ledger")
     path = Path(str(checkpoint["checkpoint_path"])) / str(ledger["relative_path"])
     rows = _read_ledger(path)
     if (
         len(rows) != scheduler_decision_high_water(schedule)
         or not rows
+        or [row.get("decision_id") for row in rows] != list(range(1, len(rows) + 1))
         or rows[-1].get("global_step") != current_step
     ):
         raise ValueError("terminal ledger does not cover the scheduler cursor")
@@ -829,6 +896,59 @@ def build_terminal_schedule_payload(
         int(row["decision_id"]) for row in update_rows
     }:
         raise ValueError("terminal update-receipt cardinality mismatch")
+    update_receipts: list[dict[str, object]] = []
+    for row in update_rows:
+        decision_id, global_step = int(row["decision_id"]), int(row["global_step"])
+        binding = evidence.update_receipts_by_decision[decision_id]
+        path_for_receipt = Path(str(binding.get("path"))).resolve()
+        raw_receipt = path_for_receipt.read_bytes()
+        receipt_payload = json.loads(raw_receipt)
+        if (
+            binding.get("successful") is not True
+            or binding.get("decision_id") != decision_id
+            or binding.get("global_step") != global_step
+            or binding.get("size_bytes") != len(raw_receipt)
+            or binding.get("sha256") != hashlib.sha256(raw_receipt).hexdigest()
+            or not isinstance(receipt_payload, Mapping)
+            or receipt_payload.get("schema_version") != 1
+            or receipt_payload.get("successful") is not True
+            or receipt_payload.get("decision_id") != decision_id
+            or receipt_payload.get("global_step") != global_step
+        ):
+            raise ValueError("terminal update receipt is not digest bound")
+        for key in ("draft_model_sha256", "draft_optimizer_sha256"):
+            digest = receipt_payload.get(key)
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or set(digest) - set("0123456789abcdef")
+            ):
+                raise ValueError("terminal update receipt is not digest bound")
+        update_receipts.append(dict(binding))
+    if any(
+        cast(Mapping[str, object], row["outcome"]).get("update_attempted")
+        and not cast(Mapping[str, object], row["outcome"]).get("update_successful")
+        or cast(Mapping[str, object], row["outcome"]).get("draft_refit_attempted")
+        and not cast(Mapping[str, object], row["outcome"]).get("draft_refit_successful")
+        for row in rows
+    ):
+        raise ValueError("successful terminal payload cannot contain failed work")
+    observable_steps = [
+        int(row["global_step"])
+        for row in refit_rows
+        if int(row["global_step"]) < current_step
+    ]
+    if set(evidence.observations_by_refit_step) != set(observable_steps):
+        raise ValueError("terminal post-refit observation cardinality mismatch")
+    resumed_from = checkpoint.get("resumed_from")
+    resume_after = (
+        None
+        if resumed_from is None
+        else int(Path(str(resumed_from)).name.removeprefix("step_"))
+    )
+    version_by_step = {
+        int(row["global_step"]): int(row["decision_id"]) for row in refit_rows
+    }
     observations: list[dict[str, object]] = []
     for row in refit_rows:
         step = int(row["global_step"])
@@ -837,7 +957,18 @@ def build_terminal_schedule_payload(
         observation = evidence.observations_by_refit_step.get(step)
         if observation is None:
             raise ValueError("terminal post-refit observation cardinality mismatch")
-        observations.append(dict(observation))
+        acceptance = observation.get("acceptance_rate")
+        if (
+            observation.get("refit_step") != step
+            or observation.get("observation_step") != step + 1
+            or observation.get("applied_draft_version") != version_by_step[step]
+            or type(acceptance) not in (int, float)
+            or not isfinite(float(acceptance))
+            or not 0.0 <= float(acceptance) <= 1.0
+        ):
+            raise ValueError("terminal post-refit observation mismatch")
+        if resume_after is None or step >= resume_after:
+            observations.append(dict(observation))
     outcomes = [row["outcome"] for row in rows]
 
     def count(key: str) -> int:
@@ -846,7 +977,7 @@ def build_terminal_schedule_payload(
         )
 
     return {
-        "mode": cast(Mapping[str, object], schedule["config"])["mode"],
+        "mode": config["mode"],
         "current_step": current_step,
         "attempted_updates": count("update_attempted"),
         "successful_updates": count("update_successful"),
@@ -864,11 +995,23 @@ def build_terminal_schedule_payload(
         "global_steps": [int(row["global_step"]) for row in rows],
         "updated_steps": [int(row["global_step"]) for row in update_rows],
         "refit_steps": [int(row["global_step"]) for row in refit_rows],
-        "update_receipts": [
-            dict(evidence.update_receipts_by_decision[int(row["decision_id"])])
-            for row in update_rows
+        "forced_update_steps": [
+            int(row["global_step"])
+            for row in rows
+            if cast(Mapping[str, object], row["outcome"]).get("forced_update")
         ],
+        "forced_refit_steps": [
+            int(row["global_step"])
+            for row in rows
+            if cast(Mapping[str, object], row["outcome"]).get("forced_refit")
+        ],
+        "update_receipts": update_receipts,
         "post_event_observations": observations,
+        "pending_post_event_steps": [
+            int(row["global_step"])
+            for row in refit_rows
+            if int(row["global_step"]) == current_step
+        ],
         "refit_versions": [
             {
                 "refit_step": int(row["global_step"]),
@@ -876,5 +1019,6 @@ def build_terminal_schedule_payload(
             }
             for row in refit_rows
         ],
+        "decision_reasons": [str(row["reason"]) for row in rows],
         "decision_ledger_segments": [{"path": str(path.resolve()), **dict(ledger)}],
     }

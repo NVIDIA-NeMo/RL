@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ def test_checkpoint_receipt_binds_all_training_components(tmp_path: Path) -> Non
     model = checkpoint / "policy" / "weights"
     optimizer = checkpoint / "policy" / "optimizer"
     dataloader = checkpoint / "train_dataloader.pt"
+    snapshot = root / "applied-draft-v1.safetensors"
     for path, contents in (
         (model, b"model"),
         (optimizer, b"optimizer"),
@@ -31,6 +33,7 @@ def test_checkpoint_receipt_binds_all_training_components(tmp_path: Path) -> Non
     ):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(contents)
+    snapshot.write_bytes(b"draft")
 
     scheduler = DraftUpdateScheduler.create(
         AlwaysDraftUpdateScheduleConfig(), origin_step=0
@@ -56,7 +59,12 @@ def test_checkpoint_receipt_binds_all_training_components(tmp_path: Path) -> Non
     )
     state = SimpleNamespace(
         draft_update_schedule=scheduler.state_dict(),
-        applied_draft_snapshot=None,
+        applied_draft_snapshot={
+            "version": 1,
+            "path": str(snapshot.resolve()),
+            "size_bytes": len(b"draft"),
+            "sha256": hashlib.sha256(b"draft").hexdigest(),
+        },
         draft_terminal_evidence=None,
         draft_decision_ledger_prefixes=[],
     )

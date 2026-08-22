@@ -49,9 +49,12 @@ import torch
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
 from nemo_rl.algorithms.draft_cadence_runtime import (
+    CadenceRuntimeConfig,
     CadenceRuntimeWriter,
     CadenceTerminalEvidence,
+    disabled_draft_schedule_payload,
 )
+from nemo_rl.algorithms.draft_update_schedule import DraftDecisionLedger
 from nemo_rl.algorithms.grpo import GRPOSaveState, _write_latest_checkpoint_status
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -203,6 +206,31 @@ class SingleControllerActor:
         self._last_checkpoint_path: Optional[str] = actor_args.last_checkpoint_path
         self._consumed_samples: int = actor_args.save_state.consumed_samples
         self._total_valid_tokens: int = actor_args.save_state.total_valid_tokens
+        raw_cadence_runtime = getattr(master_config, "cadence_runtime", None)
+        cadence_runtime = (
+            CadenceRuntimeConfig()
+            if raw_cadence_runtime is None
+            else CadenceRuntimeConfig.model_validate(raw_cadence_runtime)
+        )
+        self._cadence_writer = (
+            CadenceRuntimeWriter(cadence_runtime) if cadence_runtime.enabled else None
+        )
+        self._cadence_terminal_evidence = (
+            CadenceTerminalEvidence.from_state(self._save_state.draft_terminal_evidence)
+            if self._save_state.draft_terminal_evidence is not None
+            else CadenceTerminalEvidence({}, {})
+        )
+        if self._cadence_writer is not None:
+            if self._save_state.draft_update_schedule is None:
+                self._save_state.draft_update_schedule = (
+                    disabled_draft_schedule_payload()
+                )
+            self._cadence_ledger = DraftDecisionLedger(
+                self._cadence_writer.root
+                / f"draft-decision-ledger-after-step_{self._save_state.current_step}.jsonl"
+            )
+        else:
+            self._cadence_ledger = None
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
@@ -1595,6 +1623,29 @@ class SingleControllerActor:
             buffer_state,
             os.path.join(checkpoint_path, "replay_buffer.pt"),
         )
+        if self._cadence_writer is not None:
+            if self._cadence_ledger is None:
+                raise RuntimeError("enabled cadence runtime has no decision ledger")
+            if not self._checkpointer.save_optimizer:
+                raise RuntimeError(
+                    "enabled cadence runtime requires optimizer checkpoints"
+                )
+            # A cadence receipt is a resume authority, so asynchronous policy writes
+            # must be complete before it hashes any checkpoint component.
+            await asyncio.to_thread(self._trainer.finalize_async_save)
+            self._cadence_ledger = self._cadence_writer.checkpoint_closed(
+                current_step=self._train_steps,
+                checkpoint_path=Path(checkpoint_path),
+                save_state=save_state,
+                component_paths={
+                    "model": Path(checkpoint_path) / "policy" / "weights",
+                    "optimizer": Path(checkpoint_path) / "policy" / "optimizer",
+                    "dataloader_rng": Path(checkpoint_path) / "train_dataloader.pt",
+                },
+                decision_ledger=self._cadence_ledger,
+                terminal_evidence=self._cadence_terminal_evidence,
+                resumed_from=self._last_checkpoint_path,
+            )
         # Rename happens in the background once the async weight writes
         # finish; flushed at the next save or on exit.
         self._checkpointer.begin_finalization(

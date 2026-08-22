@@ -2,6 +2,10 @@
 
 import pytest
 
+from nemo_rl.algorithms.draft_update_schedule import (
+    AppliedDraftSnapshot,
+    FileDraftStepTransactionStore,
+)
 from nemo_rl.algorithms.grpo import restore_draft_update_scheduler
 from nemo_rl.models.policy.draft_config import (
     AlwaysDraftUpdateScheduleConfig,
@@ -57,3 +61,29 @@ def test_restore_rejects_resolved_config_mismatch() -> None:
         restore_draft_update_scheduler(
             changed, saved, origin_step=0, resuming_from_checkpoint=True
         )
+
+
+def test_recovery_rejects_forged_apply_receipt(tmp_path) -> None:
+    """A receipt from another transaction cannot make a refit look durable."""
+    config = AlwaysDraftUpdateScheduleConfig()
+    scheduler = restore_draft_update_scheduler(
+        config, None, origin_step=0, resuming_from_checkpoint=False
+    )
+    decision = scheduler.decide(global_step=1, acceptance=None)
+    snapshot_path = tmp_path / "applied-draft-v1.safetensors"
+    snapshot_path.write_bytes(b"draft")
+    store = FileDraftStepTransactionStore(tmp_path)
+    transaction = store.begin(
+        decision,
+        pre_scheduler_state=scheduler.state_dict(),
+        expected_snapshot_path=snapshot_path,
+    )
+    snapshot = AppliedDraftSnapshot(
+        version=1,
+        path=str(snapshot_path.resolve()),
+        size_bytes=5,
+        sha256="0" * 64,
+    )
+
+    with pytest.raises(ValueError, match="snapshot digest"):
+        store.write_durable_apply_receipt(transaction, snapshot=snapshot)

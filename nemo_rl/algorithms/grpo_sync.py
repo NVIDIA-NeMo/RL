@@ -34,6 +34,7 @@ from __future__ import annotations
 import gc
 import os
 import warnings
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -60,6 +61,12 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     scale_rewards,
 )
+from nemo_rl.algorithms.draft_cadence_runtime import (
+    CadenceRuntimeWriter,
+    CadenceTerminalEvidence,
+    disabled_draft_schedule_payload,
+)
+from nemo_rl.algorithms.draft_update_schedule import DraftDecisionLedger
 from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
 )
@@ -529,6 +536,38 @@ def grpo_train_sync(
     max_num_epochs = master_config.grpo.max_num_epochs
     consumed_samples = grpo_save_state.consumed_samples
     total_valid_tokens = grpo_save_state.total_valid_tokens
+    cadence_writer = (
+        CadenceRuntimeWriter(master_config.cadence_runtime)
+        if master_config.cadence_runtime.enabled
+        else None
+    )
+    cadence_evidence = (
+        CadenceTerminalEvidence.from_state(grpo_save_state.draft_terminal_evidence)
+        if grpo_save_state.draft_terminal_evidence is not None
+        else CadenceTerminalEvidence({}, {})
+    )
+    if cadence_writer is not None:
+        if grpo_save_state.draft_update_schedule is None:
+            grpo_save_state.draft_update_schedule = disabled_draft_schedule_payload()
+        cadence_ledger: DraftDecisionLedger | None = DraftDecisionLedger(
+            cadence_writer.root
+            / f"draft-decision-ledger-after-step_{grpo_save_state.current_step}.jsonl"
+        )
+    else:
+        cadence_ledger = None
+
+    def close_cadence_terminal() -> None:
+        if cadence_writer is None:
+            return
+        final_checkpoint = checkpointer.get_latest_checkpoint_path()
+        if final_checkpoint is None:
+            raise RuntimeError("enabled cadence runtime requires a final checkpoint")
+        cadence_writer.terminal_closed(
+            current_step=total_steps,
+            final_checkpoint_path=Path(final_checkpoint),
+            terminal_evidence=cadence_evidence,
+        )
+
     val_at_start = master_config.grpo.val_at_start
     val_at_end = master_config.grpo.val_at_end
     val_period = master_config.grpo.val_period
@@ -1326,6 +1365,37 @@ def grpo_train_sync(
                                 wrapped_dataloader.state_dict(),
                                 os.path.join(checkpoint_path, "train_dataloader.pt"),
                             )
+                        if cadence_writer is not None:
+                            if cadence_ledger is None:
+                                raise RuntimeError(
+                                    "enabled cadence runtime has no ledger"
+                                )
+                            if master_config.data["use_multiple_dataloader"]:
+                                raise RuntimeError(
+                                    "enabled cadence runtime requires one digest-bound dataloader state"
+                                )
+                            if not checkpointer.save_optimizer:
+                                raise RuntimeError(
+                                    "enabled cadence runtime requires optimizer checkpoints"
+                                )
+                            policy.finalize_async_save()
+                            cadence_ledger = cadence_writer.checkpoint_closed(
+                                current_step=total_steps + 1,
+                                checkpoint_path=Path(checkpoint_path),
+                                save_state=grpo_save_state,
+                                component_paths={
+                                    "model": Path(checkpoint_path)
+                                    / "policy"
+                                    / "weights",
+                                    "optimizer": Path(checkpoint_path)
+                                    / "policy"
+                                    / "optimizer",
+                                    "dataloader_rng": Path(checkpoint_path)
+                                    / "train_dataloader.pt",
+                                },
+                                decision_ledger=cadence_ledger,
+                                terminal_evidence=cadence_evidence,
+                            )
                         checkpointer.begin_finalization(
                             checkpoint_path,
                             wait_fn=policy.finalize_async_save,
@@ -1488,15 +1558,18 @@ def grpo_train_sync(
             total_steps += 1
             if early_stop_message is not None:
                 checkpointer.shutdown()
+                close_cadence_terminal()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 return
             if should_save_by_timeout:
                 checkpointer.shutdown()
+                close_cadence_terminal()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_num_steps:
                 checkpointer.shutdown()
+                close_cadence_terminal()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print(
                     "Max number of steps has been reached, stopping training early",
@@ -1513,3 +1586,4 @@ def grpo_train_sync(
     # so without this the daemon finalization thread could be killed before the
     # final tmp_step_N is renamed.
     checkpointer.shutdown()
+    close_cadence_terminal()
