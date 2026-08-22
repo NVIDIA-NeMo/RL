@@ -666,11 +666,22 @@ class MetricsDataPlaneClient(DataPlaneClient):
             metrics[f"{op}/max_ms"] = step_maxima.get(op, 0.0)
             fit = st["fit"]
             if fit.get("model_trustworthy"):
-                # Only the actionable half of the fit: whether this op is
-                # overhead- or bandwidth-bound. The absolute fixed_ms and
-                # bandwidth_mb_s behind it are cumulative regressions that
-                # barely move per step -- read them from ``snapshot()``.
-                metrics[f"{op}/overhead_frac"] = fit["overhead_frac_at_mean"]
+                # The step's time split into the two things that cause it,
+                # in ms, rather than a ratio. These stack: together they are
+                # the model's estimate of this op's ``wall_ms`` for the
+                # step, so charting them against the measured ``wall_ms``
+                # shows both the split and how well the model holds.
+                #
+                # The *coefficients* come from the cumulative fit and should
+                # be stable -- that is what a fitted model is for. The
+                # *attribution* is per step, because it is applied to this
+                # step's calls and bytes. A ratio would have been neither:
+                # cumulative and therefore flat, and unitless on an axis of
+                # milliseconds.
+                op_bytes = st["n_bytes"] - prev_op.get("n_bytes", 0)
+                ms_per_byte = 1.0 / (fit["bandwidth_mb_s"] * 1e3)
+                metrics[f"{op}/overhead_ms"] = fit["fixed_ms"] * calls
+                metrics[f"{op}/transfer_ms"] = ms_per_byte * op_bytes
         return metrics
 
     def bytes_outstanding_by_partition(self) -> dict[str, int]:
