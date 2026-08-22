@@ -17,6 +17,12 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+
+# Module-level megatron imports would break COLLECTION on non-mcore CI shards
+# (marks only deselect at run time); skip collection gracefully instead.
+pytest.importorskip("megatron.bridge.training.config")
+pytest.importorskip("megatron.core.optimizer")
+
 from megatron.bridge.training.config import OptimizerConfigOverrideProviderContext
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import (
