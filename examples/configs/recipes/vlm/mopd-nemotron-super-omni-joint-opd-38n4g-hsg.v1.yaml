@@ -216,6 +216,12 @@ on_policy_distillation:
       precision: bf16
       micro_batch_size: 1
       moe_shared_expert_overlap: false
+      # The omni policy's empty_unused_memory_level: 2 leaks to teachers and
+      # empties the CUDA cache after EVERY logprob micro-batch — at 131k
+      # chunked scoring this collapses teacher throughput (job 6451777
+      # py-spy: GPUs 0%, workers thrashing; zero groups scored in >20min).
+      # The text runs score this same teacher at 131k fast with level 1.
+      empty_unused_memory_level: 1
     teacher_overrides:
       # text teacher: TP8/EP16/CP1 over 4n4g (DP=2). CP was 2 (the text-run
       # shape), but on this stack the teacher's FIRST CP2 forward hung
@@ -251,6 +257,9 @@ on_policy_distillation:
         mtp_use_repeated_layer: __unset__
         mtp_loss_scaling_factor: __unset__
         mtp_detach_heads: __unset__
+        # duplicated from default_teacher_cfg in case per-alias overrides
+        # don't inherit the default's extra keys
+        empty_unused_memory_level: 1
 logger:
   log_dir: logs/mopd-super-omni-joint-opd-hsg
   wandb:
