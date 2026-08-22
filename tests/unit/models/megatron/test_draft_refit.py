@@ -741,12 +741,12 @@ def test_raise_export_status_maps_codes_and_unknown_to_protocol_error() -> None:
         _raise_export_status,
     )
 
-    with pytest.raises(RuntimeError, match="WIRE_INVALID"):
+    with pytest.raises(ValueError, match="WIRE_INVALID"):
         _raise_export_status(
             _DRAFT_REFIT_STATUS_WIRE_INVALID,
             "bad bytes",
             cp_rank=0,
             pp_ranks=(0, 1),
         )
-    with pytest.raises(RuntimeError, match="PROTOCOL_ERROR"):
+    with pytest.raises(ValueError, match="PROTOCOL_ERROR"):
         _raise_export_status(99, "unknown", cp_rank=1, pp_ranks=(2,))
