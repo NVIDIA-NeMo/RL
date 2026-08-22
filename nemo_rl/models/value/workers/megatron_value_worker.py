@@ -73,6 +73,7 @@ from nemo_rl.models.megatron.setup import (
     validate_and_set_config,
     validate_model_paths,
 )
+from nemo_rl.models.megatron.tq_worker_mixin import MegatronTQWorkerMixin
 from nemo_rl.models.megatron.train import (
     LossPostProcessor,
     megatron_forward_backward,
@@ -216,7 +217,7 @@ def _value_loss_prepare_fn(
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
-class MegatronValueWorkerImpl(AbstractPolicyWorker):
+class MegatronValueWorkerImpl(MegatronTQWorkerMixin, AbstractPolicyWorker):
     """Megatron-Core based value function worker for PPO.
 
     This worker wraps a Megatron-Core GPT model backbone with a value head

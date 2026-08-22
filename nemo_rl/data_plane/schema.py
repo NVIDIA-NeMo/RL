@@ -52,6 +52,29 @@ LP_SEED_FIELDS = (
     "sample_mask",
 )
 
+# PPO-only columns. ``values`` is written by the value model's forward pass,
+# ``returns`` by the driver-side GAE stage; both are absent on a GRPO run, so
+# they are kept out of DP_TRAIN_FIELDS -- a worker fetching a column nobody
+# wrote errors out rather than reading zeros.
+PPO_VALUE_FIELDS = (
+    "values",
+    "returns",
+)
+
+# Subset fetched by the value model's forward pass. Same seed columns the
+# logprob workers need: the value head reads the sequence, nothing else.
+VALUE_SEED_FIELDS = LP_SEED_FIELDS
+
+# Fields the value model's train step consumes. ``values`` is the pre-update
+# prediction MseValueLossFn clips against; ``returns`` is the GAE target.
+DP_VALUE_TRAIN_FIELDS = (
+    "input_ids",
+    "input_lengths",
+    "token_mask",
+    "sample_mask",
+    *PPO_VALUE_FIELDS,
+)
+
 # Fields requested for KV-scale calibration. Positive include-list:
 # calibration only handles seq-dim tensor inputs, so we name them
 # explicitly. Train-side deltas (logprobs/advantages/masks) and
