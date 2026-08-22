@@ -19,8 +19,8 @@ from PIL import Image
 
 import nemo_rl.data.multimodal_utils as multimodal_utils
 from nemo_rl.data.multimodal_utils import (
-    encode_images_in_examples,
     image_to_data_url,
+    normalize_media_in_examples,
     resolve_to_image,
 )
 
@@ -59,7 +59,7 @@ def test_resolve_to_image_accepts_file_scheme(tmp_path):
     assert resolve_to_image(path).size == (5, 6)
 
 
-def test_encode_images_encodes_local_paths_and_file_urls(tmp_path):
+def test_normalize_media_encodes_local_image_paths_and_file_urls(tmp_path):
     plain = _write_png(tmp_path, "plain.png", (2, 2))
     file_url = "file://" + _write_png(tmp_path, "scheme.png", (3, 3))
 
@@ -70,7 +70,7 @@ def test_encode_images_encodes_local_paths_and_file_urls(tmp_path):
             {"type": "input_text", "text": "describe"},
         )
     ]
-    encode_images_in_examples(examples)
+    normalize_media_in_examples(examples)
 
     parts = examples[0]["responses_create_params"]["input"][0]["content"]
     assert parts[0]["image_url"].startswith("data:image/png;base64,")
@@ -81,7 +81,7 @@ def test_encode_images_encodes_local_paths_and_file_urls(tmp_path):
     assert parts[2] == {"type": "input_text", "text": "describe"}
 
 
-def test_encode_images_passes_through_http_and_data_urls():
+def test_normalize_media_passes_through_http_and_data_urls():
     data_url = image_to_data_url(Image.new("RGB", (2, 2)))
     examples = [
         _example(
@@ -90,7 +90,7 @@ def test_encode_images_passes_through_http_and_data_urls():
             {"type": "input_image", "image_url": data_url},
         )
     ]
-    encode_images_in_examples(examples)
+    normalize_media_in_examples(examples)
 
     parts = examples[0]["responses_create_params"]["input"][0]["content"]
     assert parts[0]["image_url"] == "https://example.com/cat.png"
@@ -192,15 +192,15 @@ def test_encode_single_image_source_closes_image_on_error(monkeypatch):
     assert image.closed
 
 
-def test_encode_images_is_a_noop_for_text_only_examples():
+def test_normalize_media_is_a_noop_for_text_only_examples():
     examples = [_example({"type": "input_text", "text": "no images here"})]
     before = [
         dict(part)
         for part in examples[0]["responses_create_params"]["input"][0]["content"]
     ]
-    assert encode_images_in_examples(examples) is examples
+    assert normalize_media_in_examples(examples) is examples
     assert examples[0]["responses_create_params"]["input"][0]["content"] == before
 
     # Missing/oddly-shaped payloads must not raise.
-    assert encode_images_in_examples([{}, {"responses_create_params": {}}]) is not None
-    assert encode_images_in_examples([{"responses_create_params": {"input": "nope"}}])
+    assert normalize_media_in_examples([{}, {"responses_create_params": {}}]) is not None
+    assert normalize_media_in_examples([{"responses_create_params": {"input": "nope"}}])

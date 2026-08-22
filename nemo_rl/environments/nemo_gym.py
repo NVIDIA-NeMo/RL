@@ -29,8 +29,7 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.multimodal_utils import (
     attach_image_model_inputs_to_message,
-    extract_input_image_sources_from_responses_messages,
-    extract_input_video_sources_from_responses_messages,
+    extract_input_media_sources_from_responses_messages,
     normalize_media_in_examples,
     resolve_to_image,
     uses_image_placeholder,
@@ -407,45 +406,25 @@ def _index_per_turn_images(
     return per_turn
 
 
-def _image_sources_equal(left: Any, right: Any) -> bool:
-    return (
-        left == right
-        if isinstance(left, str) and isinstance(right, str)
-        else left is right
-    )
-
-
-def _input_media_sources(messages: Any) -> list[tuple[str, Any]]:
-    if not isinstance(messages, list):
-        return []
-
-    sources: list[tuple[str, Any]] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            part_message = [{"content": [part]}]
-            images = extract_input_image_sources_from_responses_messages(part_message)
-            videos = extract_input_video_sources_from_responses_messages(part_message)
-            sources.extend(("image", source) for source in images)
-            sources.extend(("video", source) for source in videos)
-    return sources
-
-
 def _media_sources_equal(
     left: tuple[str, Any],
     right: tuple[str, Any],
 ) -> bool:
-    return left[0] == right[0] and _image_sources_equal(left[1], right[1])
+    """Compare tagged media by string value or object identity."""
+    if left[0] != right[0]:
+        return False
+    left_source, right_source = left[1], right[1]
+    return (
+        left_source == right_source
+        if isinstance(left_source, str) and isinstance(right_source, str)
+        else left_source is right_source
+    )
 
 
 def _without_initial_media_sources(
     messages: Any, initial_sources: list[Any]
 ) -> tuple[Any, bool]:
-    """Copy Responses messages and remove one ordered copy of initial media."""
+    """Copy Responses messages and remove one ordered copy of initial images and videos."""
     if not isinstance(messages, list):
         return messages, False
 
@@ -460,7 +439,9 @@ def _without_initial_media_sources(
 
         filtered_content = []
         for part in content:
-            part_sources = _input_media_sources([{"content": [part]}])
+            part_sources = extract_input_media_sources_from_responses_messages(
+                [{"content": [part]}]
+            )
             if (
                 remaining_sources
                 and len(part_sources) == 1
@@ -701,6 +682,9 @@ Depending on your data shape, you may want to change these values."""
         timer = Timer()
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
+        # Normalize local media before shipping requests to vLLM. Helper is a no-op
+        # for text-only rows and already-qualified URLs.
+        # Megatron's HTTP backend consumes the same normalized Responses payload.
         normalize_media_in_examples(nemo_gym_examples)
 
         timer.start("_run_rollouts_total")
@@ -797,9 +781,15 @@ Depending on your data shape, you may want to change these values."""
         media_messages = (
             seed_obs if isinstance(seed_obs, list) and seed_obs else initial_input
         )
-        raw_initial_sources = _input_media_sources(raw_input)
-        agent_initial_sources = _input_media_sources(initial_input)
-        returned_media_sources = _input_media_sources(media_messages)
+        raw_initial_sources = extract_input_media_sources_from_responses_messages(
+            raw_input
+        )
+        agent_initial_sources = extract_input_media_sources_from_responses_messages(
+            initial_input
+        )
+        returned_media_sources = extract_input_media_sources_from_responses_messages(
+            media_messages
+        )
         initial_media_matches_raw_input = (
             bool(raw_initial_sources)
             and len(agent_initial_sources) == len(raw_initial_sources)
@@ -1127,9 +1117,11 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
 
     backend = generation_config.get("backend")
     if backend == "vllm":
+        # Enable the http server. Requires both async engine and the expose_http_server flag
         generation_config["vllm_cfg"]["async_engine"] = True
         generation_config["vllm_cfg"]["expose_http_server"] = True
     elif backend == "megatron":
+        # Enable the http server for Gym dispatch over the Megatron generation backend.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
     else:
         raise ValueError(f"NeMo Gym does not support generation backend {backend!r}.")

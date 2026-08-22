@@ -901,14 +901,14 @@ def _encode_single_image_source(source: str) -> str:
     return data_url
 
 
-def extract_input_image_sources_from_responses_messages(
+def extract_input_media_sources_from_responses_messages(
     messages: Any,
-) -> list[str | Image.Image]:
-    """Extract image sources from Responses-API messages in encounter order."""
+) -> list[tuple[str, Any]]:
+    """Extract tagged image and video sources in encounter order."""
     if not isinstance(messages, list):
         return []
 
-    sources: list[str | Image.Image] = []
+    sources: list[tuple[str, Any]] = []
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -918,36 +918,19 @@ def extract_input_image_sources_from_responses_messages(
         for part in content:
             if not isinstance(part, dict):
                 continue
-            if part.get("type") not in ("input_image", "image", "image_url"):
+            part_type = part.get("type")
+            if part_type in IMAGE_CONTENT_TYPES:
+                media_type = "image"
+                source = part.get("image") or part.get("image_url") or part.get("url")
+            elif part_type in VIDEO_CONTENT_TYPES:
+                media_type = "video"
+                source = part.get("video") or part.get("video_url") or part.get("url")
+            else:
                 continue
-            source = part.get("image") or part.get("image_url") or part.get("url")
             if isinstance(source, dict):
-                source = source.get("url")
-            if isinstance(source, (str, Image.Image)):
-                sources.append(source)
-    return sources
-
-
-def extract_input_video_sources_from_responses_messages(messages: Any) -> list[Any]:
-    """Extract video sources from Responses-API messages in encounter order."""
-    if not isinstance(messages, list):
-        return []
-
-    sources: list[Any] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content") or []
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if not isinstance(part, dict) or part.get("type") not in VIDEO_CONTENT_TYPES:
-                continue
-            source = part.get("video") or part.get("video_url") or part.get("url")
-            if isinstance(source, dict):
-                source = source.get("url")
+                source = source.get("url") or source.get("path")
             if source is not None:
-                sources.append(source)
+                sources.append((media_type, source))
     return sources
 
 
@@ -957,7 +940,10 @@ def extract_input_images_from_responses_messages(
     """Load images from Responses-API input messages in encounter order."""
     return [
         resolve_to_image(source)
-        for source in extract_input_image_sources_from_responses_messages(messages)
+        for media_type, source in extract_input_media_sources_from_responses_messages(
+            messages
+        )
+        if media_type == "image"
     ]
 
 
