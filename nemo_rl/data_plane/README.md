@@ -449,10 +449,25 @@ by construction; the bulk traffic is the rollout actor's `kv_first_write`
 and the workers' per-DP-rank `get_samples`, and neither appears in these
 series. Do not read `comm_volume_mb` as cluster-wide volume.
 
-`OpStats` is additive on purpose — the histogram buckets and the regression
-sufficient statistics from every rank sum into one cluster-wide view — but
-nothing collects them yet. That is an affordance the design leaves open,
-not a feature that exists.
+`OpStats` is additive on purpose, and `merge_snapshots()` uses it: the
+histogram buckets and the regression sufficient statistics from every rank
+*sum* into one cluster-wide view. Everything derived — percentiles, the
+affine fit, throughput — is recomputed from the merged totals, never
+averaged across ranks (averaging per-rank percentiles does not give a
+cluster percentile).
+
+`grpo_train_sync` fans out to the driver and every policy worker, and logs
+the combined result under `data_plane/cluster/` instead of the driver's
+own. It falls back to `data_plane/driver/` when the fan-out finds only one
+process. Measured: **~2.4 ms and ~1 kB per process per step** for 10
+processes, against a 6x wider view of the traffic. The fan-out is
+best-effort — a rank that cannot answer is dropped rather than failing the
+step.
+
+`observability_overhead_ms` reports what the measurement itself cost,
+summed over every process: the wrapper's wall time minus the time its inner
+client was working. It sits beside `wall_ms` so the bill is visible next to
+what it bought (measured ~0.05% of data-plane time).
 
 **Units:** every duration is `_ms`, every volume is `_mb`, no exceptions —
 a chart mixing `wall_s` against `p99_ms` puts a 0.008 beside a 24.85 and

@@ -30,6 +30,8 @@ from tensordict import NonTensorData, NonTensorStack, TensorDict
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.observability import (
     MetricsDataPlaneClient,
+    cluster_step_metrics,
+    merge_snapshots,
     _estimate_encoded_bytes,
     _td_bytes,
 )
@@ -718,4 +720,72 @@ def test_hash_verification_off_by_default():
     assert client.snapshot()["hash_verify"]["rows_recorded"] == 0
     assert client._hash_by_partition == {}
     assert "hash/mismatches" not in client.get_step_metrics(1.0)
+    client.close()
+
+
+# ── cross-process aggregation ──────────────────────────────────────────
+
+
+def _client_with(n_puts, n_bytes_each, wall_ms):
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    for _ in range(n_puts):
+        client._emit("put", "p", 1, n_bytes_each, monotonic() - wall_ms / 1e3, "ok")
+    return client
+
+
+def test_merge_sums_counters_and_rederives_percentiles():
+    """The accumulators are shaped to add: histograms and regression sums
+    from every rank combine into the true cluster distribution. Averaging
+    per-rank percentiles could not do this, which is the whole reason the
+    latency lives in fixed buckets rather than retained samples."""
+    ranks = [_client_with(4, 1_000, 5.0) for _ in range(3)]
+    merged = merge_snapshots([c.snapshot() for c in ranks])
+
+    assert merged["n_processes"] == 3
+    assert merged["by_op"]["put"]["calls"] == 12  # 3 ranks x 4 puts
+    assert merged["by_op"]["put"]["n_bytes"] == 12_000
+    assert sum(merged["by_op"]["put"]["latency_hist"]) == 12
+    # derived from the summed histogram, not averaged from the ranks
+    single = ranks[0].snapshot()["by_op"]["put"]
+    assert merged["by_op"]["put"]["p50_ms"] == pytest.approx(single["p50_ms"], rel=0.3)
+    for c in ranks:
+        c.close()
+
+
+def test_merge_takes_max_for_max_fields():
+    """A cluster's worst call is the worst any rank saw, not their sum."""
+    slow = _client_with(1, 1_000, 40.0)
+    fast = _client_with(1, 1_000, 1.0)
+    merged = merge_snapshots([slow.snapshot(), fast.snapshot()])
+    assert merged["by_op"]["put"]["max_ms"] >= 40.0
+    assert merged["by_op"]["put"]["max_ms"] < 41.0, "max, not sum"
+    slow.close()
+    fast.close()
+
+
+def test_merge_of_nothing_is_empty():
+    assert merge_snapshots([]) == {}
+
+
+def test_cluster_step_metrics_report_their_own_cost():
+    """``observability_overhead_ms`` is the wrapper's own wall time minus
+    the inner client's, summed over processes — the bill for measuring,
+    sitting beside what it bought."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=4, consumer_tasks=["t"]
+    )
+    for i in range(4):
+        client.put_samples(
+            sample_ids=[f"u{i}"],
+            partition_id="p",
+            fields=TensorDict({"x": torch.zeros(1, 512)}, batch_size=[1]),
+        )
+    merged = merge_snapshots([client.snapshot()])
+    metrics = cluster_step_metrics(merged, {}, 1.0)
+
+    assert metrics["n_processes"] == 1
+    assert metrics["observability_overhead_ms"] > 0, "measuring is never free"
+    assert 0.0 <= metrics["observability_overhead_frac"] <= 1.0
+    assert "wall_ms" in metrics and "comm_volume_mb" in metrics
     client.close()
