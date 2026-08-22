@@ -62,6 +62,10 @@ class _FakeEagleModule(torch.nn.Module):
         self.core_attention = core_attention
         self.weight = torch.nn.Parameter(torch.randn(8, 8))
 
+    def rotary_pos_emb(self, sequence_length: int) -> None:
+        del sequence_length
+        return None
+
     def forward(
         self,
         *,
@@ -132,6 +136,34 @@ def test_core_rejects_activation_recompute_config() -> None:
                 softmax_scale=None,
                 pg_collection=None,
             )
+
+
+@pytest.mark.parametrize(
+    "with_noncallable_provider",
+    [False, True],
+    ids=["missing", "noncallable"],
+)
+def test_session_begin_requires_callable_rotary_provider(
+    with_noncallable_provider: bool,
+) -> None:
+    module = _load_module()
+    core = _core(module)
+    model = torch.nn.Module()
+    model.add_module("core_attention", core)
+    if with_noncallable_provider:
+        model.rotary_pos_emb = None
+    session = module.MCoreEagleTTTSession(model)
+
+    with pytest.raises(ValueError, match="requires callable model.rotary_pos_emb"):
+        session.begin(
+            layout=_layout(module),
+            storage_plan=_storage(module),
+            excluded_tensors=(),
+            resource_ledger=module.EagleTTTResourceLedger(limit_bytes=1 << 20),
+        )
+
+    assert session.layout is None
+    assert core.layout is None
 
 
 def test_layer_spec_adapter_is_construction_time_and_does_not_mutate_default() -> None:

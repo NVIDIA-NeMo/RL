@@ -136,6 +136,10 @@ class _SessionModel(torch.nn.Module):
         super().__init__()
         self.core_attention = core_attention
 
+    def rotary_pos_emb(self, sequence_length: int) -> None:
+        del sequence_length
+        return None
+
     def forward(
         self,
         *,
