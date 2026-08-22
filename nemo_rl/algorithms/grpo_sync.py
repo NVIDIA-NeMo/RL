@@ -75,7 +75,11 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.interfaces import KVBatchMeta
-from nemo_rl.data_plane.observability import MetricsDataPlaneClient
+from nemo_rl.data_plane.observability import (
+    MetricsDataPlaneClient,
+    cluster_step_metrics,
+    merge_snapshots,
+)
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -379,6 +383,12 @@ def _compute_seq_logprob_error_metrics(
     return masking_data["sample_mask"], seq_logprob_error_metrics
 
 
+# Previous cluster-wide reading, for per-step deltas. A single client owns
+# its own previous snapshot; a cluster has no such owner, so the trainer
+# holds it.
+_PREV_CLUSTER_SNAPSHOT: dict[str, Any] = {}
+
+
 def _log_data_plane_metrics(
     policy: Any, logger: Logger, step: int, total_step_time: float
 ) -> None:
@@ -406,8 +416,23 @@ def _log_data_plane_metrics(
     client = getattr(policy, "dp_client", None)
     if not isinstance(client, MetricsDataPlaneClient):
         return  # observability disabled -> plain adapter
-    metrics = client.get_step_metrics(total_step_time)
-    logger.log_metrics(metrics, step, prefix="data_plane/driver")
+
+    collect = getattr(policy, "collect_data_plane_snapshots", None)
+    snapshots = collect() if callable(collect) else []
+    if len(snapshots) > 1:
+        # Cluster view: every rank's counters summed. Prefixed and reported
+        # instead of the driver's, not alongside, so there is one answer to
+        # "what did the data plane cost" rather than two that disagree by
+        # roughly the DP degree.
+        merged = merge_snapshots(snapshots)
+        metrics = cluster_step_metrics(merged, _PREV_CLUSTER_SNAPSHOT, total_step_time)
+        _PREV_CLUSTER_SNAPSHOT.clear()
+        _PREV_CLUSTER_SNAPSHOT.update(merged)
+        logger.log_metrics(metrics, step, prefix="data_plane/cluster")
+    else:
+        # Single process, or the fan-out could not reach the workers.
+        metrics = client.get_step_metrics(total_step_time)
+        logger.log_metrics(metrics, step, prefix="data_plane/driver")
     print(
         f"  • data plane: {metrics['wall_ms']:.0f}ms "
         f"({100 * metrics['frac_of_step']:.1f}% of step), "

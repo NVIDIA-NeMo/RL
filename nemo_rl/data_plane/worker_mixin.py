@@ -182,6 +182,17 @@ class TQWorkerMixin:
         """Cross-DP forward pad target, minted by :meth:`TQPolicy._stamp_pad_seqlen`."""
         return int((meta.extra_info or {}).get(GLOBAL_FORWARD_PAD_SEQLEN, 0))
 
+    def get_data_plane_snapshot(self) -> "dict[str, Any] | None":
+        """This rank's data-plane counters, for cluster-wide aggregation.
+
+        Returns ``None`` when observability is off or no client exists, so
+        the driver can filter rather than special-case. The payload is
+        counters only (about 1 kB), not tensors.
+        """
+        client = getattr(self, "_dp_client", None)
+        snapshot = getattr(client, "snapshot", None)
+        return snapshot() if callable(snapshot) else None
+
     def _fetch(
         self,
         meta: "KVBatchMeta",
