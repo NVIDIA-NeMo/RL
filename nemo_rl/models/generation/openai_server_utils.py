@@ -13,16 +13,272 @@
 # limitations under the License.
 """Shared helpers for the OpenAI-compatible HTTP generation servers.
 
-These utilities are backend-agnostic: they operate on token-ID lists plus a
-tokenizer, with no engine calls. They are shared by the vLLM async worker
-(``vllm_worker_async.py``) and the TRT-LLM HTTP server (``trtllm_http_server.py``),
-which both put a message-based ``/v1/chat/completions`` layer in front of a token
-engine for the agentic NeMo-Gym path. SGLang does not use these — it is driven
-token-in/token-out via ``generate(input_ids)`` and never re-templates messages,
-so it has no retokenization drift to correct.
+These backend-agnostic utilities operate on token-ID lists, parsed chat messages,
+and caller-supplied tokenizers or render functions. They make no engine calls.
+They are shared by the vLLM async worker (``vllm_worker_async.py``) and the
+TRT-LLM HTTP server (``trtllm_http_server.py``), which both put a message-based
+``/v1/chat/completions`` layer in front of a token engine for the agentic
+NeMo-Gym path. SGLang does not use these — it is driven token-in/token-out via
+``generate(input_ids)`` and never re-templates messages, so it has no
+retokenization drift to correct.
 """
 
+from collections.abc import Callable, Mapping
+from copy import Error as CopyError
+from copy import deepcopy
 from typing import Any
+
+_COMPLETE_TOKEN_BOUNDARY_MARKER = "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E"
+
+
+class CompleteTokenInjectionError(ValueError):
+    """Signal that complete-token injection must use native preprocessing."""
+
+
+def find_latest_tokenized_assistant(
+    messages: list[Any],
+) -> tuple[int, Mapping[str, Any]] | None:
+    """Return the ordinal and message for the latest tokenized assistant.
+
+    Args:
+        messages: Validated chat messages in conversation order.
+
+    Returns:
+        The assistant ordinal and message when an assistant contains both prompt
+        and generation token IDs, or ``None`` when no complete metadata exists.
+    """
+    assistant_ordinal = -1
+    latest_tokenized_assistant = None
+    for message in messages:
+        if not isinstance(message, Mapping) or message.get("role") != "assistant":
+            continue
+        assistant_ordinal += 1
+        if (
+            message.get("prompt_token_ids") is not None
+            and message.get("generation_token_ids") is not None
+        ):
+            latest_tokenized_assistant = (assistant_ordinal, message)
+    return latest_tokenized_assistant
+
+
+def _assistant_index_from_ordinal(
+    conversation: list[Any], assistant_ordinal: int
+) -> int:
+    current_ordinal = -1
+    for index, message in enumerate(conversation):
+        if not isinstance(message, Mapping) or message.get("role") != "assistant":
+            continue
+        current_ordinal += 1
+        if current_ordinal == assistant_ordinal:
+            return index
+    raise CompleteTokenInjectionError(
+        "The tokenized assistant message was not present after chat parsing."
+    )
+
+
+def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
+    if not isinstance(value, list):
+        raise CompleteTokenInjectionError(f"{field_name} must be a list.")
+    if any(type(token_id) is not int for token_id in value):
+        raise CompleteTokenInjectionError(
+            f"{field_name} must contain only integer token IDs."
+        )
+    return list(value)
+
+
+def build_complete_prompt_token_ids(
+    *,
+    tokenizer: Any,
+    conversation: list[Any],
+    assistant_ordinal: int,
+    model_prefix_token_ids: list[int],
+    render_prompt_text: Callable[[list[Any]], str],
+    render_assistant_close_text: Callable[[list[Any]], str] | None = None,
+) -> list[int]:
+    """Join exact model-prefix tokens with a verified contextual suffix.
+
+    ``assistant_ordinal`` must identify the assistant turn covered by
+    ``model_prefix_token_ids``. A mismatch can produce a valid but incorrect
+    prompt, so callers must derive both values from the same message.
+
+    The complete conversation is rendered with the tokenized assistant replaced
+    by a marker. This preserves context-sensitive template behavior after that
+    assistant while making its assistant-close sequence the exact splice
+    boundary. The close sequence can differ from the tokenizer EOS token, as it
+    does for Gemma chat templates.
+
+    Args:
+        tokenizer: Tokenizer used by the serving renderer.
+        conversation: Parsed text-only chat messages.
+        assistant_ordinal: Ordinal of the assistant covered by the model prefix.
+        model_prefix_token_ids: Non-empty
+            ``prompt_token_ids + generation_token_ids`` from that assistant.
+        render_prompt_text: Callback that renders the complete marked
+            conversation as text.
+        render_assistant_close_text: Optional callback that renders the marked
+            conversation through the selected assistant. It must expose an
+            unconditional assistant-close sequence after the marker. Templates
+            that gate the close on ``add_generation_prompt`` fall back to native
+            preprocessing.
+
+    Returns:
+        Exact model-prefix tokens followed by the tokenized contextual suffix.
+
+    Raises:
+        CompleteTokenInjectionError: The splice contract could not be verified.
+            Callers must use native preprocessing instead of rejecting the
+            request.
+    """
+    try:
+        marked_conversation = deepcopy(conversation)
+    except (CopyError, TypeError) as e:
+        raise CompleteTokenInjectionError(
+            "The conversation could not be copied for complete-token injection."
+        ) from e
+    if any(
+        _COMPLETE_TOKEN_BOUNDARY_MARKER in str(message)
+        for message in marked_conversation
+    ):
+        raise CompleteTokenInjectionError(
+            "The complete-token boundary marker collided with request data."
+        )
+
+    assistant_index = _assistant_index_from_ordinal(
+        marked_conversation, assistant_ordinal
+    )
+
+    marked_assistant = marked_conversation[assistant_index]
+    if not isinstance(marked_assistant, dict):
+        raise CompleteTokenInjectionError(
+            "The tokenized assistant message was not a message object."
+        )
+    marked_assistant["content"] = _COMPLETE_TOKEN_BOUNDARY_MARKER
+    marked_assistant.pop("reasoning_content", None)
+    marked_assistant.pop("reasoning", None)
+    marked_assistant.pop("tool_calls", None)
+
+    try:
+        marked_text = render_prompt_text(marked_conversation)
+    except CompleteTokenInjectionError:
+        raise
+    except Exception as e:
+        raise CompleteTokenInjectionError(
+            "The marked chat template could not be rendered."
+        ) from e
+
+    if not isinstance(marked_text, str):
+        raise CompleteTokenInjectionError("The marked prompt must render as text.")
+
+    marker_count = marked_text.count(_COMPLETE_TOKEN_BOUNDARY_MARKER)
+    if marker_count == 0:
+        raise CompleteTokenInjectionError(
+            "The chat template did not preserve the complete-token boundary marker."
+        )
+    if marker_count > 1:
+        raise CompleteTokenInjectionError(
+            "The complete-token boundary marker collided with rendered request data."
+        )
+
+    marker_pos = marked_text.find(_COMPLETE_TOKEN_BOUNDARY_MARKER)
+    marker_end = marker_pos + len(_COMPLETE_TOKEN_BOUNDARY_MARKER)
+
+    if render_assistant_close_text is None:
+        eos_token = getattr(tokenizer, "eos_token", None)
+        if not isinstance(eos_token, str):
+            raise CompleteTokenInjectionError(
+                "Complete-token injection requires tokenizer EOS text."
+            )
+        suffix_pos = marked_text.find(eos_token, marker_end)
+        if suffix_pos < 0:
+            raise CompleteTokenInjectionError(
+                "The chat template did not close the tokenized assistant with EOS."
+            )
+        if marked_text[marker_end:suffix_pos].strip():
+            raise CompleteTokenInjectionError(
+                "The chat template did not close the tokenized assistant immediately; "
+                "the EOS boundary would skip intervening messages."
+            )
+        assistant_close_text = eos_token
+        contextual_suffix_text = marked_text[suffix_pos:]
+    else:
+        try:
+            closed_assistant_text = render_assistant_close_text(
+                marked_conversation[: assistant_index + 1]
+            )
+        except CompleteTokenInjectionError:
+            raise
+        except Exception as e:
+            raise CompleteTokenInjectionError(
+                "The assistant-close probe could not be rendered."
+            ) from e
+        if not isinstance(closed_assistant_text, str):
+            raise CompleteTokenInjectionError(
+                "The assistant-close probe must render as text."
+            )
+        close_marker_pos = closed_assistant_text.find(_COMPLETE_TOKEN_BOUNDARY_MARKER)
+        if close_marker_pos < 0:
+            raise CompleteTokenInjectionError(
+                "The assistant-close probe did not preserve the boundary marker."
+            )
+        close_marker_end = close_marker_pos + len(_COMPLETE_TOKEN_BOUNDARY_MARKER)
+        raw_assistant_close_text = closed_assistant_text[close_marker_end:]
+        # Drop only leading whitespace before the close sequence. The guard below
+        # uses the raw text so the slice removes exactly that same whitespace;
+        # trailing whitespace remains part of the verified close sequence.
+        assistant_close_text = raw_assistant_close_text.lstrip()
+        if not assistant_close_text:
+            raise CompleteTokenInjectionError(
+                "The chat template did not emit an assistant-close sequence."
+            )
+        contextual_suffix_text = marked_text[marker_end:]
+        if not contextual_suffix_text.startswith(raw_assistant_close_text):
+            raise CompleteTokenInjectionError(
+                "The assistant-close sequence changed in the complete conversation."
+            )
+        contextual_suffix_text = contextual_suffix_text[
+            len(raw_assistant_close_text) - len(assistant_close_text) :
+        ]
+
+    try:
+        assistant_close_token_ids = _coerce_token_id_list(
+            tokenizer.encode(assistant_close_text, add_special_tokens=False),
+            "Assistant-close token IDs",
+        )
+        suffix_token_ids = _coerce_token_id_list(
+            tokenizer.encode(contextual_suffix_text, add_special_tokens=False),
+            "Contextual suffix token IDs",
+        )
+    except CompleteTokenInjectionError:
+        raise
+    except Exception as e:
+        raise CompleteTokenInjectionError(
+            "The contextual suffix could not be tokenized."
+        ) from e
+
+    if (
+        not assistant_close_token_ids
+        or suffix_token_ids[: len(assistant_close_token_ids)]
+        != assistant_close_token_ids
+    ):
+        raise CompleteTokenInjectionError(
+            "The contextual suffix did not begin with the assistant-close sequence."
+        )
+    model_prefix_token_ids = _coerce_token_id_list(
+        model_prefix_token_ids, "Model prefix token IDs"
+    )
+    if not model_prefix_token_ids:
+        raise CompleteTokenInjectionError("The model prefix token IDs were empty.")
+
+    max_overlap = min(len(model_prefix_token_ids), len(assistant_close_token_ids))
+    overlap = next(
+        (
+            overlap
+            for overlap in range(max_overlap, 0, -1)
+            if model_prefix_token_ids[-overlap:] == suffix_token_ids[:overlap]
+        ),
+        0,
+    )
+    return model_prefix_token_ids + suffix_token_ids[overlap:]
 
 
 def replace_prefix_tokens(

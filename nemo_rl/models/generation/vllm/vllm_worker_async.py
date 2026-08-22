@@ -15,11 +15,13 @@
 import asyncio
 import copy
 import gc
+import json
 import logging
 import threading
 import time
 import uuid
 import warnings
+from collections import Counter
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -40,6 +42,12 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.openai_server_utils import (
+    CompleteTokenInjectionError,
+    build_complete_prompt_token_ids,
+    find_latest_tokenized_assistant,
+    replace_prefix_tokens,
+)
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
@@ -51,11 +59,94 @@ from nemo_rl.models.generation.vllm.utils import (
     pad_and_align_routed_expert_indices,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
-from nemo_rl.models.generation.openai_server_utils import (
-    replace_prefix_tokens,
-)
 
 LOGGER = logging.getLogger(__name__)
+COMPLETE_TOKEN_INJECTION_VLLM_VERSION = "0.25.1"
+
+
+def _prefix_matches_tokenized_assistant(
+    required_prefix_token_ids: list[int], message: Any
+) -> bool:
+    """Return whether a prefix is the exact token metadata from one message."""
+    prompt_token_ids = message.get("prompt_token_ids")
+    generation_token_ids = message.get("generation_token_ids")
+    if (
+        not isinstance(required_prefix_token_ids, list)
+        or not required_prefix_token_ids
+        or not isinstance(prompt_token_ids, list)
+        or not isinstance(generation_token_ids, list)
+        or any(
+            type(token_id) is not int
+            for token_ids in (
+                required_prefix_token_ids,
+                prompt_token_ids,
+                generation_token_ids,
+            )
+            for token_id in token_ids
+        )
+    ):
+        return False
+
+    prompt_length = len(prompt_token_ids)
+    return (
+        len(required_prefix_token_ids) == prompt_length + len(generation_token_ids)
+        and required_prefix_token_ids[:prompt_length] == prompt_token_ids
+        and required_prefix_token_ids[prompt_length:] == generation_token_ids
+    )
+
+
+def _complete_token_injection_eligibility(
+    request: Any,
+    messages: list[Any],
+    *,
+    prompt_embeds_enabled: bool,
+    renderer_supported: bool,
+    vllm_version_supported: bool,
+) -> tuple[int | None, str | None]:
+    """Return an assistant ordinal or a reason to use native preprocessing."""
+    if request.stream:
+        return None, "streaming request"
+    if request.n not in (None, 1):
+        return None, "multiple response choices"
+    if request.continue_final_message:
+        return None, "continue_final_message request"
+    if request.echo:
+        return None, "echo request"
+    if request.return_assistant_tokens_mask:
+        return None, "assistant token mask request"
+    if request.add_special_tokens:
+        return None, "add_special_tokens request"
+    if request.return_prompt_text:
+        return None, "return_prompt_text request"
+    if prompt_embeds_enabled:
+        return None, "prompt embeddings enabled"
+    if not renderer_supported:
+        return None, "unsupported renderer"
+    if not vllm_version_supported:
+        return None, "unsupported vLLM version"
+    for message in messages:
+        if not isinstance(message, dict):
+            return None, "non-object message"
+        # vLLM rewrites messages only when a developer role is present. It
+        # converts that role to system and then merges systems to index 0,
+        # which would shift the assistant ordinal.
+        if message.get("role") not in {"system", "user", "assistant", "tool"}:
+            return None, "unsupported message role"
+        content = message.get("content")
+        # Responses-style content-part lists stay on native preprocessing. Chat
+        # templates can treat these lists differently from flattened text.
+        if content is not None and not isinstance(content, str):
+            return None, "non-text message content"
+
+    tokenized_assistant = find_latest_tokenized_assistant(messages)
+    if tokenized_assistant is None:
+        return None, "no fully tokenized assistant"
+    assistant_ordinal, message = tokenized_assistant
+    if not _prefix_matches_tokenized_assistant(
+        request.required_prefix_token_ids, message
+    ):
+        return None, "client-supplied prefix does not match message token metadata"
+    return assistant_ordinal, None
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -99,6 +190,7 @@ class VllmAsyncGenerationWorkerImpl(
         self.server_thread = None
         self.base_url = None
         self.http_server = None
+        self._online_renderer = None
 
         super().__init__(
             config,
@@ -128,6 +220,12 @@ class VllmAsyncGenerationWorkerImpl(
         return bool(
             self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
         )
+
+    def _get_complete_token_injection_stats(self) -> dict[str, Any]:
+        """Return a snapshot of complete-token injection renderer counters."""
+        if self._online_renderer is None:
+            return {"attempts": 0, "successes": 0, "fallbacks": {}}
+        return self._online_renderer._get_complete_token_injection_stats()
 
     def _reserve_port(self) -> None:
         """Bind and listen on a TCP socket to reserve a free port from the OS.
@@ -350,10 +448,11 @@ class VllmAsyncGenerationWorkerImpl(
         from copy import deepcopy
         from logging import Filter as LoggingFilter
         from logging import LogRecord
-        from typing import List, Optional, Union
+        from typing import Any, List, Optional, Union
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
+        import vllm
         from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
@@ -365,6 +464,7 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.entrypoints.openai.engine.protocol import ErrorResponse
         from vllm.entrypoints.openai.models.protocol import BaseModelPath
         from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+        from vllm.entrypoints.chat_utils import parse_chat_messages_async
         from vllm.entrypoints.serve.tokenize.protocol import (
             TokenizeChatRequest,
             TokenizeCompletionRequest,
@@ -373,10 +473,17 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.entrypoints.serve.tokenize.serving import (
             ServingTokenization,
         )
+        from vllm.renderers import merge_kwargs
+        from vllm.renderers.hf import (
+            HfRenderer,
+            resolve_chat_template_content_format,
+            safe_apply_chat_template,
+        )
         from vllm.renderers.online_renderer import OnlineRenderer
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
+        from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
@@ -411,13 +518,13 @@ class VllmAsyncGenerationWorkerImpl(
             def model_post_init(self, context):
                 # NeMo-Gym specific processing. This is just how NeMo-Gym returns the extra token information.
                 if self.required_prefix_token_ids is None:
-                    for message in reversed(self.messages):
-                        if "prompt_token_ids" in message:
-                            self.required_prefix_token_ids = (
-                                message["prompt_token_ids"]
-                                + message["generation_token_ids"]
-                            )
-                            break
+                    tokenized_assistant = find_latest_tokenized_assistant(self.messages)
+                    if tokenized_assistant is not None:
+                        _, message = tokenized_assistant
+                        self.required_prefix_token_ids = (
+                            message["prompt_token_ids"]
+                            + message["generation_token_ids"]
+                        )
 
                 return super().model_post_init(context)
 
@@ -448,6 +555,210 @@ class VllmAsyncGenerationWorkerImpl(
                 max_tokens = min(request_max_tokens, remaining)
                 self._set_max_tokens(request, max_tokens)
 
+            def _restore_max_tokens_after_error(
+                self, request, request_max_tokens: int, error: Exception
+            ) -> None:
+                """Restore caller state and preserve the real output count in errors."""
+                self._set_max_tokens(request, request_max_tokens)
+                if (
+                    isinstance(error, VLLMValidationError)
+                    and error.parameter == "input_tokens"
+                    and "maximum context length" in str(error)
+                ):
+                    token_count = error.value
+                    qualifier = "at least " if "contains at least" in str(error) else ""
+                    total = token_count + request_max_tokens
+                    raise VLLMValidationError(
+                        f"This model's maximum context length is "
+                        f"{self.model_config.max_model_len} tokens. However, you "
+                        f"requested {request_max_tokens} output tokens and your prompt "
+                        f"contains {qualifier}{token_count} input tokens, for a total "
+                        f"of {qualifier}{total} tokens. Please reduce the length of "
+                        f"the input prompt or the number of requested output tokens.",
+                        parameter=error.parameter,
+                        value=error.value,
+                    ) from error
+
+            def _record_complete_token_injection_fallback(
+                self, reason: str, detail: str | None = None
+            ) -> None:
+                self._complete_token_injection_fallbacks[reason] += 1
+                if reason in self._logged_complete_token_injection_fallbacks:
+                    return
+                self._logged_complete_token_injection_fallbacks.add(reason)
+                rendered_reason = reason if detail is None else f"{reason} ({detail})"
+                LOGGER.warning(
+                    "Complete-token injection fell back to native preprocessing: "
+                    "%s; statistics: %s",
+                    rendered_reason,
+                    json.dumps(
+                        self._get_complete_token_injection_stats(), sort_keys=True
+                    ),
+                )
+
+            def _get_complete_token_injection_stats(self) -> dict[str, Any]:
+                """Return a copy of the complete-token injection counters."""
+                return {
+                    "attempts": self._complete_token_injection_attempts,
+                    "successes": self._complete_token_injection_successes,
+                    "fallbacks": dict(self._complete_token_injection_fallbacks),
+                }
+
+            def _maybe_log_complete_token_injection_stats(self) -> None:
+                attempts = self._complete_token_injection_attempts
+                if attempts != 1 and attempts % 1000 != 0:
+                    return
+                LOGGER.info(
+                    "Complete-token injection statistics: %s",
+                    json.dumps(
+                        self._get_complete_token_injection_stats(), sort_keys=True
+                    ),
+                )
+
+            async def _preprocess_chat_with_complete_token_ids(
+                self,
+                request,
+                messages,
+                default_template,
+                default_template_content_format,
+                default_template_kwargs,
+                tool_dicts,
+                parser,
+                assistant_ordinal: int,
+                *,
+                skip_mm_cache: bool,
+            ):
+                """Preserve vLLM preprocessing while skipping prompt re-encoding.
+
+                This mirrors vLLM 0.25.1 ``OnlineRenderer.preprocess_chat``.
+                Re-diff that function and its render helpers during vLLM upgrades.
+                """
+                renderer = self.renderer
+                arrival_time = time.time()
+                default_template_kwargs = merge_kwargs(
+                    default_template_kwargs,
+                    dict(tools=tool_dicts, tokenize=False),
+                )
+                tok_params = request.build_tok_params(self.model_config)
+                chat_params = request.build_chat_params(
+                    default_template, default_template_content_format
+                ).with_defaults(
+                    default_template_kwargs,
+                    default_media_io_kwargs=None,
+                    default_mm_processor_kwargs=getattr(
+                        request, "mm_processor_kwargs", None
+                    ),
+                )
+                if chat_params.return_assistant_tokens_mask:
+                    raise CompleteTokenInjectionError(
+                        "Assistant token masks require native preprocessing."
+                    )
+
+                tokenizer = renderer.get_tokenizer()
+                conversation, mm_data, mm_uuids = await parse_chat_messages_async(
+                    messages,
+                    self.model_config,
+                    content_format=resolve_chat_template_content_format(
+                        chat_template=chat_params.chat_template,
+                        tools=chat_params.chat_template_kwargs.get("tools"),
+                        given_format=chat_params.chat_template_content_format,
+                        tokenizer=tokenizer,
+                        model_config=self.model_config,
+                    ),
+                    media_io_kwargs=chat_params.media_io_kwargs,
+                    mm_processor_kwargs=chat_params.mm_processor_kwargs,
+                )
+                if mm_data is not None or mm_uuids is not None:
+                    raise CompleteTokenInjectionError(
+                        "Multimodal chat data requires native preprocessing."
+                    )
+                apply_chat_template_kwargs = dict(
+                    chat_params.get_apply_chat_template_kwargs()
+                )
+                apply_chat_template_kwargs.pop("tokenize", None)
+
+                def render_prompt_text(marked_conversation):
+                    rendered = safe_apply_chat_template(
+                        self.model_config,
+                        tokenizer,
+                        marked_conversation,
+                        tokenize=False,
+                        **apply_chat_template_kwargs,
+                    )
+                    if not isinstance(rendered, str):
+                        raise CompleteTokenInjectionError(
+                            "The marked prompt did not render as text."
+                        )
+                    return rendered
+
+                def render_assistant_close_text(marked_conversation):
+                    close_template_kwargs = apply_chat_template_kwargs | {
+                        "add_generation_prompt": False
+                    }
+                    rendered = safe_apply_chat_template(
+                        self.model_config,
+                        tokenizer,
+                        marked_conversation,
+                        tokenize=False,
+                        **close_template_kwargs,
+                    )
+                    if not isinstance(rendered, str):
+                        raise CompleteTokenInjectionError(
+                            "The assistant-close probe did not render as text."
+                        )
+                    return rendered
+
+                # Do not use vLLM's one-worker renderer executor here. It would
+                # serialize the fast path and can remove the measured speedup.
+                prompt_token_ids = await asyncio.to_thread(
+                    build_complete_prompt_token_ids,
+                    tokenizer=tokenizer,
+                    conversation=conversation,
+                    assistant_ordinal=assistant_ordinal,
+                    model_prefix_token_ids=list(request.required_prefix_token_ids),
+                    render_prompt_text=render_prompt_text,
+                    render_assistant_close_text=render_assistant_close_text,
+                )
+                prompt = {"prompt_token_ids": prompt_token_ids}
+                tokenized_prompt = await renderer.tokenize_prompt_async(
+                    prompt, tok_params
+                )
+                if request.mm_processor_kwargs is not None:
+                    tokenized_prompt["mm_processor_kwargs"] = (
+                        request.mm_processor_kwargs
+                    )
+                if request.cache_salt is not None:
+                    tokenized_prompt["cache_salt"] = request.cache_salt
+                engine_prompt = await renderer.process_for_engine_async(
+                    tokenized_prompt,
+                    arrival_time,
+                    skip_mm_cache=skip_mm_cache,
+                )
+
+                if parser is not None:
+                    tool_parser = parser.tool_parser_cls
+                    tool_choice = request.tool_choice
+                    is_mistral_grammar_eligible = (
+                        tool_parser is not None
+                        and is_mistral_tool_parser(tool_parser)
+                        and is_mistral_tokenizer(tokenizer)
+                        and tokenizer.supports_grammar
+                    )
+                    should_adjust_request = (
+                        parser.reasoning_parser_cls is not None
+                        or tool_choice != "none"
+                        or is_mistral_grammar_eligible
+                    )
+                    if should_adjust_request:
+                        request = parser(
+                            tokenizer,
+                            request.tools,
+                            model_config=self.model_config,
+                            chat_template_kwargs=chat_params.chat_template_kwargs,
+                        ).adjust_request(request=request)
+
+                return conversation, [engine_prompt]
+
             # vLLM 0.25 moved chat preprocessing to
             # OnlineRenderer.preprocess_chat (tool_parser/reasoning_parser were
             # folded into a single `parser`), so this override now applies via
@@ -468,8 +779,6 @@ class VllmAsyncGenerationWorkerImpl(
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
 
-                messages_for_replace_prefix_tokens = deepcopy(messages)
-
                 # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
                 # the actual value will be set through _clamp_max_tokens later.
                 actual_request_max_tokens = None
@@ -483,6 +792,78 @@ class VllmAsyncGenerationWorkerImpl(
                     # So we don't need to set the request's max output tokens to 1 here.
                     if actual_request_max_tokens is not None:
                         self._set_max_tokens(request, 1)
+
+                if (
+                    isinstance(request, NeMoRLChatCompletionRequest)
+                    and request.required_prefix_token_ids is not None
+                ):
+                    self._complete_token_injection_attempts += 1
+                    vllm_version_supported = (
+                        vllm.__version__ == COMPLETE_TOKEN_INJECTION_VLLM_VERSION
+                    )
+                    assistant_ordinal, fallback_reason = (
+                        _complete_token_injection_eligibility(
+                            request,
+                            messages,
+                            prompt_embeds_enabled=self.model_config.enable_prompt_embeds,
+                            renderer_supported=isinstance(self.renderer, HfRenderer),
+                            vllm_version_supported=vllm_version_supported,
+                        )
+                    )
+                    if fallback_reason is not None:
+                        fallback_detail = None
+                        if fallback_reason == "unsupported vLLM version":
+                            fallback_detail = (
+                                f"detected {vllm.__version__!r}, expected "
+                                f"{COMPLETE_TOKEN_INJECTION_VLLM_VERSION!r}"
+                            )
+                        self._record_complete_token_injection_fallback(
+                            fallback_reason, fallback_detail
+                        )
+                        self._maybe_log_complete_token_injection_stats()
+                    else:
+                        assert assistant_ordinal is not None
+                        try:
+                            res = await self._preprocess_chat_with_complete_token_ids(
+                                request=request,
+                                messages=messages,
+                                default_template=default_template,
+                                default_template_content_format=(
+                                    default_template_content_format
+                                ),
+                                default_template_kwargs=default_template_kwargs,
+                                tool_dicts=tool_dicts,
+                                parser=parser,
+                                assistant_ordinal=assistant_ordinal,
+                                skip_mm_cache=skip_mm_cache,
+                            )
+                        except CompleteTokenInjectionError as e:
+                            self._record_complete_token_injection_fallback(str(e))
+                            self._maybe_log_complete_token_injection_stats()
+                        except Exception as e:
+                            if actual_request_max_tokens is not None:
+                                self._restore_max_tokens_after_error(
+                                    request, actual_request_max_tokens, e
+                                )
+                            raise
+                        else:
+                            self._complete_token_injection_successes += 1
+                            self._maybe_log_complete_token_injection_stats()
+                            if actual_request_max_tokens is not None:
+                                try:
+                                    self._clamp_max_tokens(
+                                        request,
+                                        actual_request_max_tokens,
+                                        res[1][0]["prompt_token_ids"],
+                                    )
+                                except Exception as e:
+                                    self._restore_max_tokens_after_error(
+                                        request, actual_request_max_tokens, e
+                                    )
+                                    raise
+                            return res
+
+                messages_for_replace_prefix_tokens = deepcopy(messages)
 
                 try:
                     res = await super().preprocess_chat(
@@ -501,6 +882,16 @@ class VllmAsyncGenerationWorkerImpl(
 
                         logging.getLogger(__name__).warning(
                             "Prompt exceeds max_model_len: %s", e
+                        )
+                    if actual_request_max_tokens is not None:
+                        self._restore_max_tokens_after_error(
+                            request, actual_request_max_tokens, e
+                        )
+                    raise
+                except Exception as e:
+                    if actual_request_max_tokens is not None:
+                        self._restore_max_tokens_after_error(
+                            request, actual_request_max_tokens, e
                         )
                     raise
 
@@ -538,38 +929,60 @@ class VllmAsyncGenerationWorkerImpl(
                     update={"add_generation_prompt": False}
                 )
 
-                corresponding_res = await super().preprocess_chat(
-                    request=modified_request,
-                    messages=messages_to_last_assistant_message,
-                    default_template=default_template,
-                    default_template_content_format=default_template_content_format,
-                    default_template_kwargs=default_template_kwargs,
-                    tool_dicts=tool_dicts,
-                    parser=parser,
-                    skip_mm_cache=skip_mm_cache,
-                )
+                try:
+                    corresponding_res = await super().preprocess_chat(
+                        request=modified_request,
+                        messages=messages_to_last_assistant_message,
+                        default_template=default_template,
+                        default_template_content_format=(
+                            default_template_content_format
+                        ),
+                        default_template_kwargs=default_template_kwargs,
+                        tool_dicts=tool_dicts,
+                        parser=parser,
+                        skip_mm_cache=skip_mm_cache,
+                    )
+                except Exception as e:
+                    if actual_request_max_tokens is not None:
+                        self._restore_max_tokens_after_error(
+                            request, actual_request_max_tokens, e
+                        )
+                    raise
                 actual_corresponding_token_ids = corresponding_res[1][0][
                     "prompt_token_ids"
                 ]
 
                 engine_prompt = res[1][0]
 
-                final_prompt_token_ids = replace_prefix_tokens(
-                    tokenizer=self.renderer.tokenizer,
-                    model_prefix_token_ids=request.required_prefix_token_ids,
-                    template_prefix_token_ids=actual_corresponding_token_ids,
-                    template_token_ids=engine_prompt["prompt_token_ids"],
-                )
+                try:
+                    final_prompt_token_ids = replace_prefix_tokens(
+                        tokenizer=self.renderer.tokenizer,
+                        model_prefix_token_ids=request.required_prefix_token_ids,
+                        template_prefix_token_ids=actual_corresponding_token_ids,
+                        template_token_ids=engine_prompt["prompt_token_ids"],
+                    )
+                except Exception as e:
+                    if actual_request_max_tokens is not None:
+                        self._restore_max_tokens_after_error(
+                            request, actual_request_max_tokens, e
+                        )
+                    raise
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
                 # Clamp after prefix replacement since the prompt length may have changed.
                 if actual_request_max_tokens is not None:
-                    self._clamp_max_tokens(
-                        request,
-                        actual_request_max_tokens,
-                        final_prompt_token_ids,
-                    )
+                    try:
+                        self._clamp_max_tokens(
+                            request,
+                            actual_request_max_tokens,
+                            final_prompt_token_ids,
+                        )
+                    except Exception as e:
+                        self._restore_max_tokens_after_error(
+                            request, actual_request_max_tokens, e
+                        )
+                        raise
 
                 return res
 
@@ -653,7 +1066,12 @@ class VllmAsyncGenerationWorkerImpl(
             pass
 
         class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
-            pass
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._complete_token_injection_attempts = 0
+                self._complete_token_injection_successes = 0
+                self._complete_token_injection_fallbacks: Counter[str] = Counter()
+                self._logged_complete_token_injection_fallbacks: set[str] = set()
 
         serving_chat_default_kwargs = dict(
             response_role="assistant",
@@ -715,6 +1133,7 @@ class VllmAsyncGenerationWorkerImpl(
             # here keeps the two endpoints rendering identical prompts.
             default_chat_template_kwargs=default_chat_template_kwargs,
         )
+        self._online_renderer = online_renderer
         serving_chat_kwargs.update(
             dict(
                 engine_client=engine_client,

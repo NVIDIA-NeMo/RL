@@ -27,7 +27,12 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
-from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
+from nemo_rl.models.generation.openai_server_utils import (
+    CompleteTokenInjectionError,
+    build_complete_prompt_token_ids,
+    find_latest_tokenized_assistant,
+    replace_prefix_tokens,
+)
 
 _GYM_TOKEN_METADATA_FIELDS = (
     "prompt_token_ids",
@@ -189,30 +194,91 @@ def _render_prompt_token_ids_with_optional_prefix(
     return full_prompt_token_ids, template_prefix_token_ids
 
 
-def _latest_tokenized_assistant_index(messages: list[Any]) -> Optional[int]:
-    for index in reversed(range(len(messages))):
-        message = messages[index]
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        if (
-            message.get("prompt_token_ids") is not None
-            and message.get("generation_token_ids") is not None
-        ):
-            return index
-    return None
-
-
-def _derive_required_prefix_token_ids(messages: list[Any]) -> list[int] | None:
-    """Return the exact prompt and generation IDs from the latest model turn."""
-    assistant_index = _latest_tokenized_assistant_index(messages)
-    if assistant_index is None:
+def _derive_tokenized_assistant_context(
+    messages: list[Any],
+) -> tuple[int, int, list[int]] | None:
+    """Return the ordinal, index, and exact IDs of the latest model turn."""
+    tokenized_assistant = find_latest_tokenized_assistant(messages)
+    if tokenized_assistant is None:
         return None
-    message = messages[assistant_index]
-    if not isinstance(message, dict):
-        return None
-    return _coerce_token_id_list(
+    assistant_ordinal, message = tokenized_assistant
+    assistant_indexes = [
+        index
+        for index, candidate in enumerate(messages)
+        if isinstance(candidate, dict) and candidate.get("role") == "assistant"
+    ]
+    assistant_index = assistant_indexes[assistant_ordinal]
+    required_prefix_token_ids = _coerce_token_id_list(
         message["prompt_token_ids"], "prompt_token_ids"
     ) + _coerce_token_id_list(message["generation_token_ids"], "generation_token_ids")
+    return assistant_ordinal, assistant_index, required_prefix_token_ids
+
+
+def _messages_are_text_only(messages: list[Any]) -> bool:
+    """Return whether chat-template input contains only plain-text messages."""
+    return all(
+        isinstance(message, dict)
+        and (message.get("content") is None or isinstance(message.get("content"), str))
+        for message in messages
+    )
+
+
+def _render_complete_prompt_token_ids(
+    *,
+    tokenizer: Any,
+    request_body: dict[str, Any],
+    messages: list[Any],
+    tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
+    exclude_tools_when_tool_choice_none: bool,
+    add_generation_prompt: bool,
+    assistant_ordinal: int,
+    required_prefix_token_ids: list[int],
+) -> list[int]:
+    """Build complete IDs by encoding only the suffix after a model turn."""
+
+    def render_prompt_text(conversation: list[Any]) -> str:
+        return _apply_chat_template(
+            tokenizer=tokenizer,
+            request_body=request_body,
+            messages=conversation,
+            tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+            exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=False,
+        )
+
+    def render_assistant_close_text(conversation: list[Any]) -> str:
+        return _apply_chat_template(
+            tokenizer=tokenizer,
+            request_body=request_body,
+            messages=conversation,
+            tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+            exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
+            add_generation_prompt=False,
+            tokenize=False,
+        )
+
+    return build_complete_prompt_token_ids(
+        tokenizer=tokenizer,
+        conversation=messages,
+        assistant_ordinal=assistant_ordinal,
+        model_prefix_token_ids=required_prefix_token_ids,
+        render_prompt_text=render_prompt_text,
+        render_assistant_close_text=render_assistant_close_text,
+    )
+
+
+def _is_tool_argument_mapping_error(error: BaseException) -> bool:
+    """Return whether an exception wraps the known tool-template error."""
+    current: BaseException | None = error
+    while current is not None:
+        if (
+            isinstance(current, TypeError)
+            and str(current) == _TOOL_ARGUMENT_MAPPING_ERROR
+        ):
+            return True
+        current = current.__cause__
+    return False
 
 
 def _normalize_tool_arguments_for_template(
@@ -323,57 +389,95 @@ def prepare_dynamo_chat_completion_request(
     prepared_body["messages"] = stripped_messages
     prepared_body.pop("required_prefix_token_ids", None)
 
-    required_prefix_token_ids = _derive_required_prefix_token_ids(messages)
     add_generation_prompt = _request_add_generation_prompt(prepared_body)
     template_messages = deepcopy(stripped_messages)
+    tokenized_assistant_context = _derive_tokenized_assistant_context(messages)
+    required_prefix_token_ids: list[int] | None = None
+    assistant_ordinal: int | None = None
     assistant_index: int | None = None
-    if required_prefix_token_ids is not None:
-        assistant_index = _latest_tokenized_assistant_index(messages)
-        if assistant_index is None:
-            raise ValueError(
-                "Dynamo prefix token metadata must be attached to an assistant message."
+    full_prompt_token_ids: list[int] | None = None
+    if tokenized_assistant_context is not None:
+        (
+            assistant_ordinal,
+            assistant_index,
+            required_prefix_token_ids,
+        ) = tokenized_assistant_context
+
+    if required_prefix_token_ids is not None and _messages_are_text_only(
+        template_messages
+    ):
+        assert assistant_ordinal is not None
+        try:
+            full_prompt_token_ids = _render_complete_prompt_token_ids(
+                tokenizer=tokenizer,
+                request_body=prepared_body,
+                messages=template_messages,
+                tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+                exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
+                add_generation_prompt=add_generation_prompt,
+                assistant_ordinal=assistant_ordinal,
+                required_prefix_token_ids=required_prefix_token_ids,
+            )
+        except CompleteTokenInjectionError as e:
+            if _is_tool_argument_mapping_error(e):
+                _normalize_tool_arguments_for_template(
+                    template_messages, before_index=len(template_messages)
+                )
+                try:
+                    full_prompt_token_ids = _render_complete_prompt_token_ids(
+                        tokenizer=tokenizer,
+                        request_body=prepared_body,
+                        messages=template_messages,
+                        tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+                        exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
+                        add_generation_prompt=add_generation_prompt,
+                        assistant_ordinal=assistant_ordinal,
+                        required_prefix_token_ids=required_prefix_token_ids,
+                    )
+                except CompleteTokenInjectionError:
+                    pass
+
+    if full_prompt_token_ids is None:
+        try:
+            (
+                full_prompt_token_ids,
+                template_prefix_token_ids,
+            ) = _render_prompt_token_ids_with_optional_prefix(
+                tokenizer=tokenizer,
+                request_body=prepared_body,
+                messages=template_messages,
+                tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+                exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
+                add_generation_prompt=add_generation_prompt,
+                assistant_index=assistant_index,
+            )
+        except TypeError as e:
+            if str(e) != _TOOL_ARGUMENT_MAPPING_ERROR:
+                raise
+            _normalize_tool_arguments_for_template(
+                template_messages, before_index=len(template_messages)
+            )
+            (
+                full_prompt_token_ids,
+                template_prefix_token_ids,
+            ) = _render_prompt_token_ids_with_optional_prefix(
+                tokenizer=tokenizer,
+                request_body=prepared_body,
+                messages=template_messages,
+                tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+                exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
+                add_generation_prompt=add_generation_prompt,
+                assistant_index=assistant_index,
             )
 
-    try:
-        (
-            full_prompt_token_ids,
-            template_prefix_token_ids,
-        ) = _render_prompt_token_ids_with_optional_prefix(
-            tokenizer=tokenizer,
-            request_body=prepared_body,
-            messages=template_messages,
-            tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
-            exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
-            add_generation_prompt=add_generation_prompt,
-            assistant_index=assistant_index,
-        )
-    except TypeError as e:
-        if str(e) != _TOOL_ARGUMENT_MAPPING_ERROR:
-            raise
-        _normalize_tool_arguments_for_template(
-            template_messages, before_index=len(template_messages)
-        )
-        (
-            full_prompt_token_ids,
-            template_prefix_token_ids,
-        ) = _render_prompt_token_ids_with_optional_prefix(
-            tokenizer=tokenizer,
-            request_body=prepared_body,
-            messages=template_messages,
-            tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
-            exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
-            add_generation_prompt=add_generation_prompt,
-            assistant_index=assistant_index,
-        )
-
-    if required_prefix_token_ids is not None:
-        assert template_prefix_token_ids is not None
-        full_prompt_token_ids = replace_prefix_tokens(
-            tokenizer,
-            model_prefix_token_ids=required_prefix_token_ids,
-            template_prefix_token_ids=template_prefix_token_ids,
-            template_token_ids=full_prompt_token_ids,
-        )
+        if required_prefix_token_ids is not None:
+            assert template_prefix_token_ids is not None
+            full_prompt_token_ids = replace_prefix_tokens(
+                tokenizer,
+                model_prefix_token_ids=required_prefix_token_ids,
+                template_prefix_token_ids=template_prefix_token_ids,
+                template_token_ids=full_prompt_token_ids,
+            )
 
     nvext = prepared_body.get("nvext")
     if nvext is None:
