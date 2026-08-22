@@ -668,7 +668,15 @@ def cluster_step_metrics(
         if calls <= 0:
             continue
         metrics[f"step/{op}/calls"] = calls
-        metrics[f"step/{op}/wall_ms"] = stats["wall_ms"] - prev_op.get("wall_ms", 0.0)
+        # Summed over processes that ran concurrently, like every other time
+        # on this path -- so it is process-time, and on the driver path the
+        # same key is elapsed. 200 gets of 11 ms across 8 ranks reads 2233
+        # here and took 278 ms of wall clock. Both are worth having: the sum
+        # attributes cost across ops, the per-process figure gives the
+        # magnitude a reader expects from a millisecond.
+        op_wall_ms = stats["wall_ms"] - prev_op.get("wall_ms", 0.0)
+        metrics[f"step/{op}/wall_ms"] = op_wall_ms
+        metrics[f"step/{op}/wall_ms_per_process"] = op_wall_ms / n_procs
         metrics[f"step/{op}/max_ms"] = stats["max_ms"]
         # Percentiles over THIS step's calls, summed across ranks, not over
         # the lifetime: a cumulative percentile beside a step-scoped max is
@@ -711,6 +719,7 @@ def cluster_step_metrics(
 _BREAKDOWN_COLUMNS = (
     "calls",
     "wall_ms",
+    "wall_ms_per_process",
     "max_ms",
     "overhead_ms",
     "transfer_ms",
