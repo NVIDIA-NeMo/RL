@@ -3,7 +3,7 @@
 import copy
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -92,6 +92,12 @@ class CadenceTestRun:
         )
         self.last_full_checkpoint_id = f"step_{origin_step}"
         self.resumed_from: str | None = None
+        self._ledger_quarantine_receipt: Path | None = None
+
+    @property
+    def ledger_quarantine_receipt(self) -> Path:
+        assert self._ledger_quarantine_receipt is not None
+        return self._ledger_quarantine_receipt
 
     def _rows(self) -> list[dict[str, object]]:
         paths = [Path(item.path) for item in self.ledger.sealed_prefixes]
@@ -282,7 +288,7 @@ class CadenceTestRun:
         resumed.save_state = save_state
         resumed.last_full_checkpoint_id = f"step_{step}"
         resumed.resumed_from = str(checkpoint.resolve())
-        resumed.ledger_quarantine_receipt = opened.quarantine_receipt_path
+        resumed._ledger_quarantine_receipt = opened.quarantine_receipt_path
         return resumed
 
 
@@ -612,8 +618,14 @@ def test_draft_step_transaction_recovers_matching_scheduler_snapshot_and_ledger(
     checkpoint_components = bundle["components"]
     assert isinstance(checkpoint_components, Mapping)
     assert set(checkpoint_components) == {"model", "optimizer", "dataloader_rng"}
-    assert bundle["draft_update_schedule"]["state"]["applied_draft_version"] == 1
-    assert bundle["applied_draft_snapshot"]["version"] == 1
+    draft_update_schedule = bundle["draft_update_schedule"]
+    assert isinstance(draft_update_schedule, Mapping)
+    draft_update_state = draft_update_schedule["state"]
+    assert isinstance(draft_update_state, Mapping)
+    assert draft_update_state["applied_draft_version"] == 1
+    applied_draft_snapshot = bundle["applied_draft_snapshot"]
+    assert isinstance(applied_draft_snapshot, Mapping)
+    assert applied_draft_snapshot["version"] == 1
     assert bundle["ledger_high_water"] == 1
     assert restored.entries_after(1) == []
     assert restored.scheduler.state.next_decision_id == 2
@@ -1087,7 +1099,13 @@ def test_terminal_payload_maps_decision_id_to_nonzero_origin_step(
     assert schedule["decision_ids"] == [1]
     assert schedule["global_steps"] == [8]
     assert schedule["updated_steps"] == [8]
-    assert schedule["update_receipts"][0]["decision_id"] == 1
+    update_receipts = schedule["update_receipts"]
+    assert isinstance(update_receipts, Sequence)
+    assert not isinstance(update_receipts, (str, bytes))
+    assert len(update_receipts) == 1
+    update_receipt = update_receipts[0]
+    assert isinstance(update_receipt, Mapping)
+    assert update_receipt["decision_id"] == 1
     assert schedule["refit_versions"] == [{"refit_step": 8, "applied_draft_version": 1}]
 
 
