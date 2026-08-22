@@ -342,14 +342,49 @@ _DRAFT_DECISION_REASON_CODES = {
 }
 
 
+def validate_draft_enabled_consensus(
+    draft_enabled: bool,
+    *,
+    group: torch.distributed.ProcessGroup | None = None,
+    device: torch.device | None = None,
+) -> bool:
+    """Validate the immutable draft-enabled mode once during worker setup."""
+    if not torch.distributed.is_initialized():
+        return draft_enabled
+    group = group or torch.distributed.group.WORLD
+    if device is None:
+        backend = torch.distributed.get_backend(group)
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if backend == "nccl"
+            else torch.device("cpu")
+        )
+    minimum = torch.tensor(int(draft_enabled), dtype=torch.int64, device=device)
+    maximum = minimum.clone()
+    torch.distributed.all_reduce(
+        minimum, op=torch.distributed.ReduceOp.MIN, group=group
+    )
+    torch.distributed.all_reduce(
+        maximum, op=torch.distributed.ReduceOp.MAX, group=group
+    )
+    if minimum.item() != maximum.item():
+        raise RuntimeError("draft-enabled mode mismatch across ranks")
+    return draft_enabled
+
+
 def validate_draft_update_decision_consensus(
     decision: DraftUpdateDecision | None,
     *,
     draft_enabled: bool,
+    globally_disabled: bool = False,
     group: torch.distributed.ProcessGroup | None = None,
     device: torch.device | None = None,
 ) -> DraftUpdateDecision | None:
     """Validate one complete controller decision across every training rank."""
+    if globally_disabled:
+        if draft_enabled or decision is not None:
+            raise RuntimeError("globally disabled draft cadence received a decision")
+        return None
     reason_code = (
         0 if decision is None else _DRAFT_DECISION_REASON_CODES.get(decision.reason, -1)
     )
@@ -768,6 +803,11 @@ class MegatronPolicyWorkerImpl(
 
         # Step 1: Setup distributed
         setup_distributed()
+        draft_cfg = config.get("draft")
+        draft_enabled = bool(getattr(draft_cfg, "enabled", False))
+        self._draft_cadence_globally_disabled = not validate_draft_enabled_consensus(
+            draft_enabled
+        )
         log_gpu_memory_diagnostics(
             label="after_nccl_init", worker_type="MegatronPolicyWorker"
         )
@@ -1099,6 +1139,7 @@ class MegatronPolicyWorkerImpl(
         draft_update_decision = validate_draft_update_decision_consensus(
             draft_update_decision,
             draft_enabled=draft_enabled,
+            globally_disabled=getattr(self, "_draft_cadence_globally_disabled", False),
         )
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
@@ -1668,6 +1709,7 @@ class MegatronPolicyWorkerImpl(
         draft_update_decision = validate_draft_update_decision_consensus(
             draft_update_decision,
             draft_enabled=bool(getattr(draft_cfg, "enabled", False)),
+            globally_disabled=getattr(self, "_draft_cadence_globally_disabled", False),
         )
         existing = getattr(self, "_train_step_state", None)
         if existing is not None:
