@@ -11,14 +11,181 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import TypeVar
+from dataclasses import dataclass
+from typing import Any, Literal, TypeVar
 
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
+from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
+
+
+class LengthAwareRewardConfig(BaseModel, extra="allow"):
+    """Configure reasoning-chain length reward for NeMo-Gym rollouts.
+
+    The component reward is one through ``tau1``, decreases linearly to zero
+    at ``tau2``, and remains zero for longer reasoning chains. The end-token ID
+    is model/tokenizer specific and must be provided whenever the feature is
+    enabled.
+    """
+
+    enabled: bool = False
+    tau1: int = 4096
+    tau2: int = 13000
+    weight: float = 0.1
+    composition: Literal["additive", "correctness_gated"] = "additive"
+    reasoning_end_token_id: int | None = None
+
+    @model_validator(mode="after")
+    def _validate_length_aware_reward(self) -> "LengthAwareRewardConfig":
+        if self.tau1 < 0:
+            raise ValueError(f"tau1 must be non-negative, got {self.tau1}")
+        if self.tau2 <= self.tau1:
+            raise ValueError(
+                f"tau2 must be greater than tau1, got tau1={self.tau1}, "
+                f"tau2={self.tau2}"
+            )
+        if self.weight < 0:
+            raise ValueError(f"weight must be non-negative, got {self.weight}")
+        if self.composition == "correctness_gated" and self.weight > 1:
+            raise ValueError(
+                "correctness-gated length-aware reward weight must be at most 1, "
+                f"got {self.weight}"
+            )
+        if self.enabled and self.reasoning_end_token_id is None:
+            raise ValueError(
+                "reasoning_end_token_id must be set when length-aware reward is enabled"
+            )
+        if self.reasoning_end_token_id is not None and self.reasoning_end_token_id < 0:
+            raise ValueError(
+                "reasoning_end_token_id must be non-negative, got "
+                f"{self.reasoning_end_token_id}"
+            )
+        return self
+
+
+@dataclass(frozen=True)
+class LengthAwareRewardMetrics:
+    component_rewards: list[float]
+    reasoning_chain_lengths: list[int]
+
+
+def length_aware_regularization_reward(
+    chain_length: int, *, tau1: int, tau2: int
+) -> float:
+    """Return the piecewise-linear reward for a reasoning-chain length."""
+    if chain_length < 0:
+        raise ValueError(f"chain_length must be non-negative, got {chain_length}")
+    if tau1 < 0:
+        raise ValueError(f"tau1 must be non-negative, got {tau1}")
+    if tau2 <= tau1:
+        raise ValueError(
+            f"tau2 must be greater than tau1, got tau1={tau1}, tau2={tau2}"
+        )
+
+    if chain_length <= tau1:
+        return 1.0
+    if chain_length >= tau2:
+        return 0.0
+    return 1.0 - (chain_length - tau1) / (tau2 - tau1)
+
+
+def reasoning_chain_token_length(
+    message_log: LLMMessageLogType | VLMMessageLogType,
+    *,
+    reasoning_end_token_id: int,
+) -> int:
+    """Count assistant reasoning tokens, excluding each reasoning end token.
+
+    An assistant turn without the configured end token is treated as unfinished
+    reasoning, so its complete generated token sequence is counted.
+    """
+    total = 0
+    for message in message_log:
+        if message.get("role") != "assistant":
+            continue
+        token_ids = message.get("token_ids")
+        if not isinstance(token_ids, torch.Tensor):
+            raise TypeError(
+                "Assistant message token_ids must be a torch.Tensor when applying "
+                "length-aware reward"
+            )
+        if token_ids.ndim != 1:
+            raise ValueError(
+                "Assistant message token_ids must be one-dimensional when applying "
+                f"length-aware reward, got shape={tuple(token_ids.shape)}"
+            )
+        token_id_list = token_ids.tolist()
+        try:
+            total += token_id_list.index(reasoning_end_token_id)
+        except ValueError:
+            total += len(token_id_list)
+    return total
+
+
+def apply_length_aware_reward(
+    results: list[dict[str, Any]], config: LengthAwareRewardConfig | None
+) -> LengthAwareRewardMetrics:
+    """Compose reasoning-chain length reward into NeMo-Gym scalar rewards.
+
+    ``additive`` uses ``base + weight * component``. ``correctness_gated`` uses
+    ``base * (1 - weight * (1 - component))``, which prevents short incorrect
+    responses from receiving positive reward.
+
+    Multi-component Gym rewards are rejected because a non-additive transform
+    would otherwise violate the ``reward == sum(reward_components)`` contract.
+    """
+    if config is None or not config.enabled:
+        return LengthAwareRewardMetrics([], [])
+
+    reasoning_end_token_id = config.reasoning_end_token_id
+    if reasoning_end_token_id is None:
+        raise ValueError(
+            "reasoning_end_token_id must be set when length-aware reward is enabled"
+        )
+
+    for result in results:
+        full_result = result["full_result"]
+        if full_result.get("reward_components"):
+            raise ValueError(
+                "Length-aware reward does not support NeMo-Gym results with "
+                "reward_components"
+            )
+    reasoning_chain_lengths = [
+        reasoning_chain_token_length(
+            result["message_log"],
+            reasoning_end_token_id=reasoning_end_token_id,
+        )
+        for result in results
+    ]
+    component_rewards = [
+        length_aware_regularization_reward(
+            chain_length,
+            tau1=config.tau1,
+            tau2=config.tau2,
+        )
+        for chain_length in reasoning_chain_lengths
+    ]
+
+    adjusted_rewards = []
+    for result, component_reward in zip(results, component_rewards):
+        full_result = result["full_result"]
+        base_reward = float(full_result["reward"])
+        if config.composition == "correctness_gated":
+            adjusted_reward = base_reward * (
+                1.0 - config.weight * (1.0 - component_reward)
+            )
+        else:
+            adjusted_reward = base_reward + config.weight * component_reward
+        adjusted_rewards.append(adjusted_reward)
+
+    for result, adjusted_reward in zip(results, adjusted_rewards):
+        result["full_result"]["reward"] = adjusted_reward
+
+    return LengthAwareRewardMetrics(component_rewards, reasoning_chain_lengths)
 
 
 class RewardShapingConfig(BaseModel, extra="allow"):

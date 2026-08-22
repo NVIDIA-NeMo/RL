@@ -2132,6 +2132,10 @@ class TestAsyncTrajectoryCollector:
             assert kwargs["generation_config"]["stop_token_ids"] is None
             assert kwargs["generation_config"]["stop_strings"] is None
             assert kwargs["log_full_result_tables"] is False
+            assert (
+                kwargs["length_aware_reward_config"]
+                is collector.master_config.grpo.length_aware_reward
+            )
             rollout_calls += 1
             yield _rollout_result(7)
             if rollout_calls == 1:

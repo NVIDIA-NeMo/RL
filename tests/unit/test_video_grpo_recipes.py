@@ -37,6 +37,7 @@ def test_video_grpo_recipes_preserve_unmasked_sync_and_async_contracts():
         assert grpo["max_num_steps"] == 1_000_000
         assert grpo["seq_logprob_error_threshold"] is None
         assert grpo["async_grpo"]["enabled"] is async_enabled
+        assert grpo["length_aware_reward"]["enabled"] is False
         assert policy["is_vlm"] is True
         assert vllm_cfg["video"] == {
             "sampling_style": "nemotron_vl",
@@ -52,6 +53,26 @@ def test_video_grpo_recipes_preserve_unmasked_sync_and_async_contracts():
             "NRL_VIDEO_SAMPLING_STYLE",
             "NRL_VIDEO_TEMPORAL_PATCH_SIZE",
         } & set(vllm_cfg.get("env_vars", {}))
+
+
+def test_video_length_reward_recipes_preserve_arushi_experiment_contract():
+    async_recipe = _load_recipe(
+        "vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video-length-reward.v1.yaml"
+    )
+    sync_recipe = _load_recipe(
+        "vlm_grpo-nemotron-omni-30ba3b-2n8g-megatron-tp4ep4-gym-video-length-reward.v1.yaml"
+    )
+
+    for recipe, async_enabled in ((async_recipe, True), (sync_recipe, False)):
+        assert recipe["grpo"]["async_grpo"]["enabled"] is async_enabled
+        assert recipe["grpo"]["length_aware_reward"] == {
+            "enabled": True,
+            "tau1": 1024,
+            "tau2": 4096,
+            "weight": 0.05,
+            "composition": "correctness_gated",
+            "reasoning_end_token_id": 13,
+        }
 
 
 def test_video_recipe_materializes_one_sampling_contract_for_all_consumers():

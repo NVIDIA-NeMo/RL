@@ -26,6 +26,7 @@ from PIL import Image
 from transformers import AutoTokenizer
 
 import nemo_rl.experience.rollouts as rollouts_mod
+from nemo_rl.algorithms.reward_functions import LengthAwareRewardConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
@@ -1777,6 +1778,10 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
 
     clock = {"now": 0.0}
     payload_calls = []
+    length_aware_reward_config = LengthAwareRewardConfig(
+        enabled=True,
+        reasoning_end_token_id=13,
+    )
 
     class _FakeTimerContext:
         def __init__(self, timer, label):
@@ -1913,6 +1918,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
 
     def _postprocess_group(**kwargs):
         assert kwargs["log_full_result_tables"] is False
+        assert kwargs["length_aware_reward_config"] is length_aware_reward_config
         task_index = int(kwargs["nemo_gym_rows"][0]["_ng_task_index"])
         for result, original_log in zip(
             kwargs["results"], kwargs["input_batch"]["message_log"]
@@ -1979,6 +1985,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
             },
             num_generations=2,
             log_full_result_tables=False,
+            length_aware_reward_config=length_aware_reward_config,
             deduplicate_multimodal_data=True,
             debug_payload_metrics=True,
         ):
@@ -2106,8 +2113,75 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     ) is log_full_result_tables
 
 
+def test_postprocess_nemo_gym_group_applies_length_aware_reward():
+    rows = [
+        {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
+        {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
+    ]
+    assistant_token_ids = (torch.tensor([1, 2, 13]), torch.tensor([1, 13]))
+    results = []
+    for reward, token_ids in zip((1.0, 0.0), assistant_token_ids):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1]),
+        }
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": token_ids,
+                        "generation_logprobs": torch.full(token_ids.shape, -0.1),
+                    },
+                ],
+                "full_result": {"reward": reward},
+            }
+        )
+
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=False,
+        length_aware_reward_config=LengthAwareRewardConfig(
+            enabled=True,
+            tau1=1,
+            tau2=3,
+            weight=0.5,
+            composition="correctness_gated",
+            reasoning_end_token_id=13,
+        ),
+    )
+
+    assert rollout_result.final_batch["total_reward"].tolist() == pytest.approx(
+        [0.75, 0.0]
+    )
+    assert rollout_result.rollout_metrics["length_aware_reward/mean"] == pytest.approx(
+        0.75
+    )
+    assert rollout_result.rollout_metrics[
+        "reasoning_chain_tokens/mean"
+    ] == pytest.approx(1.5)
+
+
 def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
     input_batch = BatchedDataDict({"loss_multiplier": torch.ones(3)})
+    length_aware_reward_config = LengthAwareRewardConfig(
+        enabled=True,
+        reasoning_end_token_id=13,
+    )
     expected = rollouts_mod.NemoGymRolloutResult(
         input_ids=torch.empty(0),
         final_batch=input_batch,
@@ -2121,6 +2195,7 @@ def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
         assert kwargs["log_full_result_tables"] is False
         assert kwargs["deduplicate_multimodal_data"] is True
         assert kwargs["debug_payload_metrics"] is True
+        assert kwargs["length_aware_reward_config"] is length_aware_reward_config
         yield expected
 
     monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_stream)
@@ -2132,6 +2207,7 @@ def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
         task_to_env={},
         generation_config={},
         log_full_result_tables=False,
+        length_aware_reward_config=length_aware_reward_config,
         deduplicate_multimodal_data=True,
         debug_payload_metrics=True,
     )

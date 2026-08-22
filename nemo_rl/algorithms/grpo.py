@@ -53,6 +53,7 @@ from nemo_rl.algorithms.metric_utils import (
 )
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.reward_functions import (
+    LengthAwareRewardConfig,
     RewardShapingConfig,
     apply_reward_shaping,
 )
@@ -288,6 +289,9 @@ class GRPOConfig(BaseModel, extra="allow"):
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: float = 1.0
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
+    length_aware_reward: LengthAwareRewardConfig = Field(
+        default_factory=LengthAwareRewardConfig
+    )
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: bool = False
@@ -732,6 +736,9 @@ def setup(
     # spinup can overlap with vLLM model loading via deferred model load.
     enable_nemo_gym = should_use_nemo_gym(master_config)
     _raise_if_reward_penalties_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=enable_nemo_gym
+    )
+    _raise_if_length_aware_reward_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
     nemo_gym_actor = None
@@ -1984,6 +1991,22 @@ def _raise_if_reward_penalties_enabled_without_nemo_gym(
     )
 
 
+def _raise_if_length_aware_reward_enabled_without_nemo_gym(
+    master_config: MasterConfig,
+    *,
+    enable_nemo_gym: bool,
+) -> None:
+    """Validate length-aware reward is only enabled with NeMo-Gym."""
+    if enable_nemo_gym or not master_config.grpo.length_aware_reward.enabled:
+        return
+
+    raise ValueError(
+        "grpo.length_aware_reward requires the NeMo-Gym path "
+        "(env.should_use_nemo_gym=true); it is not supported with the native "
+        "generation path."
+    )
+
+
 def _apply_message_level_advantage_penalties(
     train_data: BatchedDataDict[ClippedPGLossDataDict],
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
@@ -2957,6 +2980,9 @@ def grpo_train(
                             max_rollout_turns=None,
                             greedy=False,
                             effort_config=_get_effort_config(master_config),
+                            length_aware_reward_config=(
+                                master_config.grpo.length_aware_reward
+                            ),
                             reward_penalty_config=master_config.reward_penalties,
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                             mask_env_flagged_samples=should_mask_flagged_samples(
@@ -3894,6 +3920,7 @@ def validate(
                     max_rollout_turns=None,
                     greedy=False,
                     effort_config=_get_effort_config(master_config),
+                    length_aware_reward_config=(master_config.grpo.length_aware_reward),
                     reward_penalty_config=master_config.reward_penalties,
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                     mask_env_flagged_samples=should_mask_flagged_samples(

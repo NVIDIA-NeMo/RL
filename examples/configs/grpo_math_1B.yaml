@@ -33,6 +33,15 @@ grpo:
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}
     stop_properly_penalty_coef: null
+  # Optional NeMo-Gym reasoning-chain length reward. The end-token ID is
+  # model/tokenizer specific and is required when enabled.
+  length_aware_reward:
+    enabled: false
+    tau1: 4096
+    tau2: 13000
+    weight: 0.1
+    composition: additive
+    reasoning_end_token_id: null
 
   # Advantage Estimator Configuration
   # Options: "grpo" (default) or "reinforce_plus_plus"
