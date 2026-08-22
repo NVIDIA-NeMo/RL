@@ -375,8 +375,7 @@ def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
         )
     ):
         raise _tq_shape_drift_error(
-            "MooncakeStoreClient no longer has the methods the staging pool "
-            "patches",
+            "MooncakeStoreClient no longer has the methods the staging pool patches",
             "reuse_registered_buffers cannot be honoured and every transfer "
             "would silently re-register its buffers",
             "call sites",
