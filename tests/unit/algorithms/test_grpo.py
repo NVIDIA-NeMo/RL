@@ -2540,11 +2540,11 @@ def test_noncolocated_opd_teacher_must_fit_on_one_cluster_node(
 
 
 @pytest.mark.parametrize(
-    "initial_skip_flag",
-    [None, False],
+    ("initial_skip_flag", "init_optimizer"),
+    [(None, True), (False, False)],
 )
 def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
-    monkeypatch, mock_grpo_components, initial_skip_flag
+    monkeypatch, mock_grpo_components, initial_skip_flag, init_optimizer
 ):
     from nemo_rl.algorithms import grpo as grpo_mod
 
@@ -2598,6 +2598,8 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         def set_rollout_num_gpus_per_engine(self, _num_gpus_per_engine):
             pass
 
+    policy_init_optimizer = []
+
     def legacy_policy_factory(
         *,
         cluster,
@@ -2609,6 +2611,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         init_optimizer,
         init_reference_model,
     ):
+        policy_init_optimizer.append(init_optimizer)
         del (
             cluster,
             config,
@@ -2616,7 +2619,6 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
             processor,
             weights_path,
             optimizer_path,
-            init_optimizer,
             init_reference_model,
         )
         return DummyPolicy()
@@ -2688,9 +2690,11 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         dataset,
         None,
         policy_factory=legacy_policy_factory,
+        init_optimizer=init_optimizer,
     )
 
     assert master_config.grpo.skip_reference_policy_logprobs_calculation is True
+    assert policy_init_optimizer == [init_optimizer]
 
 
 def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):

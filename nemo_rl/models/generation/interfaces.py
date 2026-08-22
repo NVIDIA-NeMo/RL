@@ -427,6 +427,13 @@ class GenerationInterface(ABC):
         """
         pass
 
+    def snapshot_step_metrics(self) -> None:
+        """Snapshot backend counters before a generation step."""
+
+    def get_step_metrics(self) -> dict[str, float]:
+        """Return backend metric deltas collected since the latest snapshot."""
+        return {}
+
     @abstractmethod
     def shutdown(self) -> bool:
         """Shut down generation resources; repeated calls must be safe."""
