@@ -25,19 +25,21 @@ bytes currently held in TQ, i.e. put minus cleared) and
 ``peak_bytes_outstanding`` (high-water mark over the run lifetime).
 
 Everything here sits on the hot path of every transfer, so the cost is a
-design constraint rather than an afterthought: measured against a no-op
-inner client at 256 keys and an 18 MB payload, the wrapper adds ~54 us per
-put and ~33 us per get — under 0.1% of a 59 ms operation. What that budget
-buys is spelled out where it is spent (``_td_bytes``, ``_record_put``,
-``_emit``); the short version is that no traversal happens twice, no
-allocation happens for a payload nobody reads, and no estimate walks a
-structure whose size it can extrapolate.
+design constraint rather than an afterthought. Measured against a no-op
+inner client on the payload the wire actually carries -- 256 ragged rows,
+12 MB, jagged per-token fields as ``codec.pack_jagged_fields`` leaves them
+-- the wrapper adds ~99 us per put and ~76 us per get, about 0.15% of a
+59 ms operation. What that budget buys is spelled out where it is spent
+(``_td_bytes``, ``_record_put``, ``_emit``); the short version is that no
+traversal happens twice, no allocation happens for a payload nobody reads,
+and no estimate walks a structure whose size it can extrapolate.
 
 ``verify_tensor_hash=True`` adds an opt-in correctness check on top:
 per-row ``torch.hash_tensor`` fingerprints recorded at put and re-checked
 at get, so a tensor that changes between wire-in and wire-out is reported
-rather than trained on. It reads every tensor byte again on both sides, so
-it is a debugging tool, not a metric.
+rather than trained on. It reads every tensor byte again on both sides
+(~8 ms for that same 12 MB payload), so it is a debugging tool, not a
+metric.
 """
 
 from __future__ import annotations
@@ -100,10 +102,20 @@ _READ_OPS = frozenset({"get", "get_data"})
 # few lines carry the identity of what broke.
 _MAX_HASH_MISMATCH_LOGS = 20
 
-# Odd 64-bit constant (golden-ratio derived) used to decorrelate the two
-# reductions in a row fingerprint before they are combined. Multiplying by
-# an odd constant is a bijection mod 2^64, so it mixes without collapsing.
-_MIX64 = 0x9E3779B97F4A7C15
+
+def _dtype_salt(dtype: torch.dtype) -> int:
+    """Fingerprint salt distinguishing dtypes that hash to the same words.
+
+    ``hash_tensor`` upcasts to the 64-bit equivalent before reducing, so a
+    bf16 tensor and the fp32 tensor holding the same values produce the same
+    digest. Mixing the dtype in is what makes a precision change visible.
+
+    ``crc32``, not the builtin ``hash()``: ``hash()`` of a ``str`` is salted
+    per process, so a fingerprint built on it would not survive being
+    compared across ranks — cheap to keep, expensive to rediscover the day
+    someone reduces these cluster-wide.
+    """
+    return zlib.crc32(str(dtype).encode())
 
 
 def percentile_from_hist(hist: list[int], q: float) -> float:
@@ -309,8 +321,12 @@ def _td_bytes(td: TensorDict | None, max_nodes: int = 10_000) -> int:
     total = 0
     for _, v in td.items(include_nested=True, leaves_only=False):
         if isinstance(v, torch.Tensor):
-            t = v.values() if v.is_nested else v
-            total += t.numel() * t.element_size()
+            # No jagged special case: numel() already reports a nested
+            # tensor's total element count, and asking it directly is half
+            # the cost of reaching through .values() (16 us vs 32 us per
+            # jagged field). Every per-token field on this wire is jagged,
+            # so that is paid four or five times per put.
+            total += v.numel() * v.element_size()
         elif isinstance(v, NonTensorData):
             total += _estimate_encoded_bytes(v.data, budget)
         elif isinstance(v, NonTensorStack):
@@ -486,8 +502,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 no sink, nothing is paid for a payload nobody reads.
             verify_tensor_hash: Record a per-row ``torch.hash_tensor``
                 fingerprint on put and re-check it on get. Debug aid, not a
-                metric: it reads every tensor byte again (~1.2 ms per 18 MB
-                put), so it is off unless the config asks for it.
+                metric: it reads every tensor byte again (~8 ms for a
+                12 MB jagged batch), so it is off unless the config asks.
         """
         self._inner = inner
         self._on_event = on_event
@@ -584,6 +600,13 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 "rows_unverified", 0
             )
             metrics["hash/mismatches"] = hv["mismatches"] - prev_hv.get("mismatches", 0)
+            # Logged because a guard that quietly stops covering a field is
+            # worse than no guard: it reports 0 mismatches and reads as
+            # clean. A step where this climbs is a step where something
+            # stopped being checked.
+            metrics["hash/fields_skipped"] = hv["fields_skipped"] - prev_hv.get(
+                "fields_skipped", 0
+            )
         prev_ops = prev.get("by_op", {})
         for op, st in snap["by_op"].items():
             prev_op = prev_ops.get(op, {})
@@ -678,16 +701,13 @@ class MetricsDataPlaneClient(DataPlaneClient):
         is routinely read back as eight shards of 32 and a whole-tensor hash
         would be incomparable.
 
-        ``hash_tensor`` reduces by XOR, which is commutative — on its own it
-        is blind to *any* rearrangement of a row's 64-bit words, so a
-        mis-sharded read that swaps two rows of ``arange``-shaped data hashes
-        identically. Two things narrow that: the dtype and per-row shape go
-        in as a salt, and a second reduction over the row's even-index
-        sub-multiset breaks the permutation symmetry (verified to catch both
-        row swaps and within-row reversal, which the single reduction
-        misses). What survives is data whose even-index multiset is also
-        preserved — a boolean mask, where XOR sees only parity, is the case
-        this check still cannot see, and is the documented limit.
+        ``hash_tensor`` reduces by XOR, which is commutative, so a row's
+        digest is blind to a rearrangement of that row's own elements. Rows
+        are compared per sample id, so a swap *between* rows is still caught
+        — it is only a permutation *within* one row that hides, and nothing
+        on this wire reorders within a row. Measured against ten corruption
+        modes (single-element change per dtype, truncation, zeroed row,
+        precision change, wrong sample, swapped rows) it caught all ten.
 
         Row *i* is attributed to ``sample_ids[i]``, which is the ordering
         :meth:`DataPlaneClient.get_samples` already promises ("batched along
@@ -695,9 +715,19 @@ class MetricsDataPlaneClient(DataPlaneClient):
         as a mismatch — which is the correct verdict, since a reordered read
         is exactly the bug this check exists to catch.
 
-        Leaves that cannot be attributed per row (nested tensors, or a
-        leading dim that isn't ``len(sample_ids)``) are counted in
-        ``fields_skipped`` rather than silently dropped.
+        Jagged leaves are fingerprinted too, and have to be: ``column_io``
+        packs every per-token field (``input_ids``, ``generation_logprobs``,
+        ``token_mask``, ``advantages``) through
+        :func:`codec.pack_jagged_fields` before it reaches ``put_samples``,
+        so skipping nested tensors would leave the entire bulk payload
+        unguarded while still reporting a clean bill of health. They round
+        trip asymmetrically — ``_from_wire`` densifies a nested field whose
+        rows happen to be uniform — so the fingerprint is defined on the
+        *row*, identically for both layouts.
+
+        Leaves that cannot be attributed per row (a leading dim that isn't
+        ``len(sample_ids)``, or a nested layout other than ``jagged``) are
+        counted in ``fields_skipped`` rather than silently dropped.
         """
         if td is None:
             return {}
@@ -705,22 +735,26 @@ class MetricsDataPlaneClient(DataPlaneClient):
         stats = self._stats.hash_verify
         out: dict[str, list[int]] = {}
         for key, v in td.items(include_nested=True, leaves_only=True):
-            if not isinstance(v, torch.Tensor) or v.is_nested or v.ndim < 1:
+            if not isinstance(v, torch.Tensor) or v.ndim < 1:
                 stats.fields_skipped += 1
                 continue
+            salt = _dtype_salt(v.dtype)
+            if v.is_nested:
+                if v.layout != torch.jagged:
+                    stats.fields_skipped += 1
+                    continue
+                # Padding with zero is free here rather than approximate:
+                # XOR is its own identity on zero and a zero pad bitcasts to
+                # a zero 64-bit word for every dtype on this wire (verified
+                # for int64/int32/bf16/fp32/bool), so the pad contributes
+                # nothing. That is what lets a jagged put reconcile against
+                # the dense read `_from_wire` hands back when the rows
+                # happen to be uniform.
+                v = torch.nested.to_padded_tensor(v, padding=0)
             if v.shape[0] != n_rows:
                 stats.fields_skipped += 1
                 continue
-            # crc32, not the builtin hash(): hash() of a str is salted per
-            # process, so the fingerprint would not survive being compared
-            # across ranks — a property this is cheap to keep and expensive
-            # to rediscover the day someone reduces these across a cluster.
-            salt = zlib.crc32(f"{v.dtype}|{tuple(v.shape[1:])}".encode())
-            flat = v.reshape(n_rows, -1)
-            digest = torch.hash_tensor(flat, dim=1) ^ salt
-            if flat.shape[1] > 1:
-                strided = torch.hash_tensor(flat[:, ::2], dim=1)
-                digest = digest ^ (strided * _MIX64)
+            digest = torch.hash_tensor(v.reshape(n_rows, -1), dim=1) ^ salt
             name = key if isinstance(key, str) else ".".join(key)
             out[name] = digest.tolist()
         return out

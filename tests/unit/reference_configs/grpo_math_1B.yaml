@@ -535,7 +535,7 @@ data_plane:
     staging_buffer_size:   268435456 # 256 MiB/pool slot; bigger transfers bypass the pool
   observability:                      # per-op data-plane timing/volume
     enabled: false                    # true => wrap client in MetricsDataPlaneClient
-    verify_tensor_hash: false         # debug: per-row torch.hash_tensor wire-in vs wire-out (~1.2ms per 18MB)
+    verify_tensor_hash: false         # debug: per-row torch.hash_tensor wire-in vs wire-out (~8ms per 12MB batch)
 
 # Multi-Teacher On-Policy Distillation (MOPD); null = disabled (default). Mirrors
 # the field on the GRPO MasterConfig added for MOPD support.

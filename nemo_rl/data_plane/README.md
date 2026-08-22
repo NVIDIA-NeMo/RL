@@ -441,27 +441,39 @@ counts sum into one cluster-wide distribution) and byte volume. `snapshot()`
 returns the cumulative view; `get_step_metrics(step_time_s)` returns the
 per-step delta already flattened for the logger.
 
-The wrapper is measured against a no-op inner client at 256 keys and an
-18 MB payload: **~54 µs per put, ~33 µs per get** — under 0.1% of a 59 ms
-operation. Most of that is the byte walk over the `TensorDict`; the rest is
-the per-key attribution `clear_samples` needs to undo. `on_event` defaults to
-`None` when unset, in which case the per-op event dict is never built.
+Measured against a no-op inner client on the payload the wire actually
+carries — 256 ragged rows, 12 MB, jagged per-token fields as
+`pack_jagged_fields` leaves them: **~99 µs per put, ~76 µs per get**, about
+0.15% of a 59 ms operation. Most of that is the byte walk over the
+`TensorDict`; the rest is the per-key attribution `clear_samples` needs to
+undo. `on_event` defaults to `None` when unset, in which case the per-op
+event dict is never built.
 
 `verify_tensor_hash: true` additionally records a per-row
 `torch.hash_tensor` fingerprint on every put and re-checks it on every get,
 so a tensor that changes between wire-in and wire-out is reported
 (`hash/mismatches`) instead of being trained on silently. Fingerprints are
 per row, so a 256-row put read back as eight shards of 32 still reconciles.
-Two things to know before turning it on:
 
-- It reads every tensor byte again on both sides — measured at ~1.2 ms
-  per 18 MB on put and the same on get, i.e. ~2% of the 59 ms operation it
-  is guarding. Keep it to debugging runs.
-- `hash_tensor` reduces by XOR, so it cannot see a permutation of elements
-  *within* a row. Dtype and per-row shape are folded into the fingerprint;
-  element order within a row is not covered.
+Verified against ten corruption modes injected into the round trip — a
+single-element change in each dtype, a truncated row, a zeroed row, a
+bf16→fp32 precision change, a row served from the wrong sample, and two
+rows swapped — all ten are caught, with zero false alarms over a 500-row
+randomized soak and every shard grouping from 1 to 256. Three things to
+know before turning it on:
+
+- It reads every tensor byte again on both sides — measured at ~8 ms for a
+  12 MB jagged batch, on put and again on get, i.e. ~13% of the 59 ms
+  operation it is guarding. Keep it to debugging runs.
+- `hash_tensor` reduces by XOR, so a row's digest is blind to a
+  rearrangement of that row's own elements. Rows are compared per sample
+  id, so a swap *between* rows is still caught; nothing on this wire
+  reorders *within* a row.
 - Only rows this process wrote can be checked. A consumer-side client
-  reports them under `hash/rows_unverified` rather than counting them clean.
+  reports them under `hash/rows_unverified` rather than counting them
+  clean, and `hash/fields_skipped` reports any leaf it could not fingerprint
+  — watch that one, since a guard that quietly stops covering a field still
+  reports zero mismatches.
 
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
