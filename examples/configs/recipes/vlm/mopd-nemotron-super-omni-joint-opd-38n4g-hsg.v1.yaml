@@ -228,6 +228,14 @@ on_policy_distillation:
         precision: bf16
         micro_batch_size: 1
         moe_shared_expert_overlap: false
+        # text-only teacher under a VLM student: strip the omni base's VLM
+        # tower keys or import_model_from_hf_name raises "HybridModelProvider
+        # has no such field" (job 6442219). __unset__ removes the key.
+        radio_force_cpe_eval_mode: __unset__
+        freeze_vision_model: __unset__
+        freeze_vision_projection: __unset__
+        freeze_sound_encoder: __unset__
+        freeze_sound_projection: __unset__
 logger:
   log_dir: logs/mopd-super-omni-joint-opd-hsg
   wandb:
