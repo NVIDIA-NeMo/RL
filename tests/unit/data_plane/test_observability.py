@@ -343,7 +343,7 @@ def test_step_metrics_use_one_unit_per_dimension():
     )
     keys = set(client.get_step_metrics(1.0))
     assert not [k for k in keys if k.endswith(("_s", "_gb", "_kb", "_us"))], keys
-    assert "wall_ms" in keys and "comm_volume_mb" in keys
+    assert "step/wall_ms" in keys and "step/comm_volume_mb" in keys
     client.close()
 
 
@@ -359,9 +359,9 @@ def test_step_metrics_tail_is_exact_not_bucketed():
     client._emit("put", "p", 1, 8, monotonic() - 0.030, "ok")  # a 30 ms call
     metrics = client.get_step_metrics(1.0)
 
-    assert "put/p99_ms" not in metrics and "put/p50_ms" not in metrics
-    assert metrics["put/max_ms"] >= 30.0
-    assert metrics["put/max_ms"] != pytest.approx(24.85, abs=0.5), "bucket edge"
+    assert "put/p99_ms" not in metrics and "step/put/p50_ms" not in metrics
+    assert metrics["step/put/max_ms"] >= 30.0
+    assert metrics["step/put/max_ms"] != pytest.approx(24.85, abs=0.5), "bucket edge"
     # the cumulative view still carries percentiles for one-off inspection
     assert "p99_ms" in client.snapshot()["by_op"]["put"]
     client.close()
@@ -390,9 +390,9 @@ def test_latency_breakdown_stacks_to_wall_ms():
     assert fit["bandwidth_mb_s"] == pytest.approx(mb_per_s, rel=0.05)
 
     # the two components are the split, in ms, and they add up
-    total = metrics["put/overhead_ms"] + metrics["put/transfer_ms"]
-    assert total == pytest.approx(metrics["put/wall_ms"], rel=0.05)
-    assert "put/overhead_frac" not in metrics, "a ratio is derivable from these"
+    total = metrics["step/put/overhead_ms"] + metrics["step/put/transfer_ms"]
+    assert total == pytest.approx(metrics["step/put/wall_ms"], rel=0.05)
+    assert "step/put/overhead_frac" not in metrics, "a ratio is derivable from these"
     client.close()
 
 
@@ -402,9 +402,9 @@ def test_step_max_is_scoped_to_the_step():
     reported max must fall again when a step is quicker."""
     client = MetricsDataPlaneClient(NoOpDataPlaneClient())
     client._emit("put", "p", 1, 8, monotonic() - 0.050, "ok")  # slow step
-    slow = client.get_step_metrics(1.0)["put/max_ms"]
+    slow = client.get_step_metrics(1.0)["step/put/max_ms"]
     client._emit("put", "p", 1, 8, monotonic() - 0.001, "ok")  # quick step
-    quick = client.get_step_metrics(1.0)["put/max_ms"]
+    quick = client.get_step_metrics(1.0)["step/put/max_ms"]
 
     assert slow >= 50.0
     assert quick < slow, "step max must reset, not carry the lifetime worst"
@@ -492,7 +492,7 @@ def test_hash_verification_detects_corruption():
 
     hv = client.snapshot()["hash_verify"]
     assert hv["mismatches"] == 1
-    assert client.get_step_metrics(1.0)["hash/mismatches"] == 1
+    assert client.get_step_metrics(1.0)["step/hash/mismatches"] == 1
     client.close()
 
 
@@ -611,7 +611,7 @@ def test_hash_incomparable_field_is_counted_not_dropped():
     hv = client.snapshot()["hash_verify"]
     assert hv["mismatches"] == 0, "must not cry wolf on an incomparable field"
     assert hv["fields_skipped"] == 1, "the drop must be visible"
-    assert client.get_step_metrics(1.0)["hash/fields_skipped"] == 1
+    assert client.get_step_metrics(1.0)["step/hash/fields_skipped"] == 1
 
 
 class _RaggedOnReadClient(NoOpDataPlaneClient):
@@ -667,7 +667,7 @@ def test_hash_verification_off_by_default():
 
     assert client.snapshot()["hash_verify"]["rows_recorded"] == 0
     assert client._hash_by_partition == {}
-    assert "hash/mismatches" not in client.get_step_metrics(1.0)
+    assert "step/hash/mismatches" not in client.get_step_metrics(1.0)
     client.close()
 
 
@@ -732,32 +732,28 @@ def test_cluster_step_metrics_report_their_own_cost():
     merged = merge_snapshots([client.snapshot()])
     metrics = cluster_step_metrics(merged, {}, 1.0)
 
-    assert metrics["n_processes"] == 1
-    assert metrics["observability_overhead_ms"] > 0, "measuring is never free"
+    assert metrics["now/n_processes"] == 1
+    assert metrics["step/observability_overhead_ms"] > 0, "measuring is never free"
     # Deliberately not clamped to 1. Against this no-op inner client the RPC
     # is instant, so measuring costs more than the thing measured and the
     # ratio exceeds 100% -- which is exactly the signal worth surfacing.
     # Against a real backend it lands near 0.01.
-    assert metrics["observability_overhead_frac"] > 0
-    assert "wall_ms" in metrics and "comm_volume_mb" in metrics
+    assert metrics["step/observability_overhead_frac"] > 0
+    assert "step/wall_ms" in metrics and "step/comm_volume_mb" in metrics
     client.close()
 
 
-def test_cluster_busy_fraction_is_bounded():
-    """``wall_ms`` is summed over processes that ran concurrently, so
-    dividing it by one step's wall clock exceeds 1 whenever they
-    overlapped — measured 1.054 across ten processes, which reads as
-    '105% of the step'. The mean per-process fraction is bounded."""
-    # Physical fixture: each rank spends 500 ms inside a 1 s step. A rank
-    # cannot spend longer in the data plane than the step lasted, so a
-    # fixture that implies it would be testing the arithmetic on impossible
-    # input rather than the metric.
+def test_cluster_time_is_per_process_not_a_bare_fraction():
+    """``wall_ms`` sums processes that ran concurrently, so dividing it by
+    one step's wall clock exceeded 1 whenever they overlapped and read as
+    "105% of the step". Reported per process it is a duration in ms, like
+    everything else, and needs no gloss."""
     ranks = [_rank_with([100.0] * 5) for _ in range(10)]
     metrics = cluster_step_metrics(merge_snapshots(ranks), {}, 1.0)
 
-    assert "frac_of_step" not in metrics
-    assert 0.0 <= metrics["busy_frac_mean"] <= 1.0, metrics["busy_frac_mean"]
-    assert metrics["n_processes"] == 10
+    assert "busy_frac_mean" not in metrics and "frac_of_step" not in metrics
+    assert metrics["step/wall_ms_per_process"] == pytest.approx(500.0, rel=0.1)
+    assert metrics["now/n_processes"] == 10
 
 
 def test_cluster_overhead_includes_the_collection_fan_out():
@@ -778,7 +774,8 @@ def test_cluster_overhead_includes_the_collection_fan_out():
     with_gather = cluster_step_metrics(merged, {}, 1.0, collect_ms=2.31)
 
     delta = (
-        with_gather["observability_overhead_ms"] - without["observability_overhead_ms"]
+        with_gather["step/observability_overhead_ms"]
+        - without["step/observability_overhead_ms"]
     )
     assert delta == pytest.approx(2.31, rel=1e-6)
     client.close()
@@ -801,10 +798,10 @@ def test_cluster_percentiles_never_exceed_the_measured_max():
     merged = merge_snapshots([_rank_with([120.0] * 20) for _ in range(8)])
     metrics = cluster_step_metrics(merged, {}, 1.0)
 
-    assert metrics["put/max_ms"] == pytest.approx(120.0, abs=2.0)
-    assert metrics["put/p50_ms"] <= metrics["put/max_ms"]
-    assert metrics["put/p99_ms"] <= metrics["put/max_ms"]
-    assert metrics["put/p50_ms"] <= metrics["put/p99_ms"]
+    assert metrics["step/put/max_ms"] == pytest.approx(120.0, abs=2.0)
+    assert metrics["step/put/p50_ms"] <= metrics["step/put/max_ms"]
+    assert metrics["step/put/p99_ms"] <= metrics["step/put/max_ms"]
+    assert metrics["step/put/p50_ms"] <= metrics["step/put/p99_ms"]
 
 
 def test_cluster_percentiles_withheld_below_a_useful_sample_count():
@@ -813,6 +810,28 @@ def test_cluster_percentiles_withheld_below_a_useful_sample_count():
     few = merge_snapshots([_rank_with([120.0] * 3) for _ in range(2)])  # 6 calls
     many = merge_snapshots([_rank_with([120.0] * 20) for _ in range(8)])  # 160
 
-    assert "put/p50_ms" not in cluster_step_metrics(few, {}, 1.0)
-    assert "put/max_ms" in cluster_step_metrics(few, {}, 1.0), "max always works"
-    assert "put/p50_ms" in cluster_step_metrics(many, {}, 1.0)
+    assert "step/put/p50_ms" not in cluster_step_metrics(few, {}, 1.0)
+    assert "step/put/max_ms" in cluster_step_metrics(few, {}, 1.0), "max always works"
+    assert "step/put/p50_ms" in cluster_step_metrics(many, {}, 1.0)
+
+
+def test_cluster_series_declare_delta_or_level():
+    """A per-step delta and an instantaneous level shared the ``_mb`` suffix
+    and a chart, with nothing to tell them apart. Every series now sits
+    under ``step/`` or ``now/`` so the kind is on the axis label."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["t"]
+    )
+    client.put_samples(
+        sample_ids=["a"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.zeros(1, 8)}, batch_size=[1]),
+    )
+    metrics = cluster_step_metrics(merge_snapshots([client.snapshot()]), {}, 1.0)
+
+    unlabelled = [k for k in metrics if not k.startswith(("step/", "now/"))]
+    assert not unlabelled, unlabelled
+    assert "now/bytes_outstanding_mb" in metrics, "a level"
+    assert "step/comm_volume_mb" in metrics, "a delta"
+    client.close()
