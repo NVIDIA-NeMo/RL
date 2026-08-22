@@ -36,6 +36,36 @@ def get_num_buffers():
     return int(os.getenv("NRL_REFIT_NUM_BUFFERS", "2"))
 
 
+def _broadcast_preflight_status(group, src: int, *, failed: bool) -> bool:
+    """Make failure status the first collective in every packed refit."""
+    status = torch.tensor(
+        int(failed),
+        dtype=torch.int32,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    group.broadcast(status, src=src)
+    return bool(status.item())
+
+
+def packed_broadcast_preflight_producer(
+    group,
+    src: int,
+    error: Exception | None,
+) -> None:
+    """Publish producer readiness before any shared model-update payload."""
+    if not _broadcast_preflight_status(group, src, failed=error is not None):
+        return
+    if error is not None:
+        raise RuntimeError(str(error)) from error
+    raise RuntimeError("Packed-broadcast producer preflight failed on source rank")
+
+
+def packed_broadcast_preflight_consumer(group, src: int) -> None:
+    """Receive producer readiness before entering shared payload collectives."""
+    if _broadcast_preflight_status(group, src, failed=False):
+        raise RuntimeError("Packed-broadcast producer preflight failed")
+
+
 def packed_broadcast_producer(
     iterator,
     group,
@@ -44,6 +74,8 @@ def packed_broadcast_producer(
     *,
     buffer_size_bytes: int | None = None,
     num_buffers: int | None = None,
+    preflight_error: Exception | None = None,
+    preflight_checked: bool = False,
 ):
     """Broadcast a list of tensors in a packed manner.
 
@@ -54,11 +86,18 @@ def packed_broadcast_producer(
         post_iter_func: function to apply to each tensor before packing, should return a tensor
         buffer_size_bytes: packed-buffer target. Uses the NeMo-RL default when unset.
         num_buffers: number of alternating CUDA buffers. Uses the default when unset.
+        preflight_error: local producer error synchronized before any payload broadcast.
+        preflight_checked: caller already completed the shared readiness collective.
 
     Returns:
         None
 
     """
+    if not preflight_checked:
+        packed_broadcast_preflight_producer(group, src, preflight_error)
+    elif preflight_error is not None:
+        raise RuntimeError(str(preflight_error)) from preflight_error
+
     target_packed_tensor_size = (
         get_target_packed_tensor_size()
         if buffer_size_bytes is None
@@ -126,7 +165,14 @@ def packed_broadcast_producer(
         s.synchronize()
 
 
-def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
+def packed_broadcast_consumer(
+    iterator,
+    group,
+    src,
+    post_unpack_func,
+    *,
+    preflight_checked: bool = False,
+):
     """Consume a packed tensor and unpack it into a list of tensors.
 
     Args:
@@ -139,6 +185,8 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
         None
 
     """
+    if not preflight_checked:
+        packed_broadcast_preflight_consumer(group, src)
 
     def unpack_tensor(
         packed_tensor: torch.Tensor, meta_data_list: list[Any]

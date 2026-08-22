@@ -152,15 +152,21 @@ def test_stream_weights_releases_buffers_before_complete_without_full_gc(
         buffer_refs.append(weakref.ref(buffer))
         return buffer
 
+    def ipc_collect():
+        events.append("ipc_collect")
+        assert len(buffer_refs) == 2
+        assert all(buffer_ref() is None for buffer_ref in buffer_refs)
+
     def empty_cache():
         events.append("empty_cache")
+        assert events == ["ipc_collect", "empty_cache"]
         assert len(buffer_refs) == 2
         assert all(buffer_ref() is None for buffer_ref in buffer_refs)
 
     class ReleaseAwareSocket(_FakeIpcSocket):
         def send_pyobj(self, payload):
             if payload == IPCProtocol.COMPLETE:
-                assert events == ["empty_cache"]
+                assert events == ["ipc_collect", "empty_cache"]
                 assert all(buffer_ref() is None for buffer_ref in buffer_refs)
             super().send_pyobj(payload)
 
@@ -171,6 +177,7 @@ def test_stream_weights_releases_buffers_before_complete_without_full_gc(
         "current_stream",
         lambda: unittest.mock.Mock(synchronize=lambda: None),
     )
+    monkeypatch.setattr(torch.cuda, "ipc_collect", ipc_collect)
     monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
     monkeypatch.setattr(
         "nemo_rl.models.policy.utils.get_handle_from_tensor",
@@ -190,8 +197,50 @@ def test_stream_weights_releases_buffers_before_complete_without_full_gc(
         worker_name="test_worker",
     )
 
-    assert events == ["empty_cache"]
+    assert events == ["ipc_collect", "empty_cache"]
     assert socket.sent[-1] == IPCProtocol.COMPLETE
+
+
+def test_stream_weights_collects_oversized_ipc_handle_before_empty_cache(
+    monkeypatch,
+):
+    tensor = torch.ones(2048, dtype=torch.float32)
+    events = []
+
+    def ipc_collect():
+        events.append("ipc_collect")
+
+    def empty_cache():
+        assert events[-1] == "ipc_collect"
+        events.append("empty_cache")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: unittest.mock.Mock(synchronize=lambda: None),
+    )
+    monkeypatch.setattr(torch.cuda, "ipc_collect", ipc_collect)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        lambda _buffer: ("ipc-handle",),
+    )
+
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=iter([("oversized", tensor)]),
+        buffer_size_bytes=4096,
+        zmq_socket=_FakeIpcSocket(),
+        rank=0,
+        worker_name="test_worker",
+    )
+
+    assert events == [
+        "ipc_collect",
+        "empty_cache",
+        "ipc_collect",
+        "empty_cache",
+    ]
 
 
 def test_stream_weights_via_ipc_zmq_uses_cuda_buffer_for_cpu_tensors(monkeypatch):
