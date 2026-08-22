@@ -26,6 +26,7 @@ from nemo_rl.models.megatron.draft.hidden_capture import CapturedStates
 from nemo_rl.models.megatron.draft.sequence_layout import build_draft_sequence_layout
 from nemo_rl.models.megatron.draft.training import (
     DFlashForwardOutput,
+    _embed_dflash_mask_tokens,
     resolve_draft_speculator,
 )
 from nemo_rl.models.policy.draft_config import DFlashDraftConfig
@@ -83,6 +84,63 @@ def _provider():
     )
     assert provider is not None
     return provider
+
+
+class _SequenceParallelEmbedding(torch.nn.Module):
+    reduce_scatter_embeddings = True
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.seen_ids: Tensor | None = None
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        self.seen_ids = input_ids
+        assert input_ids.shape[1] % 2 == 0
+        local_sequence_length = input_ids.shape[1] // 2
+        return torch.arange(
+            local_sequence_length * input_ids.shape[0] * self.hidden_size,
+            dtype=torch.float32,
+        ).reshape(local_sequence_length, input_ids.shape[0], self.hidden_size)
+
+
+@pytest.mark.parametrize("num_anchors", [0, 2])
+def test_dflash_mask_embedding_pads_and_reconstructs_target_sp_gamma(
+    monkeypatch: pytest.MonkeyPatch,
+    num_anchors: int,
+) -> None:
+    embedding = _SequenceParallelEmbedding(hidden_size=3)
+    mask_ids = torch.full((num_anchors, 5), 7, dtype=torch.int64)
+    gathered_local: list[Tensor] = []
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+
+    def gather(local: Tensor, *, gather_dim: int, group: object) -> Tensor:
+        del group
+        assert gather_dim == 0
+        gathered_local.append(local)
+        return torch.cat((local, local + 100), dim=0)
+
+    monkeypatch.setattr(
+        "nemo_rl.models.megatron.draft.training.all_gather_tensor_autograd",
+        gather,
+    )
+
+    output = _embed_dflash_mask_tokens(
+        embedding,
+        mask_ids,
+        tensor_parallel_group=object(),
+    )
+
+    assert embedding.seen_ids is not None
+    assert embedding.seen_ids.shape == (num_anchors, 6)
+    torch.testing.assert_close(embedding.seen_ids[:, :5], mask_ids)
+    assert output.shape == (num_anchors, 5, 3)
+    expected = torch.cat((gathered_local[0], gathered_local[0] + 100), dim=0)[
+        :5
+    ].transpose(0, 1)
+    torch.testing.assert_close(output, expected)
 
 
 def test_dflash_provider_prepares_forward_and_raw_position_bins() -> None:
@@ -253,10 +311,13 @@ def test_dflash_provider_consumes_reconstructed_sp_captures_on_cp_owner() -> Non
         output.plan.sample_rows[0],
         output.plan.packed_rope_positions[0, 1],
     ] = 0
-    expected_loss_mask = output.plan.loss_mask & data["token_mask"].to(torch.bool)[
-        output.plan.sample_rows[:, None],
-        output.plan.packed_rope_positions,
-    ]
+    expected_loss_mask = (
+        output.plan.loss_mask
+        & data["token_mask"].to(torch.bool)[
+            output.plan.sample_rows[:, None],
+            output.plan.packed_rope_positions,
+        ]
+    )
     torch.testing.assert_close(
         provider._loss_mask(output.plan, data, layout),
         expected_loss_mask,

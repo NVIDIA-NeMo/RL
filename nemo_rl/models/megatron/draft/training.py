@@ -22,6 +22,7 @@ from megatron.core.transformer import MegatronModule
 from megatron.core.utils import unwrap_model
 import torch
 from torch import Tensor
+from torch.distributed._functional_collectives import all_gather_tensor_autograd
 
 from nemo_rl.algorithms.loss.draft import (
     DraftLossStats,
@@ -84,6 +85,40 @@ class DSparkForwardOutput:
     adapter: Any
     sequence_layout: DraftSequenceLayout | None = None
     selected_teacher_logits: Tensor | None = None
+
+
+def _embed_dflash_mask_tokens(
+    word_embeddings: torch.nn.Module,
+    mask_ids: Tensor,
+    *,
+    tensor_parallel_group: torch.distributed.ProcessGroup | None,
+) -> Tensor:
+    """Embed selected mask blocks while undoing target sequence parallelism."""
+    if not bool(getattr(word_embeddings, "reduce_scatter_embeddings", False)):
+        return word_embeddings(mask_ids)
+    if tensor_parallel_group is None or not torch.distributed.is_initialized():
+        raise RuntimeError(
+            "DFlash target-SP mask embeddings require an initialized TP group"
+        )
+
+    tp_size = torch.distributed.get_world_size(tensor_parallel_group)
+    gamma = mask_ids.shape[1]
+    padded_gamma = ((gamma + tp_size - 1) // tp_size) * tp_size
+    if padded_gamma != gamma:
+        padding = mask_ids[:, :1].expand(-1, padded_gamma - gamma)
+        mask_ids = torch.cat((mask_ids, padding), dim=1)
+
+    local_embeddings = word_embeddings(mask_ids)
+    gathered_embeddings = all_gather_tensor_autograd(
+        local_embeddings,
+        gather_dim=0,
+        group=tensor_parallel_group,
+    )
+    if gathered_embeddings.shape[0] != padded_gamma:
+        raise RuntimeError(
+            "target-SP mask embedding gather did not reconstruct the padded block"
+        )
+    return gathered_embeddings[:gamma].transpose(0, 1).contiguous()
 
 
 class DraftTrainingProvider(Protocol):
@@ -421,7 +456,7 @@ class DFlashSpeculator:
         context_parallel_group: torch.distributed.ProcessGroup | None,
         tensor_parallel_group: torch.distributed.ProcessGroup | None,
     ) -> None:
-        del attention_mask, tensor_parallel_group
+        del attention_mask
         if captured_states.hidden_states is None:
             raise RuntimeError("DFlash training did not capture target hidden states")
         if captured_states.inputs_embeds is None:
@@ -492,7 +527,11 @@ class DFlashSpeculator:
             device=input_embeddings.device,
         )
         with torch.no_grad():
-            mask_embeddings = word_embeddings(mask_ids)
+            mask_embeddings = _embed_dflash_mask_tokens(
+                word_embeddings,
+                mask_ids,
+                tensor_parallel_group=tensor_parallel_group,
+            )
         block_embeddings = torch.cat((anchor_embeddings, mask_embeddings), dim=1)
         output_weight = get_policy_lm_head_weight(policy_model).detach()
         selected_teacher_logits = None
