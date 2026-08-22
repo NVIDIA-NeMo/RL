@@ -1097,6 +1097,7 @@ class SingleControllerActor:
                             await asyncio.to_thread(
                                 self._trainer.begin_train_step,
                                 self._loss_fn,
+                                draft_update_decision=cadence_decision,
                             )
                             step_open = True
                         await asyncio.to_thread(

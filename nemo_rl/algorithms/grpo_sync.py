@@ -73,6 +73,7 @@ from nemo_rl.algorithms.draft_cadence_runtime import (
 )
 from nemo_rl.algorithms.draft_update_schedule import (
     DraftDecisionLedger,
+    DraftUpdateDecision,
     FileDraftStepTransactionStore,
 )
 from nemo_rl.algorithms.loss import (
@@ -166,6 +167,7 @@ def _train_policy_from_meta(
     timer: Timer | None,
     train_fields: tuple[str, ...],
     master_config: MasterConfig,
+    draft_update_decision: DraftUpdateDecision | None = None,
 ) -> dict[str, Any]:
     """Train one TQ step, using the split lifecycle required by packed CP."""
     if not _should_use_split_draft_training(master_config):
@@ -174,6 +176,7 @@ def _train_policy_from_meta(
             loss_fn=loss_fn,
             timer=timer,
             train_fields=train_fields,
+            draft_update_decision=draft_update_decision,
         )
 
     split_methods = (
@@ -194,7 +197,7 @@ def _train_policy_from_meta(
         )
 
     try:
-        policy.begin_train_step(loss_fn)
+        policy.begin_train_step(loss_fn, draft_update_decision=draft_update_decision)
         policy.train_microbatches_from_meta(
             meta,
             timer=timer,
@@ -1139,6 +1142,7 @@ def grpo_train_sync(
                         timer=timer,
                         train_fields=train_fields,
                         master_config=master_config,
+                        draft_update_decision=cadence_decision,
                     )
                     draft_config = master_config.policy.get("draft")
                     if draft_config is not None and draft_config.enabled:

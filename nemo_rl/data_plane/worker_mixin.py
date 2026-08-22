@@ -47,6 +47,7 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 
 if TYPE_CHECKING:
+    from nemo_rl.algorithms.draft_update_schedule import DraftUpdateDecision
     from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
     from nemo_rl.data_plane.interfaces import DataPlaneClient
 
@@ -475,18 +476,22 @@ class TQWorkerMixin:
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        *,
+        draft_update_decision: "DraftUpdateDecision | None" = None,
     ) -> dict[str, Any]:
         """Per-rank training entrypoint. Fetch → packing prep → delegate."""
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
         data = _attach_draft_sample_ids(data, meta.sample_ids)
-        return self.train(  # type: ignore[attr-defined]
-            data,
-            loss_fn=loss_fn,
-            eval_mode=eval_mode,
-            gbs=gbs,
-            mbs=mbs,
-        )
+        kwargs: dict[str, Any] = {
+            "loss_fn": loss_fn,
+            "eval_mode": eval_mode,
+            "gbs": gbs,
+            "mbs": mbs,
+        }
+        if draft_update_decision is not None:
+            kwargs["draft_update_decision"] = draft_update_decision
+        return self.train(data, **kwargs)  # type: ignore[attr-defined]
 
     @wrap_with_nvtx_name("policy_worker/get_logprobs_presharded")
     def get_logprobs_presharded(
@@ -557,6 +562,8 @@ class TQWorkerMixin:
         loss_fn: Any,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        *,
+        draft_update_decision: "DraftUpdateDecision | None" = None,
     ) -> None:
         """Open a logical train step. No fetch — pure lifecycle.
 
@@ -567,11 +574,10 @@ class TQWorkerMixin:
         ``begin`` — so no step identifier is needed. Optimizer state is
         untouched here.
         """
-        self.begin_train_step(  # type: ignore[attr-defined]
-            loss_fn=loss_fn,
-            gbs=gbs,
-            mbs=mbs,
-        )
+        kwargs: dict[str, Any] = {"loss_fn": loss_fn, "gbs": gbs, "mbs": mbs}
+        if draft_update_decision is not None:
+            kwargs["draft_update_decision"] = draft_update_decision
+        self.begin_train_step(**kwargs)  # type: ignore[attr-defined]
 
     @wrap_with_nvtx_name("policy_worker/train_microbatch_presharded")
     def train_microbatch_presharded(
