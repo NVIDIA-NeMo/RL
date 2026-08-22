@@ -208,6 +208,7 @@ project-includes = [
   "nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py",
   "nemo_rl/models/generation/vllm/refit_layout.py",
   "nemo_rl/models/generation/vllm/refit_loader.py",
+  "nemo_rl/models/generation/vllm/speculator_runtime.py",
   "nemo_rl/models/generation/vllm/utils.py",
   "nemo_rl/models/generation/vllm/video_utils.py",
   "nemo_rl/models/generation/vllm/vllm_backend.py",
