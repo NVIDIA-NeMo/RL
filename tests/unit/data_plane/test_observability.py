@@ -471,12 +471,9 @@ def test_hash_shard_read_of_jagged_field_is_unverified_not_a_mismatch():
     """A batch-scoped digest covers the whole buffer, so a shard read cannot
     reproduce it. That has to report as unverified — reporting it as a
     mismatch would make the guard cry wolf on every sharded fetch."""
-    client = MetricsDataPlaneClient(NoOpDataPlaneClient(), verify_tensor_hash=True)
+    client = _hash_client()
     ids = [f"u{i}" for i in range(4)]
     rows = [torch.arange(3, dtype=torch.int64) + i for i in range(4)]
-    client.register_partition(
-        partition_id="p", fields=["x"], num_samples=4, consumer_tasks=["t"]
-    )
     client.put_samples(sample_ids=ids, partition_id="p", fields=_jagged(rows))
     client.get_samples(sample_ids=ids[:2], partition_id="p", select_fields=["x"])
 
@@ -490,14 +487,10 @@ def test_hash_incomparable_field_is_counted_not_dropped():
     batch-scoped read, so the field is dropped; dropping it *silently* is
     the exact shape of the bug that let this check pass while covering
     nothing, so the drop has to land in ``fields_skipped``."""
-    store = _RaggedOnReadClient()
-    client = MetricsDataPlaneClient(store, verify_tensor_hash=True)
+    client = _hash_client(_RaggedOnReadClient())
     ids = [f"u{i}" for i in range(4)]
     dense = TensorDict(
         {"x": torch.arange(16, dtype=torch.int64).reshape(4, 4)}, batch_size=[4]
-    )
-    client.register_partition(
-        partition_id="p", fields=["x"], num_samples=4, consumer_tasks=["t"]
     )
     client.put_samples(sample_ids=ids, partition_id="p", fields=dense)
     client.get_samples(sample_ids=ids, partition_id="p", select_fields=["x"])

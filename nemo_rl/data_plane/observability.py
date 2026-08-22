@@ -24,25 +24,15 @@ totals **plus** live memory consumption: ``bytes_outstanding`` (sum of
 bytes currently held in TQ, i.e. put minus cleared) and
 ``peak_bytes_outstanding`` (high-water mark over the run lifetime).
 
-Everything here sits on the hot path of every transfer, so the cost is a
-design constraint rather than an afterthought. Measured against a no-op
-inner client on the payload the wire actually carries -- 256 ragged rows,
-12 MB, jagged per-token fields as ``codec.pack_jagged_fields`` leaves them
--- the wrapper adds ~99 us per put and ~76 us per get, about 0.15% of a
-59 ms operation. What that budget buys is spelled out where it is spent
-(``_td_bytes``, ``_record_put``, ``_emit``); the short version is that no
-traversal happens twice, no allocation happens for a payload nobody reads,
-and no estimate walks a structure whose size it can extrapolate.
+Every method here runs on the hot path of a transfer, so nothing traverses
+a structure twice and nothing is allocated for a payload no callback reads.
 
-``verify_tensor_hash=True`` adds an opt-in correctness check on top:
+``verify_tensor_hash=True`` adds an opt-in correctness check:
 ``torch.hash_tensor`` fingerprints recorded at put and re-checked at get,
 so a tensor that changes between wire-in and wire-out is reported rather
-than trained on. Rectangular leaves get a digest per row; jagged leaves get
-one over their values buffer, because torch has no ragged hash kernel and
-padding a ragged batch out to a rectangle costs more than the payload is
-worth (see :meth:`MetricsDataPlaneClient._row_fingerprints`). It reads
-every tensor byte again on both sides (~2.4 ms for that same 12 MB
-payload), so it is a debugging tool, not a metric.
+than trained on. It reads every tensor byte again on both sides, so it is a
+debugging tool, not a metric. See ``README.md`` for what it does and does
+not catch.
 """
 
 from __future__ import annotations
@@ -125,27 +115,52 @@ _INT_VIEW_BY_WIDTH = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.in
 
 
 def _as_int_view(t: torch.Tensor) -> torch.Tensor:
-    """Bitcast a tensor to a same-width integer type, or pass it through.
+    """Bitcast to a same-width integer type, or pass through.
 
-    ``hash_tensor`` has no float8 kernel and raises ``NotImplementedError``
-    there; viewing the bytes as integers sidesteps every dtype-specific
-    kernel for free, since ``view`` on a same-width dtype is metadata only.
+    ``hash_tensor`` has no float8 kernel and raises there; viewing the bytes
+    as integers sidesteps every dtype-specific kernel for free.
     """
     int_dtype = _INT_VIEW_BY_WIDTH.get(t.element_size())
     return t.view(int_dtype) if int_dtype is not None else t
 
 
-def _dtype_salt(dtype: torch.dtype) -> int:
-    """Fingerprint salt distinguishing dtypes that hash to the same words.
+def _as_list(sample_ids: Any) -> Any:
+    """Materialize ``sample_ids`` once; ``None`` passes through.
 
-    ``hash_tensor`` upcasts to the 64-bit equivalent before reducing, so a
-    bf16 tensor and the fp32 tensor holding the same values produce the same
-    digest. Mixing the dtype in is what makes a precision change visible.
+    ``_run`` consumes its lambda and the accounting needs the same sequence
+    afterwards, so a generator would be exhausted by the time it is indexed.
+    """
+    if sample_ids is None or isinstance(sample_ids, list):
+        return sample_ids
+    return list(sample_ids)
+
+
+def _pop_partition_keys(
+    store: dict[str, dict[str, Any]], partition_id: str, keys: list[str] | None
+) -> list[Any]:
+    """Drop ``keys`` from ``store[partition_id]``, returning what was removed.
+
+    ``keys=None`` drops the whole partition. Shared by the byte accounting
+    and the fingerprint store so their teardown cannot drift apart.
+    """
+    partition = store.get(partition_id)
+    if partition is None:
+        return []
+    if keys is None:
+        del store[partition_id]
+        return list(partition.values())
+    removed = [partition.pop(key) for key in keys if key in partition]
+    if not partition:
+        del store[partition_id]
+    return removed
+
+
+def _dtype_salt(dtype: torch.dtype) -> int:
+    """Salt distinguishing dtypes whose values reduce to the same words.
 
     ``crc32``, not the builtin ``hash()``: ``hash()`` of a ``str`` is salted
-    per process, so a fingerprint built on it would not survive being
-    compared across ranks — cheap to keep, expensive to rediscover the day
-    someone reduces these cluster-wide.
+    per process, so the fingerprint would not survive being compared across
+    ranks.
     """
     return zlib.crc32(str(dtype).encode())
 
@@ -173,82 +188,6 @@ def percentile_from_hist(hist: list[int], q: float) -> float:
     return LATENCY_BUCKETS_MS[-1]
 
 
-def _enc_const1(obj: Any, budget: list[int]) -> int:
-    return 1
-
-
-def _enc_float(obj: float, budget: list[int]) -> int:
-    return 9
-
-
-def _enc_int(obj: int, budget: list[int]) -> int:
-    # msgpack packs small ints in a single byte; only wide values cost 9.
-    if -32 <= obj < 128:
-        return 1
-    if -(2**15) <= obj < 2**16:
-        return 3
-    if -(2**31) <= obj < 2**32:
-        return 5
-    return 9
-
-
-def _enc_str(obj: str, budget: list[int]) -> int:
-    n = len(obj) if obj.isascii() else len(obj.encode("utf-8"))
-    return n + (1 if n < 32 else 2 if n < 256 else 3 if n < 65536 else 5)
-
-
-def _enc_bytes(obj: Any, budget: list[int]) -> int:
-    n = len(obj)
-    return n + (2 if n < 256 else 3 if n < 65536 else 5)
-
-
-def _enc_dict(obj: dict[Any, Any], budget: list[int]) -> int:
-    n = len(obj)
-    total = 1 if n < 16 else 3 if n < 65536 else 5
-    for k, v in obj.items():
-        if budget[0] <= 0:
-            break
-        budget[0] -= 1
-        total += _estimate_encoded_bytes(k, budget)
-        total += _estimate_encoded_bytes(v, budget)
-    return total
-
-
-def _enc_seq(obj: Any, budget: list[int]) -> int:
-    n = len(obj)
-    total = 1 if n < 16 else 3 if n < 65536 else 5
-    for v in obj:
-        if budget[0] <= 0:
-            break
-        budget[0] -= 1
-        total += _estimate_encoded_bytes(v, budget)
-    return total
-
-
-def _enc_tensor(obj: torch.Tensor, budget: list[int]) -> int:
-    return obj.numel() * obj.element_size()
-
-
-# Exact-type dispatch, tried before any isinstance chain. The common leaves
-# come first because insertion order is also the order of the subclass
-# fallback below, which only runs for types that miss the exact lookup.
-_ENCODERS: dict[type, Callable[[Any, list[int]], int]] = {
-    str: _enc_str,
-    int: _enc_int,
-    bool: _enc_const1,
-    float: _enc_float,
-    dict: _enc_dict,
-    list: _enc_seq,
-    tuple: _enc_seq,
-    set: _enc_seq,
-    bytes: _enc_bytes,
-    bytearray: _enc_bytes,
-    memoryview: _enc_bytes,
-    torch.Tensor: _enc_tensor,
-    type(None): _enc_const1,
-}
-
-
 def _estimate_encoded_bytes(obj: Any, budget: list[int]) -> int:
     """Approximate msgpack-encoded size of a non-tensor object.
 
@@ -259,24 +198,52 @@ def _estimate_encoded_bytes(obj: Any, budget: list[int]) -> int:
     approximates instead. Container framing (1-5 bytes per element) is not
     modelled, so treat the result as a lower bound.
 
-    Dispatch is an exact-type dict lookup rather than an ``isinstance``
-    chain: on the hot path the common leaves (``str``, ``int``) sat 5-7
-    branches deep, and the chain cost more than the arithmetic it guarded.
-
-    ``budget`` is a single-element list used as a mutable counter that bounds
-    the walk to ``max_nodes`` container elements. It is decremented only by
-    the container encoders -- a leaf cannot itself expand the walk, so
-    charging leaves bought nothing but two list index ops each. Containers
-    stop iterating once it is exhausted; summing a generator would otherwise
-    keep walking every element while each recursive call returned 0, making
-    the cost O(size) despite the budget.
+    ``budget`` bounds the walk to ``max_nodes`` container elements. Only the
+    container branches charge it: a leaf cannot itself expand the walk.
+    Containers stop iterating once it is exhausted -- summing a generator
+    would otherwise keep walking every element while each recursive call
+    returned 0, making the cost O(size) despite the budget.
     """
-    encoder = _ENCODERS.get(obj.__class__)
-    if encoder is not None:
-        return encoder(obj, budget)
-    for typ, encoder in _ENCODERS.items():
-        if isinstance(obj, typ):
-            return encoder(obj, budget)
+    if obj is None or isinstance(obj, bool):
+        return 1
+    if isinstance(obj, int):
+        # msgpack packs small ints in a single byte; only wide values cost 9.
+        if -32 <= obj < 128:
+            return 1
+        if -(2**15) <= obj < 2**16:
+            return 3
+        if -(2**31) <= obj < 2**32:
+            return 5
+        return 9
+    if isinstance(obj, float):
+        return 9
+    if isinstance(obj, str):
+        n = len(obj) if obj.isascii() else len(obj.encode("utf-8"))
+        return n + (1 if n < 32 else 2 if n < 256 else 3 if n < 65536 else 5)
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        n = len(obj)
+        return n + (2 if n < 256 else 3 if n < 65536 else 5)
+    if isinstance(obj, dict):
+        n = len(obj)
+        total = 1 if n < 16 else 3 if n < 65536 else 5
+        for k, v in obj.items():
+            if budget[0] <= 0:
+                break
+            budget[0] -= 1
+            total += _estimate_encoded_bytes(k, budget)
+            total += _estimate_encoded_bytes(v, budget)
+        return total
+    if isinstance(obj, (list, tuple, set)):
+        n = len(obj)
+        total = 1 if n < 16 else 3 if n < 65536 else 5
+        for v in obj:
+            if budget[0] <= 0:
+                break
+            budget[0] -= 1
+            total += _estimate_encoded_bytes(v, budget)
+        return total
+    if isinstance(obj, torch.Tensor):
+        return obj.numel() * obj.element_size()
     # Unknown type -> pickle/cloudpickle Ext. Cheap proxy; the real size
     # would need an actual dumps(), which is what we are avoiding.
     return 64
@@ -284,10 +251,9 @@ def _estimate_encoded_bytes(obj: Any, budget: list[int]) -> int:
 
 # Rows sampled from a NonTensorStack to estimate its payload. The stack
 # holds one Python object per batch element, so materialising it (``tolist``)
-# and walking every row is O(batch) *per put* -- ~1 ms for a 256-row
-# message_log stack. Rows in one stack share a schema, so a strided sample
-# extrapolates to within a few percent for a figure that is already
-# documented as a lower-bound estimate.
+# and walking every row is O(batch) *per put*. Sampling assumes rows are
+# exchangeable in size, which is only approximately true -- rollout rows
+# differ in length by construction -- so this is a model, not a measurement.
 _NONTENSOR_STACK_SAMPLES = 4
 
 
@@ -318,30 +284,21 @@ def _td_bytes(td: TensorDict | None, max_nodes: int = 10_000) -> int:
     """Payload bytes of a TensorDict, as the wire will see them.
 
     Tensor leaves count ``numel * element_size``, which equals
-    ``t.contiguous().nbytes`` -- the size mooncake registers and sends
-    (``mooncake_client`` calls ``.contiguous()`` before taking the pointer).
-    Verified equal for contiguous, sliced, transposed and stride-0 expanded
-    views, and across bf16/bool/int64/fp8.
-
+    ``t.contiguous().nbytes`` -- the size mooncake registers and sends.
     Non-tensor leaves are estimated with :func:`_estimate_encoded_bytes`,
-    since TQ ships them over a separate msgpack path -- omitting them would
-    undercount communication volume by whatever metadata rides along. Both
-    kinds are counted in a *single* pass: a second traversal would double the
-    per-put walk of a structure that can hold hundreds of keys.
+    since TQ ships them over a separate msgpack path. Both kinds are counted
+    in a single ``items()`` pass; ``keys()`` + ``get()`` would re-resolve
+    every nested key from the root.
 
     ``leaves_only=True`` would hide the non-tensor entries entirely
     (``NonTensorData`` is not treated as a leaf), so this walks with
-    ``leaves_only=False`` and skips container nodes itself. It walks with
-    ``items()`` rather than ``keys()`` + ``get()``: ``get()`` re-resolves
-    each nested key from the root, which measured 2.7x the cost of the
-    single traversal ``items()`` already performs.
+    ``leaves_only=False`` and skips container nodes itself.
 
-    ``NonTensorData`` and ``NonTensorStack`` are matched by type, not by
-    ``hasattr``: both are tensorclasses whose attribute misses fall through
-    a ``__getattr__`` that costs ~2.8 us per probe. The distinction matters
-    beyond speed -- ``NonTensorData`` exposes BOTH ``.data`` and
-    ``.tolist()``, and its ``.tolist()`` broadcasts the single stored object
-    across the batch dim (a 64-row batch reported 20x the real payload).
+    ``NonTensorData`` and ``NonTensorStack`` are matched by type rather than
+    ``hasattr``, and the distinction matters: ``NonTensorData`` exposes BOTH
+    ``.data`` and ``.tolist()``, and its ``.tolist()`` broadcasts the single
+    stored object across the batch dim (a 64-row batch reported 20x the real
+    payload).
 
     Aliased storage is counted per field: two keys viewing one buffer count
     twice, which is right for volume (both are serialised) and is what lets
@@ -354,10 +311,8 @@ def _td_bytes(td: TensorDict | None, max_nodes: int = 10_000) -> int:
     for _, v in td.items(include_nested=True, leaves_only=False):
         if isinstance(v, torch.Tensor):
             # No jagged special case: numel() already reports a nested
-            # tensor's total element count, and asking it directly is half
-            # the cost of reaching through .values() (16 us vs 32 us per
-            # jagged field). Every per-token field on this wire is jagged,
-            # so that is paid four or five times per put.
+            # tensor's total element count, and costs half of reaching
+            # through .values().
             total += v.numel() * v.element_size()
         elif isinstance(v, NonTensorData):
             total += _estimate_encoded_bytes(v.data, budget)
@@ -549,10 +504,10 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # lifetime as ``_bytes_by_partition``: cleared by ``clear_samples``,
         # so it is bounded by the live key population.
         self._hash_by_partition: dict[str, dict[str, dict[str, int]]] = {}
-        # partition -> field -> row count, for the jagged fields whose digest
-        # covers a whole buffer and so only reconciles against a read of that
-        # same batch. One int per field, not per row.
-        self._batch_scoped_rows: dict[str, dict[str, int]] = {}
+        # partition -> (batch-scoped field names, row count at put). Those
+        # digests cover a whole buffer, so they only reconcile against a read
+        # of that same batch; the row count is what detects a shard read.
+        self._batch_scope: dict[str, tuple[frozenset[str], int]] = {}
         self._hash_mismatches_logged = 0
         # Previous snapshot, for per-step deltas. Owned here rather than by a
         # caller: it is this client's prior reading, and keeping it here lets
@@ -632,6 +587,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
             metrics["hash/rows_checked"] = hv["rows_checked"] - prev_hv.get(
                 "rows_checked", 0
             )
+            metrics["hash/rows_recorded"] = hv["rows_recorded"] - prev_hv.get(
+                "rows_recorded", 0
+            )
             metrics["hash/rows_unverified"] = hv["rows_unverified"] - prev_hv.get(
                 "rows_unverified", 0
             )
@@ -674,12 +632,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
         Called after the underlying RPC succeeds so a failed put never
         leaves the accounting inflated.
 
-        The even split is what makes the loop cheap, and it is not a
-        simplification: ``n_bytes`` is a whole-batch figure, so there is no
-        per-key truth to preserve. The division remainder therefore lands on
-        the first key rather than being spread one-byte-at-a-time across the
-        batch — spreading it cost an ``enumerate`` and a compare per key
-        (~40% of this method at 256 keys) to move at most one byte each.
+        ``n_bytes`` is a whole-batch figure, so there is no per-key truth to
+        preserve: the split is even and the division remainder lands on the
+        first key rather than being spread across the batch.
 
         Args:
             partition_id: Partition the keys were written to.
@@ -709,20 +664,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
             keys: Uids dropped; ``None`` means the whole partition was cleared.
         """
         if self._verify_tensor_hash:
-            self._drop_hashes(partition_id, keys)
-        partition_dict = self._bytes_by_partition.get(partition_id)
-        if partition_dict is None:
-            return
-        if keys is None:
-            freed = sum(partition_dict.values())
-            del self._bytes_by_partition[partition_id]
-        else:
-            freed = 0
-            for key in keys:
-                freed += partition_dict.pop(key, 0)
-            if not partition_dict:
-                del self._bytes_by_partition[partition_id]
-        self._stats.bytes_outstanding -= freed
+            _pop_partition_keys(self._hash_by_partition, partition_id, keys)
+            if keys is None:
+                self._batch_scope.pop(partition_id, None)
+        freed = _pop_partition_keys(self._bytes_by_partition, partition_id, keys)
+        self._stats.bytes_outstanding -= sum(freed)
 
     # ── wire-in / wire-out fingerprinting (opt-in) ─────────────────────
 
@@ -734,45 +680,33 @@ class MetricsDataPlaneClient(DataPlaneClient):
     ) -> dict[str, _FieldDigest]:
         """``torch.hash_tensor`` fingerprints for each tensor leaf.
 
-        Two granularities, because the wire has two layouts and only one of
-        them can be reduced per row cheaply:
+        A rectangular leaf reduces per row (``dim=1``), which names the
+        sample that diverged. ``hash_tensor`` has no ragged kernel, so a
+        jagged leaf instead gets one digest over its whole values buffer,
+        XORed per row with that row's length, and is marked
+        ``batch_scoped``; padding it out to a rectangle to get per-row
+        digests costs far more than the answer is worth. ``README.md`` has
+        the resulting detection/attribution table.
 
-        * **Rectangular leaf** — ``hash_tensor(..., dim=1)`` gives one
-          ``uint64`` per sample id directly, for the cost of a single pass.
-          That is the granularity worth having: it names *which* sample
-          diverged, and it survives a batch being read back in shards.
-        * **Jagged leaf** — ``hash_tensor`` has no ragged kernel, so a
-          per-row digest would mean padding each field out to a rectangle
-          first. On a realistically ragged batch that rectangle is 3.5x the
-          real payload and measured 13x the cost of hashing the values
-          buffer, for a field this only has to answer "did anything change".
-          So a jagged leaf gets one digest over its whole values buffer,
-          XORed per row with that row's length, and is marked
-          ``batch_scoped``.
+        Args:
+            td: Leaves to fingerprint; ``None`` yields an empty result.
+            sample_ids: Row *i* is attributed to ``sample_ids[i]``, the
+                ordering :meth:`DataPlaneClient.get_samples` promises.
+            batch_scoped_fields: Fields the *put* side reduced batch-scoped.
+                The scheme must follow the field, not the layout in hand: a
+                field packed jagged comes back dense whenever its rows are
+                uniform (``_from_wire`` densifies those), and choosing per
+                layout makes the two sides compute different things. The
+                values buffer of a uniform jagged field and the flattened
+                dense tensor it densifies into hold the same elements in the
+                same order, so replaying the recorded scheme agrees by
+                construction.
 
-        Both are still ``torch.hash_tensor``; the jagged one just reduces
-        the flat buffer instead of a rectangle it had to build first.
-
-        Leaves are bitcast to a same-width integer type before hashing.
-        ``hash_tensor`` has no float8 kernel — it raises
-        ``NotImplementedError`` on ``float8_e4m3fn``, which would propagate
-        straight out of ``put_samples`` and take the transfer down with it.
-        The bitcast is free (a view), makes every dtype hashable, and the
-        dtype still enters through the salt.
-
-        The scheme has to follow the *field*, not the layout in hand: a
-        field packed jagged on put comes back **dense** whenever its rows
-        happen to be uniform, because ``_from_wire`` densifies those. Left
-        to pick per layout, the two sides compute different things and every
-        row of a uniform batch reports a mismatch. ``batch_scoped_fields``
-        carries the scheme chosen at put so the read reproduces it — the
-        values buffer of a uniform jagged field and the flattened dense
-        tensor it densifies into are the same elements in the same order, so
-        the digests agree by construction.
-
-        Leaves that cannot be attributed per row (a leading dim that isn't
-        ``len(sample_ids)``, or a nested layout other than ``jagged``) are
-        counted in ``fields_skipped`` rather than silently dropped.
+        Returns:
+            Field name -> :class:`_FieldDigest`. Leaves that cannot be
+            attributed per row (a leading dim that isn't ``len(sample_ids)``,
+            or a non-``jagged`` nested layout) are counted in
+            ``fields_skipped`` rather than silently dropped.
         """
         if td is None:
             return {}
@@ -826,18 +760,19 @@ class MetricsDataPlaneClient(DataPlaneClient):
             per_field = partition_hashes.setdefault(sample_id, {})
             for name, digest in digests.items():
                 per_field[name] = digest.per_row[row]
-        batch_rows = self._batch_scoped_rows.setdefault(partition_id, {})
-        for name, digest in digests.items():
-            if digest.batch_scoped:
-                batch_rows[name] = len(sample_ids)
+        scoped = frozenset(n for n, d in digests.items() if d.batch_scoped)
+        if scoped:
+            self._batch_scope[partition_id] = (scoped, len(sample_ids))
         self._stats.hash_verify.rows_recorded += len(sample_ids)
 
     def _check_hashes(self, partition_id: str, sample_ids: list[str], out: Any) -> None:
         """Compare wire-out fingerprints against what was written."""
         if not isinstance(out, TensorDict):
             return
-        batch_rows = self._batch_scoped_rows.get(partition_id, {})
-        digests = self._row_fingerprints(out, sample_ids, batch_rows.keys())
+        scoped_names, scoped_rows = self._batch_scope.get(
+            partition_id, (frozenset(), 0)
+        )
+        digests = self._row_fingerprints(out, sample_ids, scoped_names)
         if not digests:
             return
         partition_hashes = self._hash_by_partition.get(partition_id, {})
@@ -853,7 +788,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # divergence this cannot express as a row-level mismatch.
         comparable = {}
         for name, digest in digests.items():
-            if not digest.batch_scoped or batch_rows.get(name) == len(sample_ids):
+            if not digest.batch_scoped or scoped_rows == len(sample_ids):
                 comparable[name] = digest
             else:
                 stats.fields_skipped += 1
@@ -881,21 +816,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
                         expected,
                         digest.per_row[row],
                     )
-
-    def _drop_hashes(self, partition_id: str, keys: list[str] | None) -> None:
-        """Release fingerprints alongside the bytes accounting."""
-        if keys is None:
-            self._hash_by_partition.pop(partition_id, None)
-            self._batch_scoped_rows.pop(partition_id, None)
-            return
-        partition_hashes = self._hash_by_partition.get(partition_id)
-        if partition_hashes is None:
-            return
-        for key in keys:
-            partition_hashes.pop(key, None)
-        if not partition_hashes:
-            del self._hash_by_partition[partition_id]
-            self._batch_scoped_rows.pop(partition_id, None)
 
     def _run(
         self,
@@ -950,8 +870,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         wall_ms = (monotonic() - t0) * 1000.0
         on_event = self._on_event
         if on_event is not None:
-            # Built lazily: with no sink registered this dict was the single
-            # most frequent allocation in the wrapper, and nothing read it.
+            # Built lazily: with no sink registered nothing reads this dict.
             event: DataPlaneEvent = {
                 "op": op,
                 "partition_id": partition_id,
@@ -1061,9 +980,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         n_bytes = _td_bytes(fields)
         # Materialize once: ``_run`` consumes its lambda and we also need
         # to attribute bytes per sample after success.
-        sample_ids_list = (
-            sample_ids if isinstance(sample_ids, list) else list(sample_ids)
-        )
+        sample_ids_list = _as_list(sample_ids)
         out = self._run(
             "put",
             partition_id,
@@ -1085,9 +1002,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         return out
 
     def get_samples(self, sample_ids, partition_id, select_fields):
-        sample_ids_list = (
-            sample_ids if isinstance(sample_ids, list) else list(sample_ids)
-        )
+        sample_ids_list = _as_list(sample_ids)
         out = self._run(
             "get",
             partition_id,
@@ -1103,11 +1018,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         return out
 
     def clear_samples(self, sample_ids, partition_id):
-        sample_ids_list = (
-            sample_ids
-            if (sample_ids is None or isinstance(sample_ids, list))
-            else list(sample_ids)
-        )
+        sample_ids_list = _as_list(sample_ids)
         n_keys = len(sample_ids_list) if sample_ids_list is not None else 0
         self._run(
             "clear",
