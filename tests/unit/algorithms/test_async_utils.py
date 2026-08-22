@@ -1220,11 +1220,13 @@ class TestReplayBuffer:
           3. Collector's post-refit target window becomes [N+2, ...] (skipping N+1).
           4. Training waits for target N+1, which nobody generates — stall forever.
 
-        The fix is a startup pipeline barrier: before breaking, also require
-        has_complete_batch(N+1) to be True (or N+1 >= max_steps).  This test
-        constructs the exact precondition state — current step complete, lookahead
-        absent — to ensure it remains detectable and to document the expected
-        buffer readiness values that the barrier logic branches on.
+        For a restored buffer, the fix is a startup pipeline barrier: before
+        breaking, also require has_complete_batch(N+1) to be True (or N+1 >=
+        max_steps).  `_needs_initial_lookahead_barrier` applies this condition to
+        Async GRPO.  This test constructs the exact precondition state — current
+        step complete, lookahead absent — to ensure it remains detectable and to
+        document the expected buffer readiness values that the barrier logic
+        branches on.
         """
         num_prompts = 8
         resume_step = 30

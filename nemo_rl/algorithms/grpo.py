@@ -350,6 +350,21 @@ def _get_grpo_save_state(
     return GRPOSaveState(**state_values)
 
 
+def _needs_initial_lookahead_barrier(
+    *,
+    replay_buffer_restored: bool,
+    max_trajectory_age_steps: int,
+    step: int,
+    max_num_steps: int,
+) -> bool:
+    """Keep restored async buffers from skipping their next target step."""
+    return (
+        replay_buffer_restored
+        and max_trajectory_age_steps > 0
+        and step + 1 < max_num_steps
+    )
+
+
 class GRPOLoggerConfig(LoggerConfig):
     num_val_samples_to_print: int  # number of val samples to print to stdout
 
@@ -4261,6 +4276,7 @@ def async_grpo_train(
             # weights_only=False: this is a trusted same-job checkpoint artifact.
             rollouts_state = torch.load(rollouts_path, weights_only=False)
 
+    replay_buffer_restored = replay_buffer_restore_metadata is not None
     next_nemo_gym_task_index = max(
         int((rollouts_state or {}).get(NEXT_NEMO_GYM_TASK_INDEX_KEY, 0)),
         int(
@@ -4446,15 +4462,22 @@ def async_grpo_train(
         )
 
         if current_step_ready:
-            # Keep the async pipeline one step ahead before entering training.
-
-            # A restored buffer may already contain `step`, allowing startup to
-            # consume it before the collector generates `step + 1`. After refit,
-            # the collector advances to targets starting at `step + 2`, leaving
-            # `step + 1` permanently missing. Wait for the initial collector,
-            # whose range includes both steps, to complete the lookahead first.
+            # A restored buffer can already contain `step` at the first wait
+            # iteration, letting startup break before the collector has
+            # reserved `step + 1`. After refit the collector advances to
+            # targets starting at `step + 2`, leaving `step + 1` permanently
+            # missing, so wait for the initial collector to fill it first.
+            # A fresh run's buffer starts empty, so the loop cannot break
+            # until the collector has produced `step` -- by which point it has
+            # already reserved `step + 1`, the same slack the pipeline relies
+            # on at every subsequent step.
             max_num_steps = master_config.grpo.max_num_steps
-            need_lookahead = max_trajectory_age_steps > 0 and step + 1 < max_num_steps
+            need_lookahead = _needs_initial_lookahead_barrier(
+                replay_buffer_restored=replay_buffer_restored,
+                max_trajectory_age_steps=max_trajectory_age_steps,
+                step=step,
+                max_num_steps=max_num_steps,
+            )
             if need_lookahead:
                 next_step_ready = ray.get(
                     replay_buffer.has_complete_batch.remote(

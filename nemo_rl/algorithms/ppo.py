@@ -2341,6 +2341,7 @@ def async_ppo_train(
                 )
             )
             if current_step_ready:
+                # PPO keeps this conservative barrier for fresh and restored buffers.
                 # The initial collector is the only window that can generate
                 # both `step` and `step + 1`. Fill both before the first refit.
                 need_lookahead = step + 1 < max_training_steps
