@@ -18,8 +18,9 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass, fields
-from typing import Any, Callable, Optional, TypeVar, cast
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+from typing import Any, Callable, Mapping, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -36,6 +37,13 @@ from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
+)
+from nemo_rl.algorithms.draft_cadence_runtime import CadenceRuntimeConfig
+from nemo_rl.algorithms.draft_update_schedule import (
+    AppliedDraftSnapshot,
+    DraftUpdateScheduler,
+    close_initial_draft_snapshot,
+    validate_applied_draft_snapshot,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -122,6 +130,7 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.draft_config import DraftUpdateScheduleConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
@@ -322,6 +331,12 @@ class GRPOSaveState:
     # used to gate the SC buffer restore. None on checkpoints from the other
     # algorithms and from SC runs that predate this field.
     sampler_name: Optional[str] = None
+    draft_update_schedule: dict[str, object] | None = None
+    applied_draft_snapshot: dict[str, object] | None = None
+    draft_terminal_evidence: dict[str, object] | None = None
+    draft_decision_ledger_prefixes: list[dict[str, object]] = field(
+        default_factory=list
+    )
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:
@@ -333,6 +348,10 @@ def _initial_grpo_save_state() -> GRPOSaveState:
         total_valid_tokens=0,
         val_reward=-99999999.0,
         sampler_name=None,
+        draft_update_schedule=None,
+        applied_draft_snapshot=None,
+        draft_terminal_evidence=None,
+        draft_decision_ledger_prefixes=[],
     )
 
 
@@ -351,6 +370,80 @@ def _get_grpo_save_state(
     return GRPOSaveState(**state_values)
 
 
+def restore_draft_update_scheduler(
+    config: DraftUpdateScheduleConfig,
+    saved: Mapping[str, object] | None,
+    *,
+    origin_step: int,
+    resuming_from_checkpoint: bool,
+) -> DraftUpdateScheduler:
+    """Restore cadence state without conflating a fresh run and legacy resume."""
+    if saved is None:
+        if resuming_from_checkpoint and config.mode != "always":
+            raise ValueError(
+                "legacy checkpoint without cadence state may resume only in always mode"
+            )
+        return DraftUpdateScheduler.create(config, origin_step=origin_step)
+    if type(saved.get("state_version")) is not int or saved["state_version"] != 1:
+        raise ValueError("unsupported draft update schedule state version")
+    if saved.get("config") != config.model_dump(mode="json"):
+        raise ValueError("resolved draft update schedule does not match checkpoint")
+    state = saved.get("state")
+    if not isinstance(state, Mapping):
+        raise ValueError("draft update schedule state must be a mapping")
+    return DraftUpdateScheduler.create(
+        config, origin_step=cast(int, state["schedule_origin_step"]), restored=saved
+    )
+
+
+def restore_serving_draft_after_startup_sync(
+    config: DraftUpdateScheduleConfig,
+    scheduler: DraftUpdateScheduler,
+    rollout_manager: Any,
+    synchronizer: Any,
+    *,
+    snapshot: AppliedDraftSnapshot | None,
+    snapshot_path: Path | None,
+    resuming_from_checkpoint: bool,
+    install_snapshot: Callable[[AppliedDraftSnapshot], Mapping[str, object]],
+) -> AppliedDraftSnapshot:
+    """Restore target then immutable serving draft before reopening reservations."""
+    if resuming_from_checkpoint and snapshot is None and config.mode != "always":
+        raise ValueError(
+            "resumed non-always cadence requires an applied draft snapshot"
+        )
+    synchronizer.sync_target_from_current_checkpoint()
+    if snapshot is None:
+        if scheduler.state.applied_draft_version != 0:
+            raise ValueError("resumed applied draft version requires a snapshot")
+        if snapshot_path is None:
+            raise ValueError(
+                "initial serving draft requires an immutable snapshot path"
+            )
+        receipt = synchronizer.sync_current_trainable_draft(snapshot_path=snapshot_path)
+        installed = close_initial_draft_snapshot(receipt, snapshot_path)
+    else:
+        validate_applied_draft_snapshot(scheduler, snapshot)
+        receipt = synchronizer.sync_applied_draft_snapshot(snapshot)
+        installed = snapshot
+    if (
+        receipt.get("successful") is not True
+        or receipt.get("version") != installed.version
+        or receipt.get("sha256") != installed.sha256
+    ):
+        raise RuntimeError("startup serving-draft apply receipt mismatch")
+    persisted = install_snapshot(installed)
+    if (
+        persisted.get("successful") is not True
+        or persisted.get("version") != installed.version
+        or persisted.get("sha256") != installed.sha256
+    ):
+        raise RuntimeError("serving-draft snapshot was not durably installed")
+    rollout_manager.set_applied_draft_version(installed.version)
+    rollout_manager.enable_reservations()
+    return installed
+
+
 class GRPOLoggerConfig(LoggerConfig):
     num_val_samples_to_print: int  # number of val samples to print to stdout
 
@@ -367,6 +460,7 @@ class MasterConfig(BaseModel, extra="allow"):
     reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: Optional[DataPlaneConfig] = None
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
+    cadence_runtime: CadenceRuntimeConfig = Field(default_factory=CadenceRuntimeConfig)
 
 
 # ===============================================================================

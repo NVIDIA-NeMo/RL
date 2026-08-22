@@ -41,12 +41,17 @@ import os
 import time
 from collections import deque
 from functools import partial
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, Union
 
 import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
+from nemo_rl.algorithms.draft_cadence_runtime import (
+    CadenceRuntimeWriter,
+    CadenceTerminalEvidence,
+)
 from nemo_rl.algorithms.grpo import GRPOSaveState, _write_latest_checkpoint_status
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -78,6 +83,23 @@ from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
+
+
+def close_successful_training(
+    *,
+    runtime_writer: CadenceRuntimeWriter,
+    current_step: int,
+    final_checkpoint_path: Path,
+    terminal_evidence: CadenceTerminalEvidence,
+) -> Path:
+    """Close the cadence terminal artifacts only after a full checkpoint exists."""
+    runtime_writer.terminal_closed(
+        current_step=current_step,
+        final_checkpoint_path=final_checkpoint_path,
+        terminal_evidence=terminal_evidence,
+    )
+    return final_checkpoint_path
+
 
 # Named `log` rather than `logger` to keep it distinct from the experiment
 # Logger this module also uses as `self._logger`.

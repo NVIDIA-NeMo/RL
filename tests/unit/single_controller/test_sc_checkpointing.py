@@ -939,6 +939,15 @@ class TestGetResumePaths:
 
 
 class TestSetupResumeWiring:
+    def test_legacy_save_state_backfills_cadence_checkpoint_fields(self):
+        """Old SC checkpoints retain explicit neutral cadence recovery state."""
+        restored = _get_grpo_save_state(dict(_STEP_3_SAVE_STATE))
+
+        assert restored.draft_update_schedule is None
+        assert restored.applied_draft_snapshot is None
+        assert restored.draft_terminal_evidence is None
+        assert restored.draft_decision_ledger_prefixes == []
+
     def test_setup_forwards_latest_resume_paths(
         self,
         patched_factories,  # noqa: F811

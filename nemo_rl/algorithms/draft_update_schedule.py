@@ -21,7 +21,7 @@ import os
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal, Mapping, NamedTuple, cast
+from typing import Any, Callable, Literal, Mapping, NamedTuple, Protocol, cast
 
 from nemo_rl.models.policy.draft_config import DraftUpdateScheduleConfig
 
@@ -72,6 +72,16 @@ class DraftUpdateDecision:
     observed_acceptance: float | None
     forced: bool = False
     applied_draft_version: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class AppliedDraftSnapshot:
+    """An immutable, digest-bound serving-draft artifact."""
+
+    version: int
+    path: str
+    size_bytes: int
+    sha256: str
 
 
 @dataclass(slots=True)
@@ -1071,3 +1081,438 @@ class DraftDecisionLedger:
             path,
             sealed_prefixes=(*self.sealed_prefixes, receipt),
         )
+
+
+def close_applied_draft_snapshot(
+    decision: DraftUpdateDecision,
+    apply_receipt: Mapping[str, object],
+    *,
+    snapshot_path: Path,
+) -> AppliedDraftSnapshot:
+    """Validate the transfer receipt before making a refit snapshot durable."""
+    raw = snapshot_path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if (
+        not decision.draft_refit_requested
+        or apply_receipt.get("successful") is not True
+        or apply_receipt.get("version") != decision.decision_id
+        or apply_receipt.get("snapshot_path") != str(snapshot_path.resolve())
+        or apply_receipt.get("sha256") != digest
+    ):
+        raise RuntimeError("applied draft snapshot receipt mismatch")
+    return AppliedDraftSnapshot(
+        version=decision.decision_id,
+        path=str(snapshot_path.resolve()),
+        size_bytes=len(raw),
+        sha256=digest,
+    )
+
+
+def close_initial_draft_snapshot(
+    apply_receipt: Mapping[str, object], snapshot_path: Path
+) -> AppliedDraftSnapshot:
+    raw = snapshot_path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if (
+        apply_receipt.get("successful") is not True
+        or apply_receipt.get("version") != 0
+        or apply_receipt.get("snapshot_path") != str(snapshot_path.resolve())
+        or apply_receipt.get("sha256") != digest
+    ):
+        raise RuntimeError("initial serving-draft snapshot receipt mismatch")
+    return AppliedDraftSnapshot(
+        version=0,
+        path=str(snapshot_path.resolve()),
+        size_bytes=len(raw),
+        sha256=digest,
+    )
+
+
+def validate_applied_draft_snapshot(
+    scheduler: DraftUpdateScheduler, snapshot: AppliedDraftSnapshot
+) -> None:
+    path = Path(snapshot.path)
+    raw = path.read_bytes()
+    if (
+        type(snapshot.version) is not int
+        or snapshot.version != scheduler.state.applied_draft_version
+        or type(snapshot.size_bytes) is not int
+        or snapshot.size_bytes != len(raw)
+        or hashlib.sha256(raw).hexdigest() != snapshot.sha256
+    ):
+        raise ValueError("applied draft snapshot version or digest mismatch")
+
+
+def durably_install_startup_snapshot(
+    save_state: Any,
+    snapshot: AppliedDraftSnapshot,
+    *,
+    flush_save_state: Callable[[Any], Mapping[str, object]],
+) -> Mapping[str, object]:
+    save_state.applied_draft_snapshot = asdict(snapshot)
+    receipt = flush_save_state(save_state)
+    if (
+        receipt.get("successful") is not True
+        or receipt.get("version") != snapshot.version
+        or receipt.get("sha256") != snapshot.sha256
+    ):
+        raise RuntimeError("serving-draft snapshot persistence receipt mismatch")
+    return receipt
+
+
+@dataclass(frozen=True, slots=True)
+class DraftStepTransaction:
+    transaction_id: str
+    decision: DraftUpdateDecision
+    base_checkpoint_id: str
+    pre_scheduler_sha256: str
+    expected_snapshot_path: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedDraftStepTransaction:
+    transaction: DraftStepTransaction
+    decision: DraftUpdateDecision
+    outcome: Mapping[str, bool]
+    applied_snapshot: AppliedDraftSnapshot | None
+
+
+class DraftStepTransactionStore(Protocol):
+    def begin(self, decision: DraftUpdateDecision) -> DraftStepTransaction: ...
+    def resolve(
+        self,
+        transaction: DraftStepTransaction,
+        *,
+        decision: DraftUpdateDecision,
+        outcome: Mapping[str, bool],
+        applied_snapshot: AppliedDraftSnapshot | None,
+    ) -> None: ...
+    def commit_bundle_atomic(
+        self,
+        transaction: DraftStepTransaction,
+        *,
+        save_state: Any,
+        ledger_high_water: int,
+    ) -> Mapping[str, object]: ...
+    def mark_committed(
+        self, transaction: DraftStepTransaction, receipt: Mapping[str, object]
+    ) -> None: ...
+    def pending_intents(self) -> tuple[DraftStepTransaction, ...]: ...
+    def resolutions_since(
+        self, checkpoint_id: str
+    ) -> tuple[ResolvedDraftStepTransaction, ...]: ...
+    def resolution_for(
+        self, transaction_id: str
+    ) -> ResolvedDraftStepTransaction | None: ...
+    def lookup_durable_apply_receipt(
+        self, transaction: DraftStepTransaction
+    ) -> Mapping[str, object] | None: ...
+    def resolve_intent_for_recovery(
+        self,
+        transaction: DraftStepTransaction,
+        *,
+        apply_receipt: Mapping[str, object] | None,
+    ) -> ResolvedDraftStepTransaction: ...
+    def validate_checkpoint_contains(
+        self, checkpoint_id: str, resolved: ResolvedDraftStepTransaction
+    ) -> None: ...
+    def discard_after_checkpoint(
+        self, *, checkpoint_id: str, ledger_high_water: int
+    ) -> None: ...
+
+
+def close_draft_step_transaction(
+    transaction: DraftStepTransaction,
+    *,
+    decision: DraftUpdateDecision,
+    outcome: Mapping[str, bool],
+    applied_snapshot: AppliedDraftSnapshot | None,
+    scheduler: DraftUpdateScheduler,
+    decision_ledger: DraftDecisionLedger,
+    save_state: Any,
+    transaction_store: DraftStepTransactionStore,
+) -> RuntimeError | None:
+    """Close one decision in durable order, preserving failed-work accounting."""
+    transaction_store.resolve(
+        transaction,
+        decision=decision,
+        outcome=outcome,
+        applied_snapshot=applied_snapshot,
+    )
+    outcome_error: RuntimeError | None = None
+    try:
+        scheduler.record_outcome(
+            decision,
+            update_attempted=outcome["update_attempted"],
+            update_successful=outcome["update_successful"],
+            draft_refit_attempted=outcome["draft_refit_attempted"],
+            draft_refit_successful=outcome["draft_refit_successful"],
+        )
+    except RuntimeError as error:
+        outcome_error = error
+    decision_ledger.append_closed_once(decision, outcome)
+    save_state.draft_update_schedule = scheduler.state_dict()
+    if applied_snapshot is not None:
+        save_state.applied_draft_snapshot = asdict(applied_snapshot)
+    receipt = transaction_store.commit_bundle_atomic(
+        transaction, save_state=save_state, ledger_high_water=decision.decision_id
+    )
+    if (
+        receipt.get("successful") is not True
+        or receipt.get("provisional") is not True
+        or receipt.get("base_checkpoint_id") != transaction.base_checkpoint_id
+        or receipt.get("decision_id") != decision.decision_id
+        or receipt.get("scheduler_decision_id") != decision.decision_id
+        or receipt.get("snapshot_version") != scheduler.state.applied_draft_version
+        or receipt.get("ledger_high_water") != decision.decision_id
+    ):
+        raise RuntimeError("draft-step atomic bundle receipt mismatch")
+    transaction_store.mark_committed(transaction, receipt)
+    return outcome_error
+
+
+def _write_json_exclusive(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode()
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _transaction_from_payload(payload: Mapping[str, object]) -> DraftStepTransaction:
+    raw_decision = payload.get("decision")
+    if not isinstance(raw_decision, Mapping):
+        raise ValueError("draft-step intent has no decision")
+    decision = DraftUpdateDecision(**cast(dict[str, object], dict(raw_decision)))
+    fields = ("transaction_id", "base_checkpoint_id", "pre_scheduler_sha256")
+    if any(not isinstance(payload.get(field), str) for field in fields):
+        raise ValueError("draft-step intent has invalid identity")
+    expected_path = payload.get("expected_snapshot_path")
+    if expected_path is not None and not isinstance(expected_path, str):
+        raise ValueError("draft-step intent has invalid snapshot path")
+    return DraftStepTransaction(
+        transaction_id=cast(str, payload["transaction_id"]),
+        decision=decision,
+        base_checkpoint_id=cast(str, payload["base_checkpoint_id"]),
+        pre_scheduler_sha256=cast(str, payload["pre_scheduler_sha256"]),
+        expected_snapshot_path=cast(str | None, expected_path),
+    )
+
+
+class FileDraftStepTransactionStore:
+    """Crash-recoverable, append-only draft-step transaction evidence store.
+
+    The store deliberately keeps each stage in its own exclusive file.  A restart
+    can therefore distinguish an unstarted resolution from a completed one without
+    relying on process-local scheduler state.
+    """
+
+    def __init__(
+        self,
+        result_dir: Path,
+        *,
+        base_checkpoint_id: str = "step_0",
+        crash_after: str | None = None,
+    ) -> None:
+        self.root = result_dir.resolve() / "draft-step-transactions"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.base_checkpoint_id = base_checkpoint_id
+        self.crash_after = crash_after
+
+    def _path(self, transaction_id: str, kind: str) -> Path:
+        return self.root / f"{transaction_id}.{kind}.json"
+
+    def _maybe_crash(self, point: str) -> None:
+        if self.crash_after == point:
+            raise RuntimeError(f"injected crash after {point}")
+
+    def begin(self, decision: DraftUpdateDecision) -> DraftStepTransaction:
+        transaction_id = f"decision_{decision.decision_id}-{hashlib.sha256(_encode_row(asdict(decision))).hexdigest()[:16]}"
+        transaction = DraftStepTransaction(
+            transaction_id=transaction_id,
+            decision=decision,
+            base_checkpoint_id=self.base_checkpoint_id,
+            pre_scheduler_sha256="",
+            expected_snapshot_path=None,
+        )
+        _write_json_exclusive(
+            self._path(transaction_id, "intent"),
+            {**asdict(transaction), "decision": asdict(decision)},
+        )
+        self._maybe_crash("intent")
+        return transaction
+
+    def resolve(
+        self,
+        transaction: DraftStepTransaction,
+        *,
+        decision: DraftUpdateDecision,
+        outcome: Mapping[str, bool],
+        applied_snapshot: AppliedDraftSnapshot | None,
+    ) -> None:
+        if decision != transaction.decision:
+            raise ValueError("draft-step resolution decision differs from intent")
+        _validate_outcome(decision, outcome)
+        _write_json_exclusive(
+            self._path(transaction.transaction_id, "resolution"),
+            {
+                "transaction_id": transaction.transaction_id,
+                "decision": asdict(decision),
+                "outcome": dict(outcome),
+                "applied_snapshot": None
+                if applied_snapshot is None
+                else asdict(applied_snapshot),
+            },
+        )
+        self._maybe_crash("resolution")
+
+    def commit_bundle_atomic(
+        self,
+        transaction: DraftStepTransaction,
+        *,
+        save_state: Any,
+        ledger_high_water: int,
+    ) -> Mapping[str, object]:
+        receipt: dict[str, object] = {
+            "successful": True,
+            "provisional": True,
+            "base_checkpoint_id": transaction.base_checkpoint_id,
+            "decision_id": transaction.decision.decision_id,
+            "scheduler_decision_id": transaction.decision.decision_id,
+            "snapshot_version": (
+                save_state.draft_update_schedule["state"]["applied_draft_version"]
+            ),
+            "ledger_high_water": ledger_high_water,
+        }
+        _write_json_exclusive(self._path(transaction.transaction_id, "bundle"), receipt)
+        self._maybe_crash("bundle")
+        return receipt
+
+    def mark_committed(
+        self, transaction: DraftStepTransaction, receipt: Mapping[str, object]
+    ) -> None:
+        _write_json_exclusive(
+            self._path(transaction.transaction_id, "commit"), dict(receipt)
+        )
+        self._maybe_crash("commit_marker")
+
+    def _intents(self) -> dict[str, DraftStepTransaction]:
+        intents: dict[str, DraftStepTransaction] = {}
+        for path in self.root.glob("*.intent.json"):
+            transaction = _transaction_from_payload(json.loads(path.read_text()))
+            intents[transaction.transaction_id] = transaction
+        return intents
+
+    def resolution_for(
+        self, transaction_id: str
+    ) -> ResolvedDraftStepTransaction | None:
+        intent = self._intents().get(transaction_id)
+        path = self._path(transaction_id, "resolution")
+        if intent is None or not path.is_file():
+            return None
+        payload = json.loads(path.read_text())
+        if payload.get("transaction_id") != transaction_id:
+            raise ValueError("draft-step resolution transaction mismatch")
+        raw_decision = payload.get("decision")
+        raw_outcome = payload.get("outcome")
+        if not isinstance(raw_decision, Mapping) or not isinstance(
+            raw_outcome, Mapping
+        ):
+            raise ValueError("draft-step resolution schema mismatch")
+        decision = DraftUpdateDecision(**cast(dict[str, object], dict(raw_decision)))
+        _validate_outcome(decision, cast(Mapping[str, bool], raw_outcome))
+        raw_snapshot = payload.get("applied_snapshot")
+        snapshot = (
+            None
+            if raw_snapshot is None
+            else AppliedDraftSnapshot(
+                **cast(
+                    dict[str, object], dict(cast(Mapping[str, object], raw_snapshot))
+                )
+            )
+        )
+        return ResolvedDraftStepTransaction(
+            intent, decision, dict(cast(Mapping[str, bool], raw_outcome)), snapshot
+        )
+
+    def pending_intents(self) -> tuple[DraftStepTransaction, ...]:
+        return tuple(
+            transaction
+            for transaction in self._intents().values()
+            if self.resolution_for(transaction.transaction_id) is None
+        )
+
+    def resolutions_since(
+        self, checkpoint_id: str
+    ) -> tuple[ResolvedDraftStepTransaction, ...]:
+        return tuple(
+            resolution
+            for transaction in self._intents().values()
+            if transaction.base_checkpoint_id == checkpoint_id
+            if (resolution := self.resolution_for(transaction.transaction_id))
+            is not None
+        )
+
+    def lookup_durable_apply_receipt(
+        self, transaction: DraftStepTransaction
+    ) -> Mapping[str, object] | None:
+        path = self._path(transaction.transaction_id, "apply")
+        return json.loads(path.read_text()) if path.is_file() else None
+
+    def resolve_intent_for_recovery(
+        self,
+        transaction: DraftStepTransaction,
+        *,
+        apply_receipt: Mapping[str, object] | None,
+    ) -> ResolvedDraftStepTransaction:
+        successful = (
+            apply_receipt is not None and apply_receipt.get("successful") is True
+        )
+        snapshot: AppliedDraftSnapshot | None = None
+        if successful:
+            raw_snapshot = apply_receipt.get("applied_snapshot")
+            if not isinstance(raw_snapshot, Mapping):
+                raise ValueError("durable apply receipt has no snapshot")
+            snapshot = AppliedDraftSnapshot(
+                **cast(dict[str, object], dict(raw_snapshot))
+            )
+        outcome = decision_outcome_payload(
+            transaction.decision,
+            update_attempted=transaction.decision.update_requested,
+            update_successful=successful and transaction.decision.update_requested,
+            draft_refit_attempted=transaction.decision.draft_refit_requested,
+            draft_refit_successful=successful
+            and transaction.decision.draft_refit_requested,
+        )
+        self.resolve(
+            transaction,
+            decision=transaction.decision,
+            outcome=outcome,
+            applied_snapshot=snapshot,
+        )
+        resolved = self.resolution_for(transaction.transaction_id)
+        assert resolved is not None
+        return resolved
+
+    def validate_checkpoint_contains(
+        self, checkpoint_id: str, resolved: ResolvedDraftStepTransaction
+    ) -> None:
+        if resolved.transaction.base_checkpoint_id != checkpoint_id:
+            raise ValueError("draft-step resolution is not bound to checkpoint")
+
+    def discard_after_checkpoint(
+        self, *, checkpoint_id: str, ledger_high_water: int
+    ) -> None:
+        for transaction in self._intents().values():
+            if transaction.decision.decision_id > ledger_high_water:
+                for path in self.root.glob(f"{transaction.transaction_id}.*.json"):
+                    path.unlink()
