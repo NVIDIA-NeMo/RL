@@ -211,6 +211,13 @@ def test_nightly_suites_match_gpus_per_node(
             )
 
 
+def test_launch_forwards_gpus_per_node_to_ray_sub():
+    with open(os.path.join(project_root, "tools", "launch")) as f:
+        launch_script = f.read()
+
+    assert "GPUS_PER_NODE=$GPUS_PER_NODE \\\\" in launch_script
+
+
 def test_all_test_scripts_accounted_for_in_test_suites(all_test_suites):
     all_test_scripts_in_test_suites = set(all_test_suites)
 
