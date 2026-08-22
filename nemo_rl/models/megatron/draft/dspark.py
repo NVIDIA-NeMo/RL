@@ -12,7 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Small checkpoint-compatible heads used by DSpark block drafting."""
+"""Small checkpoint-compatible heads used by DSpark block drafting.
+
+The parameter names ``markov_w1`` / ``markov_w2`` / ``proj``, and the
+``nn.Linear(markov_rank, draft_vocab)`` orientation that makes ``markov_w2.weight``
+come out ``[draft_vocab, markov_rank]``, are an interop contract with the official
+``deepseek-ai/dspark_qwen3_8b_block7`` checkpoint (revision ``03326e50``). Callers
+must additionally attach these modules under the ``markov_head`` / ``confidence_head``
+attribute names, since those become the checkpoint key prefixes. Renaming any of the
+above silently breaks loading of the official artifact; the pinned schema lives in
+``tests/unit/models/megatron/fixtures/dspark_qwen3_8b_block7_03326e50.json``.
+"""
 
 from __future__ import annotations
 
@@ -127,6 +137,16 @@ class DSparkMarkovHead(nn.Module):
             device=device,
             dtype=dtype,
         )
+        if self.local_draft_vocab_size != draft_vocab_size:
+            # The optimizer identifies TP-sharded params by these attributes, not by
+            # the checkpoint axis map. Without them param_is_not_tensor_parallel_duplicate
+            # treats every tp_rank>0 shard as a duplicate and drops it from the global
+            # grad norm, so clipping silently under-clips this head.
+            from megatron.core.tensor_parallel.layers import (
+                set_tensor_model_parallel_attributes,
+            )
+
+            set_tensor_model_parallel_attributes(self.markov_w2.weight, True, 0, 1)
 
     def forward(
         self,
@@ -193,19 +213,30 @@ class DSparkMarkovHead(nn.Module):
         from megatron.core.transformer.utils import (
             make_sharded_tensors_for_checkpoint,
         )
+        from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
         tensor_parallel_layers_axis_map = (
             {"markov_w2.weight": 0}
             if self.local_draft_vocab_size != self.draft_vocab_size
             else {}
         )
+        # make_sharded_tensors_for_checkpoint only falls back to parallel_state when
+        # *both* groups are None, and get_pg_rank(None) returns 0 rather than the real
+        # rank. Forwarding exactly one of them collapses that axis of replica_id, so
+        # several ranks claim is_main_replica and the save raises CheckpointingException.
+        # See the same failure documented in eagle.py.
+        tp_group = get_tensor_model_parallel_group_if_none(self.tensor_parallel_group)
         dp_cp_group = None if metadata is None else metadata.get("dp_cp_group")
+        if tp_group is not None and dp_cp_group is None:
+            from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
+
+            dp_cp_group = ensure_metadata_has_dp_cp_group(metadata)["dp_cp_group"]
         return make_sharded_tensors_for_checkpoint(
             self.state_dict(prefix="", keep_vars=True),
             prefix,
             tensor_parallel_layers_axis_map,
             sharded_offsets,
-            tp_group=self.tensor_parallel_group,
+            tp_group=tp_group,
             dp_cp_group=dp_cp_group,
         )
 
