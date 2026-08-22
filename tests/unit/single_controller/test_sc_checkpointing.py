@@ -515,6 +515,7 @@ def _make_actor_args(
         rollout_manager=_FakeRolloutManager(),  # type: ignore[arg-type]
         tq_buffer=tq_buffer if tq_buffer is not None else _FakeTQBuffer(),  # type: ignore[arg-type]
         partition_id=_PARTITION_ID,
+        finalizer_actors=[],
         save_state=(
             save_state if save_state is not None else _initial_grpo_save_state()
         ),

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import asyncio
-import gc
 import hashlib
 import json
 import math
