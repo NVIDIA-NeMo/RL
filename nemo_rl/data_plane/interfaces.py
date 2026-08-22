@@ -109,10 +109,10 @@ class DataPlaneConfig(TypedDict):
     ``backend``, ``claim_meta_poll_interval_s``.
 
     ``storage_capacity`` / ``num_storage_units`` / ``global_segment_size`` /
-    ``local_buffer_size`` / ``reuse_registered_buffers`` used to sit at this
-    level. A config still using that spelling is not rejected — the flat
-    key is simply never read, and :func:`backend_config` resolves the
-    nested block (or its defaults) as if it were absent. See there.
+    ``local_buffer_size`` used to sit at this level. A config still using that
+    spelling is not rejected — the flat key is simply never read, and
+    :func:`backend_config` resolves the nested block (or its defaults) as if it
+    were absent. See there.
     """
 
     enabled: bool
