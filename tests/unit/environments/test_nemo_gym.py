@@ -962,6 +962,54 @@ def test_nemo_gym_stub_module():
     )
 
 
+def test_setup_nemo_gym_config_requests_dynamo_engine_data() -> None:
+    config = SimpleNamespace(
+        policy={"generation": {"backend": "dynamo", "vllm_cfg": {}}},
+        env={
+            "nemo_gym": {
+                "policy_model": {
+                    "responses_api_models": {
+                        "vllm_model": {
+                            "extra_body": {
+                                "chat_template_kwargs": {"enable_thinking": False},
+                                "nvext": {
+                                    "extra_fields": ["timing"],
+                                    "trace": "keep-me",
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    extra_body = config.env["nemo_gym"]["policy_model"]["responses_api_models"][
+        "vllm_model"
+    ]["extra_body"]
+    assert extra_body == {
+        "chat_template_kwargs": {"enable_thinking": False},
+        "nvext": {
+            "extra_fields": ["timing", "engine_data"],
+            "trace": "keep-me",
+        },
+    }
+
+
+def test_setup_nemo_gym_config_does_not_add_dynamo_fields_for_vllm() -> None:
+    config = SimpleNamespace(
+        policy={"generation": {"backend": "vllm", "vllm_cfg": {}}},
+        env={"nemo_gym": {"port_range_low": 5000}},
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert config.env["nemo_gym"] == {"port_range_low": 5000}
+
+
 @pytest.fixture(scope="function")
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
