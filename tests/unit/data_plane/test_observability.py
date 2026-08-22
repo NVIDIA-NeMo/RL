@@ -415,8 +415,8 @@ def test_step_metrics_tail_is_exact_not_bucketed():
     assert "put/p99_ms" not in metrics and "step/put/p50_ms" not in metrics
     assert metrics["step/put/max_ms"] >= 30.0
     assert metrics["step/put/max_ms"] != pytest.approx(24.85, abs=0.5), "bucket edge"
-    # the cumulative view still carries percentiles for one-off inspection
-    assert "p99_ms" in client.snapshot()["by_op"]["put"]
+    # and one call supports no percentile at all, in either view
+    assert "p99_ms" not in client.snapshot()["by_op"]["put"]
     client.close()
 
 
@@ -626,13 +626,22 @@ def test_hash_fingerprint_matches_across_jagged_and_dense():
     client = MetricsDataPlaneClient(NoOpDataPlaneClient(), verify_tensor_hash=True)
     ids = ["a", "b"]
     dense = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64)
-    jagged = _jagged(list(dense.unbind()))
 
-    put_side = client._row_fingerprints(jagged, ids)["x"]
-    get_side = client._row_fingerprints(
+    # uniform rows: both sides reduce per row, and a densified read agrees
+    put_side = client._row_fingerprints(_jagged(list(dense.unbind())), ids)["x"]
+    assert not put_side.batch_scoped
+    get_side = client._row_fingerprints(TensorDict({"x": dense}, batch_size=[2]), ids)
+    assert put_side == get_side["x"]
+
+    # ragged rows: batch-scoped, and the read replays that scheme rather than
+    # choosing one from the dense tensor in hand
+    ragged = _jagged([torch.tensor([1, 2, 3]), torch.tensor([4, 5])])
+    scoped = client._row_fingerprints(ragged, ids)["x"]
+    assert scoped.batch_scoped
+    replayed = client._row_fingerprints(
         TensorDict({"x": dense}, batch_size=[2]), ids, batch_scoped_fields={"x"}
     )["x"]
-    assert put_side == get_side
+    assert replayed.batch_scoped
 
 
 def test_hash_shard_read_of_jagged_field_is_unverified_not_a_mismatch():
@@ -649,12 +658,12 @@ def test_hash_shard_read_of_jagged_field_is_unverified_not_a_mismatch():
     client.close()
 
 
-def test_hash_incomparable_field_is_counted_not_dropped():
+def test_hash_rectangular_put_read_back_ragged_is_a_mismatch():
     """A rectangular put can come back jagged — truncating one row makes the
-    batch ragged. Its per-row digests are not comparable against a
-    batch-scoped read, so the field is dropped; dropping it *silently* is
-    the exact shape of the bug that let this check pass while covering
-    nothing, so the drop has to land in ``fields_skipped``."""
+    batch ragged. There is no row-level digest to compare against, but the
+    row lengths changing between wire-in and wire-out *is* the divergence.
+    Reporting it as a skipped field would leave ``mismatches`` reading zero,
+    the exact shape of a guard that passes while covering nothing."""
     client = _hash_client(_RaggedOnReadClient())
     ids = [f"u{i}" for i in range(4)]
     dense = TensorDict(
@@ -664,8 +673,24 @@ def test_hash_incomparable_field_is_counted_not_dropped():
     client.get_samples(sample_ids=ids, partition_id="p", select_fields=["x"])
 
     hv = client.snapshot()["hash_verify"]
-    assert hv["mismatches"] == 0, "must not cry wolf on an incomparable field"
-    assert hv["fields_skipped"] == 1, "the drop must be visible"
+    assert hv["mismatches"] > 0, "a truncated row must not read as clean"
+    assert hv["fields_skipped"] == 0, "this is a divergence, not an abstention"
+
+
+def test_hash_shard_of_a_ragged_field_is_skipped_not_a_mismatch():
+    """The abstention that *is* legitimate: a batch-scoped digest covers the
+    whole buffer it was reduced over, so a shard of it is genuinely
+    incomparable. That must land in ``fields_skipped`` — visible, but not
+    crying wolf."""
+    client = _hash_client()
+    ids = [f"u{i}" for i in range(4)]
+    rows = [torch.arange(3 + i, dtype=torch.int64) for i in range(4)]
+    client.put_samples(sample_ids=ids, partition_id="p", fields=_jagged(rows))
+    client.get_samples(sample_ids=ids[:2], partition_id="p", select_fields=["x"])
+
+    hv = client.snapshot()["hash_verify"]
+    assert hv["mismatches"] == 0
+    assert hv["fields_skipped"] == 1
     assert client.get_step_metrics(1.0)["step/hash/fields_skipped"] == 1
 
 
@@ -755,9 +780,13 @@ def test_merge_sums_counters_and_rederives_percentiles():
     assert merged["by_op"]["put"]["calls"] == 12  # 3 ranks x 4 puts
     assert merged["by_op"]["put"]["n_bytes"] == 12_000
     assert sum(merged["by_op"]["put"]["latency_hist"]) == 12
-    # derived from the summed histogram, not averaged from the ranks
-    single = ranks[0].snapshot()["by_op"]["put"]
-    assert merged["by_op"]["put"]["p50_ms"] == pytest.approx(single["p50_ms"], rel=0.3)
+    # the buckets add: the merged histogram is the ranks' summed elementwise
+    per_rank = [c.snapshot()["by_op"]["put"]["latency_hist"] for c in ranks]
+    assert merged["by_op"]["put"]["latency_hist"] == [
+        sum(counts) for counts in zip(*per_rank)
+    ]
+    # 12 calls supports no percentile, and none is offered
+    assert "p50_ms" not in merged["by_op"]["put"]
     for c in ranks:
         c.close()
 
@@ -962,7 +991,7 @@ def test_snapshot_percentiles_never_exceed_the_measured_max():
     surface documented as the cumulative view."""
     client = MetricsDataPlaneClient(NoOpDataPlaneClient())
     now = monotonic()
-    for _ in range(5):
+    for _ in range(120):  # enough that both quantiles clear their gate
         client._emit("register", "p", 1, 0, now - 0.011 / 1e3, "ok")
 
     for view in (client.snapshot(), merge_snapshots([client.snapshot()])):
@@ -1066,3 +1095,136 @@ def test_cluster_per_op_time_is_reported_per_call():
 
     columns, rows = breakdown_table(small)
     assert "mean_ms" in columns and "wall_ms_per_process" not in columns
+
+
+def test_each_quantile_waits_for_the_samples_it_needs():
+    """n samples resolve a quantile no higher than about 1 - 1/n, so a p99
+    wants 100 and a p50 only a couple. One threshold for both meant 48 calls
+    reported neither, when the median was perfectly real and only the p99
+    would have been the maximum wearing a percentile label."""
+
+    def metrics_for(n_calls):
+        client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+        now = monotonic()
+        for i in range(n_calls):
+            client._emit("put", "p", 1, 1_000, now - (5.0 + i % 7) / 1e3, "ok")
+        return cluster_step_metrics(merge_snapshots([client.snapshot()]), {}, 1.0)
+
+    assert "step/put/p50_ms" not in metrics_for(10), "too thin for either"
+    mid = metrics_for(48)
+    assert "step/put/p50_ms" in mid, "a median off 48 calls is real"
+    assert "step/put/p99_ms" not in mid, "a p99 off 48 calls is the max"
+    both = metrics_for(120)
+    assert "step/put/p50_ms" in both and "step/put/p99_ms" in both
+
+
+class _JaggedEcho(NoOpDataPlaneClient):
+    """Returns whatever was put, jagged, so row lengths survive the trip."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
+
+    def put_samples(self, sample_ids, partition_id, fields=None, tags=None):
+        for key in fields.keys():
+            v = fields.get(key)
+            rows = v.unbind() if v.is_nested else list(v)
+            for sid, row in zip(sample_ids, rows):
+                self.rows.setdefault((partition_id, sid), {})[str(key)] = row.clone()
+        return super().put_samples(
+            sample_ids=sample_ids, partition_id=partition_id, fields=fields, tags=tags
+        )
+
+    def get_samples(self, sample_ids, partition_id, select_fields):
+        out = {}
+        for f in select_fields:
+            rows = [self.rows[(partition_id, sid)][f] for sid in sample_ids]
+            out[f] = (
+                torch.stack(rows)
+                if all(r.shape == rows[0].shape for r in rows[1:])
+                else torch.nested.nested_tensor(rows, layout=torch.jagged)
+            )
+        return TensorDict(out, batch_size=[len(sample_ids)])
+
+
+def _jagged_ids(lengths, seed=0):
+    """Rows of pseudorandom token ids.
+
+    Deliberately not ``arange``: ``hash_tensor`` is an XOR reduction, and
+    aligned runs of consecutive integers collide under it — ``XOR(6..11)``
+    and ``XOR(12..17)`` are both 1 — which would make two visibly different
+    rows fingerprint the same.
+    """
+    g = torch.Generator().manual_seed(seed)
+    return TensorDict(
+        {
+            "ids": torch.nested.nested_tensor(
+                [torch.randint(0, 32000, (n,), generator=g) for n in lengths],
+                layout=torch.jagged,
+            )
+        },
+        batch_size=[len(lengths)],
+    )
+
+
+def test_uniform_jagged_rows_are_fingerprinted_per_row():
+    """A jagged field whose rows happen to be uniform is a rectangle already
+    -- its values buffer reshapes to one as a view -- so it earns per-row
+    attribution for free. The batch-scoped fallback is an XOR over one shared
+    buffer, which cannot see a permutation: two equal-length rows swapped by a
+    mis-shard would round-trip clean."""
+    inner = _JaggedEcho()
+    client = _hash_client(inner)
+    ids = [f"u{i}" for i in range(4)]
+    client.put_samples(
+        sample_ids=ids, partition_id="p", fields=_jagged_ids([6, 6, 6, 6])
+    )
+    a, b = inner.rows[("p", "u1")]["ids"], inner.rows[("p", "u2")]["ids"]
+    inner.rows[("p", "u1")]["ids"], inner.rows[("p", "u2")]["ids"] = b, a
+    client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
+
+    hv = client.snapshot()["hash_verify"]
+    assert hv["mismatches"] == 2, "the two swapped rows, named individually"
+    assert hv["fields_skipped"] == 0
+    client.close()
+
+
+def test_uniform_put_read_back_ragged_is_a_mismatch_not_a_skip():
+    """Row lengths changing between wire-in and wire-out is a divergence. It
+    has no row-level digest to compare against, but reporting it as a skipped
+    field would leave mismatches reading zero -- exactly the shape of a guard
+    that covers nothing."""
+    inner = _JaggedEcho()
+    client = _hash_client(inner)
+    ids = [f"u{i}" for i in range(4)]
+    client.put_samples(
+        sample_ids=ids, partition_id="p", fields=_jagged_ids([6, 6, 6, 6])
+    )
+    inner.rows[("p", "u2")]["ids"] = inner.rows[("p", "u2")]["ids"][:-2]
+    client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
+
+    assert client.snapshot()["hash_verify"]["mismatches"] > 0
+    client.close()
+
+
+def test_delta_put_does_not_restate_the_scheme_of_untouched_fields():
+    """write_columns puts one field into a partition written ragged earlier.
+    Holding the jagged/per-row choice per partition let that delta hand the
+    read side the wrong scheme for its own field, and every row came back a
+    false alarm."""
+    inner = _JaggedEcho()
+    client = _hash_client(inner)
+    ids = [f"u{i}" for i in range(4)]
+    client.put_samples(
+        sample_ids=ids, partition_id="p", fields=_jagged_ids([2, 4, 6, 3])
+    )
+    client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
+    assert client.snapshot()["hash_verify"]["mismatches"] == 0
+
+    # same field, rewritten uniform -- the later scheme must win
+    client.put_samples(
+        sample_ids=ids, partition_id="p", fields=_jagged_ids([6, 6, 6, 6], seed=99)
+    )
+    client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
+    assert client.snapshot()["hash_verify"]["mismatches"] == 0
+    client.close()
