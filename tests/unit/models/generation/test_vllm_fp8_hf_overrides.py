@@ -21,6 +21,8 @@ silently reverted (#2188), and re-fixed (#2904). These tests pin the merge
 behavior so it cannot regress a third time.
 """
 
+import pytest
+
 from nemo_rl.models.generation.vllm.vllm_worker import _merge_fp8_kwargs
 
 
@@ -48,14 +50,61 @@ def test_fp8_and_user_hf_overrides_coexist():
 
 def test_user_hf_overrides_take_precedence():
     """On key collision, the user-supplied hf_overrides value wins."""
-    vllm_kwargs = {"hf_overrides": {"quantization_config": {"user": "wins"}}}
+    vllm_kwargs = {
+        "hf_overrides": {
+            "quantization_config": {
+                "user": "wins",
+                "ignore": ["model.layers.0.self_attn.*"],
+            }
+        }
+    }
     fp8_kwargs = {
-        "hf_overrides": {"quantization_config": {"fp8": "base"}},
+        "hf_overrides": {
+            "quantization_config": {
+                "fp8": "base",
+                "ignore": ["lm_head"],
+                "ignored_layers": ["lm_head"],
+            }
+        },
     }
 
     _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
 
-    assert vllm_kwargs["hf_overrides"]["quantization_config"] == {"user": "wins"}
+    assert vllm_kwargs["hf_overrides"]["quantization_config"] == {
+        "fp8": "base",
+        "user": "wins",
+        "ignore": ["lm_head", "model.layers.0.self_attn.*"],
+        "ignored_layers": ["lm_head"],
+    }
+
+
+def test_none_user_quantization_config_keeps_generated_config():
+    vllm_kwargs = {"hf_overrides": {"quantization_config": None}}
+    fp8_kwargs = {
+        "hf_overrides": {
+            "quantization_config": {
+                "ignore": ["lm_head"],
+                "ignored_layers": ["lm_head"],
+            }
+        }
+    }
+
+    _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
+
+    assert vllm_kwargs["hf_overrides"]["quantization_config"] == {
+        "ignore": ["lm_head"],
+        "ignored_layers": ["lm_head"],
+    }
+
+
+def test_non_mapping_user_quantization_config_is_rejected():
+    vllm_kwargs = {"hf_overrides": {"quantization_config": "invalid"}}
+    fp8_kwargs = {"hf_overrides": {"quantization_config": {"ignore": ["lm_head"]}}}
+
+    with pytest.raises(
+        ValueError, match="hf_overrides.quantization_config must be a mapping"
+    ):
+        _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
 
 
 def test_no_existing_hf_overrides():
@@ -98,3 +147,20 @@ def test_source_fp8_kwargs_not_mutated():
     _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
 
     assert "hf_overrides" in fp8_kwargs
+
+
+@pytest.mark.vllm
+def test_vllm_keeps_target_dict_overrides_out_of_draft_model():
+    from vllm.config.speculative import SpeculativeConfig
+
+    draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
+        {
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MXFP8",
+                "ignore": ["lm_head"],
+            }
+        }
+    )
+
+    assert draft_hf_overrides is SpeculativeConfig.hf_config_override
