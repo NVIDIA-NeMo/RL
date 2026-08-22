@@ -669,6 +669,63 @@ def cluster_step_metrics(
     return metrics
 
 
+# Per-op columns worth a row in the breakdown, in the order they read.
+# ``overhead_ms``/``transfer_ms`` are only present when the affine fit is
+# trustworthy, and ``p50_ms``/``p99_ms`` only above the sample gate, so a
+# row carries None where a series was withheld rather than a zero that
+# would read as a measurement.
+_BREAKDOWN_COLUMNS = (
+    "calls",
+    "wall_ms",
+    "max_ms",
+    "overhead_ms",
+    "transfer_ms",
+    "p50_ms",
+    "p99_ms",
+)
+
+
+def breakdown_table(
+    metrics: dict[str, float],
+) -> tuple[list[str], list[list[Any]]]:
+    """Reshape the flat per-op series into one row per op.
+
+    A stack of line charts answers "how did put's wall time trend"; the
+    question this feeds is "where did this step's time go, across ops, at a
+    glance" -- which is a table, and reading it off eight separate charts is
+    the wrong tool.
+
+    Built from the metrics dict that is logged rather than from the snapshot
+    it came from, so the table and the series can never disagree: a value
+    withheld from the series (a percentile below the sample gate, a fit that
+    is not trustworthy) is absent from the table too.
+
+    Args:
+        metrics: A flat ``step/{op}/{field}`` dict from
+            :meth:`MetricsDataPlaneClient.get_step_metrics` or
+            :func:`cluster_step_metrics`.
+
+    Returns:
+        ``(columns, rows)`` for :meth:`Logger.log_table`, ops sorted by
+        descending wall time so the expensive one is the first line read.
+    """
+    per_op: dict[str, dict[str, float]] = {}
+    for key, value in metrics.items():
+        parts = key.split("/")
+        if len(parts) != 3 or parts[0] != "step":
+            continue
+        _, op, field = parts
+        if field in _BREAKDOWN_COLUMNS:
+            per_op.setdefault(op, {})[field] = value
+    rows = [
+        [op, *(stats.get(col) for col in _BREAKDOWN_COLUMNS)]
+        for op, stats in sorted(
+            per_op.items(), key=lambda kv: -kv[1].get("wall_ms", 0.0)
+        )
+    ]
+    return ["op", *_BREAKDOWN_COLUMNS], rows
+
+
 def log_event(event: DataPlaneEvent) -> None:
     logger.info("data_plane_event: %s", event)
 
