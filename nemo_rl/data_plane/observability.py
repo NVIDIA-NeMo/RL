@@ -497,7 +497,7 @@ def _op_step_stats(
     return out
 
 
-def _pct_of_dataplane(per_op: dict[str, dict[str, float]]) -> dict[str, float]:
+def _percent_of_dataplane(per_op: dict[str, dict[str, float]]) -> dict[str, float]:
     """Where this step's data-plane time went, in percent.
 
     The name carries the denominator because that is the one thing a reader
@@ -529,14 +529,14 @@ def _pct_of_dataplane(per_op: dict[str, dict[str, float]]) -> dict[str, float]:
         per_op: Per-op step detail from :func:`_op_step_stats`.
 
     Returns:
-        ``step/pct_of_dataplane/by_op/{op}`` and ``step/pct_of_dataplane/by_cause/{cause}``,
+        ``step/percent_of_dataplane/by_op/{op}`` and ``step/percent_of_dataplane/by_cause/{cause}``,
         each in percent. Empty when no op ran.
     """
     total = sum(r["wall_ms"] for r in per_op.values())
     if total <= 0:
         return {}
-    pct = {
-        f"step/pct_of_dataplane/by_op/{op}": 100.0 * r["wall_ms"] / total
+    percent = {
+        f"step/percent_of_dataplane/by_op/{op}": 100.0 * r["wall_ms"] / total
         for op, r in per_op.items()
     }
     for cause, field_name in (
@@ -547,8 +547,10 @@ def _pct_of_dataplane(per_op: dict[str, dict[str, float]]) -> dict[str, float]:
             r[field_name] * r["calls"] for r in per_op.values() if field_name in r
         )
         if attributed > 0:
-            pct[f"step/pct_of_dataplane/by_cause/{cause}"] = 100.0 * attributed / total
-    return pct
+            percent[f"step/percent_of_dataplane/by_cause/{cause}"] = (
+                100.0 * attributed / total
+            )
+    return percent
 
 
 def _latency_split(
@@ -617,7 +619,7 @@ def _derive_op_metrics(by_op: dict[str, Any], total_wall_ms: float) -> None:
         stats["mb_per_s"] = (
             (stats["n_bytes"] / 1e6) / (wall_ms / 1e3) if wall_ms else 0.0
         )
-        stats["pct_of_total_ms"] = (
+        stats["percent_of_total_ms"] = (
             100.0 * wall_ms / total_wall_ms if total_wall_ms else 0.0
         )
         stats["fit"] = fit_latency_bandwidth(stats)
@@ -778,7 +780,7 @@ def cluster_step_metrics(
         }
     )
     per_op = _op_step_stats(merged["by_op"], prev.get("by_op", {}))
-    metrics.update(_pct_of_dataplane(per_op))
+    metrics.update(_percent_of_dataplane(per_op))
     for op, row in per_op.items():
         for field_name, value in row.items():
             metrics[f"step/{op}/{field_name}"] = value
@@ -800,11 +802,11 @@ _HEADLINE = (
     "step/self/overhead_ms",
     "step/self/frac",
 )
-_HEADLINE_PREFIXES = ("step/pct_of_dataplane/", "step/hash/", "step/self/")
+_HEADLINE_PREFIXES = ("step/percent_of_dataplane/", "step/hash/", "step/self/")
 # ``step/<x>/<field>`` is the per-op shape, so these reserved middles must
 # not be mistaken for op tags -- ``step/self/overhead_ms`` was becoming a
 # "self" row in the breakdown table beside put and get.
-_RESERVED_NAMESPACES = frozenset({"pct_of_dataplane", "hash", "self"})
+_RESERVED_NAMESPACES = frozenset({"percent_of_dataplane", "hash", "self"})
 
 
 def headline_series(metrics: dict[str, float]) -> dict[str, float]:
@@ -831,7 +833,7 @@ def headline_series(metrics: dict[str, float]) -> dict[str, float]:
 # row carries None where a series was withheld rather than a zero that
 # would read as a measurement.
 _BREAKDOWN_COLUMNS = (
-    "pct_of_dataplane",
+    "percent_of_dataplane",
     "calls",
     "wall_ms",
     "mean_ms",
@@ -872,8 +874,8 @@ def breakdown_table(
     per_op: dict[str, dict[str, float]] = {}
     for key, value in metrics.items():
         parts = key.split("/")
-        if len(parts) == 4 and parts[:3] == ["step", "pct_of_dataplane", "by_op"]:
-            per_op.setdefault(parts[3], {})["pct_of_dataplane"] = value
+        if len(parts) == 4 and parts[:3] == ["step", "percent_of_dataplane", "by_op"]:
+            per_op.setdefault(parts[3], {})["percent_of_dataplane"] = value
         elif (
             len(parts) == 3
             and parts[0] == "step"
@@ -883,7 +885,7 @@ def breakdown_table(
             per_op.setdefault(parts[1], {})[parts[2]] = value
     rows = [
         [op, *(stats.get(col) for col in _BREAKDOWN_COLUMNS)]
-        # By wall time, which orders identically to ``pct_of_dataplane`` (that is
+        # By wall time, which orders identically to ``percent_of_dataplane`` (that is
         # wall time over a common total) and is present even when the
         # percentages are not -- a table built from a partial metrics dict
         # still reads worst-first.
@@ -1082,7 +1084,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         ``VllmGeneration.get_step_metrics`` so trainers stay one line.
 
         ``frac_of_step`` is the metric that decides whether optimising the
-        data plane is worth anything: ``pct_of_dataplane`` only says where
+        data plane is worth anything: ``percent_of_dataplane`` only says where
         data-plane time went, never whether it mattered against compute.
         """
         # Reading the step maxima is what closes the window: the values
@@ -1116,7 +1118,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 "fields_skipped", 0
             )
         per_op = _op_step_stats(snap["by_op"], prev.get("by_op", {}))
-        metrics.update(_pct_of_dataplane(per_op))
+        metrics.update(_percent_of_dataplane(per_op))
         for op, row in per_op.items():
             for field_name, value in row.items():
                 metrics[f"step/{op}/{field_name}"] = value
