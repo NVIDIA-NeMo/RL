@@ -667,15 +667,15 @@ def cluster_step_metrics(
         if calls <= 0:
             continue
         metrics[f"step/{op}/calls"] = calls
-        # Summed over processes that ran concurrently, like every other time
-        # on this path -- so it is process-time, and on the driver path the
-        # same key is elapsed. 200 gets of 11 ms across 8 ranks reads 2233
-        # here and took 278 ms of wall clock. Both are worth having: the sum
-        # attributes cost across ops, the per-process figure gives the
-        # magnitude a reader expects from a millisecond.
         op_wall_ms = stats["wall_ms"] - prev_op.get("wall_ms", 0.0)
+        # How long one call took, which is the only form of this that
+        # describes the wire rather than the shape of the run. ``wall_ms``
+        # is summed over concurrent processes, so it scales with DP degree;
+        # dividing by the process count instead just trades one arbitrary
+        # denominator for another. Per call is invariant to both, and
+        # comparable across runs and cluster sizes.
+        metrics[f"step/{op}/mean_ms"] = op_wall_ms / calls
         metrics[f"step/{op}/wall_ms"] = op_wall_ms
-        metrics[f"step/{op}/wall_ms_per_process"] = op_wall_ms / n_procs
         metrics[f"step/{op}/max_ms"] = stats["max_ms"]
         # Percentiles over THIS step's calls, summed across ranks, not over
         # the lifetime: a cumulative percentile beside a step-scoped max is
@@ -717,9 +717,9 @@ def cluster_step_metrics(
 # would read as a measurement.
 _BREAKDOWN_COLUMNS = (
     "calls",
-    "wall_ms",
-    "wall_ms_per_process",
+    "mean_ms",
     "max_ms",
+    "wall_ms",
     "overhead_ms",
     "transfer_ms",
     "p50_ms",
@@ -996,6 +996,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
             # can divide. ``snapshot()`` still carries the full picture,
             # percentiles included, for a one-off inspection.
             metrics[f"step/{op}/calls"] = calls
+            metrics[f"step/{op}/mean_ms"] = op_ms / calls
             metrics[f"step/{op}/wall_ms"] = op_ms
             # ``max_ms`` rather than p50/p99. Those come off a histogram
             # that is never reset, so per step they were a lifetime figure
