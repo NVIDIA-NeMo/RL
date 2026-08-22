@@ -400,6 +400,28 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         results = ray.get(futures)
         return results
 
+    def initialize_model_express(self, *, server_url: str | None = None) -> list[str]:
+        """Initialize rank-local MX trainer clients and return their source slots."""
+        return [
+            slot
+            for slot in self.run_all_workers_single_data(
+                "initialize_model_express", server_url=server_url
+            )
+            if slot is not None
+        ]
+
+    def publish_model_express_version(self, version: Any) -> None:
+        """Publish one global version from every trainer rank."""
+        self.run_all_workers_single_data(
+            "publish_model_express_version", version=version
+        )
+
+    def release_model_express_version(self, version: Any) -> None:
+        """Withdraw every trainer shard after its version is retired."""
+        self.run_all_workers_single_data(
+            "release_model_express_version", version=version
+        )
+
     def init_collective(
         self,
         ip: str,

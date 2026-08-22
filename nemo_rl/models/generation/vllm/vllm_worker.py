@@ -216,10 +216,16 @@ class BaseVllmGenerationWorker:
                 engine_index_on_node = (
                     local_bundle_indices[0] % num_gpus_per_node
                 ) // mp_size
-            env_vars["VLLM_PORT"] = str(
+            vllm_port = (
                 DEFAULT_VLLM_PORT_RANGE_LOW
                 + engine_index_on_node * DEFAULT_VLLM_PORTS_PER_ENGINE
             )
+            env_vars["VLLM_PORT"] = str(vllm_port)
+            # MX inference derives rank-local listeners from these configured
+            # bases plus the CUDA device id. Keep them in unused portions of
+            # this engine's deterministic 100-port reservation.
+            env_vars["MX_METADATA_PORT"] = str(vllm_port + 64)
+            env_vars["MX_WORKER_GRPC_PORT"] = str(vllm_port + 80)
 
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
@@ -324,6 +330,7 @@ class BaseVllmGenerationWorker:
         self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
+        self._bundle_indices = bundle_indices
         self._extra_env_vars = extra_env_vars
 
         # Store the Python executable being used by this worker
@@ -1155,6 +1162,27 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+
+    def initialize_model_express(self, *, server_url: str | None = None) -> None:
+        """Initialize the rank-local MX clients owned by this vLLM engine."""
+        assert self.llm is not None, "vLLM must be initialized before ModelExpress"
+        self.llm.collective_rpc(
+            "initialize_model_express",
+            args=(server_url,),
+        )
+
+    def update_weights_from_model_express(self, *, version: Any) -> bool:
+        """Apply one exact MX version on every internal vLLM rank."""
+        assert self.llm is not None, "vLLM must be initialized before ModelExpress"
+        results = cast(
+            list[bool],
+            self.llm.collective_rpc(
+                "update_weights_from_model_express", args=(version,)
+            ),
+        )
+        if not results or not all(results):
+            raise RuntimeError(f"ModelExpress update failed: {results}")
+        return True
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:

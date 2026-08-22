@@ -70,7 +70,12 @@ def test_reset_encoder_cache_flag_rejected_on_unsupported_refit_transports():
     assert normalize_vllm_refit_config(_config("nccl_reshard")) is None
 
     # Transports whose refit path never resets the encoder cache fail loudly.
-    for transport in ("nixl", "vllm_s3_sparse", "vllm_zmq_sparse"):
+    for transport in (
+        "nixl",
+        "vllm_s3_sparse",
+        "vllm_zmq_sparse",
+        "model_express",
+    ):
         with pytest.raises(ValueError, match="reset_encoder_cache_after_weight_update"):
             normalize_vllm_refit_config(_config(transport))
 

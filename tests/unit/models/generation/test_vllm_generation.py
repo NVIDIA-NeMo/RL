@@ -19,7 +19,7 @@ import sys
 import types
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
@@ -49,6 +49,56 @@ from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
+
+
+def test_model_express_initializes_every_vllm_rank() -> None:
+    worker = object.__new__(VllmGenerationWorkerImpl)
+    worker.llm = MagicMock()
+
+    worker.initialize_model_express(server_url="mx-server:8000")
+
+    worker.llm.collective_rpc.assert_called_once_with(
+        "initialize_model_express",
+        args=("mx-server:8000",),
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_model_express_initializes_every_vllm_rank() -> None:
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.llm = MagicMock()
+    worker.llm.collective_rpc = AsyncMock()
+
+    await worker.initialize_model_express_async(server_url="mx-server:8000")
+
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        "initialize_model_express",
+        args=("mx-server:8000",),
+    )
+
+
+@pytest.mark.parametrize("results", [[], [None], [True, None], [False]])
+def test_model_express_update_requires_every_engine_to_succeed(monkeypatch, results):
+    generation = object.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": False}}
+    generation.worker_group = MagicMock()
+    generation.worker_group.run_all_workers_single_data.return_value = ["update-future"]
+    monkeypatch.setattr(ray, "get", lambda _futures: results)
+
+    with pytest.raises(RuntimeError, match="failed ModelExpress refit"):
+        generation.update_weights_from_model_express(MagicMock(version_id="version-1"))
+
+
+def test_model_express_update_accepts_success_from_every_engine(monkeypatch):
+    generation = object.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": False}}
+    generation.worker_group = MagicMock()
+    generation.worker_group.run_all_workers_single_data.return_value = ["update-future"]
+    monkeypatch.setattr(ray, "get", lambda _futures: [True, True])
+
+    generation.update_weights_from_model_express(MagicMock(version_id="version-1"))
+
+
 # Define basic vLLM test config
 basic_vllm_test_config: VllmConfig = {
     "backend": "vllm",
