@@ -429,7 +429,7 @@ data_plane:
   global_segment_size: 549755813888    # 512 GiB — used when backend == "mooncake_cpu"
   local_buffer_size:   68719476736     # 64 GiB  — used when backend == "mooncake_cpu"
   observability:                       # NotRequired
-    enabled: false                     # per-op timing / latency percentiles / volume
+    enabled: true                      # per-op timing / latency percentiles / volume
     verify_tensor_hash: false          # debug: wire-in vs wire-out tensor check
 ```
 
@@ -447,10 +447,14 @@ carries — 256 ragged rows, 12 MB, jagged per-token fields as
 0.1% of a 59 ms operation. What is left is dominated by the per-key
 attribution `clear_samples` needs to undo.
 
-Note that `enabled: true` also installs `log_event` as the default
-`on_event` sink, which emits one `logger.info` line per data-plane op. Pass
-`observability.callback` explicitly (or `None`) if you want the counters
-without the per-op log.
+This is **on by default**, and only engages when `data_plane.enabled` is
+true, so it costs nothing for runs that don't use the data plane. There is
+no default per-op sink: `get_step_metrics()` is the surface, and
+`grpo_train_sync` logs it once a step under the `data_plane/` prefix — so
+the series reach whatever backends the run has enabled (wandb, TensorBoard,
+MLflow). Roughly 5-8 series per distinct op tag. Set
+`observability.callback` if you additionally want a hook on every transfer;
+`log_event` is exported for that.
 
 `verify_tensor_hash: true` additionally records a `torch.hash_tensor`
 fingerprint on every put and re-checks it on every get, so a tensor that
