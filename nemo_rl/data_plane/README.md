@@ -592,30 +592,39 @@ Two granularities, because torch has no ragged hash kernel:
 
 | leaf | digest | scope |
 |---|---|---|
-| rectangular (`rewards`, `input_lengths`) | one per row, `hash_tensor(..., dim=1)` | per sample id; survives shard reads |
-| jagged (`input_ids`, `generation_logprobs`, `token_mask`, `advantages`) | one over the values buffer, XORed per row with that row's length | per batch; a shard read reports unverified |
+| rectangular rows — dense, or jagged with uniform lengths | one per row, `hash_tensor(..., dim=1)` | per sample id; survives shard reads |
+| genuinely ragged rows | one over the values buffer, XORed per row with that row's length | per batch; a shard read reports unverified |
 
-Giving the jagged fields per-row digests would mean padding each one out to
-a rectangle first. On a realistically ragged batch that rectangle is 3.5×
-the real payload and cost 13× more, to answer a question the buffer digest
-already answers.
+The split is on the *rows*, not the layout. A jagged leaf whose rows happen
+to be uniform is already a rectangle — its values buffer reshapes to one as
+a view — so it takes the per-row path for free. Only a leaf with rows of
+differing lengths falls back, and giving *those* per-row digests would mean
+padding each out to a rectangle first: on a realistically ragged batch that
+rectangle is 3.5× the real payload and costs 13× more, to answer a question
+the buffer digest already answers.
+
+Whichever scheme a put used is recorded per field and replayed on the read,
+so the two sides always compute the same thing. A field written with
+uniform rows that comes back ragged is a divergence in the row lengths
+themselves, and is reported as a mismatch.
 
 **Detection is not attribution, and the difference is the whole point of
 the split.** The same corruption, injected into an 8-row batch:
 
-| corruption | jagged leaf | rectangular leaf |
+| corruption | ragged leaf | rectangular leaf |
 |---|---|---|
 | 1 element changed in `u3` | caught, flags **all 8 rows** | caught, names **`u3`** |
 | `u5` zeroed | caught, flags all 8 rows | caught, names `u5` |
 | `u3`↔`u4` swapped | caught only if their lengths differ | caught, names `u3`,`u4` |
 | nothing | clean | clean |
 
-A jagged digest covers the whole values buffer, so any change moves every
+A ragged digest covers the whole values buffer, so any change moves every
 row's value: it says *this batch is wrong*, never *this sample is wrong*.
-Since `pack_jagged_fields` leaves ~94% of the payload jagged (only
-`rewards` and `input_lengths` stay rectangular), that is the normal
-resolution — you learn a step's transfer diverged and have to bisect for
-the row yourself.
+On rollout data straight out of generation that is the normal resolution
+for the token-aligned fields — you learn a step's transfer diverged and
+have to bisect for the row yourself. Anything uniform-width (a densified
+read, `advantages` written at full width, a shard whose rows agree) names
+the sample.
 
 Verified by injecting corruption into the round trip. Caught: a
 single-element change in every dtype, a truncated row, a zeroed row, a
@@ -624,14 +633,15 @@ bf16→fp32 precision change, and a row served from the wrong sample — with
 from 1 to 256, reversed id order, field subsets and delta writes. Known
 limits, measured rather than assumed:
 
-- A **mis-shard** (two rows swapped) is caught on a jagged field only when
-  the two rows differ in length — 58/60 on ragged rollout data, never on a
-  uniform-length batch. Rectangular fields catch it unconditionally.
+- A batch-scoped digest is an XOR reduction over one shared buffer, and XOR
+  cannot see a permutation of what it reduces. On a ragged field a
+  **mis-shard** (two rows swapped) is therefore caught only when the two
+  rows differ in length — 60/60 on ragged rollout data, where lengths rarely
+  collide. Rows of uniform width catch it unconditionally, per row. The same
+  blind spot hides a reordering *within* a row: 0/200 for a two-token swap
+  in `input_ids`, and 18/200 for moving two set bits in a bool mask.
 - It reads every tensor byte again on both sides — ~2.4 ms for a 12 MB
   jagged batch, on put and again on get. Keep it to debugging runs.
-- A rectangular field that comes back **jagged** (one row truncated makes
-  the batch ragged) has no comparable digest and is dropped — counted in
-  `hash/fields_skipped`, not reported as a mismatch.
 - Only rows this process wrote can be checked. A consumer-side client
   reports them under `hash/rows_unverified` rather than counting them
   clean, and `hash/fields_skipped` reports any leaf it could not compare

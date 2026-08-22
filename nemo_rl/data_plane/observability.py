@@ -96,12 +96,12 @@ _READ_OPS = frozenset({"get", "get_data"})
 # few lines carry the identity of what broke.
 _MAX_HASH_MISMATCH_LOGS = 20
 
-# Calls needed in a window before a percentile off the histogram means
-# anything. Below this the interpolation returns bucket geometry: one sample
-# in (100, 250] yields p50 = 100 + 150*0.50 = 175 and p99 = 248.5 whatever
-# the call actually took. Reporting that next to an exact ``max_ms`` produced
-# a max below its own median.
-_MIN_SAMPLES_FOR_PERCENTILE = 50
+# Quantiles reported per op, each with the sample count it needs. n samples
+# resolve a quantile no higher than about 1 - 1/n, so a p99 wants 100 and a
+# p50 wants only a couple -- 20 for stability. One threshold for both was
+# why 48 calls reported neither, when the median was perfectly real and only
+# the p99 would have been the maximum wearing a percentile label.
+_QUANTILES = ((0.50, "p50_ms", 20), (0.99, "p99_ms", 100))
 
 
 class _FieldDigest(NamedTuple):
@@ -470,24 +470,28 @@ def _latency_split(
     return fit["fixed_ms"], ms_per_byte * (op_bytes / calls)
 
 
-def _clamped_percentiles(hist: list[int], max_ms: float) -> tuple[float, float] | None:
-    """p50 and p99 from ``hist``, or ``None`` when the sample is too thin.
+def _clamped_percentiles(hist: list[int], max_ms: float) -> dict[str, float]:
+    """Whichever of :data:`_QUANTILES` this sample can actually support.
 
-    Two corrections, both needed wherever a percentile is taken. Below
-    :data:`_MIN_SAMPLES_FOR_PERCENTILE` the interpolation returns bucket
-    geometry rather than data -- one sample in (100, 250] yields a p50 of
-    175 whatever the call took -- so there is no answer to give. And the
-    interpolation spreads a bucket's samples uniformly across it, so calls
-    clustered low in a wide bucket read high, above the exact maximum
-    measured beside them; the maximum is the tighter bound.
+    Two corrections, both needed wherever a percentile is taken off a coarse
+    histogram. Each quantile is withheld until there are enough samples to
+    resolve it: below that the interpolation returns bucket geometry rather
+    than data -- one sample in (100, 250] yields a p50 of 175 whatever the
+    call took. And the interpolation spreads a bucket's samples uniformly
+    across it, so calls clustered low in a wide bucket read high, above the
+    exact maximum measured beside them; the maximum is the tighter bound.
+
+    Returns a dict rather than a fixed pair so a caller emits only what the
+    data supports. An absent series says "not enough calls"; a zero would
+    read as a measurement.
     """
-    if sum(hist) < _MIN_SAMPLES_FOR_PERCENTILE:
-        return None
+    n = sum(hist)
     ceiling = max_ms if max_ms > 0 else float("inf")
-    return (
-        min(percentile_from_hist(hist, 0.50), ceiling),
-        min(percentile_from_hist(hist, 0.99), ceiling),
-    )
+    return {
+        name: min(percentile_from_hist(hist, q), ceiling)
+        for q, name, min_samples in _QUANTILES
+        if n >= min_samples
+    }
 
 
 def _derive_op_metrics(by_op: dict[str, Any], total_wall_ms: float) -> None:
@@ -511,13 +515,9 @@ def _derive_op_metrics(by_op: dict[str, Any], total_wall_ms: float) -> None:
         )
         stats["fit"] = fit_latency_bandwidth(stats)
         hist = stats["latency_hist"]
-        pct = _clamped_percentiles(hist, stats["max_ms"])
-        stats["p50_ms"], stats["p99_ms"] = pct if pct else (0.0, 0.0)
-        # Tail/mean ratio: a mean hides MR churn and queueing, which show
-        # up as p99 pulling away from the mean.
-        stats["tail_ratio_p99_mean"] = (
-            stats["p99_ms"] / stats["mean_ms"] if stats["mean_ms"] > 0 else 0.0
-        )
+        # Only what the sample supports; an absent key says "not enough
+        # calls", which a zero would not.
+        stats.update(_clamped_percentiles(hist, stats["max_ms"]))
 
 
 # Snapshot fields that combine by summing, by taking a maximum, and the
@@ -697,9 +697,8 @@ def cluster_step_metrics(
         ]
         # Off the step's histogram delta, not the cumulative one
         # :func:`_derive_op_metrics` used.
-        pct = _clamped_percentiles(step_hist, stats["max_ms"])
-        if pct:
-            metrics[f"step/{op}/p50_ms"], metrics[f"step/{op}/p99_ms"] = pct
+        for name, value in _clamped_percentiles(step_hist, stats["max_ms"]).items():
+            metrics[f"step/{op}/{name}"] = value
         # The split belongs here more than on the driver path: this fit is
         # over every rank's sufficient statistics, so it has far more
         # samples and far more size variation -- and size variation is
@@ -903,7 +902,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # partition -> (batch-scoped field names, row count at put). Those
         # digests cover a whole buffer, so they only reconcile against a read
         # of that same batch; the row count is what detects a shard read.
-        self._batch_scope: dict[str, tuple[frozenset[str], int]] = {}
+        # partition -> field -> rows the field's digest was reduced over,
+        # for batch-scoped fields only. An absent field was reduced per row.
+        self._batch_scope: dict[str, dict[str, int]] = {}
         self._hash_mismatches_logged = 0
         # Set by ``_emit`` to the inner client's wall time for the op just
         # run, so the wrapping methods can subtract it and bill the rest to
@@ -1110,12 +1111,15 @@ class MetricsDataPlaneClient(DataPlaneClient):
         """``torch.hash_tensor`` fingerprints for each tensor leaf.
 
         A rectangular leaf reduces per row (``dim=1``), which names the
-        sample that diverged. ``hash_tensor`` has no ragged kernel, so a
-        jagged leaf instead gets one digest over its whole values buffer,
-        XORed per row with that row's length, and is marked
-        ``batch_scoped``; padding it out to a rectangle to get per-row
-        digests costs far more than the answer is worth. ``README.md`` has
-        the resulting detection/attribution table.
+        sample that diverged. A jagged leaf whose rows happen to be uniform
+        is rectangular already — its values buffer reshapes to the rectangle
+        as a view — so it takes the same path for free. Only a genuinely
+        ragged leaf falls back to one digest over its whole values buffer,
+        XORed per row with that row's length, and marked ``batch_scoped``;
+        padding it out to a rectangle costs far more than the answer is
+        worth. That fallback inherits the blind spot of an XOR reduction: it
+        sees any change to the multiset of values, but not a permutation of
+        them. ``README.md`` has the detection/attribution table.
 
         Args:
             td: Leaves to fingerprint; ``None`` yields an empty result.
@@ -1156,20 +1160,24 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 if offsets.numel() - 1 != n_rows:
                     stats.fields_skipped += 1
                     continue
-                buffer, lengths = v.values(), (offsets[1:] - offsets[:-1]).tolist()
+                lengths = (offsets[1:] - offsets[:-1]).tolist()
+                # Uniform rows: the values buffer already *is* the rectangle,
+                # so reshaping it is a view and the per-row reduction is free.
+                rectangle = v.values() if len(set(lengths)) == 1 else None
             elif v.shape[0] != n_rows:
                 stats.fields_skipped += 1
                 continue
-            elif name in batch_scoped_fields:
-                buffer = v
-                lengths = [v.shape[1] if v.ndim >= 2 else 1] * n_rows
             else:
-                flat = _as_int_view(v.reshape(n_rows, -1))
+                lengths = [v.shape[1] if v.ndim >= 2 else 1] * n_rows
+                rectangle = v
+            if rectangle is not None and name not in batch_scoped_fields:
+                flat = _as_int_view(rectangle.reshape(n_rows, -1))
                 out[name] = _FieldDigest(
                     (torch.hash_tensor(flat, dim=1) ^ salt).tolist(),
                     batch_scoped=False,
                 )
                 continue
+            buffer = v.values() if v.is_nested else v
             flat_buffer = _as_int_view(buffer.reshape(1, -1))
             buffer_digest = torch.hash_tensor(flat_buffer, dim=1).tolist()[0] ^ salt
             out[name] = _FieldDigest(
@@ -1189,19 +1197,24 @@ class MetricsDataPlaneClient(DataPlaneClient):
             per_field = partition_hashes.setdefault(sample_id, {})
             for name, digest in digests.items():
                 per_field[name] = digest.per_row[row]
-        scoped = frozenset(n for n, d in digests.items() if d.batch_scoped)
-        if scoped:
-            self._batch_scope[partition_id] = (scoped, len(sample_ids))
+        # Per field, not per partition: a delta put (write_columns) names only
+        # the fields it writes, and must not restate the scheme of the ones it
+        # left alone. Recording the batch it was reduced over lets the read
+        # side tell a shard of a batch-scoped field from a relayout.
+        scheme = self._batch_scope.setdefault(partition_id, {})
+        for name, digest in digests.items():
+            if digest.batch_scoped:
+                scheme[name] = len(sample_ids)
+            else:
+                scheme.pop(name, None)
         self._stats.hash_verify.rows_recorded += len(sample_ids)
 
     def _check_hashes(self, partition_id: str, sample_ids: list[str], out: Any) -> None:
         """Compare wire-out fingerprints against what was written."""
         if not isinstance(out, TensorDict):
             return
-        scoped_names, scoped_rows = self._batch_scope.get(
-            partition_id, (frozenset(), 0)
-        )
-        digests = self._row_fingerprints(out, sample_ids, scoped_names)
+        scheme = self._batch_scope.get(partition_id, {})
+        digests = self._row_fingerprints(out, sample_ids, scheme)
         if not digests:
             return
         partition_hashes = self._hash_by_partition.get(partition_id, {})
@@ -1212,15 +1225,28 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # as a mismatch — but *count* the drop. Dropping silently is the
         # exact shape of the bug that made this check pass while covering
         # nothing: a field stops being compared and the report still reads
-        # clean. It also fires when a rectangular put comes back jagged
-        # (one row truncated makes the batch ragged), which is a real
-        # divergence this cannot express as a row-level mismatch.
+        # clean.
         comparable = {}
+        relaid_out = []
         for name, digest in digests.items():
-            if not digest.batch_scoped or scoped_rows == len(sample_ids):
+            if not digest.batch_scoped or scheme.get(name) == len(sample_ids):
                 comparable[name] = digest
+            elif name in scheme:
+                stats.fields_skipped += 1  # a shard of a batch-scoped put
             else:
-                stats.fields_skipped += 1
+                # Put reduced this field per row, so its rows were uniform;
+                # they came back ragged. The row lengths themselves changed —
+                # a real divergence, not something to skip.
+                relaid_out.append(name)
+        for name in relaid_out:
+            if self._hash_mismatches_logged < _MAX_HASH_MISMATCH_LOGS:
+                self._hash_mismatches_logged += 1
+                logger.error(
+                    "data-plane hash mismatch: partition=%s field=%s written "
+                    "with uniform row lengths, read back ragged",
+                    partition_id,
+                    name,
+                )
         for row, sample_id in enumerate(sample_ids):
             per_field = partition_hashes.get(sample_id)
             if not per_field:
@@ -1229,6 +1255,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 stats.rows_unverified += 1
                 continue
             stats.rows_checked += 1
+            stats.mismatches += len(relaid_out)
             for name, digest in comparable.items():
                 expected = per_field.get(name)
                 if expected is None or expected == digest.per_row[row]:
