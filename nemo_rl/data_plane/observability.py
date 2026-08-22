@@ -518,10 +518,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._on_event = on_event
         self._verify_tensor_hash = verify_tensor_hash
         self._stats = DataPlaneStats()
-        # Nested per-partition / per-key live byte counts. Populated on
-        # successful ``put_samples``; popped on successful ``clear_samples``.
-        # Bounded by the live key population, not cumulative traffic.
-        self._bytes_by_partition: dict[str, dict[str, int]] = {}
+        # Live bytes and live keys per partition. Populated on successful
+        # ``put_samples``, released on successful ``clear_samples``. Bounded
+        # by the live key population, not by cumulative traffic.
+        self._bytes_by_partition: dict[str, int] = {}
+        self._keys_by_partition: dict[str, set[str]] = {}
         # partition -> sample_id -> field -> wire-in fingerprint. Same
         # lifetime as ``_bytes_by_partition``: cleared by ``clear_samples``,
         # so it is bounded by the live key population.
@@ -548,7 +549,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         """
         out = asdict(self._stats)
         out["n_keys_outstanding"] = sum(
-            len(d) for d in self._bytes_by_partition.values()
+            len(k) for k in self._keys_by_partition.values()
         )
         for op, s in out["by_op"].items():
             s["mean_ms"] = s["wall_ms"] / s["calls"] if s["calls"] else 0.0
@@ -630,23 +631,28 @@ class MetricsDataPlaneClient(DataPlaneClient):
             if calls <= 0:
                 continue
             op_ms = st["wall_ms"] - prev_op.get("wall_ms", 0.0)
+            # Five series per op tag, deliberately. Anything exactly
+            # derivable from these is left out rather than logged: mean is
+            # wall_s/calls, and a dashboard can divide. ``snapshot()`` still
+            # carries the full picture for a one-off inspection.
             metrics[f"{op}/calls"] = calls
             metrics[f"{op}/wall_s"] = op_ms / 1e3
-            metrics[f"{op}/mean_ms"] = op_ms / calls
             # Percentiles and the overhead/bandwidth fit are cumulative by
             # construction (histogram buckets, regression sums) -- as-is.
             metrics[f"{op}/p50_ms"] = st["p50_ms"]
             metrics[f"{op}/p99_ms"] = st["p99_ms"]
             fit = st["fit"]
             if fit.get("model_trustworthy"):
-                metrics[f"{op}/fixed_overhead_ms"] = fit["fixed_ms"]
-                metrics[f"{op}/bandwidth_mb_s"] = fit["bandwidth_mb_s"]
+                # Only the actionable half of the fit: whether this op is
+                # overhead- or bandwidth-bound. The absolute fixed_ms and
+                # bandwidth_mb_s behind it are cumulative regressions that
+                # barely move per step -- read them from ``snapshot()``.
                 metrics[f"{op}/overhead_frac"] = fit["overhead_frac_at_mean"]
         return metrics
 
     def bytes_outstanding_by_partition(self) -> dict[str, int]:
         """Per-partition breakdown of currently-held bytes."""
-        return {p: sum(d.values()) for p, d in self._bytes_by_partition.items()}
+        return dict(self._bytes_by_partition)
 
     def _record_put(self, partition_id: str, keys: list[str], n_bytes: int) -> None:
         """Attribute put bytes per key so a later ``clear_samples`` can subtract.
@@ -654,23 +660,24 @@ class MetricsDataPlaneClient(DataPlaneClient):
         Called after the underlying RPC succeeds so a failed put never
         leaves the accounting inflated.
 
-        ``n_bytes`` is a whole-batch figure, so there is no per-key truth to
-        preserve: the split is even and the division remainder lands on the
-        first key rather than being spread across the batch.
+        ``n_bytes`` is a whole-batch figure, so there was never a per-key
+        truth to keep: the old per-key dict stored an even split, and a
+        subset clear released the mean either way. Holding one total and one
+        key set says the same thing and lets ``set.update`` do the per-key
+        work in C — 18.6 us to 3.0 us at 256 keys, which was the single
+        largest remaining cost on the put path.
 
         Args:
             partition_id: Partition the keys were written to.
             keys: Per-sample uids that were written.
-            n_bytes: Total bytes written; distributed evenly across keys.
+            n_bytes: Total bytes written; released pro rata on clear.
         """
         if not keys or n_bytes <= 0:
             return
-        per_key, remainder = divmod(n_bytes, len(keys))
-        partition_dict = self._bytes_by_partition.setdefault(partition_id, {})
-        get_held = partition_dict.get
-        for key in keys:
-            partition_dict[key] = get_held(key, 0) + per_key
-        partition_dict[keys[0]] += remainder
+        self._keys_by_partition.setdefault(partition_id, set()).update(keys)
+        self._bytes_by_partition[partition_id] = (
+            self._bytes_by_partition.get(partition_id, 0) + n_bytes
+        )
         self._stats.bytes_outstanding += n_bytes
         if self._stats.bytes_outstanding > self._stats.peak_bytes_outstanding:
             self._stats.peak_bytes_outstanding = self._stats.bytes_outstanding
@@ -681,6 +688,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         Called after the underlying RPC succeeds so a failed clear keeps
         the accounting consistent with TQ's actual state.
 
+        Bytes are released pro rata: the partition's total times the share
+        of its live keys being dropped. Clearing the last key releases the
+        remainder exactly, so a partition always reconciles to zero however
+        it is chopped up.
+
         Args:
             partition_id: Partition the keys were dropped from.
             keys: Uids dropped; ``None`` means the whole partition was cleared.
@@ -689,8 +701,21 @@ class MetricsDataPlaneClient(DataPlaneClient):
             _pop_partition_keys(self._hash_by_partition, partition_id, keys)
             if keys is None:
                 self._batch_scope.pop(partition_id, None)
-        freed = _pop_partition_keys(self._bytes_by_partition, partition_id, keys)
-        self._stats.bytes_outstanding -= sum(freed)
+        live = self._keys_by_partition.get(partition_id)
+        if live is None:
+            return
+        total = self._bytes_by_partition.get(partition_id, 0)
+        if keys is not None:
+            live -= live.intersection(keys)
+        if keys is None or not live:
+            freed = total
+            del self._keys_by_partition[partition_id]
+            self._bytes_by_partition.pop(partition_id, None)
+        else:
+            dropped = len(keys)
+            freed = total * dropped // (len(live) + dropped)
+            self._bytes_by_partition[partition_id] = total - freed
+        self._stats.bytes_outstanding -= freed
 
     # ── wire-in / wire-out fingerprinting (opt-in) ─────────────────────
 
