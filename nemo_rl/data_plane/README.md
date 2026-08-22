@@ -409,34 +409,63 @@ global_forward_pad_seqlen = round_up(1320, 64) = 1344
 ## Configuration
 
 The data plane is configured via a `data_plane:` block in the master
-YAML (`examples/configs/...`). **YAML is the single source of truth
-for defaults** — the adapter has no hidden `cfg.get(key, default)`
-fallbacks. The canonical exemplar is
+YAML (`examples/configs/...`). The canonical exemplar is
 `examples/configs/grpo_math_1B.yaml`.
 
-All eight keys below are **required** when `enabled=true`. Recipes
-under `examples/configs/recipes/**/*.yaml` inherit them via
-`defaults:` from the exemplar.
+`enabled`, `impl`, `backend` and `claim_meta_poll_interval_s` are
+**required** when `enabled=true`. Backend sizing lives in a block named
+for the backend that reads it; only the block named by `backend` is
+consulted, and an absent block means that backend's defaults, which are
+declared on `SimpleStorageConfig` / `MooncakeCpuConfig` in
+`nemo_rl/data_plane/interfaces.py`. Recipes under
+`examples/configs/recipes/**/*.yaml` inherit all of it via `defaults:`.
 
 ```yaml
 data_plane:
   enabled: false                       # flip to true to engage grpo_train_sync
   impl: transfer_queue                 # only one impl today
   backend: "simple"                    # "simple" or "mooncake_cpu"
-  storage_capacity: 1000000            # max samples retained per partition
-  num_storage_units: 2                 # storage shards
   claim_meta_poll_interval_s: 0.5      # blocking-claim poll cadence
-  global_segment_size: 549755813888    # 512 GiB — used when backend == "mooncake_cpu"
-  local_buffer_size:   68719476736     # 64 GiB  — used when backend == "mooncake_cpu"
+  simple:
+    storage_capacity: 1000000          # max samples retained per partition
+    num_storage_units: 2               # storage shards
+  mooncake_cpu:
+    global_segment_size: 68719476736   # 64 GiB/process
+    local_buffer_size:    4294967296   # 4 GiB/process
+    reuse_registered_buffers: true     # reuse RDMA-registered buffers
+    cpu_staging_slots: 4                # lazily allocated registered host slots
+    cpu_staging_buffer_mb: 256          # maximum MiB per host slot
+    use_gdr: false                      # GPU-memory RDMA staging in CUDA clients
+    gdr_staging_buffer_mb: 1024         # persistent MiB per active GDR client
   # observability:                     # NotRequired
   #   enabled: false
 ```
 
+The nested blocks are the only source of backend sizing. Legacy flat
+simple/CPU sizing keys are ignored. The first GDR integration's flat
+`use_gdr` and `gdr_staging_buffer_mb` spellings are rejected with a migration
+message so an old GDR recipe cannot silently run with GDR disabled.
+
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
   and small runs.
-- **`mooncake_cpu`** — Mooncake transfer engine; higher throughput at
-  scale. Required for multi-node clusters with large bulk volume.
+- **`mooncake_cpu`** — Mooncake's RDMA-only transfer engine. By default,
+  tensors transfer through registered CPU staging. Set
+  `mooncake_cpu.use_gdr: true` to let CUDA-initialized clients use
+  TransferQueue's GDR staging path. CPU-only clients, such as a
+  SingleController producer, continue to use CPU RDMA. Both paths retain the
+  same all-InfiniBand-rail (or RoCE-only fallback) transport selection.
+
+The CPU staging pool grows lazily up to
+`cpu_staging_slots × cpu_staging_buffer_mb` per client process. The
+defaults preserve four 256 MiB slots; setting the values to `1` and `1024`
+selects one 1 GiB slot for a controlled experiment. These settings continue to
+apply to CPU-only clients in a mixed CPU-producer/GDR-receiver run.
+
+`gdr_staging_buffer_mb` is the positive persistent GPU staging capacity per
+active CUDA client and defaults to 1024 MiB. In a mixed CPU-producer/GDR-receiver
+flow, the current TransferQueue pin requires it to fit the largest individual
+tensor.
 
 Capacity rule of thumb (any backend):
 

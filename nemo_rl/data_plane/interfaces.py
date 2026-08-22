@@ -39,7 +39,51 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
+from pydantic import BaseModel, PositiveInt
 from tensordict import TensorDict
+
+
+class SimpleStorageConfig(BaseModel, extra="allow"):
+    """Sizing for ``backend="simple"``. Ignored by every other backend.
+
+    ``num_storage_units`` scales with the cluster: TQ round-robins storage
+    units over Ray nodes and recommends ``>= 2 x`` the node count, so a fixed
+    literal under-provisions a multi-node run. The exemplar YAML sets
+    ``${mul:2, ${cluster.num_nodes}}``; set a plain int to pin it.
+    """
+
+    storage_capacity: int = 1000000  # max samples retained per partition
+    num_storage_units: int = 2
+
+
+class MooncakeCpuConfig(BaseModel, extra="allow"):
+    """Sizing and RDMA knobs for ``backend="mooncake_cpu"``. Ignored otherwise.
+
+    ``global_segment_size`` / ``local_buffer_size`` are per client *process*
+    (one per GPU), so a node pays ``gpus_per_node x (segment + buffer)``. Under
+    RDMA that memory is pinned and resident from setup, so keep the per-node
+    product in mind when raising them. Under-sizing surfaces as
+    ``batch_get_tensor returned None``.
+
+    ``reuse_registered_buffers`` keeps a small pool of RDMA-registered host
+    buffers alive instead of registering a fresh one per CPU transfer.
+    ``cpu_staging_slots`` and ``cpu_staging_buffer_mb`` bound that pool;
+    slots grow lazily, so their product is the maximum pinned host-memory cost
+    per client. Set ``reuse_registered_buffers=false`` to fall back to
+    upstream's per-call registration.
+
+    ``use_gdr`` switches CUDA-initialized clients to TransferQueue's GDR path.
+    ``gdr_staging_buffer_mb`` is the positive persistent GPU staging capacity
+    per active GDR client.
+    """
+
+    global_segment_size: int = 68719476736  # 64 GiB per client process
+    local_buffer_size: int = 4294967296  # 4 GiB per client process
+    reuse_registered_buffers: bool = True
+    cpu_staging_slots: PositiveInt = 4
+    cpu_staging_buffer_mb: PositiveInt = 256
+    use_gdr: bool = False
+    gdr_staging_buffer_mb: PositiveInt = 1024
 
 
 class DataPlaneConfig(TypedDict):
@@ -49,28 +93,79 @@ class DataPlaneConfig(TypedDict):
     the TQ adapter, not by NeMo-RL. ``impl`` selects which adapter we go
     through.
 
-    Required keys (always set in exemplar YAML — never defaulted in code):
-    ``enabled``, ``impl``, ``backend``, ``storage_capacity``,
-    ``num_storage_units``, ``claim_meta_poll_interval_s``,
-    ``global_segment_size``, ``local_buffer_size``.
+    Backend-specific knobs live under a block named for the backend that reads
+    them — ``simple:`` and ``mooncake_cpu:`` — mirroring TransferQueue's own
+    ``config.yaml`` and the per-backend overlay :func:`_init_tq` builds. Both
+    blocks are optional: an absent block means "use this backend's defaults",
+    which is why a config selecting ``simple`` never has to mention mooncake's
+    RDMA sizing at all. Defaults live on :class:`SimpleStorageConfig` /
+    :class:`MooncakeCpuConfig`, not at any call site.
 
-    ``global_segment_size`` / ``local_buffer_size`` are only *read* when
-    ``backend == "mooncake_cpu"``; the simple backend ignores them.
-    They are required (not NotRequired) so the YAML carries the full
-    schema and there are no hidden Python defaults.
+    Required keys (always set in the exemplar YAML): ``enabled``, ``impl``,
+    ``backend``, ``claim_meta_poll_interval_s``.
+
+    ``storage_capacity`` / ``num_storage_units`` / ``global_segment_size`` /
+    ``local_buffer_size`` / ``reuse_registered_buffers`` used to sit at this
+    level; the nested-only sizing contract ignores those old spellings. The
+    first GDR integration also spelled ``use_gdr`` and
+    ``gdr_staging_buffer_mb`` there. :func:`backend_config` rejects those two
+    GDR spellings so an old recipe cannot silently run with GDR disabled.
     """
 
     enabled: bool
     impl: Literal["transfer_queue"]
     backend: Literal["simple", "mooncake_cpu"]
-    storage_capacity: int
-    num_storage_units: int
     claim_meta_poll_interval_s: float
-    global_segment_size: int
-    local_buffer_size: int
+    simple: NotRequired[SimpleStorageConfig]
+    mooncake_cpu: NotRequired[MooncakeCpuConfig]
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
+
+    # The first GDR integration's deprecated flat spellings are declared only
+    # so Pydantic preserves them until ``backend_config`` can raise the
+    # migration error below. Without these entries, MasterConfig silently
+    # drops the keys during validation.
+    use_gdr: NotRequired[bool]
+    gdr_staging_buffer_mb: NotRequired[int]
+
+
+# PR #3501 introduced these at the top level before backend-specific nesting.
+# Reject that spelling for either selected backend so rebasing an existing GDR
+# recipe cannot silently disable GDR.
+_FIRST_GDR_FLAT_KEYS = ("use_gdr", "gdr_staging_buffer_mb")
+
+_BACKEND_MODELS: dict[str, type[BaseModel]] = {
+    "simple": SimpleStorageConfig,
+    "mooncake_cpu": MooncakeCpuConfig,
+}
+
+
+def backend_config(cfg: DataPlaneConfig) -> Any:
+    """Return the validated sizing block for ``cfg["backend"]``.
+
+    Reads the nested block and lets the model supply anything it omits, so no
+    caller ever writes a fallback. Works whether ``cfg`` came through pydantic
+    (block already coerced to a model) or as a plain dict from a test.
+
+    Sizing is read only from the nested block. A config still using the
+    pre-nesting flat sizing spelling gets this backend's defaults, not its own
+    values. The first GDR integration's flat spelling is rejected instead,
+    because otherwise an old GDR recipe would silently run with GDR disabled.
+    """
+    backend = cfg["backend"]
+    stale_gdr = [k for k in _FIRST_GDR_FLAT_KEYS if k in cfg]
+    if stale_gdr:
+        raise ValueError(
+            f"data_plane.{{{','.join(stale_gdr)}}} moved under "
+            "data_plane.mooncake_cpu. Update the first GDR integration's "
+            "top-level spelling before running this stack."
+        )
+
+    nested = cfg.get(backend) or {}
+    if isinstance(nested, BaseModel):
+        nested = nested.model_dump(exclude_unset=True)
+    return _BACKEND_MODELS[backend].model_validate(nested)
 
 
 class ObservabilityConfig(TypedDict):

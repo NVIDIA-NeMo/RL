@@ -16,7 +16,7 @@ import os
 import socket
 import sys
 import time
-from typing import NamedTuple, NotRequired, Optional, TypedDict
+from typing import TYPE_CHECKING, NamedTuple, NotRequired, Optional, TypedDict
 
 import ray
 from ray.util.placement_group import (
@@ -26,6 +26,9 @@ from ray.util.placement_group import (
     remove_placement_group,
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+if TYPE_CHECKING:
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -279,7 +282,10 @@ def _get_free_consecutive_ports_local(
     )
 
 
-def init_ray(log_dir: Optional[str] = None) -> None:
+def init_ray(
+    log_dir: Optional[str] = None,
+    data_plane_cfg: Optional["DataPlaneConfig"] = None,
+) -> None:
     """Initialise Ray.
 
     Try to attach to an existing local cluster.
@@ -288,7 +294,14 @@ def init_ray(log_dir: Optional[str] = None) -> None:
 
     Args:
         log_dir: Optional directory to store Ray logs and temp files.
+        data_plane_cfg: Optional data-plane config, passed by launchers that
+            enable it. Its backend's engine env vars are applied here because the
+            ``dict(os.environ)`` snapshot below is what carries them to workers;
+            see :func:`~nemo_rl.data_plane.factory.maybe_configure_data_plane_env`.
     """
+    from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
+
+    maybe_configure_data_plane_env(data_plane_cfg)
     # Strip MPI/PMIx/SLURM launcher vars from the driver env before they get
     # captured into runtime_env (both by `dict(os.environ)` below and by
     # RayWorkerGroup, which re-reads os.environ). Otherwise they are forwarded

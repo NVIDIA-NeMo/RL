@@ -18,6 +18,31 @@ from __future__ import annotations
 from nemo_rl.data_plane.interfaces import DataPlaneClient, DataPlaneConfig
 
 
+def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
+    """Set backend env vars that must be identical in every process.
+
+    Call this on the driver **before** ``init_ray()``: ``init_ray`` snapshots the
+    driver's environment into ``runtime_env["env_vars"]`` and hands it to every
+    worker, so this is the point at which a setting becomes cluster-wide. A
+    backend whose engine reads a knob once at startup cannot be configured any
+    later than this without processes disagreeing.
+
+    No-op when the data plane is disabled or the backend has no such knobs.
+
+    Args:
+        cfg: Data-plane config, or ``None`` when the data plane is off.
+    """
+    if cfg is None or not cfg["enabled"]:
+        return
+
+    if cfg["impl"] == "transfer_queue":
+        from nemo_rl.data_plane.adapters.transfer_queue import (
+            maybe_configure_engine_env,
+        )
+
+        maybe_configure_engine_env(cfg)
+
+
 def build_data_plane_client(
     cfg: DataPlaneConfig | None, *, bootstrap: bool = True
 ) -> DataPlaneClient:
