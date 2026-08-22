@@ -632,13 +632,19 @@ class TestFinish:
         ],
         ids=["cp1", "cp2_zero_owner", "cp4_uneven_zero_owners"],
     )
-    def test_draft_metric_is_cp_invariant_before_replica_leader_filtering(
+    def test_draft_metric_uses_global_counts_before_replica_leader_filtering(
         self,
         mock_module_symbols,
         cp_numerators,
         cp_counts,
     ):
-        """CP0 must report the full replica numerator before TQ drops CP twins."""
+        """CP0 must report the full replica numerator before TQ drops CP twins.
+
+        The all_reduce here is mocked to inject the global counts, so this
+        pins the normalization WIRING (global counts reach the metric before
+        leader filtering), not true CP invariance. Real multi-process CP
+        invariance of ``_finish_train_step_body`` is follow-up coverage.
+        """
         from nemo_rl.algorithms.loss.draft import DraftLossStats
         from nemo_rl.algorithms.loss.interfaces import LossType
         from nemo_rl.models.megatron.draft.step_state import (

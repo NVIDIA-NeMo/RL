@@ -269,9 +269,7 @@ def _validate_draft_training_setup(
         )
     generation_config = config.get("generation")
     vllm_config = (
-        generation_config.get("vllm_kwargs")
-        if generation_config is not None
-        else None
+        generation_config.get("vllm_kwargs") if generation_config is not None else None
     )
     speculative_config = (
         vllm_config.get("speculative_config") if vllm_config is not None else None
@@ -283,11 +281,24 @@ def _validate_draft_training_setup(
         if generation_config is not None
         else None
     )
+    # The runtime merges the training megatron config into the inference
+    # config, so an OMITTED override inherits the training PP/CP value when
+    # the Megatron generation backend is in use. Apply the same default here;
+    # otherwise CP>1 training with Megatron generation and no explicit
+    # override would silently run generation at CP>1 instead of failing this
+    # check. vLLM generation does not inherit megatron parallelism, so the
+    # default only applies to the megatron backend.
+    generation_backend = (
+        generation_config.get("backend") if generation_config is not None else None
+    )
+    inherits_megatron_parallelism = generation_backend == "megatron"
     generation_pipeline_size = (
         mcore_generation_config.get("pipeline_model_parallel_size")
         if mcore_generation_config is not None
         else None
     )
+    if generation_pipeline_size is None and inherits_megatron_parallelism:
+        generation_pipeline_size = pipeline_parallel_size
     if generation_pipeline_size is not None and int(generation_pipeline_size) != 1:
         unsupported.append("generation pipeline_model_parallel_size must be 1")
     generation_context_size = (
@@ -295,6 +306,8 @@ def _validate_draft_training_setup(
         if mcore_generation_config is not None
         else None
     )
+    if generation_context_size is None and inherits_megatron_parallelism:
+        generation_context_size = context_parallel_size
     if generation_context_size is not None and int(generation_context_size) != 1:
         unsupported.append("generation context_parallel_size must be 1")
     if unsupported:
@@ -1096,10 +1109,16 @@ class MegatronPolicyWorkerImpl(
                         optimizer_step=int(self.scheduler.num_steps),
                     )
                     if draft_normalization_counts is not None:
+                        # Unreachable with draft+CP>1 today (the entrypoint
+                        # validator rejects it), but reduce over DP x CP like
+                        # the deferred path so a future gate change cannot
+                        # silently shrink this denominator.
                         draft_normalization_counts = (
                             _all_reduce_draft_normalization_counts(
                                 draft_normalization_counts,
-                                group=parallel_state.get_data_parallel_group(),
+                                group=parallel_state.get_data_parallel_group(
+                                    with_context_parallel=True
+                                ),
                             )
                         )
 

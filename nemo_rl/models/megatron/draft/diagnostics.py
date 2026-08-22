@@ -120,13 +120,23 @@ def finalize_draft_update_probe(
 def require_draft_update(result: DraftUpdateResult) -> None:
     """Require evidence that a draft optimizer step updated parameters.
 
+    A microbatch can legitimately contain zero eligible draft windows under
+    packed context parallelism, in which case a zero gradient with unchanged
+    parameters is a consistent no-op, not a failure. Only inconsistent
+    evidence (a gradient without a parameter change, or vice versa) raises.
+
     Args:
         result: Completed update probe.
 
     Raises:
-        RuntimeError: If gradients or parameter changes are absent.
+        RuntimeError: If the gradient and parameter-change evidence disagree.
     """
+    updated = result.checksum_delta > 0 and result.before != result.after
     if result.grad_l2 <= 0:
-        raise RuntimeError("draft update probe requires a nonzero gradient")
-    if result.checksum_delta <= 0 or result.before == result.after:
+        if updated:
+            raise RuntimeError(
+                "draft update probe saw a parameter change without a gradient"
+            )
+        return
+    if not updated:
         raise RuntimeError("draft update probe requires a parameter change")

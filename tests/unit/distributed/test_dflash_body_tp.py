@@ -179,8 +179,9 @@ def _inputs(
     device: torch.device,
     *,
     hidden_size: int = 32,
+    sequence_length: int = 5,
 ) -> tuple[Any, Tensor, Tensor]:
-    token_valid = torch.ones((1, 5), dtype=torch.bool, device=device)
+    token_valid = torch.ones((1, sequence_length), dtype=torch.bool, device=device)
     plan = build_dflash_batch_plan(
         token_valid,
         torch.tensor([7], dtype=torch.int64, device=device),
@@ -191,7 +192,7 @@ def _inputs(
     )
     generator = torch.Generator(device=device).manual_seed(2026)
     target_taps = torch.randn(
-        (1, 5, 2, hidden_size),
+        (1, sequence_length, 2, hidden_size),
         generator=generator,
         device=device,
     )
@@ -470,6 +471,60 @@ def test_tp2_rank_local_malformed_input_fails_synchronously(
     assert outcomes == [
         ("block_embeddings shape does not match the DFlash plan", False),
         ("block_embeddings shape does not match the DFlash plan", False),
+    ]
+
+
+def test_tp2_rank_local_valid_shapes_fail_before_first_projection(
+    _tp2_world: None,
+) -> None:
+    rank = torch.distributed.get_rank()
+    device = (
+        torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
+    body = DFlashBody(
+        _config(),
+        tp_group=torch.distributed.group.WORLD,
+        parallel_config=_fp32_parallel_config(2),
+    ).to(device)
+    entered_fc = False
+
+    def reject_fc_entry(_module: torch.nn.Module, _inputs: tuple[Tensor, ...]) -> None:
+        nonlocal entered_fc
+        entered_fc = True
+        raise RuntimeError("self.fc must not run before TP input-shape agreement")
+
+    body.fc.register_forward_pre_hook(reject_fc_entry)
+    plan, target_taps, block_embeddings = _inputs(
+        device,
+        sequence_length=5 + rank,
+    )
+
+    try:
+        body(
+            target_taps=target_taps,
+            block_embeddings=block_embeddings,
+            plan=plan,
+        )
+    except Exception as error:
+        local_outcome = (type(error).__name__, str(error), entered_fc)
+    else:
+        local_outcome = ("no error", "", entered_fc)
+
+    outcomes: list[tuple[str, str, bool] | None] = [None, None]
+    torch.distributed.all_gather_object(outcomes, local_outcome)
+    assert outcomes == [
+        (
+            "ValueError",
+            "DFlash plan and input shapes must match across tensor-parallel ranks",
+            False,
+        ),
+        (
+            "ValueError",
+            "DFlash plan and input shapes must match across tensor-parallel ranks",
+            False,
+        ),
     ]
 
 
