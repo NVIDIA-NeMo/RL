@@ -60,6 +60,9 @@ policy:
         revision: ${policy.draft.model_revision}
         num_speculative_tokens: ${policy.draft.block_size}
         draft_tensor_parallel_size: 1
+      compilation_config:
+        backend: eager
+        cudagraph_mode: PIECEWISE
 logger:
   log_dir: logs/grpo-qwen3-8b-1n8g-megatron-dspark
   wandb:

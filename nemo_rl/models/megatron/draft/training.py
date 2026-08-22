@@ -87,7 +87,7 @@ class DSparkForwardOutput:
     selected_teacher_logits: Tensor | None = None
 
 
-def _embed_dflash_mask_tokens(
+def _embed_draft_mask_tokens(
     word_embeddings: torch.nn.Module,
     mask_ids: Tensor,
     *,
@@ -527,7 +527,7 @@ class DFlashSpeculator:
             device=input_embeddings.device,
         )
         with torch.no_grad():
-            mask_embeddings = _embed_dflash_mask_tokens(
+            mask_embeddings = _embed_draft_mask_tokens(
                 word_embeddings,
                 mask_ids,
                 tensor_parallel_group=tensor_parallel_group,
@@ -852,7 +852,7 @@ class DSparkSpeculator:
         context_parallel_group: torch.distributed.ProcessGroup | None,
         tensor_parallel_group: torch.distributed.ProcessGroup | None,
     ) -> None:
-        del attention_mask, tensor_parallel_group
+        del attention_mask
         if captured_states.hidden_states is None:
             raise RuntimeError("DSpark training did not capture target hidden states")
         if captured_states.inputs_embeds is None:
@@ -925,7 +925,11 @@ class DSparkSpeculator:
             device=input_embeddings.device,
         )
         with torch.no_grad():
-            mask_embeddings = policy.embedding.word_embeddings(mask_ids)
+            mask_embeddings = _embed_draft_mask_tokens(
+                policy.embedding.word_embeddings,
+                mask_ids,
+                tensor_parallel_group=tensor_parallel_group,
+            )
         block_embeddings = torch.cat((anchor_embeddings, mask_embeddings), dim=1)
         output_weight = get_policy_lm_head_weight(policy_model).detach()
         selected_teacher_logits = None

@@ -26,7 +26,7 @@ from nemo_rl.models.megatron.draft.hidden_capture import CapturedStates
 from nemo_rl.models.megatron.draft.sequence_layout import build_draft_sequence_layout
 from nemo_rl.models.megatron.draft.training import (
     DFlashForwardOutput,
-    _embed_dflash_mask_tokens,
+    _embed_draft_mask_tokens,
     resolve_draft_speculator,
 )
 from nemo_rl.models.policy.draft_config import DFlashDraftConfig
@@ -127,7 +127,7 @@ def test_dflash_mask_embedding_pads_and_reconstructs_target_sp_gamma(
         gather,
     )
 
-    output = _embed_dflash_mask_tokens(
+    output = _embed_draft_mask_tokens(
         embedding,
         mask_ids,
         tensor_parallel_group=object(),
