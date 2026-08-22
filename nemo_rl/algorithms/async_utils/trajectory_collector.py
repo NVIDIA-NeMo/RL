@@ -909,6 +909,7 @@ class AsyncTrajectoryCollector:
         if use_nemo_gym:
             # Import here to keep the NeMo-Gym dependency local to its backend.
             from nemo_rl.experience.rollouts import (
+                get_nemo_gym_effort_config,
                 get_nemo_gym_thinking_tags,
                 run_async_nemo_gym_rollout,
                 should_mask_flagged_samples,
@@ -936,6 +937,7 @@ class AsyncTrajectoryCollector:
                 max_rollout_turns=None,
                 greedy=False,
                 reward_penalty_config=self.master_config.reward_penalties,
+                effort_config=get_nemo_gym_effort_config(self.master_config.env),
                 thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
                 mask_env_flagged_samples=should_mask_flagged_samples(
                     self.master_config.env

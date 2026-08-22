@@ -24,7 +24,7 @@ from typing import Any, Callable, Optional, TypeVar, cast
 import numpy as np
 import ray
 import torch
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -57,6 +57,8 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
+    apply_mask_sample_filter,
+    apply_message_level_advantage_penalties,
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
@@ -90,14 +92,16 @@ from nemo_rl.experience.interfaces import (
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
 from nemo_rl.experience.rollouts import (
-    EffortLevelsConfig,
+    RewardPenaltyConfig,
     attach_initial_nemo_gym_image_payloads,
     backfill_missing_routed_experts,
+    get_nemo_gym_effort_config,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
+    validate_reward_penalties_use_nemo_gym,
 )
 from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import (
@@ -129,6 +133,7 @@ from nemo_rl.utils.logger import (
     LoggerConfig,
     print_message_log_samples,
     should_log_nemo_gym_full_result_tables,
+    should_log_nemo_gym_responses,
 )
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.multimodal_payload_metrics import (
@@ -196,46 +201,6 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
     recompute_kv_cache_after_weight_updates: bool = False
-
-
-class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
-    """Optional token IDs for reward penalties."""
-
-    unwanted: list[int] | None = None
-    think_open: int | None = None
-    think_close: int | None = None
-
-
-class RewardPenaltyConfig(BaseModel, extra="allow"):
-    """Reward-zeroing penalties applied to NeMo-Gym rollout results."""
-
-    penalize_duplicated_reasoning: bool = False
-    penalize_empty_final_answer: bool = False
-    penalize_unwanted_tokens: bool = False
-    penalize_malformed_think_tag: bool = False
-    # Optional token IDs. token_ids.unwanted is required when
-    # penalize_unwanted_tokens is true;
-    # think-tag IDs are inferred from configured tag strings when possible.
-    token_ids: Optional[RewardPenaltyTokenIdsConfig] = None
-
-    @model_validator(mode="after")
-    def _require_unwanted_token_ids_when_penalized(self) -> "RewardPenaltyConfig":
-        if self.penalize_unwanted_tokens and (
-            self.token_ids is None or not self.token_ids.unwanted
-        ):
-            raise ValueError(
-                "reward_penalties.token_ids.unwanted must be set when "
-                "reward_penalties.penalize_unwanted_tokens is true"
-            )
-        return self
-
-
-_REWARD_PENALTY_FLAGS = (
-    "penalize_duplicated_reasoning",
-    "penalize_empty_final_answer",
-    "penalize_unwanted_tokens",
-    "penalize_malformed_think_tag",
-)
 
 
 class GRPOConfig(BaseModel, extra="allow"):
@@ -1969,127 +1934,10 @@ def _raise_if_reward_penalties_enabled_without_nemo_gym(
     enable_nemo_gym: bool,
 ) -> None:
     """Validate reward-zeroing penalties are only used with NeMo-Gym."""
-    if enable_nemo_gym:
-        return
-
-    if not any(
-        getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
-    ):
-        return
-
-    raise ValueError(
-        "reward_penalties require the NeMo-Gym path "
-        "(env.should_use_nemo_gym=true); they are not supported with the native "
-        "generation path."
+    validate_reward_penalties_use_nemo_gym(
+        master_config.reward_penalties,
+        enable_nemo_gym=enable_nemo_gym,
     )
-
-
-def _apply_message_level_advantage_penalties(
-    train_data: BatchedDataDict[ClippedPGLossDataDict],
-    message_logs: list[LLMMessageLogType | VLMMessageLogType],
-    invalid_tool_call_advantage: float | None,
-    malformed_thinking_advantage: float | None,
-    log_config: bool = False,
-) -> Optional[dict[str, float]]:
-    """Overwrite advantages for flagged assistant-message token spans.
-
-    For each assistant message flagged by the NeMo-Gym detector as an invalid
-    tool call or malformed thinking, overwrite that message's advantage span in
-    ``train_data["advantages"]`` with the configured negative value. No-op when
-    neither ``grpo.invalid_tool_call_advantage`` nor
-    ``grpo.malformed_thinking_advantage`` is set.
-
-    Args:
-        train_data: Training batch; ``advantages`` is modified in place.
-        message_logs: Batch of message logs with per-message flags.
-        invalid_tool_call_advantage: Advantage value assigned to invalid tool calls.
-        malformed_thinking_advantage: Advantage value assigned to malformed thinking.
-        log_config: If True, print the configured penalty values once.
-
-    Returns:
-        Dictionary of penalty metrics if penalties are applied, otherwise None.
-    """
-    penalty_metrics = {}
-    invalid_neg_adv = invalid_tool_call_advantage
-    malformed_neg_adv = malformed_thinking_advantage
-    if invalid_neg_adv is None and malformed_neg_adv is None:
-        return penalty_metrics
-
-    if log_config:
-        print(
-            f"Invalid tool call advantage: {invalid_neg_adv}",
-            flush=True,
-        )
-        print(
-            f"Malformed thinking advantage: {malformed_neg_adv}",
-            flush=True,
-        )
-
-    advantages = train_data["advantages"]
-    materialized_advantages = False
-    num_invalid_tool_calls = 0
-    num_malformed_thinking = 0
-    num_assistant_messages = 0
-
-    for i, message_log in enumerate(message_logs):
-        token_offset = 0
-        for j, message in enumerate(message_log):
-            token_ids = cast(torch.Tensor, message["token_ids"])
-            msg_len = len(token_ids)
-            is_assistant = (
-                message["role"] == "assistant" and "generation_logprobs" in message
-            )
-            if is_assistant:
-                num_assistant_messages += 1
-            is_invalid = (
-                is_assistant
-                and invalid_neg_adv is not None
-                and message.get("is_invalid_tool_call", False)
-            )
-            is_malformed_thinking = (
-                is_assistant
-                and malformed_neg_adv is not None
-                and message.get("has_malformed_thinking", False)
-            )
-            if (is_invalid or is_malformed_thinking) and not materialized_advantages:
-                # GRPO/GDPO may expand per-sample advantages into zero-stride views;
-                # clone before span writes so penalties only affect targeted tokens.
-                advantages = advantages.clone()
-                train_data["advantages"] = advantages
-                materialized_advantages = True
-
-            if is_invalid:
-                num_invalid_tool_calls += 1
-                print(
-                    f"Setting negative advantage ({invalid_neg_adv}) for invalid tool call in assistant message {i} {j}",
-                    flush=True,
-                )
-                advantages[i, token_offset : token_offset + msg_len] = invalid_neg_adv
-            elif is_malformed_thinking:
-                num_malformed_thinking += 1
-                print(
-                    f"Setting negative advantage ({malformed_neg_adv}) for malformed thinking in assistant message {i} {j}",
-                    flush=True,
-                )
-                advantages[i, token_offset : token_offset + msg_len] = malformed_neg_adv
-            token_offset += msg_len
-
-    invalid_tool_call_rate = num_invalid_tool_calls / max(num_assistant_messages, 1)
-    malformed_thinking_rate = num_malformed_thinking / max(num_assistant_messages, 1)
-    print(
-        f"Invalid tool call rate: {invalid_tool_call_rate:.4f} ({num_invalid_tool_calls}/{num_assistant_messages})",
-        flush=True,
-    )
-    print(
-        f"Malformed thinking rate: {malformed_thinking_rate:.4f} ({num_malformed_thinking}/{num_assistant_messages})",
-        flush=True,
-    )
-    penalty_metrics["invalid_tool_call_rate"] = invalid_tool_call_rate
-    penalty_metrics["malformed_thinking_rate"] = malformed_thinking_rate
-    penalty_metrics["num_invalid_tool_calls"] = num_invalid_tool_calls
-    penalty_metrics["num_malformed_thinking"] = num_malformed_thinking
-    penalty_metrics["num_assistant_messages"] = num_assistant_messages
-    return penalty_metrics
 
 
 def _apply_configured_message_level_advantage_penalties(
@@ -2097,13 +1945,13 @@ def _apply_configured_message_level_advantage_penalties(
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
     master_config: MasterConfig,
     log_config: bool = False,
-) -> Optional[dict[str, float]]:
+) -> dict[str, float | int]:
     """Resolve config and apply message-level advantage penalties."""
     (
         invalid_tool_call_advantage,
         malformed_thinking_advantage,
     ) = _resolve_message_level_advantage_penalties(master_config)
-    return _apply_message_level_advantage_penalties(
+    return apply_message_level_advantage_penalties(
         train_data=train_data,
         message_logs=message_logs,
         invalid_tool_call_advantage=invalid_tool_call_advantage,
@@ -2152,41 +2000,6 @@ def _build_async_grpo_train_data(
     return train_data
 
 
-def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
-    """Zero loss_multiplier where mask_sample is True and return the count."""
-    if "mask_sample" not in repeated_batch:
-        return 0
-
-    loss_multiplier = repeated_batch["loss_multiplier"].clone()
-    mask_sample = repeated_batch["mask_sample"]
-
-    if isinstance(mask_sample, list):
-        mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
-    mask_sample_bool = mask_sample.bool()
-
-    num_masked = int(mask_sample_bool.sum().item())
-    loss_multiplier[mask_sample_bool] = 0
-    repeated_batch["loss_multiplier"] = loss_multiplier
-    return num_masked
-
-
-def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
-    """Whether NeMo Gym is responsible for full response logging.
-
-    When **True**, skip the expensive per-step ``train_data_step*.jsonl`` dump.
-    When **False** (the default if unset), write the local JSONL file.
-
-    W&B full-result Tables are controlled independently by
-    ``logger.wandb.log_nemo_gym_full_result_tables``.
-    """
-    env_config = master_config.env
-    should_log_nemo_gym_responses = bool(
-        env_config.get("should_log_nemo_gym_responses")
-    )
-
-    return should_log_nemo_gym_responses
-
-
 def _write_latest_checkpoint_status(
     checkpointer: CheckpointManager, last_checkpoint_step: int
 ) -> None:
@@ -2212,16 +2025,6 @@ def _write_latest_checkpoint_status(
     status["last_checkpoint_step"] = last_checkpoint_step
     with open(status_path, "w") as f:
         json.dump(status, f)
-
-
-def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
-    """Return the effort-levels reward-shaping config from env.nemo_gym, if set."""
-    if "nemo_gym" not in master_config.env:
-        return None
-    effort_dict = master_config.env["nemo_gym"].get("effort_levels")
-    if effort_dict is None:
-        return None
-    return EffortLevelsConfig.model_validate(effort_dict)
 
 
 def _pad_teacher_logprobs(teacher_logprobs: torch.Tensor, train_S: int) -> torch.Tensor:
@@ -2956,7 +2759,7 @@ def grpo_train(
                             ),
                             max_rollout_turns=None,
                             greedy=False,
-                            effort_config=_get_effort_config(master_config),
+                            effort_config=get_nemo_gym_effort_config(master_config.env),
                             reward_penalty_config=master_config.reward_penalties,
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                             mask_env_flagged_samples=should_mask_flagged_samples(
@@ -3144,7 +2947,7 @@ def grpo_train(
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
 
-                    num_mask_sample_filtered = _apply_mask_sample_filter(repeated_batch)
+                    num_mask_sample_filtered = apply_mask_sample_filter(repeated_batch)
                     metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
 
                     add_grpo_token_loss_masks_and_generation_logprobs(
@@ -3629,7 +3432,7 @@ def grpo_train(
             # Logging
             # Log training data
             memory_tracker.snapshot_start_of_stage("Logging", dir())
-            if not _should_log_nemo_gym_responses(master_config):
+            if not should_log_nemo_gym_responses(master_config.env):
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
@@ -3893,7 +3696,7 @@ def validate(
                     ),
                     max_rollout_turns=None,
                     greedy=False,
-                    effort_config=_get_effort_config(master_config),
+                    effort_config=get_nemo_gym_effort_config(master_config.env),
                     reward_penalty_config=master_config.reward_penalties,
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                     mask_env_flagged_samples=should_mask_flagged_samples(
@@ -4722,7 +4525,7 @@ def async_grpo_train(
                             repeated_batch["loss_multiplier"] = loss_multiplier
 
                     with timer.time("mask_sample_filter"):
-                        num_mask_sample_filtered = _apply_mask_sample_filter(
+                        num_mask_sample_filtered = apply_mask_sample_filter(
                             repeated_batch
                         )
 
@@ -5256,8 +5059,8 @@ def async_grpo_train(
             # Log training data (match sync GRPO logging payload for parity).
             # NeMo Gym responses can be very large and expensive to log; when
             # env.should_log_nemo_gym_responses is true, skip this jsonl (see
-            # _should_log_nemo_gym_responses).
-            if not _should_log_nemo_gym_responses(master_config):
+            # should_log_nemo_gym_responses).
+            if not should_log_nemo_gym_responses(master_config.env):
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]

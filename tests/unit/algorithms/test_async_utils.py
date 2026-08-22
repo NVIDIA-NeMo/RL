@@ -51,6 +51,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
+from nemo_rl.experience.rollouts import EffortLevelsConfig, RewardPenaltyConfig
 
 
 @ray.remote(num_cpus=0)
@@ -1400,6 +1401,7 @@ class TestAsyncTrajectoryCollector:
 
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
+        reward_penalties = SimpleNamespace()
         return MasterConfig.model_construct(
             grpo=GRPOConfig.model_construct(
                 num_prompts_per_step=2,
@@ -1419,6 +1421,7 @@ class TestAsyncTrajectoryCollector:
                 "wandb_enabled": False,
                 "wandb": {"log_nemo_gym_full_result_tables": False},
             },
+            reward_penalties=reward_penalties,
         )
 
     def test_collector_selects_ppo_config(self):
@@ -1435,6 +1438,7 @@ class TestAsyncTrajectoryCollector:
             max_trajectory_age_steps=3,
             warmup_generation_lead_steps=5,
         )
+        reward_penalties = RewardPenaltyConfig(penalize_empty_final_answer=True)
         master_config = PPOMasterConfig.model_construct(
             policy={"make_sequence_length_divisible_by": 1},
             ppo=PPOConfig.model_construct(
@@ -1443,6 +1447,7 @@ class TestAsyncTrajectoryCollector:
                 max_rollout_turns=1,
                 async_ppo=async_config,
             ),
+            reward_penalties=reward_penalties,
         )
         collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
         collector = collector_cls(
@@ -1456,6 +1461,7 @@ class TestAsyncTrajectoryCollector:
         assert collector.algorithm_config is master_config.ppo
         assert collector.async_config is async_config
         assert collector.async_config.max_trajectory_age_steps == 3
+        assert collector.master_config.reward_penalties is reward_penalties
 
         collector.set_generation_window(
             weight_version=2,
@@ -1979,6 +1985,17 @@ class TestAsyncTrajectoryCollector:
         replay_buffer = FakeReplayBuffer()
         collector = self.create_local_collector(replay_buffer=replay_buffer)
         collector.running = True
+        collector.master_config.env = {
+            "should_use_nemo_gym": True,
+            "nemo_gym": {
+                "effort_levels": {
+                    "low_weight": 0.25,
+                    "low_penalty": 2.0,
+                    "low_ub": 512,
+                    "low_string": "brief",
+                }
+            },
+        }
         target_weight = 13
         collector._generating_targets.add(target_weight)
         batches = [
@@ -2105,6 +2122,17 @@ class TestAsyncTrajectoryCollector:
             "stop_token_ids": [1],
             "stop_strings": ["stop"],
         }
+        collector.master_config.env = {
+            "should_use_nemo_gym": True,
+            "nemo_gym": {
+                "effort_levels": {
+                    "low_weight": 0.25,
+                    "low_penalty": 2.0,
+                    "low_ub": 512,
+                    "low_string": "brief",
+                }
+            },
+        }
         target_weight = 15
         collector._generating_targets.add(target_weight)
         repeated_batch = BatchedDataDict(
@@ -2132,6 +2160,16 @@ class TestAsyncTrajectoryCollector:
             assert kwargs["generation_config"]["stop_token_ids"] is None
             assert kwargs["generation_config"]["stop_strings"] is None
             assert kwargs["log_full_result_tables"] is False
+            assert (
+                kwargs["reward_penalty_config"]
+                is collector.master_config.reward_penalties
+            )
+            assert kwargs["effort_config"] == EffortLevelsConfig(
+                low_weight=0.25,
+                low_penalty=2.0,
+                low_ub=512,
+                low_string="brief",
+            )
             rollout_calls += 1
             yield _rollout_result(7)
             if rollout_calls == 1:

@@ -24,10 +24,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
-from nemo_rl.algorithms.grpo import (
-    GRPOConfig,
-    RewardPenaltyConfig,
-)
+from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.grpo import (
     MasterConfig as GRPOMasterConfig,
 )
@@ -38,6 +35,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig as XTokenOffPolicyDistillationMasterConfig,
 )
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
+from nemo_rl.experience.rollouts import RewardPenaltyConfig
 from nemo_rl.utils.config import (
     load_config_with_inheritance,
     register_omegaconf_resolvers,
