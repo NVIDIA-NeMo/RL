@@ -536,6 +536,43 @@ def test_hash_shard_read_of_jagged_field_is_unverified_not_a_mismatch():
     client.close()
 
 
+def test_hash_incomparable_field_is_counted_not_dropped():
+    """A rectangular put can come back jagged — truncating one row makes the
+    batch ragged. Its per-row digests are not comparable against a
+    batch-scoped read, so the field is dropped; dropping it *silently* is
+    the exact shape of the bug that let this check pass while covering
+    nothing, so the drop has to land in ``fields_skipped``."""
+    store = _RaggedOnReadClient()
+    client = MetricsDataPlaneClient(store, verify_tensor_hash=True)
+    ids = [f"u{i}" for i in range(4)]
+    dense = TensorDict(
+        {"x": torch.arange(16, dtype=torch.int64).reshape(4, 4)}, batch_size=[4]
+    )
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=4, consumer_tasks=["t"]
+    )
+    client.put_samples(sample_ids=ids, partition_id="p", fields=dense)
+    client.get_samples(sample_ids=ids, partition_id="p", select_fields=["x"])
+
+    hv = client.snapshot()["hash_verify"]
+    assert hv["mismatches"] == 0, "must not cry wolf on an incomparable field"
+    assert hv["fields_skipped"] == 1, "the drop must be visible"
+    assert client.get_step_metrics(1.0)["hash/fields_skipped"] == 1
+
+
+class _RaggedOnReadClient(NoOpDataPlaneClient):
+    """Returns one row shorter than it was written — a truncation on the wire."""
+
+    def get_samples(self, sample_ids, partition_id, select_fields):
+        out = super().get_samples(sample_ids, partition_id, select_fields)
+        rows = list(out["x"].unbind())
+        rows[1] = rows[1][:-1]
+        return TensorDict(
+            {"x": torch.nested.nested_tensor(rows, layout=torch.jagged)},
+            batch_size=[len(sample_ids)],
+        )
+
+
 def test_hash_fingerprint_separates_dtype():
     """The values reduce identically once bitcast, so only the dtype salt
     makes a precision change visible."""
