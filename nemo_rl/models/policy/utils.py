@@ -709,11 +709,6 @@ def stream_weights_via_http_impl(
         worker_state=worker_state,
     )
 
-    worker_state["weight_version"] = worker_state.get("weight_version", 0) + 1
-    weight_version = worker_state["weight_version"]
-    gather_src = worker_state["gather_src"]
-    gather_group = worker_state["gather_group"]
-
     engine_url = None
     for i, candidate in enumerate(rollout_engine_urls):
         start = i * num_gpus_per_engine
@@ -728,6 +723,11 @@ def stream_weights_via_http_impl(
             f"{len(rollout_engine_urls)} engine URL(s); "
             f"rank must fall within [0, {num_gpus_per_engine * len(rollout_engine_urls)})."
         )
+
+    worker_state["weight_version"] = worker_state.get("weight_version", 0) + 1
+    weight_version = worker_state["weight_version"]
+    gather_src = worker_state["gather_src"]
+    gather_group = worker_state["gather_group"]
 
     try:
         bucket: list = []

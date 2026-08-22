@@ -31,6 +31,7 @@ from nemo_rl.models.policy.utils import (
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
     rebuild_cuda_tensor_from_ipc,
+    stream_weights_via_http_impl,
     stream_weights_via_ipc_zmq_impl,
 )
 
@@ -623,3 +624,70 @@ class TestEnsureTeacherIpcBuffer:
         assert s2 is s and h2 is h
         s3, _ = ensure_teacher_ipc_buffer(s, h, 3, 1, 4, 8, torch.float32, dev)
         assert s3 is not s and s3.shape == (3, 1, 4, 8)
+
+
+class _FakeProcessGroup:
+    def __init__(self, ranks):
+        self.ranks = ranks
+
+
+class _FakeDist:
+    """Minimal ``torch.distributed`` stand-in for the HTTP refit topology."""
+
+    def __init__(self, rank):
+        self._rank = rank
+        self.created_groups = []
+
+    def get_rank(self):
+        return self._rank
+
+    def new_group(self, ranks, backend=None):
+        group = _FakeProcessGroup(list(ranks))
+        self.created_groups.append(group)
+        return group
+
+
+def test_stream_weights_via_http_reports_uncovered_rank(monkeypatch):
+    """An uncovered rank gets the descriptive error, not a bare KeyError."""
+    # One engine of 2 GPUs covers ranks [0, 2), so rank 2 never stashes
+    # gather_src/gather_group in _ensure_ipc_topology.
+    monkeypatch.setattr("nemo_rl.models.policy.utils.dist", _FakeDist(rank=2))
+
+    worker_state: dict = {}
+    with pytest.raises(RuntimeError, match="No rollout engine matched rank=2"):
+        stream_weights_via_http_impl(
+            params_generator=iter([]),
+            rollout_engine_urls=["http://localhost:30000"],
+            num_gpus_per_engine=2,
+            rank=2,
+            world_size=4,
+            worker_name="test_worker",
+            buffer_size_bytes=4096,
+            worker_state=worker_state,
+        )
+
+    assert "gather_src" not in worker_state
+
+
+def test_stream_weights_via_http_covered_rank_uses_cached_topology(monkeypatch):
+    """A covered rank still resolves its engine and bumps the weight version."""
+    fake_dist = _FakeDist(rank=1)
+    monkeypatch.setattr("nemo_rl.models.policy.utils.dist", fake_dist)
+
+    worker_state: dict = {}
+    # rank 1 is not gather_src, and the generator is empty, so nothing is
+    # gathered and no HTTP request is made.
+    stream_weights_via_http_impl(
+        params_generator=iter([]),
+        rollout_engine_urls=["http://localhost:30000"],
+        num_gpus_per_engine=2,
+        rank=1,
+        world_size=2,
+        worker_name="test_worker",
+        buffer_size_bytes=4096,
+        worker_state=worker_state,
+    )
+
+    assert worker_state["gather_src"] == 0
+    assert worker_state["gather_group"] is fake_dist.created_groups[0]
+    assert worker_state["weight_version"] == 1
