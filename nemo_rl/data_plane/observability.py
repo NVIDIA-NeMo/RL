@@ -842,16 +842,22 @@ class MetricsDataPlaneClient(DataPlaneClient):
         if not digests:
             return
         partition_hashes = self._hash_by_partition.get(partition_id, {})
+        stats = self._stats.hash_verify
         # A batch-scoped digest covers the whole buffer it was reduced from,
         # so it only means anything against a read of that same batch. Drop
         # those fields on a shard read rather than reporting every row of it
-        # as a mismatch.
-        comparable = {
-            name: digest
-            for name, digest in digests.items()
-            if not digest.batch_scoped or batch_rows.get(name) == len(sample_ids)
-        }
-        stats = self._stats.hash_verify
+        # as a mismatch — but *count* the drop. Dropping silently is the
+        # exact shape of the bug that made this check pass while covering
+        # nothing: a field stops being compared and the report still reads
+        # clean. It also fires when a rectangular put comes back jagged
+        # (one row truncated makes the batch ragged), which is a real
+        # divergence this cannot express as a row-level mismatch.
+        comparable = {}
+        for name, digest in digests.items():
+            if not digest.batch_scoped or batch_rows.get(name) == len(sample_ids):
+                comparable[name] = digest
+            else:
+                stats.fields_skipped += 1
         for row, sample_id in enumerate(sample_ids):
             per_field = partition_hashes.get(sample_id)
             if not per_field:
