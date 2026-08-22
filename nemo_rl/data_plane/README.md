@@ -462,10 +462,17 @@ time so the expensive one reads first:
 
 | op | calls | mean_ms | max_ms | wall_ms | overhead_ms | transfer_ms | p50_ms | p99_ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| get | 200 | 11.16 | 16.0 | 2232 | 1207 | 1025 | 12.9 | 16.0 |
-| put | 48 | 23.66 | 31.9 | 1135 | 579.2 | 556.1 | — | — |
+| get | 200 | 11.17 | 16.0 | 2232 | 6.03 | 5.15 | 12.9 | 16.0 |
+| put | 48 | 23.66 | 31.9 | 1135 | 12.06 | 11.60 | — | — |
 
-**`mean_ms` is the one that describes the wire.** `wall_ms` on the cluster
+Everything in ms on that row is **per call**, and the two split terms add
+to `mean_ms`: that `get` row reads "each call cost 11.17 ms, of which 6.03
+was fixed per-request overhead and 5.15 was bandwidth at this step's mean
+request size". Per call the overhead term *is* the fitted constant, so it
+is comparable against a hardware number. `calls` and `wall_ms` are the only
+extensive columns.
+
+**Per-call figures describe the wire; sums describe the run.** `wall_ms` on the cluster
 path is summed over processes that ran concurrently, so it is process-time
 and scales with DP degree — 200 gets of 11 ms across 8 ranks reads 2232
 while the wall clock was 279. Dividing by the process count only trades one
