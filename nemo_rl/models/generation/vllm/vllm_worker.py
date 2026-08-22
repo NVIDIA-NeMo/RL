@@ -97,12 +97,21 @@ def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -
     update and merge it separately so that fp8's ``quantization_config`` is the
     base while user overrides (e.g. ``max_position_embeddings``) survive and take
     precedence. This regression was reintroduced once already; see #1413/#2904.
+    FP8 also carries NeMo metadata through vLLM's ``additional_config``; merge
+    that separately so it coexists with other NeMo metadata, such as checkpoint
+    engine config.
     """
     fp8_kwargs = dict(fp8_kwargs)
     fp8_hf_overrides = fp8_kwargs.pop("hf_overrides", {})
+    fp8_additional_config = fp8_kwargs.pop("additional_config", {})
     vllm_kwargs.update(fp8_kwargs)
     existing_hf_overrides = vllm_kwargs.get("hf_overrides") or {}
     vllm_kwargs["hf_overrides"] = {**fp8_hf_overrides, **existing_hf_overrides}
+    existing_additional_config = dict(vllm_kwargs.get("additional_config") or {})
+    vllm_kwargs["additional_config"] = {
+        **existing_additional_config,
+        **fp8_additional_config,
+    }
 
 
 # Use a base class to share some functions to avoid code duplication.

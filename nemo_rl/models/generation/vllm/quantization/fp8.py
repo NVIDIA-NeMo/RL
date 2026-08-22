@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from unittest.mock import patch
 
 import ray
@@ -46,6 +46,8 @@ MXFP8_BLOCK_QUANT_KWARGS = {
     "quant_algo": "MXFP8",
 }
 
+NEMO_RL_FP8_CONFIG_KEY = "nemo_rl_fp8_config"
+
 
 @dataclass(frozen=True)
 class FP8Config:
@@ -71,6 +73,7 @@ class FP8State:
 # Global FP8 config that can be accessed by patched vLLM functions
 # initialized by 'init_fp8_cfg()'
 global_fp8_config: FP8Config = None
+global_fp8_config_is_mx_checked: bool = False
 # Global FP8 state that holds runtime fp8 objects
 fp8_state: FP8State = FP8State()
 
@@ -122,10 +125,11 @@ def monkey_patch_vllm_ray_executor(fp8_config):
 
 
 def apply_fp8_patches(self, fp8_config):
-    global global_fp8_config, fp8_patches_applied
+    global global_fp8_config, global_fp8_config_is_mx_checked, fp8_patches_applied
     assert not fp8_patches_applied
 
     global_fp8_config = fp8_config
+    global_fp8_config_is_mx_checked = False
 
     # Apply patches conditionally based on configuration
     # Only apply weight patches if using FP8 weights
@@ -187,7 +191,7 @@ def apply_fp8_patches(self, fp8_config):
 
 
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
-    global global_fp8_config
+    global global_fp8_config, global_fp8_config_is_mx_checked
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
     if vllm_cfg.get("is_mx") and not use_fp8_weights:
@@ -236,6 +240,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             "pow2_activation_scaling_factors", False
         )
     global_fp8_config = FP8Config(**fp8_config_kwargs)
+    global_fp8_config_is_mx_checked = False
 
     if vllm_cfg.get("use_deep_gemm", False) and not is_mx:
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
@@ -307,6 +312,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "quantization": "fp8",
         "kv_cache_dtype": kv_cache_dtype,
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
+        "additional_config": {NEMO_RL_FP8_CONFIG_KEY: asdict(global_fp8_config)},
     }
 
     return vllm_kwargs
@@ -334,6 +340,72 @@ def is_fp8_model(vllm_config):
         return True
 
     return False
+
+
+def is_mxfp8_model(vllm_config):
+    try:
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptMxFp8Config,
+        )
+    except ImportError:
+        return False
+
+    return isinstance(getattr(vllm_config, "quant_config", None), ModelOptMxFp8Config)
+
+
+def fp8_config_from_vllm_config(vllm_config) -> FP8Config | None:
+    additional_config = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional_config, dict):
+        return None
+
+    raw_config = additional_config.get(NEMO_RL_FP8_CONFIG_KEY)
+    if raw_config is None:
+        return None
+    if isinstance(raw_config, FP8Config):
+        return raw_config
+    if isinstance(raw_config, dict):
+        return FP8Config(**raw_config)
+    raise TypeError(
+        f"{NEMO_RL_FP8_CONFIG_KEY} must be an FP8Config or dict, got "
+        f"{type(raw_config).__name__}."
+    )
+
+
+def _get_refit_fp8_config(model_runner) -> FP8Config:
+    global global_fp8_config, global_fp8_config_is_mx_checked
+
+    worker_fp8_config = fp8_config_from_vllm_config(
+        getattr(model_runner, "vllm_config", None)
+    )
+
+    if global_fp8_config is not None:
+        if (
+            worker_fp8_config is not None
+            and worker_fp8_config.is_mx != global_fp8_config.is_mx
+        ):
+            raise RuntimeError(
+                "The process-local FP8 configuration disagrees with the "
+                "vLLM worker additional_config for MXFP8 mode."
+            )
+        global_fp8_config_is_mx_checked = True
+        return global_fp8_config
+
+    if worker_fp8_config is not None:
+        global_fp8_config = worker_fp8_config
+        global_fp8_config_is_mx_checked = True
+        return global_fp8_config
+
+    raise RuntimeError(
+        "The process-local FP8 configuration is unavailable in this vLLM "
+        "refit worker, and the worker's vLLM additional_config does not carry "
+        f"{NEMO_RL_FP8_CONFIG_KEY}."
+    )
+
+
+def _get_refit_is_mx(model_runner):
+    if global_fp8_config_is_mx_checked and global_fp8_config is not None:
+        return global_fp8_config.is_mx
+    return _get_refit_fp8_config(model_runner).is_mx
 
 
 def _get_params_in_layers(param_names, layers):
@@ -474,9 +546,10 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
 
 
 def load_weights(weights, model_runner):
-    global global_fp8_config
     weights_quantized = []
     model = model_runner.model
+    fp8_config = _get_refit_fp8_config(model_runner)
+    is_mx = fp8_config.is_mx
 
     for k, v in weights:
         # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix
@@ -512,15 +585,16 @@ def load_weights(weights, model_runner):
             weights_quantized.append((k, v))
             continue
         # Cast the weight into fp8 and its scale factor
-        if global_fp8_config.is_mx:
+        if is_mx:
             param_lp, param_scale = quantize_mxfp8_weight(v)
         else:
             param_lp, param_scale = cast_tensor_to_fp8_blockwise(
                 v.to(torch.float),
                 weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
+                fp8_config=fp8_config,
             )
         param_scale = torch.squeeze(param_scale, dim=-1)
-        if global_fp8_config.is_mx:
+        if is_mx:
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_from_checkpoint", param_scale])
         else:
@@ -533,6 +607,7 @@ def load_weights(weights, model_runner):
 def cast_tensor_to_fp8_blockwise(
     data_hp,
     weight_block_size,
+    fp8_config: FP8Config | None = None,
 ):
     assert len(data_hp.shape) == 2, "Only 2d input tensor is supported"
 
@@ -577,8 +652,13 @@ def cast_tensor_to_fp8_blockwise(
     # Calculate descale factor
     descale = max_abs / max_dtype
 
-    global global_fp8_config
-    if global_fp8_config.use_weight_pow2_scale:
+    fp8_config = fp8_config or global_fp8_config
+    if fp8_config is None:
+        raise RuntimeError(
+            "FP8 blockwise casting requires an FP8 configuration, but neither "
+            "an explicit config nor the process-local global config is available."
+        )
+    if fp8_config.use_weight_pow2_scale:
         exponent = torch.ceil(torch.log2(descale))
         # Post process exponent to be in range of -127 to 127 and to be E8M0 biased
         exponent = torch.clamp(exponent, min=-127, max=127) + 127

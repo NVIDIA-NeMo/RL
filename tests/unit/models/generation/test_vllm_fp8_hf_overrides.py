@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regression tests for merging fp8 kwargs with user-supplied hf_overrides.
+"""Regression tests for merging fp8 kwargs with user-supplied vLLM kwargs.
 
 The fp8 path returns a nested ``hf_overrides`` (holding ``quantization_config``).
 A naive ``vllm_kwargs.update(fp8_kwargs)`` shallow-merges and clobbers any
@@ -93,8 +93,27 @@ def test_source_fp8_kwargs_not_mutated():
     fp8_kwargs = {
         "quantization": "fp8",
         "hf_overrides": {"quantization_config": {"weight_block_size": [128, 128]}},
+        "additional_config": {"nemo_rl_fp8_config": {"is_mx": True}},
     }
 
     _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
 
     assert "hf_overrides" in fp8_kwargs
+    assert "additional_config" in fp8_kwargs
+
+
+def test_fp8_additional_config_merges_with_existing_entries():
+    """FP8 metadata must coexist with other vLLM additional_config users."""
+    vllm_kwargs = {
+        "additional_config": {"nemo_rl_checkpoint_engine": {"backend": "nixl"}}
+    }
+    fp8_kwargs = {
+        "additional_config": {"nemo_rl_fp8_config": {"is_mx": True}},
+    }
+
+    _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
+
+    assert vllm_kwargs["additional_config"] == {
+        "nemo_rl_checkpoint_engine": {"backend": "nixl"},
+        "nemo_rl_fp8_config": {"is_mx": True},
+    }
