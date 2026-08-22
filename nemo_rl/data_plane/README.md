@@ -460,12 +460,14 @@ cluster percentile).
 `data_plane/{cluster,driver}/breakdown` — one row per op, ordered by wall
 time so the expensive one reads first:
 
-| op | calls | wall_ms | max_ms | p50_ms | p99_ms |
-|---|---:|---:|---:|---:|---:|
-| put | 64 | 3998 | 114.9 | 58.93 | 114.9 |
-| get | 240 | 2916 | 20.0 | 12.76 | 20.0 |
-| clear | 32 | 43.42 | 2.03 | — | — |
-| register | 16 | 11.95 | 1.08 | — | — |
+| op | calls | wall_ms | max_ms | overhead_ms | transfer_ms | p50_ms | p99_ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| get | 200 | 2233 | 16.01 | 1207 | 1026 | 12.9 | 16.01 |
+| put | 48 | 1135 | 31.9 | 579.3 | 556.1 | — | — |
+
+`overhead_ms` and `transfer_ms` stack to the measured `wall_ms` — that row
+reads "2233 ms of get was 1207 ms of fixed per-call cost and 1026 ms of
+bandwidth", which is a decision you can act on.
 
 A stack of line charts answers "how did put's wall time trend"; this
 answers "where did the step go", which is a table. Cells are empty rather

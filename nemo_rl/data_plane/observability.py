@@ -443,6 +443,28 @@ def _step_deltas(snap: dict[str, Any], prev: dict[str, Any]) -> dict[str, float]
     }
 
 
+def _latency_split(
+    fit: dict[str, Any], calls: int, op_bytes: int
+) -> tuple[float, float] | None:
+    """This step's time split into fixed overhead and transfer, in ms.
+
+    The two stack: together they are the model's estimate of the op's
+    ``wall_ms``, so charting them against the measured value shows the split
+    and how well the model holds. The *coefficients* come from the
+    cumulative fit and should be stable -- that is what a fitted model is
+    for -- while the *attribution* is per step, applied to this step's calls
+    and bytes.
+
+    ``None`` when the fit is not trustworthy, which includes the common RL
+    case of near-uniform request sizes where the split is mathematically
+    unrecoverable.
+    """
+    if not fit.get("model_trustworthy"):
+        return None
+    ms_per_byte = 1.0 / (fit["bandwidth_mb_s"] * 1e3)
+    return fit["fixed_ms"] * calls, ms_per_byte * op_bytes
+
+
 def _clamped_percentiles(hist: list[int], max_ms: float) -> tuple[float, float] | None:
     """p50 and p99 from ``hist``, or ``None`` when the sample is too thin.
 
@@ -665,6 +687,18 @@ def cluster_step_metrics(
         pct = _clamped_percentiles(step_hist, stats["max_ms"])
         if pct:
             metrics[f"step/{op}/p50_ms"], metrics[f"step/{op}/p99_ms"] = pct
+        # The split belongs here more than on the driver path: this fit is
+        # over every rank's sufficient statistics, so it has far more
+        # samples and far more size variation -- and size variation is
+        # exactly what decides whether the split is identifiable at all.
+        split = _latency_split(
+            stats["fit"], calls, stats["n_bytes"] - prev_op.get("n_bytes", 0)
+        )
+        if split:
+            (
+                metrics[f"step/{op}/overhead_ms"],
+                metrics[f"step/{op}/transfer_ms"],
+            ) = split
     return metrics
 
 
@@ -959,24 +993,14 @@ class MetricsDataPlaneClient(DataPlaneClient):
             # that goes flat, quantised to bucket edges. The max is exact
             # and says the same thing at the handful of calls per step.
             metrics[f"step/{op}/max_ms"] = step_maxima.get(op, 0.0)
-            fit = st["fit"]
-            if fit.get("model_trustworthy"):
-                # The step's time split into the two things that cause it,
-                # in ms, rather than a ratio. These stack: together they are
-                # the model's estimate of this op's ``wall_ms`` for the
-                # step, so charting them against the measured ``wall_ms``
-                # shows both the split and how well the model holds.
-                #
-                # The *coefficients* come from the cumulative fit and should
-                # be stable -- that is what a fitted model is for. The
-                # *attribution* is per step, because it is applied to this
-                # step's calls and bytes. A ratio would have been neither:
-                # cumulative and therefore flat, and unitless on an axis of
-                # milliseconds.
-                op_bytes = st["n_bytes"] - prev_op.get("n_bytes", 0)
-                ms_per_byte = 1.0 / (fit["bandwidth_mb_s"] * 1e3)
-                metrics[f"step/{op}/overhead_ms"] = fit["fixed_ms"] * calls
-                metrics[f"step/{op}/transfer_ms"] = ms_per_byte * op_bytes
+            split = _latency_split(
+                st["fit"], calls, st["n_bytes"] - prev_op.get("n_bytes", 0)
+            )
+            if split:
+                (
+                    metrics[f"step/{op}/overhead_ms"],
+                    metrics[f"step/{op}/transfer_ms"],
+                ) = split
         return metrics
 
     def _record_put(self, partition_id: str, keys: list[str], n_bytes: int) -> None:
