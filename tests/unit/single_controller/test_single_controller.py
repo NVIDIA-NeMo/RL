@@ -23,6 +23,7 @@ import torch
 
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
+from nemo_rl.algorithms.draft_update_schedule import DraftUpdateScheduler
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
@@ -34,6 +35,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy.draft_config import AlwaysDraftUpdateScheduleConfig
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
@@ -360,6 +362,16 @@ class _NoOpTrainer:
         return {}
 
 
+class _NoReceiptTrainer(_NoOpTrainer):
+    supports_draft_update_receipts = False
+
+    def __init__(self) -> None:
+        self.prepare_calls = 0
+
+    def prepare_for_training(self) -> None:
+        self.prepare_calls += 1
+
+
 class _LpRecordingTrainer(_NoOpTrainer):
     """Records the ``keep_train_buffers`` flag the pump passes on each chunk."""
 
@@ -432,6 +444,32 @@ def test_train_pump_stops_after_rollout_exhaustion_and_buffer_drain() -> None:
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert ctrl._train_steps == 0
+
+
+def test_train_pump_preflight_precedes_prepare_and_scheduler_mutation() -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0", "sample-1"],
+        fields=[],
+        sequence_lengths=[1, 1],
+        tags=[{"weight_version": 0}, {"weight_version": 0}],
+    )
+    ctrl = _train_pump_controller(sampler=_OneThenEmptySampler(meta))
+    trainer = _NoReceiptTrainer()
+    ctrl._trainer = trainer
+    ctrl._weight_synchronizer = SimpleNamespace(supports_draft_apply_receipts=False)
+    scheduler = DraftUpdateScheduler.create(
+        AlwaysDraftUpdateScheduleConfig(), origin_step=0
+    )
+    ctrl._cadence_scheduler = scheduler
+    before = scheduler.state_dict()
+
+    with pytest.raises(RuntimeError, match="update receipt capability"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert trainer.prepare_calls == 0
+    assert scheduler.state_dict() == before
 
 
 def test_train_pump_fails_if_rollout_exhausts_during_partial_step() -> None:

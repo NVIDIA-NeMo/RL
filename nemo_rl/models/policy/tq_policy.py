@@ -37,6 +37,7 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.algorithms.draft_update_schedule import DraftUpdateDecision
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
@@ -69,6 +70,8 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         out["moe_metrics"] = results[0]["moe_metrics"]
     if "draft_grad_norm" in results[0]:
         out["draft_grad_norm"] = results[0]["draft_grad_norm"]
+    if "draft_update_decision" in results[0]:
+        out["draft_update_decision"] = results[0]["draft_update_decision"]
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
     for r in results:
         for k, v in r["all_mb_metrics"].items():
@@ -367,6 +370,8 @@ class TQPolicy(Policy):
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
         train_fields: tuple[str, ...] = DP_TRAIN_FIELDS,
+        *,
+        draft_update_decision: DraftUpdateDecision | None = None,
     ) -> dict[str, Any]:
         """1-hop counterpart to :meth:`train`.
 
@@ -425,6 +430,14 @@ class TQPolicy(Policy):
             if timer
             else nullcontext()
         ):
+            common_kwargs: dict[str, Any] = {
+                "loss_fn": loss_fn,
+                "eval_mode": eval_mode,
+                "gbs": batch_size,
+                "mbs": micro_batch_size,
+            }
+            if draft_update_decision is not None:
+                common_kwargs["draft_update_decision"] = draft_update_decision
             futures = self.worker_group.run_all_workers_sharded_data(
                 "train_presharded",
                 meta=dp_metas,
@@ -439,12 +452,7 @@ class TQPolicy(Policy):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs={
-                    "loss_fn": loss_fn,
-                    "eval_mode": eval_mode,
-                    "gbs": batch_size,
-                    "mbs": micro_batch_size,
-                },
+                common_kwargs=common_kwargs,
             )
         results = self.worker_group.get_all_worker_results(futures)
         aggregated_results = _aggregate_train_results(results)
@@ -487,6 +495,8 @@ class TQPolicy(Policy):
         loss_fn: LossFunction,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        *,
+        draft_update_decision: DraftUpdateDecision | None = None,
     ) -> None:
         """Open a logical train step on every worker."""
         batch_size = gbs or self.cfg["train_global_batch_size"]
@@ -496,11 +506,15 @@ class TQPolicy(Policy):
         # run_all_workers_single_data returns plain ObjectRefs (one per
         # GPU), not a MultiWorkerFuture — consume with ray.get, matching
         # every other single-data fan-out in lm_policy.
+        kwargs: dict[str, Any] = {
+            "loss_fn": loss_fn,
+            "gbs": batch_size,
+            "mbs": micro_batch_size,
+        }
+        if draft_update_decision is not None:
+            kwargs["draft_update_decision"] = draft_update_decision
         futures = self.worker_group.run_all_workers_single_data(
-            "begin_train_step_presharded",
-            loss_fn=loss_fn,
-            gbs=batch_size,
-            mbs=micro_batch_size,
+            "begin_train_step_presharded", **kwargs
         )
         ray.get(futures)
 

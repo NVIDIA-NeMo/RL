@@ -41,12 +41,28 @@ import os
 import time
 from collections import deque
 from functools import partial
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, Union
 
 import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
+from nemo_rl.algorithms.draft_cadence_runtime import (
+    CadenceRuntimeWriter,
+    CadenceTerminalEvidence,
+    disabled_draft_schedule_payload,
+    initialize_cadence_scheduler,
+    initialize_or_recover_cadence_resume,
+    preflight_cadence_receipt_capability,
+    produce_cadence_decision,
+    require_cadence_step_receipts,
+)
+from nemo_rl.algorithms.draft_update_schedule import (
+    DraftDecisionLedger,
+    DraftUpdateScheduler,
+    FileDraftStepTransactionStore,
+)
 from nemo_rl.algorithms.grpo import GRPOSaveState, _write_latest_checkpoint_status
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -78,6 +94,23 @@ from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
+
+
+def close_successful_training(
+    *,
+    runtime_writer: CadenceRuntimeWriter,
+    current_step: int,
+    final_checkpoint_path: Path,
+    terminal_evidence: CadenceTerminalEvidence,
+) -> Path:
+    """Close the cadence terminal artifacts only after a full checkpoint exists."""
+    runtime_writer.terminal_closed(
+        current_step=current_step,
+        final_checkpoint_path=final_checkpoint_path,
+        terminal_evidence=terminal_evidence,
+    )
+    return final_checkpoint_path
+
 
 # Named `log` rather than `logger` to keep it distinct from the experiment
 # Logger this module also uses as `self._logger`.
@@ -181,6 +214,57 @@ class SingleControllerActor:
         self._last_checkpoint_path: Optional[str] = actor_args.last_checkpoint_path
         self._consumed_samples: int = actor_args.save_state.consumed_samples
         self._total_valid_tokens: int = actor_args.save_state.total_valid_tokens
+        cadence_runtime = master_config.cadence_runtime
+        self._cadence_writer = (
+            CadenceRuntimeWriter(cadence_runtime) if cadence_runtime.enabled else None
+        )
+        self._cadence_terminal_evidence = (
+            CadenceTerminalEvidence.from_state(self._save_state.draft_terminal_evidence)
+            if self._save_state.draft_terminal_evidence is not None
+            else CadenceTerminalEvidence({}, {})
+        )
+        self._cadence_ledger: DraftDecisionLedger | None
+        self._cadence_transactions: FileDraftStepTransactionStore | None
+        self._cadence_scheduler: DraftUpdateScheduler | None
+        if self._cadence_writer is not None:
+            self._cadence_ledger = DraftDecisionLedger(
+                self._cadence_writer.root
+                / f"draft-decision-ledger-after-step_{self._save_state.current_step}.jsonl"
+            )
+            self._cadence_transactions = FileDraftStepTransactionStore(
+                self._cadence_writer.root,
+                base_checkpoint_id=f"step_{self._save_state.current_step}",
+            )
+            draft_config = self._master_config.policy.get("draft")
+            if self._last_checkpoint_path is not None:
+                resume = initialize_or_recover_cadence_resume(
+                    draft_config,
+                    saved=self._save_state.draft_update_schedule,
+                    origin_step=self._save_state.current_step,
+                    checkpoint_path=Path(self._last_checkpoint_path),
+                    result_root=self._cadence_writer.root,
+                    transaction_store=self._cadence_transactions,
+                    decision_ledger=self._cadence_ledger,
+                    save_state=self._save_state,
+                )
+                self._cadence_ledger = resume.ledger
+                self._cadence_scheduler = resume.scheduler
+            else:
+                self._cadence_scheduler = initialize_cadence_scheduler(
+                    draft_config,
+                    self._save_state.draft_update_schedule,
+                    origin_step=self._save_state.current_step,
+                    resuming_from_checkpoint=False,
+                )
+                self._save_state.draft_update_schedule = (
+                    disabled_draft_schedule_payload()
+                    if self._cadence_scheduler is None
+                    else self._cadence_scheduler.state_dict()
+                )
+        else:
+            self._cadence_ledger = None
+            self._cadence_transactions = None
+            self._cadence_scheduler = None
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
@@ -309,6 +393,19 @@ class SingleControllerActor:
                 # rollout pump leaves the train pump to drain committed groups.
                 await rollout_task
             await train_task
+            if self._cadence_writer is not None:
+                await asyncio.to_thread(self._checkpointer.finalize_pending)
+                final_checkpoint = self._checkpointer.get_latest_checkpoint_path()
+                if final_checkpoint is None:
+                    raise RuntimeError(
+                        "enabled cadence runtime requires a final checkpoint"
+                    )
+                close_successful_training(
+                    runtime_writer=self._cadence_writer,
+                    current_step=self._train_steps,
+                    final_checkpoint_path=Path(final_checkpoint),
+                    terminal_evidence=self._cadence_terminal_evidence,
+                )
         finally:
             for task in tasks:
                 task.cancel()
@@ -967,13 +1064,43 @@ class SingleControllerActor:
                         train_meta = await self._advantage_stage(train_meta)
 
                     # Train
+                    preflight_cadence_receipt_capability(
+                        self._cadence_scheduler,
+                        update_receipts_supported=bool(
+                            getattr(
+                                self._trainer,
+                                "supports_draft_update_receipts",
+                                False,
+                            )
+                        ),
+                        apply_receipts_supported=bool(
+                            getattr(
+                                self._weight_synchronizer,
+                                "supports_draft_apply_receipts",
+                                False,
+                            )
+                        ),
+                    )
                     with self._timer.time("training_prep"):
                         await asyncio.to_thread(self._trainer.prepare_for_training)
                     with self._timer.time("policy_training"):
                         if not step_open:
+                            cadence_decision = produce_cadence_decision(
+                                self._cadence_scheduler,
+                                global_step=self._train_steps + 1,
+                            )
+                            require_cadence_step_receipts(
+                                cadence_decision,
+                                worker_receipt=None,
+                                apply_receipt=None,
+                            )
+                            begin_kwargs: dict[str, Any] = {}
+                            if cadence_decision is not None:
+                                begin_kwargs["draft_update_decision"] = cadence_decision
                             await asyncio.to_thread(
                                 self._trainer.begin_train_step,
                                 self._loss_fn,
+                                **begin_kwargs,
                             )
                             step_open = True
                         await asyncio.to_thread(
@@ -1579,6 +1706,30 @@ class SingleControllerActor:
             checkpoint_path,
             wait_fn=self._trainer.finalize_async_save,
         )
+        if self._cadence_writer is not None:
+            if self._cadence_ledger is None:
+                raise RuntimeError("enabled cadence runtime has no decision ledger")
+            if not self._checkpointer.save_optimizer:
+                raise RuntimeError(
+                    "enabled cadence runtime requires optimizer checkpoints"
+                )
+            await asyncio.to_thread(self._checkpointer.finalize_pending)
+            final_checkpoint = self._checkpointer.get_latest_checkpoint_path()
+            if final_checkpoint is None:
+                raise RuntimeError("cadence finalization did not produce a checkpoint")
+            self._cadence_ledger = self._cadence_writer.checkpoint_closed(
+                current_step=self._train_steps,
+                checkpoint_path=Path(final_checkpoint),
+                save_state=save_state,
+                component_paths={
+                    "model": Path(final_checkpoint) / "policy" / "weights",
+                    "optimizer": Path(final_checkpoint) / "policy" / "optimizer",
+                    "dataloader_rng": Path(final_checkpoint) / "train_dataloader.pt",
+                },
+                decision_ledger=self._cadence_ledger,
+                terminal_evidence=self._cadence_terminal_evidence,
+                resumed_from=self._last_checkpoint_path,
+            )
         await asyncio.to_thread(
             _write_latest_checkpoint_status,
             self._checkpointer,

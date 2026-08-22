@@ -17,6 +17,7 @@ from typing import Any, Optional, TypedDict
 import ray
 import torch
 
+from nemo_rl.algorithms.draft_update_schedule import DraftUpdateDecision
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
@@ -111,6 +112,7 @@ class PolicyInterface(ABC):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
+        draft_update_decision: DraftUpdateDecision | None = None,
     ) -> dict[str, Any]:
         """Train the policy on a global batch of data.
 
@@ -120,6 +122,8 @@ class PolicyInterface(ABC):
             eval_mode: Whether to run in evaluation mode (no gradient updates)
             gbs: Global batch size override (if None, uses config default)
             mbs: Micro batch size override (if None, uses config default)
+            draft_update_decision: Controller-owned draft update decision. Backends
+                without online draft training receive ``None``.
         """
         pass
 

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from pathlib import Path
 
 import pytest
@@ -20,16 +21,116 @@ from pydantic import ValidationError
 
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.models.policy.draft_config import (
+    AdaptiveDraftUpdateScheduleConfig,
+    AlwaysDraftUpdateScheduleConfig,
     DFlashDraftConfig,
     DSparkDraftConfig,
     DraftOptimizerConfig,
     Eagle3DraftConfig,
+    FixedDraftUpdateScheduleConfig,
 )
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 register_omegaconf_resolvers()
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"mode": "adaptive", "min_interval": 0},
+        {"mode": "adaptive", "min_interval": 20, "max_interval": 10},
+        {"mode": "adaptive", "ewma_alpha": 0.0},
+        {"mode": "adaptive", "ewma_alpha": 1.1},
+        {"mode": "adaptive", "degradation_threshold": math.inf},
+        {
+            "mode": "adaptive",
+            "recovery_threshold": 0.02,
+            "degradation_threshold": 0.02,
+        },
+    ],
+)
+def test_adaptive_schedule_rejects_invalid_values(
+    values: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        AdaptiveDraftUpdateScheduleConfig.model_validate(values)
+
+
+def test_schedule_members_forbid_unrelated_fields() -> None:
+    with pytest.raises(ValidationError):
+        AlwaysDraftUpdateScheduleConfig.model_validate(
+            {"mode": "always", "fixed_interval": 10}
+        )
+    with pytest.raises(ValidationError):
+        FixedDraftUpdateScheduleConfig.model_validate(
+            {"mode": "fixed", "action": "adaptive", "fixed_interval": 10}
+        )
+
+
+def test_dflash_omitted_schedule_resolves_to_always_member_only() -> None:
+    config = DFlashDraftConfig(
+        enabled=True,
+        gamma=5,
+        anchors_per_sample=4,
+        mask_token_id=151665,
+        target_hidden_state_layer_ids=[1, 17, 33],
+    )
+    assert config.update_schedule.model_dump(mode="json") == {"mode": "always"}
+
+
+def test_dspark_omitted_schedule_resolves_to_always_member_only() -> None:
+    config = DSparkDraftConfig(
+        enabled=True,
+        block_size=7,
+        anchors_per_sample=4,
+        mask_token_id=151665,
+        target_hidden_state_layer_ids=[1, 17, 33],
+    )
+    assert config.update_schedule.model_dump(mode="json") == {"mode": "always"}
+
+
+def test_dflash_nested_fixed_schedule_selects_fixed_member() -> None:
+    config = DFlashDraftConfig(
+        enabled=True,
+        gamma=5,
+        anchors_per_sample=4,
+        mask_token_id=151665,
+        target_hidden_state_layer_ids=[1, 17, 33],
+        update_schedule={
+            "mode": "fixed",
+            "action": "sparse_update",
+            "fixed_interval": 10,
+        },
+    )
+    assert isinstance(config.update_schedule, FixedDraftUpdateScheduleConfig)
+
+
+def test_dspark_nested_adaptive_schedule_selects_adaptive_member() -> None:
+    config = DSparkDraftConfig(
+        enabled=True,
+        block_size=7,
+        anchors_per_sample=4,
+        mask_token_id=151665,
+        target_hidden_state_layer_ids=[1, 17, 33],
+        update_schedule={"mode": "adaptive"},
+    )
+    assert isinstance(config.update_schedule, AdaptiveDraftUpdateScheduleConfig)
+
+
+def test_nested_schedule_rejects_unknown_mode() -> None:
+    with pytest.raises(ValidationError, match="mode"):
+        DFlashDraftConfig.model_validate(
+            {
+                "enabled": True,
+                "gamma": 5,
+                "anchors_per_sample": 4,
+                "mask_token_id": 151665,
+                "target_hidden_state_layer_ids": [1, 17, 33],
+                "update_schedule": {"mode": "sometimes"},
+            }
+        )
 
 
 def test_eagle3_draft_config_preserves_legacy_defaults() -> None:
@@ -222,9 +323,7 @@ def test_dspark_config_resolves_target_owned_vocab() -> None:
     }
 
     assert (
-        DSparkDraftConfig(**values).resolve_draft_vocab_size(
-            target_vocab_size=151_936
-        )
+        DSparkDraftConfig(**values).resolve_draft_vocab_size(target_vocab_size=151_936)
         == 151_936
     )
     assert (
@@ -245,9 +344,10 @@ def test_dspark_update_probe_is_explicitly_opt_in() -> None:
     }
 
     assert DSparkDraftConfig(**values).update_probe_enabled is False
-    assert DSparkDraftConfig(
-        **values, update_probe_enabled=True
-    ).update_probe_enabled is True
+    assert (
+        DSparkDraftConfig(**values, update_probe_enabled=True).update_probe_enabled
+        is True
+    )
 
 
 def test_dspark_config_rejects_dflash_gamma_alias() -> None:

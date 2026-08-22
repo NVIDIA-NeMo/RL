@@ -29,6 +29,8 @@ from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
+from nemo_rl.algorithms.draft_cadence_runtime import CadenceRuntimeConfig
+from nemo_rl.algorithms.draft_update_schedule import DraftUpdateScheduler
 from nemo_rl.algorithms.grpo import (
     AdvEstimatorConfig,
     AsyncGRPOConfig,
@@ -90,6 +92,7 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.policy.draft_config import AlwaysDraftUpdateScheduleConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
@@ -1719,6 +1722,59 @@ def _run_sync_draft_refit_marker_case(
         if line.startswith("draft_post_update_refit=")
     ]
     return events, markers, error
+
+
+def test_sync_cadence_preflight_fails_before_prepare_or_scheduler_mutation(
+    mock_grpo_components, tmp_path: Path
+) -> None:
+    components = mock_grpo_components
+    master_config = components["master_config"]
+    master_config.data_plane = {"enabled": True}
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.cadence_runtime = CadenceRuntimeConfig(
+        enabled=True,
+        result_dir=str(tmp_path / "cadence"),
+    )
+    master_config.policy["draft"] = MagicMock(enabled=True)
+    policy = components["policy"]
+    policy.supports_draft_update_receipts = False
+    policy.supports_draft_apply_receipts = False
+    components["checkpointer"].get_latest_checkpoint_path.return_value = None
+    scheduler = DraftUpdateScheduler.create(
+        AlwaysDraftUpdateScheduleConfig(), origin_step=0
+    )
+    before = scheduler.state_dict()
+
+    with (
+        mock_sync_grpo_infrastructure(policy),
+        patch(
+            "nemo_rl.algorithms.grpo_sync.MemoryTracker",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo_sync.initialize_cadence_scheduler",
+            return_value=scheduler,
+        ),
+        pytest.raises(RuntimeError, match="update receipt capability"),
+    ):
+        grpo_train_sync(
+            policy,
+            _mock_policy_generation(),
+            components["train_dataloader"],
+            components["val_dataloader"],
+            components["tokenizer"],
+            components["loss_fn"],
+            components["task_to_env"],
+            components["val_task_to_env"],
+            components["logger"],
+            components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    policy.prepare_for_training.assert_not_called()
+    assert scheduler.state_dict() == before
 
 
 def test_sync_draft_refit_marker_follows_fresh_update(

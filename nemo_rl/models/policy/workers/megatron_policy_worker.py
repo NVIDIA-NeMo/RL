@@ -49,6 +49,7 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms.draft_update_schedule import DraftUpdateDecision
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data.multimodal_utils import (
@@ -329,6 +330,125 @@ def _validate_draft_training_entrypoint(
             "context-parallel draft co-training requires the split "
             "begin/train_microbatch/finish API"
         )
+
+
+_DRAFT_DECISION_REASON_CODES = {
+    "always": 1,
+    "fixed_interval": 2,
+    "adaptive_degradation": 3,
+    "adaptive_burst": 4,
+    "max_interval": 5,
+    "none": 6,
+}
+
+
+def validate_draft_enabled_consensus(
+    draft_enabled: bool,
+    *,
+    group: torch.distributed.ProcessGroup | None = None,
+    device: torch.device | None = None,
+) -> bool:
+    """Validate the immutable draft-enabled mode once during worker setup."""
+    if not torch.distributed.is_initialized():
+        return draft_enabled
+    group = group or torch.distributed.group.WORLD
+    if device is None:
+        backend = torch.distributed.get_backend(group)
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if backend == "nccl"
+            else torch.device("cpu")
+        )
+    minimum = torch.tensor(int(draft_enabled), dtype=torch.int64, device=device)
+    maximum = minimum.clone()
+    torch.distributed.all_reduce(
+        minimum, op=torch.distributed.ReduceOp.MIN, group=group
+    )
+    torch.distributed.all_reduce(
+        maximum, op=torch.distributed.ReduceOp.MAX, group=group
+    )
+    if minimum.item() != maximum.item():
+        raise RuntimeError("draft-enabled mode mismatch across ranks")
+    return draft_enabled
+
+
+def validate_draft_update_decision_consensus(
+    decision: DraftUpdateDecision | None,
+    *,
+    draft_enabled: bool,
+    globally_disabled: bool = False,
+    group: torch.distributed.ProcessGroup | None = None,
+    device: torch.device | None = None,
+) -> DraftUpdateDecision | None:
+    """Validate one complete controller decision across every training rank."""
+    if globally_disabled:
+        if draft_enabled or decision is not None:
+            raise RuntimeError("globally disabled draft cadence received a decision")
+        return None
+    reason_code = (
+        0 if decision is None else _DRAFT_DECISION_REASON_CODES.get(decision.reason, -1)
+    )
+    if not torch.distributed.is_initialized():
+        if draft_enabled and decision is None:
+            raise RuntimeError(
+                "draft_update_decision is required but missing on at least one rank"
+            )
+        if reason_code == -1:
+            raise RuntimeError("unsupported draft decision reason across ranks")
+        return decision
+
+    group = group or torch.distributed.group.WORLD
+    if device is None:
+        backend = torch.distributed.get_backend(group)
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if backend == "nccl"
+            else torch.device("cpu")
+        )
+    observation = (
+        0.0
+        if decision is None or decision.observed_acceptance is None
+        else decision.observed_acceptance
+    )
+    observation_bits = (
+        torch.tensor(observation, dtype=torch.float64).view(torch.int64).item()
+    )
+    signature = torch.tensor(
+        [
+            int(draft_enabled),
+            int(decision is not None),
+            0 if decision is None else decision.global_step,
+            0 if decision is None else decision.decision_id,
+            0 if decision is None else int(decision.update_requested),
+            0 if decision is None else int(decision.draft_refit_requested),
+            reason_code,
+            0 if decision is None else int(decision.forced),
+            0 if decision is None else decision.applied_draft_version,
+            int(decision is not None and decision.observed_acceptance is not None),
+            observation_bits,
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    minimum = signature.clone()
+    maximum = signature.clone()
+    torch.distributed.all_reduce(
+        minimum, op=torch.distributed.ReduceOp.MIN, group=group
+    )
+    torch.distributed.all_reduce(
+        maximum, op=torch.distributed.ReduceOp.MAX, group=group
+    )
+    if minimum[0].item() != maximum[0].item():
+        raise RuntimeError("draft-enabled mode mismatch across ranks")
+    if maximum[0].item() == 1 and minimum[1].item() == 0:
+        raise RuntimeError(
+            "draft_update_decision is required but missing on at least one rank"
+        )
+    if minimum[6].item() == -1 or maximum[6].item() == -1:
+        raise RuntimeError("unsupported draft decision reason across ranks")
+    if not torch.equal(minimum, maximum):
+        raise RuntimeError("draft update decision mismatch across ranks")
+    return decision
 
 
 def _should_use_router_replay(
@@ -683,6 +803,11 @@ class MegatronPolicyWorkerImpl(
 
         # Step 1: Setup distributed
         setup_distributed()
+        draft_cfg = config.get("draft")
+        draft_enabled = bool(getattr(draft_cfg, "enabled", False))
+        self._draft_cadence_globally_disabled = not validate_draft_enabled_consensus(
+            draft_enabled
+        )
         log_gpu_memory_diagnostics(
             label="after_nccl_init", worker_type="MegatronPolicyWorker"
         )
@@ -990,6 +1115,8 @@ class MegatronPolicyWorkerImpl(
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
+        *,
+        draft_update_decision: DraftUpdateDecision | None = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
@@ -1006,6 +1133,13 @@ class MegatronPolicyWorkerImpl(
             draft_provider=getattr(self, "draft_provider", None),
             context_parallel_size=parallel_state.get_context_parallel_world_size(),
             split_api=False,
+        )
+        draft_cfg = self.cfg.get("draft")
+        draft_enabled = bool(getattr(draft_cfg, "enabled", False))
+        draft_update_decision = validate_draft_update_decision_consensus(
+            draft_update_decision,
+            draft_enabled=draft_enabled,
+            globally_disabled=getattr(self, "_draft_cadence_globally_disabled", False),
         )
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
@@ -1160,7 +1294,6 @@ class MegatronPolicyWorkerImpl(
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
                     # Forward pass.
-                    draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
                     use_router_replay = _should_use_router_replay(
                         enabled=self._router_replay_enabled,
                         data=batch,
@@ -1361,6 +1494,8 @@ class MegatronPolicyWorkerImpl(
         self._collect_mtp_metrics(metrics, total_num_microbatches, mtp_grad_norm)
         if draft_grad_norm is not None:
             metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
+        if draft_update_decision is not None:
+            metrics["draft_update_decision"] = draft_update_decision
 
         # Skip FLOPs estimation when sequence packing is enabled: gbs counts original
         # samples but each packed sequence spans max_total_sequence_length tokens,
@@ -1567,7 +1702,15 @@ class MegatronPolicyWorkerImpl(
         loss_fn: LossFunction,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        *,
+        draft_update_decision: DraftUpdateDecision | None = None,
     ) -> None:
+        draft_cfg = self.cfg.get("draft")
+        draft_update_decision = validate_draft_update_decision_consensus(
+            draft_update_decision,
+            draft_enabled=bool(getattr(draft_cfg, "enabled", False)),
+            globally_disabled=getattr(self, "_draft_cadence_globally_disabled", False),
+        )
         existing = getattr(self, "_train_step_state", None)
         if existing is not None:
             raise RuntimeError(
@@ -1588,6 +1731,7 @@ class MegatronPolicyWorkerImpl(
         self.optimizer.zero_grad()
 
         state = self._split_step_state_init(loss_fn=loss_fn, gbs=gbs, mbs=mbs)
+        state["draft_update_decision"] = draft_update_decision
 
         # Null the three mcore hooks that would fire a mid-step DP reduce:
         #   grad_sync_func — PP scheduler's direct call on last-MB boundaries
@@ -2111,6 +2255,9 @@ class MegatronPolicyWorkerImpl(
         }
         if draft_grad_norm is not None:
             metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
+        draft_update_decision = state["draft_update_decision"]
+        if draft_update_decision is not None:
+            metrics["draft_update_decision"] = draft_update_decision
 
         # MoE aux-loss metrics: same convention as sync train() — scale
         # by the total pipeline-microbatch count accumulated across all
