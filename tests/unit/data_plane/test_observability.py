@@ -1010,8 +1010,8 @@ def test_breakdown_table_rows_by_op_worst_first():
     to "what is my bottleneck" should be the top-left of the table."""
     metrics = {
         "step/wall_ms": 100.0,
-        "step/share/by_op/get": 0.10,
-        "step/share/by_op/put": 0.90,
+        "step/time_pct/by_op/get": 10.0,
+        "step/time_pct/by_op/put": 90.0,
         "step/get/calls": 8,
         "step/get/wall_ms": 10.0,
         "step/get/max_ms": 2.0,
@@ -1027,8 +1027,8 @@ def test_breakdown_table_rows_by_op_worst_first():
     assert [r[0] for r in rows] == ["put", "get"], "worst first"
     assert len(rows) == 2, "only per-op series become rows"
     assert rows[0][columns.index("wall_ms")] == 90.0
-    assert rows[0][columns.index("share_pct")] == pytest.approx(90.0)
-    assert columns[1] == "share_pct", "the bottleneck reads first"
+    assert rows[0][columns.index("time_pct")] == pytest.approx(90.0)
+    assert columns[1] == "time_pct", "the bottleneck reads first"
 
 
 def test_breakdown_table_leaves_withheld_series_empty():
@@ -1101,7 +1101,7 @@ def test_cluster_per_op_time_is_reported_per_call():
     ), "the sum does move with cluster size"
 
     columns, rows = breakdown_table(small)
-    assert "mean_ms" in columns and "share_pct" in columns
+    assert "mean_ms" in columns and "time_pct" in columns
 
 
 def test_each_quantile_waits_for_the_samples_it_needs():
@@ -1263,27 +1263,34 @@ def _busy_client(op_calls):
     return client
 
 
-def test_time_shares_name_the_bottleneck():
+def test_time_pct_names_the_bottleneck_and_says_of_what():
     """The question a dashboard has to answer is "which op is expensive",
-    and 32 per-op line charts do not answer it. The by-op shares are one
-    decomposition of data-plane time and sum to 1, so the largest is the
-    bottleneck by construction."""
+    and 32 per-op line charts do not answer it.
+
+    The denominator is data-plane time, not the step: ``by_op`` sums to 100
+    by construction, so the largest is the bottleneck *within the data
+    plane*. Whether the data plane mattered at all is ``frac_of_step``,
+    which divides by the step's own clock -- here a tenth of a second of
+    data-plane work inside a 10 s step is 9% of one and 100% of the other.
+    """
     client = _busy_client({"get": (100, 9.0), "put": (10, 1.0), "clear": (10, 0.1)})
     metrics = cluster_step_metrics(
-        merge_snapshots([client.snapshot(reset_step_window=True)]), {}, 1.0
+        merge_snapshots([client.snapshot(reset_step_window=True)]), {}, 10.0
     )
 
-    shares = {k: v for k, v in metrics.items() if k.startswith("step/share/by_op/")}
-    assert sum(shares.values()) == pytest.approx(1.0)
-    assert max(shares, key=shares.__getitem__) == "step/share/by_op/get"
-    assert shares["step/share/by_op/get"] == pytest.approx(900 / 911, rel=0.05)
-    client.close()
+    by_op = {k: v for k, v in metrics.items() if k.startswith("step/time_pct/by_op/")}
+    assert sum(by_op.values()) == pytest.approx(100.0), "percent of one total"
+    assert max(by_op, key=by_op.__getitem__) == "step/time_pct/by_op/get"
+    assert by_op["step/time_pct/by_op/get"] == pytest.approx(100 * 900 / 911, rel=0.05)
+    # the two denominators are different questions and must not agree
+    assert metrics["step/frac_of_step"] == pytest.approx(0.0911, rel=0.1)
 
 
-def test_headline_drops_per_op_detail_but_keeps_the_shares():
+def test_headline_drops_per_op_detail_but_keeps_the_percentages():
     """Four ops times eight fields is 32 series saying one thing. The detail
     is still computed -- the breakdown table is built from the same dict, so
-    the two cannot disagree -- but only the totals and shares are charted."""
+    the two cannot disagree -- but only the totals and percentages are
+    charted."""
     client = _busy_client({"get": (100, 9.0), "put": (10, 1.0), "clear": (10, 0.1)})
     metrics = cluster_step_metrics(
         merge_snapshots([client.snapshot(reset_step_window=True)]), {}, 1.0
@@ -1292,7 +1299,7 @@ def test_headline_drops_per_op_detail_but_keeps_the_shares():
 
     assert len(head) < len(metrics) / 2, f"{len(head)} of {len(metrics)}"
     assert not [k for k in head if k.split("/")[1:2] in (["get"], ["put"], ["clear"])]
-    assert "step/share/by_op/get" in head
+    assert "step/time_pct/by_op/get" in head
     assert "step/wall_ms" in head and "step/frac_of_step" in head
     # and the detail the table needs survives in the full dict
     assert breakdown_table(metrics)[1], "table still has rows"
@@ -1344,7 +1351,7 @@ def test_breakdown_table_ignores_reserved_namespaces():
             "step/put/wall_ms": 9.0,
             "step/self/overhead_ms": 6.2,
             "step/hash/mismatches": 0,
-            "step/share/by_cause/transfer": 0.4,
+            "step/time_pct/by_cause/transfer": 40.0,
         }
     )
     assert [r[0] for r in rows] == ["put"], rows
