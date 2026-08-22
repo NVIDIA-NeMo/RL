@@ -113,7 +113,10 @@ class MegatronGeneration(GenerationInterface):
             name_prefix: Prefix for naming the worker group (non-colocated only).
             processor: Optional processor for VLMs (non-colocated only).
             weights_path: Optional path to model weights (non-colocated only).
-            skip_weight_load: Do not load the weights from the checkpoint; refit will do it.
+            skip_weight_load: Do not load weights from the checkpoint; refit will do it.
+                Inference-engine initialization is deferred until that first refit so CUDA
+                graphs capture the final persistent weight buffers rather than placeholder
+                checkpoint tensors.
         """
         # Import here to avoid circular imports
         from nemo_rl.models.policy.lm_policy import Policy
@@ -129,6 +132,20 @@ class MegatronGeneration(GenerationInterface):
         # `self._policy_config` keeps a reference to the full PolicyConfig.
         self._policy_config = config
         self.cfg: MCoreGenerationConfig = config["generation"]
+        self.refit_impl = self.cfg["mcore_generation_config"].get("refit_impl", "mcore")
+        if self.refit_impl not in ("bridge", "mcore"):
+            raise ValueError(
+                "policy.generation.mcore_generation_config.refit_impl must be "
+                f"'bridge' or 'mcore', got {self.refit_impl!r}."
+            )
+        if self.refit_impl == "mcore":
+            refit_backend = self.cfg["mcore_generation_config"]["refit_backend"]
+            if refit_backend not in ("gloo", "nccl", "nvshmem"):
+                raise ValueError(
+                    "policy.generation.mcore_generation_config.refit_backend "
+                    "must be 'gloo', 'nccl', or 'nvshmem' when "
+                    f"refit_impl='mcore', got {refit_backend!r}."
+                )
         # Populated after the first prepare_for_generation (which starts the HTTP server).
         self.dp_openai_server_base_urls: list[Optional[str]] = []
         # Installed by setup via create_weight_synchronizer.
@@ -163,8 +180,22 @@ class MegatronGeneration(GenerationInterface):
             skip_weight_load=skip_weight_load,
         )
 
-        # Start the persistent inference engine + HTTP server during construction.
-        self.prepare_for_generation()
+        # A skip-load model does not have its final weight objects yet. In particular,
+        # MXFP8 refit replaces placeholder TE tensors with persistent MXFP8Tensor buffers.
+        # Capturing CUDA graphs here would retain the placeholder addresses (and graph
+        # warmup would execute the wrong tensor type). refit_policy_generation calls
+        # prepare_for_generation(tags=["kv_cache"]) after the first weight transfer,
+        # which initializes the engine and captures against the final buffers.
+        if not skip_weight_load:
+            self.prepare_for_generation()
+
+    @property
+    def uses_native_refit(self) -> bool:
+        """Whether non-colocated refit uses Megatron Core's native mechanism."""
+        return (
+            self.refit_impl == "mcore"
+            and self.cfg.get("refit_transport") != "nccl_reshard"
+        )
 
     def init_collective(
         self,
@@ -173,32 +204,79 @@ class MegatronGeneration(GenerationInterface):
         world_size: int,
         *,
         train_world_size: int,
-        refit_backend: str = "gloo",
+        refit_backend: Optional[str] = None,
     ) -> list[ray.ObjectRef]:
-        """Initialize the refit collective for weight synchronization.
+        """Join the configured refit collective after the training ranks.
 
         Args:
             ip: IP address for the process group rendezvous.
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             train_world_size: Number of training workers (used to offset ranks).
-            refit_backend: Copy service backend ("gloo" or "nccl";
-                "nvshmem" is currently broken and warns at setup).
+            refit_backend: Optional override for the native MCore copy-service
+                backend. Ignored by Bridge packed refit.
 
         Returns:
             List of Ray ObjectRefs for the collective init futures.
         """
-        return self._policy.init_collective_mcore_generation(
+        if self.uses_native_refit:
+            backend = (
+                refit_backend or self.cfg["mcore_generation_config"]["refit_backend"]
+            )
+            return self._policy.init_collective_mcore_generation(
+                ip,
+                port,
+                world_size,
+                rank_offset=train_world_size,
+                refit_backend=backend,
+            )
+        return self._policy.init_collective(
             ip,
             port,
             world_size,
+            train_world_size=train_world_size,
             rank_offset=train_world_size,
-            refit_backend=refit_backend,
         )
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
-        """Receive updated weights from the training cluster via collective communication."""
-        return self._policy.swap_weights_via_reshard(is_source=False)
+        """Receive weights through the configured Megatron refit mechanism."""
+        if self.uses_native_refit:
+            return self._policy.swap_weights_via_reshard(is_source=False)
+        return self._policy.worker_group.run_all_workers_single_data(
+            "update_generation_weights_from_collective"
+        )
+
+    def init_nccl_reshard_comm_group(
+        self,
+        *,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Join every training PP stage's NCCL M-to-N communicator."""
+        return self._policy.worker_group.run_all_workers_single_data(
+            "init_nccl_reshard_comm_groups_generation",
+            pp_ips=pp_ips,
+            pp_ports=pp_ports,
+            pp_size=pp_size,
+            train_ranks_per_stage=train_ranks_per_stage,
+            sub_world_size=sub_world_size,
+        )
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict[str, Any]) -> None:
+        """Build each inference worker's HF-to-Megatron M-to-N receive map."""
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "prepare_nccl_reshard_generation_refit_info", refit_info=refit_info
+        )
+        ray.get(futures)
+
+    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
+        """Receive one NCCL M-to-N refit on every Megatron inference worker."""
+        return self._policy.worker_group.run_all_workers_single_data(
+            "nccl_reshard_generation_refit"
+        )
 
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -301,6 +379,10 @@ class MegatronGeneration(GenerationInterface):
 
         Must be called simultaneously on both training and inference workers.
         """
+        if not self.uses_native_refit:
+            raise RuntimeError(
+                "NVSHMEM pre-initialization is only valid with refit_impl='mcore'."
+            )
         return self._policy.preinit_nvshmem()
 
     def suspend_for_refit(self) -> None:
@@ -316,8 +398,15 @@ class MegatronGeneration(GenerationInterface):
         )
 
     def prepare_refit_info(self, state_dict_info: Optional[dict[str, Any]]) -> None:
-        """Accept the cross-backend refit-prep contract; Megatron needs none of it."""
-        pass
+        """Prepare Bridge conversion tasks on every dedicated inference worker."""
+        if not self._owns_policy or self.uses_native_refit:
+            return
+        if state_dict_info is None:
+            raise ValueError("Megatron collective refit requires state_dict_info.")
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "prepare_generation_refit_info", state_dict_info=state_dict_info
+        )
+        ray.get(futures)
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling on the dedicated inference workers.

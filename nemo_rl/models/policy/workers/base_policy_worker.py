@@ -32,6 +32,7 @@ class AbstractPolicyWorker:
         world_size: int,
         *,
         train_world_size: int,
+        rank_offset: int = 0,
         nccl_peer: str = "nemo",
     ) -> None:
         """Initialize the collective communication.
@@ -41,12 +42,16 @@ class AbstractPolicyWorker:
             port: Port for the process group
             world_size: Total world size (train_world_size + inference_world_size)
             train_world_size: Number of training workers (used in inference cluster)
+            rank_offset: Offset added to this worker group's local rank.
             nccl_peer: NCCL initialization protocol used by the inference workers
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         self.model_update_group = StatelessProcessGroup(
-            master_address=ip, port=port, rank=self.rank, world_size=world_size
+            master_address=ip,
+            port=port,
+            rank=self.rank + rank_offset,
+            world_size=world_size,
         )
         device = torch.cuda.current_device()
         # Release unused cached allocator blocks before NCCL communicator

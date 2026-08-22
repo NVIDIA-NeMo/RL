@@ -28,20 +28,29 @@ single `ValueError` listing every violation. The current requirements are:
   path uses IPC and is unaffected by this feature.
 * **Megatron training backend** — `policy.megatron_cfg.enabled=true` (the DTensor
   training backend is not supported yet.).
-* **vLLM generation backend** — `policy.generation.backend=vllm` (SGLang and TRTLLM
-  backend is not supported yet.).
+* **vLLM or Megatron generation backend** — `policy.generation.backend` must be
+  `vllm` or `megatron` (SGLang and TRTLLM are not supported yet).
 * Megatron `expert_tensor_parallel_size` (i.e., ETP) must be 1; custom PP layouts
   (`pipeline_model_parallel_layout`, virtual PP > 1, embedding/loss pipeline-split
   accounting) are not supported yet.
-* **Precision** must match end to end for BF16 train ↔ BF16 gen and blockwise-FP8
-  train (`fp8_param=true` + blockwise recipe) ↔ FP8 gen
-  (`vllm_cfg.precision=fp8`). BF16 train → MXFP8 gen is also supported with
-  `vllm_cfg.precision=fp8` and `vllm_cfg.is_mx=true`; the generation ranks
-  quantize each received BF16 shard before installing it. Blockwise-FP8 train →
+* **Precision** for vLLM supports BF16 train ↔ BF16 gen, blockwise-FP8 train
+  (`fp8_param=true` + blockwise recipe) ↔ FP8 gen, and BF16 train → MXFP8 gen
+  (`vllm_cfg.precision=fp8`, `vllm_cfg.is_mx=true`). Blockwise-FP8 train →
   MXFP8 gen is not supported.
+* Megatron generation accepts BF16 or MXFP8 training parameters
+  (`fp8_param=true` + MXFP8 recipe). MXFP8 sources are materialized as logical
+  BF16 for transport; the destination either stores BF16 or quantizes each
+  complete local weight into MXFP8. When MXFP8 parameter all-gather reuses the
+  gradient buffer, that aliased allocation stays GPU-resident across refit so
+  persistent DDP/autograd views remain valid; ordinary gradient buffers and
+  optimizer state are still offloaded.
 * vLLM expert parallelism is supported with the NeMo RL convention
-  `expert_parallel_size == tensor_parallel_size`. 
-* Generation-side, PP > 1 is not supported. 
+  `expert_parallel_size == tensor_parallel_size`.
+* For Megatron generation, `refit_transport=nccl_reshard` selects M-to-N
+  regardless of `mcore_generation_config.refit_impl`. Set `refit_transport=null`
+  with `refit_impl=bridge` for packed Bridge refit or `refit_impl=mcore` for
+  Megatron Core's native refit.
+* Generation-side PP > 1 is not supported.
 * **No ModelOpt real quantization** — `policy.generation.real_quant=false`. Real-quant
   rollouts refit through vLLM's layerwise-reload weight loaders, which the bulk
   `xferdtensor` writes bypass.
@@ -80,10 +89,11 @@ nccl-reshard-refit implementation:
   `model_update_group` and are loaded on the generation side through the backend's
   regular `load_weights` machinery.
 
-The feature is integrated into the `nemo_rl/weight_sync/` framework:
-`create_weight_synchronizer(..., nccl_reshard_refit=True)` returns a
-`NcclReshardWeightSynchronizer` whose `init_communicator()` performs the one-time setup
-and whose `sync_weights()` runs one refit.
+The feature is integrated into the `nemo_rl/weight_sync/` framework. For vLLM,
+`create_weight_synchronizer(...)` returns an `NcclReshardWeightSynchronizer` directly.
+For Megatron generation, the existing `MegatronWeightSynchronizer` retains ownership of
+the inference-engine lifecycle and delegates only the transfer to an
+`NcclReshardWeightSynchronizer`.
 
 ### Execution Flow: Setup Time
 
@@ -202,6 +212,11 @@ generation side maps those HF names onto whatever its own storage layout is.
   deliberately **shape-driven** so the same code handles generation TP and generation
   EP; the comm bootstrap methods; the `nccl_reshard_refit()` receive loop; the misc
   consumer feeding `load_weights`.
+* **Megatron generation side** (`megatron_worker.py`): mapping the same canonical
+  HF FFN shards to local fused dense/expert views. BF16 destinations receive in
+  place; MXFP8 destinations use short-lived BF16 staging buffers and quantize into
+  their persistent MCore storage. Misc weights continue through Megatron Bridge's
+  packed-broadcast import path.
 
 **To extend to a new backend**, the only piece with genuinely new logic is
 `build_hf_to_local_param_map`. Everything else is boilerplate that follows a fixed

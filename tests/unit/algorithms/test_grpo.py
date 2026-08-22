@@ -15,7 +15,7 @@
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call as mock_call, patch
 
 import pytest
 import ray
@@ -140,6 +140,67 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
         buffer_size_bytes=1024**3,
         kv_scales=kv_scales,
     )
+
+
+@pytest.mark.parametrize("refit_impl", ["bridge", "mcore"])
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_megatron_refit_uses_configured_transfer(
+    mock_ray: MagicMock, refit_impl: str
+) -> None:
+    mock_ray.get.return_value = [True]
+    policy = MagicMock()
+    generation = object.__new__(MegatronGeneration)
+    generation.refit_impl = refit_impl
+    generation.cfg = {
+        "mcore_generation_config": {
+            "refit_impl": refit_impl,
+            "refit_backend": "gloo",
+        }
+    }
+    generation.weight_synchronizer = None
+    generation.suspend_for_refit = MagicMock()
+    generation.prepare_for_generation = MagicMock()
+    generation.update_weights_from_collective = MagicMock(return_value=["recv"])
+    generation.resume_after_refit = MagicMock()
+
+    refit_policy_generation(policy, generation, colocated_inference=False)
+
+    if refit_impl == "mcore":
+        policy.swap_weights_via_reshard.assert_called_once_with(is_source=True)
+        policy.broadcast_weights_for_collective.assert_not_called()
+    else:
+        policy.broadcast_weights_for_collective.assert_called_once_with(kv_scales=None)
+        policy.swap_weights_via_reshard.assert_not_called()
+    generation.update_weights_from_collective.assert_called_once_with()
+
+
+def test_megatron_m2n_synchronizer_preserves_engine_lifecycle() -> None:
+    policy = MagicMock()
+    generation = object.__new__(MegatronGeneration)
+    generation.suspend_for_refit = MagicMock()
+    generation.prepare_for_generation = MagicMock()
+    generation.resume_after_refit = MagicMock()
+    generation.weight_synchronizer = MagicMock()
+    generation.weight_synchronizer.sync_weights.return_value = {"bytes": 16.0}
+
+    metrics = refit_policy_generation(
+        policy,
+        generation,
+        colocated_inference=False,
+        kv_scales={"layer.0": 0.5},
+    )
+
+    assert metrics == {"bytes": 16.0}
+    generation.suspend_for_refit.assert_called_once_with()
+    policy.offload_before_refit.assert_called_once_with()
+    assert generation.prepare_for_generation.call_args_list == [
+        mock_call(tags=["weights"]),
+        mock_call(tags=["kv_cache"]),
+    ]
+    generation.weight_synchronizer.sync_weights.assert_called_once_with(
+        timer=None, kv_scales={"layer.0": 0.5}
+    )
+    generation.resume_after_refit.assert_called_once_with()
 
 
 class TestMaskSampleFilter:

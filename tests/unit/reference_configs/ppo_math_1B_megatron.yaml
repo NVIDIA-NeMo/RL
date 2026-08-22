@@ -248,6 +248,8 @@ policy:
       enable_chunked_prefill: true
       unified_memory_level: 0
       max_tokens: 16384
+      refit_impl: "bridge"
+      refit_backend: "nvshmem"
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}

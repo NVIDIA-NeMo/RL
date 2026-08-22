@@ -14,6 +14,7 @@
 
 import gc
 from copy import deepcopy
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -34,6 +35,177 @@ from nemo_rl.weight_sync.megatron_weight_synchronizer import (
 from tests.unit.test_utils import SimpleLossFn
 
 model_name = "Qwen/Qwen3-0.6B"
+
+
+def test_megatron_generation_defaults_to_native_refit():
+    config = {
+        "generation": {
+            "mcore_generation_config": {
+                "refit_backend": "gloo",
+                "expose_http_server": False,
+            }
+        }
+    }
+
+    generation = MegatronGeneration(
+        config=config,
+        tokenizer=MagicMock(),
+        policy=MagicMock(),
+    )
+
+    assert generation.refit_impl == "mcore"
+    assert generation.uses_native_refit
+
+
+@pytest.mark.parametrize("refit_impl", ["bridge", "mcore"])
+def test_megatron_generation_dispatches_refit_implementation(refit_impl):
+    generation = object.__new__(MegatronGeneration)
+    generation.refit_impl = refit_impl
+    generation.cfg = {
+        "mcore_generation_config": {
+            "refit_impl": refit_impl,
+            "refit_backend": "gloo",
+        }
+    }
+    generation._policy = MagicMock()
+    generation._owns_policy = False
+
+    generation.init_collective("127.0.0.1", 1234, 4, train_world_size=2)
+    generation.update_weights_from_collective()
+
+    if refit_impl == "mcore":
+        generation._policy.init_collective_mcore_generation.assert_called_once_with(
+            "127.0.0.1",
+            1234,
+            4,
+            rank_offset=2,
+            refit_backend="gloo",
+        )
+        generation._policy.swap_weights_via_reshard.assert_called_once_with(
+            is_source=False
+        )
+        generation._policy.init_collective.assert_not_called()
+    else:
+        generation._policy.init_collective.assert_called_once_with(
+            "127.0.0.1",
+            1234,
+            4,
+            train_world_size=2,
+            rank_offset=2,
+        )
+        generation._policy.worker_group.run_all_workers_single_data.assert_called_once_with(
+            "update_generation_weights_from_collective"
+        )
+        generation._policy.init_collective_mcore_generation.assert_not_called()
+
+
+def test_megatron_generation_m2n_transport_overrides_native_refit() -> None:
+    generation = object.__new__(MegatronGeneration)
+    generation.refit_impl = "mcore"
+    generation.cfg = {
+        "refit_transport": "nccl_reshard",
+        "mcore_generation_config": {
+            "refit_impl": "mcore",
+            "refit_backend": "nccl",
+        },
+    }
+    generation._policy = MagicMock()
+    generation._owns_policy = False
+
+    generation.init_collective("127.0.0.1", 1234, 4, train_world_size=2)
+
+    assert not generation.uses_native_refit
+    generation._policy.init_collective.assert_called_once_with(
+        "127.0.0.1",
+        1234,
+        4,
+        train_world_size=2,
+        rank_offset=2,
+    )
+    generation._policy.init_collective_mcore_generation.assert_not_called()
+
+
+def test_megatron_generation_forwards_m2n_refit_lifecycle() -> None:
+    generation = object.__new__(MegatronGeneration)
+    generation._policy = MagicMock()
+    generation._owns_policy = False
+    generation._policy.worker_group.run_all_workers_single_data.side_effect = [
+        ["init"],
+        ["prepare"],
+        ["refit"],
+    ]
+
+    assert generation.init_nccl_reshard_comm_group(
+        pp_ips=["10.0.0.1"],
+        pp_ports=[1234],
+        pp_size=1,
+        train_ranks_per_stage=2,
+        sub_world_size=4,
+    ) == ["init"]
+    with patch(
+        "nemo_rl.models.generation.megatron.megatron_generation.ray.get",
+        return_value=["prepare"],
+    ) as get:
+        generation.prepare_nccl_reshard_refit_info({"layer_names": []})
+        get.assert_called_once_with(["prepare"])
+    assert generation.nccl_reshard_refit() == ["refit"]
+
+    assert (
+        generation._policy.worker_group.run_all_workers_single_data.call_args_list
+        == [
+            call(
+                "init_nccl_reshard_comm_groups_generation",
+                pp_ips=["10.0.0.1"],
+                pp_ports=[1234],
+                pp_size=1,
+                train_ranks_per_stage=2,
+                sub_world_size=4,
+            ),
+            call(
+                "prepare_nccl_reshard_generation_refit_info",
+                refit_info={"layer_names": []},
+            ),
+            call("nccl_reshard_generation_refit"),
+        ]
+    )
+
+
+def test_bridge_refit_refreshes_parameter_caches_before_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nemo_rl.models.generation.megatron.megatron_worker as worker_module
+    from megatron.core.transformer.module import MegatronModule
+
+    events = []
+
+    class _CacheAwareModule(MegatronModule):
+        def __init__(self) -> None:
+            super().__init__(config=MagicMock())
+
+        def refresh_cache(self) -> None:
+            events.append("refresh")
+
+    worker = object.__new__(worker_module.MegatronGenerationRefitMixin)
+    worker.model_update_group = object()
+    worker._generation_refit_state_dict_info = {}
+    worker._generation_refit_tasks = []
+    worker._generation_refit_dependency_counts = {}
+    worker._generation_refit_model_chunks = [torch.nn.Sequential(_CacheAwareModule())]
+    worker.megatron_bridge = MagicMock()
+    worker.megatron_bridge._model_bridge._broadcast_shared_embeddings.side_effect = (
+        lambda _model_chunks: events.append("embeddings")
+    )
+
+    monkeypatch.setattr(
+        worker_module,
+        "packed_broadcast_consumer",
+        lambda **_kwargs: events.append("receive"),
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
+
+    assert worker.update_generation_weights_from_collective()
+    assert events == ["receive", "embeddings", "refresh", "sync"]
+
 
 basic_megatron_test_config: PolicyConfig = {
     "model_name": model_name,
@@ -142,6 +314,7 @@ basic_megatron_test_config: PolicyConfig = {
             "kv_cache_management_mode": "persist",
             "materialize_only_last_token_logits": True,
             "num_speculative_tokens": 0,
+            "refit_impl": "bridge",
             "refit_backend": "gloo",  # not nvshmem: its NVLS multicast init is unavailable in CI
             "parsers": [],
             "expose_http_server": False,
@@ -529,13 +702,19 @@ def test_megatron_generation_colocated(
 @pytest.mark.mcore
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize("skip_weight_load", [False, True])
+@pytest.mark.parametrize("refit_impl", ["bridge", "mcore"])
 def test_megatron_generation_non_colocated_refit(
-    policy_cluster_separate, test_input_data, tokenizer, skip_weight_load
+    policy_cluster_separate,
+    test_input_data,
+    tokenizer,
+    skip_weight_load,
+    refit_impl,
 ):
     """Non-colocated Megatron generation.
 
-    With skip_weight_load the inference engine builds without loading the
-    checkpoint and must still generate correctly once refit delivers weights.
+    With skip_weight_load, inference-engine initialization is deferred until
+    refit delivers the final weight objects. This is required for CUDA graphs
+    to capture persistent refit-buffer addresses.
     """
     generation_cluster = RayVirtualCluster(
         bundle_ct_per_node_list=[1],
@@ -551,6 +730,7 @@ def test_megatron_generation_non_colocated_refit(
         pytest.skip("Need at least two GPUs across separate clusters")
 
     config = deepcopy(basic_megatron_test_config)
+    config["generation"]["mcore_generation_config"]["refit_impl"] = refit_impl
 
     policy = None
     mg = None

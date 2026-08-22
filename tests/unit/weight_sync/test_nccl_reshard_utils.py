@@ -140,7 +140,7 @@ def test_check_nccl_reshard_refit_support_rejects_blockwise_fp8_to_mxfp8() -> No
         ),
         (
             {"backend": "sglang"},
-            "policy.generation.backend must be 'vllm' (got 'sglang')",
+            "policy.generation.backend must be 'vllm' or 'megatron' (got 'sglang')",
         ),
     ],
 )
@@ -154,6 +154,104 @@ def test_check_nccl_reshard_refit_support_rejects_invalid_config(
         check_nccl_reshard_refit_support(config)
 
     assert expected_violation in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "train_fp8_cfg",
+    [
+        {"enabled": False},
+        {"enabled": True, "fp8_recipe": "mxfp8", "fp8_param": False},
+        {"enabled": True, "fp8_recipe": "mxfp8", "fp8_param": True},
+    ],
+)
+@pytest.mark.parametrize(
+    "generation_fp8_cfg",
+    [{"enabled": False}, {"enabled": True, "fp8_recipe": "mxfp8"}],
+)
+def test_check_nccl_reshard_refit_support_accepts_megatron_bf16_and_mxfp8(
+    train_fp8_cfg: dict[str, object], generation_fp8_cfg: dict[str, object]
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["megatron_cfg"]["fp8_cfg"] = train_fp8_cfg
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "refit_impl": "bridge",
+            "expert_tensor_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "fp8_cfg": generation_fp8_cfg,
+        },
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_blockwise_fp8_megatron_source() -> (
+    None
+):
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_recipe": "blockwise",
+        "fp8_param": True,
+    }
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "refit_impl": "bridge",
+            "expert_tensor_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "fp8_cfg": {"enabled": False},
+        },
+    }
+
+    with pytest.raises(ValueError, match="fp8_recipe='mxfp8'"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_disabled_mxfp8_params() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": False,
+        "fp8_recipe": "mxfp8",
+        "fp8_param": True,
+    }
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "refit_impl": "bridge",
+            "expert_tensor_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "fp8_cfg": {"enabled": False},
+        },
+    }
+
+    with pytest.raises(ValueError, match="fp8_cfg.enabled=True"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_allows_transport_to_override_refit_impl() -> (
+    None
+):
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "refit_transport": "nccl_reshard",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "refit_impl": "mcore",
+            "pipeline_model_parallel_size": 1,
+        },
+    }
+
+    check_nccl_reshard_refit_support(config)
 
 
 # --------------------------------------------------------------------------
@@ -546,6 +644,24 @@ def test_build_refit_info_groups_experts_and_tags_them():
         for layer in info["layer_names"]
         for p in info["per_layer_params"][layer]
     )
+
+
+def test_build_refit_info_replicates_megatron_experts_when_etp_is_one():
+    info = build_nccl_reshard_refit_info(
+        _moe_metadata(num_experts=2),
+        train_parallelism={"tp_size": 1, "ep_size": 2, "pp_size": 1},
+        gen_parallelism={
+            "tp_size": 2,
+            "ep_size": 1,
+            "etp_size": 1,
+            "pp_size": 1,
+        },
+        train_world_size=2,
+        gen_world_size=2,
+    )
+
+    gate = _find(info, "model.layers.0.mlp.experts.gate_proj.weight")
+    assert all(isinstance(placement, Replicate) for placement in gate["dst_placements"])
 
 
 # --------------------------------------------------------------------------

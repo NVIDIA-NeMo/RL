@@ -14,7 +14,7 @@
 
 """NCCL-xfer (shard-to-shard) weight synchronizer for non-colocated deployments.
 
-Handles disaggregated Megatron-train -> vLLM-gen weight refit via the
+Handles disaggregated Megatron-train -> vLLM/Megatron-gen weight refit via the
 ``xferdtensor`` reshard: bulk FFN/expert params are resharded shard-to-shard
 between the train and gen parallelism layouts over a dedicated per-PP-stage NCCL
 communicator, while the remaining "misc" params ride a packed broadcast over the
@@ -31,9 +31,8 @@ Lifecycle:
   sync_weights():
     policy.nccl_reshard_refit(kv_scales) + generation.nccl_reshard_refit(); verify.
 
-Like the collective transport, this is a pure data mover: policy and generation
-run on separate GPU clusters, so the phase transitions (offload / restore) are
-owned by the orchestrator, not here.
+Like the collective transport, this is a pure data mover. Backend-specific
+phase transitions are owned by the caller.
 """
 
 from contextlib import nullcontext
@@ -51,7 +50,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 class NcclReshardWeightSynchronizer(WeightSynchronizer):
     """Weight synchronizer using the ``xferdtensor`` shard-to-shard reshard.
 
-    For non-colocated Megatron-train -> vLLM-gen deployments where weights are
+    For non-colocated Megatron-train -> vLLM/Megatron-gen deployments where weights are
     redistributed directly between the two parallelism layouts (bulk path) plus
     a packed broadcast for the misc params. Mirrors
     :class:`CollectiveWeightSynchronizer` but additionally bootstraps the
@@ -93,12 +92,32 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         }
 
     def _gen_parallelism(self) -> dict[str, int]:
-        vllm_cfg = self._policy.cfg["generation"].get("vllm_cfg", {})
-        return {
-            "tp_size": vllm_cfg.get("tensor_parallel_size", 1),
-            "ep_size": vllm_cfg.get("expert_parallel_size", 1),
-            "pp_size": vllm_cfg.get("pipeline_parallel_size", 1),
-        }
+        generation_cfg = self._policy.cfg["generation"]
+        if generation_cfg["backend"] == "vllm":
+            vllm_cfg = generation_cfg.get("vllm_cfg", {})
+            tp_size = vllm_cfg.get("tensor_parallel_size", 1)
+            ep_size = vllm_cfg.get("expert_parallel_size", 1)
+            return {
+                "tp_size": tp_size,
+                "ep_size": ep_size,
+                "etp_size": tp_size if ep_size == 1 else 1,
+                "pp_size": vllm_cfg.get("pipeline_parallel_size", 1),
+            }
+        if generation_cfg["backend"] == "megatron":
+            megatron_cfg = {
+                **self._policy.cfg["megatron_cfg"],
+                **generation_cfg["mcore_generation_config"],
+            }
+            return {
+                "tp_size": megatron_cfg["tensor_model_parallel_size"],
+                "ep_size": megatron_cfg["expert_model_parallel_size"],
+                "etp_size": megatron_cfg.get("expert_tensor_parallel_size", 1),
+                "pp_size": megatron_cfg["pipeline_model_parallel_size"],
+            }
+        raise ValueError(
+            "NCCL M-to-N refit only supports vLLM or Megatron generation, got "
+            f"{generation_cfg['backend']!r}."
+        )
 
     def sync_weights(
         self,

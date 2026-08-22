@@ -1521,13 +1521,16 @@ def setup(
 
         check_nccl_reshard_refit_support(master_config)
 
-    if generation_config.get("refit_transport") is not None and backend != "vllm":
+    refit_transport = generation_config.get("refit_transport")
+    if refit_transport is not None and not (
+        backend == "vllm"
+        or (backend == "megatron" and refit_transport == "nccl_reshard")
+    ):
         raise NotImplementedError(
-            "Non-default refit transports are only supported for the vLLM "
-            f"generation backend, but policy.generation.backend={backend!r}. "
-            "Set policy.generation.refit_transport=null. Support for other "
-            "generation backends is tracked in "
-            "https://github.com/NVIDIA-NeMo/RL/issues/3288."
+            f"refit_transport={refit_transport!r} is not supported for "
+            f"policy.generation.backend={backend!r}. "
+            "Set policy.generation.refit_transport=null. Megatron generation "
+            "supports refit_transport='nccl_reshard'."
         )
 
     if backend == "megatron":

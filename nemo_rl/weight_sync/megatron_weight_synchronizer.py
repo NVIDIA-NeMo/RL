@@ -31,11 +31,8 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
     transfer, but one the worker performs internally on wake. Sync therefore
     reduces to dropping training-only buffers and re-entering inference mode.
 
-    Non-colocated adds the cross-group collective: the training and inference
-    workers are disjoint actor groups that rendezvous in mcore's
-    reshard-capable weight swap, with the engine suspended around the
-    transfer. That wiring (a joint refit process group over the configured
-    copy-service backend) is established once in ``init_communicator``.
+    Non-colocated generation keeps the Megatron engine lifecycle here and
+    delegates the transfer to native MCore refit, packed collective, or M2N.
     """
 
     def __init__(
@@ -58,6 +55,30 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
         self._refit_backend: Optional[str] = None
+        self._transport: Optional[WeightSynchronizer] = None
+        if not colocated and not generation.uses_native_refit:
+            if generation.cfg.get("refit_transport") == "nccl_reshard":
+                from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
+                    NcclReshardWeightSynchronizer,
+                )
+
+                self._transport = NcclReshardWeightSynchronizer(
+                    policy=policy,
+                    generation=generation,
+                    train_cluster=train_cluster,
+                    inference_cluster=inference_cluster,
+                )
+            else:
+                from nemo_rl.weight_sync.collective_weight_synchronizer import (
+                    CollectiveWeightSynchronizer,
+                )
+
+                self._transport = CollectiveWeightSynchronizer(
+                    policy=policy,
+                    generation=generation,
+                    train_cluster=train_cluster,
+                    inference_cluster=inference_cluster,
+                )
         self._stale = True
 
     def init_communicator(self) -> None:
@@ -67,6 +88,9 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         nothing to wire.
         """
         if self._colocated:
+            return
+        if self._transport is not None:
+            self._transport.init_communicator()
             return
         ip, port = self._train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -125,17 +149,20 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
             else nullcontext()
         )
         with timer_context:
-            futures_train = self._policy.swap_weights_via_reshard(is_source=True)
-            futures_inference = self._generation.update_weights_from_collective()
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            if not all(result for result in results if result is not None):
-                raise RuntimeError(
-                    "❌ Error: Updating weights for the generation policy failed "
-                    "during refit.\nThis often indicates an issue with the "
-                    "refit copy service or a problem within the generation "
-                    "backend.\n"
-                )
+            if self._transport is not None:
+                self._transport.sync_weights(kv_scales=kv_scales)
+            else:
+                futures_train = self._policy.swap_weights_via_reshard(is_source=True)
+                futures_inference = self._generation.update_weights_from_collective()
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                if not all(result for result in results if result is not None):
+                    raise RuntimeError(
+                        "❌ Error: Updating weights for the generation policy failed "
+                        "during refit.\nThis often indicates an issue with the "
+                        "refit copy service or a problem within the generation "
+                        "backend.\n"
+                    )
 
         self._generation.prepare_for_generation(tags=["kv_cache"])
         self._generation.resume_after_refit()
@@ -147,4 +174,6 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         return self._stale
 
     def shutdown(self) -> None:
-        """Nothing to tear down; the collective lives in the worker groups."""
+        """Release any resources owned by the delegated transport."""
+        if self._transport is not None:
+            self._transport.shutdown()
