@@ -421,41 +421,72 @@ def test_hash_fingerprints_released_on_clear():
     client.close()
 
 
+def _jagged(rows):
+    return TensorDict(
+        {"x": torch.nested.nested_tensor(rows, layout=torch.jagged)},
+        batch_size=[len(rows)],
+    )
+
+
 def test_hash_fingerprint_covers_jagged_fields():
     """The per-token fields on this wire are jagged by the time they reach
     ``put_samples`` (``codec.pack_jagged_fields``). Skipping nested leaves
     would leave the entire bulk payload unguarded while still reporting zero
     mismatches — a guard that reads as clean because it checked nothing."""
     client = MetricsDataPlaneClient(NoOpDataPlaneClient(), verify_tensor_hash=True)
-    ids = ["a", "b", "c"]
     rows = [torch.arange(n, dtype=torch.int64) + n for n in (3, 5, 4)]
-    jagged = TensorDict(
-        {"x": torch.nested.nested_tensor(rows, layout=torch.jagged)}, batch_size=[3]
-    )
-    digests = client._row_fingerprints(jagged, ids)
-    assert "x" in digests, "jagged leaf was skipped"
+    digest = client._row_fingerprints(_jagged(rows), ["a", "b", "c"])["x"]
+
     assert client.snapshot()["hash_verify"]["fields_skipped"] == 0
-    assert len(set(digests["x"])) == 3
+    assert digest.batch_scoped, "jagged digests only reconcile per batch"
+    assert len(digest.per_row) == 3
+    # A jagged digest carries the row length, so a change in any row's
+    # payload moves every row's value and a length change moves one.
+    changed = list(rows)
+    changed[1] = changed[1] + 1
+    assert client._row_fingerprints(_jagged(changed), ["a", "b", "c"])["x"] != digest
 
 
 def test_hash_fingerprint_matches_across_jagged_and_dense():
     """``_from_wire`` densifies a jagged field whose rows are uniform, so a
-    jagged put has to reconcile against a dense get. Zero padding is XOR-
-    neutral, which is what makes the two layouts agree."""
+    jagged put has to reconcile against a dense get.
+
+    Regression guard: picking the scheme from the layout in hand rather than
+    from what was recorded made every row of a uniform batch report a
+    mismatch — 940 false alarms over the verification soak.
+    """
     client = MetricsDataPlaneClient(NoOpDataPlaneClient(), verify_tensor_hash=True)
     ids = ["a", "b"]
     dense = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64)
-    jagged = torch.nested.nested_tensor(list(dense.unbind()), layout=torch.jagged)
-    assert (
-        client._row_fingerprints(TensorDict({"x": jagged}, batch_size=[2]), ids)["x"]
-        == client._row_fingerprints(TensorDict({"x": dense}, batch_size=[2]), ids)["x"]
+    jagged = _jagged(list(dense.unbind()))
+
+    put_side = client._row_fingerprints(jagged, ids)["x"]
+    get_side = client._row_fingerprints(
+        TensorDict({"x": dense}, batch_size=[2]), ids, batch_scoped_fields={"x"}
+    )["x"]
+    assert put_side == get_side
+
+
+def test_hash_shard_read_of_jagged_field_is_unverified_not_a_mismatch():
+    """A batch-scoped digest covers the whole buffer, so a shard read cannot
+    reproduce it. That has to report as unverified — reporting it as a
+    mismatch would make the guard cry wolf on every sharded fetch."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient(), verify_tensor_hash=True)
+    ids = [f"u{i}" for i in range(4)]
+    rows = [torch.arange(3, dtype=torch.int64) + i for i in range(4)]
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=4, consumer_tasks=["t"]
     )
+    client.put_samples(sample_ids=ids, partition_id="p", fields=_jagged(rows))
+    client.get_samples(sample_ids=ids[:2], partition_id="p", select_fields=["x"])
+
+    assert client.snapshot()["hash_verify"]["mismatches"] == 0
+    client.close()
 
 
 def test_hash_fingerprint_separates_dtype():
-    """``hash_tensor`` upcasts to 64 bits before reducing, so bf16 and fp32
-    holding the same values reduce identically. The dtype salt is the only
-    thing that makes a precision change visible."""
+    """The values reduce identically once bitcast, so only the dtype salt
+    makes a precision change visible."""
     client = MetricsDataPlaneClient(NoOpDataPlaneClient(), verify_tensor_hash=True)
     ids = ["a", "b"]
     values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
@@ -465,7 +496,20 @@ def test_hash_fingerprint_separates_dtype():
     as_bf16 = client._row_fingerprints(
         TensorDict({"x": values.to(torch.bfloat16)}, batch_size=[2]), ids
     )["x"]
-    assert as_fp32 != as_bf16
+    assert as_fp32.per_row != as_bf16.per_row
+
+
+def test_hash_fingerprint_handles_float8():
+    """``hash_tensor`` has no float8 kernel. Without the integer bitcast the
+    ``NotImplementedError`` propagates out of ``put_samples`` and takes the
+    transfer down with it."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient(), verify_tensor_hash=True)
+    fp8 = TensorDict(
+        {"x": torch.tensor([[1.0, 2.0], [3.0, 4.0]]).to(torch.float8_e4m3fn)},
+        batch_size=[2],
+    )
+    digest = client._row_fingerprints(fp8, ["a", "b"])["x"]
+    assert len(digest.per_row) == 2
 
 
 def test_hash_verification_off_by_default():

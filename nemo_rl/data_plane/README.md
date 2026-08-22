@@ -449,26 +449,35 @@ carries — 256 ragged rows, 12 MB, jagged per-token fields as
 undo. `on_event` defaults to `None` when unset, in which case the per-op
 event dict is never built.
 
-`verify_tensor_hash: true` additionally records a per-row
-`torch.hash_tensor` fingerprint on every put and re-checks it on every get,
-so a tensor that changes between wire-in and wire-out is reported
-(`hash/mismatches`) instead of being trained on silently. Fingerprints are
-per row, so a 256-row put read back as eight shards of 32 still reconciles.
+`verify_tensor_hash: true` additionally records a `torch.hash_tensor`
+fingerprint on every put and re-checks it on every get, so a tensor that
+changes between wire-in and wire-out is reported (`hash/mismatches`)
+instead of being trained on silently.
 
-Verified against ten corruption modes injected into the round trip — a
-single-element change in each dtype, a truncated row, a zeroed row, a
-bf16→fp32 precision change, a row served from the wrong sample, and two
-rows swapped — all ten are caught, with zero false alarms over a 500-row
-randomized soak and every shard grouping from 1 to 256. Three things to
-know before turning it on:
+Two granularities, because torch has no ragged hash kernel:
 
-- It reads every tensor byte again on both sides — measured at ~8 ms for a
-  12 MB jagged batch, on put and again on get, i.e. ~13% of the 59 ms
-  operation it is guarding. Keep it to debugging runs.
-- `hash_tensor` reduces by XOR, so a row's digest is blind to a
-  rearrangement of that row's own elements. Rows are compared per sample
-  id, so a swap *between* rows is still caught; nothing on this wire
-  reorders *within* a row.
+| leaf | digest | scope |
+|---|---|---|
+| rectangular (`rewards`, `input_lengths`) | one per row, `hash_tensor(..., dim=1)` | per sample id; survives shard reads |
+| jagged (`input_ids`, `generation_logprobs`, `token_mask`, `advantages`) | one over the values buffer, XORed per row with that row's length | per batch; a shard read reports unverified |
+
+Giving the jagged fields per-row digests would mean padding each one out to
+a rectangle first. On a realistically ragged batch that rectangle is 3.5×
+the real payload and cost 13× more, to answer a question the buffer digest
+already answers.
+
+Verified by injecting corruption into the round trip. Caught: a
+single-element change in every dtype, a truncated row, a zeroed row, a
+bf16→fp32 precision change, and a row served from the wrong sample — with
+**zero false alarms** over a 500-row randomized soak, every shard grouping
+from 1 to 256, reversed id order, field subsets and delta writes. Known
+limits, measured rather than assumed:
+
+- A **mis-shard** (two rows swapped) is caught on a jagged field only when
+  the two rows differ in length — 58/60 on ragged rollout data, never on a
+  uniform-length batch. Rectangular fields catch it unconditionally.
+- It reads every tensor byte again on both sides — ~2.4 ms for a 12 MB
+  jagged batch, on put and again on get. Keep it to debugging runs.
 - Only rows this process wrote can be checked. A consumer-side client
   reports them under `hash/rows_unverified` rather than counting them
   clean, and `hash/fields_skipped` reports any leaf it could not fingerprint
