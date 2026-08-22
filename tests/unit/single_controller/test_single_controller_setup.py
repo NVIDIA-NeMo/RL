@@ -23,11 +23,11 @@ import pytest
 from omegaconf import OmegaConf
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
+from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     ReadyFirstSamplerConfig,
     SamplerConfig,
 )
-from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig

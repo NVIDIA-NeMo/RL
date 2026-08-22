@@ -28,6 +28,7 @@ from pydantic import (
     model_validator,
 )
 
+from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
@@ -36,7 +37,6 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
-from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
