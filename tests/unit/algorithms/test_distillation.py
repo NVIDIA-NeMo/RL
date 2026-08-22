@@ -643,10 +643,10 @@ def test_validate_logs_data_when_logger_provided(mock_components):
             return_value=(mock_batch, mock_rollout_metrics),
         ),
         patch(
-            "nemo_rl.algorithms.distillation._should_use_nemo_gym", return_value=False
+            "nemo_rl.algorithms.distillation.should_use_nemo_gym", return_value=False
         ),
         patch(
-            "nemo_rl.algorithms.distillation._should_use_async_rollouts",
+            "nemo_rl.algorithms.distillation.should_use_async_rollouts",
             return_value=False,
         ),
         patch("nemo_rl.algorithms.distillation.print_message_log_samples"),
@@ -699,10 +699,10 @@ def test_validate_works_without_logger(mock_components):
             return_value=(mock_batch, mock_rollout_metrics),
         ),
         patch(
-            "nemo_rl.algorithms.distillation._should_use_nemo_gym", return_value=False
+            "nemo_rl.algorithms.distillation.should_use_nemo_gym", return_value=False
         ),
         patch(
-            "nemo_rl.algorithms.distillation._should_use_async_rollouts",
+            "nemo_rl.algorithms.distillation.should_use_async_rollouts",
             return_value=False,
         ),
         patch("nemo_rl.algorithms.distillation.print_message_log_samples"),
@@ -1338,7 +1338,7 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
             side_effect=lambda cfg, _: cfg,
         ),
         patch.object(runner, "setup_nemo_gym_config"),
-        patch.object(runner, "_should_use_nemo_gym", return_value=True),
+        patch.object(runner, "should_use_nemo_gym", return_value=True),
         patch.object(runner, "setup_response_data", return_value=(MagicMock(), None)),
         patch.object(runner, "init_ray"),
         patch.object(runner, "setup") as mock_setup,

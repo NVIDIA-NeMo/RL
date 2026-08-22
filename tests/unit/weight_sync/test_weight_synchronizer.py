@@ -555,7 +555,9 @@ class TestMegatronWeightSynchronizer:
         assert sync.is_stale
         assert sync.sync_weights() == {}
         policy.offload_before_refit.assert_called_once()
-        gen.prepare_for_generation.assert_called_once_with()
+        # The refit-protocol tag makes the wake bypass the worker's
+        # engine-awake early-return (the reshard copy rides this wake).
+        gen.prepare_for_generation.assert_called_once_with(tags=["colocated_refit"])
         gen.suspend_for_refit.assert_not_called()
         policy.swap_weights_via_reshard.assert_not_called()
         assert not sync.is_stale
