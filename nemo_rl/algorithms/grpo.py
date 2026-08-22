@@ -2958,6 +2958,7 @@ def grpo_train(
                             greedy=False,
                             effort_config=_get_effort_config(master_config),
                             reward_penalty_config=master_config.reward_penalties,
+                            length_adjustment_config=master_config.grpo.model_dump(),
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                             mask_env_flagged_samples=should_mask_flagged_samples(
                                 master_config.env
@@ -3895,6 +3896,7 @@ def validate(
                     greedy=False,
                     effort_config=_get_effort_config(master_config),
                     reward_penalty_config=master_config.reward_penalties,
+                    length_adjustment_config=master_config.grpo.model_dump(),
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                     mask_env_flagged_samples=should_mask_flagged_samples(
                         master_config.env
