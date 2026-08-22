@@ -625,6 +625,32 @@ def test_update_weights_from_collective_reraises_on_fatal_native_refit(monkeypat
 
 
 @pytest.mark.vllm
+def test_native_collective_refit_uses_one_transport_buffer(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_collective_update_extension(vllm_backend)
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+
+    @contextlib.contextmanager
+    def lifecycle(_transport):
+        yield lambda: None
+
+    ext._weight_update_lifecycle = lifecycle
+    observed_num_buffers = None
+
+    def consume(*, iterator, group, src, post_unpack_func, num_buffers=None):
+        nonlocal observed_num_buffers
+        observed_num_buffers = num_buffers
+
+    monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", consume)
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", lambda: None)
+
+    assert ext.update_weights_from_collective() is True
+    assert observed_num_buffers == 1
+
+
+@pytest.mark.vllm
 def test_sparse_delta_refit_rejected_for_native_trtllm_backend():
     from nemo_rl.models.generation.vllm import vllm_backend
 
