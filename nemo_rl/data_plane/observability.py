@@ -586,22 +586,38 @@ def cluster_step_metrics(
     # The mean fraction of the step a process spent in the data plane is
     # bounded and answers the question people ask of it.
     n_procs = max(merged.get("n_processes", 1), 1)
+    # Namespaced by what kind of number it is, because the unit alone does
+    # not say. ``comm_volume_mb`` was a per-step delta and
+    # ``bytes_outstanding_mb`` an instantaneous level -- same suffix, same
+    # chart, nothing to tell them apart.
+    #   step/  what happened during this step  (a delta, resets each step)
+    #   now/   what is true at this instant    (a level, persists)
     metrics: dict[str, float] = {
-        "wall_ms": wall_ms,
-        "busy_frac_mean": (
-            wall_ms / 1e3 / (step_time_s * n_procs) if step_time_s > 0 else 0.0
-        ),
-        "comm_volume_mb": (
+        "step/wall_ms": wall_ms,
+        # ``wall_ms`` sums processes that ran concurrently, so it can exceed
+        # the step's own wall clock. Divided by the process count it reads
+        # as "how long the average process spent in the data plane this
+        # step" -- in ms like everything else, and needing no gloss.
+        "step/wall_ms_per_process": wall_ms / n_procs,
+        "step/comm_volume_mb": (
             merged["comm_volume_bytes"] - prev.get("comm_volume_bytes", 0)
         )
         / 1e6,
-        "bytes_written_mb": (merged["bytes_written"] - prev.get("bytes_written", 0))
+        "step/bytes_written_mb": (
+            merged["bytes_written"] - prev.get("bytes_written", 0)
+        )
         / 1e6,
-        "bytes_read_mb": (merged["bytes_read"] - prev.get("bytes_read", 0)) / 1e6,
-        "bytes_outstanding_mb": merged["bytes_outstanding"] / 1e6,
-        "n_processes": n_procs,
-        "observability_overhead_ms": overhead_ms,
-        "observability_overhead_frac": (overhead_ms / wall_ms if wall_ms > 0 else 0.0),
+        "step/bytes_read_mb": (merged["bytes_read"] - prev.get("bytes_read", 0)) / 1e6,
+        # A level, not a delta: bytes held in TQ right now, put minus
+        # cleared. It climbs when something is not being cleared, which is
+        # the leak signal it exists for. A rising line here is the metric
+        # working, not an accumulation bug.
+        "now/bytes_outstanding_mb": merged["bytes_outstanding"] / 1e6,
+        "now/n_processes": n_procs,
+        "step/observability_overhead_ms": overhead_ms,
+        "step/observability_overhead_frac": (
+            overhead_ms / wall_ms if wall_ms > 0 else 0.0
+        ),
     }
     prev_ops = prev.get("by_op", {})
     for op, stats in merged["by_op"].items():
@@ -609,9 +625,9 @@ def cluster_step_metrics(
         calls = stats["calls"] - prev_op.get("calls", 0)
         if calls <= 0:
             continue
-        metrics[f"{op}/calls"] = calls
-        metrics[f"{op}/wall_ms"] = stats["wall_ms"] - prev_op.get("wall_ms", 0.0)
-        metrics[f"{op}/max_ms"] = stats["max_ms"]
+        metrics[f"step/{op}/calls"] = calls
+        metrics[f"step/{op}/wall_ms"] = stats["wall_ms"] - prev_op.get("wall_ms", 0.0)
+        metrics[f"step/{op}/max_ms"] = stats["max_ms"]
         # Percentiles over THIS step's calls, summed across ranks, not over
         # the lifetime: a cumulative percentile beside a step-scoped max is
         # two different windows on one chart, and it showed a max below its
@@ -633,10 +649,10 @@ def cluster_step_metrics(
             # true percentile cannot exceed the maximum, and the maximum is
             # measured exactly, so it is the tighter bound.
             ceiling = stats["max_ms"]
-            metrics[f"{op}/p50_ms"] = min(
+            metrics[f"step/{op}/p50_ms"] = min(
                 percentile_from_hist(step_hist, 0.50), ceiling
             )
-            metrics[f"{op}/p99_ms"] = min(
+            metrics[f"step/{op}/p99_ms"] = min(
                 percentile_from_hist(step_hist, 0.99), ceiling
             )
     return metrics
@@ -835,31 +851,40 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # axis. GB was the same problem one dimension over -- a realistic
         # step moved 0.00017 GB.
         metrics: dict[str, float] = {
-            "wall_ms": wall_ms,
-            "frac_of_step": (wall_ms / 1e3 / step_time_s) if step_time_s > 0 else 0.0,
-            "comm_volume_mb": vol / 1e6,
-            "bytes_written_mb": (snap["bytes_written"] - prev.get("bytes_written", 0))
+            "step/wall_ms": wall_ms,
+            "step/frac_of_step": (
+                (wall_ms / 1e3 / step_time_s) if step_time_s > 0 else 0.0
+            ),
+            "step/comm_volume_mb": vol / 1e6,
+            "step/bytes_written_mb": (
+                snap["bytes_written"] - prev.get("bytes_written", 0)
+            )
             / 1e6,
-            "bytes_read_mb": (snap["bytes_read"] - prev.get("bytes_read", 0)) / 1e6,
-            "bytes_outstanding_mb": snap["bytes_outstanding"] / 1e6,
+            "step/bytes_read_mb": (snap["bytes_read"] - prev.get("bytes_read", 0))
+            / 1e6,
+            # A level, not a delta -- see the cluster path for why the two
+            # need to be distinguishable on a chart.
+            "now/bytes_outstanding_mb": snap["bytes_outstanding"] / 1e6,
         }
         if self._verify_tensor_hash:
             hv, prev_hv = snap["hash_verify"], prev.get("hash_verify", {})
-            metrics["hash/rows_checked"] = hv["rows_checked"] - prev_hv.get(
+            metrics["step/hash/rows_checked"] = hv["rows_checked"] - prev_hv.get(
                 "rows_checked", 0
             )
-            metrics["hash/rows_recorded"] = hv["rows_recorded"] - prev_hv.get(
+            metrics["step/hash/rows_recorded"] = hv["rows_recorded"] - prev_hv.get(
                 "rows_recorded", 0
             )
-            metrics["hash/rows_unverified"] = hv["rows_unverified"] - prev_hv.get(
+            metrics["step/hash/rows_unverified"] = hv["rows_unverified"] - prev_hv.get(
                 "rows_unverified", 0
             )
-            metrics["hash/mismatches"] = hv["mismatches"] - prev_hv.get("mismatches", 0)
+            metrics["step/hash/mismatches"] = hv["mismatches"] - prev_hv.get(
+                "mismatches", 0
+            )
             # Logged because a guard that quietly stops covering a field is
             # worse than no guard: it reports 0 mismatches and reads as
             # clean. A step where this climbs is a step where something
             # stopped being checked.
-            metrics["hash/fields_skipped"] = hv["fields_skipped"] - prev_hv.get(
+            metrics["step/hash/fields_skipped"] = hv["fields_skipped"] - prev_hv.get(
                 "fields_skipped", 0
             )
         prev_ops = prev.get("by_op", {})
@@ -873,13 +898,13 @@ class MetricsDataPlaneClient(DataPlaneClient):
             # out rather than logged: mean is wall_ms/calls, and a dashboard
             # can divide. ``snapshot()`` still carries the full picture,
             # percentiles included, for a one-off inspection.
-            metrics[f"{op}/calls"] = calls
-            metrics[f"{op}/wall_ms"] = op_ms
+            metrics[f"step/{op}/calls"] = calls
+            metrics[f"step/{op}/wall_ms"] = op_ms
             # ``max_ms`` rather than p50/p99. Those come off a histogram
             # that is never reset, so per step they were a lifetime figure
             # that goes flat, quantised to bucket edges. The max is exact
             # and says the same thing at the handful of calls per step.
-            metrics[f"{op}/max_ms"] = step_maxima.get(op, 0.0)
+            metrics[f"step/{op}/max_ms"] = step_maxima.get(op, 0.0)
             fit = st["fit"]
             if fit.get("model_trustworthy"):
                 # The step's time split into the two things that cause it,
@@ -896,8 +921,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 # milliseconds.
                 op_bytes = st["n_bytes"] - prev_op.get("n_bytes", 0)
                 ms_per_byte = 1.0 / (fit["bandwidth_mb_s"] * 1e3)
-                metrics[f"{op}/overhead_ms"] = fit["fixed_ms"] * calls
-                metrics[f"{op}/transfer_ms"] = ms_per_byte * op_bytes
+                metrics[f"step/{op}/overhead_ms"] = fit["fixed_ms"] * calls
+                metrics[f"step/{op}/transfer_ms"] = ms_per_byte * op_bytes
         return metrics
 
     def bytes_outstanding_by_partition(self) -> dict[str, int]:
