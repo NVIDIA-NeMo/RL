@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import ray
 import torch
@@ -62,6 +63,7 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.grpo_sync import (
     _log_completed_draft_refit,
     _should_use_split_draft_training,
+    _sum_step_metric_values,
     _train_policy_from_meta,
     _train_fields_for_step,
     grpo_train_sync,
@@ -5808,6 +5810,25 @@ def test_train_fields_for_step(
     )
     assert ("prev_logprobs" in fields) is expect_prev
     assert ("reference_policy_logprobs" in fields) is expect_reference
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_sum_step_metric_values_handles_torch_tensors(device: str) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the device-boundary regression")
+
+    values = [
+        torch.tensor(1.25, device=device),
+        torch.tensor([2.0, 3.75], device=device),
+    ]
+
+    assert _sum_step_metric_values(values) == pytest.approx(7.0)
+
+
+def test_sum_step_metric_values_preserves_numpy_behavior() -> None:
+    values = np.array([1.25, 2.0, 3.75])
+
+    assert _sum_step_metric_values(values) == pytest.approx(7.0)
 
 
 @pytest.mark.parametrize(

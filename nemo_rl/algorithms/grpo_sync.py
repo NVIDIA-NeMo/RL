@@ -206,6 +206,20 @@ def _train_fields_for_step(
     )
 
 
+def _sum_step_metric_values(values: np.ndarray | list[Any]) -> float:
+    """Sum metric payloads without asking NumPy to materialize CUDA tensors."""
+    if isinstance(values, np.ndarray):
+        return float(np.sum(values).item())
+
+    total = 0.0
+    for value in values:
+        if isinstance(value, torch.Tensor):
+            total += float(value.detach().sum().item())
+        else:
+            total += float(np.sum(value).item())
+    return total
+
+
 # ── DAPO non-zero-std dynamic sampling, slice-only ─────────────────────
 # Slice-only formulation of nemo_rl.algorithms.grpo.dynamic_sampling: filter
 # on std != 0, accumulate survivors across iterations, slice on overflow.
@@ -1217,7 +1231,7 @@ def grpo_train_sync(
                     }:
                         metrics[k] = np.mean(v).item()
                     elif isinstance(v, (np.ndarray, list)):
-                        metrics[k] = np.sum(v).item()
+                        metrics[k] = _sum_step_metric_values(v)
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
 
