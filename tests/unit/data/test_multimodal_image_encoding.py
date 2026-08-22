@@ -20,8 +20,10 @@ from PIL import Image
 import nemo_rl.data.multimodal_utils as multimodal_utils
 from nemo_rl.data.multimodal_utils import (
     image_to_data_url,
-    normalize_media_in_examples,
     resolve_to_image,
+)
+from nemo_rl.environments.nemo_gym_multimodal import (
+    normalize_media_in_examples,
 )
 
 

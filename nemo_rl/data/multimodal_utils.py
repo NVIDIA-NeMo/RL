@@ -19,7 +19,6 @@ import re
 import uuid
 from collections import defaultdict
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
@@ -41,7 +40,6 @@ AUDIO_CONTENT_TYPES = frozenset({"input_audio", "audio", "audio_url"})
 MULTIMODAL_CONTENT_TYPES = frozenset(
     {*IMAGE_CONTENT_TYPES, *VIDEO_CONTENT_TYPES, *AUDIO_CONTENT_TYPES}
 )
-NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS = 8
 
 # List of allowed placeholder strings for different media types in the dataset string
 # e.g. "This is an example of <image>"
@@ -891,14 +889,15 @@ def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
     return f"data:image/{fmt.lower()};base64,{encoded}"
 
 
-def _encode_single_image_source(source: str) -> str:
-    """Resolve and encode one image source."""
-    image = resolve_to_image(source)
-    try:
-        data_url = image_to_data_url(image)
-    finally:
-        image.close()
-    return data_url
+def get_responses_content_part_url(part: dict[str, Any], *keys: str) -> str:
+    """Return a string media source from a Responses/Chat content part."""
+    for key in keys:
+        value = part.get(key)
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("path")
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def extract_input_media_sources_from_responses_messages(
@@ -934,17 +933,19 @@ def extract_input_media_sources_from_responses_messages(
     return sources
 
 
-def extract_input_images_from_responses_messages(
-    messages: Any,
-) -> list[Image.Image]:
-    """Load images from Responses-API input messages in encounter order."""
-    return [
-        resolve_to_image(source)
-        for media_type, source in extract_input_media_sources_from_responses_messages(
-            messages
-        )
-        if media_type == "image"
-    ]
+def media_sources_equal(
+    left: tuple[str, Any],
+    right: tuple[str, Any],
+) -> bool:
+    """Compare tagged media by string value or object identity."""
+    if left[0] != right[0]:
+        return False
+    left_source, right_source = left[1], right[1]
+    return (
+        left_source == right_source
+        if isinstance(left_source, str) and isinstance(right_source, str)
+        else left_source is right_source
+    )
 
 
 def _materialize_ragged_pixel_values(
@@ -1086,94 +1087,6 @@ def video_path_to_data_url(video_path: str) -> str:
         )
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:video/{mime};base64,{encoded}"
-
-
-def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
-    """Canonicalize Gym media parts and inline each unique local source."""
-    image_targets_by_source: dict[str, list[dict]] = {}
-
-    for example in nemo_gym_examples:
-        input_items = example.get("responses_create_params", {}).get("input", [])
-        if not isinstance(input_items, list):
-            continue
-        for item in input_items:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content", [])
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                part_type = part.get("type")
-                if part_type in IMAGE_CONTENT_TYPES:
-                    source_keys = ("image_url", "image", "url")
-                    canonical_type = "input_image"
-                    canonical_key = "image_url"
-                    is_image = True
-                elif part_type in VIDEO_CONTENT_TYPES:
-                    source_keys = ("video_url", "video", "url")
-                    canonical_type = "input_video"
-                    canonical_key = "video_url"
-                    is_image = False
-                else:
-                    continue
-
-                present_keys = [key for key in source_keys if key in part]
-                if not present_keys and part_type == "input_image" and "file_id" in part:
-                    continue
-                if len(present_keys) != 1:
-                    raise ValueError(
-                        f"{part_type} requires exactly one of {source_keys}"
-                    )
-
-                source = part[present_keys[0]]
-                nested_detail = source.get("detail") if isinstance(source, dict) else None
-                url = (
-                    source.get("url") or source.get("path", "")
-                    if isinstance(source, dict)
-                    else source
-                )
-                if not isinstance(url, str) or not url:
-                    raise ValueError(f"{part_type} requires a non-empty media URL")
-                if not url.startswith(("http://", "https://", "data:")):
-                    if is_image:
-                        image_targets_by_source.setdefault(url, []).append(part)
-                    else:
-                        url = video_path_to_data_url(url)
-
-                for key in source_keys:
-                    if key != canonical_key:
-                        part.pop(key, None)
-                part["type"] = canonical_type
-                part[canonical_key] = url
-                if is_image and nested_detail is not None:
-                    part.setdefault("detail", nested_detail)
-
-    sources = list(image_targets_by_source)
-    if sources:
-        with ThreadPoolExecutor(
-            max_workers=NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS
-        ) as executor:
-            encoded_by_source = dict(
-                zip(
-                    sources,
-                    executor.map(_encode_single_image_source, sources),
-                    strict=True,
-                )
-            )
-
-        # Keep payload mutation on the caller thread after worker-owned images
-        # have been closed and every unique source has been encoded.
-        for source, targets in image_targets_by_source.items():
-            data_url = encoded_by_source[source]
-            for part in targets:
-                part["image_url"] = data_url
-    return nemo_gym_examples
-
-
-# Backward-compatible alias for existing callers.
-encode_images_in_examples = normalize_media_in_examples
 
 
 def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:

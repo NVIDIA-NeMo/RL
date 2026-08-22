@@ -32,7 +32,6 @@ from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
     PackedTensor,
     image_to_data_url,
-    normalize_media_in_examples,
 )
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -46,12 +45,13 @@ from nemo_rl.environments.nemo_gym import (
     setup_nemo_gym_config,
     validate_reward_components_match_scalar,
 )
-from nemo_rl.environments.nemo_gym_video import (
+from nemo_rl.environments.nemo_gym_multimodal import (
     _extract_static_video_messages,
     _inject_vllm_mm_processor_kwargs,
-    _metadata_extra_body,
     nemo_gym_example_to_video_datum_spec,
+    normalize_media_in_examples,
 )
+from nemo_rl.environments.nemo_gym_request import _metadata_extra_body
 from nemo_rl.environments.nemotron_utils import (
     _expand_nemotron_video_placeholders,
     _flatten_nemotron_video_frame_messages,
@@ -378,7 +378,7 @@ def test_video_datum_uses_temporal_processor_contract(monkeypatch, tmp_path):
 
     frames = np.zeros((4, 8, 8, 3), dtype=np.uint8)
     monkeypatch.setattr(
-        "nemo_rl.environments.nemo_gym_video.load_video_frames_with_metadata",
+        "nemo_rl.environments.nemo_gym_multimodal.load_video_frames_with_metadata",
         lambda *args, **kwargs: (
             frames,
             {"frames_indices": [0, 3, 6, 9], "fps": 3.0},
@@ -511,7 +511,7 @@ def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_pa
         }
 
     monkeypatch.setattr(
-        "nemo_rl.environments.nemo_gym_video.nemo_gym_example_to_video_datum_spec",
+        "nemo_rl.environments.nemo_gym_multimodal.nemo_gym_example_to_video_datum_spec",
         fake_video_processor,
     )
     processor = SimpleNamespace(
@@ -572,7 +572,7 @@ def test_video_datum_uses_cached_frames_without_decoding_video(monkeypatch, tmp_
         }
     }
     monkeypatch.setattr(
-        "nemo_rl.environments.nemo_gym_video._video_to_image_content",
+        "nemo_rl.environments.nemo_gym_multimodal._video_to_image_content",
         lambda *args, **kwargs: pytest.fail("cached frames must not decode the video"),
     )
 
@@ -659,7 +659,7 @@ def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path)
     }
     frames = np.zeros((4, 8, 16, 3), dtype=np.uint8)
     monkeypatch.setattr(
-        "nemo_rl.environments.nemo_gym_video.load_video_frames_with_metadata",
+        "nemo_rl.environments.nemo_gym_multimodal.load_video_frames_with_metadata",
         lambda *args, **kwargs: (
             frames,
             {"frames_indices": [0, 3, 6, 9], "fps": 3.0},
@@ -817,11 +817,11 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
         return "data:video/x-nemo-rl-cached-frames;base64,dGVzdA=="
 
     monkeypatch.setattr(
-        "nemo_rl.environments.nemo_gym_video.build_cached_video_frame_data_url",
+        "nemo_rl.environments.nemo_gym_multimodal.build_cached_video_frame_data_url",
         fake_manifest_builder,
     )
     monkeypatch.setattr(
-        "nemo_rl.environments.nemo_gym_video.process_nemotron_video_frames",
+        "nemo_rl.environments.nemo_gym_multimodal.process_nemotron_video_frames",
         lambda *args, **kwargs: {
             "input_ids": torch.tensor([[7, 18, 18, 9]]),
             "pixel_values": torch.ones(4, 3, 8, 8),
