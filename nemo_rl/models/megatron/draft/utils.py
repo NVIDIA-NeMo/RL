@@ -46,6 +46,9 @@ _HF_SNAPSHOT_ALLOW_PATTERNS = [
     "pytorch_model.bin.index.json",
 ]
 _HF_SNAPSHOT_IGNORE_PATTERNS = ["*.pt", "*.pth", "*.ckpt"]
+_DFLASH_FORBIDDEN_EXPORT_COMPONENTS = frozenset(
+    {"lm_head", "output_layer", "mask_embedding", "mask_token"}
+)
 _MODEL_LAYER_QKV_KEY_PATTERN = re.compile(
     r"^eagle_module\.decoder\.layers\.(\d+)\.self_attention\.linear_qkv\.weight$"
 )
@@ -1111,6 +1114,24 @@ def export_eagle_weights_to_hf(
         hf_state.append(("d2t", source_state["eagle_module.d2t"]))
 
     return hf_state
+
+
+def validate_dflash_export_state_dict(
+    state_dict: Mapping[str, Tensor],
+) -> None:
+    """Reject target-owned parameters from a standalone DFlash artifact."""
+    forbidden_keys = sorted(
+        key
+        for key in state_dict
+        if _DFLASH_FORBIDDEN_EXPORT_COMPONENTS.intersection(
+            component.casefold() for component in key.split(".")
+        )
+    )
+    if forbidden_keys:
+        raise ValueError(
+            "[draft] DFlash export contains target-owned parameter keys: "
+            + ", ".join(forbidden_keys)
+        )
 
 
 def get_policy_lm_head_weight(policy_model_chunk: MegatronModule) -> torch.Tensor:
