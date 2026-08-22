@@ -1868,7 +1868,7 @@ class MegatronPolicyWorkerImpl(
             draft_step_state.correct_main_grads(
                 self.model.parameters(),
                 policy_normalization_count=n_true,
-                context_parallel_size=self.cp_size,
+                context_parallel_size=parallel_state.get_context_parallel_world_size(),
             )
 
         # End-of-step gradient finalization, exactly once per optimizer step.

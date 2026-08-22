@@ -137,7 +137,6 @@ def _make_worker(loss_type):
         },
     }
     w.dp_size = 2
-    w.cp_size = 1
     w.sampling_params = None
     w.draft_model = None
     w.defer_fp32_logits = False
@@ -226,6 +225,7 @@ def mock_module_symbols():
         # parallel_state mocks
         pstate.is_pipeline_last_stage.return_value = True
         pstate.get_data_parallel_group.return_value = MagicMock()
+        pstate.get_context_parallel_world_size.return_value = 1
 
         yield {
             "mfb": mfb,
@@ -612,6 +612,9 @@ class TestFinish:
         )
         # policy scale 1/2048 followed by relative draft correction 2048/1024
         assert draft_param.main_grad.item() == pytest.approx(6.0)
+        mock_module_symbols[
+            "pstate"
+        ].get_context_parallel_world_size.assert_called_once_with()
         mb = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"][0]
         assert mb["draft_loss"].item() == pytest.approx(4.0)
         # Sync metrics report policy and draft losses separately. Preserve the
@@ -673,7 +676,9 @@ class TestFinish:
 
         mock_module_symbols["all_reduce"].side_effect = emulate_collectives
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.cp_size = len(cp_numerators)
+        mock_module_symbols[
+            "pstate"
+        ].get_context_parallel_world_size.return_value = len(cp_numerators)
         draft_param = torch.nn.Parameter(torch.tensor(1.0))
         draft_param.grad_norm_group = "draft"
         draft_param.main_grad = torch.tensor(3.0)
