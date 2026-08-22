@@ -30,6 +30,7 @@ from tensordict import NonTensorData, NonTensorStack, TensorDict
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.observability import (
     MetricsDataPlaneClient,
+    breakdown_table,
     cluster_step_metrics,
     merge_snapshots,
     _estimate_encoded_bytes,
@@ -916,3 +917,42 @@ def test_snapshot_percentiles_never_exceed_the_measured_max():
         assert stats["p99_ms"] <= stats["max_ms"], stats
         assert stats["p50_ms"] <= stats["p99_ms"], stats
     client.close()
+
+
+def test_breakdown_table_rows_by_op_worst_first():
+    """One row per op, ordered by wall time, so the expensive op is the
+    first line read rather than the alphabetically luckiest."""
+    metrics = {
+        "step/wall_ms": 100.0,
+        "step/get/calls": 8,
+        "step/get/wall_ms": 10.0,
+        "step/get/max_ms": 2.0,
+        "step/put/calls": 2,
+        "step/put/wall_ms": 90.0,
+        "step/put/max_ms": 50.0,
+        "step/comm_volume_mb": 1.0,  # not per-op, must not become a row
+        "now/bytes_outstanding_mb": 0.0,  # a level, likewise
+    }
+    columns, rows = breakdown_table(metrics)
+
+    assert columns[0] == "op"
+    assert [r[0] for r in rows] == ["put", "get"], "worst first"
+    assert len(rows) == 2, "only per-op series become rows"
+    assert rows[0][columns.index("wall_ms")] == 90.0
+
+
+def test_breakdown_table_leaves_withheld_series_empty():
+    """A percentile below the sample gate, or a fit that is not trustworthy,
+    is absent from the series — the table must carry None there rather than
+    a zero that would read as a measurement."""
+    columns, rows = breakdown_table(
+        {"step/put/calls": 3, "step/put/wall_ms": 5.0, "step/put/max_ms": 2.0}
+    )
+    row = rows[0]
+    assert row[columns.index("p99_ms")] is None
+    assert row[columns.index("overhead_ms")] is None
+    assert row[columns.index("calls")] == 3
+
+
+def test_breakdown_table_is_empty_when_nothing_ran():
+    assert breakdown_table({"step/wall_ms": 0.0})[1] == []

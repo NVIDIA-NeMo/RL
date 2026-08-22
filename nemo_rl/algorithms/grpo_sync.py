@@ -32,6 +32,7 @@ against both entrypoints and diffing the wandb runs.
 from __future__ import annotations
 
 import gc
+import logging
 import os
 import time
 import warnings
@@ -78,6 +79,7 @@ from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.observability import (
     MetricsDataPlaneClient,
+    breakdown_table,
     cluster_step_metrics,
     merge_snapshots,
 )
@@ -384,6 +386,23 @@ def _compute_seq_logprob_error_metrics(
     return masking_data["sample_mask"], seq_logprob_error_metrics
 
 
+def _log_breakdown(
+    logger: Logger, metrics: dict[str, float], step: int, name: str
+) -> None:
+    """Log the per-op breakdown as a table beside the series.
+
+    Best effort: a backend without a table type skips it, and a failure here
+    must not take a step down over a visualisation.
+    """
+    try:
+        columns, rows = breakdown_table(metrics)
+    except Exception as exc:  # noqa: BLE001 - a panel must never fail a step
+        logging.getLogger(__name__).warning("data-plane breakdown failed: %s", exc)
+    else:
+        if rows:
+            logger.log_table(columns, rows, step, name)
+
+
 def _log_data_plane_metrics(
     policy: Any, logger: Logger, step: int, total_step_time: float
 ) -> None:
@@ -424,10 +443,12 @@ def _log_data_plane_metrics(
         )
         policy._prev_cluster_snapshot = merged
         logger.log_metrics(metrics, step, prefix="data_plane/cluster")
+        _log_breakdown(logger, metrics, step, "data_plane/cluster/breakdown")
     else:
         # Single process, or the fan-out could not reach the workers.
         metrics = client.get_step_metrics(total_step_time)
         logger.log_metrics(metrics, step, prefix="data_plane/driver")
+        _log_breakdown(logger, metrics, step, "data_plane/driver/breakdown")
     print(
         f"  • data plane: {metrics['step/wall_ms']:.0f}ms, "
         f"{metrics['step/comm_volume_mb']:.1f} MB moved"
