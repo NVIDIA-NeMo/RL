@@ -79,6 +79,9 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
 # dispatcher only waits for completion — no aggregation needed.
 
 
+logger = logging.getLogger(__name__)
+
+
 class TQPolicy(TQDriverMixin, Policy):
     """TQ-mediated counterpart to :class:`Policy`.
 
@@ -214,14 +217,17 @@ class TQPolicy(TQDriverMixin, Policy):
         if hasattr(client, "snapshot"):
             snapshots.append(client.snapshot())
         try:
-            futures = self.worker_group.run_all_workers_single_data(
-                "get_data_plane_snapshot"
-            )
-            snapshots.extend(
-                s for s in self.worker_group.get_all_worker_results(futures) if s
-            )
+            # ``Policy.run_all_workers_single_data`` already does the
+            # ``ray.get``. Pairing the worker-group call with
+            # ``get_all_worker_results`` does not work -- the former returns
+            # a list of ObjectRefs and the latter wants a MultiWorkerFuture --
+            # and the broad except below swallowed the AttributeError, so
+            # only the driver's snapshot was ever returned.
+            ranks = self.run_all_workers_single_data("get_data_plane_snapshot")
         except Exception as exc:  # noqa: BLE001 - metrics must never fail a step
-            logging.warning("data-plane snapshot fan-out failed: %s", exc)
+            logger.warning("data-plane snapshot fan-out failed: %s", exc)
+        else:
+            snapshots.extend(s for s in ranks if s)
         return snapshots
 
     # ── 1-hop entrypoints (KVBatchMeta in, no re-fan-out) ──────────────────

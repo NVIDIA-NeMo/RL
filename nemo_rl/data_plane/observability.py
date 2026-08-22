@@ -423,6 +423,46 @@ def fit_latency_bandwidth(s: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _step_deltas(snap: dict[str, Any], prev: dict[str, Any]) -> dict[str, float]:
+    """The five series both step-metric paths report, identically.
+
+    Shared so the single-process and cluster views cannot drift on series
+    names -- which is the whole point of the ``step/``/``now/`` convention
+    they publish under.
+    """
+    return {
+        "step/wall_ms": snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0),
+        "step/comm_volume_mb": (
+            snap["comm_volume_bytes"] - prev.get("comm_volume_bytes", 0)
+        )
+        / 1e6,
+        "step/bytes_written_mb": (snap["bytes_written"] - prev.get("bytes_written", 0))
+        / 1e6,
+        "step/bytes_read_mb": (snap["bytes_read"] - prev.get("bytes_read", 0)) / 1e6,
+        "now/bytes_outstanding_mb": snap["bytes_outstanding"] / 1e6,
+    }
+
+
+def _clamped_percentiles(hist: list[int], max_ms: float) -> tuple[float, float] | None:
+    """p50 and p99 from ``hist``, or ``None`` when the sample is too thin.
+
+    Two corrections, both needed wherever a percentile is taken. Below
+    :data:`_MIN_SAMPLES_FOR_PERCENTILE` the interpolation returns bucket
+    geometry rather than data -- one sample in (100, 250] yields a p50 of
+    175 whatever the call took -- so there is no answer to give. And the
+    interpolation spreads a bucket's samples uniformly across it, so calls
+    clustered low in a wide bucket read high, above the exact maximum
+    measured beside them; the maximum is the tighter bound.
+    """
+    if sum(hist) < _MIN_SAMPLES_FOR_PERCENTILE:
+        return None
+    ceiling = max_ms if max_ms > 0 else float("inf")
+    return (
+        min(percentile_from_hist(hist, 0.50), ceiling),
+        min(percentile_from_hist(hist, 0.99), ceiling),
+    )
+
+
 def _derive_op_metrics(by_op: dict[str, Any], total_wall_ms: float) -> None:
     """Fill in the derived per-op fields, in place.
 
@@ -444,16 +484,8 @@ def _derive_op_metrics(by_op: dict[str, Any], total_wall_ms: float) -> None:
         )
         stats["fit"] = fit_latency_bandwidth(stats)
         hist = stats["latency_hist"]
-        # Clamped to the exact max, here rather than at one call site, so
-        # every consumer of a snapshot inherits it. Bucket interpolation
-        # spreads a bucket's samples uniformly across it, so calls clustered
-        # low in a wide bucket read high -- five register calls of 0.011 ms
-        # all land in (0, 0.1] and interpolate to a p50 of 0.05, four times
-        # the slowest call that happened. A true percentile cannot exceed
-        # the maximum and the maximum is measured exactly.
-        ceiling = stats["max_ms"] if stats["max_ms"] > 0 else float("inf")
-        stats["p50_ms"] = min(percentile_from_hist(hist, 0.50), ceiling)
-        stats["p99_ms"] = min(percentile_from_hist(hist, 0.99), ceiling)
+        pct = _clamped_percentiles(hist, stats["max_ms"])
+        stats["p50_ms"], stats["p99_ms"] = pct if pct else (0.0, 0.0)
         # Tail/mean ratio: a mean hides MR churn and queueing, which show
         # up as p99 pulling away from the mean.
         stats["tail_ratio_p99_mean"] = (
@@ -486,7 +518,7 @@ _OP_SUM = (
     "sum_bytes_ms",
     "sum_ms_sq",
 )
-_OP_MAX = ("max_ms", "step_max_ms")
+_OP_MAX = ("max_ms",)
 
 
 def merge_snapshots(snapshots: "list[dict[str, Any]]") -> dict[str, Any]:
@@ -571,12 +603,9 @@ def cluster_step_metrics(
     holds ``prev`` and passes it back.
 
     ``observability_overhead_ms`` is the whole bill for measuring: every
-    process's wrapper time (its wall time minus the time its inner client
-    was working) plus ``collect_ms``, the fan-out that gathered and merged
-    the snapshots. Both halves matter and the second is the larger -- the
-    per-op wrapper costs tenths of a millisecond while the fan-out costs a
-    couple, so a figure covering only the first understates by an order of
-    magnitude and is worse than no figure at all.
+    process's wrapper time plus ``collect_ms``, the fan-out that gathered
+    the snapshots. The fan-out is the larger half; omitting it understates
+    by an order of magnitude.
 
     Args:
         merged: Cluster-wide snapshot from :func:`merge_snapshots`.
@@ -593,39 +622,22 @@ def cluster_step_metrics(
     # The mean fraction of the step a process spent in the data plane is
     # bounded and answers the question people ask of it.
     n_procs = max(merged.get("n_processes", 1), 1)
-    # Namespaced by what kind of number it is, because the unit alone does
-    # not say. ``comm_volume_mb`` was a per-step delta and
-    # ``bytes_outstanding_mb`` an instantaneous level -- same suffix, same
-    # chart, nothing to tell them apart.
-    #   step/  what happened during this step  (a delta, resets each step)
-    #   now/   what is true at this instant    (a level, persists)
-    metrics: dict[str, float] = {
-        "step/wall_ms": wall_ms,
-        # ``wall_ms`` sums processes that ran concurrently, so it can exceed
-        # the step's own wall clock. Divided by the process count it reads
-        # as "how long the average process spent in the data plane this
-        # step" -- in ms like everything else, and needing no gloss.
-        "step/wall_ms_per_process": wall_ms / n_procs,
-        "step/comm_volume_mb": (
-            merged["comm_volume_bytes"] - prev.get("comm_volume_bytes", 0)
-        )
-        / 1e6,
-        "step/bytes_written_mb": (
-            merged["bytes_written"] - prev.get("bytes_written", 0)
-        )
-        / 1e6,
-        "step/bytes_read_mb": (merged["bytes_read"] - prev.get("bytes_read", 0)) / 1e6,
-        # A level, not a delta: bytes held in TQ right now, put minus
-        # cleared. It climbs when something is not being cleared, which is
-        # the leak signal it exists for. A rising line here is the metric
-        # working, not an accumulation bug.
-        "now/bytes_outstanding_mb": merged["bytes_outstanding"] / 1e6,
-        "now/n_processes": n_procs,
-        "step/observability_overhead_ms": overhead_ms,
-        "step/observability_overhead_frac": (
-            overhead_ms / wall_ms if wall_ms > 0 else 0.0
-        ),
-    }
+    # step/ is a delta over this step; now/ is a level at this instant.
+    # The unit alone does not distinguish them -- see README.md.
+    metrics = _step_deltas(merged, prev)
+    metrics.update(
+        {
+            # ``wall_ms`` sums processes that ran concurrently, so it can
+            # exceed the step's own wall clock. Per process it reads as a
+            # duration in ms, like everything else here.
+            "step/wall_ms_per_process": wall_ms / n_procs,
+            "now/n_processes": n_procs,
+            "step/observability_overhead_ms": overhead_ms,
+            "step/observability_overhead_frac": (
+                overhead_ms / wall_ms if wall_ms > 0 else 0.0
+            ),
+        }
+    )
     prev_ops = prev.get("by_op", {})
     for op, stats in merged["by_op"].items():
         prev_op = prev_ops.get(op, {})
@@ -648,17 +660,11 @@ def cluster_step_metrics(
                 prev_op.get("latency_hist") or [0] * len(stats["latency_hist"]),
             )
         ]
-        if sum(step_hist) >= _MIN_SAMPLES_FOR_PERCENTILE:
-            # Same clamp as :func:`_derive_op_metrics`, applied again here
-            # because this percentile comes off the step's histogram delta
-            # rather than the cumulative one that function derived.
-            ceiling = stats["max_ms"] if stats["max_ms"] > 0 else float("inf")
-            metrics[f"step/{op}/p50_ms"] = min(
-                percentile_from_hist(step_hist, 0.50), ceiling
-            )
-            metrics[f"step/{op}/p99_ms"] = min(
-                percentile_from_hist(step_hist, 0.99), ceiling
-            )
+        # Off the step's histogram delta, not the cumulative one
+        # :func:`_derive_op_metrics` used.
+        pct = _clamped_percentiles(step_hist, stats["max_ms"])
+        if pct:
+            metrics[f"step/{op}/p50_ms"], metrics[f"step/{op}/p99_ms"] = pct
     return metrics
 
 
@@ -848,28 +854,15 @@ class MetricsDataPlaneClient(DataPlaneClient):
             bucket.step_max_ms = 0.0
 
         wall_ms = snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
-        vol = snap["comm_volume_bytes"] - prev.get("comm_volume_bytes", 0)
         # Every duration is ms and every volume is MB, with no exceptions:
         # a chart that mixes wall_s against p99_ms puts a 0.008 next to a
         # 24.85 and reads as a bug in the data plane rather than in the
         # axis. GB was the same problem one dimension over -- a realistic
         # step moved 0.00017 GB.
-        metrics: dict[str, float] = {
-            "step/wall_ms": wall_ms,
-            "step/frac_of_step": (
-                (wall_ms / 1e3 / step_time_s) if step_time_s > 0 else 0.0
-            ),
-            "step/comm_volume_mb": vol / 1e6,
-            "step/bytes_written_mb": (
-                snap["bytes_written"] - prev.get("bytes_written", 0)
-            )
-            / 1e6,
-            "step/bytes_read_mb": (snap["bytes_read"] - prev.get("bytes_read", 0))
-            / 1e6,
-            # A level, not a delta -- see the cluster path for why the two
-            # need to be distinguishable on a chart.
-            "now/bytes_outstanding_mb": snap["bytes_outstanding"] / 1e6,
-        }
+        metrics = _step_deltas(snap, prev)
+        metrics["step/frac_of_step"] = (
+            (wall_ms / 1e3 / step_time_s) if step_time_s > 0 else 0.0
+        )
         if self._verify_tensor_hash:
             hv, prev_hv = snap["hash_verify"], prev.get("hash_verify", {})
             metrics["step/hash/rows_checked"] = hv["rows_checked"] - prev_hv.get(
@@ -929,10 +922,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 metrics[f"step/{op}/transfer_ms"] = ms_per_byte * op_bytes
         return metrics
 
-    def bytes_outstanding_by_partition(self) -> dict[str, int]:
-        """Per-partition breakdown of currently-held bytes."""
-        return dict(self._bytes_by_partition)
-
     def _record_put(self, partition_id: str, keys: list[str], n_bytes: int) -> None:
         """Attribute put bytes per key so a later ``clear_samples`` can subtract.
 
@@ -989,9 +978,12 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # those released bytes this partition never held: clearing 50 live
         # keys alongside 50 unknown ones freed two thirds of a partition
         # that had lost half its keys.
-        removed = len(live.intersection(keys)) if keys is not None else len(live)
-        if keys is not None:
-            live -= set(keys)
+        if keys is None:
+            removed = len(live)
+        else:
+            dropped = live.intersection(keys)
+            live -= dropped
+            removed = len(dropped)
         if keys is None or not live:
             freed = total
             del self._keys_by_partition[partition_id]
