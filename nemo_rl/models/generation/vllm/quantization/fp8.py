@@ -20,6 +20,7 @@ import ray
 import torch
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModel
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
@@ -94,6 +95,20 @@ def my_run_engine_core(*args, **kwargs):
 
 def monkey_patch_vllm_ray_executor(fp8_config):
     if fp8_config.model_parallel_size > 1:
+        if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
+            from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+
+            original_initialize_worker = RayWorkerProc.initialize_worker
+
+            def patched_initialize_worker(self, *args, **kwargs):
+                if not fp8_patches_applied:
+                    apply_fp8_patches(None, fp8_config)
+
+                return original_initialize_worker(self, *args, **kwargs)
+
+            RayWorkerProc.initialize_worker = patched_initialize_worker
+            return
+
         # we patch vllm's collective_rpc so that before vllm initalizes the model on each rank, we execute
         # a ray remote that patches each worker with the required fp8 vllm patches
         from vllm.v1.executor.ray_executor import RayDistributedExecutor
