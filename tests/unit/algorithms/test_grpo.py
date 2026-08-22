@@ -804,19 +804,30 @@ def test_log_completed_draft_refit_skips_non_draft_training(capsys) -> None:
 
 
 @pytest.mark.parametrize(
-    ("speculator_type", "context_parallel_size"),
-    [("dflash", 2), ("dspark", 4)],
+    ("speculator_type", "context_parallel_size", "sequence_parallel"),
+    [
+        ("dflash", 2, True),
+        ("dspark", 4, True),
+        ("dflash", 2, False),
+        ("custom", 2, False),
+    ],
 )
 def test_split_draft_training_requires_supported_packed_cp_layout(
-    speculator_type: str, context_parallel_size: int
+    speculator_type: str, context_parallel_size: int, sequence_parallel: bool
 ) -> None:
     master_config = MagicMock()
     master_config.policy = {
-        "draft": MagicMock(enabled=True, speculator_type=speculator_type),
+        "draft": MagicMock(
+            enabled=True,
+            speculator_type=speculator_type,
+            supports_context_parallel=True,
+            supports_sequence_packing=True,
+            supports_target_sequence_parallel=True,
+        ),
         "megatron_cfg": {
             "enabled": True,
             "context_parallel_size": context_parallel_size,
-            "sequence_parallel": True,
+            "sequence_parallel": sequence_parallel,
         },
         "sequence_packing": {"enabled": True},
     }
@@ -829,29 +840,59 @@ def test_split_draft_training_requires_supported_packed_cp_layout(
     [
         (None, {"enabled": True, "context_parallel_size": 2}, {"enabled": True}),
         (
-            MagicMock(enabled=True, speculator_type="eagle3"),
+            MagicMock(
+                enabled=True,
+                speculator_type="eagle3",
+                supports_context_parallel=False,
+                supports_sequence_packing=False,
+                supports_target_sequence_parallel=False,
+            ),
             {"enabled": True, "context_parallel_size": 2, "sequence_parallel": True},
             {"enabled": True},
         ),
         (
-            MagicMock(enabled=True, speculator_type="dflash"),
+            MagicMock(
+                enabled=True,
+                speculator_type="dflash",
+                supports_context_parallel=True,
+                supports_sequence_packing=True,
+                supports_target_sequence_parallel=True,
+            ),
             {"enabled": False, "context_parallel_size": 2, "sequence_parallel": True},
             {"enabled": True},
         ),
         (
-            MagicMock(enabled=True, speculator_type="dflash"),
+            MagicMock(
+                enabled=True,
+                speculator_type="dflash",
+                supports_context_parallel=True,
+                supports_sequence_packing=True,
+                supports_target_sequence_parallel=True,
+            ),
             {"enabled": True, "context_parallel_size": 1, "sequence_parallel": True},
             {"enabled": True},
         ),
         (
-            MagicMock(enabled=True, speculator_type="dflash"),
-            {"enabled": True, "context_parallel_size": 2, "sequence_parallel": False},
-            {"enabled": True},
-        ),
-        (
-            MagicMock(enabled=True, speculator_type="dflash"),
+            MagicMock(
+                enabled=True,
+                speculator_type="dflash",
+                supports_context_parallel=True,
+                supports_sequence_packing=True,
+                supports_target_sequence_parallel=True,
+            ),
             {"enabled": True, "context_parallel_size": 2, "sequence_parallel": True},
             {"enabled": False},
+        ),
+        (
+            MagicMock(
+                enabled=True,
+                speculator_type="custom",
+                supports_context_parallel=True,
+                supports_sequence_packing=True,
+                supports_target_sequence_parallel=False,
+            ),
+            {"enabled": True, "context_parallel_size": 2, "sequence_parallel": True},
+            {"enabled": True},
         ),
     ],
 )
@@ -961,6 +1002,75 @@ def test_train_policy_from_meta_aborts_when_split_begin_fails() -> None:
 
     policy.abort_train_step.assert_called_once_with()
     policy.train_microbatches_from_meta.assert_not_called()
+
+
+def test_train_policy_from_meta_aborts_when_split_finish_fails() -> None:
+    policy = MagicMock()
+    policy.finish_train_step.side_effect = RuntimeError("finish failed")
+    master_config = MagicMock()
+    master_config.policy = {
+        "draft": MagicMock(
+            enabled=True,
+            speculator_type="dflash",
+            supports_context_parallel=True,
+            supports_sequence_packing=True,
+            supports_target_sequence_parallel=True,
+        ),
+        "megatron_cfg": {
+            "enabled": True,
+            "context_parallel_size": 2,
+            "sequence_parallel": True,
+        },
+        "sequence_packing": {"enabled": True},
+    }
+
+    with pytest.raises(RuntimeError, match="finish failed"):
+        _train_policy_from_meta(
+            policy,
+            MagicMock(),
+            loss_fn=MagicMock(),
+            timer=None,
+            train_fields=("input_ids",),
+            master_config=master_config,
+        )
+
+    policy.abort_train_step.assert_called_once_with()
+
+
+def test_train_policy_from_meta_preserves_training_error_when_abort_fails() -> None:
+    policy = MagicMock()
+    policy.train_microbatches_from_meta.side_effect = RuntimeError("backward failed")
+    policy.abort_train_step.side_effect = RuntimeError("abort failed")
+    master_config = MagicMock()
+    master_config.policy = {
+        "draft": MagicMock(
+            enabled=True,
+            speculator_type="dspark",
+            supports_context_parallel=True,
+            supports_sequence_packing=True,
+            supports_target_sequence_parallel=True,
+        ),
+        "megatron_cfg": {
+            "enabled": True,
+            "context_parallel_size": 2,
+            "sequence_parallel": True,
+        },
+        "sequence_packing": {"enabled": True},
+    }
+
+    with pytest.raises(RuntimeError, match="backward failed") as error:
+        _train_policy_from_meta(
+            policy,
+            MagicMock(),
+            loss_fn=MagicMock(),
+            timer=None,
+            train_fields=("input_ids",),
+            master_config=master_config,
+        )
+
+    assert error.value.__notes__ == [
+        "split training abort also failed: RuntimeError('abort failed')"
+    ]
 
 
 def test_train_policy_from_meta_keeps_cp1_on_monolithic_path() -> None:
@@ -5680,13 +5790,24 @@ def test_validate_use_kl_in_reward_allows_zero_kl_penalty():
 
 
 @pytest.mark.parametrize(
-    "skip_prev_logprobs, expect_prev",
-    [(False, True), (True, False)],
-    ids=["keep_prev_logprobs", "skip_prev_logprobs"],
+    "skip_prev_logprobs, skip_reference_logprobs, expect_prev, expect_reference",
+    [
+        (False, False, True, True),
+        (True, False, False, True),
+        (False, True, True, False),
+        (True, True, False, False),
+    ],
+    ids=["keep_both", "skip_prev", "skip_reference", "skip_both"],
 )
-def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
-    fields = _train_fields_for_step(skip_prev_logprobs)
+def test_train_fields_for_step(
+    skip_prev_logprobs, skip_reference_logprobs, expect_prev, expect_reference
+):
+    fields = _train_fields_for_step(
+        skip_prev_logprobs,
+        skip_reference_logprobs,
+    )
     assert ("prev_logprobs" in fields) is expect_prev
+    assert ("reference_policy_logprobs" in fields) is expect_reference
 
 
 @pytest.mark.parametrize(

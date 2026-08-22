@@ -126,14 +126,19 @@ def _should_use_split_draft_training(master_config: MasterConfig) -> bool:
     sequence_packing = policy_config.get("sequence_packing")
     if draft_config is None or megatron_config is None:
         return False
+    target_sequence_parallel = megatron_config.get("sequence_parallel") is True
     return bool(
         draft_config.enabled
-        and draft_config.speculator_type in ("dflash", "dspark")
         and megatron_config.get("enabled") is True
         and int(megatron_config.get("context_parallel_size", 1)) > 1
-        and megatron_config.get("sequence_parallel") is True
         and sequence_packing is not None
         and sequence_packing.get("enabled") is True
+        and draft_config.supports_context_parallel
+        and draft_config.supports_sequence_packing
+        and (
+            not target_sequence_parallel
+            or draft_config.supports_target_sequence_parallel
+        )
     )
 
 
@@ -188,10 +193,16 @@ def _train_policy_from_meta(
         raise
 
 
-def _train_fields_for_step(skip_prev_logprobs: bool) -> tuple[str, ...]:
-    """Fields workers fetch this step; ``prev_logprobs`` is dropped when skipped."""
+def _train_fields_for_step(
+    skip_prev_logprobs: bool,
+    skip_reference_logprobs: bool,
+) -> tuple[str, ...]:
+    """Return only fields produced by the enabled logprob stages."""
     return tuple(
-        f for f in DP_TRAIN_FIELDS if not (skip_prev_logprobs and f == "prev_logprobs")
+        field
+        for field in DP_TRAIN_FIELDS
+        if not (skip_prev_logprobs and field == "prev_logprobs")
+        and not (skip_reference_logprobs and field == "reference_policy_logprobs")
     )
 
 
@@ -889,9 +900,12 @@ def grpo_train_sync(
                     master_config.grpo.seq_logprob_error_threshold
                 )
                 # Worker-side fetch schema for this step. Same skip decision
-                # as ``select_fields`` below, but consumed only by
-                # ``train_from_meta`` (driver read uses ``select_fields``).
-                train_fields = _train_fields_for_step(skip_prev_logprobs)
+                # as ``select_fields`` below, but consumed only by the
+                # train-from-meta path (driver read uses ``select_fields``).
+                train_fields = _train_fields_for_step(
+                    skip_prev_logprobs,
+                    skip_reference_logprobs,
+                )
 
                 if compute_prev or compute_ref:
                     print("▶ Preparing for logprob inference...", flush=True)
