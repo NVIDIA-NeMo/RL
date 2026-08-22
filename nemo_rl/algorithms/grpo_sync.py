@@ -70,6 +70,7 @@ from nemo_rl.algorithms.utils import (
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_performance_metrics,
+    sum_metric_values,
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
@@ -118,10 +119,91 @@ def _raise_if_message_level_advantage_penalties_enabled(
     )
 
 
-def _train_fields_for_step(skip_prev_logprobs: bool) -> tuple[str, ...]:
-    """Fields workers fetch this step; ``prev_logprobs`` is dropped when skipped."""
+def _should_use_split_draft_training(master_config: MasterConfig) -> bool:
+    """Select the proven packed Megatron CP path for block-draft training."""
+    policy_config = master_config.policy
+    draft_config = policy_config.get("draft")
+    megatron_config = policy_config.get("megatron_cfg")
+    sequence_packing = policy_config.get("sequence_packing")
+    if draft_config is None or megatron_config is None:
+        return False
+    target_sequence_parallel = megatron_config.get("sequence_parallel") is True
+    return bool(
+        draft_config.enabled
+        and megatron_config.get("enabled") is True
+        and int(megatron_config.get("context_parallel_size", 1)) > 1
+        and sequence_packing is not None
+        and sequence_packing.get("enabled") is True
+        and draft_config.supports_context_parallel
+        and draft_config.supports_sequence_packing
+        and (
+            not target_sequence_parallel
+            or draft_config.supports_target_sequence_parallel
+        )
+    )
+
+
+def _train_policy_from_meta(
+    policy: TQPolicy,
+    meta: KVBatchMeta,
+    *,
+    loss_fn: LossFunction,
+    timer: Timer | None,
+    train_fields: tuple[str, ...],
+    master_config: MasterConfig,
+) -> dict[str, Any]:
+    """Train one TQ step, using the split lifecycle required by packed CP."""
+    if not _should_use_split_draft_training(master_config):
+        return policy.train_from_meta(
+            meta,
+            loss_fn=loss_fn,
+            timer=timer,
+            train_fields=train_fields,
+        )
+
+    split_methods = (
+        "begin_train_step",
+        "train_microbatches_from_meta",
+        "finish_train_step",
+        "abort_train_step",
+    )
+    missing_methods = [
+        method
+        for method in split_methods
+        if not callable(getattr(policy, method, None))
+    ]
+    if missing_methods:
+        raise RuntimeError(
+            "packed context-parallel DFlash/DSpark training requires the TQ split "
+            f"training API; missing: {', '.join(missing_methods)}"
+        )
+
+    try:
+        policy.begin_train_step(loss_fn)
+        policy.train_microbatches_from_meta(
+            meta,
+            timer=timer,
+            train_fields=train_fields,
+        )
+        return policy.finish_train_step()
+    except BaseException as train_error:
+        try:
+            policy.abort_train_step()
+        except BaseException as abort_error:
+            train_error.add_note(f"split training abort also failed: {abort_error!r}")
+        raise
+
+
+def _train_fields_for_step(
+    skip_prev_logprobs: bool,
+    skip_reference_logprobs: bool,
+) -> tuple[str, ...]:
+    """Return only fields produced by the enabled logprob stages."""
     return tuple(
-        f for f in DP_TRAIN_FIELDS if not (skip_prev_logprobs and f == "prev_logprobs")
+        field
+        for field in DP_TRAIN_FIELDS
+        if not (skip_prev_logprobs and field == "prev_logprobs")
+        and not (skip_reference_logprobs and field == "reference_policy_logprobs")
     )
 
 
@@ -377,6 +459,20 @@ def _compute_seq_logprob_error_metrics(
     return masking_data["sample_mask"], seq_logprob_error_metrics
 
 
+def _log_completed_draft_refit(
+    master_config: MasterConfig,
+    *,
+    pending_step: Optional[int],
+) -> None:
+    """Emit a driver-ordered marker only for refits after a draft update."""
+    draft_config = master_config.policy.get("draft")
+    if pending_step is not None and draft_config is not None and draft_config.enabled:
+        print(
+            f"draft_post_update_refit=complete step={pending_step}",
+            flush=True,
+        )
+
+
 def grpo_train_sync(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -415,6 +511,7 @@ def grpo_train_sync(
     kv_scales_cache = None  # Cache reused for computed kv scales
 
     POLICY_GENERATION_STALE = True
+    pending_draft_refit_step: Optional[int] = None
     assert policy_generation is not None
 
     if master_config.grpo.skip_reference_policy_logprobs_calculation:
@@ -632,6 +729,11 @@ def grpo_train_sync(
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
+                        _log_completed_draft_refit(
+                            master_config,
+                            pending_step=pending_draft_refit_step,
+                        )
+                        pending_draft_refit_step = None
                         POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
@@ -799,9 +901,12 @@ def grpo_train_sync(
                     master_config.grpo.seq_logprob_error_threshold
                 )
                 # Worker-side fetch schema for this step. Same skip decision
-                # as ``select_fields`` below, but consumed only by
-                # ``train_from_meta`` (driver read uses ``select_fields``).
-                train_fields = _train_fields_for_step(skip_prev_logprobs)
+                # as ``select_fields`` below, but consumed only by the
+                # train-from-meta path (driver read uses ``select_fields``).
+                train_fields = _train_fields_for_step(
+                    skip_prev_logprobs,
+                    skip_reference_logprobs,
+                )
 
                 if compute_prev or compute_ref:
                     print("▶ Preparing for logprob inference...", flush=True)
@@ -932,12 +1037,17 @@ def grpo_train_sync(
                     # Meta-driven train: workers fetch the union of
                     # rollout + driver-written + worker-written columns
                     # from TQ, train, return aggregated metrics via Ray.
-                    train_results = policy.train_from_meta(
+                    train_results = _train_policy_from_meta(
+                        policy,
                         meta,
                         loss_fn=loss_fn,
                         timer=timer,
                         train_fields=train_fields,
+                        master_config=master_config,
                     )
+                    draft_config = master_config.policy.get("draft")
+                    if draft_config is not None and draft_config.enabled:
+                        pending_draft_refit_step = total_steps + 1
 
                 if sync_kv_scales:
                     with timer.time("recompute_kv_scales"):
@@ -1008,6 +1118,11 @@ def grpo_train_sync(
                             colocated_inference,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
+                        _log_completed_draft_refit(
+                            master_config,
+                            pending_step=pending_draft_refit_step,
+                        )
+                        pending_draft_refit_step = None
                         POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
@@ -1103,7 +1218,7 @@ def grpo_train_sync(
                     }:
                         metrics[k] = np.mean(v).item()
                     elif isinstance(v, (np.ndarray, list)):
-                        metrics[k] = np.sum(v).item()
+                        metrics[k] = sum_metric_values(v)
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
 

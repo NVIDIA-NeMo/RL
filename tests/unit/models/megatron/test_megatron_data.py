@@ -1365,6 +1365,7 @@ class TestMakeProcessedMicrobatchIterator:
         mock_position_ids = MagicMock()
         mock_packed_seq_params = None
         mock_cu_seqlens_padded = None
+        mock_draft_sequence_layout = MagicMock()
 
         mock_process.return_value = ProcessedInputs(
             input_ids=mock_input_ids,
@@ -1373,6 +1374,7 @@ class TestMakeProcessedMicrobatchIterator:
             position_ids=mock_position_ids,
             packed_seq_params=mock_packed_seq_params,
             cu_seqlens_padded=mock_cu_seqlens_padded,
+            draft_sequence_layout=mock_draft_sequence_layout,
         )
 
         # Create mock data dict
@@ -1400,6 +1402,7 @@ class TestMakeProcessedMicrobatchIterator:
         assert isinstance(microbatch, ProcessedMicrobatch)
         assert microbatch.data_dict == mock_data_dict
         assert microbatch.input_ids == mock_input_ids
+        assert microbatch.draft_sequence_layout is mock_draft_sequence_layout
 
         # Verify data was moved to CUDA
         mock_data_dict.to.assert_called_once_with("cuda")
@@ -1449,6 +1452,82 @@ class TestMakeProcessedMicrobatchIterator:
         assert call_kwargs["pad_individual_seqs_to_multiple_of"] == 8
         assert call_kwargs["pad_packed_seq_to_multiple_of"] == 16
         assert call_kwargs["pad_full_seq_to"] == 1024
+
+    @patch(
+        "nemo_rl.models.megatron.data.get_tensor_model_parallel_rank", return_value=1
+    )
+    @patch(
+        "nemo_rl.models.megatron.data.get_tensor_model_parallel_world_size",
+        return_value=2,
+    )
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=1)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size",
+        return_value=2,
+    )
+    @patch("nemo_rl.models.megatron.data._build_draft_sequence_layout")
+    @patch("nemo_rl.models.megatron.data.process_microbatch")
+    def test_make_processed_microbatch_iterator_builds_packed_draft_layout(
+        self,
+        mock_process,
+        mock_build_layout,
+        _mock_cp_size,
+        _mock_cp_rank,
+        _mock_tp_size,
+        _mock_tp_rank,
+    ):
+        """Catches draft layout reconstruction outside the canonical packer."""
+        from nemo_rl.models.megatron.data import (
+            ProcessedInputs,
+            make_processed_microbatch_iterator,
+        )
+
+        mock_layout = MagicMock()
+        mock_build_layout.return_value = mock_layout
+        cu_seqlens_padded = torch.tensor([0, 8, 16], dtype=torch.int64)
+        mock_process.return_value = ProcessedInputs(
+            input_ids=MagicMock(),
+            input_ids_cp_sharded=MagicMock(),
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=MagicMock(),
+            cu_seqlens_padded=cu_seqlens_padded,
+        )
+
+        values = {
+            "draft_sample_ids": torch.tensor([101, 303], dtype=torch.int64),
+            "input_lengths": torch.tensor([5, 3], dtype=torch.int64),
+        }
+        mock_data_dict = MagicMock()
+        mock_data_dict.to.return_value = mock_data_dict
+        mock_data_dict.__contains__.side_effect = values.__contains__
+        mock_data_dict.__getitem__.side_effect = values.__getitem__
+        cfg = {
+            "sequence_packing": {"enabled": True},
+            "megatron_cfg": {"sequence_parallel": True},
+        }
+
+        microbatch = next(
+            make_processed_microbatch_iterator(
+                raw_iterator=iter([mock_data_dict]),
+                cfg=cfg,
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=8,
+                pad_packed_seq_to_multiple_of=16,
+                straggler_timer=MagicMock(),
+                pad_full_seq_to=None,
+            )
+        )
+
+        assert microbatch.draft_sequence_layout is mock_layout
+        call = mock_build_layout.call_args.kwargs
+        assert torch.equal(call["logical_sample_ids"], values["draft_sample_ids"])
+        assert torch.equal(call["cu_seqlens_q"], torch.tensor([0, 5, 8]))
+        assert torch.equal(call["cu_seqlens_q_padded"], cu_seqlens_padded)
+        assert call["cp_rank"] == 1
+        assert call["cp_size"] == 2
+        assert call["tp_rank"] == 1
+        assert call["tp_size"] == 2
 
 
 PACK_SEQUENCES_TEST_ACTOR_FQN = (
