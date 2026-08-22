@@ -690,3 +690,63 @@ def test_cp_lane_manifest_mismatch_fails_before_refit_builder(
     distributed_test_runner,
 ) -> None:
     distributed_test_runner(_run_cp_lane_manifest_mismatch, world_size=8)
+
+
+def test_decode_wire_manifest_flags_malformed_metadata_as_wire_invalid() -> None:
+    from nemo_rl.models.megatron.draft.utils import (
+        _decode_wire_manifest,
+        _DRAFT_REFIT_STATUS_OK,
+        _DRAFT_REFIT_STATUS_WIRE_INVALID,
+        _wire_manifest,
+        DraftRefitTensorSpec,
+    )
+
+    spec = DraftRefitTensorSpec(
+        name="model.layers.0.norm.weight",
+        shape=(2,),
+        dtype=torch.float32,
+        device_type="cuda",
+    )
+    metadata, utf8_bytes = _wire_manifest((spec,))
+    status, detail, manifest = _decode_wire_manifest(
+        tensor_count=1, metadata=metadata, utf8_bytes=utf8_bytes
+    )
+    assert status == _DRAFT_REFIT_STATUS_OK and len(manifest) == 1
+
+    # Trailing metadata values must surface as WIRE_INVALID, not a crash.
+    status, detail, manifest = _decode_wire_manifest(
+        tensor_count=1, metadata=metadata + [0, 0, 0], utf8_bytes=utf8_bytes
+    )
+    assert status == _DRAFT_REFIT_STATUS_WIRE_INVALID
+    assert "trailing" in detail and manifest == ()
+
+    # Truncated name bytes must surface as WIRE_INVALID.
+    status, detail, manifest = _decode_wire_manifest(
+        tensor_count=1, metadata=metadata, utf8_bytes=utf8_bytes[:-1]
+    )
+    assert status == _DRAFT_REFIT_STATUS_WIRE_INVALID
+    assert manifest == ()
+
+    # Truncated metadata (count says two tensors) must surface as WIRE_INVALID.
+    status, detail, manifest = _decode_wire_manifest(
+        tensor_count=2, metadata=metadata, utf8_bytes=utf8_bytes
+    )
+    assert status == _DRAFT_REFIT_STATUS_WIRE_INVALID
+    assert "truncated" in detail and manifest == ()
+
+
+def test_raise_export_status_maps_codes_and_unknown_to_protocol_error() -> None:
+    from nemo_rl.models.megatron.draft.utils import (
+        _DRAFT_REFIT_STATUS_WIRE_INVALID,
+        _raise_export_status,
+    )
+
+    with pytest.raises(RuntimeError, match="WIRE_INVALID"):
+        _raise_export_status(
+            _DRAFT_REFIT_STATUS_WIRE_INVALID,
+            "bad bytes",
+            cp_rank=0,
+            pp_ranks=(0, 1),
+        )
+    with pytest.raises(RuntimeError, match="PROTOCOL_ERROR"):
+        _raise_export_status(99, "unknown", cp_rank=1, pp_ranks=(2,))

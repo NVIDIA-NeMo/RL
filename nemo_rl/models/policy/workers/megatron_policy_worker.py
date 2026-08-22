@@ -452,6 +452,10 @@ def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
 @contextmanager
 def _meta_tensor_alloc_context(
     *,
+    # NOTE: currently unreachable at the sole caller (draft metadata is
+    # precomputed before entering this context, so no int64/uint8 protocol
+    # broadcast fires inside it); kept as a defensive hook for Bridge-driven
+    # export paths that do broadcast fixed-width protocol tensors.
     control_broadcast_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Skip real GPU work during metadata enumeration.
