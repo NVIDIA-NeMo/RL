@@ -279,6 +279,27 @@ class _StagingPoolRegistry:
             return pool
 
 
+def _tq_shape_drift_error(
+    missing: str, consequence: str, target: str, *, opt_out: bool = False
+) -> RuntimeError:
+    """Build the error shared by the monkey-patch shape guards below.
+
+    All three guards fire for the same reason — the pinned ``transfer_queue``
+    revision no longer has the internals a patch depends on — so they share
+    this message shape rather than each hand-rolling it.
+    """
+    remedy = f"re-point the patch at the new {target}"
+    if opt_out:
+        remedy += (
+            ", or set data_plane.mooncake_cpu.reuse_registered_buffers=false "
+            "to run on upstream's per-call registration deliberately"
+        )
+    return RuntimeError(
+        f"transfer_queue's {missing}, so {consequence}. The TQ pin in "
+        f"pyproject.toml has moved: {remedy}."
+    )
+
+
 def _patch_mooncake_register_check() -> None:
     """Make a failed RDMA registration fail at the registration.
 
@@ -288,6 +309,12 @@ def _patch_mooncake_register_check() -> None:
     memory the NIC may never have mapped and reports only ``TRANSFER_FAIL``
     (-800). Applied for every ``mooncake_cpu`` client, independent of
     ``reuse_registered_buffers``, so the check survives disabling the pool.
+
+    Raises if ``_register_all_buffers`` is missing, rather than returning
+    early: this check has no ``reuse_registered_buffers``-style opt-out, so
+    silently skipping it would put a failed registration back to surfacing
+    only as a bare ``TRANSFER_FAIL``, which is exactly the diagnosability
+    this patch exists to add.
     """
     try:
         from transfer_queue.storage.clients import mooncake_client as _mc
@@ -298,7 +325,12 @@ def _patch_mooncake_register_check() -> None:
     if cls is None or getattr(cls, "_nrl_register_checked", False):
         return
     if not hasattr(cls, "_register_all_buffers"):
-        return
+        raise _tq_shape_drift_error(
+            "MooncakeStoreClient no longer has _register_all_buffers",
+            "a failed RDMA registration would go back to surfacing only as "
+            "a bare TRANSFER_FAIL (-800) with no root cause",
+            "call site",
+        )
 
     def _register_all_buffers(self, ptrs, sizes):  # type: ignore[no-untyped-def]
         for ptr, size in zip(ptrs, sizes, strict=True):
@@ -318,8 +350,10 @@ def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
     cached. This keeps a small pool of registered buffers alive instead.
 
     Monkey-patched because TransferQueue is pinned by git SHA in
-    ``pyproject.toml``. Returns early, leaving upstream behaviour intact, if
-    the internals it drives are not shaped as expected.
+    ``pyproject.toml``. Raises if the internals it drives are not shaped as
+    expected, rather than returning early: a silent return would leave
+    ``reuse_registered_buffers: true`` reading as on while the pool is
+    never built, with no symptom besides lost throughput.
     """
     try:
         from transfer_queue.storage.clients import mooncake_client as _mc
@@ -340,11 +374,25 @@ def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
             "_batch_upsert_with_retry",
         )
     ):
-        return
+        raise _tq_shape_drift_error(
+            "MooncakeStoreClient no longer has the methods the staging pool "
+            "patches",
+            "reuse_registered_buffers cannot be honoured and every transfer "
+            "would silently re-register its buffers",
+            "call sites",
+            opt_out=True,
+        )
 
     _n_slots_raw = getattr(_mc, "MAX_BATCH_WORKER_THREADS", None)
     if not isinstance(_n_slots_raw, int):
-        return
+        raise _tq_shape_drift_error(
+            "mooncake_client module no longer exposes MAX_BATCH_WORKER_THREADS "
+            "as an int",
+            "the staging pool cannot be sized and reuse_registered_buffers "
+            "cannot be honoured",
+            "constant",
+            opt_out=True,
+        )
     n_slots: int = _n_slots_raw
     registry = _StagingPoolRegistry(n_slots, max_bytes)
 
