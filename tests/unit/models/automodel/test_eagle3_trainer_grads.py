@@ -113,3 +113,31 @@ def test_rope_inv_freq_stays_fp32_after_bf16_cast():
     assert model.rotary_emb.original_inv_freq.dtype == torch.float32
     # The rest of the model really did cast.
     assert model.fc.weight.dtype == torch.bfloat16
+
+
+def test_chunked_kl_matches_unchunked_reference(monkeypatch):
+    """Sequence-chunked + checkpointed KL must equal the one-shot computation
+    exactly (per-position KL is independent), including gradients."""
+    import torch
+
+    from nemo_rl.models.automodel.draft import eagle3_qwen3 as m
+
+    torch.manual_seed(0)
+    logits_ref = torch.randn(2, 7, 13, requires_grad=True)
+    targets = torch.randn(2, 7, 13)
+
+    reference = m._kl_div_per_position_chunk(logits_ref, targets)
+    reference.sum().backward()
+
+    monkeypatch.setattr(m, "_KL_CHUNK_TOKENS", 3)  # force multi-chunk path
+    logits_chunked = logits_ref.detach().clone().requires_grad_(True)
+    chunked = m._kl_div_per_position(logits_chunked, targets)
+    chunked.sum().backward()
+
+    assert torch.allclose(chunked, reference, atol=1e-6)
+    assert torch.allclose(logits_chunked.grad, logits_ref.grad, atol=1e-6)
+
+    # No-grad path (eval) takes the plain branch and must agree too.
+    with torch.no_grad():
+        eval_out = m._kl_div_per_position(logits_ref.detach(), targets)
+    assert torch.allclose(eval_out, reference, atol=1e-6)

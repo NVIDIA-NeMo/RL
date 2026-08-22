@@ -47,6 +47,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from torch import nn
 from transformers import DynamicCache
 from transformers.models.llama.modeling_llama import (
@@ -186,10 +187,47 @@ class Eagle3ForwardTerms:
     cond_acc_dens: list[torch.Tensor]
 
 
-def _kl_div_per_position(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+_KL_CHUNK_TOKENS = 2048
+
+
+def _kl_div_per_position_chunk(
+    logits: torch.Tensor, targets: torch.Tensor
+) -> torch.Tensor:
     log_p = F.log_softmax(logits, dim=-1, dtype=torch.float32)
     target_p = F.softmax(targets, dim=-1, dtype=torch.float32)
     return F.kl_div(log_p, target_p, reduction="none", log_target=False).sum(dim=-1)
+
+
+def _kl_div_per_position(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Per-position KL over the draft vocab, chunked along the sequence.
+
+    Each position's KL is independent, so chunking is mathematically exact.
+    The fp32 ``[*, chunk, V]`` transients (log_softmax, softmax, elementwise
+    kl) would otherwise materialize for the FULL row at once — at 18k-token
+    generations with a 32000 draft vocab that is ~2.3 GiB per tensor per TTT
+    step, which OOMs the tp=2 co-training layout. Checkpointing recomputes
+    the transients per chunk in backward (same pattern as the dspark loss's
+    chunked fp32 probability distance).
+    """
+    seq_len = logits.size(1)
+    if seq_len <= _KL_CHUNK_TOKENS:
+        return _kl_div_per_position_chunk(logits, targets)
+    pieces = []
+    for start in range(0, seq_len, _KL_CHUNK_TOKENS):
+        logit_chunk = logits[:, start : start + _KL_CHUNK_TOKENS]
+        target_chunk = targets[:, start : start + _KL_CHUNK_TOKENS]
+        if logits.requires_grad:
+            piece = checkpoint(
+                _kl_div_per_position_chunk,
+                logit_chunk,
+                target_chunk,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            piece = _kl_div_per_position_chunk(logit_chunk, target_chunk)
+        pieces.append(piece)
+    return torch.cat(pieces, dim=1)
 
 
 def _align_for_step(
