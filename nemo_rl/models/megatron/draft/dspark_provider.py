@@ -200,6 +200,13 @@ class _DSparkProviderAdapter(nn.Module):
 
         confidence_logits = None
         if self.confidence_head is not None:
+            # The confidence path reads markov_w1 directly (no TP copy-region):
+            # every input here (draft_hidden, valid_mask, previous_token_ids) is
+            # TP-replicated full-sequence, so each rank computes the identical,
+            # complete gradient - wrapping in _CopyToTensorParallelRegion would
+            # over-count markov_w1.grad by the TP world size. If a future change
+            # delivers sequence-sharded draft_hidden, the metadata-agreement and
+            # slot-shape checks in dspark_tiled_objective fail loudly first.
             markov_embeddings = None
             if self.confidence_head.with_markov:
                 safe_previous_token_ids = torch.where(

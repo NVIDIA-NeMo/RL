@@ -364,11 +364,18 @@ def test_hard_ce_uses_explicit_sampled_labels_instead_of_teacher_argmax() -> Non
         pytest.param((1.75, 0.375, 2.25), id="mixed_non_unit"),
     ],
 )
+@pytest.mark.parametrize("token_chunk_size", [1, 2, 4, 100])
 def test_dspark_objective_matches_dense_component_oracles(
     loss_weights: tuple[float, float, float],
+    token_chunk_size: int,
 ) -> None:
-    """Wrong CE, TV factor, acceptance target, bins, or weights breaks literals."""
+    """Wrong CE, TV factor, acceptance target, bins, or weights breaks literals.
+
+    Chunk sizes cover single-token tiles, the default, a non-divisible boundary
+    (6 rows split 4+2), and a single oversized tile.
+    """
     inputs = _inputs()
+    inputs["token_chunk_size"] = token_chunk_size
     expected_ce, expected_tv, expected_confidence = _dense_oracle(inputs)
 
     actual = dspark_tiled_objective(**inputs, loss_weights=loss_weights)
