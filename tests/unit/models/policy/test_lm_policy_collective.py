@@ -194,7 +194,7 @@ def test_megatron_worker_target_only_skips_draft_preflight_and_payload(
     from nemo_rl.models.policy import utils as policy_utils
     from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
 
-    worker_cls = worker_module.MegatronPolicyWorkerImpl.__ray_metadata__.modified_class
+    worker_cls = worker_module.MegatronPolicyWorkerImpl
     worker = object.__new__(worker_cls)
     worker.rank = 0
     worker.model = object()
@@ -247,7 +247,7 @@ def test_megatron_collective_target_only_skips_draft_preflight_and_payload(
 ):
     from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
 
-    worker_cls = worker_module.MegatronPolicyWorkerImpl.__ray_metadata__.modified_class
+    worker_cls = worker_module.MegatronPolicyWorkerImpl
     worker = object.__new__(worker_cls)
     worker.model = object()
     worker.refit_conversion_tasks = []
