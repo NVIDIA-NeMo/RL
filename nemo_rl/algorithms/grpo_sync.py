@@ -34,6 +34,7 @@ from __future__ import annotations
 import gc
 import os
 import warnings
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -74,7 +75,13 @@ from nemo_rl.algorithms.draft_cadence_runtime import (
 from nemo_rl.algorithms.draft_update_schedule import (
     DraftDecisionLedger,
     DraftUpdateDecision,
+    DraftUpdateScheduler,
+    DraftStepTransaction,
+    DraftStepTransactionStore,
     FileDraftStepTransactionStore,
+    close_applied_draft_snapshot,
+    close_draft_step_transaction,
+    decision_outcome_payload,
 )
 from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
@@ -104,6 +111,7 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection
 
 
 def _raise_if_message_level_advantage_penalties_enabled(
@@ -168,6 +176,7 @@ def _train_policy_from_meta(
     train_fields: tuple[str, ...],
     master_config: MasterConfig,
     draft_update_decision: DraftUpdateDecision | None = None,
+    capture_draft_update_receipt: bool = False,
 ) -> dict[str, Any]:
     """Train one TQ step, using the split lifecycle required by packed CP."""
     if not _should_use_split_draft_training(master_config):
@@ -178,6 +187,8 @@ def _train_policy_from_meta(
         }
         if draft_update_decision is not None:
             train_kwargs["draft_update_decision"] = draft_update_decision
+        if capture_draft_update_receipt:
+            train_kwargs["capture_draft_update_receipt"] = True
         return policy.train_from_meta(
             meta,
             **train_kwargs,
@@ -204,6 +215,8 @@ def _train_policy_from_meta(
         begin_kwargs: dict[str, Any] = {}
         if draft_update_decision is not None:
             begin_kwargs["draft_update_decision"] = draft_update_decision
+        if capture_draft_update_receipt:
+            begin_kwargs["capture_draft_update_receipt"] = True
         policy.begin_train_step(loss_fn, **begin_kwargs)
         policy.train_microbatches_from_meta(
             meta,
@@ -482,6 +495,126 @@ def _compute_seq_logprob_error_metrics(
             seq_logprob_error_metrics.pop("num_masked_seqs")
         )
     return masking_data["sample_mask"], seq_logprob_error_metrics
+
+
+def apply_scheduled_refit(
+    decision: DraftUpdateDecision,
+    train_results: Mapping[str, object],
+    scheduler: DraftUpdateScheduler,
+    *,
+    transaction: DraftStepTransaction,
+    decision_ledger: DraftDecisionLedger,
+    grpo_save_state: GRPOSaveState,
+    transaction_store: DraftStepTransactionStore,
+    runtime_writer: CadenceRuntimeWriter | None,
+    terminal_evidence: CadenceTerminalEvidence | None,
+    sync_weights: Callable[..., Mapping[str, object]],
+    publish_target_version: Callable[[], None],
+    publish_draft_version: Callable[[int], None],
+) -> WeightSyncSelection:
+    """Close one scheduled train/refit transaction before publishing versions."""
+    update_ok = (
+        not decision.update_requested
+        or train_results.get("draft_update_successful") is True
+    )
+    if not update_ok:
+        outcome = decision_outcome_payload(
+            decision,
+            update_attempted=decision.update_requested,
+            update_successful=False,
+            draft_refit_attempted=False,
+            draft_refit_successful=False,
+        )
+        close_draft_step_transaction(
+            transaction,
+            decision=decision,
+            outcome=outcome,
+            applied_snapshot=None,
+            scheduler=scheduler,
+            decision_ledger=decision_ledger,
+            save_state=grpo_save_state,
+            transaction_store=transaction_store,
+        )
+        raise RuntimeError("draft update failed across workers before weight transfer")
+    selection = WeightSyncSelection(
+        target=True,
+        draft=decision.draft_refit_requested,
+    )
+    transfer_attempted = False
+    try:
+        if runtime_writer is not None:
+            if terminal_evidence is None:
+                raise RuntimeError("cadence runtime writer requires terminal evidence")
+            if decision.update_requested:
+                update_receipt = train_results.get("draft_update_receipt")
+                if not isinstance(update_receipt, Mapping):
+                    raise RuntimeError("successful draft update lacks worker receipt")
+                runtime_writer.successful_update_closed(
+                    decision=decision,
+                    worker_receipt=update_receipt,
+                    evidence=terminal_evidence,
+                    save_state=grpo_save_state,
+                )
+        elif terminal_evidence is not None:
+            raise RuntimeError("terminal evidence is enabled without runtime writer")
+        transfer_attempted = True
+        sync_receipt = sync_weights(selection=selection)
+        if sync_receipt.get("successful") is not True:
+            raise RuntimeError("target weight transfer receipt failed")
+        applied_snapshot = None
+        if selection.draft:
+            raw_receipt = sync_receipt.get("draft_apply_receipt")
+            if not isinstance(raw_receipt, Mapping):
+                raise RuntimeError("draft apply receipt is absent")
+            applied_snapshot = close_applied_draft_snapshot(
+                decision,
+                raw_receipt,
+                snapshot_path=Path(str(raw_receipt["snapshot_path"])),
+            )
+    except BaseException as transfer_error:
+        outcome = decision_outcome_payload(
+            decision,
+            update_attempted=decision.update_requested,
+            update_successful=decision.update_requested,
+            draft_refit_attempted=(
+                decision.draft_refit_requested and transfer_attempted
+            ),
+            draft_refit_successful=False,
+        )
+        close_draft_step_transaction(
+            transaction,
+            decision=decision,
+            outcome=outcome,
+            applied_snapshot=None,
+            scheduler=scheduler,
+            decision_ledger=decision_ledger,
+            save_state=grpo_save_state,
+            transaction_store=transaction_store,
+        )
+        raise transfer_error
+    outcome = decision_outcome_payload(
+        decision,
+        update_attempted=decision.update_requested,
+        update_successful=decision.update_requested,
+        draft_refit_attempted=decision.draft_refit_requested,
+        draft_refit_successful=decision.draft_refit_requested,
+    )
+    close_error = close_draft_step_transaction(
+        transaction,
+        decision=decision,
+        outcome=outcome,
+        applied_snapshot=applied_snapshot,
+        scheduler=scheduler,
+        decision_ledger=decision_ledger,
+        save_state=grpo_save_state,
+        transaction_store=transaction_store,
+    )
+    if close_error is not None:
+        raise close_error
+    publish_target_version()
+    if selection.draft:
+        publish_draft_version(decision.decision_id)
+    return selection
 
 
 def _log_completed_draft_refit(

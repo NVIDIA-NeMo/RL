@@ -16,7 +16,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import numpy as np
 import pytest
@@ -956,6 +956,39 @@ def test_train_policy_from_meta_uses_split_lifecycle_and_fields() -> None:
     policy.train_from_meta.assert_not_called()
 
 
+def test_train_policy_from_meta_captures_split_update_receipt_when_enabled() -> None:
+    policy = MagicMock()
+    policy.finish_train_step.return_value = {"draft_update_successful": True}
+    master_config = MagicMock()
+    master_config.policy = {
+        "draft": MagicMock(enabled=True, speculator_type="dflash"),
+        "megatron_cfg": {
+            "enabled": True,
+            "context_parallel_size": 2,
+            "sequence_parallel": True,
+        },
+        "sequence_packing": {"enabled": True},
+    }
+    decision = MagicMock()
+
+    _train_policy_from_meta(
+        policy,
+        MagicMock(),
+        loss_fn=MagicMock(),
+        timer=None,
+        train_fields=("input_ids",),
+        master_config=master_config,
+        draft_update_decision=decision,
+        capture_draft_update_receipt=True,
+    )
+
+    policy.begin_train_step.assert_called_once_with(
+        ANY,
+        draft_update_decision=decision,
+        capture_draft_update_receipt=True,
+    )
+
+
 def test_train_policy_from_meta_aborts_split_step_on_failure() -> None:
     policy = MagicMock()
     policy.train_microbatches_from_meta.side_effect = RuntimeError("backward failed")
@@ -1115,6 +1148,42 @@ def test_train_policy_from_meta_keeps_cp1_on_monolithic_path() -> None:
         train_fields=train_fields,
     )
     policy.begin_train_step.assert_not_called()
+
+
+def test_train_policy_from_meta_captures_cp1_update_receipt_when_enabled() -> None:
+    policy = MagicMock()
+    policy.train_from_meta.return_value = {"draft_update_successful": True}
+    master_config = MagicMock()
+    master_config.policy = {
+        "draft": MagicMock(enabled=True, speculator_type="dflash"),
+        "megatron_cfg": {
+            "enabled": True,
+            "context_parallel_size": 1,
+            "sequence_parallel": True,
+        },
+        "sequence_packing": {"enabled": True},
+    }
+    decision = MagicMock()
+
+    _train_policy_from_meta(
+        policy,
+        MagicMock(),
+        loss_fn=MagicMock(),
+        timer=None,
+        train_fields=("input_ids",),
+        master_config=master_config,
+        draft_update_decision=decision,
+        capture_draft_update_receipt=True,
+    )
+
+    policy.train_from_meta.assert_called_once_with(
+        ANY,
+        loss_fn=ANY,
+        timer=None,
+        train_fields=("input_ids",),
+        draft_update_decision=decision,
+        capture_draft_update_receipt=True,
+    )
 
 
 def test_multimodal_dedup_rejects_unqualified_transfer_paths(
