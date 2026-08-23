@@ -197,8 +197,8 @@ def test_gae_kl_penalty_in_rewards():
         mask=mask,
         lengths=lengths,
         values=values,
-        logprobs=logprobs,
-        reference_logprobs=reference_logprobs_same,
+        logprobs_policy=logprobs,
+        logprobs_reference=reference_logprobs_same,
     )
     adv_no_kl, _ = estimator.compute_advantage(
         prompt_ids=torch.tensor([[0]]),
@@ -218,8 +218,8 @@ def test_gae_kl_penalty_in_rewards():
         mask=mask,
         lengths=lengths,
         values=values,
-        logprobs=logprobs,
-        reference_logprobs=reference_logprobs_divergent,
+        logprobs_policy=logprobs,
+        logprobs_reference=reference_logprobs_divergent,
     )
     assert not torch.allclose(adv_kl_positive, adv_no_kl), (
         "Non-zero KL should change advantages relative to the no-KL baseline"
@@ -239,8 +239,8 @@ def test_gae_kl_penalty_in_rewards():
         mask=mask,
         lengths=lengths,
         values=values,
-        logprobs=logprobs,
-        reference_logprobs=reference_logprobs_divergent,
+        logprobs_policy=logprobs,
+        logprobs_reference=reference_logprobs_divergent,
     )
     torch.testing.assert_close(adv_gate_off, adv_no_kl)
 
