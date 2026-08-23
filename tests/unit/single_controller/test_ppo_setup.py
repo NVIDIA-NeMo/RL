@@ -236,6 +236,16 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
+    def test_rejects_a_ppo_epoch_count_below_one(self):
+        mc = _ppo_master_config(
+            ppo=PPOConfig.model_construct(
+                max_num_steps=100, ppo_epochs=0, **_STEP_CONFIG
+            )
+        )
+
+        with pytest.raises(ValueError, match="ppo_epochs must be at least 1"):
+            validate_single_controller_config(mc)
+
     def test_rejects_non_gae_estimator(self):
         with pytest.raises(ValueError):
             PPOConfig(adv_estimator={"name": "grpo"})
@@ -296,12 +306,31 @@ class TestAdvantageEstimatorSelection:
 
 class TestMegatronTrainIters:
     def test_injects_into_both_policy_and_value(self):
-        mc = _ppo_master_config(megatron_enabled=True, max_num_steps=7)
+        mc = _ppo_master_config(
+            megatron_enabled=True,
+            ppo=PPOConfig.model_construct(
+                max_num_steps=7, ppo_epochs=1, **_STEP_CONFIG
+            ),
+        )
 
         sc_setup_mod._maybe_inject_megatron_train_iters(mc)
 
         assert mc.policy["megatron_cfg"]["train_iters"] == 7
         assert mc.value["megatron_cfg"]["train_iters"] == 7
+
+    def test_scales_the_tick_budget_by_ppo_epochs(self):
+        """Each epoch steps both optimizers, so each is a scheduler tick."""
+        mc = _ppo_master_config(
+            megatron_enabled=True,
+            ppo=PPOConfig.model_construct(
+                max_num_steps=7, ppo_epochs=3, **_STEP_CONFIG
+            ),
+        )
+
+        sc_setup_mod._maybe_inject_megatron_train_iters(mc)
+
+        assert mc.policy["megatron_cfg"]["train_iters"] == 21
+        assert mc.value["megatron_cfg"]["train_iters"] == 21
 
     def test_skips_a_critic_on_a_non_megatron_backend(self):
         mc = _ppo_master_config(megatron_enabled=False, max_num_steps=7)

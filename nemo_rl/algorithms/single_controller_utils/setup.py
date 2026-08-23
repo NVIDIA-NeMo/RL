@@ -425,19 +425,24 @@ def _clamp_max_num_steps(
 
 def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     """Set train_iters from max_num_steps after its dataloader clamp."""
-    max_num_steps = algo_config(master_config).max_num_steps
+    algo_cfg = algo_config(master_config)
+    is_ppo = is_ppo_run(master_config)
+    # train_iters is a scheduler-tick budget, and each PPO epoch steps both
+    # optimizers once, so the configured warmup/decay horizon has to be scaled.
+    ppo_epochs = algo_cfg.ppo_epochs if is_ppo else 1
+    train_iters = algo_cfg.max_num_steps * ppo_epochs
 
     # policy
     policy_config = master_config.policy
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        policy_config["megatron_cfg"]["train_iters"] = max_num_steps
+        policy_config["megatron_cfg"]["train_iters"] = train_iters
 
     # value
-    if not is_ppo_run(master_config):
+    if not is_ppo:
         return
     value_config = master_config.value
     if value_config.get("megatron_cfg", {}).get("enabled", False):
-        value_config["megatron_cfg"]["train_iters"] = max_num_steps  # type: ignore
+        value_config["megatron_cfg"]["train_iters"] = train_iters  # type: ignore[index]
 
 
 def _maybe_attach_fleet_health(
