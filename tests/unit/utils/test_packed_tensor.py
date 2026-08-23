@@ -313,3 +313,69 @@ def test_packed_broadcast_midstream_failure_reaches_consumer(monkeypatch):
 
     assert loaded_names == ["first.weight"]
     assert consumer_group.current_index == len(producer_group.broadcasted_tensors)
+
+
+def test_packed_broadcast_consumer_drains_after_load_failure(monkeypatch):
+    class ImmediateStream:
+        def synchronize(self):
+            return None
+
+    original_empty = torch.empty
+    original_tensor = torch.tensor
+
+    def force_cpu(factory):
+        def wrapped(*args, **kwargs):
+            device = kwargs.get("device")
+            if device is not None and torch.device(device).type == "cuda":
+                kwargs["device"] = "cpu"
+            return factory(*args, **kwargs)
+
+        return wrapped
+
+    monkeypatch.setattr(torch, "empty", force_cpu(original_empty))
+    monkeypatch.setattr(torch, "tensor", force_cpu(original_tensor))
+    monkeypatch.setattr(torch.cuda, "Stream", ImmediateStream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size", lambda: 1
+    )
+    monkeypatch.setattr("nemo_rl.utils.packed_tensor.get_num_buffers", lambda: 1)
+
+    producer_group = MockCommunicationGroup()
+    packed_broadcast_producer(
+        iterator=iter(
+            [
+                ("first.weight", torch.tensor([1.0])),
+                ("second.weight", torch.tensor([2.0])),
+            ]
+        ),
+        group=producer_group,
+        src=0,
+        post_iter_func=lambda item: item[1],
+    )
+
+    callback_error = RuntimeError("injected consumer load failure")
+    callback_names = []
+
+    def fail_first_load(tensors):
+        callback_names.append([name for name, _ in tensors])
+        raise callback_error
+
+    consumer_group = MockConsumerCommunicationGroup(producer_group.broadcasted_tensors)
+    with pytest.raises(RuntimeError, match="injected consumer load failure") as error:
+        packed_broadcast_consumer(
+            iterator=iter(
+                [
+                    ("first.weight", ((1,), torch.float32)),
+                    ("second.weight", ((1,), torch.float32)),
+                ]
+            ),
+            group=consumer_group,
+            src=0,
+            post_unpack_func=fail_first_load,
+        )
+
+    assert error.value is callback_error
+    assert callback_names == [["first.weight"]]
+    assert consumer_group.current_index == len(producer_group.broadcasted_tensors)

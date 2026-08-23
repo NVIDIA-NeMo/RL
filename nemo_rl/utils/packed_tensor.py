@@ -79,6 +79,7 @@ def _broadcast_packed_frame_header(
     status: int,
     num_bytes: int = 0,
     num_tensors: int = 0,
+    readback: bool = True,
 ) -> tuple[int, int, int]:
     """Broadcast one fixed-size payload frame header."""
     header = torch.tensor(
@@ -87,6 +88,8 @@ def _broadcast_packed_frame_header(
         device=torch.device("cuda", torch.cuda.current_device()),
     )
     group.broadcast(header, src=src)
+    if not readback:
+        return status, num_bytes, num_tensors
     received = header.cpu().tolist()
     if len(received) != _PACKED_FRAME_HEADER_WORDS:
         raise RuntimeError("Invalid packed-broadcast frame header")
@@ -119,6 +122,14 @@ def packed_broadcast_producer(
     Returns:
         None
 
+    Note:
+        Synchronous Python iterator, export, and packing failures are published
+        as an ERROR frame. Stream synchronization, CUDA allocation/kernel/OOM,
+        and NCCL/broadcast failures are communicator-fatal and propagate
+        directly; this protocol cannot use a failed CUDA context or transport
+        to publish a terminal collective. Peer liveness in that case requires
+        communicator teardown by the caller.
+
     """
     if not preflight_checked:
         packed_broadcast_preflight_producer(group, src, preflight_error)
@@ -145,12 +156,14 @@ def packed_broadcast_producer(
     while not iterator_exhausted:
         # Move to the next buffer
         buffer_idx = (buffer_idx + 1) % num_buffers
-        # Synchronize the current stream
+        # CUDA/NCCL failures at a stream fence are communicator-fatal. Do not
+        # pretend that another collective on the same context can report them.
         streams[buffer_idx].synchronize()
         try:
             # Prepare a complete frame before publishing its DATA header. Any
-            # lazy export failure can then be reported without leaving the
-            # consumer waiting for a payload that will never be broadcast.
+            # synchronous Python export failure can then be reported without
+            # leaving the consumer waiting for a payload that will never be
+            # broadcast.
             with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
                 # Initialize the packing tensor list and sizes
                 packing_tensor_list[buffer_idx] = []
@@ -180,18 +193,21 @@ def packed_broadcast_producer(
                     packed_tensors[buffer_idx] = torch.cat(
                         packing_tensor_list[buffer_idx], dim=0
                     )
-        except Exception:
-            # Preserve ordering with payloads already enqueued on side streams
-            # before publishing the terminal producer failure.
-            for stream in streams:
-                stream.synchronize()
-            _broadcast_packed_frame_header(
-                group,
-                src,
-                status=_PACKED_FRAME_ERROR,
-            )
+        except BaseException:
+            try:
+                _broadcast_packed_frame_header(
+                    group,
+                    src,
+                    status=_PACKED_FRAME_ERROR,
+                )
+            except BaseException:
+                pass
             raise
 
+        # Detect deferred device/transport failures before DATA publication,
+        # but treat them as communicator-fatal rather than attempting another
+        # collective on a potentially failed CUDA context.
+        streams[buffer_idx].synchronize()
         with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
             if packing_tensor_list[buffer_idx]:
                 _broadcast_packed_frame_header(
@@ -200,6 +216,7 @@ def packed_broadcast_producer(
                     status=_PACKED_FRAME_DATA,
                     num_bytes=packing_tensor_sizes[buffer_idx],
                     num_tensors=len(packing_tensor_list[buffer_idx]),
+                    readback=False,
                 )
                 group.broadcast(packed_tensors[buffer_idx], src=src)
             if iterator_exhausted:
@@ -207,6 +224,7 @@ def packed_broadcast_producer(
                     group,
                     src,
                     status=_PACKED_FRAME_COMPLETE,
+                    readback=False,
                 )
 
     # Join all packing/broadcast side streams before returning. Without this,
@@ -235,6 +253,14 @@ def packed_broadcast_consumer(
 
     Returns:
         None
+
+    Note:
+        Synchronous Python unpack and load-callback failures are preserved while
+        remaining frames are drained through the terminal frame. Stream
+        synchronization, CUDA allocation/kernel/OOM, and NCCL/broadcast failures
+        are communicator-fatal and propagate directly because further
+        collectives on that context or transport are not reliable. Peer liveness
+        in that case requires communicator teardown by the caller.
 
     """
     if not preflight_checked:
@@ -294,10 +320,11 @@ def packed_broadcast_consumer(
     ]
 
     protocol_error: str | None = None
+    consumer_error: BaseException | None = None
     while True:
         # Move to the next buffer
         buffer_idx = (buffer_idx + 1) % num_buffers
-        # Synchronize the current stream
+        # A deferred CUDA/NCCL failure invalidates the drain transport itself.
         streams[buffer_idx].synchronize()
         with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
             status, packed_size, tensor_count = _broadcast_packed_frame_header(
@@ -306,17 +333,21 @@ def packed_broadcast_consumer(
                 status=_PACKED_FRAME_DATA,
             )
             if status == _PACKED_FRAME_ERROR:
-                raise RuntimeError(
-                    "Packed-broadcast producer failed during payload transfer"
-                )
+                if consumer_error is None:
+                    consumer_error = RuntimeError(
+                        "Packed-broadcast producer failed during payload transfer"
+                    )
+                break
             if status == _PACKED_FRAME_COMPLETE:
                 try:
                     next(iterator)
                 except StopIteration:
                     break
-                raise RuntimeError(
-                    "Packed-broadcast producer completed before consumer metadata"
-                )
+                if protocol_error is None:
+                    protocol_error = (
+                        "Packed-broadcast producer completed before consumer metadata"
+                    )
+                break
             if status != _PACKED_FRAME_DATA or packed_size < 0 or tensor_count <= 0:
                 raise RuntimeError(
                     "Invalid packed-broadcast DATA frame: "
@@ -353,15 +384,16 @@ def packed_broadcast_consumer(
                     "Packed-broadcast payload size does not match consumer metadata: "
                     f"producer={packed_size}, consumer={packing_tensor_sizes[buffer_idx]}"
                 )
-            if protocol_error is None:
-                post_unpack_func(
-                    unpack_tensor(
-                        packed_tensors[buffer_idx], packing_tensor_meta_data[buffer_idx]
+            if protocol_error is None and consumer_error is None:
+                try:
+                    post_unpack_func(
+                        unpack_tensor(
+                            packed_tensors[buffer_idx],
+                            packing_tensor_meta_data[buffer_idx],
+                        )
                     )
-                )
-
-    if protocol_error is not None:
-        raise RuntimeError(protocol_error)
+                except BaseException as error:
+                    consumer_error = error
 
     # Join all recv/unpack/load side streams before returning. Without this,
     # generation can start reading model weights while the final unpack/load
@@ -370,3 +402,8 @@ def packed_broadcast_consumer(
     # stream without blocking).
     for s in streams:
         s.synchronize()
+
+    if consumer_error is not None:
+        raise consumer_error
+    if protocol_error is not None:
+        raise RuntimeError(protocol_error)
