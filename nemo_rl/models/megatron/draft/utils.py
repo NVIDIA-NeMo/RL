@@ -1841,6 +1841,7 @@ def _dflash_weight_layout(
     """Return the logical public shape and TP split axis for a body tensor."""
     hidden_size = int(config.hidden_size)
     intermediate_size = int(config.intermediate_size)
+    query_size = int(config.num_attention_heads) * int(config.head_dim)
     key_value_size = int(config.num_key_value_heads) * int(config.head_dim)
     if parameter_name == "fc.weight":
         return (hidden_size, hidden_size * int(config.num_target_taps)), 0
@@ -1850,10 +1851,10 @@ def _dflash_weight_layout(
     suffix = parameter_name.split(".", 2)[-1]
     layouts: dict[str, tuple[tuple[int, ...], int | None]] = {
         "input_layernorm.weight": ((hidden_size,), None),
-        "self_attn.q_proj.weight": ((hidden_size, hidden_size), 0),
+        "self_attn.q_proj.weight": ((query_size, hidden_size), 0),
         "self_attn.k_proj.weight": ((key_value_size, hidden_size), 0),
         "self_attn.v_proj.weight": ((key_value_size, hidden_size), 0),
-        "self_attn.o_proj.weight": ((hidden_size, hidden_size), 1),
+        "self_attn.o_proj.weight": ((hidden_size, query_size), 1),
         "self_attn.q_norm.weight": ((int(config.head_dim),), None),
         "self_attn.k_norm.weight": ((int(config.head_dim),), None),
         "post_attention_layernorm.weight": ((hidden_size,), None),
