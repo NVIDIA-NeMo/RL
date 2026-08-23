@@ -22,6 +22,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Capture DRY_RUN passed on the command line BEFORE sourcing swe_nano.env, which
 # exports DRY_RUN=1 and would otherwise clobber the caller's value.
 _DRY_RUN_IN="${DRY_RUN:-}"
+_USE_SNAPSHOT_IN="${USE_SNAPSHOT:-}"
 
 set -a
 # shellcheck disable=SC1091
@@ -34,6 +35,7 @@ CONFIG_PATH="${CODE_DIR}/examples/configs/ultra/nano_swe_teacher_sc.yaml"
 RESULTS_DIR="${WORKSPACE_DIR}/results/${EXP_NAME}"
 BASE_LOG_DIR="${WORKSPACE_DIR}/ray_logs/${EXP_NAME}"
 [ -n "${_DRY_RUN_IN}" ] && DRY_RUN="${_DRY_RUN_IN}"
+[ -n "${_USE_SNAPSHOT_IN}" ] && USE_SNAPSHOT="${_USE_SNAPSHOT_IN}"
 set +a
 
 bash "${HERE}/ultra_launch.sh" "$@"

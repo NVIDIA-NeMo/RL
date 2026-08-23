@@ -17,6 +17,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 _DRY_RUN_IN="${DRY_RUN:-}"
 _WALLTIME_IN="${WALLTIME:-}"
+_USE_SNAPSHOT_IN="${USE_SNAPSHOT:-}"
 
 set -a
 # shellcheck disable=SC1091
@@ -43,6 +44,7 @@ if [ "${CALL_TIMING:-1}" = "1" ]; then
 fi
 [ -n "${_DRY_RUN_IN}" ] && DRY_RUN="${_DRY_RUN_IN}"
 [ -n "${_WALLTIME_IN}" ] && WALLTIME="${_WALLTIME_IN}"
+[ -n "${_USE_SNAPSHOT_IN}" ] && USE_SNAPSHOT="${_USE_SNAPSHOT_IN}"
 set +a
 
 bash "${HERE}/ultra_launch.sh" \
