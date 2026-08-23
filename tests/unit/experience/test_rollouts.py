@@ -2209,6 +2209,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
     manager._tokenizer = None
+    manager._effort_config = None
     manager._result_to_completion = lambda result: result["value"]
     manager._compute_rollout_metrics = lambda completions, agent: {
         "completion_count": len(completions),

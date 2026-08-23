@@ -16,7 +16,6 @@ import asyncio
 import copy
 import enum
 import json
-import statistics
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -46,7 +45,7 @@ from nemo_rl.experience.rollouts import (
     _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
     _dummy_routed_experts_for_tokens,
-    _EffortShapingMetrics,
+    _effort_shaping_metrics,
     _find_routed_experts_template,
     _tensorize_by_key,
     attach_static_multimodal_payload,
@@ -1007,8 +1006,10 @@ class AsyncNemoGymRolloutImpl:
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):
             rollout_metrics = self._compute_rollout_metrics(
-                completions, inputs[0]["agent_ref"]["name"], shaping
+                completions, inputs[0]["agent_ref"]["name"]
             )
+            # Same helper the batched path uses, so the two cannot drift apart.
+            rollout_metrics.update(_effort_shaping_metrics(shaping))
 
         rollout_metrics.update(env_timing_metrics)
 
@@ -1045,7 +1046,6 @@ class AsyncNemoGymRolloutImpl:
         self,
         completions: list[Completion],
         agent_name: str,
-        shaping: _EffortShapingMetrics,
     ) -> dict[str, Any]:
         """Aggregate per-sample and per-agent metrics."""
         # Prepare lists of values for each metric.
@@ -1118,30 +1118,6 @@ class AsyncNemoGymRolloutImpl:
             "gen_tokens_per_sample/mean"
         ]
 
-        # Length-based reward shaping metrics for low-effort prompts. Empty lists
-        # (shaping disabled or no matching prompt) leave rollout_metrics untouched.
-        if shaping.length_rewards_low:
-            rollout_metrics["mean_length_reward_low"] = sum(
-                shaping.length_rewards_low
-            ) / len(shaping.length_rewards_low)
-        if shaping.rewards_low:
-            rollout_metrics["mean_reward_low"] = sum(shaping.rewards_low) / len(
-                shaping.rewards_low
-            )
-        if shaping.low_lengths:
-            rollout_metrics["mean_length_low"] = sum(shaping.low_lengths) / len(
-                shaping.low_lengths
-            )
-            rollout_metrics["median_length_low"] = float(
-                statistics.median(shaping.low_lengths)
-            )
-        if shaping.high_lengths:
-            rollout_metrics["mean_length_high"] = sum(shaping.high_lengths) / len(
-                shaping.high_lengths
-            )
-            rollout_metrics["median_length_high"] = float(
-                statistics.median(shaping.high_lengths)
-            )
         return rollout_metrics
 
 
