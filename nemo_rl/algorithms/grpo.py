@@ -4727,6 +4727,16 @@ def async_grpo_train(
                     del initial_prompt_message_logs
                     del prompt_batched_flat
 
+                    # Match the synchronous GRPO path: native response-length
+                    # shaping must run after rollout collection and before the
+                    # shaped rewards are used to compute advantages. Reasoning-
+                    # length shaping is already applied by NeMo Gym before the
+                    # trajectory enters the replay buffer.
+                    if master_config.grpo.reward_shaping.response_length_enabled:
+                        repeated_batch = apply_reward_shaping(
+                            repeated_batch, master_config.grpo.reward_shaping
+                        )
+
                     rewards = repeated_batch["total_reward"]
 
                     print(

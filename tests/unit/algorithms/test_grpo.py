@@ -1357,6 +1357,83 @@ def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components)
     mock_grpo_components["policy"].shutdown.assert_called_once()
 
 
+def test_async_grpo_applies_response_length_shaping_before_advantages(
+    mock_grpo_components,
+):
+    """Native response-length shaping must affect async GRPO advantages."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.grpo.reward_shaping = GRPORewardShapingConfig(
+        enabled=True,
+        mode="response_length",
+        max_response_length=6,
+        overlong_buffer_length=2,
+        overlong_buffer_penalty=1.0,
+    )
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch["message_log"] = [
+        [
+            {
+                "role": "user",
+                "content": "test",
+                "token_ids": torch.tensor([1, 2, 3]),
+            },
+            {
+                "role": "assistant",
+                "content": "response",
+                "token_ids": torch.tensor([4, 5, 6, 7, 8]),
+                "generation_logprobs": torch.zeros(5),
+            },
+        ]
+    ]
+    mock_batch["total_reward"] = torch.tensor([1.0])
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 5.0}
+
+    advantage_estimator = MagicMock()
+    advantage_estimator.compute_advantage.return_value = torch.zeros(1, 2)
+    advantage_estimator.last_metrics = {}
+
+    with (
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        _patched_logprob_phase(mock_grpo_components["policy"]),
+        patch(
+            "nemo_rl.algorithms.grpo._create_advantage_estimator",
+            return_value=advantage_estimator,
+        ),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    advantage_kwargs = advantage_estimator.compute_advantage.call_args.kwargs
+    torch.testing.assert_close(advantage_kwargs["rewards"], torch.tensor([0.5]))
+    torch.testing.assert_close(
+        advantage_kwargs["repeated_batch"]["unshaped_total_reward"],
+        torch.tensor([1.0]),
+    )
+    torch.testing.assert_close(
+        advantage_kwargs["std_rewards"],
+        torch.tensor([1.0]),
+    )
+
+
 @pytest.mark.parametrize(
     ("generation_config", "expected"),
     [

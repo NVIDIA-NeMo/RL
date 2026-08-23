@@ -284,7 +284,7 @@ The validation set you pass in will directly be used for validation with no addi
             )
         # Check if async mode is enabled
         elif config.grpo.async_grpo.enabled:
-            # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
+            # Async GRPO does not support dynamic sampling or reward scaling.
             if config.grpo.use_dynamic_sampling:
                 raise NotImplementedError(
                     "use_dynamic_sampling is not supported with async GRPO"
@@ -293,11 +293,6 @@ The validation set you pass in will directly be used for validation with no addi
                 raise NotImplementedError(
                     "reward_scaling is not supported with async GRPO"
                 )
-            if config.grpo.reward_shaping.response_length_enabled:
-                raise NotImplementedError(
-                    "response-length reward shaping is not supported with async GRPO"
-                )
-
             # Async GRPO does not support multiple dataloaders
             if config.data["use_multiple_dataloader"]:
                 raise NotImplementedError(

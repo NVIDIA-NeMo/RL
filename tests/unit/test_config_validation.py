@@ -235,6 +235,58 @@ def test_vlm_launcher_dispatches_on_async_grpo_enabled():
     assert "grpo_train" in sync_calls
 
 
+@pytest.mark.parametrize(
+    "launcher_relpath",
+    [
+        "examples/run_grpo.py",
+        "examples/run_vlm_grpo.py",
+        "examples/nemo_gym/run_grpo_nemo_gym.py",
+    ],
+)
+def test_async_grpo_launchers_allow_reward_shaping(launcher_relpath: str):
+    """Keep launchers from rejecting shaping supported by async_grpo_train."""
+    launcher = Path(__file__).parents[2] / launcher_relpath
+    tree = ast.parse(launcher.read_text())
+
+    async_branches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "config.grpo.async_grpo.enabled"
+    ]
+    assert len(async_branches) == 1
+
+    unsupported_checks = [
+        ast.unparse(node.test)
+        for node in ast.walk(async_branches[0])
+        if isinstance(node, ast.If) and "reward_shaping" in ast.unparse(node.test)
+    ]
+    assert unsupported_checks == []
+
+
+def test_sync_rollout_actor_forwards_reward_shaping():
+    """Keep SingleController Gym rollouts on the same shaping path."""
+    actor_source = (
+        Path(__file__).parents[2] / "nemo_rl" / "experience" / "sync_rollout_actor.py"
+    )
+    tree = ast.parse(actor_source.read_text())
+    rollout_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_nemo_gym_rollout_sync"
+    ]
+    assert len(rollout_calls) == 1
+
+    reward_shaping_values = [
+        ast.unparse(keyword.value)
+        for keyword in rollout_calls[0].keywords
+        if keyword.arg == "reward_shaping_config"
+    ]
+    assert reward_shaping_values == ["cfg.grpo.reward_shaping"]
+
+
 def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
     """Unwanted-token penalty requires explicit unwanted-token config.
 
