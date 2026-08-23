@@ -279,13 +279,7 @@ def _model_templates(draft_model: Any) -> list[_ModelTemplate]:
             )
             if parameter is None:
                 raise RuntimeError(f"draft factory {value.key!r} has no live parameter")
-            for leaf in _expanded_sharded_values(value):
-                if not isinstance(leaf, ShardedTensor):
-                    raise TypeError(
-                        f"draft factory {value.key!r} produced unsupported "
-                        f"{type(leaf).__name__}"
-                    )
-                templates.append(_ModelTemplate(parameter, leaf))
+            templates.append(_ModelTemplate(parameter, value))
             return
         if isinstance(value, ShardedTensor):
             parameter = (
@@ -305,6 +299,92 @@ def _model_templates(draft_model: Any) -> list[_ModelTemplate]:
 
     visit(state)
     return templates
+
+
+def _sharded_tensor_leaves(value: Any) -> list[Any]:
+    from megatron.core.dist_checkpointing.mapping import (
+        ShardedTensor,
+        ShardedTensorFactory,
+    )
+
+    leaves = (
+        _expanded_sharded_values(value)
+        if isinstance(value, ShardedTensorFactory)
+        else [value]
+    )
+    if not all(isinstance(leaf, ShardedTensor) for leaf in leaves):
+        raise TypeError(
+            f"sharded factory {value.key!r} produced a non-tensor state leaf"
+        )
+    return leaves
+
+
+def _expanded_optimizer_factory_leaves(
+    factory: Any,
+    *,
+    logical_key: str,
+    tensor: torch.Tensor,
+    replica_id: int | tuple[int, ...],
+    flattened_range: tuple[int, int] | None,
+) -> list[Any]:
+    transformed = replace(
+        factory,
+        key=logical_key,
+        data=tensor,
+        replica_id=replica_id,
+        flattened_range=(
+            None
+            if flattened_range is None
+            else slice(flattened_range[0], flattened_range[1])
+        ),
+    )
+    return _sharded_tensor_leaves(transformed)
+
+
+def _factory_flattened_leaf_ranges(
+    full_leaves: Sequence[Any],
+    state_leaves: Sequence[Any],
+    *,
+    model_key: str,
+    state_key: str,
+    source_local_numel: int,
+    flattened_range: tuple[int, int],
+) -> list[tuple[Any, Any, tuple[int, int]]]:
+    source_start, source_end = flattened_range
+    cursor = 0
+    state_index = 0
+    ranged_leaves: list[tuple[Any, Any, tuple[int, int]]] = []
+    covered = 0
+    for full_leaf in full_leaves:
+        leaf_numel = full_leaf.data.numel()
+        overlap_start = max(source_start, cursor)
+        overlap_end = min(source_end, cursor + leaf_numel)
+        if overlap_start < overlap_end:
+            if state_index >= len(state_leaves):
+                raise RuntimeError("factory dropped a flattened optimizer leaf")
+            state_leaf = state_leaves[state_index]
+            state_index += 1
+            if (
+                not full_leaf.key.startswith(model_key)
+                or not state_leaf.key.startswith(state_key)
+                or full_leaf.key[len(model_key) :] != state_leaf.key[len(state_key) :]
+            ):
+                raise RuntimeError("factory optimizer leaf identity mismatch")
+            local_range = (overlap_start - cursor, overlap_end - cursor)
+            if state_leaf.data.numel() != local_range[1] - local_range[0]:
+                raise RuntimeError(
+                    f"factory flattened leaf size mismatch for {state_leaf.key}"
+                )
+            ranged_leaves.append((state_leaf, full_leaf, local_range))
+            covered += state_leaf.data.numel()
+        cursor += leaf_numel
+    if (
+        cursor != source_local_numel
+        or covered != source_end - source_start
+        or state_index != len(state_leaves)
+    ):
+        raise RuntimeError("factory flattened leaves do not cover the local slice")
+    return ranged_leaves
 
 
 def _record_from_sharded_tensor(
@@ -351,12 +431,13 @@ def _regular_param_state_map(optimizer: Any) -> dict[torch.nn.Parameter, Any]:
     if isinstance(optimizer, ChainedOptimizer):
         merged: dict[torch.nn.Parameter, Any] = {}
         for child in optimizer.chained_optimizers:
-            overlap = merged.keys() & _regular_param_state_map(child).keys()
+            child_state = _regular_param_state_map(child)
+            overlap = merged.keys() & child_state.keys()
             if overlap:
                 raise RuntimeError(
                     "draft parameter appears in multiple chained optimizers"
                 )
-            merged.update(_regular_param_state_map(child))
+            merged.update(child_state)
         return merged
 
     model_to_main: dict[torch.nn.Parameter, torch.nn.Parameter] = {}
@@ -390,8 +471,9 @@ def _optimizer_group_records(
     )
     records: list[CanonicalDraftStateRecord] = []
     for optimizer_index, child in enumerate(children):
+        owned_group_indexes = _owned_optimizer_group_indexes(child, draft_parameters)
         for group_index, group in enumerate(child.optimizer.param_groups):
-            if not any(parameter in draft_parameters for parameter in group["params"]):
+            if group_index not in owned_group_indexes:
                 continue
             for key, value in sorted(group.items()):
                 if key == "params":
@@ -408,22 +490,58 @@ def _optimizer_group_records(
     return records
 
 
+def _owned_optimizer_group_indexes(
+    optimizer: Any, draft_parameters: set[torch.nn.Parameter]
+) -> set[int]:
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+    from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
+
+    if isinstance(optimizer, DistributedOptimizer):
+        return {
+            int(group_index)
+            for parameter, (
+                group_index,
+                _,
+            ) in optimizer.model_param_group_index_map.items()
+            if parameter in draft_parameters
+        }
+
+    owned_parameters = set(draft_parameters)
+    if isinstance(optimizer, Float16OptimizerWithFloat16Params):
+        live_to_master: dict[torch.nn.Parameter, torch.nn.Parameter] = {}
+        for live_group, master_group in zip(
+            optimizer.float16_groups, optimizer.fp32_from_float16_groups
+        ):
+            live_to_master.update(zip(live_group, master_group))
+        for native_group in optimizer.fp32_from_fp32_groups:
+            live_to_master.update((parameter, parameter) for parameter in native_group)
+        owned_parameters = {
+            master
+            for live, master in live_to_master.items()
+            if live in draft_parameters
+        }
+    return {
+        group_index
+        for group_index, group in enumerate(optimizer.optimizer.param_groups)
+        if any(parameter in owned_parameters for parameter in group["params"])
+    }
+
+
 def _distributed_optimizer_records(
     optimizer: Any, templates: list[_ModelTemplate]
 ) -> list[CanonicalDraftStateRecord]:
-    from megatron.core.dist_checkpointing.mapping import is_main_replica
+    from megatron.core.dist_checkpointing.mapping import (
+        ShardedTensorFactory,
+        is_main_replica,
+    )
 
     validate_pinned_distributed_optimizer_class(type(optimizer))
     instance_id = int(optimizer.distributed_optimizer_instance_id)
     records: list[CanonicalDraftStateRecord] = []
-    seen_parameters: set[torch.nn.Parameter] = set()
     for template in templates:
         parameter = template.parameter
         if parameter not in optimizer.model_param_group_index_map:
             continue
-        if parameter in seen_parameters:
-            continue
-        seen_parameters.add(parameter)
         sharded = template.value
         replica_id = optimizer_replica_id(sharded.replica_id, instance_id=instance_id)
         if not is_main_replica(replica_id):
@@ -454,17 +572,46 @@ def _distributed_optimizer_records(
                     )
                 )
                 continue
-            records.append(
-                _record_from_sharded_tensor(
-                    component="optimizer",
-                    logical_key=f"{sharded.key}/{key}",
-                    sharded=sharded,
+            if isinstance(sharded, ShardedTensorFactory):
+                logical_key = f"{sharded.key}/{key}"
+                full_leaves = _sharded_tensor_leaves(sharded)
+                leaves = _expanded_optimizer_factory_leaves(
+                    sharded,
+                    logical_key=logical_key,
                     tensor=tensor,
                     replica_id=replica_id,
                     flattened_range=flattened_range,
-                    base_local_shape=tuple(sharded.local_shape),
                 )
-            )
+                for leaf, full_leaf, leaf_range in _factory_flattened_leaf_ranges(
+                    full_leaves,
+                    leaves,
+                    model_key=sharded.key,
+                    state_key=logical_key,
+                    source_local_numel=sharded.data.numel(),
+                    flattened_range=flattened_range,
+                ):
+                    records.append(
+                        _record_from_sharded_tensor(
+                            component="optimizer",
+                            logical_key=leaf.key,
+                            sharded=full_leaf,
+                            tensor=leaf.data,
+                            replica_id=replica_id,
+                            flattened_range=leaf_range,
+                        )
+                    )
+            else:
+                records.append(
+                    _record_from_sharded_tensor(
+                        component="optimizer",
+                        logical_key=f"{sharded.key}/{key}",
+                        sharded=sharded,
+                        tensor=tensor,
+                        replica_id=replica_id,
+                        flattened_range=flattened_range,
+                        base_local_shape=tuple(sharded.local_shape),
+                    )
+                )
     return records
 
 
@@ -474,6 +621,8 @@ def _regular_optimizer_records(
     from megatron.core.dist_checkpointing.mapping import is_main_replica
 
     records: list[CanonicalDraftStateRecord] = []
+    from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
+
     state_map = _regular_param_state_map(optimizer)
     for template in templates:
         if template.parameter not in state_map:
@@ -495,15 +644,34 @@ def _regular_optimizer_records(
         for key, value in sorted(state.items()):
             logical_key = f"{sharded.key}/{key}"
             if isinstance(value, torch.Tensor) and value.numel() > 1:
-                records.append(
-                    _record_from_sharded_tensor(
-                        component="optimizer",
+                if isinstance(sharded, ShardedTensorFactory):
+                    leaves = _expanded_optimizer_factory_leaves(
+                        sharded,
                         logical_key=logical_key,
-                        sharded=sharded,
                         tensor=value,
                         replica_id=sharded.replica_id,
+                        flattened_range=None,
                     )
-                )
+                    for leaf in leaves:
+                        records.append(
+                            _record_from_sharded_tensor(
+                                component="optimizer",
+                                logical_key=leaf.key,
+                                sharded=leaf,
+                                tensor=leaf.data,
+                                replica_id=leaf.replica_id,
+                            )
+                        )
+                else:
+                    records.append(
+                        _record_from_sharded_tensor(
+                            component="optimizer",
+                            logical_key=logical_key,
+                            sharded=sharded,
+                            tensor=value,
+                            replica_id=sharded.replica_id,
+                        )
+                    )
             else:
                 records.append(
                     CanonicalDraftStateRecord.for_scalar(
@@ -527,18 +695,18 @@ def canonical_draft_state_records(
     templates = _model_templates(draft_model)
     records: list[CanonicalDraftStateRecord] = []
     for template in templates:
-        sharded = template.value
-        if not is_main_replica(sharded.replica_id):
-            continue
-        records.append(
-            _record_from_sharded_tensor(
-                component="model",
-                logical_key=sharded.key,
-                sharded=sharded,
-                tensor=sharded.data,
-                replica_id=sharded.replica_id,
+        for sharded in _sharded_tensor_leaves(template.value):
+            if not is_main_replica(sharded.replica_id):
+                continue
+            records.append(
+                _record_from_sharded_tensor(
+                    component="model",
+                    logical_key=sharded.key,
+                    sharded=sharded,
+                    tensor=sharded.data,
+                    replica_id=sharded.replica_id,
+                )
             )
-        )
 
     draft_parameters = {template.parameter for template in templates}
     records.extend(_optimizer_group_records(optimizer, draft_parameters))

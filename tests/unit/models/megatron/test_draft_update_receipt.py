@@ -17,6 +17,7 @@ from __future__ import annotations
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import sys
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -82,6 +83,365 @@ def _decision() -> Any:
         reason="always",
         observed_acceptance=None,
     )
+
+
+def _install_fake_optimizer_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[type[Any], type[Any], type[Any]]:
+    class FakeChainedOptimizer:
+        pass
+
+    class FakeFloat16OptimizerWithFloat16Params:
+        pass
+
+    class FakeDistributedOptimizer:
+        pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core.optimizer.optimizer",
+        SimpleNamespace(
+            ChainedOptimizer=FakeChainedOptimizer,
+            Float16OptimizerWithFloat16Params=FakeFloat16OptimizerWithFloat16Params,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core.optimizer.distrib_optimizer",
+        SimpleNamespace(DistributedOptimizer=FakeDistributedOptimizer),
+    )
+    return (
+        FakeChainedOptimizer,
+        FakeFloat16OptimizerWithFloat16Params,
+        FakeDistributedOptimizer,
+    )
+
+
+def _install_fake_mapping_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[type[Any], type[Any]]:
+    @dataclass
+    class FakeShardedTensor:
+        key: str
+        data: torch.Tensor
+        dtype: torch.dtype
+        local_shape: tuple[int, ...]
+        global_shape: tuple[int, ...]
+        global_offset: tuple[int, ...]
+        axis_fragmentations: tuple[int, ...] | None
+        replica_id: int | tuple[int, ...] = 0
+        prepend_axis_num: int = 0
+
+    @dataclass
+    class FakeShardedTensorFactory:
+        key: str
+        data: torch.Tensor
+        build_fn: Any
+        merge_fn: Any
+        replica_id: int | tuple[int, ...] = 0
+        flattened_range: slice | None = None
+
+        def build(self) -> Any:
+            return self.build_fn(
+                self.key,
+                self.data,
+                self.replica_id,
+                self.flattened_range,
+            )
+
+    def apply_factories(container: Any) -> None:
+        def expand(value: Any) -> Any:
+            if isinstance(value, FakeShardedTensorFactory):
+                return expand(value.build())
+            if isinstance(value, dict):
+                return {key: expand(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [expand(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(expand(item) for item in value)
+            return value
+
+        expanded = expand(container)
+        container.clear()
+        container.update(expanded)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core.dist_checkpointing.mapping",
+        SimpleNamespace(
+            ShardedTensor=FakeShardedTensor,
+            ShardedTensorFactory=FakeShardedTensorFactory,
+            apply_factories=apply_factories,
+            is_main_replica=lambda replica_id: (
+                replica_id == 0
+                if isinstance(replica_id, int)
+                else all(item == 0 for item in replica_id)
+            ),
+        ),
+    )
+    return FakeShardedTensor, FakeShardedTensorFactory
+
+
+def _root_with_group_records(
+    receipt: Any,
+    group_records: list[Any],
+) -> str:
+    records = [
+        receipt.CanonicalDraftStateRecord.for_tensor(
+            component="model",
+            logical_key="draft.weight",
+            global_shape=(1,),
+            global_offset=(0,),
+            local_tensor=torch.tensor([1.0]),
+            replica_id=0,
+        ),
+        receipt.CanonicalDraftStateRecord.for_scalar(
+            component="optimizer",
+            logical_key="draft.weight/state_initialized",
+            value=False,
+            replica_id=0,
+            record_kind="state_marker",
+        ),
+        *group_records,
+    ]
+    return receipt.canonical_draft_state_roots(records).optimizer_sha256
+
+
+def test_float16_group_hyperparameters_follow_live_to_master_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt = _receipt_module()
+    _, float16_cls, _ = _install_fake_optimizer_modules(monkeypatch)
+    model_parameter = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+    master_parameter = torch.nn.Parameter(model_parameter.float())
+    optimizer = object.__new__(float16_cls)
+    optimizer.float16_groups = [[model_parameter]]
+    optimizer.fp32_from_float16_groups = [[master_parameter]]
+    optimizer.fp32_from_fp32_groups = [[]]
+    optimizer.optimizer = SimpleNamespace(
+        param_groups=[{"params": [master_parameter], "lr": 1.0e-4}]
+    )
+
+    before_records = receipt._optimizer_group_records(optimizer, {model_parameter})
+    before = _root_with_group_records(receipt, before_records)
+    optimizer.optimizer.param_groups[0]["lr"] = 2.0e-4
+    after = _root_with_group_records(
+        receipt,
+        receipt._optimizer_group_records(optimizer, {model_parameter}),
+    )
+
+    assert sum(record.logical_key.endswith("/lr") for record in before_records) == 1
+    assert before != after
+
+
+def test_distributed_group_hyperparameters_follow_model_group_index_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt = _receipt_module()
+    _, _, distributed_cls = _install_fake_optimizer_modules(monkeypatch)
+    model_parameter = torch.nn.Parameter(torch.ones(1))
+    local_main_slice = torch.nn.Parameter(torch.ones(1))
+    optimizer = object.__new__(distributed_cls)
+    optimizer.model_param_group_index_map = {model_parameter: (0, 0)}
+    optimizer.optimizer = SimpleNamespace(
+        param_groups=[{"params": [local_main_slice], "lr": 1.0e-4}]
+    )
+
+    before_records = receipt._optimizer_group_records(optimizer, {model_parameter})
+    before = _root_with_group_records(receipt, before_records)
+    optimizer.optimizer.param_groups[0]["lr"] = 2.0e-4
+    after = _root_with_group_records(
+        receipt,
+        receipt._optimizer_group_records(optimizer, {model_parameter}),
+    )
+
+    assert sum(record.logical_key.endswith("/lr") for record in before_records) == 1
+    assert before != after
+
+
+def test_factory_transforms_regular_optimizer_moments_on_a_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt = _receipt_module()
+    _install_fake_optimizer_modules(monkeypatch)
+    sharded_tensor_cls, factory_cls = _install_fake_mapping_module(monkeypatch)
+    parameter = torch.nn.Parameter(torch.arange(4, dtype=torch.float32))
+
+    def build(
+        key: str,
+        data: torch.Tensor,
+        replica_id: int | tuple[int, ...],
+        flattened_range: slice | None,
+    ) -> dict[str, Any]:
+        assert flattened_range is None
+        return {
+            "left": sharded_tensor_cls(
+                f"{key}.left",
+                data[:2],
+                data.dtype,
+                (2,),
+                (2,),
+                (0,),
+                None,
+                replica_id,
+            ),
+            "right": sharded_tensor_cls(
+                f"{key}.right",
+                data[2:],
+                data.dtype,
+                (2,),
+                (2,),
+                (0,),
+                None,
+                replica_id,
+            ),
+        }
+
+    factory = factory_cls(
+        key="draft.weight",
+        data=parameter,
+        build_fn=build,
+        merge_fn=lambda state: torch.cat([state["left"], state["right"]]),
+    )
+    model = _DraftModel(parameter, {"weight": factory})
+    optimizer = SimpleNamespace(
+        optimizer=SimpleNamespace(
+            param_groups=[{"params": [parameter], "lr": 0.1}],
+            state={
+                parameter: {
+                    "exp_avg": torch.tensor([1.0, 2.0, 3.0, 4.0]),
+                }
+            },
+        )
+    )
+
+    records = receipt.canonical_draft_state_records(model, optimizer)
+    moments = {
+        record.logical_key: record
+        for record in records
+        if record.component == "optimizer" and "exp_avg" in record.logical_key
+    }
+    left_expected = receipt.CanonicalDraftStateRecord.for_tensor(
+        component="optimizer",
+        logical_key="unused",
+        global_shape=(2,),
+        global_offset=(0,),
+        local_tensor=torch.tensor([1.0, 2.0]),
+        replica_id=0,
+    )
+    right_expected = receipt.CanonicalDraftStateRecord.for_tensor(
+        component="optimizer",
+        logical_key="unused",
+        global_shape=(2,),
+        global_offset=(0,),
+        local_tensor=torch.tensor([3.0, 4.0]),
+        replica_id=0,
+    )
+
+    assert factory.data is parameter
+    assert set(moments) == {
+        "draft.weight/exp_avg.left",
+        "draft.weight/exp_avg.right",
+    }
+    assert moments["draft.weight/exp_avg.left"].num_bytes == 8
+    assert moments["draft.weight/exp_avg.right"].num_bytes == 8
+    assert (
+        moments["draft.weight/exp_avg.left"].tensor_sha256
+        == left_expected.tensor_sha256
+    )
+    assert (
+        moments["draft.weight/exp_avg.right"].tensor_sha256
+        == right_expected.tensor_sha256
+    )
+
+
+def test_distributed_factory_receives_flattened_range_and_keeps_all_leaves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt = _receipt_module()
+    _, _, distributed_cls = _install_fake_optimizer_modules(monkeypatch)
+    sharded_tensor_cls, factory_cls = _install_fake_mapping_module(monkeypatch)
+    monkeypatch.setattr(
+        receipt,
+        "validate_pinned_distributed_optimizer_class",
+        lambda cls: None,
+    )
+    parameter = torch.nn.Parameter(torch.arange(4, dtype=torch.float32))
+    build_ranges: list[tuple[int, int] | None] = []
+
+    def build(
+        key: str,
+        data: torch.Tensor,
+        replica_id: int | tuple[int, ...],
+        flattened_range: slice | None,
+    ) -> dict[str, Any]:
+        interval = (
+            None
+            if flattened_range is None
+            else (int(flattened_range.start), int(flattened_range.stop))
+        )
+        build_ranges.append(interval)
+        if flattened_range is None:
+            left, right = data[:2], data[2:]
+        else:
+            left, right = data[:1], data[1:]
+        return {
+            "left": sharded_tensor_cls(
+                f"{key}.left",
+                left,
+                data.dtype,
+                (2,),
+                (2,),
+                (0,),
+                None,
+                replica_id,
+            ),
+            "right": sharded_tensor_cls(
+                f"{key}.right",
+                right,
+                data.dtype,
+                (2,),
+                (2,),
+                (0,),
+                None,
+                replica_id,
+            ),
+        }
+
+    factory = factory_cls(
+        key="draft.weight",
+        data=parameter,
+        build_fn=build,
+        merge_fn=lambda state: torch.cat([state["left"], state["right"]]),
+        replica_id=(0, 0, 0),
+    )
+    model = _DraftModel(parameter, {"weight": factory})
+    optimizer = object.__new__(distributed_cls)
+    optimizer.distributed_optimizer_instance_id = 0
+    optimizer.model_param_group_index_map = {parameter: (0, 0)}
+    optimizer.optimizer = SimpleNamespace(
+        param_groups=[{"params": [torch.nn.Parameter(torch.ones(2))], "lr": 0.1}]
+    )
+    optimizer._get_model_param_range_map = lambda _: {
+        "param": SimpleNamespace(start=1, end=3)
+    }
+    optimizer._get_main_param_and_optimizer_states = lambda _: {
+        "param": torch.tensor([10.0, 11.0]),
+        "exp_avg": torch.tensor([1.0, 2.0]),
+    }
+
+    records = receipt.canonical_draft_state_records(model, optimizer)
+    moment_keys = {
+        record.logical_key
+        for record in records
+        if record.component == "optimizer" and "exp_avg" in record.logical_key
+    }
+
+    assert (1, 3) in build_ranges
+    assert moment_keys == {
+        "draft.weight/exp_avg.left",
+        "draft.weight/exp_avg.right",
+    }
 
 
 def test_schema_rejects_gapped_flattened_optimizer_coverage() -> None:
@@ -188,6 +548,11 @@ def test_factory_expands_on_a_container_copy() -> None:
     state = {"weight": factory}
     model = _DraftModel(parameter, state)
     base = torch.optim.AdamW([{"params": [parameter]}], lr=0.1)
+    base.state[parameter] = {
+        "step": torch.tensor(1.0),
+        "exp_avg": torch.tensor([1.0, 2.0, 3.0, 4.0]),
+        "exp_avg_sq": torch.tensor([2.0, 3.0, 4.0, 5.0]),
+    }
     optimizer = object.__new__(FP32Optimizer)
     optimizer.optimizer = base
 
@@ -198,6 +563,13 @@ def test_factory_expands_on_a_container_copy() -> None:
         record.logical_key for record in records if record.component == "model"
     }
     assert model_keys == {"draft.weight.left", "draft.weight.right"}
+    moments = {
+        record.logical_key: record
+        for record in records
+        if record.component == "optimizer" and "exp_avg" in record.logical_key
+    }
+    assert moments["draft.weight/exp_avg.left"].num_bytes == 8
+    assert moments["draft.weight/exp_avg.right"].num_bytes == 8
 
 
 def test_uninitialized_adam_emits_false_state_marker_without_fabrication() -> None:
