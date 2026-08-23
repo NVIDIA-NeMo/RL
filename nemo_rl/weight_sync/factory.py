@@ -79,6 +79,14 @@ def create_weight_synchronizer(
         )
 
     def checked(synchronizer: WeightSynchronizer) -> WeightSynchronizer:
+        if (
+            draft_update_schedule_mode != "always"
+            and generation_backend != VLLM_BACKEND
+        ):
+            raise ValueError(
+                "component-selective draft refit is unsupported by "
+                f"generation backend {generation_backend!r}"
+            )
         require_component_selection(synchronizer, draft_update_schedule_mode)
         return synchronizer
 

@@ -110,7 +110,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
 
     @property
     def supports_component_selection(self) -> bool:
-        return True
+        return self._generation.cfg.get("backend") == "vllm"
 
     @property
     def is_stale(self) -> bool:

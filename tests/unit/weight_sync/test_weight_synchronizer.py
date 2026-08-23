@@ -70,7 +70,7 @@ def _mock_policy(**overrides):
 
 def _mock_generation(**overrides):
     gen = MagicMock()
-    gen.cfg = {}
+    gen.cfg = {"backend": VLLM_BACKEND}
     gen.prepare_for_generation.return_value = True
     gen.finish_generation.return_value = True
     gen.prepare_refit_info.return_value = None
@@ -213,6 +213,13 @@ def test_collective_default_sync_preserves_legacy_endpoint_call_shape(mock_ray) 
 
 
 class TestIPCWeightSynchronizer:
+    def test_dynamo_endpoint_does_not_advertise_component_selection(self) -> None:
+        synchronizer = IPCWeightSynchronizer(
+            _mock_policy(), _mock_generation(cfg={"backend": DYNAMO_BACKEND})
+        )
+
+        assert not synchronizer.supports_component_selection
+
     @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
     def test_sync_weights_calls_full_lifecycle(self, mock_ray):
         mock_ray.get.return_value = [True]
@@ -438,6 +445,19 @@ class TestHTTPWeightSynchronizer:
 
 
 class TestCollectiveWeightSynchronizer:
+    def test_dynamo_endpoint_rejects_target_only_before_collectives(self) -> None:
+        policy = _mock_policy()
+        generation = _mock_generation(cfg={"backend": DYNAMO_BACKEND})
+        synchronizer = CollectiveWeightSynchronizer(
+            policy, generation, _mock_cluster(), _mock_cluster()
+        )
+
+        with pytest.raises(ValueError, match="component-selective.*unsupported"):
+            synchronizer.sync_weights(selection=WeightSyncSelection(draft=False))
+
+        policy.broadcast_weights_for_collective.assert_not_called()
+        generation.update_weights_from_collective.assert_not_called()
+
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
     def test_sync_weights_calls_broadcast_and_receive(self, mock_ray):
         mock_ray.get.return_value = [True]
@@ -888,6 +908,21 @@ class TestFactory:
             inference_cluster=_mock_cluster(),
         )
         assert isinstance(sync, CollectiveWeightSynchronizer)
+
+    @pytest.mark.parametrize("colocated", [False, True])
+    def test_dynamo_sparse_cadence_fails_before_transport_construction(
+        self, colocated: bool
+    ) -> None:
+        with pytest.raises(ValueError, match="component-selective.*unsupported"):
+            create_weight_synchronizer(
+                policy=_mock_policy(),
+                generation=_mock_generation(cfg={"backend": DYNAMO_BACKEND}),
+                generation_backend=DYNAMO_BACKEND,
+                colocated=colocated,
+                train_cluster=None if colocated else _mock_cluster(),
+                inference_cluster=None if colocated else _mock_cluster(),
+                draft_update_schedule_mode="fixed",
+            )
 
     def test_non_colocated_sglang_raises(self):
         policy = _mock_policy()
