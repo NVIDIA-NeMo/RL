@@ -289,6 +289,7 @@ class VllmGeneration(GenerationInterface):
             self.device_uuids = self._report_device_id()
 
         self._step_metrics_snapshot: dict[str | tuple[str, int], float] | None = None
+        self._rollout_science_snapshot: dict[str | tuple[str, int], float] | None = None
 
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster
@@ -597,6 +598,30 @@ class VllmGeneration(GenerationInterface):
         self._step_metrics_snapshot = None
 
         return step_metrics
+
+    @property
+    def supports_selected_rollout_science(self) -> bool:
+        return True
+
+    def begin_rollout_science(self) -> None:
+        """Snapshot counters for one rollout call, independent of step metrics."""
+        if self._rollout_science_snapshot is not None:
+            raise RuntimeError("rollout science capture is already open")
+        self._rollout_science_snapshot = self._get_raw_spec_counters()
+
+    def finish_rollout_science(self) -> dict[str, float]:
+        """Return canonical accepted/draft deltas for the open rollout call."""
+        start = self._rollout_science_snapshot
+        if start is None:
+            raise RuntimeError("rollout science capture is not open")
+        try:
+            metrics = compute_spec_decode_metrics(start, self._get_raw_spec_counters())
+        finally:
+            self._rollout_science_snapshot = None
+        return metrics
+
+    def cancel_rollout_science(self) -> None:
+        self._rollout_science_snapshot = None
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int

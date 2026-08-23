@@ -18,7 +18,11 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSyncSelection, WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import (
+    DraftApplyRequest,
+    WeightSyncSelection,
+    WeightSynchronizer,
+)
 
 
 class MegatronWeightSynchronizer(WeightSynchronizer):
@@ -97,7 +101,12 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         selection: WeightSyncSelection = WeightSyncSelection(),
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
+        draft_apply_request: DraftApplyRequest | None = None,
     ) -> Optional[dict[str, float]]:
+        if draft_apply_request is not None:
+            raise ValueError(
+                "Megatron weight sync does not support draft apply receipts"
+            )
         self.validate_selection(selection)
         if self._colocated:
             # The wake below carries any configured reshard; the loop already slept the engine

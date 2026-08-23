@@ -36,7 +36,9 @@ step batch in one call.
 
 from __future__ import annotations
 
+import math
 import uuid
+from collections.abc import Mapping
 from typing import Any, Optional
 
 import numpy as np
@@ -65,6 +67,63 @@ from nemo_rl.utils.r3_trace import trace_rollout_payload
 # the training/dynamic-sampling path only handles tensors/lists. Validation
 # requests them explicitly to print per-sample message logs.
 OPT_IN_CARRY_KEYS: tuple[str, ...] = ("turn_roles", "turn_contents")
+
+ACCEPTED_TOKEN_COUNT_KEY = "vllm/spec_num_accepted_tokens"
+DRAFT_TOKEN_COUNT_KEY = "vllm/spec_num_draft_tokens"
+APPLIED_DRAFT_VERSION_KEY = "draft_schedule/applied_draft_version"
+
+
+class ServingDraftVersionTracker:
+    """Bind selected rollout counters to one monotonic serving-draft version."""
+
+    def __init__(self) -> None:
+        self._version: int | None = None
+
+    @property
+    def version(self) -> int | None:
+        return self._version
+
+    def publish(self, version: int) -> None:
+        if type(version) is not int or version < 0:
+            raise ValueError("serving draft version must be a nonnegative integer")
+        if self._version is not None and version < self._version:
+            raise RuntimeError(
+                "stale serving draft version publication: "
+                f"current={self._version}, requested={version}"
+            )
+        self._version = version
+
+    def stamp(
+        self,
+        metrics: Mapping[str, Any],
+        *,
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        if self._version is None:
+            raise RuntimeError("serving draft version is absent")
+        if expected_version is not None and expected_version != self._version:
+            raise RuntimeError(
+                "stale selected rollout: "
+                f"expected serving version {expected_version}, current={self._version}"
+            )
+        existing = metrics.get(APPLIED_DRAFT_VERSION_KEY)
+        if existing is not None and existing != self._version:
+            raise ValueError("mixed serving draft version in one rollout batch")
+        accepted = metrics.get(ACCEPTED_TOKEN_COUNT_KEY)
+        drafted = metrics.get(DRAFT_TOKEN_COUNT_KEY)
+        if (
+            isinstance(accepted, bool)
+            or isinstance(drafted, bool)
+            or not isinstance(accepted, (int, float))
+            or not isinstance(drafted, (int, float))
+            or not math.isfinite(float(accepted))
+            or not math.isfinite(float(drafted))
+            or float(accepted) < 0.0
+            or float(drafted) < 0.0
+            or float(accepted) > float(drafted)
+        ):
+            raise ValueError("selected accepted/draft token counts are invalid")
+        return {**metrics, APPLIED_DRAFT_VERSION_KEY: self._version}
 
 
 def _flatten_rollout_message_log_for_tq(
@@ -130,10 +189,19 @@ class SyncRolloutActor:
         self.tokenizer = tokenizer
         self.task_to_env = task_to_env
         self.master_config = master_config
+        self._serving_draft_version = ServingDraftVersionTracker()
 
         from nemo_rl.data_plane import build_data_plane_client
 
         self._dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+
+    def publish_applied_draft_version(self, version: int) -> None:
+        """Publish a version only after its durable refit transaction closes."""
+        self._serving_draft_version.publish(version)
+
+    def set_applied_draft_version(self, version: int) -> None:
+        """Compatibility alias for controller-owned serving-version publication."""
+        self.publish_applied_draft_version(version)
 
     def rollout_to_tq(
         self,
@@ -145,6 +213,8 @@ class SyncRolloutActor:
         finish_generation: bool = True,
         task_to_env_override: Optional[dict[str, EnvironmentInterface]] = None,
         carry_keys: Optional[list[str]] = None,
+        capture_draft_science: bool = False,
+        expected_applied_draft_version: int | None = None,
     ) -> tuple[
         KVBatchMeta,
         dict[str, Any],
@@ -203,6 +273,10 @@ class SyncRolloutActor:
                 (training uses this). Validation passes a slim list
                 (e.g. ``["total_reward"]``) to avoid wasting Ray transfer
                 on fields it doesn't consume.
+            capture_draft_science: Capture canonical speculative accepted/draft
+                counter deltas for this exact rollout call.
+            expected_applied_draft_version: Controller-selected serving version
+                that must still be active for this batch.
 
         Returns:
             ``(meta, driver_carry, rollout_metrics, generation_logger_metrics)``
@@ -242,40 +316,60 @@ class SyncRolloutActor:
             greedy=False,
         )
 
-        # Rollout dispatch (mirrors grpo_sync.py:294-349).
-        if should_use_nemo_gym(cfg):
-            r = run_nemo_gym_rollout_sync(
-                **common,
-                max_seq_len=None,
-                max_rollout_turns=None,
-                generation_config=cfg.policy["generation"],
-                log_full_result_tables=should_log_nemo_gym_full_result_tables(
-                    wandb_enabled=cfg.logger["wandb_enabled"],
-                    wandb_config=cfg.logger["wandb"],
-                ),
-                effort_config=EffortLevelsConfig.model_validate(
-                    cfg.env["nemo_gym"].get("effort_levels")
+        if capture_draft_science:
+            if not self.policy_generation.supports_selected_rollout_science:
+                raise RuntimeError(
+                    "selected rollout science is unsupported by the generation backend"
                 )
-                if "nemo_gym" in cfg.env
-                and cfg.env["nemo_gym"].get("effort_levels") is not None
-                else None,
-                reward_penalty_config=cfg.reward_penalties,
-                thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
-                deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
-                debug_payload_metrics=cfg.grpo.debug_payload_metrics,
-            )
-            final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
-        else:
-            runner = (
-                run_async_multi_turn_rollout
-                if should_use_async_rollouts(cfg.policy["generation"])
-                else run_multi_turn_rollout
-            )
-            final_batch, rollout_metrics = runner(
-                **common,
-                max_seq_len=cfg.policy["max_total_sequence_length"],
-                max_rollout_turns=cfg.grpo.max_rollout_turns,
-                deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
+            if self._serving_draft_version.version is None:
+                raise RuntimeError("serving draft version is absent")
+            self.policy_generation.begin_rollout_science()
+
+        # Rollout dispatch (mirrors grpo_sync.py:294-349).
+        try:
+            if should_use_nemo_gym(cfg):
+                r = run_nemo_gym_rollout_sync(
+                    **common,
+                    max_seq_len=None,
+                    max_rollout_turns=None,
+                    generation_config=cfg.policy["generation"],
+                    log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                        wandb_enabled=cfg.logger["wandb_enabled"],
+                        wandb_config=cfg.logger["wandb"],
+                    ),
+                    effort_config=EffortLevelsConfig.model_validate(
+                        cfg.env["nemo_gym"].get("effort_levels")
+                    )
+                    if "nemo_gym" in cfg.env
+                    and cfg.env["nemo_gym"].get("effort_levels") is not None
+                    else None,
+                    reward_penalty_config=cfg.reward_penalties,
+                    thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
+                    deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
+                    debug_payload_metrics=cfg.grpo.debug_payload_metrics,
+                )
+                final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
+            else:
+                runner = (
+                    run_async_multi_turn_rollout
+                    if should_use_async_rollouts(cfg.policy["generation"])
+                    else run_multi_turn_rollout
+                )
+                final_batch, rollout_metrics = runner(
+                    **common,
+                    max_seq_len=cfg.policy["max_total_sequence_length"],
+                    max_rollout_turns=cfg.grpo.max_rollout_turns,
+                    deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
+                )
+        except BaseException:
+            if capture_draft_science:
+                self.policy_generation.cancel_rollout_science()
+            raise
+        if capture_draft_science:
+            science_metrics = self.policy_generation.finish_rollout_science()
+            rollout_metrics = self._serving_draft_version.stamp(
+                {**rollout_metrics, **science_metrics},
+                expected_version=expected_applied_draft_version,
             )
         fb = final_batch.to("cpu")
         del final_batch

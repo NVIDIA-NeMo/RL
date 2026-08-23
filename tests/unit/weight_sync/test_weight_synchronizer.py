@@ -14,6 +14,8 @@
 
 """Unit tests for the WeightSynchronizer abstraction and its implementations."""
 
+import hashlib
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -33,6 +35,7 @@ from nemo_rl.weight_sync.http_weight_synchronizer import (
     HTTPWeightSynchronizer,
 )
 from nemo_rl.weight_sync.interfaces import (
+    DraftApplyRequest,
     WeightSyncSelection,
     WeightSynchronizer,
     preflight_component_selection,
@@ -113,6 +116,237 @@ class TestWeightSynchronizerABC:
 def test_selection_rejects_target_false() -> None:
     with pytest.raises(ValueError, match="target policy"):
         WeightSyncSelection(target=False, draft=True)
+
+
+def test_draft_apply_request_rejects_invalid_identity(tmp_path: Path) -> None:
+    snapshot = tmp_path / "draft.bin"
+    snapshot.write_bytes(b"draft")
+    digest = hashlib.sha256(b"draft").hexdigest()
+
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        DraftApplyRequest(version=True, snapshot_path=str(snapshot), sha256=digest)
+    with pytest.raises(ValueError, match="absolute"):
+        DraftApplyRequest(version=1, snapshot_path="draft.bin", sha256=digest)
+    with pytest.raises(ValueError, match="SHA256"):
+        DraftApplyRequest(version=1, snapshot_path=str(snapshot), sha256="bad")
+
+
+@pytest.mark.parametrize(
+    "synchronizer_cls", [IPCWeightSynchronizer, CollectiveWeightSynchronizer]
+)
+@patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+@patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+def test_supported_sync_returns_digest_bound_draft_apply_receipt(
+    ipc_ray: MagicMock,
+    collective_ray: MagicMock,
+    synchronizer_cls: type[WeightSynchronizer],
+    tmp_path: Path,
+) -> None:
+    ipc_ray.get.return_value = [True]
+    collective_ray.get.return_value = [True]
+    snapshot = (tmp_path / "applied-draft-v7.bin").resolve()
+    snapshot.write_bytes(b"serving-draft-v7")
+    digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+    request = DraftApplyRequest(
+        version=7,
+        snapshot_path=str(snapshot),
+        sha256=digest,
+    )
+    policy = _mock_policy()
+    generation = _mock_generation()
+    if synchronizer_cls is IPCWeightSynchronizer:
+        synchronizer = synchronizer_cls(policy, generation)
+    else:
+        synchronizer = synchronizer_cls(
+            policy, generation, _mock_cluster(), _mock_cluster()
+        )
+
+    receipt = synchronizer.sync_weights(draft_apply_request=request)
+
+    assert receipt == {
+        "successful": True,
+        "draft_apply_receipt": {
+            "successful": True,
+            "version": 7,
+            "snapshot_path": str(snapshot),
+            "sha256": digest,
+        },
+    }
+    assert synchronizer.supports_draft_apply_receipts is True
+
+
+@pytest.mark.parametrize(
+    "synchronizer_cls", [IPCWeightSynchronizer, CollectiveWeightSynchronizer]
+)
+@patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+@patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+def test_apply_receipt_fails_closed_if_snapshot_changes_during_transfer(
+    ipc_ray: MagicMock,
+    collective_ray: MagicMock,
+    synchronizer_cls: type[WeightSynchronizer],
+    tmp_path: Path,
+) -> None:
+    snapshot = (tmp_path / "applied-draft-v2.bin").resolve()
+    snapshot.write_bytes(b"before")
+    request = DraftApplyRequest(
+        version=2,
+        snapshot_path=str(snapshot),
+        sha256=hashlib.sha256(b"before").hexdigest(),
+    )
+    calls = 0
+
+    def mutate_after_sender(_value: object) -> list[bool] | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            snapshot.write_bytes(b"after")
+            return None
+        return [True]
+
+    ipc_ray.get.side_effect = mutate_after_sender
+    collective_ray.get.side_effect = mutate_after_sender
+    policy = _mock_policy()
+    generation = _mock_generation()
+    if synchronizer_cls is IPCWeightSynchronizer:
+        synchronizer = synchronizer_cls(policy, generation)
+    else:
+        synchronizer = synchronizer_cls(
+            policy, generation, _mock_cluster(), _mock_cluster()
+        )
+
+    with pytest.raises(RuntimeError, match="snapshot.*changed"):
+        synchronizer.sync_weights(draft_apply_request=request)
+
+    assert synchronizer.is_stale
+
+
+@pytest.mark.parametrize(
+    "synchronizer_cls", [IPCWeightSynchronizer, CollectiveWeightSynchronizer]
+)
+@patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+@patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+def test_changed_apply_request_marks_a_previously_fresh_synchronizer_stale(
+    ipc_ray: MagicMock,
+    collective_ray: MagicMock,
+    synchronizer_cls: type[WeightSynchronizer],
+    tmp_path: Path,
+) -> None:
+    ipc_ray.get.return_value = [True]
+    collective_ray.get.return_value = [True]
+    snapshot = (tmp_path / "applied-draft-v3.bin").resolve()
+    snapshot.write_bytes(b"before")
+    request = DraftApplyRequest(
+        version=3,
+        snapshot_path=str(snapshot),
+        sha256=hashlib.sha256(b"before").hexdigest(),
+    )
+    policy = _mock_policy()
+    generation = _mock_generation()
+    if synchronizer_cls is IPCWeightSynchronizer:
+        synchronizer = synchronizer_cls(policy, generation)
+    else:
+        synchronizer = synchronizer_cls(
+            policy, generation, _mock_cluster(), _mock_cluster()
+        )
+    synchronizer.sync_weights()
+    assert not synchronizer.is_stale
+    snapshot.write_bytes(b"after")
+
+    with pytest.raises(RuntimeError, match="snapshot.*changed"):
+        synchronizer.sync_weights(draft_apply_request=request)
+
+    assert synchronizer.is_stale
+
+
+@pytest.mark.parametrize(
+    "synchronizer_cls", [IPCWeightSynchronizer, CollectiveWeightSynchronizer]
+)
+@patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+@patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+def test_receiver_requires_at_least_one_explicit_success(
+    ipc_ray: MagicMock,
+    collective_ray: MagicMock,
+    synchronizer_cls: type[WeightSynchronizer],
+) -> None:
+    ipc_ray.get.return_value = [None]
+    collective_ray.get.return_value = [None]
+    policy = _mock_policy()
+    generation = _mock_generation()
+    if synchronizer_cls is IPCWeightSynchronizer:
+        synchronizer = synchronizer_cls(policy, generation)
+    else:
+        synchronizer = synchronizer_cls(
+            policy, generation, _mock_cluster(), _mock_cluster()
+        )
+
+    with pytest.raises(RuntimeError, match="Weight transfer failed"):
+        synchronizer.sync_weights()
+
+    assert synchronizer.is_stale
+
+
+@pytest.mark.parametrize(
+    "synchronizer_cls", [IPCWeightSynchronizer, CollectiveWeightSynchronizer]
+)
+def test_target_only_rejects_draft_apply_request_before_transfer(
+    synchronizer_cls: type[WeightSynchronizer], tmp_path: Path
+) -> None:
+    snapshot = (tmp_path / "draft.bin").resolve()
+    snapshot.write_bytes(b"draft")
+    request = DraftApplyRequest(
+        version=1,
+        snapshot_path=str(snapshot),
+        sha256=hashlib.sha256(b"draft").hexdigest(),
+    )
+    policy = _mock_policy()
+    generation = _mock_generation()
+    if synchronizer_cls is IPCWeightSynchronizer:
+        synchronizer = synchronizer_cls(policy, generation)
+    else:
+        synchronizer = synchronizer_cls(
+            policy, generation, _mock_cluster(), _mock_cluster()
+        )
+
+    with pytest.raises(ValueError, match="target-only"):
+        synchronizer.sync_weights(
+            selection=WeightSyncSelection(draft=False),
+            draft_apply_request=request,
+        )
+
+    policy.stream_weights_via_ipc_zmq.assert_not_called()
+    policy.broadcast_weights_for_collective.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "synchronizer_cls", [IPCWeightSynchronizer, CollectiveWeightSynchronizer]
+)
+@patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+@patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+def test_failed_transfer_marks_a_previously_fresh_synchronizer_stale(
+    ipc_ray: MagicMock,
+    collective_ray: MagicMock,
+    synchronizer_cls: type[WeightSynchronizer],
+) -> None:
+    ipc_ray.get.return_value = [True]
+    collective_ray.get.return_value = [True]
+    policy = _mock_policy()
+    generation = _mock_generation()
+    if synchronizer_cls is IPCWeightSynchronizer:
+        synchronizer = synchronizer_cls(policy, generation)
+        active_ray = ipc_ray
+    else:
+        synchronizer = synchronizer_cls(
+            policy, generation, _mock_cluster(), _mock_cluster()
+        )
+        active_ray = collective_ray
+    synchronizer.sync_weights()
+    assert not synchronizer.is_stale
+    active_ray.get.side_effect = RuntimeError("transfer failed")
+
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        synchronizer.sync_weights()
+
+    assert synchronizer.is_stale
 
 
 @pytest.mark.parametrize(

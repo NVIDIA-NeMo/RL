@@ -14,7 +14,11 @@
 
 from typing import Any
 
-from nemo_rl.weight_sync.interfaces import WeightSyncSelection, WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import (
+    DraftApplyRequest,
+    WeightSyncSelection,
+    WeightSynchronizer,
+)
 
 
 def create_weight_synchronizer(*args: Any, **kwargs: Any) -> WeightSynchronizer:
@@ -25,6 +29,7 @@ def create_weight_synchronizer(*args: Any, **kwargs: Any) -> WeightSynchronizer:
 
 
 __all__ = [
+    "DraftApplyRequest",
     "WeightSynchronizer",
     "WeightSyncSelection",
     "create_weight_synchronizer",

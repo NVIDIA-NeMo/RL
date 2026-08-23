@@ -155,6 +155,7 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
 from nemo_rl.weight_sync.interfaces import (
+    DraftApplyRequest,
     WeightSyncSelection,
     preflight_component_selection,
     require_component_selection,
@@ -2482,7 +2483,8 @@ def refit_policy_generation(
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
     selection: WeightSyncSelection = WeightSyncSelection(),
-) -> dict[str, float]:
+    draft_apply_request: DraftApplyRequest | None = None,
+) -> dict[str, Any]:
     """Refit the policy generation interface with the latest policy weights.
 
     Args:
@@ -2492,17 +2494,26 @@ def refit_policy_generation(
             the buffer size is computed from remaining memory.
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
+        draft_apply_request: Optional digest-bound identity for a selected draft
+            apply receipt.
 
     Returns:
-        Scalar metrics reported by the selected weight synchronizer.
+        Status, metrics, and optional apply receipt from the synchronizer.
     """
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if synchronizer is not None:
-        return (
-            synchronizer.sync_weights(
-                selection=selection, timer=timer, kv_scales=kv_scales
-            )
-            or {}
+        sync_kwargs: dict[str, object] = {
+            "selection": selection,
+            "timer": timer,
+            "kv_scales": kv_scales,
+        }
+        if draft_apply_request is not None:
+            sync_kwargs["draft_apply_request"] = draft_apply_request
+        return dict(synchronizer.sync_weights(**sync_kwargs) or {})
+
+    if draft_apply_request is not None:
+        raise ValueError(
+            "draft apply receipts require an attached capable weight synchronizer"
         )
 
     if colocated_inference:

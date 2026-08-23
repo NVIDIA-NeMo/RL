@@ -34,7 +34,11 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSyncSelection, WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import (
+    DraftApplyRequest,
+    WeightSyncSelection,
+    WeightSynchronizer,
+)
 
 
 class CollectiveWeightSynchronizer(WeightSynchronizer):
@@ -70,8 +74,14 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         selection: WeightSyncSelection = WeightSyncSelection(),
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
-    ) -> None:
+        draft_apply_request: DraftApplyRequest | None = None,
+    ) -> dict[str, object]:
         self.validate_selection(selection)
+        if draft_apply_request is not None and not selection.draft:
+            raise ValueError("target-only weight sync cannot produce a draft receipt")
+        self._stale = True
+        if draft_apply_request is not None:
+            draft_apply_request.receipt()
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
@@ -97,7 +107,10 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
 
             ray.get(futures_train)
             results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+            receiver_results = [result for result in results if result is not None]
+            update_success = bool(receiver_results) and all(
+                result is True for result in receiver_results
+            )
 
             if not update_success:
                 raise RuntimeError(
@@ -106,11 +119,19 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
                     "or the generation backend worker."
                 )
 
+        receipt: dict[str, object] = {"successful": True}
+        if draft_apply_request is not None:
+            receipt["draft_apply_receipt"] = draft_apply_request.receipt()
         self._stale = False
+        return receipt
 
     @property
     def supports_component_selection(self) -> bool:
         return self._generation.cfg.get("backend") == "vllm"
+
+    @property
+    def supports_draft_apply_receipts(self) -> bool:
+        return self.supports_component_selection
 
     @property
     def is_stale(self) -> bool:

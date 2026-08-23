@@ -36,7 +36,11 @@ from nemo_rl.utils.weight_transfer_http import (
     vllm_refit_api_key,
     vllm_refit_endpoints,
 )
-from nemo_rl.weight_sync.interfaces import WeightSyncSelection, WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import (
+    DraftApplyRequest,
+    WeightSyncSelection,
+    WeightSynchronizer,
+)
 
 _REMOTE_SPARSE_TRANSPORTS = {
     "vllm_s3_sparse": "s3",
@@ -112,7 +116,12 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
         selection: WeightSyncSelection = WeightSyncSelection(),
         timer: Timer | None = None,
         kv_scales: dict[str, float] | None = None,
+        draft_apply_request: DraftApplyRequest | None = None,
     ) -> dict[str, float]:
+        if draft_apply_request is not None:
+            raise ValueError(
+                "remote sparse refit does not support draft apply receipts"
+            )
         self.validate_selection(selection)
         if self._poisoned:
             raise RuntimeError(

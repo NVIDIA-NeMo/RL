@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import warnings
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any, Optional
@@ -88,6 +89,19 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
 # dispatcher only waits for completion — no aggregation needed.
 
 
+def _supports_draft_apply_receipts(
+    config: Mapping[str, Any], *, update_receipts_supported: bool
+) -> bool:
+    """Return whether sync TQ can request a digest-bound default vLLM apply."""
+    generation = config.get("generation")
+    if not update_receipts_supported or not isinstance(generation, Mapping):
+        return False
+    return (
+        generation.get("backend") == "vllm"
+        and generation.get("refit_transport") is None
+    )
+
+
 class TQPolicy(Policy):
     """TQ-mediated counterpart to :class:`Policy`.
 
@@ -111,6 +125,10 @@ class TQPolicy(Policy):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self.supports_draft_apply_receipts = _supports_draft_apply_receipts(
+            self.cfg,
+            update_receipts_supported=self.supports_draft_update_receipts,
+        )
         # Validate the topology the data plane fan-out (`shard_meta_for_dp`)
         # depends on. Failing here surfaces a clear error at policy
         # construction; the same condition is re-checked inside

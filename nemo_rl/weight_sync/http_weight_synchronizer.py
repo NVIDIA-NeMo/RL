@@ -33,7 +33,11 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSyncSelection, WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import (
+    DraftApplyRequest,
+    WeightSyncSelection,
+    WeightSynchronizer,
+)
 
 
 class HTTPWeightSynchronizer(WeightSynchronizer):
@@ -66,7 +70,10 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
         selection: WeightSyncSelection = WeightSyncSelection(),
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
+        draft_apply_request: DraftApplyRequest | None = None,
     ) -> None:
+        if draft_apply_request is not None:
+            raise ValueError("HTTP weight sync does not support draft apply receipts")
         self.validate_selection(selection)
         assert kv_scales is None, (
             "HTTP transport (SGLang) does not support FP8 KV cache scale sync. "

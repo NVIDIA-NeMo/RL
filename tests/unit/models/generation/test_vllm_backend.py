@@ -180,7 +180,9 @@ def test_collective_target_only_receiver_omits_draft_then_full_sync_restores_it(
     assert target_only_manifest.target.byte_count == 8
     assert target_only_manifest.draft is None
 
-    def receive(iterator, _group, _src, post_unpack_func):
+    def receive(*, iterator, group, src, post_unpack_func):
+        assert group is ext.model_update_group
+        assert src == 0
         entries = list(iterator)
         received.append(tuple(name for name, _ in entries))
         post_unpack_func([(name, torch.ones(2)) for name, _ in entries])
@@ -249,7 +251,9 @@ def test_collective_mtp_selection_controls_unprefixed_drafter_update(
         vllm_backend, monkeypatch, method
     )
 
-    def receive(iterator, _group, _src, post_unpack_func):
+    def receive(*, iterator, group, src, post_unpack_func):
+        assert group is ext.model_update_group
+        assert src == 0
         entries = list(iterator)
         assert tuple(name for name, _ in entries) == ("model.weight",)
         post_unpack_func([(name, torch.ones(2)) for name, _ in entries])

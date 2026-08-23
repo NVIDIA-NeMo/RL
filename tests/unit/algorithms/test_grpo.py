@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -96,6 +97,7 @@ from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.draft_config import AlwaysDraftUpdateScheduleConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.timer import Timer
+from nemo_rl.weight_sync.interfaces import DraftApplyRequest, WeightSyncSelection
 from tests.unit.algorithms.utils import (
     create_mock_batch,
 )
@@ -179,6 +181,61 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
         buffer_size_bytes=1024**3,
         kv_scales=kv_scales,
     )
+
+
+def test_refit_policy_generation_preserves_digest_bound_apply_receipt(
+    tmp_path: Path,
+) -> None:
+    snapshot = (tmp_path / "applied-draft-v5.bin").resolve()
+    snapshot.write_bytes(b"draft-v5")
+    request = DraftApplyRequest(
+        version=5,
+        snapshot_path=str(snapshot),
+        sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+    )
+    receipt = {
+        "successful": True,
+        "draft_apply_receipt": request.receipt(),
+    }
+    synchronizer = MagicMock()
+    synchronizer.sync_weights.return_value = receipt
+    generation = MagicMock(weight_synchronizer=synchronizer)
+
+    result = refit_policy_generation(
+        MagicMock(),
+        generation,
+        colocated_inference=False,
+        draft_apply_request=request,
+    )
+
+    assert result == receipt
+    synchronizer.sync_weights.assert_called_once_with(
+        selection=WeightSyncSelection(),
+        timer=None,
+        kv_scales=None,
+        draft_apply_request=request,
+    )
+
+
+def test_refit_policy_generation_rejects_receipt_without_capable_synchronizer(
+    tmp_path: Path,
+) -> None:
+    snapshot = (tmp_path / "applied-draft-v1.bin").resolve()
+    snapshot.write_bytes(b"draft-v1")
+    request = DraftApplyRequest(
+        version=1,
+        snapshot_path=str(snapshot),
+        sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+    )
+    generation = MagicMock(weight_synchronizer=None)
+
+    with pytest.raises(ValueError, match="capable weight synchronizer"):
+        refit_policy_generation(
+            MagicMock(),
+            generation,
+            colocated_inference=True,
+            draft_apply_request=request,
+        )
 
 
 class TestMaskSampleFilter:

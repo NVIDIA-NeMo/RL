@@ -512,6 +512,23 @@ class GenerationInterface(ABC):
         """
         return False
 
+    @property
+    def supports_selected_rollout_science(self) -> bool:
+        """Whether this backend can report accepted/draft counts per rollout call."""
+        return False
+
+    def begin_rollout_science(self) -> None:
+        """Open a per-rollout speculative-counter interval."""
+        raise NotImplementedError
+
+    def finish_rollout_science(self) -> dict[str, float]:
+        """Close a per-rollout interval and return canonical counter deltas."""
+        raise NotImplementedError
+
+    def cancel_rollout_science(self) -> None:
+        """Discard an open per-rollout interval after generation failure."""
+        raise NotImplementedError
+
     def clear_logger_metrics(self) -> None:
         """Clear logger metrics for performance reporting.
 

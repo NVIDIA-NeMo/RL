@@ -38,7 +38,10 @@ at the synchronizer level.
 """
 
 from abc import ABC, abstractmethod
+import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from nemo_rl.utils.timer import Timer
@@ -54,6 +57,46 @@ class WeightSyncSelection:
     def __post_init__(self) -> None:
         if not self.target:
             raise ValueError("target policy must synchronize on every policy step")
+
+
+@dataclass(frozen=True, slots=True)
+class DraftApplyRequest:
+    """Immutable serving-draft snapshot identity for one refit."""
+
+    version: int
+    snapshot_path: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version < 0:
+            raise ValueError("draft apply version must be a nonnegative integer")
+        path = Path(self.snapshot_path)
+        if not path.is_absolute():
+            raise ValueError("draft apply snapshot path must be absolute")
+        if len(self.sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.sha256
+        ):
+            raise ValueError("draft apply snapshot SHA256 must be lowercase hex")
+        if not path.is_file():
+            raise ValueError("draft apply snapshot must be an existing file")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != self.sha256:
+            raise ValueError("draft apply snapshot SHA256 does not match its bytes")
+
+    def receipt(self) -> Mapping[str, object]:
+        """Revalidate the snapshot and bind it to a successful apply."""
+        path = Path(self.snapshot_path)
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as error:
+            raise RuntimeError("draft apply snapshot changed or disappeared") from error
+        if digest != self.sha256:
+            raise RuntimeError("draft apply snapshot changed during weight transfer")
+        return {
+            "successful": True,
+            "version": self.version,
+            "snapshot_path": self.snapshot_path,
+            "sha256": self.sha256,
+        }
 
 
 class WeightSynchronizer(ABC):
@@ -78,7 +121,8 @@ class WeightSynchronizer(ABC):
         selection: WeightSyncSelection = WeightSyncSelection(),
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
-    ) -> Optional[dict[str, float]]:
+        draft_apply_request: DraftApplyRequest | None = None,
+    ) -> Mapping[str, object] | None:
         """Transfer the latest policy weights to the generation backend.
 
         This method encapsulates the full sync lifecycle:
@@ -102,9 +146,14 @@ class WeightSynchronizer(ABC):
             kv_scales: Optional KV cache scales for FP8 quantization.
                 Honored by the IPC/ZMQ and NCCL collective transports. The
                 HTTP transport ignores this parameter.
+            draft_apply_request: Optional immutable snapshot binding. A capable
+                transport emits a nested apply receipt only after the selected
+                draft transfer succeeds and the snapshot digest is unchanged.
 
         Returns:
-            Optional transport-specific scalar metrics for the current sync.
+            Transport status and optional transport-specific metrics/receipts.
+            Legacy transports may return ``None``; transports advertising
+            draft-apply receipts always return a mapping.
 
         Raises:
             RuntimeError: If the weight transfer fails.
@@ -114,6 +163,11 @@ class WeightSynchronizer(ABC):
     @property
     def supports_component_selection(self) -> bool:
         """Whether this transport can omit the draft component safely."""
+        return False
+
+    @property
+    def supports_draft_apply_receipts(self) -> bool:
+        """Whether this transport can bind a successful draft apply to a snapshot."""
         return False
 
     def validate_selection(self, selection: WeightSyncSelection) -> None:

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from nemo_rl.algorithms.draft_update_schedule import DraftUpdateDecision
@@ -38,7 +39,7 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.models.policy.tq_policy import TQPolicy, _supports_draft_apply_receipts
 
 
 _RECEIPT = {
@@ -192,6 +193,44 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
     p.sharding_annotations = MagicMock()
     p.sharding_annotations.get_axis_size.return_value = 2
     return p, wg
+
+
+@pytest.mark.parametrize("context_parallel_size", [1, 2, 4])
+def test_tq_policy_truthfully_advertises_default_vllm_apply_receipts(
+    context_parallel_size: int,
+) -> None:
+    config = {
+        "generation": {"backend": "vllm", "refit_transport": None},
+        "megatron_cfg": {"context_parallel_size": context_parallel_size},
+    }
+
+    assert _supports_draft_apply_receipts(
+        config,
+        update_receipts_supported=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "generation",
+    [
+        {"backend": "sglang", "refit_transport": None},
+        {"backend": "vllm", "refit_transport": "nixl"},
+        {"backend": "vllm", "refit_transport": "nccl_reshard"},
+    ],
+)
+def test_tq_policy_does_not_advertise_unsupported_apply_receipt_transport(
+    generation: dict[str, object],
+) -> None:
+    config = {"generation": generation}
+
+    assert not _supports_draft_apply_receipts(
+        config,
+        update_receipts_supported=True,
+    )
+    assert not _supports_draft_apply_receipts(
+        {"generation": {"backend": "vllm", "refit_transport": None}},
+        update_receipts_supported=False,
+    )
 
 
 def test_lm_policy_preserves_uniform_draft_update_successful_bool() -> None:
