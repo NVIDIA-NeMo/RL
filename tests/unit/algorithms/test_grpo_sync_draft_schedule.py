@@ -71,6 +71,19 @@ class SyncHarness:
         transaction = self.transaction_store.begin(decision)
         self.training_decisions.append(decision)
 
+        train_results = dict(self.worker_result)
+        if (
+            decision.update_requested
+            and train_results.get("draft_update_successful") is True
+        ):
+            train_results["draft_update_receipt"] = {
+                "successful": True,
+                "decision_id": decision.decision_id,
+                "global_step": decision.global_step,
+                "draft_model_sha256": "a" * 64,
+                "draft_optimizer_sha256": "b" * 64,
+            }
+
         draft_apply_request = None
         if decision.draft_refit_requested:
             path = self.root / f"draft-v{decision.decision_id}.bin"
@@ -92,7 +105,7 @@ class SyncHarness:
 
         apply_scheduled_refit(
             decision,
-            self.worker_result,
+            train_results,
             self.scheduler,
             transaction=transaction,
             decision_ledger=self.decision_ledger,
