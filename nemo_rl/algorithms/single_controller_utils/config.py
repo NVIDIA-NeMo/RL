@@ -771,6 +771,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    # First: everything below reads the active algorithm block, which only exists
+    # once this has confirmed exactly one is set.
+    _validate_algo_settings(master_config)
+
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
 
@@ -870,8 +874,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "`loss_fn.reference_policy_kl_penalty` is 0, so no reference "
             "model was initialized."
         )
-
-    _validate_algo_settings(master_config)
 
     _validate_failure_settings(async_config, algo_cfg.num_prompts_per_step)
 
