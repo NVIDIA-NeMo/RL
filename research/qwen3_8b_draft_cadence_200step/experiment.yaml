@@ -1,0 +1,60 @@
+schema_version: 1
+model: Qwen3-8B
+dataset: DAPOMath17K
+seed: 42
+max_steps: 200
+analysis_window: [21, 200]
+required_checkpoint_steps: [50, 100, 150, 200]
+output_sequence_length: 1024
+max_input_sequence_length: 2048
+max_model_length: 4096
+global_batch_size: 8
+prompts_per_step: 2
+generations_per_prompt: 4
+topology:
+  nodes: 1
+  gpus_per_node: 4
+  tensor_parallel_size: 2
+  pipeline_parallel_size: 1
+  context_parallel_size: 1
+  sequence_packing: false
+  sequence_parallel: false
+speculative_k: 5
+draft_optimizer:
+  lr: 5.0e-6
+  min_lr: 5.0e-7
+  weight_decay: 0.01
+cuda_graph:
+  backend: eager
+  mode: PIECEWISE
+  capture_sizes: [1, 2, 4, 6, 8, 10, 12, 16, 18, 20, 24, 28, 30, 32, 36, 40, 42, 48, 50, 56, 60, 64]
+wandb:
+  entity: nvidia
+  project: sna-specdec
+  group: qwen3-8b-dflash-dspark-cadence-200step-v1
+target:
+  model: Qwen/Qwen3-8B
+  revision: b968826d9c46dd6066d109eabc6255188de91218
+drafters:
+  dflash:
+    model: z-lab/Qwen3-8B-DFlash-b16
+    revision: 9b41424b7109f9c5413454f481b09a82b85333f4
+  dspark:
+    model: deepseek-ai/dspark_qwen3_8b_block7
+    revision: 03326e5043815da1f81b109078b2889737c26017
+cadences:
+  static: {mode: fixed, action: sparse_update, fixed_interval: 201}
+  always: {mode: always}
+  fixed-5: {mode: fixed, action: sparse_update, fixed_interval: 5}
+  fixed-10: {mode: fixed, action: sparse_update, fixed_interval: 10}
+  fixed-20: {mode: fixed, action: sparse_update, fixed_interval: 20}
+  adaptive:
+    mode: adaptive
+    action: sparse_update
+    min_interval: 5
+    max_interval: 20
+    ewma_alpha: 0.1
+    degradation_threshold: 0.02
+    recovery_threshold: 0.01
+    min_observations: 20
+    max_burst_updates: 10
