@@ -1,0 +1,17 @@
+# FP8 simulated KV-cache quantization recipe for QARL.
+#
+# Constant amax allows this recipe to be used for rollout only because no
+# policy-side amax transfer is required.
+metadata:
+  recipe_type: ptq
+  description: FP8 E4M3 simulated KV-cache quantization with constant amax.
+quantize:
+  algorithm: max
+  quant_cfg:
+    - quantizer_name: '*'
+      enable: false
+    - quantizer_name: '*[kv]_bmm_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3
+        use_constant_amax: true

@@ -14,11 +14,13 @@
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _build_prompt_token_ids,
+    _build_sampling_params,
     _compute_splice_inputs,
     _make_parse_tool_calls,
     _resolve_tool_parser_name,
@@ -47,6 +49,52 @@ class _RecordingTokenizer:
     def apply_chat_template(self, messages, **kwargs):
         self.calls.append((messages, kwargs))
         return [1, 2, 3]
+
+
+def test_http_sampling_params_match_the_direct_path():
+    """The HTTP rollout path must sample exactly like the direct generate() path."""
+    sampling_params_cls = MagicMock()
+
+    _build_sampling_params(
+        sampling_params_cls,
+        sampling_config={"temperature": 0.8, "top_p": 0.9, "top_k": 20},
+        stop_token_ids=[9],
+        max_tokens=4,
+    )
+
+    sampling_params_cls.assert_called_once_with(
+        temperature=0.8,
+        top_p=0.9,
+        top_k=20,
+        max_tokens=4,
+        stop_token_ids=[9],
+        include_stop_str_in_output=True,
+        logprobs=True,
+        logprobs_simple_format=True,
+    )
+
+
+def test_http_sampling_params_map_null_top_k_and_empty_stop_tokens():
+    """null top_k reaches TRT-LLM as 0, and unset stop tokens as None, not []."""
+    sampling_params_cls = MagicMock()
+
+    _build_sampling_params(
+        sampling_params_cls,
+        sampling_config={"temperature": 1.0, "top_p": 1.0, "top_k": None},
+        stop_token_ids=None,
+        max_tokens=8,
+    )
+
+    sampling_params_cls.assert_called_once_with(
+        temperature=1.0,
+        top_p=1.0,
+        top_k=0,
+        max_tokens=8,
+        stop_token_ids=None,
+        include_stop_str_in_output=True,
+        logprobs=True,
+        logprobs_simple_format=True,
+    )
 
 
 def test_explicit_tool_parser_overrides_model_auto_resolution():

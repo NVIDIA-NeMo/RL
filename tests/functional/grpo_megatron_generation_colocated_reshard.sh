@@ -17,24 +17,25 @@ export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
 
-# Native async path: non-colocated Megatron generation with the async mcore engine and
-# NO NeMo-Gym (the megatron analog of grpo_non_colocated.sh).
-# Using Qwen2.5-0.5B instead of Qwen3-0.6B because the latter is not supported by Megatron yet
+# Colocated reshard: training runs TP2 while inference runs TP1 x DP2, so
+# prepare_for_generation must build a dedicated inference model and swap
+# weights across differing layouts. A wrong-weights reshard shows up as
+# generation/training logprob disagreement, hence the mult_prob_error gate.
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo.py \
     --config $PROJECT_ROOT/examples/configs/grpo_math_1B_megatron.yaml \
-    policy.model_name=Qwen/Qwen2.5-0.5B \
+    policy.model_name=Qwen/Qwen3-0.6B \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
     policy.train_global_batch_size=4 \
     policy.logprob_batch_size=4 \
     policy.train_micro_batch_size=1 \
+    policy.megatron_cfg.tensor_model_parallel_size=2 \
     policy.generation.backend=megatron \
-    policy.generation.colocated.enabled=false \
-    policy.generation.colocated.resources.gpus_per_node=1 \
+    ++policy.generation.mcore_generation_config.transformer_impl=inference_optimized \
+    ++policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
     policy.generation.mcore_generation_config.refit_backend=nccl \
-    policy.generation.mcore_generation_config.async_engine=true \
     cluster.gpus_per_node=2 \
     grpo.max_num_steps=2 \
     logger.tensorboard_enabled=true \
@@ -49,3 +50,11 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
     'max(data["train/token_mult_prob_error"]) < 1.05'
+
+# Check that colocated reshard actually took place.
+# A matched layout that requires no reshard would pass all tests.
+# While the configs we are passing guarantee reshard, this is still a useful sanity check.
+if ! grep -q "\[colocated-reshard\] building dedicated inference model" $RUN_LOG; then
+    echo "FAIL: colocated-reshard marker not found; dedicated inference model was never built"
+    exit 1
+fi

@@ -77,6 +77,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     grpo.max_num_steps=10 \
     grpo.val_period=-1 \
     grpo.val_at_start=false \
+    grpo.async_grpo=null \
     policy.train_global_batch_size=8 \
     policy.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \

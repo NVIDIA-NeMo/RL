@@ -46,9 +46,13 @@ except ImportError:
 class _FakeTrainableModel:
     def __init__(self):
         self.train_called = False
+        self.eval_called = False
 
     def train(self):
         self.train_called = True
+
+    def eval(self):
+        self.eval_called = True
 
 
 @pytest.mark.automodel
@@ -72,6 +76,45 @@ def test_dtensor_v2_prepare_for_training_restores_optimizer(monkeypatch):
 
     assert model.train_called
     assert restored_devices == ["cuda"]
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize("keep_train_buffers", [False, True])
+def test_dtensor_v2_prepare_for_lp_inference_keep_train_buffers(
+    monkeypatch, keep_train_buffers
+):
+    """``keep_train_buffers`` suppresses the optimizer offload and nothing else.
+
+    ``True`` is not reachable from a dtensor run today -- the split train API
+    that leaves a step open (begin_train_step / train_microbatch /
+    finish_train_step) exists only on the Megatron worker -- but the branch is
+    here, so pin it: inverted, it would strand the optimizer on CPU for the rest
+    of the step.
+    """
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    model = _FakeTrainableModel()
+    offloaded_devices = []
+
+    worker.model = model
+    worker.optimizer = object()
+    worker.cpu_offload = False
+    worker.offload_optimizer_for_logprob = True
+    worker.move_to_cuda = lambda model: model
+    worker.move_optimizer_to_device = lambda device: offloaded_devices.append(device)
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    # The allocator wake-up is a real ``.cuda()`` call; keep this test CPU-only.
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: MagicMock())
+
+    DTensorPolicyWorkerV2Impl.prepare_for_lp_inference(
+        worker, keep_train_buffers=keep_train_buffers
+    )
+
+    assert model.eval_called
+    assert offloaded_devices == ([] if keep_train_buffers else ["cpu"])
 
 
 @pytest.mark.automodel

@@ -196,7 +196,7 @@ def test_vllm_utils_vlm_with_missing_images_fallback_to_tokens():
     assert all("prompt_token_ids" in p for p in prompts)
 
 
-def test_vllm_utils_vlm_with_none_content_fallback_to_tokens_and_sample_idx():
+def test_vllm_utils_vlm_with_none_content_uses_updated_tokens_and_media():
     input_ids, input_lengths = _mk_inputs()
     data = BatchedDataDict(
         {
@@ -206,16 +206,21 @@ def test_vllm_utils_vlm_with_none_content_fallback_to_tokens_and_sample_idx():
             "vllm_images": [["img"], ["img"]],
         }
     )
-    # even though images provided, None content should fallback to tokens
     prompts_all = format_prompt_for_vllm_generation(data)
     assert len(prompts_all) == 2
     assert all("prompt_token_ids" in p for p in prompts_all)
+    assert [p["multi_modal_data"]["image"] for p in prompts_all] == ["img", "img"]
+    assert (
+        prompts_all[1]["prompt_token_ids"] == input_ids[1, : input_lengths[1]].tolist()
+    )
 
     # single-sample API
     p0 = format_prompt_for_vllm_generation(data, sample_idx=0)
     p1 = format_prompt_for_vllm_generation(data, sample_idx=1)
     assert isinstance(p0, dict) and isinstance(p1, dict)
     assert "prompt_token_ids" in p0 and "prompt_token_ids" in p1
+    assert p0["multi_modal_data"]["image"] == "img"
+    assert p1["multi_modal_data"]["image"] == "img"
 
 
 def test_normalize_routed_experts_full_sequence_alignment():

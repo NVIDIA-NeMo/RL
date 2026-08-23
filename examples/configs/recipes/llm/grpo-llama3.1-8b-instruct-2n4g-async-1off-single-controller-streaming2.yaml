@@ -1,0 +1,18 @@
+defaults: ./grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2.yaml
+
+logger:
+  log_dir: logs/grpo-llama3.1-8b-instruct-2n4g-async-1off-single-controller-streaming2
+  wandb:
+    name: grpo-llama3.1-8b-instruct-2n4g-async-1off-single-controller-streaming2
+
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n4g-async-1off-single-controller-streaming2
+
+policy:
+  generation:
+    colocated:
+      resources:
+        gpus_per_node: 4
+
+cluster:
+  gpus_per_node: 4

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,6 +32,8 @@ import torch
 from typing_extensions import Self
 
 from nemo_rl.data.multimodal_utils import (
+    MULTIMODAL_CONTENT_TYPES,
+    NATIVE_MULTIMODAL_KEYS,
     PackedTensor,
 )
 from nemo_rl.data.packing import get_packer
@@ -41,6 +43,50 @@ from nemo_rl.distributed.collectives import (
 )
 
 DictT = TypeVar("DictT", bound=Mapping[str, Any])
+
+_COUPLED_MULTIMODAL_KEYS = (
+    ("pixel_values", "image_grid_thw"),
+    ("pixel_values", "imgs_sizes"),
+    ("pixel_values", "num_frames"),
+    ("pixel_values_videos", "video_grid_thw"),
+)
+
+
+def _prepare_multimodal_sharing(
+    value: Any,
+    *,
+    media_context: bool = False,
+) -> dict[int, Any]:
+    """Enable PackedTensor provenance and return deepcopy memo entries.
+
+    PackedTensor is an explicit multimodal type. Raw native-vLLM payloads are
+    shared only under named media keys or typed content parts. Containers are
+    still deep-copied so rollout rows may diverge safely.
+    """
+    shared_leaves: dict[int, Any] = {}
+
+    def visit(item: Any, in_media_context: bool = False) -> None:
+        if isinstance(item, PackedTensor):
+            item.enable_deduplication()
+            return
+        if isinstance(item, dict):
+            content_type = item.get("type")
+            typed_media = content_type in MULTIMODAL_CONTENT_TYPES
+            for key, child in item.items():
+                visit(
+                    child,
+                    in_media_context or typed_media or key in NATIVE_MULTIMODAL_KEYS,
+                )
+            return
+        if isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child, in_media_context)
+            return
+        if in_media_context:
+            shared_leaves[id(item)] = item
+
+    visit(value, media_context)
+    return shared_leaves
 
 
 class SequencePackingArgs(TypedDict):
@@ -77,6 +123,8 @@ class DynamicBatchingArgs(TypedDict):
 
 
 class BatchedDataDict(UserDict, Generic[DictT]):
+    _PIXEL_DTYPE_CAST_KEYS = frozenset({"pixel_values", "pixel_values_videos"})
+
     # keys that are model specific, but not part of the PackedTensor
     ADDITIONAL_OPTIONAL_KEY_TENSORS = [
         "token_type_ids",  # specific to gemma3 that tells where the image tokens are in the sequence, not required for llm-only inference/training
@@ -91,12 +139,48 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         self.elem_counts_per_gb = None
 
     def get_multimodal_dict(
-        self, as_tensors: bool = False, device: Optional[torch.device] = None
+        self,
+        as_tensors: bool = False,
+        device: Optional[torch.device] = None,
+        pixel_dtype: Optional[torch.dtype] = None,
     ) -> dict[str, Any]:
-        """Return a regular dict of tensors or packed multimodal data items."""
+        """Return a regular dict of tensors or packed multimodal data items.
+
+        ``pixel_dtype`` converts pixel tensors without materializing repeated
+        logical segments. This is used to reduce policy-bound Ray payloads.
+        """
+        if as_tensors:
+            for value_key, metadata_key in _COUPLED_MULTIMODAL_KEYS:
+                value = self.data.get(value_key)
+                metadata = self.data.get(metadata_key)
+                if not isinstance(value, PackedTensor) or not isinstance(
+                    metadata, PackedTensor
+                ):
+                    continue
+                # Legacy values have no logical indirection to validate. Keep
+                # the per-row scan off the flag-off policy hot path.
+                if not (
+                    value.deduplication_enabled
+                    or value._row_offsets is not None
+                    or metadata.deduplication_enabled
+                    or metadata._row_offsets is not None
+                ):
+                    continue
+                value_counts = value.logical_segment_counts_by_row()
+                metadata_counts = metadata.logical_segment_counts_by_row()
+                if value_counts != metadata_counts:
+                    raise ValueError(
+                        "Coupled multimodal keys must have the same ordered "
+                        f"per-row segment counts, but {value_key!r} has "
+                        f"{value_counts} and {metadata_key!r} has "
+                        f"{metadata_counts}."
+                    )
+
         multimodal_dict = {}
         for k, v in self.data.items():
             if isinstance(v, PackedTensor):
+                if pixel_dtype is not None and k in self._PIXEL_DTYPE_CAST_KEYS:
+                    v = v.to_dtype(pixel_dtype)
                 multimodal_dict[k] = v.as_tensor(device=device) if as_tensors else v
             elif k in self.ADDITIONAL_OPTIONAL_KEY_TENSORS:
                 multimodal_dict[k] = v
@@ -108,6 +192,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         cls: Type[Self],
         batches: Sequence[Mapping[Any, Any]],
         pad_value_dict: Optional[dict[str, int | float]] = None,
+        *,
+        allow_missing_packed_tensors: bool = False,
     ) -> Self:
         """Given a list of batches, stack the tensors/lists within and put them in a single dictionary.
 
@@ -116,6 +202,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         Args:
             batches (list[Dict]): A list of dictionaries, each containing a batch of data.
             pad_value_dict (Optional[dict[str, int]]): An optional dict mapping keys to non-default(0) padding values.
+            allow_missing_packed_tensors: Represent missing ``PackedTensor``
+                media keys as empty logical rows. This is opt-in so ordinary
+                flag-off concatenation retains its strict key checks.
 
         Returns:
             BatchedDataDict: A new BatchedDataDict containing the stacked data.
@@ -128,12 +217,26 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         def batch_size(item: Mapping[Any, Any]) -> int:
             if not item:
                 return 0
-            value = next(iter(item.values()))
-            if isinstance(value, PackedTensor):
-                return len(value)
-            if isinstance(value, torch.Tensor):
-                return value.shape[0]
-            return len(value)
+
+            if not allow_missing_packed_tensors:
+                # Preserve the legacy shared primitive exactly unless sparse
+                # PackedTensor normalization was explicitly requested.
+                return len(next(iter(item.values())))
+
+            sizes = set()
+            for value in item.values():
+                if isinstance(value, PackedTensor):
+                    sizes.add(len(value))
+                elif isinstance(value, torch.Tensor):
+                    sizes.add(value.shape[0])
+                else:
+                    sizes.add(len(value))
+            if len(sizes) != 1:
+                raise ValueError(
+                    "Source batch has inconsistent logical row counts: "
+                    f"{sorted(sizes)}."
+                )
+            return next(iter(sizes))
 
         keys = sorted({key for item in batches for key in item})
         for k in keys:
@@ -143,12 +246,47 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 if k not in item and batch_size(item)
             ]
             if missing_nonempty_batches:
-                raise KeyError(
-                    f"Key {k!r} is missing from non-empty batches "
-                    f"{missing_nonempty_batches}."
-                )
+                present_values = [item[k] for item in batches if k in item]
+                if not (
+                    allow_missing_packed_tensors
+                    and present_values
+                    and all(isinstance(value, PackedTensor) for value in present_values)
+                ):
+                    raise KeyError(
+                        f"Key {k!r} is missing from non-empty batches "
+                        f"{missing_nonempty_batches}."
+                    )
 
-            list_of_tensors = [item[k] for item in batches if k in item]
+                template = present_values[0]
+                assert isinstance(template, PackedTensor)
+                list_of_tensors = [
+                    (
+                        item[k]
+                        if k in item
+                        else PackedTensor.empty_rows_like(template, batch_size(item))
+                    )
+                    for item in batches
+                    if k in item or batch_size(item)
+                ]
+            else:
+                list_of_tensors = [item[k] for item in batches if k in item]
+
+            if allow_missing_packed_tensors and isinstance(
+                list_of_tensors[0], PackedTensor
+            ):
+                source_batches = [
+                    item for item in batches if k in item or batch_size(item)
+                ]
+                for batch_index, (item, packed_tensor) in enumerate(
+                    zip(source_batches, list_of_tensors)
+                ):
+                    expected_rows = batch_size(item)
+                    if len(packed_tensor) != expected_rows:
+                        raise ValueError(
+                            f"PackedTensor key {k!r} has {len(packed_tensor)} "
+                            f"logical rows in source batch {batch_index}, "
+                            f"expected {expected_rows}."
+                        )
 
             if isinstance(list_of_tensors[0], list):
                 tensor_or_list: list[Any] | torch.Tensor = [
@@ -622,7 +760,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     aggregated_shards[shard_idx][k] = (
                         PackedTensor.concat(packed_slices)
                         if packed_slices
-                        else PackedTensor.empty_like(v)
+                        else PackedTensor.empty_rows_like(v, 0)
                     )
                 else:
                     shard_values = []
@@ -767,12 +905,21 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             sliced_batch[k] = self.data[k][start:end]
         return sliced_batch
 
-    def repeat_interleave(self, num_repeats: int) -> Self:
+    def repeat_interleave(
+        self,
+        num_repeats: int,
+        *,
+        share_immutable_media: bool = False,
+    ) -> Self:
         """Repeats the batch num_repeats times.
 
         For each element in the batch, repeat each value num_repeats times.
         i.e:
         {"key": torch.tensor([1, 2, 3]), "other_key": [1, 2, 3]} -> {"key": torch.tensor([1, 1, 2, 2, 3, 3]), "other_key": [1, 1, 2, 2, 3, 3]}
+
+        When ``share_immutable_media`` is enabled, only explicit multimodal
+        leaves share storage. Every surrounding row/message/content container
+        remains independent.
         """
         repeated_batch: Self = type(self)()
         for k, v in self.data.items():
@@ -785,9 +932,20 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 )
             else:
                 # For lists or other sequences, use a list comprehension to repeat each element
-                repeated_batch[k] = [
-                    deepcopy(item) for item in v for _ in range(num_repeats)
-                ]
+                repeated_items = []
+                for item in v:
+                    shared_leaves = (
+                        _prepare_multimodal_sharing(
+                            item,
+                            media_context=k in NATIVE_MULTIMODAL_KEYS,
+                        )
+                        if share_immutable_media
+                        else {}
+                    )
+                    repeated_items.extend(
+                        deepcopy(item, dict(shared_leaves)) for _ in range(num_repeats)
+                    )
+                repeated_batch[k] = repeated_items
         return repeated_batch
 
     def truncate_tensors(self, dim: int, truncated_len: int):
@@ -861,9 +1019,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         """Get the batch size of the batch."""
         # Get the first key and use its size as the batch size
         # This assumes all keys have the same batch size
-        key = next(iter(self.data))
         if not self.data:
             return 0
+        key = next(iter(self.data))
         if not torch.is_tensor(self.data[key]):
             return len(self.data[key])
         return self.data[key].shape[0]  # type: ignore # it's a tensor here
