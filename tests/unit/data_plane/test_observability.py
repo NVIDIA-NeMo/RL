@@ -609,12 +609,16 @@ def test_hash_shard_read_of_jagged_field_is_unverified_not_a_mismatch():
     client.close()
 
 
-def test_hash_rectangular_put_read_back_ragged_is_a_mismatch():
+def test_hash_rectangular_put_read_back_ragged_checks_row_lengths():
     """A rectangular put can come back jagged — truncating one row makes the
-    batch ragged. There is no row-level digest to compare against, but the
-    row lengths changing between wire-in and wire-out *is* the divergence.
-    Reporting it as a skipped field would leave ``mismatches`` reading zero,
-    the exact shape of a guard that passes while covering nothing."""
+    batch ragged. The content is no longer comparable, so the field counts as
+    an abstention, but the row *lengths* still are, and a row that changed
+    length is a real divergence.
+
+    Failing the whole field instead reported 3584 mismatches per step on a
+    healthy 5-process run: writing a shard with uniform rows and reading it
+    back inside a batch whose other rows differ in length is the normal
+    shape of the pipeline, not a corruption."""
     client = _hash_client(_RaggedOnReadClient())
     ids = [f"u{i}" for i in range(4)]
     dense = TensorDict(
@@ -625,7 +629,7 @@ def test_hash_rectangular_put_read_back_ragged_is_a_mismatch():
 
     hv = client.snapshot()["hash_verify"]
     assert hv["mismatches"] > 0, "a truncated row must not read as clean"
-    assert hv["fields_skipped"] == 0, "this is a divergence, not an abstention"
+    assert hv["fields_skipped"] == 1, "and the content it could not compare"
 
 
 def test_hash_shard_of_a_ragged_field_is_skipped_not_a_mismatch():
@@ -1453,3 +1457,27 @@ def test_volume_namespace_does_not_become_a_breakdown_row():
     )
     assert [r[0] for r in rows] == ["get"], rows
     assert rows[0][columns.index("mb")] == 18.0
+
+
+def test_uniform_write_read_back_inside_a_ragged_batch_is_clean():
+    """The false positive this cost: a shard written with uniform rows, read
+    back inside a batch whose *other* rows are ragged. Nothing diverged --
+    every recorded row still has the length it was written with -- and the
+    guard reported 3584 mismatches per step on a healthy run until it
+    compared lengths instead of failing the field outright."""
+    inner = _JaggedEcho()
+    client = _hash_client(inner)
+    ids = [f"u{i}" for i in range(4)]
+    client.put_samples(
+        sample_ids=ids, partition_id="p", fields=_jagged_ids([6, 6, 6, 6])
+    )
+    # a later writer adds rows of a different length to the same partition
+    other = [f"v{i}" for i in range(2)]
+    inner.rows[("p", other[0])] = {"ids": torch.randint(0, 32000, (3,))}
+    inner.rows[("p", other[1])] = {"ids": torch.randint(0, 32000, (9,))}
+    client.get_samples(sample_ids=ids + other, partition_id="p", select_fields=["ids"])
+
+    hv = client.snapshot()["hash_verify"]
+    assert hv["mismatches"] == 0, "no row changed length; nothing diverged"
+    assert hv["fields_skipped"] == 1, "content uncomparable, and counted"
+    client.close()

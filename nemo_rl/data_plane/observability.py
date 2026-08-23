@@ -116,10 +116,14 @@ class _FieldDigest(NamedTuple):
     buffer, so they only reconcile against a read of that same batch. A
     shard of it computes a different buffer digest and must be reported
     unverified rather than as a mismatch.
+
+    ``row_lens`` is how long each row was, which is the one thing still
+    comparable when the read cannot reproduce the write's scheme.
     """
 
     per_row: list[int]
     batch_scoped: bool
+    row_lens: tuple[int, ...]
 
 
 # Same-width signed integer for each tensor element size, used to bitcast a
@@ -1343,13 +1347,16 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 out[name] = _FieldDigest(
                     (torch.hash_tensor(flat, dim=1) ^ salt).tolist(),
                     batch_scoped=False,
+                    row_lens=(flat.shape[1],) * n_rows,
                 )
                 continue
             buffer = v.values() if v.is_nested else v
             flat_buffer = _as_int_view(buffer.reshape(1, -1))
             buffer_digest = torch.hash_tensor(flat_buffer, dim=1).tolist()[0] ^ salt
             out[name] = _FieldDigest(
-                [buffer_digest ^ length for length in lengths], batch_scoped=True
+                [buffer_digest ^ length for length in lengths],
+                batch_scoped=True,
+                row_lens=tuple(lengths),
             )
         return out
 
@@ -1372,9 +1379,12 @@ class MetricsDataPlaneClient(DataPlaneClient):
         scheme = self._batch_scope.setdefault(partition_id, {})
         for name, digest in digests.items():
             if digest.batch_scoped:
-                scheme[name] = len(sample_ids)
+                scheme[name] = ("scoped", len(sample_ids))
             else:
-                scheme.pop(name, None)
+                # Width, not row count: a per-row scheme means the rows were
+                # uniform, so one number describes them all and lets a later
+                # ragged read still check whether any row changed length.
+                scheme[name] = ("rows", digest.row_lens[0] if digest.row_lens else 0)
         self._stats.hash_verify.rows_recorded += len(sample_ids)
 
     def _check_hashes(self, partition_id: str, sample_ids: list[str], out: Any) -> None:
@@ -1382,7 +1392,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         if not isinstance(out, TensorDict):
             return
         scheme = self._batch_scope.get(partition_id, {})
-        digests = self._row_fingerprints(out, sample_ids, scheme)
+        # Only the batch-scoped names: the scheme also records per-row fields
+        # now, and handing the whole mapping over forced every field onto the
+        # scoped path.
+        scoped_names = {n for n, how in scheme.items() if how[0] == "scoped"}
+        digests = self._row_fingerprints(out, sample_ids, scoped_names)
         if not digests:
             return
         partition_hashes = self._hash_by_partition.get(partition_id, {})
@@ -1394,27 +1408,30 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # exact shape of the bug that made this check pass while covering
         # nothing: a field stops being compared and the report still reads
         # clean.
-        comparable = {}
-        relaid_out = []
+        comparable: dict[str, _FieldDigest] = {}
+        length_only: dict[str, tuple[_FieldDigest, int]] = {}
         for name, digest in digests.items():
-            if not digest.batch_scoped or scheme.get(name) == len(sample_ids):
+            recorded = scheme.get(name)
+            if not digest.batch_scoped:
                 comparable[name] = digest
-            elif name in scheme:
-                stats.fields_skipped += 1  # a shard of a batch-scoped put
+            elif recorded is None:
+                continue  # this process never wrote the field
+            elif recorded[0] == "scoped":
+                if recorded[1] == len(sample_ids):
+                    comparable[name] = digest
+                else:
+                    stats.fields_skipped += 1  # a shard of a batch-scoped put
             else:
-                # Put reduced this field per row, so its rows were uniform;
-                # they came back ragged. The row lengths themselves changed —
-                # a real divergence, not something to skip.
-                relaid_out.append(name)
-        for name in relaid_out:
-            if self._hash_mismatches_logged < _MAX_HASH_MISMATCH_LOGS:
-                self._hash_mismatches_logged += 1
-                logger.error(
-                    "data-plane hash mismatch: partition=%s field=%s written "
-                    "with uniform row lengths, read back ragged",
-                    partition_id,
-                    name,
-                )
+                # Written with uniform rows, read back ragged. Treating that
+                # as a divergence reported 3584 mismatches per step on a
+                # healthy run: it is the normal shape of a real pipeline,
+                # where a shard is written uniform and read back inside a
+                # batch whose other rows differ in length. The row lengths
+                # are still comparable, and a row that changed length *is* a
+                # divergence, so check that much and count the rest as the
+                # abstention it is.
+                length_only[name] = (digest, recorded[1])
+                stats.fields_skipped += 1
         for row, sample_id in enumerate(sample_ids):
             per_field = partition_hashes.get(sample_id)
             if not per_field:
@@ -1423,7 +1440,21 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 stats.rows_unverified += 1
                 continue
             stats.rows_checked += 1
-            stats.mismatches += len(relaid_out)
+            for name, (digest, width) in length_only.items():
+                if per_field.get(name) is None or digest.row_lens[row] == width:
+                    continue
+                stats.mismatches += 1
+                if self._hash_mismatches_logged < _MAX_HASH_MISMATCH_LOGS:
+                    self._hash_mismatches_logged += 1
+                    logger.error(
+                        "data-plane hash mismatch: partition=%s sample=%s "
+                        "field=%s row was %d long on the wire in, %d out",
+                        partition_id,
+                        sample_id,
+                        name,
+                        width,
+                        digest.row_lens[row],
+                    )
             for name, digest in comparable.items():
                 expected = per_field.get(name)
                 if expected is None or expected == digest.per_row[row]:
