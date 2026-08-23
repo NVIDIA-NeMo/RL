@@ -3145,3 +3145,96 @@ def test_vocab_parallel_gather_columns_tp_sharded(monkeypatch):
     ref[..., idx].float().backward(grad_out)
     torch.testing.assert_close(shards[0].grad, ref.grad[..., :v_local])
     torch.testing.assert_close(shards[1].grad, ref.grad[..., v_local:])
+
+
+# ---------------------------------------------------------------------------
+# force_on_policy_ratio aliases prev_logprobs to curr_logprobs, which puts the
+# substituted 0.0 into the quantities that read prev. Those must narrow too.
+#
+# Both tests below assert INDEPENDENCE rather than a fixed number: they vary
+# generation_logprobs at the filtered position only. A quantity that still sees
+# the substituted value moves; one that correctly dropped the position cannot.
+# ---------------------------------------------------------------------------
+
+_ON_POLICY_SEQ = 4
+_ON_POLICY_CURR = torch.tensor([[-0.5, -0.6, 0.0]])  # third entry is the substitute
+_ON_POLICY_KEEP = torch.tensor([[1.0, 1.0, 0.0]])
+
+
+def _on_policy_data(filtered_gen_logprob, keep):
+    """generation_logprobs differs ONLY at the filtered position."""
+    data = BatchedDataDict(
+        {
+            "token_mask": torch.ones(1, _ON_POLICY_SEQ),
+            "sample_mask": torch.ones(1),
+            "advantages": torch.full((1, _ON_POLICY_SEQ), 0.5),
+            "prev_logprobs": torch.full((1, _ON_POLICY_SEQ), -1.0),
+            "generation_logprobs": torch.tensor(
+                [[-1.0, -0.5, -0.6, filtered_gen_logprob]]
+            ),
+            "reference_policy_logprobs": torch.full((1, _ON_POLICY_SEQ), -2.0),
+        }
+    )
+    if keep is not None:
+        data["curr_logprobs_keep_mask"] = keep
+    return data
+
+
+def _run_on_policy(cfg_kwargs, filtered_gen_logprob, keep):
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            force_on_policy_ratio=True,
+            **cfg_kwargs,
+        )
+    )
+    _, metrics = loss_fn(
+        _ON_POLICY_CURR,
+        _on_policy_data(filtered_gen_logprob, keep),
+        torch.tensor(1.0),
+        torch.tensor(3.0),
+    )
+    return metrics
+
+
+@pytest.mark.parametrize(
+    "metric",
+    [
+        "token_mult_prob_error",
+        "gen_kl_error",
+        "policy_kl_error",
+        "js_divergence_error",
+        "sampling_importance_ratio",
+    ],
+)
+def test_force_on_policy_ratio_narrows_the_mismatch_diagnostics(metric):
+    """The filtered position must not steer a diagnostic once keep is supplied."""
+    kept_a = _run_on_policy({}, -5.0, _ON_POLICY_KEEP)[metric]
+    kept_b = _run_on_policy({}, -9.0, _ON_POLICY_KEEP)[metric]
+    assert kept_a == pytest.approx(kept_b), (
+        f"{metric} still depends on generation_logprobs at the filtered position"
+    )
+
+    # Without the keep mask the same swing moves the metric, which is the bug.
+    loose_a = _run_on_policy({}, -5.0, None)[metric]
+    loose_b = _run_on_policy({}, -9.0, None)[metric]
+    assert loose_a != pytest.approx(loose_b)
+
+
+def test_force_on_policy_ratio_narrows_the_sequence_importance_weight():
+    """The GSPO weight multiplies every token, so actor_mask cannot undo it.
+
+    ``seq_lp_diff`` sums (prev - generation) over the mask before the reduction,
+    so a single filtered position scales the whole sequence by exp(|log pi_gen|).
+    """
+    seq_cfg = {"sequence_level_importance_ratios": True, "token_level_loss": False}
+
+    kept_a = _run_on_policy(seq_cfg, -5.0, _ON_POLICY_KEEP)["sampling_importance_ratio"]
+    kept_b = _run_on_policy(seq_cfg, -9.0, _ON_POLICY_KEEP)["sampling_importance_ratio"]
+    assert kept_a == pytest.approx(kept_b)
+
+    loose = _run_on_policy(seq_cfg, -5.0, None)["sampling_importance_ratio"]
+    assert loose == pytest.approx(math.exp(5.0), rel=1e-4), (
+        "un-narrowed, the whole sequence is weighted by the fabricated exp(5)"
+    )
+    assert kept_a < loose / 100

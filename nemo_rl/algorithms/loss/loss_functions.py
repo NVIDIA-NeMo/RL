@@ -407,16 +407,17 @@ class ClippedPGLossFn(LossFunction):
         # there: it reads ``curr_logprobs_unfiltered``, which is finite at
         # exactly those positions.
         #
-        # The mismatch diagnostics keep the full mask for a weaker reason, and
-        # it is worth being precise about it. They read ``prev_logprobs``,
-        # which carries its OWN substitutions -- the same helper runs on the
-        # logprob-inference pass (see ``automodel/train.py``,
-        # ``megatron/train.py`` and ``dtensor_policy_worker.py``). So they are
-        # not clean; they simply cannot be narrowed here, because the keep mask
-        # published this step identifies the positions *this* forward filtered,
-        # not the ones the earlier forward did, and narrowing with it would
-        # drop the wrong ones. ``force_on_policy_ratio`` is the single case
-        # where the two sets coincide, since prev is then an alias of curr.
+        # The mismatch diagnostics are a different story, and it is worth being
+        # precise. They read ``prev_logprobs``, which carries its OWN
+        # substitutions -- the same helper runs on the logprob-inference pass
+        # (see ``automodel/train.py``, ``megatron/train.py`` and
+        # ``dtensor_policy_worker.py``). So they are not clean. They normally
+        # cannot be narrowed either, because the keep mask published this step
+        # identifies the positions *this* forward filtered, not the ones the
+        # earlier forward did, and narrowing with it would drop the wrong ones.
+        # ``force_on_policy_ratio`` is the single case where the two sets
+        # coincide, since prev is then an alias of curr -- see ``prev_mask``
+        # below, which is what handles it.
         keep_mask = data.get("curr_logprobs_keep_mask")
         actor_token_mask = token_mask if keep_mask is None else token_mask * keep_mask
         actor_mask = actor_token_mask * sample_mask.unsqueeze(-1)
@@ -426,13 +427,21 @@ class ClippedPGLossFn(LossFunction):
         if self.force_on_policy_ratio:
             prev_logprobs = curr_logprobs.detach()
 
+        # Everything below that reads ``prev_logprobs`` normally reads a
+        # separately computed tensor, so the curr-side narrowing does not apply
+        # to it. ``force_on_policy_ratio`` aliases prev to curr just above,
+        # which puts the substituted 0.0 in there too -- and 0.0 means p = 1,
+        # so those reductions read exp(|log pi_gen|) at each filtered position.
+        prev_token_mask = actor_token_mask if self.force_on_policy_ratio else token_mask
+        prev_mask = actor_mask if self.force_on_policy_ratio else mask
+
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
         lp_error = torch.abs(generation_logprobs - prev_logprobs)  # noqa: F841  (precommit ignore for now)
         # average over all tokens in the microbatch
         mult_prob_error = masked_mean(
-            torch.exp(lp_error * mask),
-            mask,
+            torch.exp(lp_error * prev_mask),
+            prev_mask,
             global_normalization_factor=global_valid_toks,
         ).item()
 
@@ -447,7 +456,7 @@ class ClippedPGLossFn(LossFunction):
         )
         gen_kl_error = masked_mean(
             gen_kl_error,
-            mask,
+            prev_mask,
             global_normalization_factor=global_valid_toks,
         ).item()
 
@@ -462,7 +471,7 @@ class ClippedPGLossFn(LossFunction):
         )
         policy_kl_error = masked_mean(
             policy_kl_error,
-            mask,
+            prev_mask,
             global_normalization_factor=global_valid_toks,
         ).item()
 
@@ -486,7 +495,7 @@ class ClippedPGLossFn(LossFunction):
 
         js_divergence_error = masked_mean(
             0.5 * kl_prev_to_mixture + 0.5 * kl_gen_to_mixture,
-            mask,
+            prev_mask,
             global_normalization_factor=global_valid_toks,
         ).item()
 
@@ -592,7 +601,9 @@ class ClippedPGLossFn(LossFunction):
         # See: docs/guides/grpo.md#importance-sampling-correction
         if self.sequence_level_importance_ratios:
             # importance weight w_i = exp(Σ_t (log π_actor − log π_behaviour))
-            seq_lp_diff = ((prev_logprobs - generation_logprobs) * mask).sum(dim=-1)
+            seq_lp_diff = ((prev_logprobs - generation_logprobs) * prev_mask).sum(
+                dim=-1
+            )
             actor_importance_weights = torch.exp(seq_lp_diff).detach()
             actor_importance_weights = torch.nan_to_num(
                 actor_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
@@ -630,7 +641,7 @@ class ClippedPGLossFn(LossFunction):
                 _is_filter_metrics = {
                     "is_oob_ratio": masked_mean(
                         token_oob_mask.float(),
-                        mask,
+                        prev_mask,
                         global_normalization_factor=global_valid_toks,
                     ).item(),
                 }
@@ -650,7 +661,7 @@ class ClippedPGLossFn(LossFunction):
                 _is_filter_metrics = {
                     "is_oob_ratio": masked_mean(
                         (~token_kept_mask).float(),
-                        mask,
+                        prev_mask,
                         global_normalization_factor=global_valid_toks,
                     ).item(),
                 }
@@ -668,7 +679,7 @@ class ClippedPGLossFn(LossFunction):
                     neginf=0.0,
                 )
                 seq_log_is_ratio_mean = masked_mean(
-                    log_is_ratio, token_mask, dim=-1
+                    log_is_ratio, prev_token_mask, dim=-1
                 )  # [B]
                 seq_geomean_is_ratio = torch.exp(seq_log_is_ratio_mean).detach()  # [B]
                 seq_kept_mask = (
@@ -728,7 +739,7 @@ class ClippedPGLossFn(LossFunction):
         else:
             sample_importance_ratio = masked_mean(
                 actor_importance_weights,
-                mask,
+                prev_mask,
                 global_normalization_factor=global_valid_toks,
             )
 
