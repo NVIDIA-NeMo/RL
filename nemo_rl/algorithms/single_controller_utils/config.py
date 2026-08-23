@@ -759,6 +759,33 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "not have yet (#2625)."
         )
 
+    policy_megatron_cfg = master_config.policy.get("megatron_cfg", {})  # type: ignore
+    if (
+        getattr(algo_cfg, "policy_training_start_step", 0) > 0
+        and master_config.checkpointing["enabled"]
+        and master_config.checkpointing["save_optimizer"]
+        and policy_megatron_cfg.get("enabled")
+        and policy_megatron_cfg.get("checkpoint", {}).get(
+            "ckpt_assume_constant_structure"
+        )
+    ):
+        raise ValueError(
+            "policy.megatron_cfg.checkpoint.ckpt_assume_constant_structure=true "
+            "is incompatible with PPO critic warmup when optimizer checkpointing "
+            "is enabled. Set ckpt_assume_constant_structure=false, "
+            "ppo.policy_training_start_step=0, or checkpointing.save_optimizer=false."
+        )
+
+    if (
+        getattr(async_config.sampler, "warmup_lookahead_versions", None) is not None
+        and getattr(algo_cfg, "policy_training_start_step", 0) == 0
+    ):
+        raise ValueError(
+            "async_rl.sampler.warmup_lookahead_versions requires "
+            "ppo.policy_training_start_step > 0; without critic warmup there is "
+            "no frozen-policy window to widen."
+        )
+
     sampler_name = async_config.sampler.name
     if sampler_name != "in_order":
         raise ValueError(

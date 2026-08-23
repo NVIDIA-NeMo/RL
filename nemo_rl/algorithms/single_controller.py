@@ -39,6 +39,7 @@ import logging
 import math
 import os
 import time
+import warnings
 from collections import deque
 from functools import partial
 from typing import Any, Awaitable, Callable, Optional, Union
@@ -275,6 +276,11 @@ class SingleControllerActor:
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
         }
+
+        # Seeded here rather than in run(): on resume _trainer_version is the
+        # checkpoint's step, so a run resuming mid-warmup needs the widened
+        # window before the first dispatch.
+        self._retune_lookahead_versions()
 
         print(
             f"SingleControllerActor: "
@@ -1046,6 +1052,17 @@ class SingleControllerActor:
                                 value_result = await self._value_train(train_meta)
 
                         if is_policy_training_step:
+                            if (
+                                self._is_ppo
+                                and self._train_steps == policy_training_start_step
+                                and policy_training_start_step > 0
+                                and epoch == 0
+                            ):
+                                print(
+                                    f"  ✓ Critic warmup complete ({policy_training_start_step} "
+                                    "steps). Starting policy training.",
+                                    flush=True,
+                                )
                             # Always restore training mode because log-prob inference may have
                             # switched the model to inference mode.
                             with self._timer.time("training_prep"):
@@ -1217,6 +1234,7 @@ class SingleControllerActor:
                         aborted_stale_inflight_groups = await self._sync_weights(
                             calibration_data=calibration_data
                         )
+                    self._retune_lookahead_versions()
                     self._rollout_manager.set_weight_version(self._trainer_version)
                     step_metrics.update(
                         {
@@ -1272,7 +1290,10 @@ class SingleControllerActor:
                     should_save_by_step or should_save_by_timeout
                 ):
                     with self._timer.time("checkpointing"):
-                        await self._save_checkpoint(step_metrics)
+                        await self._save_checkpoint(
+                            step_metrics,
+                            is_policy_training_step=is_policy_training_step,
+                        )
 
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"
@@ -1615,11 +1636,18 @@ class SingleControllerActor:
         )
         return len(stale_tasks)
 
-    async def _save_checkpoint(self, step_metrics: dict[str, Any]) -> None:
+    async def _save_checkpoint(
+        self,
+        step_metrics: dict[str, Any],
+        *,
+        is_policy_training_step: bool,
+    ) -> None:
         """Write a full checkpoint for the just-finished train step.
 
         Everything except the (possibly async) policy weight write must be
         on disk before begin_finalization; rollouts keep running throughout.
+        The policy optimizer is skipped during critic warmup -- it has never
+        stepped.
         """
         save_state = self._save_state
         save_state.current_step = self._train_steps
@@ -1652,9 +1680,19 @@ class SingleControllerActor:
         full_metric_name = self._master_config.checkpointing["metric_name"]
         if full_metric_name is not None:
             metric_name = full_metric_name.split(":", 1)[1]
-            if metric_name not in step_metrics:
+            if not is_policy_training_step:
+                warnings.warn(
+                    f"checkpointing.metric_name={full_metric_name!r} is not "
+                    "available during PPO critic warmup; this checkpoint will "
+                    "not be saved as top-k.",
+                    stacklevel=2,
+                )
+                if hasattr(save_state, full_metric_name):
+                    delattr(save_state, full_metric_name)
+            elif metric_name not in step_metrics:
                 raise ValueError(f"Metric {metric_name} not found in train metrics")
-            setattr(save_state, full_metric_name, step_metrics[metric_name])
+            else:
+                setattr(save_state, full_metric_name, step_metrics[metric_name])
 
         # Flush the previous checkpoint's background finalization first;
         # re-raises a failure from it.
@@ -1667,6 +1705,8 @@ class SingleControllerActor:
             vars(save_state),
             self._master_config,
         )
+
+        # Save value model
         if self._is_ppo:
             # The critic shares the training GPUs, so the two weight saves are
             # serialized. The critic goes first because offloading the policy runs
@@ -1689,17 +1729,24 @@ class SingleControllerActor:
             # Also covers a warmup step, which never ran prepare_for_training in
             # the pump and would otherwise save from CPU-resident params.
             await asyncio.to_thread(self._trainer.prepare_for_training)
+
+        # Save policy model
         # With async_save this returns after D2H staging; disk writes finish
         # in the background.
         await asyncio.to_thread(
             self._trainer.save_checkpoint,
             weights_path=os.path.join(checkpoint_path, "policy", "weights"),
+            # Always save policy weights so every PPO checkpoint has
+            # the same component layout. Before the first real policy
+            # update, omit optimizer and scheduler state because their
+            # lazily initialized state is not yet safe to checkpoint.
             optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer")
-            if self._checkpointer.save_optimizer
+            if self._checkpointer.save_optimizer and is_policy_training_step
             else None,
             tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
             checkpointing_cfg=self._master_config.checkpointing,
         )
+
         await asyncio.to_thread(
             torch.save,
             dataloader_state,
@@ -1719,6 +1766,7 @@ class SingleControllerActor:
             buffer_state,
             os.path.join(checkpoint_path, "replay_buffer.pt"),
         )
+
         # Rename happens in the background once the async weight writes
         # finish; flushed at the next save or on exit.
         self._checkpointer.begin_finalization(
@@ -1997,3 +2045,20 @@ class SingleControllerActor:
         if self._is_ppo:
             fields.append(adv_cfg.values_field)
         return list(dict.fromkeys(fields))
+
+    def _retune_lookahead_versions(self) -> None:
+        """Widen the sampler's lookahead while the policy is frozen, then shrink it back.
+
+        Port of ppo.py's _async_ppo_generation_lead_steps.
+        """
+        if not self._is_ppo:
+            return
+        steady = self._async_cfg.sampler.max_lookahead_versions
+        warmup = self._async_cfg.sampler.warmup_lookahead_versions
+        start = self._algo_cfg.policy_training_start_step
+        if warmup is None or self._trainer_version >= start:
+            window = steady
+        else:
+            remaining_to_frontier = start + steady - self._trainer_version
+            window = max(steady, min(warmup, remaining_to_frontier))
+        self._sampler.set_gate_window(window)
