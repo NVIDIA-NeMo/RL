@@ -356,8 +356,6 @@ def test_sync_weights_honors_recompute_kv_cache_config(
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=False,
     )
-    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
-    ctrl._trainer_version = 3
     ctrl._inflight_by_group_id = {}
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
@@ -367,7 +365,6 @@ def test_sync_weights_honors_recompute_kv_cache_config(
 
     ctrl._weight_synchronizer.sync_weights.assert_called_once_with(kv_scales=None)
     assert ctrl._gen.invalidate_kv_cache.call_count == expected_invalidation_calls
-    ctrl._rollout_manager.set_weight_version.assert_called_once_with(3)
     assert ctrl._rollout_permitted.is_set()
 
 
@@ -385,8 +382,6 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._trainer = SimpleNamespace(
         calibrate_qkv_fp8_scales=MagicMock(return_value={"layers": {"layer.0": 0.5}})
     )
-    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
-    ctrl._trainer_version = 3
     ctrl._inflight_by_group_id = {}
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
@@ -773,6 +768,9 @@ class _NoOpTrainer:
     def finish_train_step(self) -> dict:
         return {}
 
+    def offload_to_cpu(self) -> None:
+        pass
+
 
 class _LpRecordingTrainer(_NoOpTrainer):
     """Records the ``keep_train_buffers`` flag the pump passes on each chunk."""
@@ -806,6 +804,25 @@ class _OrderRecordingTrainer(_NoOpTrainer):
 
     def prepare_for_training(self) -> None:
         self.calls.append("policy.prepare_for_training")
+
+
+class _EpochRecordingTrainer(_OrderRecordingTrainer):
+    """Also records the optimizer-step lifecycle, which the epoch loop repeats."""
+
+    def begin_train_step(self, loss_fn) -> None:
+        del loss_fn
+        self.calls.append("policy.begin_train_step")
+
+    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+        del meta
+        self.calls.append("policy.train_microbatches_from_meta")
+
+    def finish_train_step(self) -> dict:
+        self.calls.append("policy.finish_train_step")
+        return {}
+
+    def offload_to_cpu(self) -> None:
+        self.calls.append("policy.offload_to_cpu")
 
 
 class _NoOpDataPlane:
@@ -846,9 +863,11 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
     ctrl._is_ppo = False
+    ctrl._ppo_epochs = 1
     ctrl._value = None
     ctrl._value_loss_fn = None
     ctrl._gen = SimpleNamespace(requires_kv_scale_sync=False)
+    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
@@ -1188,10 +1207,12 @@ def _ppo_train_pump_controller(
     sampler,
     policy_training_start_step: int = 0,
     value: _NoOpValue | None = None,
+    ppo_epochs: int = 1,
 ) -> tuple[object, _NoOpValue]:
     ctrl = _train_pump_controller(sampler=sampler)
     value = _NoOpValue() if value is None else value
     ctrl._is_ppo = True
+    ctrl._ppo_epochs = ppo_epochs
     ctrl._value = value
     ctrl._value_loss_fn = MagicMock(name="value_loss_fn")
     ctrl._master_config.grpo = None
@@ -1328,11 +1349,12 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(monkeypatch) -> None
     trainer.prepare_for_training.assert_not_called()
     trainer.begin_train_step.assert_not_called()
     trainer.finish_train_step.assert_not_called()
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
-    # The step still closed and advanced the version, so staleness accounting
-    # keeps working through the warmup.
+    ctrl._sync_weights.assert_not_awaited()
+    # The step still closed and published the new version, so staleness
+    # accounting keeps working through the warmup.
     assert ctrl._train_steps == 1
     assert ctrl._trainer_version == 1
+    ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
 
 
 def test_train_pump_trains_the_policy_once_warmup_is_over(monkeypatch) -> None:
@@ -1355,6 +1377,88 @@ def test_train_pump_trains_the_policy_once_warmup_is_over(monkeypatch) -> None:
     trainer.begin_train_step.assert_called_once()
     trainer.finish_train_step.assert_called_once_with()
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+
+
+def test_train_pump_steps_both_optimizers_once_per_ppo_epoch(monkeypatch) -> None:
+    """ppo_epochs repeats the whole train stage over the step's own batch."""
+    meta = _single_group_meta()
+    ctrl, value = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta), ppo_epochs=2
+    )
+    trainer = MagicMock(spec=_NoOpTrainer)
+    trainer.finish_train_step.return_value = {}
+    ctrl._trainer = trainer
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert value.calls.count("train_from_meta") == 2
+    assert trainer.begin_train_step.call_count == 2
+    assert trainer.finish_train_step.call_count == 2
+    # Still one RL step, so one refit and one version bump.
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    assert ctrl._trainer_version == 1
+
+
+def test_train_pump_runs_every_critic_epoch_during_warmup(monkeypatch) -> None:
+    """The frozen policy does not shorten the critic's own epoch loop."""
+    meta = _single_group_meta()
+    ctrl, value = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta),
+        policy_training_start_step=1,
+        ppo_epochs=2,
+    )
+    trainer = MagicMock(spec=_NoOpTrainer)
+    ctrl._trainer = trainer
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert value.calls.count("train_from_meta") == 2
+    trainer.prepare_for_training.assert_not_called()
+    trainer.finish_train_step.assert_not_called()
+
+
+def test_train_pump_offloads_the_policy_between_ppo_epochs(monkeypatch) -> None:
+    """The two models share the training GPUs, so every critic train runs with
+    the policy on CPU -- including the ones after the first epoch."""
+    meta = _single_group_meta()
+    calls: list[str] = []
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta),
+        value=_NoOpValue(calls=calls, prefix="critic."),
+        ppo_epochs=2,
+    )
+    ctrl._trainer = _EpochRecordingTrainer(calls)
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert calls == [
+        "policy.finish_inference",
+        "critic.prepare_for_inference",
+        "critic.get_values_from_meta",
+        "critic.finish_inference",
+        "critic.prepare_for_training",
+        "critic.train_from_meta",
+        "critic.finish_training",
+        "policy.prepare_for_training",
+        "policy.begin_train_step",
+        "policy.train_microbatches_from_meta",
+        "policy.finish_train_step",
+        "policy.offload_to_cpu",
+        "critic.prepare_for_training",
+        "critic.train_from_meta",
+        "critic.finish_training",
+        "policy.prepare_for_training",
+        "policy.begin_train_step",
+        "policy.train_microbatches_from_meta",
+        # No offload after the last epoch: the refit needs the policy resident.
+        "policy.finish_train_step",
+    ]
 
 
 def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:

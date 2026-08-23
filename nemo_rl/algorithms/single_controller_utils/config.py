@@ -741,6 +741,9 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "See examples/configs/ppo_math_1B_megatron_single_controller.yaml."
             )
 
+    if algo_cfg.ppo_epochs < 1:
+        raise ValueError("ppo.ppo_epochs must be at least 1")
+
     async_config = master_config.async_rl
     # Without it the critic steps once per chunk and the policy once per step,
     # which is two effective learning rates from one config, and no error.
