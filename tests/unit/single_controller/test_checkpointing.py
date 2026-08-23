@@ -71,7 +71,7 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
-from tests.unit.single_controller.test_single_controller_setup import (
+from tests.unit.single_controller.test_setup import (
     patched_factories,  # noqa: F401
 )
 
@@ -861,7 +861,7 @@ def _write_checkpoint(
 def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
     """Partially-populated MasterConfig for setup_single_controller tests.
 
-    Same shape as test_single_controller_setup._make_master_config, plus the
+    Same shape as test_setup._make_master_config, plus the
     checkpointing block setup now reads.
     """
     return MasterConfig.model_construct(
