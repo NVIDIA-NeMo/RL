@@ -2080,8 +2080,8 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
     }
     extension.maybe_init_zmq = lambda: None
 
-    def load_weights(weights, coverage=None):
-        assert coverage is not None
+    def load_weights(weights, *, coverage=None):
+        assert coverage is None
         for name, weight in weights:
             view_refs.append(weakref.ref(weight))
             loaded.append((name, weight.clone()))
