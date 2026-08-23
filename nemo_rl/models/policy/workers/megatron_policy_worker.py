@@ -138,6 +138,7 @@ from nemo_rl.utils.packed_tensor import (
 )
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 from nemo_rl.utils.timer import Timer
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     HFToLocalParamMap,
     LocalParamSpec,
@@ -3294,12 +3295,18 @@ class MegatronPolicyWorkerImpl(
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(
-        self, buffer_size_bytes: int = 0, kv_scales: Optional[dict[str, float]] = None
+        self,
+        buffer_size_bytes: int = 0,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        selection: WeightSyncSelection = WeightSyncSelection(),
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
-        draft_weights, preflight_error = self._preflight_draft_weights_for_refit()
-        if preflight_error is not None:
-            raise RuntimeError(str(preflight_error)) from preflight_error
+        draft_weights: tuple[tuple[str, torch.Tensor], ...] = ()
+        if selection.draft:
+            draft_weights, preflight_error = self._preflight_draft_weights_for_refit()
+            if preflight_error is not None:
+                raise RuntimeError(str(preflight_error)) from preflight_error
 
         self.maybe_init_zmq()
 
@@ -3324,9 +3331,13 @@ class MegatronPolicyWorkerImpl(
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        selection: WeightSyncSelection = WeightSyncSelection(),
     ) -> None:
         """Broadcast the weights for collective communication."""
-        draft_weights, preflight_error = self._preflight_draft_weights_for_refit()
+        draft_weights: tuple[tuple[str, torch.Tensor], ...] = ()
+        preflight_error: Exception | None = None
+        if selection.draft:
+            draft_weights, preflight_error = self._preflight_draft_weights_for_refit()
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
             iterator=self._iter_params_with_optional_kv_scales(

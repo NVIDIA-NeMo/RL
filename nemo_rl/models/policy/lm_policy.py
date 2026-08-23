@@ -47,6 +47,7 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
     TopkLogitsOutputSpec,
 )
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection
 from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
@@ -1107,13 +1108,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return free_memory_bytes
 
     def stream_weights_via_ipc_zmq(
-        self, buffer_size_bytes: int, kv_scales: Optional[dict[str, float]] = None
+        self,
+        buffer_size_bytes: int,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        selection: WeightSyncSelection = WeightSyncSelection(),
     ) -> list[ray.ObjectRef]:
         """Send the weights for IPC handles via ZMQ socket."""
+        kwargs: dict[str, Any] = {
+            "buffer_size_bytes": buffer_size_bytes,
+            "kv_scales": kv_scales,
+        }
+        if not selection.draft:
+            kwargs["selection"] = selection
         futures = self.worker_group.run_all_workers_single_data(
-            "stream_weights_via_ipc_zmq",
-            buffer_size_bytes=buffer_size_bytes,
-            kv_scales=kv_scales,
+            "stream_weights_via_ipc_zmq", **kwargs
         )
         return futures
 
@@ -1156,13 +1165,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        selection: WeightSyncSelection = WeightSyncSelection(),
     ) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
+        kwargs: dict[str, Any] = {
+            "kv_scales": kv_scales,
+            "buffer_size_bytes": buffer_size_bytes,
+            "num_buffers": num_buffers,
+        }
+        if not selection.draft:
+            kwargs["selection"] = selection
         futures = self.worker_group.run_all_workers_single_data(
-            "broadcast_weights_for_collective",
-            kv_scales=kv_scales,
-            buffer_size_bytes=buffer_size_bytes,
-            num_buffers=num_buffers,
+            "broadcast_weights_for_collective", **kwargs
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures

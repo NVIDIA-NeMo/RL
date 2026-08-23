@@ -83,7 +83,10 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_SPARSE_REFIT_TRANSPORTS,
+    VllmConfig,
+)
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -91,6 +94,7 @@ from nemo_rl.models.megatron.router_replay import (
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
+from nemo_rl.weight_sync.interfaces import preflight_component_selection
 
 
 @dataclass
@@ -545,6 +549,19 @@ def setup_single_controller(
     assert generation_config is not None, (
         "single_controller_utils.setup requires policy.generation in master_config"
     )
+    draft_config = policy_config.get("draft")
+    draft_update_schedule_mode = str(
+        getattr(getattr(draft_config, "update_schedule", None), "mode", "always")
+    )
+    preflight_component_selection(
+        schedule_mode=draft_update_schedule_mode,
+        generation_backend=generation_config["backend"],
+        colocated=generation_config["colocated"]["enabled"],
+        refit_transport=generation_config.get("refit_transport"),
+        remote_sparse=(
+            generation_config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS
+        ),
+    )
 
     if data_config["use_multiple_dataloader"]:
         raise NotImplementedError(
@@ -774,6 +791,7 @@ def setup_single_controller(
         train_cluster=train_cluster,
         inference_cluster=inference_cluster,
         refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+        draft_update_schedule_mode=draft_update_schedule_mode,
     )
     weight_synchronizer.init_communicator()
     setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0

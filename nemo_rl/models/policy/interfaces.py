@@ -22,6 +22,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.utils.timer import Timer
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection
 
 
 class LogprobOutputSpec(TypedDict):
@@ -203,6 +204,8 @@ class ColocatablePolicyInterface(PolicyInterface):
         self,
         buffer_size_bytes: int,
         kv_scales: Optional[dict[str, float]] = None,
+        *,
+        selection: WeightSyncSelection = WeightSyncSelection(),
     ) -> list[ray.ObjectRef]:
         pass
 
@@ -238,6 +241,7 @@ class ColocatablePolicyInterface(PolicyInterface):
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        selection: WeightSyncSelection = WeightSyncSelection(),
     ) -> list[ray.ObjectRef]:
         pass
 

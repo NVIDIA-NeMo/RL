@@ -154,6 +154,11 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.interfaces import (
+    WeightSyncSelection,
+    preflight_component_selection,
+    require_component_selection,
+)
 
 # ===============================================================================
 # Configuration
@@ -486,6 +491,13 @@ def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
         )
 
 
+def _draft_update_schedule_mode(policy_config: PolicyConfig) -> str:
+    """Return the configured draft transfer cadence without enabling it."""
+    draft_config = policy_config.get("draft")
+    schedule = getattr(draft_config, "update_schedule", None)
+    return str(getattr(schedule, "mode", "always"))
+
+
 def _needs_hf_refit_handshake(
     generation_backend: str,
     nccl_reshard_refit_enabled: bool,
@@ -594,6 +606,16 @@ def setup(
         )
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
+    draft_update_schedule_mode = _draft_update_schedule_mode(policy_config)
+    preflight_component_selection(
+        schedule_mode=draft_update_schedule_mode,
+        generation_backend=generation_config["backend"],
+        colocated=generation_config["colocated"]["enabled"],
+        refit_transport=generation_config.get("refit_transport"),
+        remote_sparse=(
+            generation_config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS
+        ),
+    )
     _validate_multimodal_dedup_capability(master_config)
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
@@ -1634,6 +1656,7 @@ def setup(
             colocated=colocated_inference,
             train_cluster=train_cluster,
             inference_cluster=None if colocated_inference else inference_cluster,
+            draft_update_schedule_mode=draft_update_schedule_mode,
         )
         policy_generation.weight_synchronizer.init_communicator()
         setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
@@ -1658,6 +1681,7 @@ def setup(
                 colocated=False,
                 train_cluster=train_cluster,
                 inference_cluster=inference_cluster,
+                draft_update_schedule_mode=draft_update_schedule_mode,
             )
             policy_generation.weight_synchronizer.init_communicator()
         else:
@@ -1694,6 +1718,9 @@ def setup(
             request_timeout_s=refit_config.sparse.request_timeout_s,
             baseline_init_refs=remote_baseline_init_refs,
         )
+        require_component_selection(
+            policy_generation.weight_synchronizer, draft_update_schedule_mode
+        )
         policy_generation.weight_synchronizer.init_communicator()
         setup_timing_metrics.extras[f"vllm_{remote_transport}_sparse_init_time_s"] = (
             time.perf_counter() - t0
@@ -1708,6 +1735,7 @@ def setup(
             colocated=colocated_inference,
             train_cluster=train_cluster,
             inference_cluster=inference_cluster,
+            draft_update_schedule_mode=draft_update_schedule_mode,
         )
         policy_generation.weight_synchronizer.init_communicator()
         setup_timing_metrics.vllm_checkpoint_engine_init_time_s = (
@@ -2453,6 +2481,7 @@ def refit_policy_generation(
     _refit_buffer_size_gb: Optional[float] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
+    selection: WeightSyncSelection = WeightSyncSelection(),
 ) -> dict[str, float]:
     """Refit the policy generation interface with the latest policy weights.
 
@@ -2469,7 +2498,12 @@ def refit_policy_generation(
     """
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if synchronizer is not None:
-        return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
+        return (
+            synchronizer.sync_weights(
+                selection=selection, timer=timer, kv_scales=kv_scales
+            )
+            or {}
+        )
 
     if colocated_inference:
         policy.offload_before_refit()
@@ -2513,8 +2547,11 @@ def refit_policy_generation(
                 futures_train = policy.stream_weights_via_ipc_zmq(
                     buffer_size_bytes=buffer_size_bytes,
                     kv_scales=kv_scales,
+                    **({"selection": selection} if not selection.draft else {}),
                 )
-                futures_inference = policy_generation.update_weights_via_ipc_zmq()
+                futures_inference = policy_generation.update_weights_via_ipc_zmq(
+                    **({"selection": selection} if not selection.draft else {})
+                )
                 # wait for all futures to complete
                 ray.get(futures_train)
                 results = ray.get(futures_inference)
@@ -2528,8 +2565,11 @@ def refit_policy_generation(
                 )
             futures_train = policy.broadcast_weights_for_collective(
                 kv_scales=kv_scales,
+                **({"selection": selection} if not selection.draft else {}),
             )
-            futures_inference = policy_generation.update_weights_from_collective()
+            futures_inference = policy_generation.update_weights_from_collective(
+                **({"selection": selection} if not selection.draft else {})
+            )
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)

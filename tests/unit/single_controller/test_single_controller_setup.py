@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -261,6 +262,39 @@ class TestSetup:
             raise AssertionError(f"unknown test case {invalid_case}")
 
         with pytest.raises(ValueError, match=match):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_generation"].assert_not_called()
+        patched_factories["_build_trainer"].assert_not_called()
+
+    def test_fixed_cadence_rejects_unsupported_backend_before_worker_setup(
+        self, patched_factories
+    ):
+        mc = _make_master_config(backend="sglang")
+        mc.policy["draft"] = SimpleNamespace(
+            update_schedule=SimpleNamespace(mode="fixed")
+        )
+
+        with pytest.raises(ValueError, match="component-selective.*unsupported"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_generation"].assert_not_called()
+        patched_factories["_build_trainer"].assert_not_called()
+
+    def test_fixed_cadence_rejects_remote_sparse_before_worker_setup(
+        self, patched_factories
+    ):
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"]["refit_transport"] = "vllm_zmq_sparse"
+        mc.policy["draft"] = SimpleNamespace(
+            update_schedule=SimpleNamespace(mode="fixed")
+        )
+
+        with pytest.raises(ValueError, match="component-selective.*unsupported"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         patched_factories["setup_response_data"].assert_not_called()
