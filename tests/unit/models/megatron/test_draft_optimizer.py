@@ -136,6 +136,40 @@ def test_draft_optimizer_provider_only_overrides_tagged_parameters() -> None:
     )
 
 
+def test_draft_weight_decay_override_keeps_norm_and_bias_at_zero_decay() -> None:
+    """Megatron's standard wd_mult=0.0 for 1-D params survives the draft override:
+    the scheduler multiplies get_wd(group) * wd_mult, so draft norms/biases keep
+    zero decay even when draft.optimizer.weight_decay is set."""
+    from megatron.core.optimizer import get_standard_config_overrides
+
+    bias_like = torch.nn.Parameter(torch.ones(4))
+    bias_like.grad_norm_group = "draft"
+    provider = DraftOptimizerConfigOverrideProvider(
+        DraftOptimizerConfig(lr=1.0e-3, weight_decay=0.02)
+    )
+    context = OptimizerConfigOverrideProviderContext(
+        scheduler_config=MagicMock(),
+        optimizer_config=OptimizerConfig(lr=2.0e-3, min_lr=2.0e-4, weight_decay=0.1),
+        model=MagicMock(),
+    )
+    draft_overrides = provider.build_config_overrides(context)
+    assert draft_overrides is not None
+    standard_overrides = get_standard_config_overrides(context.optimizer_config)
+
+    merged = {**standard_overrides, **draft_overrides}
+    combined = combine_param_group_overrides(
+        [
+            override
+            for key, override in merged.items()
+            if key.matches(bias_like, "draft.norm.bias")
+        ]
+    )
+
+    assert combined["start_wd"] == 0.02
+    assert combined["wd_mult"] == 0.0
+    assert combined["start_wd"] * combined["wd_mult"] == 0.0
+
+
 def test_draft_optimizer_provider_rejects_incompatible_inherited_min_lr() -> None:
     parameter = torch.nn.Parameter(torch.ones(1))
     parameter.grad_norm_group = "draft"
