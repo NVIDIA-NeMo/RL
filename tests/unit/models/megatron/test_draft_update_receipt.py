@@ -14,9 +14,12 @@
 
 from __future__ import annotations
 
+import ast
+import hashlib
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import sys
+import textwrap
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -26,6 +29,41 @@ import pytest
 import torch
 
 pytestmark = pytest.mark.mcore
+
+
+def test_pinned_distributed_optimizer_digest_matches_submodule_source() -> None:
+    receipt = _receipt_module()
+    source_path = (
+        Path(__file__).parents[4]
+        / "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+        / "megatron/core/optimizer/distrib_optimizer.py"
+    )
+    source = source_path.read_text()
+    source_lines = source.splitlines(keepends=True)
+    tree = ast.parse(source)
+    optimizer_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DistributedOptimizer"
+    )
+    method_sources: list[str] = []
+    for method_name in receipt._DISTRIBUTED_OPTIMIZER_METHODS:
+        method = next(
+            node
+            for node in optimizer_class.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == method_name
+        )
+        start_line = min(
+            [method.lineno, *(decorator.lineno for decorator in method.decorator_list)]
+        )
+        method_sources.append(
+            textwrap.dedent("".join(source_lines[start_line - 1 : method.end_lineno]))
+        )
+
+    actual = hashlib.sha256("\n".join(method_sources).encode("utf-8")).hexdigest()
+
+    assert actual == receipt._DISTRIBUTED_OPTIMIZER_SOURCE_SHA256
 
 
 def _receipt_module() -> Any:

@@ -36,7 +36,7 @@ from typing import (
 import torch
 
 _DISTRIBUTED_OPTIMIZER_SOURCE_SHA256 = (
-    "c048e93bbcb079ff50f52ef366e685fab80115665941beac1cbaa358e88145d0"
+    "4775fbda708f1e6f620eb7b757ea141f2c953512294eb0b5189f1dc701aac2a6"
 )
 _DISTRIBUTED_OPTIMIZER_METHODS = (
     "_build_model_and_main_param_groups",
