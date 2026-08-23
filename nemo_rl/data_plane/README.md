@@ -467,6 +467,7 @@ totals and `percent_of_dataplane`, with the per-op detail in a table beside them
 | `step/percent_of_dataplane/by_op/{put,get,clear,register}` | which call is expensive? |
 | `step/percent_of_dataplane/by_cause/{fixed_overhead,transfer}` | is that fixed per-request cost, or moving bytes? |
 | `step/wall_ms`, `step/comm_volume_mb` | how much time and traffic |
+| `step/volume_mb/by_op/{get,put}` | which direction that traffic went |
 | `now/bytes_outstanding_mb`, `now/n_processes` | occupancy, fan-out width |
 | `step/self/{overhead_ms,frac}` | what measuring cost |
 | `step/hash/*` | only with `verify_tensor_hash` on |
@@ -501,6 +502,20 @@ to *at most* 100: only ops with an identifiable affine fit can be split, so
 the remainder (27% above — the `register` and `clear` calls, which move
 no bytes and so have no bandwidth term to fit) is time that could not be
 attributed rather than time that did not happen.
+
+`volume_mb` counts *transfers*, not data size, and two things follow from
+that. A byte written and later read is counted on both sides. And every
+reporting process is summed, so four ranks each fetching their own shard
+count four times. Both are correct for "what crossed the wire" -- on a real
+step get moved 20.8 MB against put's 2.7 MB, because every DP rank fetches
+its shard once for the logprob pass and again for the train pass. Neither
+is correct for "how big was the batch", which these series cannot answer.
+
+**The rollout actor is not in the fan-out**, so `kv_first_write` -- the
+write of the entire rollout batch, and the largest write in the step -- is
+absent from `volume_mb/by_op/put` and from `comm_volume_mb`. That is why
+put reads small next to get. Read the write side as "what the driver and
+policy workers wrote", not as the step's write traffic.
 
 On the cluster path `wall_ms` is summed over processes that ran
 concurrently, so these are percentages of aggregate **process-time**, not of
