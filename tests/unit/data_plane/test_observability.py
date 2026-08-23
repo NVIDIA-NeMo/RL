@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from time import monotonic
 
+import logging
+
 import pytest
 import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict
@@ -33,6 +35,7 @@ from nemo_rl.data_plane.observability import (
     breakdown_table,
     cluster_step_metrics,
     headline_series,
+    _hash_deltas,
     merge_snapshots,
     _estimate_encoded_bytes,
     _QUANTILES,
@@ -1533,3 +1536,37 @@ def test_uniform_write_read_back_inside_a_ragged_batch_is_clean():
     assert hv["mismatches"] == 0, "no row changed length; nothing diverged"
     assert hv["fields_skipped"] == 1, "content uncomparable, and counted"
     client.close()
+
+
+def test_implausible_mismatch_rate_is_called_out(caplog):
+    """Every row of every field wrong, identically, every step is not what a
+    broken wire looks like -- it is what a broken guard looks like. Both false
+    alarms this check has produced had that shape, and a reader should not
+    have to work that out from a raw count."""
+    hv = {
+        "rows_recorded": 100,
+        "rows_checked": 100,
+        "mismatches": 300,
+        "rows_unverified": 0,
+        "fields_skipped": 0,
+    }
+    with caplog.at_level(logging.WARNING):
+        deltas = _hash_deltas(hv, {})
+
+    assert deltas["step/hash/mismatches"] == 300
+    assert "more likely a bug in the check" in caplog.text
+
+
+def test_a_believable_mismatch_rate_is_not_second_guessed(caplog):
+    """A handful of bad rows is exactly what the guard exists to report."""
+    hv = {
+        "rows_recorded": 100,
+        "rows_checked": 100,
+        "mismatches": 3,
+        "rows_unverified": 0,
+        "fields_skipped": 0,
+    }
+    with caplog.at_level(logging.WARNING):
+        _hash_deltas(hv, {})
+
+    assert "more likely a bug" not in caplog.text
