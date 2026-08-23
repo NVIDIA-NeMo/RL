@@ -525,7 +525,7 @@ def _hash_deltas(hv: dict[str, int], prev_hv: dict[str, int]) -> dict[str, float
     """
     if not hv or not hv.get("rows_recorded"):
         return {}
-    return {
+    deltas = {
         f"step/hash/{name}": hv[name] - prev_hv.get(name, 0)
         for name in (
             "rows_checked",
@@ -535,6 +535,22 @@ def _hash_deltas(hv: dict[str, int], prev_hv: dict[str, int]) -> dict[str, float
             "fields_skipped",
         )
     }
+    # Corruption of every row of every field in a step, repeated identically,
+    # is not what a broken wire looks like -- it is what a broken guard looks
+    # like. Both false alarms this check has produced had exactly this shape
+    # (3584 mismatches against 1536 rows, unchanging), and both were the
+    # guard's own bookkeeping. Say so rather than leaving a reader to decide
+    # whether to believe a number that large.
+    checked, bad = deltas["step/hash/rows_checked"], deltas["step/hash/mismatches"]
+    if checked > 0 and bad >= checked:
+        logger.warning(
+            "data-plane hash: %d mismatches against %d rows checked this step. "
+            "A rate that high is more likely a bug in the check than in the "
+            "wire -- confirm against the per-sample lines before acting on it.",
+            bad,
+            checked,
+        )
+    return deltas
 
 
 def _volume_mb(per_op: dict[str, dict[str, float]]) -> dict[str, float]:
@@ -1462,14 +1478,23 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 stats.mismatches += 1
                 if self._hash_mismatches_logged < _MAX_HASH_MISMATCH_LOGS:
                     self._hash_mismatches_logged += 1
+                    # Scheme and shape on the line: the last two false alarms
+                    # were both bookkeeping (a scheme replayed wrong, a
+                    # grouping that could not be compared), and neither was
+                    # diagnosable from the digests alone.
                     logger.error(
                         "data-plane hash mismatch: partition=%s sample=%s "
-                        "field=%s wire_in=%d wire_out=%d",
+                        "field=%s wire_in=%d wire_out=%d "
+                        "(%s scheme, row %d of %d, %d long)",
                         partition_id,
                         sample_id,
                         name,
                         expected,
                         digest.per_row[row],
+                        "batch-scoped" if digest.batch_scoped else "per-row",
+                        row,
+                        len(sample_ids),
+                        digest.row_lens[row] if digest.row_lens else -1,
                     )
 
     def _run(
