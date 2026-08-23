@@ -756,6 +756,15 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "not have yet (#2625)."
         )
 
+    sampler_name = async_config.sampler.name
+    if sampler_name != "in_order":
+        raise ValueError(
+            "PPO on the SingleController path only supports "
+            f"async_rl.sampler.name='in_order', but got '{sampler_name}'. "
+            "Other samplers are not supported yet (in particular during critic "
+            "warmup) (#2625)."
+        )
+
     rl_step_samples = (
         algo_cfg.num_prompts_per_step * algo_cfg.num_generations_per_prompt
     )
