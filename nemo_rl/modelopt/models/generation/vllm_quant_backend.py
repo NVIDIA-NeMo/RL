@@ -478,23 +478,24 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             finalize_layerwise_reload,
             initialize_layerwise_reload,
         )
+        from vllm.model_executor.model_loader.utils import (
+            process_weights_after_loading,
+        )
 
         model = self.model_runner.model
         reload_roots = self._get_modelopt_reload_roots()
 
         def finalize(finalize_draft: bool) -> None:
-            # Match the base lifecycle's finalize(finalize_draft) signature.
-            # Real-quant refits do not support co-trained draft finalization;
-            # fail loudly rather than silently skipping it.
-            if finalize_draft:
-                raise RuntimeError(
-                    "ModelOpt real-quant refit does not support draft finalization"
-                )
             try:
                 with torch.device(self.device):
                     _require_complete_modelopt_layerwise_reload(model)
                     for reload_root in reload_roots:
                         finalize_layerwise_reload(reload_root, self.model_config)
+                    if finalize_draft:
+                        self._maybe_process_draft_after_loading(
+                            process_weights_after_loading
+                        )
+                self._maybe_process_mtp_drafter_after_loading()
                 # Fence completion for both collective return and the IPC
                 # COMPLETE acknowledgment. Data-batch ACKs use the hook below.
                 torch.accelerator.synchronize()
