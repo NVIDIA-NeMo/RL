@@ -50,6 +50,7 @@ from nemo_rl.algorithms.metric_utils import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
+    algo_config,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.utils import set_seed
@@ -370,12 +371,12 @@ def _clamp_max_num_steps(
     master_config: MasterConfig, dataloader: StatefulDataLoader
 ) -> None:
     """Clamp grpo.max_num_steps to max_num_epochs * len(dataloader)."""
-    grpo_config = master_config.grpo
-    max_num_epochs = grpo_config.max_num_epochs
+    algo_cfg = algo_config(master_config)
+    max_num_epochs = algo_cfg.max_num_epochs
     if max_num_epochs is None:
         return
-    grpo_config.max_num_steps = min(
-        grpo_config.max_num_steps,
+    algo_cfg.max_num_steps = min(
+        algo_cfg.max_num_steps,
         max_num_epochs * len(dataloader),
     )
 
@@ -385,8 +386,8 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     policy_config = master_config.policy
     if not policy_config.get("megatron_cfg", {}).get("enabled", False):
         return
-    grpo_config = master_config.grpo
-    policy_config["megatron_cfg"]["train_iters"] = grpo_config.max_num_steps
+    algo_cfg = algo_config(master_config)
+    policy_config["megatron_cfg"]["train_iters"] = algo_cfg.max_num_steps
 
 
 def _maybe_attach_fleet_health(
@@ -525,13 +526,13 @@ def setup_single_controller(
     validate_single_controller_config(master_config)
 
     # short names for config sections
-    grpo_config = master_config.grpo
+    algo_cfg = algo_config(master_config)
     dp_config = master_config.data_plane
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     data_config = master_config.data
 
-    if grpo_config.val_period > 0 or grpo_config.val_at_start or grpo_config.val_at_end:
+    if algo_cfg.val_period > 0 or algo_cfg.val_at_start or algo_cfg.val_at_end:
         raise NotImplementedError(
             "SingleController doesn't support validation now, will support "
             "later. Set grpo.val_period=0, val_at_start=false, val_at_end=false."
@@ -557,7 +558,7 @@ def setup_single_controller(
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
-    set_seed(grpo_config.seed)
+    set_seed(algo_cfg.seed)
 
     # ==========================
     # Checkpointing
@@ -595,7 +596,7 @@ def setup_single_controller(
         dataset, _val_dataset, env_handles, _val_env_handles = response_data
     dataloader = StatefulDataLoader(
         dataset,
-        batch_size=grpo_config.num_prompts_per_step,
+        batch_size=algo_cfg.num_prompts_per_step,
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
@@ -797,9 +798,9 @@ def setup_single_controller(
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
-        num_generations_per_prompt=grpo_config.num_generations_per_prompt,
+        num_generations_per_prompt=algo_cfg.num_generations_per_prompt,
         max_seq_len=_generation_max_seq_len(generation_config),
-        max_rollout_turns=grpo_config.max_rollout_turns,
+        max_rollout_turns=algo_cfg.max_rollout_turns,
         policy_generation=generation,
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
