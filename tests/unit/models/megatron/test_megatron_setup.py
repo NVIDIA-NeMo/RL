@@ -2218,6 +2218,40 @@ class TestHandleModelImport:
         mock_ps.destroy_model_parallel.assert_not_called()
 
 
+def test_restore_optimizer_lr_bounds_uses_current_config():
+    from nemo_rl.models.megatron.setup import _restore_optimizer_lr_bounds
+
+    optimizer = SimpleNamespace(
+        param_groups=[
+            {"max_lr": 9.0, "min_lr": 8.0},
+            {"max_lr": 7.0, "min_lr": 6.0},
+        ]
+    )
+    scheduler = MagicMock(max_lr=1.0e-6, min_lr=1.0e-7)
+
+    _restore_optimizer_lr_bounds(
+        optimizer,
+        scheduler,
+        [(1.0e-6, 1.0e-7), (2.0e-6, 2.0e-7)],
+    )
+
+    assert optimizer.param_groups == [
+        {"max_lr": 1.0e-6, "min_lr": 1.0e-7},
+        {"max_lr": 2.0e-6, "min_lr": 2.0e-7},
+    ]
+    scheduler.step.assert_called_once_with(increment=0)
+
+
+def test_restore_optimizer_lr_bounds_rejects_group_count_change():
+    from nemo_rl.models.megatron.setup import _restore_optimizer_lr_bounds
+
+    optimizer = SimpleNamespace(param_groups=[{}])
+    scheduler = MagicMock()
+
+    with pytest.raises(RuntimeError, match="param-group count changed"):
+        _restore_optimizer_lr_bounds(optimizer, scheduler, [(1.0, 0.0), (2.0, 0.0)])
+
+
 @pytest.mark.mcore
 class TestSetupModelAndOptimizer:
     """Tests for setup_model_and_optimizer function."""

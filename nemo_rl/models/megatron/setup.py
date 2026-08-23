@@ -1287,6 +1287,45 @@ def _patch_bridge_signal_handler_for_worker_threads() -> None:
     _BRIDGE_SIGNAL_HANDLER_PATCHED = True
 
 
+def _capture_optimizer_lr_bounds(
+    optimizer: Any, scheduler: Any
+) -> list[tuple[float | None, float | None]] | None:
+    """Capture config-selected LR bounds before checkpoint state is loaded."""
+    if optimizer is None or not scheduler.override_opt_param_scheduler:
+        return None
+    return [
+        (param_group.get("max_lr"), param_group.get("min_lr"))
+        for param_group in optimizer.param_groups
+    ]
+
+
+def _restore_optimizer_lr_bounds(
+    optimizer: Any,
+    scheduler: Any,
+    configured_bounds: list[tuple[float | None, float | None]] | None,
+) -> None:
+    """Reapply config-selected LR bounds after optimizer checkpoint restore."""
+    if configured_bounds is None:
+        return
+    if len(configured_bounds) != len(optimizer.param_groups):
+        raise RuntimeError(
+            "Optimizer param-group count changed while loading a checkpoint: "
+            f"configured={len(configured_bounds)}, "
+            f"loaded={len(optimizer.param_groups)}"
+        )
+    for param_group, (max_lr, min_lr) in zip(
+        optimizer.param_groups, configured_bounds, strict=True
+    ):
+        param_group["max_lr"] = max_lr
+        param_group["min_lr"] = min_lr
+    # Keep the restored scheduler step while applying the configured bounds now.
+    scheduler.step(increment=0)
+    print(
+        "Reapplied configured optimizer param-group LR bounds after checkpoint "
+        f"load: max_lr={scheduler.max_lr}, min_lr={scheduler.min_lr}"
+    )
+
+
 def setup_model_and_optimizer(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -1471,9 +1510,13 @@ def setup_model_and_optimizer(
             model=model,
             use_gloo_process_groups=megatron_cfg.dist.use_gloo_process_groups,
         )
+        configured_param_group_lr_bounds = _capture_optimizer_lr_bounds(
+            optimizer, scheduler
+        )
     else:
         optimizer = None
         scheduler = None
+        configured_param_group_lr_bounds = None
 
     print("Model, optimizer, and learning rate scheduler built")
     torch.distributed.barrier()
@@ -1503,6 +1546,12 @@ def setup_model_and_optimizer(
             skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
         )
         print("Checkpoint loaded")
+
+        _restore_optimizer_lr_bounds(
+            optimizer,
+            scheduler,
+            configured_param_group_lr_bounds,
+        )
 
         # See _force_sync_optimizer_fp32_from_model: required when
         # optimizer_cpu_offload=True so the first optimizer step does Adam on the
