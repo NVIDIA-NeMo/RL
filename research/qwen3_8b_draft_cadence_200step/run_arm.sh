@@ -76,5 +76,9 @@ PY
 
 uv run examples/run_grpo.py --config "${config_path}" "${overrides[@]}"
 
+python3 -m research.qwen3_8b_draft_cadence_200step.launch adapt-native \
+  --arm "${arm}" --result-dir "${result_dir}" \
+  --expected-product-head "${expected_product_head}"
+
 python3 -m research.qwen3_8b_draft_cadence_200step.launch terminal-preflight \
   --arm "${arm}" --result-dir "${result_dir}"

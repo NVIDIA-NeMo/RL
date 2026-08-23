@@ -85,7 +85,16 @@ class LaunchContractTest(unittest.TestCase):
     def test_run_script_invokes_the_resume_receipt_gate(self) -> None:
         script = (Path(__file__).parents[1] / "run_arm.sh").read_text()
         self.assertIn("launch resume-preflight", script)
+        self.assertIn("launch adapt-native", script)
         self.assertIn("launch terminal-preflight", script)
+        self.assertLess(
+            script.index("uv run examples/run_grpo.py"),
+            script.index("launch adapt-native"),
+        )
+        self.assertLess(
+            script.index("launch adapt-native"),
+            script.index("launch terminal-preflight"),
+        )
 
     @patch("research.qwen3_8b_draft_cadence_200step.launch.subprocess.run")
     @patch(

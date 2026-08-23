@@ -53,6 +53,17 @@ def acceptance_from_rollout_metric_batches(
     batches: Iterable[Mapping[str, object]],
 ) -> float | None:
     """Return count-weighted acceptance across every contributing batch."""
+    counts = rollout_count_totals(batches)
+    if counts is None:
+        return None
+    accepted_total, draft_total = counts
+    return accepted_total / draft_total
+
+
+def rollout_count_totals(
+    batches: Iterable[Mapping[str, object]],
+) -> tuple[float, float] | None:
+    """Return validated selected accepted/draft token totals."""
     accepted_total = 0.0
     draft_total = 0.0
     seen = False
@@ -73,7 +84,7 @@ def acceptance_from_rollout_metric_batches(
         seen = True
     if not seen or draft_total <= 0.0:
         return None
-    return accepted_total / draft_total
+    return accepted_total, draft_total
 
 
 def rollout_science_from_metric_batches(
@@ -109,6 +120,9 @@ def acceptance_observation_for_schedule(
 class PreparedDraftDecision:
     decision: DraftUpdateDecision
     terminal_evidence: CadenceTerminalEvidence | None
+    accepted_tokens: float | None
+    draft_tokens: float | None
+    selected_version: int | None
 
 
 def prepare_sync_draft_decision(
@@ -124,12 +138,16 @@ def prepare_sync_draft_decision(
     if cadence_runtime_enabled != (evidence is not None):
         raise ValueError("cadence runtime evidence enablement mismatch")
     if needs_acceptance:
+        materialized_batches = tuple(rollout_metric_batches)
         science_acceptance, selected_version = rollout_science_from_metric_batches(
-            rollout_metric_batches,
+            materialized_batches,
             require_version=cadence_runtime_enabled,
         )
+        counts = rollout_count_totals(materialized_batches)
+        accepted_tokens, draft_tokens = (None, None) if counts is None else counts
     else:
         science_acceptance, selected_version = None, None
+        accepted_tokens, draft_tokens = None, None
     if (
         cadence_runtime_enabled
         and selected_version != scheduler.state.applied_draft_version
@@ -154,4 +172,10 @@ def prepare_sync_draft_decision(
             last_applied_refit_step=prior_refit_step,
             acceptance_rate=science_acceptance,
         )
-    return PreparedDraftDecision(decision=decision, terminal_evidence=evidence)
+    return PreparedDraftDecision(
+        decision=decision,
+        terminal_evidence=evidence,
+        accepted_tokens=accepted_tokens,
+        draft_tokens=draft_tokens,
+        selected_version=selected_version,
+    )

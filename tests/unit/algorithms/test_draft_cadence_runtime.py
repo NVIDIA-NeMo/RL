@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,6 +32,7 @@ from nemo_rl.models.policy.draft_config import (
     DraftUpdateScheduleConfig,
     FixedDraftUpdateScheduleConfig,
 )
+from nemo_rl.weight_sync.interfaces import DraftApplyRequest
 
 
 def _dflash_config(
@@ -137,6 +139,44 @@ def test_selected_draft_identity_binds_world_roots_exclusively(
     )
     retry_request = write_draft_apply_identity(tmp_path, decision, receipt)
     assert retry_request.snapshot_path != request.snapshot_path
+
+
+def test_initial_apply_receipt_binds_version_zero_world_roots(tmp_path: Path) -> None:
+    identity = tmp_path / "initial-identity.json"
+    identity.write_text('{"version":0}\n')
+    request = DraftApplyRequest(
+        version=0,
+        snapshot_path=str(identity.resolve()),
+        sha256=hashlib.sha256(identity.read_bytes()).hexdigest(),
+    )
+    worker_receipt = {
+        "successful": True,
+        "decision_id": 0,
+        "global_step": 0,
+        "draft_model_sha256": "a" * 64,
+        "draft_optimizer_sha256": "b" * 64,
+    }
+    writer = CadenceRuntimeWriter(
+        CadenceRuntimeConfig(enabled=True, result_dir=str(tmp_path / "runtime"))
+    )
+
+    writer.initial_apply_closed(
+        worker_receipt=worker_receipt,
+        request=request,
+        apply_receipt=request.receipt(),
+    )
+
+    receipt = json.loads(
+        (tmp_path / "runtime" / "initial-draft-apply.json").read_text()
+    )
+    assert receipt["serving_version"] == 0
+    assert receipt["draft_model_sha256"] == "a" * 64
+    with pytest.raises(FileExistsError):
+        writer.initial_apply_closed(
+            worker_receipt=worker_receipt,
+            request=request,
+            apply_receipt=request.receipt(),
+        )
 
 
 def test_missing_task4_or_task5_receipt_fails_before_cadence_apply() -> None:

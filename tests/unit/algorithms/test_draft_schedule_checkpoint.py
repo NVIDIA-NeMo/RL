@@ -35,6 +35,7 @@ from nemo_rl.algorithms.draft_cadence_runtime import (
     load_checkpoint_bundle,
     open_resume_decision_ledger,
     record_terminal_post_refit_observation,
+    record_terminal_step_science,
     recover_draft_step_transactions,
     scheduler_decision_high_water,
 )
@@ -217,6 +218,16 @@ class CadenceTestRun:
         )
         if outcome_error is not None:
             raise outcome_error
+        accepted_tokens = 50.0 if acceptance is None else 100.0 * acceptance
+        self.terminal_evidence = record_terminal_step_science(
+            self.terminal_evidence,
+            decision=decision,
+            accepted_tokens=accepted_tokens,
+            draft_tokens=100.0,
+            selected_version=decision.applied_draft_version,
+            applied_version_after_step=self.scheduler.state.applied_draft_version,
+        )
+        self.save_state.draft_terminal_evidence = self.terminal_evidence.state_dict()
 
     def checkpoint(
         self,
@@ -1107,6 +1118,14 @@ def test_terminal_payload_maps_decision_id_to_nonzero_origin_step(
     assert isinstance(update_receipt, Mapping)
     assert update_receipt["decision_id"] == 1
     assert schedule["refit_versions"] == [{"refit_step": 8, "applied_draft_version": 1}]
+    decision_rows = schedule["decision_rows"]
+    assert isinstance(decision_rows, list)
+    assert len(decision_rows) == 1
+    assert decision_rows[0]["accepted_tokens"] == 70.0
+    assert decision_rows[0]["draft_tokens"] == 100.0
+    assert decision_rows[0]["selected_rollout_draft_version"] == 0
+    assert decision_rows[0]["applied_draft_version_after_step"] == 1
+    assert decision_rows[0]["target_refit_successful"] is True
 
 
 def test_resumed_terminal_payload_reports_only_post_boundary_observations(

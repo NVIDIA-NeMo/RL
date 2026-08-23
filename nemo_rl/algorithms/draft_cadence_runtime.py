@@ -12,7 +12,7 @@ import hashlib
 import json
 import os
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from math import isfinite
 from pathlib import Path
 from typing import Any, Mapping, Self, cast
@@ -353,6 +353,9 @@ def seal_checkpoint_ledger(
 class CadenceTerminalEvidence:
     update_receipts_by_decision: dict[int, Mapping[str, object]]
     observations_by_refit_step: dict[int, Mapping[str, object]]
+    selected_science_by_decision: dict[int, Mapping[str, object]] = field(
+        default_factory=dict
+    )
 
     def state_dict(self) -> dict[str, object]:
         return {
@@ -364,13 +367,22 @@ class CadenceTerminalEvidence:
                 str(key): dict(value)
                 for key, value in self.observations_by_refit_step.items()
             },
+            "selected_science_by_decision": {
+                str(key): dict(value)
+                for key, value in self.selected_science_by_decision.items()
+            },
         }
 
     @classmethod
     def from_state(cls, state: Mapping[str, object]) -> CadenceTerminalEvidence:
         updates = state.get("update_receipts_by_decision")
         observations = state.get("observations_by_refit_step")
-        if not isinstance(updates, Mapping) or not isinstance(observations, Mapping):
+        science = state.get("selected_science_by_decision", {})
+        if (
+            not isinstance(updates, Mapping)
+            or not isinstance(observations, Mapping)
+            or not isinstance(science, Mapping)
+        ):
             raise ValueError("invalid checkpointed cadence terminal evidence")
         try:
             parsed_updates = {
@@ -383,15 +395,71 @@ class CadenceTerminalEvidence:
                 for key, value in observations.items()
                 if isinstance(value, Mapping)
             }
+            parsed_science = {
+                int(key): dict(value)
+                for key, value in science.items()
+                if isinstance(value, Mapping)
+            }
         except (TypeError, ValueError) as error:
             raise ValueError(
                 "invalid checkpointed cadence terminal evidence"
             ) from error
-        if len(parsed_updates) != len(updates) or len(parsed_observations) != len(
-            observations
+        if (
+            len(parsed_updates) != len(updates)
+            or len(parsed_observations) != len(observations)
+            or len(parsed_science) != len(science)
         ):
             raise ValueError("invalid checkpointed cadence evidence entry")
-        return cls(parsed_updates, parsed_observations)
+        return cls(parsed_updates, parsed_observations, parsed_science)
+
+
+def record_terminal_step_science(
+    evidence: CadenceTerminalEvidence,
+    *,
+    decision: DraftUpdateDecision,
+    accepted_tokens: float | None,
+    draft_tokens: float | None,
+    selected_version: int | None,
+    applied_version_after_step: int,
+) -> CadenceTerminalEvidence:
+    """Persist selected counts and serving versions after a closed step."""
+    if (
+        type(accepted_tokens) not in (int, float)
+        or type(draft_tokens) not in (int, float)
+        or not isfinite(float(accepted_tokens))
+        or not isfinite(float(draft_tokens))
+        or float(accepted_tokens) < 0.0
+        or float(draft_tokens) <= 0.0
+        or float(accepted_tokens) > float(draft_tokens)
+        or selected_version != decision.applied_draft_version
+        or type(applied_version_after_step) is not int
+        or applied_version_after_step < 0
+    ):
+        raise ValueError("closed cadence step science is invalid")
+    expected_after = (
+        decision.decision_id
+        if decision.draft_refit_requested
+        else decision.applied_draft_version
+    )
+    if applied_version_after_step != expected_after:
+        raise ValueError("closed cadence applied version is inconsistent")
+    payload: dict[str, object] = {
+        "decision_id": decision.decision_id,
+        "global_step": decision.global_step,
+        "accepted_tokens": float(accepted_tokens),
+        "draft_tokens": float(draft_tokens),
+        "selected_rollout_draft_version": selected_version,
+        "applied_draft_version_before_step": decision.applied_draft_version,
+        "applied_draft_version_after_step": applied_version_after_step,
+        "target_refit_attempted": True,
+        "target_refit_successful": True,
+    }
+    previous = evidence.selected_science_by_decision.setdefault(
+        decision.decision_id, payload
+    )
+    if previous != payload:
+        raise ValueError("conflicting closed cadence step science")
+    return evidence
 
 
 def record_terminal_post_refit_observation(
@@ -868,6 +936,42 @@ class CadenceRuntimeWriter:
         self.update_receipt_root.mkdir(exist_ok=True)
         _fsync_directory(self.root)
 
+    def initial_apply_closed(
+        self,
+        *,
+        worker_receipt: Mapping[str, object],
+        request: DraftApplyRequest,
+        apply_receipt: Mapping[str, object],
+    ) -> None:
+        """Persist proof of the version-0 apply before serving publication."""
+        if (
+            request.version != 0
+            or worker_receipt.get("successful") is not True
+            or worker_receipt.get("decision_id") != 0
+            or apply_receipt != request.receipt()
+        ):
+            raise ValueError("initial draft apply evidence is inconsistent")
+        for key in ("draft_model_sha256", "draft_optimizer_sha256"):
+            value = worker_receipt.get(key)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or set(value) - set("0123456789abcdef")
+            ):
+                raise ValueError("initial draft apply lacks WORLD state roots")
+        write_json_exclusive_atomic(
+            self.root / "initial-draft-apply.json",
+            {
+                "schema_version": 1,
+                "successful": True,
+                "serving_version": 0,
+                "snapshot_path": request.snapshot_path,
+                "sha256": request.sha256,
+                "draft_model_sha256": worker_receipt["draft_model_sha256"],
+                "draft_optimizer_sha256": worker_receipt["draft_optimizer_sha256"],
+            },
+        )
+
     def successful_update_closed(
         self,
         *,
@@ -1082,13 +1186,33 @@ def build_terminal_schedule_payload(
         )
     }
     if schedule.get("mode") == "disabled":
-        if evidence.update_receipts_by_decision or evidence.observations_by_refit_step:
+        if (
+            evidence.update_receipts_by_decision
+            or evidence.observations_by_refit_step
+            or evidence.selected_science_by_decision
+        ):
             raise ValueError("disabled draft cannot have terminal events")
         return {
             "mode": "disabled",
             "current_step": current_step,
             **zero_fields,
             "policy_refit_count": current_step,
+            "attempted_draft_refits": 0,
+            "successful_draft_refits": 0,
+            "successful_target_refits": current_step,
+            "decision_count": 0,
+            "decision_reason_counts": {
+                reason: 0
+                for reason in (
+                    "always",
+                    "fixed_interval",
+                    "none",
+                    "adaptive_degradation",
+                    "adaptive_burst",
+                    "max_interval",
+                )
+            },
+            "decision_rows": [],
             "decision_ids": [],
             "global_steps": [],
             "updated_steps": [],
@@ -1126,6 +1250,10 @@ def build_terminal_schedule_payload(
         int(row["decision_id"]) for row in update_rows
     }:
         raise ValueError("terminal update-receipt cardinality mismatch")
+    if set(evidence.selected_science_by_decision) != {
+        int(row["decision_id"]) for row in rows
+    }:
+        raise ValueError("terminal selected-science cardinality mismatch")
     update_receipts: list[dict[str, object]] = []
     for row in update_rows:
         decision_id, global_step = int(row["decision_id"]), int(row["global_step"])
@@ -1201,26 +1329,73 @@ def build_terminal_schedule_payload(
             observations.append(dict(observation))
     outcomes = [row["outcome"] for row in rows]
 
+    decision_rows: list[dict[str, object]] = []
+    for row in rows:
+        decision_id = int(row["decision_id"])
+        science = evidence.selected_science_by_decision[decision_id]
+        outcome = cast(Mapping[str, object], row["outcome"])
+        if (
+            science.get("decision_id") != decision_id
+            or science.get("global_step") != row["global_step"]
+        ):
+            raise ValueError("terminal selected science differs from decision")
+        decision_rows.append(
+            {
+                "decision_id": decision_id,
+                "global_step": int(row["global_step"]),
+                "update_requested": bool(row["update_requested"]),
+                "draft_refit_requested": bool(row["draft_refit_requested"]),
+                "reason": str(row["reason"]),
+                "observed_acceptance": row["observed_acceptance"],
+                "forced": bool(row["forced"]),
+                "update_attempted": bool(outcome["update_attempted"]),
+                "update_successful": bool(outcome["update_successful"]),
+                "draft_refit_attempted": bool(outcome["draft_refit_attempted"]),
+                "draft_refit_successful": bool(outcome["draft_refit_successful"]),
+                **dict(science),
+            }
+        )
+
     def count(key: str) -> int:
         return sum(
             bool(cast(Mapping[str, object], outcome).get(key)) for outcome in outcomes
         )
 
+    attempted_updates = count("update_attempted")
+    successful_updates = count("update_successful")
+    attempted_refits = count("draft_refit_attempted")
+    successful_refits = count("draft_refit_successful")
+    reason_counts = {
+        reason: sum(str(row["reason"]) == reason for row in rows)
+        for reason in (
+            "always",
+            "fixed_interval",
+            "none",
+            "adaptive_degradation",
+            "adaptive_burst",
+            "max_interval",
+        )
+    }
     return {
         "mode": config["mode"],
         "current_step": current_step,
-        "attempted_updates": count("update_attempted"),
-        "successful_updates": count("update_successful"),
-        "failed_updates": count("update_attempted") - count("update_successful"),
+        "attempted_updates": attempted_updates,
+        "successful_updates": successful_updates,
+        "failed_updates": attempted_updates - successful_updates,
         "skipped_updates": count("update_skipped"),
-        "attempted_refits": count("draft_refit_attempted"),
-        "successful_refits": count("draft_refit_successful"),
-        "failed_refits": count("draft_refit_attempted")
-        - count("draft_refit_successful"),
+        "attempted_refits": attempted_refits,
+        "successful_refits": successful_refits,
+        "failed_refits": attempted_refits - successful_refits,
         "skipped_refits": count("draft_refit_skipped"),
         "forced_updates": count("forced_update"),
         "forced_refits": count("forced_refit"),
         "policy_refit_count": current_step,
+        "attempted_draft_refits": attempted_refits,
+        "successful_draft_refits": successful_refits,
+        "successful_target_refits": current_step,
+        "decision_count": len(rows),
+        "decision_reason_counts": reason_counts,
+        "decision_rows": decision_rows,
         "decision_ids": [int(row["decision_id"]) for row in rows],
         "global_steps": [int(row["global_step"]) for row in rows],
         "updated_steps": [int(row["global_step"]) for row in update_rows],

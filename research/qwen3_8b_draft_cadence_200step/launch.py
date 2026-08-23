@@ -19,6 +19,7 @@ from research.qwen3_8b_draft_cadence_200step.matrix import (
     render_hydra_overrides,
 )
 from research.qwen3_8b_draft_cadence_200step.receipts import (
+    adapt_native_outputs,
     validate_arm_receipts,
     validate_resume_ready,
 )
@@ -267,6 +268,10 @@ def main(argv: list[str] | None = None) -> None:
     terminal = subparsers.add_parser("terminal-preflight")
     terminal.add_argument("--arm", required=True)
     terminal.add_argument("--result-dir", type=Path, required=True)
+    adapt = subparsers.add_parser("adapt-native")
+    adapt.add_argument("--arm", required=True)
+    adapt.add_argument("--result-dir", type=Path, required=True)
+    adapt.add_argument("--expected-product-head", required=True)
     args = parser.parse_args(argv)
     arm = _arm(args.arm)
     if args.command == "overrides":
@@ -283,6 +288,10 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "resume-preflight":
         validate_resume_ready(
+            args.result_dir, arm, product_head=args.expected_product_head
+        )
+    elif args.command == "adapt-native":
+        adapt_native_outputs(
             args.result_dir, arm, product_head=args.expected_product_head
         )
     else:

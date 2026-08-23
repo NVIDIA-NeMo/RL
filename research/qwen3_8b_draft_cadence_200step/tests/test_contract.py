@@ -13,6 +13,7 @@ from research.qwen3_8b_draft_cadence_200step.matrix import (
     render_hydra_overrides,
 )
 from research.qwen3_8b_draft_cadence_200step.receipts import (
+    adapt_native_outputs,
     validate_adaptive_decisions,
     validate_arm_receipts,
     validate_resume_ready,
@@ -481,6 +482,121 @@ class ReceiptContractTest(unittest.TestCase):
             (latest / "draft-decision-ledger.jsonl").write_text("")
             with self.assertRaisesRegex(ValueError, "digest"):
                 validate_resume_ready(root, arm, product_head="a" * 40)
+
+    def _replace_normalized_with_native_outputs(
+        self, root: Path, arm: Arm, *, product_head: str
+    ) -> None:
+        terminal = json.loads((root / "terminal.json").read_text())
+        rows = [
+            json.loads(line)
+            for line in (root / "decision-ledger.jsonl").read_text().splitlines()
+        ]
+        final_receipt = json.loads(
+            (
+                root / "checkpoints" / "step_200" / "cadence-checkpoint-receipt.json"
+            ).read_text()
+        )
+        final_receipt["completed_policy_steps"] = 200
+        final_receipt_path = (
+            root / "checkpoints" / "step_200" / "cadence-checkpoint-receipt.json"
+        )
+        final_receipt_path.write_text(json.dumps(final_receipt))
+        (root / "checkpoint-runtime.json").write_text(json.dumps(final_receipt))
+        schedule = {
+            key: value
+            for key, value in terminal.items()
+            if key
+            not in {
+                "terminal",
+                "exit_code",
+                "requested_policy_steps",
+                "completed_policy_steps",
+            }
+        }
+        schedule["current_step"] = 200
+        schedule["decision_rows"] = rows
+        (root / "schedule-runtime.json").write_text(json.dumps(schedule))
+        (root / "run-identity.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "arm": arm.name,
+                    "product_head": product_head,
+                    "wandb_run_id": "stable-run",
+                }
+            )
+        )
+        if arm.drafter != "none":
+            identity = root / "initial-identity.json"
+            identity.write_text('{"version":0}\n')
+            (root / "initial-draft-apply.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "successful": True,
+                        "serving_version": 0,
+                        "snapshot_path": str(identity.resolve()),
+                        "sha256": hashlib.sha256(identity.read_bytes()).hexdigest(),
+                        "draft_model_sha256": "1" * 64,
+                        "draft_optimizer_sha256": "2" * 64,
+                    }
+                )
+            )
+        (root / "terminal.json").unlink()
+        (root / "runtime-evidence.json").unlink()
+        (root / "decision-ledger.jsonl").unlink()
+
+    def test_native_outputs_are_adapted_without_losing_science_or_versions(
+        self,
+    ) -> None:
+        arm = next(arm for arm in build_arms() if arm.name == "dspark-fixed-10")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_success_receipts(root, arm)
+            self._replace_normalized_with_native_outputs(
+                root, arm, product_head="a" * 40
+            )
+
+            adapt_native_outputs(root, arm, product_head="a" * 40)
+
+            terminal = validate_arm_receipts(root, arm)
+            self.assertEqual(terminal["completed_policy_steps"], 200)
+            rows = [
+                json.loads(line)
+                for line in (root / "decision-ledger.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(rows[9]["accepted_tokens"], 50)
+            self.assertEqual(rows[9]["selected_rollout_draft_version"], 0)
+            runtime = json.loads((root / "runtime-evidence.json").read_text())
+            self.assertEqual(runtime["product_head"], "a" * 40)
+            self.assertEqual(
+                runtime["native_sources"]["schedule"], "schedule-runtime.json"
+            )
+
+    def test_native_adapter_fails_closed_before_writing_on_incomplete_science(
+        self,
+    ) -> None:
+        arm = next(arm for arm in build_arms() if arm.name == "dflash-adaptive")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_success_receipts(root, arm)
+            self._replace_normalized_with_native_outputs(
+                root, arm, product_head="b" * 40
+            )
+            schedule_path = root / "schedule-runtime.json"
+            schedule = json.loads(schedule_path.read_text())
+            del schedule["decision_rows"][1]["accepted_tokens"]
+            schedule_path.write_text(json.dumps(schedule))
+
+            with self.assertRaisesRegex(ValueError, "acceptance|rollout counts"):
+                adapt_native_outputs(root, arm, product_head="b" * 40)
+
+            for name in (
+                "decision-ledger.jsonl",
+                "terminal.json",
+                "runtime-evidence.json",
+            ):
+                self.assertFalse((root / name).exists())
 
 
 if __name__ == "__main__":

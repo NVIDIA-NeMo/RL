@@ -142,6 +142,9 @@ def test_experiment_sync_nonadaptive_collects_science_without_scheduler_input(
         draft_refit_successful=True,
     )
     assert first.terminal_evidence is not None
+    assert first.accepted_tokens == 8.0
+    assert first.draft_tokens == 10.0
+    assert first.selected_version == 0
     second = prepare_sync_draft_decision(
         scheduler,
         [
@@ -253,4 +256,7 @@ def test_sync_adaptive_feeds_same_science_observation_to_scheduler() -> None:
         global_step=1,
     )
     assert prepared.decision.observed_acceptance == pytest.approx(0.6)
+    assert prepared.accepted_tokens == 6.0
+    assert prepared.draft_tokens == 10.0
+    assert prepared.selected_version is None
     assert prepared.terminal_evidence is None

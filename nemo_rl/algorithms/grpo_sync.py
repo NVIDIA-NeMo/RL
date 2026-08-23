@@ -70,6 +70,7 @@ from nemo_rl.algorithms.draft_cadence_runtime import (
     initialize_cadence_scheduler,
     initialize_or_recover_cadence_resume,
     preflight_cadence_receipt_capability,
+    record_terminal_step_science,
     require_cadence_step_receipts,
     write_draft_apply_identity,
 )
@@ -971,6 +972,11 @@ def grpo_train_sync(
             installed = close_initial_draft_snapshot(
                 apply_receipt, Path(request.snapshot_path)
             )
+            cadence_writer.initial_apply_closed(
+                worker_receipt=state_receipt,
+                request=request,
+                apply_receipt=apply_receipt,
+            )
             grpo_save_state.applied_draft_snapshot = {
                 "version": installed.version,
                 "path": installed.path,
@@ -1549,6 +1555,24 @@ def grpo_train_sync(
                         publish_target_version=publish_target_version,
                         publish_draft_version=publish_draft_version,
                     )
+                    if cadence_writer is not None:
+                        if cadence_evidence is None:
+                            raise RuntimeError(
+                                "closed cadence step lacks terminal evidence"
+                            )
+                        cadence_evidence = record_terminal_step_science(
+                            cadence_evidence,
+                            decision=cadence_decision,
+                            accepted_tokens=prepared_cadence.accepted_tokens,
+                            draft_tokens=prepared_cadence.draft_tokens,
+                            selected_version=prepared_cadence.selected_version,
+                            applied_version_after_step=(
+                                cadence_scheduler.state.applied_draft_version
+                            ),
+                        )
+                        grpo_save_state.draft_terminal_evidence = (
+                            cadence_evidence.state_dict()
+                        )
                     _log_completed_draft_refit(
                         master_config,
                         pending_step=(

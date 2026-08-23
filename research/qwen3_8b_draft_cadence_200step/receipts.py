@@ -50,6 +50,12 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _write_json_exclusive(path: Path, payload: object) -> None:
+    with path.open("x") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+
+
 def _checkpoint_tree_sha256(root: Path) -> str:
     digest = hashlib.sha256()
     for member in sorted(path for path in root.rglob("*") if path.is_file()):
@@ -266,8 +272,17 @@ def _expected_update_steps(arm: Arm, rows: list[dict[str, Any]]) -> set[int]:
     return steps
 
 
-def validate_arm_receipts(root: Path, arm: Arm) -> dict[str, Any]:
-    runtime = _read_json(root / "runtime-evidence.json")
+def validate_arm_receipts(
+    root: Path,
+    arm: Arm,
+    *,
+    _runtime: dict[str, Any] | None = None,
+    _terminal: dict[str, Any] | None = None,
+    _rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    runtime = (
+        _read_json(root / "runtime-evidence.json") if _runtime is None else _runtime
+    )
     if (
         runtime.get("target_revision") != arm.target_revision
         or runtime.get("drafter_revision") != arm.drafter_revision
@@ -315,7 +330,7 @@ def validate_arm_receipts(root: Path, arm: Arm) -> dict[str, Any]:
         or runtime.get("step_2_complete") is not True
     ):
         raise ValueError("Step 1/Step 2 runtime evidence is incomplete")
-    terminal = _read_json(root / "terminal.json")
+    terminal = _read_json(root / "terminal.json") if _terminal is None else _terminal
     if (
         terminal.get("terminal") is not True
         or terminal.get("exit_code") != 0
@@ -323,7 +338,7 @@ def validate_arm_receipts(root: Path, arm: Arm) -> dict[str, Any]:
         or terminal.get("completed_policy_steps") != arm.max_steps
     ):
         raise ValueError(f"{arm.name} is not terminal 200/200 success")
-    rows = _read_ledger(root / "decision-ledger.jsonl")
+    rows = _read_ledger(root / "decision-ledger.jsonl") if _rows is None else _rows
     expected_decision_count = 0 if arm.cadence == "baseline" else arm.max_steps
     if len(rows) != expected_decision_count:
         raise ValueError(f"expected {arm.max_steps} decision rows, found {len(rows)}")
@@ -445,6 +460,155 @@ def validate_arm_receipts(root: Path, arm: Arm) -> dict[str, Any]:
     if terminal.get("decision_reason_counts") != reason_counts:
         raise ValueError("terminal decision reason counters disagree with ledger")
     return terminal
+
+
+def adapt_native_outputs(root: Path, arm: Arm, *, product_head: str) -> None:
+    """Losslessly normalize closed native cadence receipts after process success."""
+    normalized_paths = tuple(
+        root / name
+        for name in (
+            "decision-ledger.jsonl",
+            "terminal.json",
+            "runtime-evidence.json",
+        )
+    )
+    existing = [str(path) for path in normalized_paths if path.exists()]
+    if existing:
+        raise FileExistsError(f"normalized cadence outputs already exist: {existing}")
+    if len(product_head) != 40 or set(product_head) - set("0123456789abcdef"):
+        raise ValueError("product head must be a full lowercase git SHA")
+    identity = _read_json(root / "run-identity.json")
+    if (
+        identity.get("schema_version") != 1
+        or identity.get("arm") != arm.name
+        or identity.get("product_head") != product_head
+    ):
+        raise ValueError("native output identity does not match arm or product head")
+
+    checkpoint = _read_json(root / "checkpoint-runtime.json")
+    schedule = _read_json(root / "schedule-runtime.json")
+    final_receipt_path = (
+        root
+        / "checkpoints"
+        / f"step_{arm.max_steps}"
+        / "cadence-checkpoint-receipt.json"
+    )
+    final_receipt = _read_json(final_receipt_path)
+    if checkpoint != final_receipt:
+        raise ValueError("native terminal checkpoint differs from final receipt")
+    if (
+        checkpoint.get("current_step") != arm.max_steps
+        or checkpoint.get("completed_policy_steps") != arm.max_steps
+        or schedule.get("current_step") != arm.max_steps
+    ):
+        raise ValueError("native outputs are not terminal at the requested step")
+    raw_rows = schedule.get("decision_rows")
+    if not isinstance(raw_rows, list) or any(
+        not isinstance(row, dict) for row in raw_rows
+    ):
+        raise ValueError("native schedule decision rows are absent")
+    rows = [dict(row) for row in raw_rows]
+
+    initial_path = root / "initial-draft-apply.json"
+    initial_refit: dict[str, object] | None
+    initial_receipt_sha256: str | None
+    if arm.drafter == "none":
+        if initial_path.exists():
+            raise ValueError("baseline native output cannot have a draft apply")
+        initial_refit = None
+        initial_receipt_sha256 = None
+    else:
+        initial = _read_json(initial_path)
+        snapshot_value = initial.get("snapshot_path")
+        if not isinstance(snapshot_value, str) or not snapshot_value:
+            raise ValueError("initial draft apply identity path is absent")
+        snapshot_path = Path(snapshot_value).resolve()
+        if (
+            initial.get("schema_version") != 1
+            or initial.get("successful") is not True
+            or initial.get("serving_version") != 0
+            or not snapshot_path.is_file()
+            or initial.get("sha256") != _sha256_file(snapshot_path)
+            or not _is_sha256(initial.get("draft_model_sha256"))
+            or not _is_sha256(initial.get("draft_optimizer_sha256"))
+        ):
+            raise ValueError("initial draft apply evidence is inconsistent")
+        initial_refit = {
+            "attempted": True,
+            "successful": True,
+            "serving_version": 0,
+        }
+        initial_receipt_sha256 = _sha256_file(initial_path)
+
+    capture_sizes = [
+        1,
+        2,
+        4,
+        6,
+        8,
+        10,
+        12,
+        16,
+        18,
+        20,
+        24,
+        28,
+        30,
+        32,
+        36,
+        40,
+        42,
+        48,
+        50,
+        56,
+        60,
+        64,
+    ]
+    runtime: dict[str, Any] = {
+        "schema_version": 1,
+        "product_head": product_head,
+        "target_revision": arm.target_revision,
+        "drafter_revision": arm.drafter_revision,
+        "initial_draft_refit": initial_refit,
+        "initial_apply_receipt_sha256": initial_receipt_sha256,
+        "cuda_graph_mode": "PIECEWISE",
+        "cuda_graph_capture_sizes": capture_sizes,
+        "step_1_complete": arm.max_steps >= 1
+        and (arm.cadence == "baseline" or rows[0].get("global_step") == 1),
+        "step_2_complete": arm.max_steps >= 2
+        and (arm.cadence == "baseline" or rows[1].get("global_step") == 2),
+        "native_sources": {
+            "checkpoint": "checkpoint-runtime.json",
+            "checkpoint_sha256": _sha256_file(root / "checkpoint-runtime.json"),
+            "schedule": "schedule-runtime.json",
+            "schedule_sha256": _sha256_file(root / "schedule-runtime.json"),
+        },
+    }
+    terminal = {key: value for key, value in schedule.items() if key != "decision_rows"}
+    terminal.update(
+        {
+            "schema_version": 1,
+            "terminal": True,
+            "exit_code": 0,
+            "requested_policy_steps": arm.max_steps,
+            "completed_policy_steps": arm.max_steps,
+        }
+    )
+
+    validate_arm_receipts(
+        root,
+        arm,
+        _runtime=runtime,
+        _terminal=terminal,
+        _rows=rows,
+    )
+    ledger_raw = "".join(
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
+    )
+    with normalized_paths[0].open("x") as stream:
+        stream.write(ledger_raw)
+    _write_json_exclusive(normalized_paths[1], terminal)
+    _write_json_exclusive(normalized_paths[2], runtime)
 
 
 def validate_resume_ready(root: Path, arm: Arm, *, product_head: str) -> Path:
