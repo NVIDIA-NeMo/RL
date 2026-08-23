@@ -29,7 +29,11 @@ import pytest
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import DP_VALUE_TRAIN_FIELDS, VALUE_SEED_FIELDS
+from nemo_rl.data_plane.schema import (
+    DP_VALUE_TRAIN_FIELDS,
+    GLOBAL_FORWARD_PAD_SEQLEN,
+    VALUE_SEED_FIELDS,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.models.value.tq_value import TQValue
 
@@ -212,3 +216,52 @@ class TestTQValueFanout:
             out = v.train_from_meta(meta, loss_fn="LF")
 
         assert out["all_mb_metrics"]["loss"] == [0.1, 0.2]
+
+
+class TestPadTargetIsolation:
+    """Each dispatch mints its own pad target, in both directions: the critic
+    goes first within a step, and with ppo_epochs > 1 the policy has already
+    stamped by the time the critic runs again."""
+
+    def test_dispatch_does_not_stamp_the_callers_meta(self):
+        v, _ = _make_tq_value()
+        v.use_dynamic_batches = False
+        v.use_sequence_packing = False
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["s0", "s1"],
+            sequence_lengths=[7, 9],
+        )
+        with patch(
+            "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+            return_value=([meta, meta], None),
+        ) as mock_shard:
+            v.get_values_from_meta(meta)
+
+        assert GLOBAL_FORWARD_PAD_SEQLEN not in meta.extra_info
+        # ...but the dispatched meta carries one, so DP ranks still agree.
+        assert GLOBAL_FORWARD_PAD_SEQLEN in mock_shard.call_args.args[0].extra_info
+
+    def test_a_stamped_caller_meta_does_not_decide_the_critic_pad(self):
+        """ppo_epochs > 1: the policy has stamped the shared meta by epoch 1."""
+        v, _ = _make_tq_value()
+        v.use_dynamic_batches = False
+        v.use_sequence_packing = False
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["s0", "s1"],
+            sequence_lengths=[7, 9],
+            extra_info={GLOBAL_FORWARD_PAD_SEQLEN: 4096},
+        )
+        with patch(
+            "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+            return_value=([meta, meta], None),
+        ) as mock_shard:
+            v.get_values_from_meta(meta)
+
+        dispatched = mock_shard.call_args.args[0]
+        assert dispatched.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] != 4096
+        # The caller's value survives for whoever minted it.
+        assert meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] == 4096

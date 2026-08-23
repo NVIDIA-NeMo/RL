@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Optional
 
 from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
@@ -69,6 +70,31 @@ class TQDriverMixin:
         meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = round_up(
             max(meta.sequence_lengths), max(pad_mult, seq_round)
         )
+
+    def _isolated_meta(
+        self,
+        meta: KVBatchMeta,
+        *,
+        fields: list[str],
+        task_name: str,
+    ) -> KVBatchMeta:
+        """Narrow ``meta`` for one model's dispatch and mint it a fresh pad target.
+
+        The mint is idempotent, so sharing or inheriting the target would let
+        whichever model dispatches first decide the forward pad for the rest --
+        and with ppo_epochs > 1 the caller's meta is already stamped when the
+        critic dispatches again.
+        """
+        extra_info = dict(meta.extra_info)
+        extra_info.pop(GLOBAL_FORWARD_PAD_SEQLEN, None)
+        isolated = replace(
+            meta,
+            fields=fields,
+            task_name=task_name,
+            extra_info=extra_info,
+        )
+        self._stamp_pad_seqlen(isolated)
+        return isolated
 
     def read_from_dataplane(
         self,

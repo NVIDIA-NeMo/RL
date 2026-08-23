@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import warnings
 from contextlib import nullcontext
-from dataclasses import replace
 from typing import Any, Optional
 
 import ray
@@ -110,9 +109,8 @@ class TQValue(TQDriverMixin, Value):
             micro_batch_size: Inference micro batch size; None uses the config default.
             timer: Optional timer for nested get_values measurements.
         """
-        self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("logprob_mb_tokens")
-        value_meta = replace(
+        value_meta = self._isolated_meta(
             meta,
             fields=list(VALUE_SEED_FIELDS),
             task_name="value_fwd",
@@ -162,9 +160,8 @@ class TQValue(TQDriverMixin, Value):
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
 
-        self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
-        train_meta = replace(
+        train_meta = self._isolated_meta(
             meta,
             fields=list(DP_VALUE_TRAIN_FIELDS),
             task_name="value_train",
