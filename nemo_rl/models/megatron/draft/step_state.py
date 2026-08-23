@@ -22,6 +22,7 @@ import torch
 from nemo_rl.algorithms.loss.draft import DraftLossStats
 
 DRAFT_STEP_PAYLOAD_KEY = "_draft_step_payload"
+DRAFT_LOSS_METRIC_KEY = "draft_loss"
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,9 +125,7 @@ class DraftStepState:
             return value.detach() * scale
         return value * scale
 
-    def weighted_numerator_for_reduction(
-        self, reference: torch.Tensor
-    ) -> torch.Tensor:
+    def weighted_numerator_for_reduction(self, reference: torch.Tensor) -> torch.Tensor:
         """Return this CP rank's weighted numerator on a collective-safe device."""
         if self._local_numerators is None or self._weights is None:
             return reference.new_zeros(())

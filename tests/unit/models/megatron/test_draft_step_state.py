@@ -220,3 +220,54 @@ def test_zero_policy_count_zeroes_draft_gradient(dtype: torch.dtype) -> None:
     )
 
     assert draft_param.main_grad.item() == 0.0
+
+
+def test_split_accumulation_matches_monolithic_normalization() -> None:
+    """Split-vs-nonsplit parity: draft counts equal the policy's shifted-mask
+    count by construction (roll_tensor zeroes the vacated slot), so accumulating
+    per-microbatch stats and normalizing once must equal the monolithic path."""
+    from nemo_rl.algorithms.loss.draft import streaming_vocab_parallel_soft_ce
+
+    generator = torch.Generator().manual_seed(20260822)
+    student = torch.randn(4, 5, 7, generator=generator, dtype=torch.float64)
+    teacher = torch.randn(4, 5, 7, generator=generator, dtype=torch.float64)
+    token_mask = torch.ones(4, 5)
+    token_mask[0, 0] = 1.0  # exercise the shifted first slot explicitly
+    token_mask[1, 3] = 0.0
+    rolled_mask = torch.roll(token_mask, shifts=-1, dims=1)
+    rolled_mask[:, -1] = 0.0
+
+    monolithic = streaming_vocab_parallel_soft_ce(
+        student_logits=student,
+        teacher_logits=teacher,
+        mask=rolled_mask,
+        token_chunk_size=64,
+        tp_group=None,
+    )
+    monolithic_loss = monolithic.normalized(
+        normalization_counts=monolithic.counts,
+    )
+
+    state = DraftStepState()
+    split_losses = []
+    for half in (slice(0, 2), slice(2, 4)):
+        stats = streaming_vocab_parallel_soft_ce(
+            student_logits=student[half],
+            teacher_logits=teacher[half],
+            mask=rolled_mask[half],
+            token_chunk_size=64,
+            tp_group=None,
+        )
+        state.accumulate(state.metric_payload(stats))
+        split_losses.append(stats.numerators)
+    global_counts = state.local_counts
+    split_loss = sum(split_losses).sum() / (global_counts.sum() + 1e-8)
+
+    assert torch.equal(global_counts, monolithic.counts), (
+        "split-accumulated counts must equal the monolithic denominator"
+    )
+    torch.testing.assert_close(split_loss, monolithic_loss, rtol=1e-12, atol=1e-12)
+    policy_count = token_mask[:, 1:].sum()
+    assert torch.equal(global_counts.sum(), policy_count), (
+        "draft rolled-mask count must equal the policy shifted-mask count"
+    )

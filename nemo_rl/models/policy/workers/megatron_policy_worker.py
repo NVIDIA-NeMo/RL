@@ -78,6 +78,7 @@ from nemo_rl.models.megatron.draft.diagnostics import (
     start_draft_update_probe,
 )
 from nemo_rl.models.megatron.draft.step_state import (
+    DRAFT_LOSS_METRIC_KEY,
     DRAFT_STEP_PAYLOAD_KEY,
     DraftStepPayload,
     DraftStepState,
@@ -2073,7 +2074,7 @@ class MegatronPolicyWorkerImpl(
             for k, v in m.items():
                 if k == DRAFT_STEP_PAYLOAD_KEY:
                     continue
-                if k == "draft_loss" and draft_step_state.active:
+                if k == DRAFT_LOSS_METRIC_KEY and draft_step_state.active:
                     assert normalized_draft_metric is not None
                     out[k] = (
                         normalized_draft_metric

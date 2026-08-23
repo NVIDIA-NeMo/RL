@@ -287,6 +287,14 @@ class DraftLossWrapper:
             **kwargs,
         )
 
+        # Function-local import: step_state lives under models.megatron.draft,
+        # whose package import pulls the modelopt chain non-megatron users avoid.
+        from nemo_rl.models.megatron.draft.step_state import (
+            DRAFT_LOSS_METRIC_KEY,
+            DRAFT_STEP_PAYLOAD_KEY,
+            DraftStepState,
+        )
+
         if self.draft_provider is None:
             loss_input, data = self.prepare_fn(
                 logits=next_token_logits,
@@ -314,11 +322,6 @@ class DraftLossWrapper:
             assert stats is not None
             draft_loss = (stats.numerators * stats.weights).sum()
             # Deferred payloads are only consumed by the Megatron split API.
-            from nemo_rl.models.megatron.draft.step_state import (
-                DRAFT_STEP_PAYLOAD_KEY,
-                DraftStepState,
-            )
-
             metrics[DRAFT_STEP_PAYLOAD_KEY] = DraftStepState.metric_payload(stats)
         else:
             if self.draft_provider is None:
@@ -342,7 +345,7 @@ class DraftLossWrapper:
                     normalization_counts=normalization_counts,
                 )
         combined_loss = policy_loss + self.loss_weight * draft_loss
-        metrics["draft_loss"] = float(draft_loss.detach().item())
+        metrics[DRAFT_LOSS_METRIC_KEY] = float(draft_loss.detach().item())
         return combined_loss, metrics
 
 
