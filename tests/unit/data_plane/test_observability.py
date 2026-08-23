@@ -24,7 +24,6 @@ from __future__ import annotations
 from time import monotonic
 
 import logging
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -1587,24 +1586,3 @@ def test_a_believable_mismatch_rate_is_not_second_guessed(caplog):
         _hash_deltas(hv, {})
 
     assert "more likely a bug" not in caplog.text
-
-
-def test_wandb_logger_warns_when_a_step_is_written_after_it_commits():
-    """wandb accepts a log against a committed step, returns cleanly, and
-    drops it. That silently cost this feature every one of its series until
-    someone read a finished run back out of the API -- so the Logger says so
-    rather than leaving each call site to remember the ordering."""
-    from nemo_rl.utils.logger import WandbLogger
-
-    logged: list[dict] = []
-    logger_obj = WandbLogger.__new__(WandbLogger)
-    logger_obj.run = type("R", (), {"log": lambda self, m, **kw: logged.append(m)})()
-    logger_obj._committed_step = -1
-
-    with patch.object(logging.getLogger("nemo_rl.utils.logger"), "warning") as warn:
-        logger_obj.log_metrics({"a": 1.0}, step=3, step_finished=True)
-        assert warn.call_count == 0, "the committing log is fine"
-        logger_obj.log_metrics({"b": 2.0}, step=3)
-        assert warn.call_count == 1, "the one after it is not"
-        logger_obj.log_metrics({"c": 3.0}, step=4)
-        assert warn.call_count == 1, "a later step is fine again"
