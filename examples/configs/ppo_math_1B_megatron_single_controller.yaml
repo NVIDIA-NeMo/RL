@@ -148,8 +148,6 @@ policy:
   megatron_cfg:
     enabled: true
 
-  # Both are read on the SC path but absent from the PPO exemplar chain, which
-  # predates them. Values copied from grpo_math_1B.yaml.
   draft:
     enabled: false
     model_name: null
