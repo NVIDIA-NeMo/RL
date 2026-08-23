@@ -231,9 +231,7 @@ def test_dspark_config_resolves_target_owned_vocab() -> None:
     }
 
     assert (
-        DSparkDraftConfig(**values).resolve_draft_vocab_size(
-            target_vocab_size=151_936
-        )
+        DSparkDraftConfig(**values).resolve_draft_vocab_size(target_vocab_size=151_936)
         == 151_936
     )
     assert (
@@ -254,9 +252,10 @@ def test_dspark_update_probe_is_explicitly_opt_in() -> None:
     }
 
     assert DSparkDraftConfig(**values).update_probe_enabled is False
-    assert DSparkDraftConfig(
-        **values, update_probe_enabled=True
-    ).update_probe_enabled is True
+    assert (
+        DSparkDraftConfig(**values, update_probe_enabled=True).update_probe_enabled
+        is True
+    )
 
 
 def test_dspark_config_rejects_dflash_gamma_alias() -> None:
