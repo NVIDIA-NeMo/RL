@@ -11,6 +11,9 @@ grpo:
 
 checkpointing:
   enabled: true
+  # set to false to start fresh in a checkpoint_dir that already has
+  # checkpoints; the existing ones are moved to checkpoint_dir/run_<n>/
+  resume_if_exists: true
   checkpoint_dir: results/audio_grpo_3B_megatron
   keep_top_k: 10
   save_period: 400

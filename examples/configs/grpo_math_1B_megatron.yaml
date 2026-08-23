@@ -30,6 +30,9 @@ loss_fn:
 
 checkpointing:
   enabled: false
+  # set to false to start fresh in a checkpoint_dir that already has
+  # checkpoints; the existing ones are moved to checkpoint_dir/run_<n>/
+  resume_if_exists: true
   checkpoint_dir: "results/grpo_megatron"
   metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
   higher_is_better: true
