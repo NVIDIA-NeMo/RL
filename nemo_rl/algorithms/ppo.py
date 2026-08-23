@@ -188,12 +188,14 @@ class PPOConfig(BaseModel, extra="allow"):
     # None logs metrics without masking; values above the threshold are excluded.
     seq_logprob_error_threshold: float | None = None
     # Asynchronous PPO uses a replay buffer with non-colocated generation.
-    async_ppo: AsyncPPOConfig = Field(default_factory=AsyncPPOConfig)
+    # Legacy async config block; SC reads its async knobs from `async_rl` instead.
+    async_ppo: AsyncPPOConfig | None = Field(default_factory=AsyncPPOConfig)
 
     @model_validator(mode="after")
     def validate_async_warmup_settings(self) -> "PPOConfig":
         if (
-            self.async_ppo.enabled
+            self.async_ppo is not None
+            and self.async_ppo.enabled
             and self.policy_training_start_step == 0
             and self.async_ppo.warmup_generation_lead_steps is not None
         ):
