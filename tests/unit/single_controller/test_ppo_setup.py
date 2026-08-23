@@ -367,3 +367,79 @@ class TestSetupBuildsTheCritic:
         assert actor_args.value_loss_fn is None
         assert timing.value_init_time_s is None
         patched_ppo_factories["policy"].offload_to_cpu.assert_not_called()
+
+
+def _cluster_config(mc: MasterConfig, *, colocated: bool, backend: str) -> MasterConfig:
+    """Fill in the cluster / generation keys _build_clusters reads."""
+    mc.cluster = {
+        "num_nodes": 1,
+        "gpus_per_node": 8,
+        "master_port_range_low": None,
+        "master_port_range_high": None,
+    }
+    mc.policy["generation"] = {
+        "backend": backend,
+        "colocated": {
+            "enabled": colocated,
+            "resources": {"gpus_per_node": None if colocated else 2, "num_nodes": None},
+        },
+    }
+    return mc
+
+
+class TestTrainClusterSizesForTheCritic:
+    """The critic shares the training GPUs, so it needs its own worker-group slot."""
+
+    @pytest.fixture
+    def fake_cluster(self):
+        with patch.object(sc_setup_mod, "RayVirtualCluster") as cls:
+            cls.side_effect = lambda **kwargs: MagicMock(kwargs=kwargs)
+            yield cls
+
+    def _groups(self, mc):
+        train, inference = sc_setup_mod._build_clusters(mc)
+        return train.kwargs["max_colocated_worker_groups"], inference.kwargs[
+            "max_colocated_worker_groups"
+        ]
+
+    def test_noncolocated_ppo_leaves_a_slot_for_the_critic(self, fake_cluster):
+        mc = _cluster_config(_ppo_master_config(), colocated=False, backend="vllm")
+
+        train_groups, inference_groups = self._groups(mc)
+
+        assert train_groups == 2
+        # The critic never lands on the inference cluster.
+        assert inference_groups == 1
+
+    def test_noncolocated_grpo_is_unchanged(self, fake_cluster):
+        mc = _cluster_config(_make_master_config(), colocated=False, backend="vllm")
+
+        train_groups, inference_groups = self._groups(mc)
+
+        assert train_groups == 1
+        assert inference_groups == 1
+
+    def test_colocated_ppo_adds_the_critic_beside_policy_and_generation(
+        self, fake_cluster
+    ):
+        mc = _cluster_config(_ppo_master_config(), colocated=True, backend="vllm")
+
+        train, inference = sc_setup_mod._build_clusters(mc)
+
+        assert train is inference
+        assert train.kwargs["max_colocated_worker_groups"] == 3
+
+    def test_colocated_grpo_is_unchanged(self, fake_cluster):
+        mc = _cluster_config(_make_master_config(), colocated=True, backend="vllm")
+
+        train, _ = sc_setup_mod._build_clusters(mc)
+
+        assert train.kwargs["max_colocated_worker_groups"] == 2
+
+    def test_colocated_megatron_generation_needs_no_extra_slot(self, fake_cluster):
+        """The megatron backend generates from the policy's own workers."""
+        mc = _cluster_config(_ppo_master_config(), colocated=True, backend="megatron")
+
+        train, _ = sc_setup_mod._build_clusters(mc)
+
+        assert train.kwargs["max_colocated_worker_groups"] == 2

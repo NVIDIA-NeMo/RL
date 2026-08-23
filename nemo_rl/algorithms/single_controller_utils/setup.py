@@ -147,15 +147,22 @@ def _build_clusters(
     gpus_per_node = cluster_config["gpus_per_node"]
     port_range_low = cluster_config.get("master_port_range_low")
     port_range_high = cluster_config.get("master_port_range_high")
+    # Worker groups sharing the training GPUs: the policy, plus the critic on
+    # the PPO path.
+    train_worker_groups = 2 if is_ppo_run(master_config) else 1
 
     if colocated:
-        # Policy + generation share GPUs — one cluster.
+        # Policy (+ critic) + generation share GPUs — one cluster.
         cluster = RayVirtualCluster(
             name="sc_policy_cluster",
             bundle_ct_per_node_list=[gpus_per_node] * num_nodes,
             use_gpus=True,
             num_gpus_per_node=gpus_per_node,
-            max_colocated_worker_groups=1 if backend == "megatron" else 2,
+            max_colocated_worker_groups=(
+                train_worker_groups
+                if backend == "megatron"
+                else train_worker_groups + 1
+            ),
             port_range_low=port_range_low,
             port_range_high=port_range_high,
         )
@@ -192,7 +199,7 @@ def _build_clusters(
         bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
         use_gpus=True,
         num_gpus_per_node=train_gpus_per_node,
-        max_colocated_worker_groups=1,
+        max_colocated_worker_groups=train_worker_groups,
         port_range_low=port_range_low,
         port_range_high=port_range_high,
     )

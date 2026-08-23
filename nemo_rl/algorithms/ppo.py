@@ -1561,8 +1561,8 @@ def ppo_train(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=train_data["rewards"],
                         mask=advantage_mask,
-                        reference_logprobs=train_data.get("reference_policy_logprobs"),
-                        logprobs=train_data["prev_logprobs"],
+                        logprobs_policy=train_data["prev_logprobs"],
+                        logprobs_reference=train_data.get("reference_policy_logprobs"),
                     )
                     if "values" in train_data:
                         adv_kwargs["values"] = train_data["values"]
@@ -2551,8 +2551,8 @@ def async_ppo_train(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=train_data["rewards"],
                         mask=advantage_mask,
-                        reference_logprobs=train_data.get("reference_policy_logprobs"),
-                        logprobs=train_data["prev_logprobs"],
+                        logprobs_policy=train_data["prev_logprobs"],
+                        logprobs_reference=train_data.get("reference_policy_logprobs"),
                     )
                     if "values" in train_data:
                         adv_kwargs["values"] = train_data["values"]

@@ -377,8 +377,8 @@ class GeneralizedAdvantageEstimator:
         self,
         rewards: torch.Tensor,
         mask: torch.Tensor,
-        logprobs: torch.Tensor | None = None,
-        reference_logprobs: torch.Tensor | None = None,
+        logprobs_policy: torch.Tensor | None = None,
+        logprobs_reference: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Build per-token reward tensor with optional KL penalty.
 
@@ -388,8 +388,8 @@ class GeneralizedAdvantageEstimator:
         Args:
             rewards: Scalar reward per sample, shape [batch_size].
             mask: Response token mask, shape [batch_size, seq_len].
-            logprobs: Current policy log probs, shape [batch_size, seq_len].
-            reference_logprobs: Reference policy log probs, shape [batch_size, seq_len].
+            logprobs_policy: Current policy log probs, shape [batch_size, seq_len].
+            logprobs_reference: Reference policy log probs, shape [batch_size, seq_len].
 
         Returns:
             token_level_rewards: shape [batch_size, seq_len].
@@ -403,10 +403,10 @@ class GeneralizedAdvantageEstimator:
         if (
             self.use_kl_in_reward
             and self.kl_coef > 0
-            and logprobs is not None
-            and reference_logprobs is not None
+            and logprobs_policy is not None
+            and logprobs_reference is not None
         ):
-            kl = calculate_kl(logprobs, reference_logprobs, self.kl_type)
+            kl = calculate_kl(logprobs_policy, logprobs_reference, self.kl_type)
             token_level_rewards = token_level_rewards - self.kl_coef * kl
 
         # Place terminal reward at the last response token (last mask=1
@@ -453,8 +453,8 @@ class GeneralizedAdvantageEstimator:
         rewards,
         mask,
         values,
-        reference_logprobs=None,
-        logprobs=None,
+        logprobs_policy=None,
+        logprobs_reference=None,
         **kwargs,
     ):
         """Compute GAE advantages with temporal bootstrapping.
@@ -472,8 +472,8 @@ class GeneralizedAdvantageEstimator:
         token_level_rewards = self._build_token_level_rewards(
             rewards,
             mask,
-            logprobs,
-            reference_logprobs,
+            logprobs_policy,
+            logprobs_reference,
         )
 
         lam_value = self._resolve_lambda_value()
