@@ -1428,3 +1428,80 @@ def test_write_and_read_volume_are_not_computed_for_nobody():
     assert metrics["step/comm_volume_mb"] > 0, "the total is still reported"
     assert metrics["step/put/mb"] == pytest.approx(0.004), "and split per op"
     client.close()
+
+
+def test_data_plane_is_logged_before_the_step_is_committed():
+    """``logger.log_metrics(..., step_finished=True)`` commits the wandb step,
+    and anything logged against a committed step is dropped.
+
+    The data-plane call used to sit *after* that commit in ``grpo_train_sync``,
+    so every series was computed, printed to stdout, and silently discarded --
+    invisible to a fake logger, and only caught by reading a real run back out
+    of the wandb API. This asserts the source order rather than the behaviour,
+    because the drop happens inside wandb.
+    """
+    import pathlib
+
+    import nemo_rl
+
+    # Read the file rather than import it: ``grpo_sync`` pulls the training
+    # stack, and the rest of this suite runs without it.
+    #
+    # Comments stripped: the explanatory comment above the call site names
+    # ``step_finished=True`` too, and matching that would pass on any ordering.
+    source = (
+        pathlib.Path(nemo_rl.__file__).parent / "algorithms" / "grpo_sync.py"
+    ).read_text()
+    body = "\n".join(
+        line
+        for line in source[source.index("def grpo_train_sync") :].splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    dp_call = body.index("_log_data_plane_metrics(policy, logger")
+    commit = body.index("step_finished=True")
+    assert dp_call < commit, (
+        "_log_data_plane_metrics must run before the step_finished=True log; "
+        "wandb drops anything logged against an already-committed step"
+    )
+
+
+def test_per_op_volume_is_charted_and_sums_to_comm_volume():
+    """``comm_volume_mb`` alone hides which direction the traffic went. On a
+    real step get moved 20.8 MB against put's 2.7 MB -- every DP rank fetches
+    its shard for the logprob pass and again for the train pass -- and a
+    single total cannot say that."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    now = monotonic()
+    for _ in range(6):
+        client._emit("get", "p", 1, 3_000_000, now - 5 / 1e3, "ok")
+    for _ in range(2):
+        client._emit("put", "p", 1, 1_000_000, now - 5 / 1e3, "ok")
+    client._emit("clear", "p", 1, 0, now - 1 / 1e3, "ok")
+
+    metrics = cluster_step_metrics(
+        merge_snapshots([client.snapshot(reset_step_window=True)]), {}, 1.0
+    )
+    head = headline_series(metrics)
+
+    assert head["step/volume_mb/by_op/get"] == pytest.approx(18.0)
+    assert head["step/volume_mb/by_op/put"] == pytest.approx(2.0)
+    assert "step/volume_mb/by_op/clear" not in head, "no payload, not a zero"
+    # the parts account for the whole
+    per_op = sum(v for k, v in head.items() if k.startswith("step/volume_mb/"))
+    assert per_op == pytest.approx(head["step/comm_volume_mb"])
+    client.close()
+
+
+def test_volume_namespace_does_not_become_a_breakdown_row():
+    """``step/volume_mb/by_op/get`` must feed the get row, not invent a
+    ``volume_mb`` op beside put and get."""
+    columns, rows = breakdown_table(
+        {
+            "step/get/calls": 3,
+            "step/get/wall_ms": 9.0,
+            "step/get/mb": 18.0,
+            "step/volume_mb/by_op/get": 18.0,
+        }
+    )
+    assert [r[0] for r in rows] == ["get"], rows
+    assert rows[0][columns.index("mb")] == 18.0

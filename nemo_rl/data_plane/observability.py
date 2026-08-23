@@ -534,6 +534,27 @@ def _hash_deltas(hv: dict[str, int], prev_hv: dict[str, int]) -> dict[str, float
     }
 
 
+def _volume_mb(per_op: dict[str, dict[str, float]]) -> dict[str, float]:
+    """Bytes each op moved this step, in MB, per op that moved any.
+
+    ``comm_volume_mb`` is the total and hides the asymmetry that matters:
+    on a real step ``get`` moved 20.8 MB against ``put``'s 2.7 MB, because
+    every DP rank fetches its shard once for the logprob pass and again for
+    the train pass. Those are separate transfers over the wire, not an
+    accounting artifact, and the same is true of summing across processes --
+    each rank pulls its own shard.
+
+    Ops that carry no payload (``register``, ``clear``) are omitted rather
+    than reported as zero, matching how the percentages treat an op that
+    did not run.
+    """
+    return {
+        f"step/volume_mb/by_op/{op}": row["mb"]
+        for op, row in per_op.items()
+        if row["mb"] > 0
+    }
+
+
 def _percent_of_dataplane(per_op: dict[str, dict[str, float]]) -> dict[str, float]:
     """Where this step's data-plane time went, in percent.
 
@@ -821,6 +842,7 @@ def cluster_step_metrics(
     )
     per_op = _op_step_stats(merged["by_op"], prev.get("by_op", {}))
     metrics.update(_percent_of_dataplane(per_op))
+    metrics.update(_volume_mb(per_op))
     for op, row in per_op.items():
         for field_name, value in row.items():
             metrics[f"step/{op}/{field_name}"] = value
@@ -842,11 +864,16 @@ _HEADLINE = (
     "step/self/overhead_ms",
     "step/self/frac",
 )
-_HEADLINE_PREFIXES = ("step/percent_of_dataplane/", "step/hash/", "step/self/")
+_HEADLINE_PREFIXES = (
+    "step/percent_of_dataplane/",
+    "step/volume_mb/",
+    "step/hash/",
+    "step/self/",
+)
 # ``step/<x>/<field>`` is the per-op shape, so these reserved middles must
 # not be mistaken for op tags -- ``step/self/overhead_ms`` was becoming a
 # "self" row in the breakdown table beside put and get.
-_RESERVED_NAMESPACES = frozenset({"percent_of_dataplane", "hash", "self"})
+_RESERVED_NAMESPACES = frozenset({"percent_of_dataplane", "volume_mb", "hash", "self"})
 
 
 def headline_series(metrics: dict[str, float]) -> dict[str, float]:
@@ -1155,6 +1182,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         metrics["step/self/frac"] = self_ms / wall_ms if wall_ms > 0 else 0.0
         per_op = _op_step_stats(snap["by_op"], prev.get("by_op", {}))
         metrics.update(_percent_of_dataplane(per_op))
+        metrics.update(_volume_mb(per_op))
         for op, row in per_op.items():
             for field_name, value in row.items():
                 metrics[f"step/{op}/{field_name}"] = value
