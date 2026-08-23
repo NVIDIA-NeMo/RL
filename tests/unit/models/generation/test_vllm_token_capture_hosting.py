@@ -62,6 +62,8 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         is_model_owner=is_model_owner,
         token_capture=None,
         _rollout_weight_version=0,
+        _staging_source=None,
+        _prefix_cache={},
     )
     worker.install_token_capture = lambda capture: setattr(
         worker, "token_capture", capture
@@ -200,8 +202,13 @@ def _worker_with_capture(sink: _MemorySink):
 
     worker = _fake_worker()
     worker._capture_calls = {}
+    worker._prefix_cache = {}
+    worker._staging_source = None
     worker._delta_align_routed_experts = (
         VllmAsyncGenerationWorkerImpl._delta_align_routed_experts
+    )
+    worker._fetch_chain_prefix = lambda staging_chain: (
+        VllmAsyncGenerationWorkerImpl._fetch_chain_prefix(worker, staging_chain)
     )
     worker.token_capture = RolloutTokenCapture(
         sink=sink,
@@ -209,6 +216,16 @@ def _worker_with_capture(sink: _MemorySink):
         adapter=VLLMCaptureAdapter(),
     )
     return worker
+
+
+class _MemoryPrefixSource:
+    def __init__(self, deltas: dict[str, list[int]]) -> None:
+        self.deltas = deltas
+        self.calls: list[list[str]] = []
+
+    def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
+        self.calls.append(list(staging_keys))
+        return [token for key in staging_keys for token in self.deltas[key]]
 
 
 def _served_content(gen_ids, logprobs):
@@ -285,6 +302,62 @@ def test_request_capture_token_in_prev_len_chains():
     assert coords["parent_call_id"] == "c1"
     assert (coords["delta_len"], coords["cum_len"]) == (3, 6)
     assert sink.records[0].token_ids_delta == [20, 21, 22]
+
+
+def test_staging_chain_fetches_patches_and_begins_capture():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": [12]})
+    worker._staging_source = source
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "model_call_id": "c3",
+            "parent_call_id": "c2",
+            "prev_len": 3,
+            "mode": "token_in",
+            "staging_chain": ["r0/c1", "r0/c2"],
+        },
+        stream=False,
+    )
+
+    prefix = VllmAsyncGenerationWorkerImpl._patch_chain_prefix(
+        worker, request.ng_capture
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, prefix + [20])
+
+    assert prefix == [10, 11, 12]
+    assert source.calls == [["r0/c1", "r0/c2"]]
+    assert request.ng_capture["required_prefix_token_ids"] == prefix
+    call, prompt = worker._capture_calls[id(request)]
+    assert call.admission.required_prefix_token_ids == prefix
+    assert prompt == [10, 11, 12, 20]
+
+
+def test_staging_chain_cache_fetches_only_uncached_suffix():
+    worker = _worker_with_capture(_MemorySink())
+    source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": [12]})
+    worker._staging_source = source
+
+    first = VllmAsyncGenerationWorkerImpl._fetch_chain_prefix(worker, ["r0/c1"])
+    second = VllmAsyncGenerationWorkerImpl._fetch_chain_prefix(
+        worker, ["r0/c1", "r0/c2"]
+    )
+
+    assert first == [10, 11]
+    assert second == [10, 11, 12]
+    assert source.calls == [["r0/c1"], ["r0/c2"]]
+
+
+def test_staging_chain_rejects_fetched_length_mismatch():
+    worker = _worker_with_capture(_MemorySink())
+    worker._staging_source = _MemoryPrefixSource({"r0/c1": [10, 11]})
+    admission = {"prev_len": 3, "staging_chain": ["r0/c1"]}
+
+    with pytest.raises(ValueError, match="expected 3, fetched 2"):
+        VllmAsyncGenerationWorkerImpl._patch_chain_prefix(worker, admission)
+
+    assert "required_prefix_token_ids" not in admission
 
 
 def test_request_capture_is_a_noop_without_context_or_capture():

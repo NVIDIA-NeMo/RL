@@ -149,3 +149,44 @@ def test_sink_clear_drops_rows(tq_client, staging_partition):
     sink.clear(keys)
     with pytest.raises(KeyError):
         source.fetch(keys)
+
+
+def test_fetch_prefix_token_ids_empty(tq_client, staging_partition):
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    assert source.fetch_prefix_token_ids([]) == []
+
+
+def test_fetch_prefix_token_ids_single_key(tq_client, staging_partition):
+    sink = TQTokenSink(tq_client, staging_partition=staging_partition)
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    records, _, _ = build_fixture_artifacts("single_call")
+    record = records[0]
+    assert sink.stage(record).ok
+    result = source.fetch_prefix_token_ids([record.staging_key])
+    assert result == record.token_ids_delta
+
+
+def test_fetch_prefix_token_ids_three_keys_concatenates(tq_client, staging_partition):
+    sink = TQTokenSink(tq_client, staging_partition=staging_partition)
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    records, _, _ = build_fixture_artifacts("worked_example")
+    for record in records:
+        assert sink.stage(record).ok
+    keys = [record.staging_key for record in records]
+    result = source.fetch_prefix_token_ids(keys)
+    expected = [t for record in records for t in record.token_ids_delta]
+    assert result == expected
+
+
+def test_fetch_prefix_token_ids_missing_key_raises_keyerror(
+    tq_client, staging_partition
+):
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    with pytest.raises(KeyError):
+        source.fetch_prefix_token_ids(["ghost_rollout/ghost_call"])
+
+
+def test_fetch_prefix_token_ids_rejects_duplicates(tq_client, staging_partition):
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    with pytest.raises(KeyError, match="duplicates"):
+        source.fetch_prefix_token_ids(["r/c", "r/c"])

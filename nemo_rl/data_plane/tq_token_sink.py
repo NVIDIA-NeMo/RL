@@ -358,6 +358,31 @@ class TQTokenSource:
             snapshots.append(snapshot)
         return snapshots
 
+    def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
+        """Bulk-fetch ordered delta chain and concatenate token_ids_delta into a prefix."""
+        if not staging_keys:
+            return []
+        if len(set(staging_keys)) != len(staging_keys):
+            raise KeyError("prefix fetch: staging_keys contains duplicates")
+        rows = _call_dp(
+            self._dp_client,
+            "get_samples",
+            sample_ids=list(staging_keys),
+            partition_id=self._staging_partition,
+            select_fields=["token_ids_delta"],
+        )
+        n_rows = int(rows.batch_size[0]) if rows.batch_size else 0
+        if n_rows != len(staging_keys):
+            raise KeyError(
+                f"prefix fetch incomplete: requested {len(staging_keys)} keys, got {n_rows}"
+            )
+        result: list[int] = []
+        for index in range(n_rows):
+            row = _select_row(rows, index)
+            delta = row["token_ids_delta"].squeeze(0).tolist()
+            result.extend(int(t) for t in delta)
+        return result
+
     def fetch_for_finalization(
         self, staging_keys: list[str]
     ) -> list[FetchedStagedCall]:

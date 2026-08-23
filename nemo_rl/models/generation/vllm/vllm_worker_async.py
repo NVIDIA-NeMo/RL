@@ -111,6 +111,8 @@ class VllmAsyncGenerationWorkerImpl(
         # In-flight captured calls keyed by id(request): (ActiveCall, the
         # exact engine prompt ids recorded at preprocess time).
         self._capture_calls: dict[int, tuple[Any, list[int]]] = {}
+        self._staging_source: Any | None = None
+        self._prefix_cache: dict[str, list[int]] = {}
 
         super().__init__(
             config,
@@ -379,10 +381,14 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_gym.token_id_capture.staging import install_capture
 
         from nemo_rl.data_plane import build_data_plane_client
-        from nemo_rl.data_plane.tq_token_sink import TQTokenSink
+        from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
         sink = TQTokenSink(dp_client, staging_partition=staging_partition)
+        self._staging_source = TQTokenSource(
+            dp_client, staging_partition=staging_partition
+        )
+        self._prefix_cache.clear()
         install_capture(
             self,
             sink=sink,
@@ -414,6 +420,47 @@ class VllmAsyncGenerationWorkerImpl(
             stream=bool(getattr(request, "stream", False)),
         )
         self._capture_calls[id(request)] = (call, list(prompt_token_ids))
+
+    def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
+        """Assemble prefix token ids from staging_chain, with a worker-local LRU cache."""
+        cache = self._prefix_cache
+        cached_ids: list[int] = []
+        miss_start = 0
+        for i, key in enumerate(staging_chain):
+            if key in cache:
+                cached_ids = cache[key]
+                miss_start = i + 1
+        miss_keys = staging_chain[miss_start:]
+        if not miss_keys:
+            return list(cached_ids)
+        if self._staging_source is None:
+            raise RuntimeError(
+                "_staging_source not initialized; call setup_token_capture() first"
+            )
+        fetched = self._staging_source.fetch_prefix_token_ids(miss_keys)
+        result = cached_ids + fetched
+        last_key = staging_chain[-1]
+        cache[last_key] = result
+        if len(cache) > 256:
+            del cache[next(iter(cache))]
+        return result
+
+    def _patch_chain_prefix(self, ng_capture: dict[str, Any]) -> list[int] | None:
+        """Fetch a staged prefix and patch a raw capture admission in place."""
+        staging_chain = ng_capture.get("staging_chain") or []
+        if not staging_chain:
+            return None
+        prefix_token_ids = self._fetch_chain_prefix(staging_chain)
+        prev_len = ng_capture.get("prev_len")
+        if type(prev_len) is not int or prev_len <= 0:
+            raise ValueError("staging_chain admission requires prev_len > 0")
+        if len(prefix_token_ids) != prev_len:
+            raise ValueError(
+                "staging_chain prefix length mismatch: "
+                f"expected {prev_len}, fetched {len(prefix_token_ids)}"
+            )
+        ng_capture["required_prefix_token_ids"] = prefix_token_ids
+        return prefix_token_ids
 
     @staticmethod
     def _delta_align_routed_experts(
@@ -663,7 +710,16 @@ class VllmAsyncGenerationWorkerImpl(
                         )
                     raise
 
-                if (
+                # Check staging_chain in ng_capture before required_prefix_token_ids.
+                ng_capture_dict = getattr(request, "ng_capture", None) or {}
+                chain_prefix_token_ids = worker_self._patch_chain_prefix(
+                    ng_capture_dict
+                )
+
+                if chain_prefix_token_ids is not None:
+                    # External staging, token-in mode: fetch prefix from TQ.
+                    model_prefix_token_ids = chain_prefix_token_ids
+                elif (
                     not hasattr(request, "required_prefix_token_ids")
                     or request.required_prefix_token_ids is None
                 ):
@@ -680,7 +736,10 @@ class VllmAsyncGenerationWorkerImpl(
                         request, res[1][0]["prompt_token_ids"]
                     )
                     return res
+                else:
+                    model_prefix_token_ids = list(request.required_prefix_token_ids)
 
+                # Token-in splice path — shared by staging_chain and direct prefix.
                 last_assistant_message_idx = None
                 for i in reversed(range(len(messages_for_replace_prefix_tokens))):
                     if messages_for_replace_prefix_tokens[i]["role"] == "assistant":
@@ -720,7 +779,7 @@ class VllmAsyncGenerationWorkerImpl(
 
                 final_prompt_token_ids = replace_prefix_tokens(
                     tokenizer=self.renderer.tokenizer,
-                    model_prefix_token_ids=request.required_prefix_token_ids,
+                    model_prefix_token_ids=model_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
