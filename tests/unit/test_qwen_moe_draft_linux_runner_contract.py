@@ -13,6 +13,7 @@ def test_focused_qwen_moe_runner_uses_the_locked_python_module() -> None:
     assert "sys.prefix" in contents
     assert "pytest.__file__" in contents
     assert "/opt/nemo_rl_venv/bin/pytest" not in contents
+    assert "tests/unit/models/megatron/test_dflash_asymmetric_tp_export.py" in contents
 
 
 if __name__ == "__main__":
