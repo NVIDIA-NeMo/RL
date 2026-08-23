@@ -668,26 +668,32 @@ def projected_streaming_vocab_parallel_soft_ce(
     tp_group: torch.distributed.ProcessGroup | None,
     bin_ids: torch.Tensor | None = None,
     weights: torch.Tensor | None = None,
+    _skip_tp_metadata_check: bool = False,
 ) -> DraftLossStats:
     """Project hidden states against preselected teacher rows with TP-safe metadata.
 
     TP ranks agree on a fixed structural header and exact mask/bin/weight metadata
     before validation or loss collectives, so malformed rank-local inputs fail together.
+
+    ``_skip_tp_metadata_check`` is a private escape hatch for callers that already ran
+    the agreement check on the tensors these arguments are derived from (the DFlash
+    adapter); it avoids doubling the collective traffic per step under TP.
     """
-    _tp_assert_projected_metadata_agreement(
-        tp_group=tp_group,
-        reference=student_hidden,
-        tensors=(
-            ("student_hidden", student_hidden),
-            ("output_weight", output_weight),
-            ("selected_teacher_logits", selected_teacher_logits),
-            ("mask", mask),
-            ("bin_ids", bin_ids),
-            ("weights", weights),
-        ),
-        scalars=(("token_chunk_size", token_chunk_size),),
-        exact_tensors=(("mask", mask), ("bin_ids", bin_ids), ("weights", weights)),
-    )
+    if not _skip_tp_metadata_check:
+        _tp_assert_projected_metadata_agreement(
+            tp_group=tp_group,
+            reference=student_hidden,
+            tensors=(
+                ("student_hidden", student_hidden),
+                ("output_weight", output_weight),
+                ("selected_teacher_logits", selected_teacher_logits),
+                ("mask", mask),
+                ("bin_ids", bin_ids),
+                ("weights", weights),
+            ),
+            scalars=(("token_chunk_size", token_chunk_size),),
+            exact_tensors=(("mask", mask), ("bin_ids", bin_ids), ("weights", weights)),
+        )
     if student_hidden.ndim < 2 or student_hidden.numel() == 0:
         raise ValueError(
             "student_hidden must contain at least one token and one hidden element, "
@@ -820,7 +826,15 @@ def dflash_projected_vocab_parallel_soft_ce(
     token_chunk_size: int,
     tp_group: torch.distributed.ProcessGroup | None,
 ) -> DraftLossStats:
-    """Map DFlash block slots to the live target head and indexed teacher rows."""
+    """Map DFlash block slots to the live target head and indexed teacher rows.
+
+    Slot 0 is the verified anchor token and is always excluded from the loss: this
+    function overrides ``loss_mask[:, 0]`` to False regardless of what the caller
+    passed. The returned ``DraftLossStats.counts`` is a rank-local ``(gamma,)``
+    vector; callers must all-reduce it across DP/CP before passing it as
+    ``normalization_counts`` to :meth:`DraftLossStats.normalized`, unlike the scalar
+    ``global_valid_toks`` pattern used by the base draft cross-entropy path.
+    """
     _tp_assert_projected_metadata_agreement(
         tp_group=tp_group,
         reference=draft_hidden,
@@ -942,6 +956,9 @@ def dflash_projected_vocab_parallel_soft_ce(
         selected_teacher_logits=selected_teacher_logits,
         mask=effective_loss_mask,
         bin_ids=bin_ids,
+        # The agreement check above already exact-matched every tensor these
+        # arguments derive from; rerunning it would double the TP collectives.
+        _skip_tp_metadata_check=True,
         weights=weights,
         token_chunk_size=token_chunk_size,
         tp_group=tp_group,
