@@ -39,15 +39,13 @@ import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
-from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
+from nemo_rl.data_plane.driver_mixin import TQDriverMixin
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
-    GLOBAL_FORWARD_PAD_SEQLEN,
     LP_SEED_FIELDS,
     fields_with_optional_routed_experts,
 )
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
@@ -81,7 +79,7 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
 # dispatcher only waits for completion — no aggregation needed.
 
 
-class TQPolicy(Policy):
+class TQPolicy(TQDriverMixin, Policy):
     """TQ-mediated counterpart to :class:`Policy`.
 
     Constructor accepts an additional ``dp_cfg`` (the
@@ -199,73 +197,7 @@ class TQPolicy(Policy):
         """Drop this step's bulk from TQ. Mirror of :meth:`prepare_step`."""
         self.discard_samples(meta.sample_ids, meta.partition_id)
 
-    def _stamp_pad_seqlen(self, meta: KVBatchMeta) -> None:
-        """Mint ``GLOBAL_FORWARD_PAD_SEQLEN`` onto ``meta.extra_info`` (idempotent).
-
-        Cross-DP forward pad target. Preshard shards inherit it via
-        ``dict(meta.extra_info)`` propagation.
-        """
-        if not meta.sequence_lengths:
-            return
-        if GLOBAL_FORWARD_PAD_SEQLEN in meta.extra_info:
-            return
-        _, dba = self._packing_args("train_mb_tokens")
-        seq_round = int(dba["sequence_length_round"]) if dba is not None else 1
-        pad_mult = int(meta.extra_info.get("pad_to_multiple", 1))
-        meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = round_up(
-            max(meta.sequence_lengths), max(pad_mult, seq_round)
-        )
-
-    def read_from_dataplane(
-        self,
-        meta: KVBatchMeta,
-        *,
-        select_fields: list[str],
-        pad_value_dict: Optional[dict[str, Any]] = None,
-    ) -> BatchedDataDict[Any]:
-        """Fetch + materialize columns from the data plane (TQ).
-
-        ``read_columns`` pads to ``meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN]``
-        — the same value workers pad to in their forward pass. Driver
-        and workers thus return columns at one identical seq dim, with
-        no driver-side knowledge of ``sequence_length_round``.
-        """
-        self._stamp_pad_seqlen(meta)
-        return read_columns(
-            self.dp_client,
-            meta,
-            select_fields=select_fields,
-            pad_value_dict=pad_value_dict,
-        )
-
-    def write_to_dataplane(self, meta: KVBatchMeta, fields: dict[str, Any]) -> None:
-        """Write driver-computed columns to the data plane (TQ)."""
-        write_columns(self.dp_client, meta, fields=fields)
-
     # ── 1-hop entrypoints (KVBatchMeta in, no re-fan-out) ──────────────────
-
-    def _packing_args(
-        self,
-        mb_tokens_key: str,
-    ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
-        """Resolve (sequence_packing_args, dynamic_batching_args) for a given stage.
-
-        The stage is identified by ``mb_tokens_key`` (``"logprob_mb_tokens"`` or
-        ``"train_mb_tokens"``).
-        """
-        if getattr(self, "use_dynamic_batches", False):
-            args = dict(self.dynamic_batching_args)
-            args["max_tokens_per_microbatch"] = self.cfg["dynamic_batching"][
-                mb_tokens_key
-            ]
-            return None, args
-        if getattr(self, "use_sequence_packing", False):
-            args = dict(self.sequence_packing_args)
-            args["max_tokens_per_microbatch"] = self.cfg["sequence_packing"][
-                mb_tokens_key
-            ]
-            return args, None
-        return None, None
 
     def _logprob_dispatch(
         self,
