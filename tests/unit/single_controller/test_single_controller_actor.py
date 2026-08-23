@@ -336,6 +336,105 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
     )
 
 
+def _lookahead_controller(
+    *,
+    trainer_version: int,
+    policy_training_start_step: int,
+    max_lookahead_versions: int = 1,
+    warmup_lookahead_versions: int | None = None,
+    is_ppo: bool = True,
+):
+    """Bare actor carrying only what the lookahead schedule reads."""
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._is_ppo = is_ppo
+    ctrl._trainer_version = trainer_version
+    ctrl._algo_cfg = SimpleNamespace(
+        policy_training_start_step=policy_training_start_step
+    )
+    ctrl._async_cfg = SimpleNamespace(
+        sampler=SimpleNamespace(
+            max_lookahead_versions=max_lookahead_versions,
+            warmup_lookahead_versions=warmup_lookahead_versions,
+        )
+    )
+    ctrl._sampler = MagicMock()
+    return ctrl
+
+
+class TestLookaheadSchedule:
+    """Port of ppo.py's _async_ppo_generation_lead_steps.
+
+    Generation may run further ahead while the policy is frozen, then the window
+    has to converge back before warmup-era rollouts stop being trainable.
+    """
+
+    @pytest.mark.parametrize(
+        ("trainer_version", "expected"),
+        [
+            # start=4, steady=1, warmup=5 -> frontier is 4+1=5.
+            (0, 5),  # min(5, 5-0) = 5
+            (1, 4),  # min(5, 5-1) = 4, already shrinking
+            (3, 2),
+            (4, 1),  # warmup over: back to steady
+            (9, 1),
+        ],
+    )
+    def test_window_widens_then_converges(self, trainer_version, expected):
+        ctrl = _lookahead_controller(
+            trainer_version=trainer_version,
+            policy_training_start_step=4,
+            max_lookahead_versions=1,
+            warmup_lookahead_versions=5,
+        )
+
+        ctrl._retune_lookahead_versions()
+
+        ctrl._sampler.set_gate_window.assert_called_once_with(expected)
+
+    def test_steady_value_is_a_defensive_floor(self):
+        """Kept because ppo.py has it, but unreachable through a valid config.
+
+        The floor only binds when warmup < steady, which
+        InOrderSamplerConfig.validate_warmup_lookahead already rejects -- inside
+        the warmup branch the frontier term is always greater than steady. This
+        builds the config by hand to reach it at all.
+        """
+        ctrl = _lookahead_controller(
+            trainer_version=2,
+            policy_training_start_step=100,
+            max_lookahead_versions=3,
+            warmup_lookahead_versions=2,
+        )
+
+        ctrl._retune_lookahead_versions()
+
+        ctrl._sampler.set_gate_window.assert_called_once_with(3)
+
+    def test_unset_warmup_window_pins_the_steady_value(self):
+        ctrl = _lookahead_controller(
+            trainer_version=0,
+            policy_training_start_step=4,
+            max_lookahead_versions=2,
+            warmup_lookahead_versions=None,
+        )
+
+        ctrl._retune_lookahead_versions()
+
+        ctrl._sampler.set_gate_window.assert_called_once_with(2)
+
+    def test_retune_is_a_noop_off_the_ppo_path(self):
+        ctrl = _lookahead_controller(
+            trainer_version=0,
+            policy_training_start_step=0,
+            is_ppo=False,
+        )
+
+        ctrl._retune_lookahead_versions()
+
+        ctrl._sampler.set_gate_window.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("recompute_kv_cache", "expected_invalidation_calls"),
     [(False, 0), (True, 1)],
@@ -685,6 +784,9 @@ class _EmptySampler:
         del current_train_weight
         return 0
 
+    def set_gate_window(self, gate_window: int) -> None:
+        self.gate_window = gate_window
+
     async def select(self, **kwargs):
         del kwargs
         return None, 0
@@ -846,6 +948,10 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._async_cfg = SimpleNamespace(
         min_groups_for_streaming_train=1,
         rollout_failure=SimpleNamespace(min_step_batch_fraction=0.9),
+        sampler=SimpleNamespace(
+            max_lookahead_versions=1,
+            warmup_lookahead_versions=None,
+        ),
     )
     ctrl._consumed_samples = 0
     ctrl._total_valid_tokens = 0
@@ -1330,7 +1436,9 @@ def test_train_pump_skips_the_critic_on_an_empty_chunk(monkeypatch) -> None:
     assert "get_values_from_meta" in value.calls
 
 
-def test_train_pump_freezes_the_policy_during_critic_warmup(monkeypatch) -> None:
+def test_train_pump_freezes_the_policy_during_critic_warmup(
+    monkeypatch, capsys
+) -> None:
     """Below policy_training_start_step the critic trains alone: no optimizer
     step, and no weight transfer to generation either."""
     meta = _single_group_meta()
@@ -1355,9 +1463,10 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(monkeypatch) -> None
     assert ctrl._train_steps == 1
     assert ctrl._trainer_version == 1
     ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
+    assert "Critic warmup complete" not in capsys.readouterr().out
 
 
-def test_train_pump_trains_the_policy_once_warmup_is_over(monkeypatch) -> None:
+def test_train_pump_trains_the_policy_once_warmup_is_over(monkeypatch, capsys) -> None:
     meta = _single_group_meta()
     ctrl, _ = _ppo_train_pump_controller(
         sampler=_OneThenEmptySampler(meta),
@@ -1377,6 +1486,8 @@ def test_train_pump_trains_the_policy_once_warmup_is_over(monkeypatch) -> None:
     trainer.begin_train_step.assert_called_once()
     trainer.finish_train_step.assert_called_once_with()
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    # Announced exactly once, on the step that crosses the boundary.
+    assert capsys.readouterr().out.count("Critic warmup complete") == 1
 
 
 def test_train_pump_steps_both_optimizers_once_per_ppo_epoch(monkeypatch) -> None:

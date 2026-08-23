@@ -196,6 +196,9 @@ class _FakeSampler:
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
 
+    def set_gate_window(self, gate_window: int) -> None:
+        self.gate_window = gate_window
+
     def set_dispatch_index(self, resume_from_step: int) -> None:
         pass
 
@@ -793,7 +796,7 @@ class _OrderRecordingPolicy:
         self.calls.append("policy.prepare_for_training")
 
     def save_checkpoint(self, **kwargs: Any) -> None:
-        del kwargs
+        self.save_kwargs = kwargs
         self.calls.append("policy.save_checkpoint")
 
     def finalize_async_save(self) -> None:
@@ -810,7 +813,7 @@ class _OrderRecordingCritic:
         self.calls.append("critic.prepare_for_training")
 
     def save_checkpoint(self, **kwargs: Any) -> None:
-        del kwargs
+        self.save_kwargs = kwargs
         self.calls.append("critic.save_checkpoint")
 
     def finish_training(self) -> None:
@@ -863,7 +866,7 @@ class TestPPOSaveOrder:
         calls: list[str] = []
         actor = _ppo_save_actor(tmp_path, calls)
 
-        asyncio.run(actor._save_checkpoint({}))
+        asyncio.run(actor._save_checkpoint({}, is_policy_training_step=True))
 
         assert calls == [
             "policy.offload_to_cpu",
@@ -873,6 +876,46 @@ class TestPPOSaveOrder:
             "policy.prepare_for_training",
             "policy.save_checkpoint",
         ]
+
+
+class TestPPOWarmupCheckpoint:
+    """During critic warmup the policy optimizer has never stepped."""
+
+    @pytest.fixture
+    def actor(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.single_controller._write_latest_checkpoint_status",
+            lambda *args, **kwargs: None,
+        )
+        return _ppo_save_actor(tmp_path, [])
+
+    def test_warmup_step_writes_no_policy_optimizer(self, actor):
+        asyncio.run(actor._save_checkpoint({}, is_policy_training_step=False))
+
+        assert actor._trainer.save_kwargs["optimizer_path"] is None
+        # The critic trains from step 0, so its optimizer is still written.
+        assert actor._value.save_kwargs["optimizer_path"] is not None
+
+    def test_training_step_writes_the_policy_optimizer(self, actor):
+        asyncio.run(actor._save_checkpoint({}, is_policy_training_step=True))
+
+        assert actor._trainer.save_kwargs["optimizer_path"] is not None
+
+    def test_warmup_step_skips_the_top_k_metric(self, actor):
+        """No policy metrics exist yet, so the checkpoint just is not a candidate."""
+        actor._master_config.checkpointing["metric_name"] = "train:loss"
+
+        with pytest.warns(UserWarning, match="not available during PPO critic warmup"):
+            asyncio.run(actor._save_checkpoint({}, is_policy_training_step=False))
+
+        assert not hasattr(actor._save_state, "train:loss")
+
+    def test_a_training_step_still_raises_on_a_missing_metric(self, actor):
+        """The warmup branch must not soften the misconfiguration error."""
+        actor._master_config.checkpointing["metric_name"] = "train:loss"
+
+        with pytest.raises(ValueError, match="not found in train metrics"):
+            asyncio.run(actor._save_checkpoint({}, is_policy_training_step=True))
 
 
 # ── metric_name behavior ─────────────────────────────────────────────────────

@@ -269,6 +269,30 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
+    @staticmethod
+    def _warmup_ckpt_config(*, constant_structure: bool) -> MasterConfig:
+        mc = _ppo_master_config(megatron_enabled=True)
+        mc.ppo.policy_training_start_step = 2
+        mc.policy["megatron_cfg"]["checkpoint"] = {
+            "ckpt_assume_constant_structure": constant_structure
+        }
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_optimizer"] = True
+        return mc
+
+    def test_rejects_constant_ckpt_structure_with_warmup(self):
+        """The policy optimizer first appears when warmup ends, so one cached
+        layout cannot describe both states."""
+        mc = self._warmup_ckpt_config(constant_structure=True)
+
+        with pytest.raises(ValueError, match="ckpt_assume_constant_structure=true"):
+            validate_single_controller_config(mc)
+
+    def test_accepts_varying_ckpt_structure_with_warmup(self):
+        validate_single_controller_config(
+            self._warmup_ckpt_config(constant_structure=False)
+        )
+
     def test_grpo_is_free_to_use_any_sampler(self):
         mc = _make_master_config()
         mc.async_rl.sampler = WindowedSamplerConfig()
