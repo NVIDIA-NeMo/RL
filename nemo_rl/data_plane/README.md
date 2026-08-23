@@ -717,8 +717,18 @@ limits, measured rather than assumed:
   collide. Rows of uniform width catch it unconditionally, per row. The same
   blind spot hides a reordering *within* a row: 0/200 for a two-token swap
   in `input_ids`, and 18/200 for moving two set bits in a bool mask.
-- It reads every tensor byte again on both sides — ~2.4 ms for a 12 MB
-  jagged batch, on put and again on get. Keep it to debugging runs.
+- It reads every tensor byte again on both sides. Measured against a live
+  TransferQueue moving 23.6 MB per step: **10.2 ms, or +11% of data-plane
+  time** — which on a real GRPO step, where the data plane is a few percent
+  of the step, is under 0.1% end to end. The cost lands in
+  `step/self/overhead_ms` like the rest of the measurement, so it is visible
+  rather than quoted from a benchmark.
+- **A mismatch count at or above `rows_checked` is reported as suspect.**
+  Every row of every field wrong, identically, every step is not what a
+  broken wire looks like; it is what a broken guard looks like. Both false
+  alarms this check has produced had exactly that shape, and both were its
+  own bookkeeping. Per-sample lines carry the scheme, the row index and the
+  row length so the next one is adjudicable from a single log line.
 - Only rows this process wrote can be checked. A consumer-side client
   reports them under `hash/rows_unverified` rather than counting them
   clean, and `hash/fields_skipped` reports any leaf it could not compare
