@@ -41,8 +41,9 @@ import os
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional, Union
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import torch
@@ -774,6 +775,104 @@ class TestAsyncSaveFinalization:
 
         with pytest.raises(RuntimeError, match="finalization failed"):
             actor._checkpointer.shutdown()
+
+
+# ── PPO save ordering ────────────────────────────────────────────────────────
+
+
+class _OrderRecordingPolicy:
+    """Policy stand-in logging the residency calls _save_checkpoint drives."""
+
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+
+    def offload_to_cpu(self) -> None:
+        self.calls.append("policy.offload_to_cpu")
+
+    def prepare_for_training(self) -> None:
+        self.calls.append("policy.prepare_for_training")
+
+    def save_checkpoint(self, **kwargs: Any) -> None:
+        del kwargs
+        self.calls.append("policy.save_checkpoint")
+
+    def finalize_async_save(self) -> None:
+        pass
+
+
+class _OrderRecordingCritic:
+    """Critic stand-in sharing the policy's call log."""
+
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+
+    def prepare_for_training(self) -> None:
+        self.calls.append("critic.prepare_for_training")
+
+    def save_checkpoint(self, **kwargs: Any) -> None:
+        del kwargs
+        self.calls.append("critic.save_checkpoint")
+
+    def finish_training(self) -> None:
+        self.calls.append("critic.finish_training")
+
+
+def _ppo_save_actor(tmp_path: Path, calls: list[str]):
+    """Bare actor carrying only what _save_checkpoint reads."""
+    actor = object.__new__(_ACTOR_CLS)
+    checkpoint_path = tmp_path / "tmp_step_1"
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+
+    actor._save_state = SimpleNamespace()
+    actor._train_steps = 1
+    actor._current_epoch = 0
+    actor._consumed_samples = 0
+    actor._total_valid_tokens = 0
+    actor._replacement_reserve = []
+    actor._async_cfg = SimpleNamespace(
+        sampler=SimpleNamespace(name="in_order"),
+        max_buffered_rollouts=4,
+    )
+    actor._master_config = SimpleNamespace(checkpointing={"metric_name": None})
+    actor._dataloader = SimpleNamespace(state_dict=lambda: {})
+    actor._buffer = SimpleNamespace(state_dict=AsyncMock(return_value={}))
+    actor._checkpointer = MagicMock()
+    actor._checkpointer.save_optimizer = True
+    actor._checkpointer.init_tmp_checkpoint.return_value = str(checkpoint_path)
+    actor._is_ppo = True
+    actor._trainer = _OrderRecordingPolicy(calls)
+    actor._value = _OrderRecordingCritic(calls)
+    return actor
+
+
+class TestPPOSaveOrder:
+    def test_the_policy_is_offloaded_across_the_critic_save(
+        self, tmp_path, monkeypatch
+    ):
+        """The critic shares the training GPUs, so the two saves serialize.
+
+        The critic goes first because offloading the policy runs
+        finalize_async_save, which would block on the policy's own write if that
+        had already been staged. The onload before the policy save is also what a
+        critic-warmup step needs, having skipped prepare_for_training in the pump.
+        """
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.single_controller._write_latest_checkpoint_status",
+            lambda *args, **kwargs: None,
+        )
+        calls: list[str] = []
+        actor = _ppo_save_actor(tmp_path, calls)
+
+        asyncio.run(actor._save_checkpoint({}))
+
+        assert calls == [
+            "policy.offload_to_cpu",
+            "critic.prepare_for_training",
+            "critic.save_checkpoint",
+            "critic.finish_training",
+            "policy.prepare_for_training",
+            "policy.save_checkpoint",
+        ]
 
 
 # ── metric_name behavior ─────────────────────────────────────────────────────
