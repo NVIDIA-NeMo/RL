@@ -468,6 +468,9 @@ totals and `percent_of_dataplane`, with the per-op detail in a table beside them
 | `step/percent_of_dataplane/by_cause/{fixed_overhead,transfer}` | is that fixed per-request cost, or moving bytes? |
 | `step/wall_ms`, `step/comm_volume_mb` | how much time and traffic |
 | `step/volume_mb/by_op/{get,put}` | which direction that traffic went |
+
+Per-op detail is published under `step/by_op/<op>/<field>` and feeds the
+breakdown table rather than a chart.
 | `now/bytes_outstanding_mb`, `now/n_processes` | occupancy, fan-out width |
 | `step/self/{overhead_ms,frac}` | what measuring cost |
 | `step/hash/*` | only with `verify_tensor_hash` on |
