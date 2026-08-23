@@ -778,6 +778,63 @@ def test_ppo_seq_logprob_error_mask_rejects_all_masked_batch():
         )
 
 
+def test_ppo_context_window_filter_masks_only_context_failures():
+    from nemo_rl.algorithms.ppo import _apply_ppo_context_window_filter
+
+    batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([1.0, 1.0, 0.0]),
+            "context_window_error": [False, True, False],
+        }
+    )
+
+    assert _apply_ppo_context_window_filter(batch) == 1
+    torch.testing.assert_close(
+        batch["loss_multiplier"], torch.tensor([1.0, 0.0, 0.0])
+    )
+
+
+def test_ppo_context_window_filter_is_noop_without_metadata():
+    from nemo_rl.algorithms.ppo import _apply_ppo_context_window_filter
+
+    batch = BatchedDataDict({"loss_multiplier": torch.tensor([1.0, 1.0])})
+
+    assert _apply_ppo_context_window_filter(batch) == 0
+    torch.testing.assert_close(batch["loss_multiplier"], torch.ones(2))
+
+
+def test_resolve_initial_value_weights_uses_weight_only_warm_start(tmp_path):
+    from nemo_rl.algorithms.ppo import _resolve_initial_value_weights
+
+    weights_path = tmp_path / "value" / "weights"
+    weights_path.mkdir(parents=True)
+
+    resolved_weights, resolved_optimizer = _resolve_initial_value_weights(
+        {"initial_value_weights_path": str(weights_path)},
+        None,
+        None,
+        tmp_path / "old-optimizer",
+    )
+
+    assert resolved_weights == weights_path
+    assert resolved_optimizer is None
+
+
+def test_resolve_initial_value_weights_never_overrides_native_resume(tmp_path):
+    from nemo_rl.algorithms.ppo import _resolve_initial_value_weights
+
+    resume_weights = tmp_path / "resume-weights"
+    resume_optimizer = tmp_path / "resume-optimizer"
+    resolved = _resolve_initial_value_weights(
+        {"initial_value_weights_path": str(tmp_path / "missing")},
+        tmp_path / "step_10",
+        resume_weights,
+        resume_optimizer,
+    )
+
+    assert resolved == (resume_weights, resume_optimizer)
+
+
 def _make_ppo_loop_batch() -> BatchedDataDict:
     return BatchedDataDict(
         {

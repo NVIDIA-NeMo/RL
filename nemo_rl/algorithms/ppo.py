@@ -17,6 +17,7 @@ import time
 import traceback
 import warnings
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -212,6 +213,9 @@ class PPOConfig(TypedDict):
     # Value model trains from step 0; policy training is skipped for
     # total_steps < this value. Default 0 (train from start).
     policy_training_start_step: NotRequired[int]
+    # Optional weight-only critic warm start for a fresh PPO run. Native resume
+    # checkpoints always take precedence. Optimizer and run state remain fresh.
+    initial_value_weights_path: NotRequired[str | None]
     # Nullable sequence-level multiplicative probability-error threshold.
     # None logs metrics without masking; values above the threshold are excluded.
     seq_logprob_error_threshold: float | None
@@ -271,6 +275,59 @@ def _apply_ppo_seq_logprob_error_masking(
             "step with an empty batch."
         )
     return advantage_mask, metrics
+
+
+def _apply_ppo_context_window_filter(repeated_batch: BatchedDataDict) -> int:
+    """Mask Gym context-window failures from both PPO actor and critic loss.
+
+    A context-window 400 is censored because the overflow can come from model
+    history, an injected tool observation, or both. Explicit generation
+    truncation remains controlled independently by ``overlong_filtering``.
+    """
+    if "context_window_error" not in repeated_batch:
+        return 0
+
+    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+    context_window_error = torch.as_tensor(
+        repeated_batch["context_window_error"],
+        dtype=torch.bool,
+        device=loss_multiplier.device,
+    )
+    if context_window_error.shape != loss_multiplier.shape:
+        raise ValueError(
+            "context_window_error and loss_multiplier must have the same shape: "
+            f"got {tuple(context_window_error.shape)} and "
+            f"{tuple(loss_multiplier.shape)}"
+        )
+
+    loss_multiplier[context_window_error] = 0
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    return int(context_window_error.sum().item())
+
+
+def _resolve_initial_value_weights(
+    ppo_config: PPOConfig,
+    last_checkpoint_path: Optional[os.PathLike],
+    value_weights_path: Optional[Path],
+    value_optimizer_path: Optional[Path],
+) -> tuple[Optional[Path], Optional[Path]]:
+    """Resolve an optional weight-only critic warm start for a fresh run."""
+    configured_path = ppo_config.get("initial_value_weights_path")
+    if last_checkpoint_path is not None or configured_path is None:
+        return value_weights_path, value_optimizer_path
+
+    initial_value_weights_path = Path(configured_path)
+    if not initial_value_weights_path.is_dir():
+        raise FileNotFoundError(
+            "ppo.initial_value_weights_path is not a checkpoint directory: "
+            f"{initial_value_weights_path}"
+        )
+    print(
+        "  ✓ Warm-starting critic weights only from "
+        f"{initial_value_weights_path} (fresh optimizer and training state)",
+        flush=True,
+    )
+    return initial_value_weights_path, None
 
 
 class PPOLoggerConfig(LoggerConfig):
@@ -732,6 +789,12 @@ def setup(
     value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
         last_checkpoint_path,
         model_component="value",
+    )
+    value_weights_path, value_optimizer_path = _resolve_initial_value_weights(
+        ppo_config,
+        last_checkpoint_path,
+        value_weights_path,
+        value_optimizer_path,
     )
 
     # Each Megatron worker advances its scheduler once per train() call. Actor
@@ -1667,6 +1730,10 @@ def ppo_train(
                             truncated = torch.tensor(truncated, dtype=torch.bool)
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    metrics_logging_data["num_context_window_samples_filtered"] = (
+                        _apply_ppo_context_window_filter(repeated_batch)
+                    )
 
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -2741,6 +2808,10 @@ def async_ppo_train(
                             truncated = torch.tensor(truncated, dtype=torch.bool)
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    metrics["num_context_window_samples_filtered"] = (
+                        _apply_ppo_context_window_filter(repeated_batch)
+                    )
 
                     # PPO's inline loss-mask setup (unmask all assistant messages),
                     # matching sync ppo_train — deliberately NOT GRPO's helper,
