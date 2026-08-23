@@ -227,6 +227,7 @@ project-includes = [
   "nemo_rl/models/megatron/draft/dspark_provider.py",
   "nemo_rl/models/megatron/draft/__init__.py",
   "nemo_rl/models/megatron/draft/optimizer.py",
+  "nemo_rl/models/megatron/draft/receipt.py",
   "nemo_rl/models/megatron/draft/sequence_layout.py",
   "nemo_rl/models/megatron/draft/sequence_parallel.py",
   "nemo_rl/models/megatron/draft/context_parallel.py",

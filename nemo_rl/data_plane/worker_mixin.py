@@ -478,6 +478,7 @@ class TQWorkerMixin:
         mbs: Optional[int] = None,
         *,
         draft_update_decision: "DraftUpdateDecision | None" = None,
+        capture_draft_update_receipt: bool = False,
     ) -> dict[str, Any]:
         """Per-rank training entrypoint. Fetch → packing prep → delegate."""
         data = self._fetch(meta)
@@ -491,6 +492,8 @@ class TQWorkerMixin:
         }
         if draft_update_decision is not None:
             kwargs["draft_update_decision"] = draft_update_decision
+        if capture_draft_update_receipt:
+            kwargs["capture_draft_update_receipt"] = True
         return self.train(data, **kwargs)  # type: ignore[attr-defined]
 
     @wrap_with_nvtx_name("policy_worker/get_logprobs_presharded")
@@ -564,6 +567,7 @@ class TQWorkerMixin:
         mbs: Optional[int] = None,
         *,
         draft_update_decision: "DraftUpdateDecision | None" = None,
+        capture_draft_update_receipt: bool = False,
     ) -> None:
         """Open a logical train step. No fetch — pure lifecycle.
 
@@ -577,6 +581,8 @@ class TQWorkerMixin:
         kwargs: dict[str, Any] = {"loss_fn": loss_fn, "gbs": gbs, "mbs": mbs}
         if draft_update_decision is not None:
             kwargs["draft_update_decision"] = draft_update_decision
+        if capture_draft_update_receipt:
+            kwargs["capture_draft_update_receipt"] = True
         self.begin_train_step(**kwargs)  # type: ignore[attr-defined]
 
     @wrap_with_nvtx_name("policy_worker/train_microbatch_presharded")

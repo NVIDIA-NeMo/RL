@@ -113,6 +113,7 @@ class PolicyInterface(ABC):
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
         draft_update_decision: DraftUpdateDecision | None = None,
+        capture_draft_update_receipt: bool = False,
     ) -> dict[str, Any]:
         """Train the policy on a global batch of data.
 
@@ -124,6 +125,8 @@ class PolicyInterface(ABC):
             mbs: Micro batch size override (if None, uses config default)
             draft_update_decision: Controller-owned draft update decision. Backends
                 without online draft training receive ``None``.
+            capture_draft_update_receipt: Capture canonical draft model and optimizer
+                roots after a successful requested update.
         """
         pass
 

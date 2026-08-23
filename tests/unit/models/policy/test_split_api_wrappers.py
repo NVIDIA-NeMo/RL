@@ -33,11 +33,32 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from nemo_rl.algorithms.draft_update_schedule import DraftUpdateDecision
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.policy.tq_policy import TQPolicy
+
+
+_RECEIPT = {
+    "successful": True,
+    "decision_id": 7,
+    "global_step": 3,
+    "draft_model_sha256": "1" * 64,
+    "draft_optimizer_sha256": "2" * 64,
+}
+
+
+def _decision() -> DraftUpdateDecision:
+    return DraftUpdateDecision(
+        global_step=3,
+        decision_id=7,
+        update_requested=True,
+        draft_refit_requested=True,
+        reason="always",
+        observed_acceptance=None,
+    )
 
 
 class _SplitStubWorker(TQWorkerMixin):
@@ -62,8 +83,15 @@ class _SplitStubWorker(TQWorkerMixin):
         return self._leader
 
     # backend split API
-    def begin_train_step(self, loss_fn, gbs=None, mbs=None):
-        self.calls.append(("begin", loss_fn, gbs, mbs))
+    def begin_train_step(
+        self,
+        loss_fn,
+        gbs=None,
+        mbs=None,
+        *,
+        capture_draft_update_receipt=False,
+    ):
+        self.calls.append(("begin", loss_fn, gbs, mbs, capture_draft_update_receipt))
 
     def train_microbatch(self, data):
         self.calls.append(("train_microbatch", data))
@@ -94,7 +122,15 @@ class TestPreshardedWrappers:
         w = _SplitStubWorker()
         loss_fn = object()
         w.begin_train_step_presharded(loss_fn=loss_fn, gbs=8, mbs=2)
-        assert w.calls == [("begin", loss_fn, 8, 2)]
+        assert w.calls == [("begin", loss_fn, 8, 2, False)]
+
+    def test_begin_forwards_explicit_receipt_capture_flag(self):
+        w = _SplitStubWorker()
+        w.begin_train_step_presharded(
+            loss_fn=object(),
+            capture_draft_update_receipt=True,
+        )
+        assert w.calls[-1][-1] is True
 
     def test_train_microbatch_fetches_attaches_then_dispatches(self):
         w = _SplitStubWorker()
@@ -149,6 +185,7 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
     p.cfg = {"train_global_batch_size": 8, "train_micro_batch_size": 2}
     p._router_replay_enabled = False
     p.flops_tracker = None
+    p._capture_draft_update_receipt_for_open_step = False
     wg = MagicMock()
     wg.run_all_workers_single_data.return_value = ["f0", "f1"]
     p.worker_group = wg
@@ -178,6 +215,39 @@ def test_lm_policy_preserves_uniform_draft_update_successful_bool() -> None:
     assert result["draft_update_successful"] is False
 
 
+def test_lm_policy_threads_capture_and_surfaces_visible_publisher_receipt() -> None:
+    policy = object.__new__(Policy)
+    policy.cfg = {"train_global_batch_size": 8, "train_micro_batch_size": 2}
+    policy.flops_tracker = None
+    policy._shard_for_train = MagicMock(return_value=[{"input_lengths": torch.ones(1)}])
+    policy._report_sharded_payload = MagicMock()
+    policy.worker_group = MagicMock()
+    policy.worker_group.get_all_worker_results.return_value = [
+        {
+            "global_loss": torch.tensor(1.0),
+            "grad_norm": torch.tensor(0.5),
+            "draft_update_successful": True,
+            "all_mb_metrics": {},
+            "world_rank": 1,
+            "draft_update_receipt_publisher_rank": 1,
+            "draft_update_receipt": _RECEIPT,
+        }
+    ]
+
+    result = policy.train(
+        data=MagicMock(),
+        loss_fn=MagicMock(),
+        draft_update_decision=_decision(),
+        capture_draft_update_receipt=True,
+    )
+
+    common = policy.worker_group.run_all_workers_sharded_data.call_args.kwargs[
+        "common_kwargs"
+    ]
+    assert common["capture_draft_update_receipt"] is True
+    assert result["draft_update_receipt"] == _RECEIPT
+
+
 class TestTQPolicySplitFanout:
     def test_begin_consumes_single_data_futures_with_ray_get(self):
         """run_all_workers_single_data returns plain ObjectRefs, not a
@@ -191,6 +261,21 @@ class TestTQPolicySplitFanout:
         )
         mock_ray.get.assert_called_once_with(["f0", "f1"])
         wg.get_all_worker_results.assert_not_called()
+
+    def test_begin_threads_capture_flag_and_stores_it_until_finish(self):
+        p, wg = _make_tq_policy()
+        with patch("nemo_rl.models.policy.tq_policy.ray"):
+            p.begin_train_step(
+                loss_fn="LF",
+                capture_draft_update_receipt=True,
+            )
+        assert p._capture_draft_update_receipt_for_open_step is True
+        assert (
+            wg.run_all_workers_single_data.call_args.kwargs[
+                "capture_draft_update_receipt"
+            ]
+            is True
+        )
 
     def test_train_microbatches_from_meta_dispatches_and_returns_none(self):
         p, wg = _make_tq_policy()
@@ -277,6 +362,37 @@ class TestTQPolicySplitFanout:
         assert out["all_mb_metrics"]["loss"] == [0.1, 0.1]  # twins dropped
         # _aggregate_train_results surfaces global_loss under "loss"
         assert out["loss"] == 1.0
+
+    def test_finish_selects_receipt_from_raw_rows_before_metric_dedup(self):
+        p, _ = _make_tq_policy()
+        p._capture_draft_update_receipt_for_open_step = True
+
+        def _result(rank: int, leader: bool) -> dict:
+            row = {
+                "global_loss": 1.0,
+                "grad_norm": 0.5,
+                "draft_update_successful": True,
+                "draft_update_decision": _decision(),
+                "all_mb_metrics": {"loss": [0.1]},
+                "is_replica_leader": leader,
+                "world_rank": rank,
+                "draft_update_receipt_publisher_rank": 1,
+            }
+            if rank == 1:
+                row["draft_update_receipt"] = _RECEIPT
+            return row
+
+        with patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray:
+            mock_ray.get.return_value = [
+                _result(0, True),
+                _result(1, True),
+                _result(2, False),
+            ]
+            out = p.finish_train_step()
+
+        assert out["draft_update_receipt"] == _RECEIPT
+        assert out["all_mb_metrics"]["loss"] == [0.1, 0.1]
+        assert p._capture_draft_update_receipt_for_open_step is False
 
     def test_finish_surfaces_draft_grad_norm(self):
         p, _ = _make_tq_policy()

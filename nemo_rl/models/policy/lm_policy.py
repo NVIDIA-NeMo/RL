@@ -120,6 +120,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
         draft_config = config.get("draft")
         draft_enabled = bool(draft_config is not None and draft_config.enabled)
+        self.supports_draft_update_receipts = bool(
+            megatron_enable and draft_enabled and init_optimizer
+        )
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
@@ -774,6 +777,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         check_dim_skip_keys: Optional[Iterable[str]] = None,
         *,
         draft_update_decision: DraftUpdateDecision | None = None,
+        capture_draft_update_receipt: bool = False,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
@@ -812,6 +816,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             }
             if draft_update_decision is not None:
                 common_kwargs["draft_update_decision"] = draft_update_decision
+            if capture_draft_update_receipt:
+                common_kwargs["capture_draft_update_receipt"] = True
             futures = self.worker_group.run_all_workers_sharded_data(
                 "train",
                 data=sharded_data,
@@ -845,6 +851,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             aggregated_results["draft_update_successful"] = results[0][
                 "draft_update_successful"
             ]
+        receipt_required = bool(
+            draft_update_decision is not None
+            and draft_update_decision.update_requested
+            and aggregated_results.get("draft_update_successful", False)
+        )
+        receipt = None
+        if capture_draft_update_receipt:
+            from nemo_rl.models.megatron.draft.receipt import (
+                select_published_draft_update_receipt,
+            )
+
+            receipt = select_published_draft_update_receipt(
+                results,
+                capture_draft_update_receipt=True,
+                receipt_required=receipt_required,
+            )
+        if receipt is not None:
+            aggregated_results["draft_update_receipt"] = receipt
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops

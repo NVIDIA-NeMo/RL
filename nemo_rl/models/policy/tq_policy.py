@@ -128,6 +128,7 @@ class TQPolicy(Policy):
         self._router_replay_enabled = bool(
             (self.cfg.get("router_replay") or {}).get("enabled", False)
         )
+        self._capture_draft_update_receipt_for_open_step = False
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -374,6 +375,7 @@ class TQPolicy(Policy):
         train_fields: tuple[str, ...] = DP_TRAIN_FIELDS,
         *,
         draft_update_decision: DraftUpdateDecision | None = None,
+        capture_draft_update_receipt: bool = False,
     ) -> dict[str, Any]:
         """1-hop counterpart to :meth:`train`.
 
@@ -440,6 +442,8 @@ class TQPolicy(Policy):
             }
             if draft_update_decision is not None:
                 common_kwargs["draft_update_decision"] = draft_update_decision
+            if capture_draft_update_receipt:
+                common_kwargs["capture_draft_update_receipt"] = True
             futures = self.worker_group.run_all_workers_sharded_data(
                 "train_presharded",
                 meta=dp_metas,
@@ -458,6 +462,24 @@ class TQPolicy(Policy):
             )
         results = self.worker_group.get_all_worker_results(futures)
         aggregated_results = _aggregate_train_results(results)
+        receipt_required = bool(
+            draft_update_decision is not None
+            and draft_update_decision.update_requested
+            and aggregated_results.get("draft_update_successful", False)
+        )
+        receipt = None
+        if capture_draft_update_receipt:
+            from nemo_rl.models.megatron.draft.receipt import (
+                select_published_draft_update_receipt,
+            )
+
+            receipt = select_published_draft_update_receipt(
+                results,
+                capture_draft_update_receipt=True,
+                receipt_required=receipt_required,
+            )
+        if receipt is not None:
+            aggregated_results["draft_update_receipt"] = receipt
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
@@ -499,6 +521,7 @@ class TQPolicy(Policy):
         mbs: Optional[int] = None,
         *,
         draft_update_decision: DraftUpdateDecision | None = None,
+        capture_draft_update_receipt: bool = False,
     ) -> None:
         """Open a logical train step on every worker."""
         batch_size = gbs or self.cfg["train_global_batch_size"]
@@ -515,10 +538,13 @@ class TQPolicy(Policy):
         }
         if draft_update_decision is not None:
             kwargs["draft_update_decision"] = draft_update_decision
+        if capture_draft_update_receipt:
+            kwargs["capture_draft_update_receipt"] = True
         futures = self.worker_group.run_all_workers_single_data(
             "begin_train_step_presharded", **kwargs
         )
         ray.get(futures)
+        self._capture_draft_update_receipt_for_open_step = capture_draft_update_receipt
 
     def train_microbatches_from_meta(
         self,
@@ -600,6 +626,25 @@ class TQPolicy(Policy):
             "finish_train_step_presharded",
         )
         results = ray.get(futures)
+        capture_draft_update_receipt = self._capture_draft_update_receipt_for_open_step
+        self._capture_draft_update_receipt_for_open_step = False
+        receipt_required = bool(
+            results
+            and results[0].get("draft_update_decision") is not None
+            and results[0]["draft_update_decision"].update_requested
+            and results[0].get("draft_update_successful", False)
+        )
+        receipt = None
+        if capture_draft_update_receipt:
+            from nemo_rl.models.megatron.draft.receipt import (
+                select_published_draft_update_receipt,
+            )
+
+            receipt = select_published_draft_update_receipt(
+                results,
+                capture_draft_update_receipt=True,
+                receipt_required=receipt_required,
+            )
         # Filter to DP-replica leaders only. ``run_all_workers_single_data``
         # returns one result per GPU (TP×CP×PP×DP), but TP/CP/non-last-PP
         # twins hold identical copies of their DP shard's metric list.
@@ -609,6 +654,8 @@ class TQPolicy(Policy):
         # dispatch; finish has no data to shard, so we dedupe here.
         leader_results = [r for r in results if r.get("is_replica_leader", True)]
         aggregated_results = _aggregate_train_results(leader_results)
+        if receipt is not None:
+            aggregated_results["draft_update_receipt"] = receipt
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
@@ -622,6 +669,7 @@ class TQPolicy(Policy):
             "abort_train_step_presharded",
         )
         ray.get(futures)
+        self._capture_draft_update_receipt_for_open_step = False
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()

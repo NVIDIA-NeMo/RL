@@ -21,6 +21,10 @@ import torch
 import torch.distributed as dist
 
 from nemo_rl.algorithms.draft_update_schedule import DraftUpdateDecision
+from nemo_rl.models.megatron.draft.receipt import (
+    CanonicalDraftStateRecord,
+    maybe_capture_draft_update_receipt,
+)
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     validate_draft_enabled_consensus,
     validate_draft_update_outcome_consensus,
@@ -162,4 +166,73 @@ def test_requested_update_without_owner_raises_on_every_rank() -> None:
             local_update_successful=False,
             group=dist.group.WORLD,
             device=torch.device("cpu"),
+        )
+
+
+def test_receipt_roots_and_visible_publisher_are_world_consensused() -> None:
+    _init_torchrun_group()
+    rank = int(os.environ["RANK"])
+    decision = DraftUpdateDecision(
+        global_step=3,
+        decision_id=7,
+        update_requested=True,
+        draft_refit_requested=True,
+        reason="always",
+        observed_acceptance=None,
+    )
+
+    captured = maybe_capture_draft_update_receipt(
+        capture_draft_update_receipt=True,
+        decision=decision,
+        draft_update_successful=True,
+        shard_factory=lambda: [
+            CanonicalDraftStateRecord.for_tensor(
+                component="model",
+                logical_key="draft.weight",
+                global_shape=(4,),
+                global_offset=(rank * 2,),
+                local_tensor=torch.tensor([rank + 1, rank + 2], dtype=torch.int32),
+                replica_id=0,
+            ),
+            CanonicalDraftStateRecord.for_tensor(
+                component="optimizer",
+                logical_key="draft.weight/exp_avg",
+                global_shape=(4,),
+                global_offset=(rank * 2,),
+                local_tensor=torch.tensor([rank + 3, rank + 4], dtype=torch.float32),
+                replica_id=0,
+            ),
+        ],
+        wrapper_visible=rank == 1,
+    )
+
+    assert captured is not None
+    assert captured["publisher_rank"] == 1
+    assert (captured["receipt"] is not None) == (rank == 1)
+
+
+def test_receipt_factory_error_raises_identically_after_world_collective() -> None:
+    _init_torchrun_group()
+    rank = int(os.environ["RANK"])
+    decision = DraftUpdateDecision(
+        global_step=3,
+        decision_id=7,
+        update_requested=True,
+        draft_refit_requested=True,
+        reason="always",
+        observed_acceptance=None,
+    )
+
+    def local_records() -> list[CanonicalDraftStateRecord]:
+        if rank == 1:
+            raise RuntimeError("rank-one adapter failure")
+        return []
+
+    with pytest.raises(RuntimeError, match="rank 1: RuntimeError: rank-one"):
+        maybe_capture_draft_update_receipt(
+            capture_draft_update_receipt=True,
+            decision=decision,
+            draft_update_successful=True,
+            shard_factory=local_records,
+            wrapper_visible=True,
         )

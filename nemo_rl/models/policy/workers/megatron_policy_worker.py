@@ -79,6 +79,10 @@ from nemo_rl.models.megatron.draft.diagnostics import (
     start_draft_update_probe,
 )
 from nemo_rl.models.megatron.draft.optimizer import suspend_draft_optimizer_groups
+from nemo_rl.models.megatron.draft.receipt import (
+    canonical_draft_state_records,
+    maybe_capture_draft_update_receipt,
+)
 from nemo_rl.models.megatron.draft.step_state import (
     DRAFT_STEP_PAYLOAD_KEY,
     DraftStepPayload,
@@ -1186,6 +1190,34 @@ class MegatronPolicyWorkerImpl(
             return None
         return start_draft_update_probe(self.draft_model)
 
+    def _maybe_capture_draft_update_receipt(
+        self,
+        *,
+        capture_draft_update_receipt: bool,
+        draft_update_decision: DraftUpdateDecision | None,
+        draft_update_successful: bool,
+    ) -> dict[str, Any]:
+        captured = maybe_capture_draft_update_receipt(
+            capture_draft_update_receipt=capture_draft_update_receipt,
+            decision=draft_update_decision,
+            draft_update_successful=draft_update_successful,
+            shard_factory=lambda: (
+                canonical_draft_state_records(self.draft_model, self.optimizer)
+                if self.draft_model is not None
+                else []
+            ),
+            wrapper_visible=bool(self._is_replica_leader()),
+        )
+        if captured is None:
+            return {}
+        output: dict[str, Any] = {
+            "world_rank": torch.distributed.get_rank(),
+            "draft_update_receipt_publisher_rank": captured["publisher_rank"],
+        }
+        if captured["receipt"] is not None:
+            output["draft_update_receipt"] = captured["receipt"]
+        return output
+
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -1197,6 +1229,7 @@ class MegatronPolicyWorkerImpl(
         check_dim_skip_keys: Optional[Iterable[str]] = None,
         *,
         draft_update_decision: DraftUpdateDecision | None = None,
+        capture_draft_update_receipt: bool = False,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
@@ -1551,6 +1584,11 @@ class MegatronPolicyWorkerImpl(
             if draft_update_decision is not None
             else False
         )
+        draft_receipt_metrics = self._maybe_capture_draft_update_receipt(
+            capture_draft_update_receipt=capture_draft_update_receipt,
+            draft_update_decision=draft_update_decision,
+            draft_update_successful=draft_update_successful,
+        )
 
         if saved_extra_state is not None:
             self._restore_model_extra_state_dict(saved_extra_state)
@@ -1609,6 +1647,7 @@ class MegatronPolicyWorkerImpl(
             metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
         if draft_update_decision is not None:
             metrics["draft_update_decision"] = draft_update_decision
+        metrics.update(draft_receipt_metrics)
 
         # Skip FLOPs estimation when sequence packing is enabled: gbs counts original
         # samples but each packed sequence spans max_total_sequence_length tokens,
@@ -1817,6 +1856,7 @@ class MegatronPolicyWorkerImpl(
         mbs: Optional[int] = None,
         *,
         draft_update_decision: DraftUpdateDecision | None = None,
+        capture_draft_update_receipt: bool = False,
     ) -> None:
         draft_cfg = self.cfg.get("draft")
         draft_update_decision = validate_draft_update_decision_consensus(
@@ -1845,6 +1885,7 @@ class MegatronPolicyWorkerImpl(
 
         state = self._split_step_state_init(loss_fn=loss_fn, gbs=gbs, mbs=mbs)
         state["draft_update_decision"] = draft_update_decision
+        state["capture_draft_update_receipt"] = capture_draft_update_receipt
         state["draft_execution_inputs"] = draft_execution_inputs(
             draft_update_decision,
             self.draft_model,
@@ -2249,6 +2290,11 @@ class MegatronPolicyWorkerImpl(
             if state["draft_update_decision"] is not None
             else False
         )
+        draft_receipt_metrics = self._maybe_capture_draft_update_receipt(
+            capture_draft_update_receipt=state["capture_draft_update_receipt"],
+            draft_update_decision=state["draft_update_decision"],
+            draft_update_successful=draft_update_successful,
+        )
         grad_norm = reduce_max_stat_across_model_parallel_group(
             grad_norm, mp_group=pg_collection.mp
         )
@@ -2400,6 +2446,7 @@ class MegatronPolicyWorkerImpl(
         draft_update_decision = state["draft_update_decision"]
         if draft_update_decision is not None:
             metrics["draft_update_decision"] = draft_update_decision
+        metrics.update(draft_receipt_metrics)
 
         # MoE aux-loss metrics: same convention as sync train() — scale
         # by the total pipeline-microbatch count accumulated across all
