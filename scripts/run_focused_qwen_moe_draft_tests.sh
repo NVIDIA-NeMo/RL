@@ -24,4 +24,4 @@ readonly CONTRACT_TEST=tests/unit/test_qwen_moe_draft_linux_runner_contract.py
 
 uv run --frozen --no-sync python -c 'import pytest, sys; print(f"LOCKED_PYTEST interpreter={sys.executable} prefix={sys.prefix} pytest={pytest.__file__}")'
 uv run --frozen --no-sync python -m pytest -q --mcore-only "${MCORE_TESTS[@]}" "$@"
-exec uv run --frozen --no-sync python -m pytest -q "${CONTRACT_TEST}" "$@"
+exec uv run --frozen --no-sync python -m pytest -q "${CONTRACT_TEST}"

@@ -37,6 +37,7 @@ def test_focused_qwen_moe_runner_uses_the_locked_python_module() -> None:
     assert "readonly CONTRACT_TEST=" in contents
     assert '"${MCORE_TESTS[@]}"' in contents
     assert '"${CONTRACT_TEST}"' in contents
+    assert contents.count('"$@"') == 1
 
 
 if __name__ == "__main__":
