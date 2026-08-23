@@ -231,6 +231,34 @@ def test_build_clusters_rejects_non_colocated_megatron_generation():
         sc_setup_mod._build_clusters(master_config)
 
 
+def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
+    """Topology planning reports the supported SC backends instead of KeyError."""
+    master_config = _make_master_config(colocated=False, backend="trtllm")
+    master_config.cluster = {"num_nodes": 2, "gpus_per_node": 8, "segment_size": 1}
+    master_config.policy["generation"]["colocated"]["resources"] = {
+        "gpus_per_node": 8,
+        "num_nodes": 1,
+    }
+    monkeypatch.setattr(
+        sc_setup_mod,
+        "prepare_segment_topology",
+        lambda *args, **kwargs: (
+            [{"nvlink_domain": 0.001}],
+            ["inference"],
+            {
+                "training": ("nvlink_domain", 0),
+                "inference": ("nvlink_domain", 1),
+            },
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="only supports vllm or sglang generation; got 'trtllm'",
+    ):
+        sc_setup_mod._build_clusters(master_config)
+
+
 def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
     """Teacher nodes are removed before the student train/inference split."""
     master_config = _make_master_config(colocated=False)

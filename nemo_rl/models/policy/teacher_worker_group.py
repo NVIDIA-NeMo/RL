@@ -33,7 +33,7 @@ from nemo_rl.algorithms.opd import TeacherResourceConfig
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
 from nemo_rl.data_plane.column_io import round_up
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
-from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN
+from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN, TEACHER_LP_FIELDS
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -169,6 +169,11 @@ class TeacherWorkerGroup:
             cfg["megatron_cfg"]["peft"]["enabled"] = False
         if "draft" in cfg:
             cfg["draft"]["enabled"] = False
+        # Router replay keeps the student's rollout and training logprobs
+        # consistent. A frozen teacher has no training pass, and its text-only
+        # TQ fetch does not carry routed_experts, so replay must stay off.
+        if "router_replay" in cfg:
+            cfg["router_replay"]["enabled"] = False
         # The teacher uses the plain Megatron worker, so a student-side quant_cfg
         # would be silently ignored. Drop it explicitly and warn instead.
         if cfg.get("quant_cfg") is not None:
@@ -275,10 +280,18 @@ class TeacherWorkerGroup:
         sequence_pad_multiple = (
             1 if self.use_sequence_packing else (self.sequence_length_pad_multiple)
         )
+        if self.use_dynamic_batches:
+            # The driver rounds dynamic microbatch lengths to this value. Match
+            # that rounding in the stamped fetch width so worker-side narrowing
+            # cannot request more tokens than TQ materialized.
+            sequence_pad_multiple = max(
+                sequence_pad_multiple,
+                int(self.cfg["dynamic_batching"]["sequence_length_round"]),
+            )
         teacher_meta = replace(
             meta,
             task_name=f"teacher_lp:{self.alias}",
-            fields=["input_ids", "input_lengths"],
+            fields=list(TEACHER_LP_FIELDS),
             extra_info={
                 **dict(meta.extra_info or {}),
                 GLOBAL_FORWARD_PAD_SEQLEN: round_up(

@@ -615,6 +615,63 @@ def test_tq_teacher_enrichment_drains_background_thread_before_cancellation():
     assert finished.is_set()
 
 
+def test_tq_teacher_waiters_do_not_occupy_executor_threads(monkeypatch):
+    """Only the active inference for a physical teacher enters to_thread."""
+    import asyncio
+    import threading
+
+    from nemo_rl.algorithms import opd
+
+    started = threading.Event()
+    release = threading.Event()
+    submissions = 0
+    real_to_thread = asyncio.to_thread
+
+    class BlockingTeacher(_MockTeacherWorkerGroup):
+        def get_logprobs_from_meta(self, meta):
+            del meta
+            started.set()
+            release.wait(timeout=2)
+
+    async def counted_to_thread(func, /, *args, **kwargs):
+        nonlocal submissions
+        submissions += 1
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(opd.asyncio, "to_thread", counted_to_thread)
+    coordinator = opd.TQTeacherLogprobCoordinator(
+        dp_client=object(),
+        teacher_worker_groups={"teacher": BlockingTeacher(dp_size=1)},
+        alias_to_group_alias={"math": "teacher"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"math": "/ckpt/teacher"}
+        },
+    )
+
+    async def run_waiters():
+        first = asyncio.create_task(
+            coordinator.enrich(
+                _teacher_meta("first", batch_size=1, seq_len=3),
+                _teacher_record("math"),
+            )
+        )
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        second = asyncio.create_task(
+            coordinator.enrich(
+                _teacher_meta("second", batch_size=1, seq_len=3),
+                _teacher_record("math"),
+            )
+        )
+        await asyncio.sleep(0.01)
+        assert submissions == 1
+        release.set()
+        await asyncio.gather(first, second)
+
+    asyncio.run(run_waiters())
+    assert submissions == 2
+
+
 def test_tq_teacher_enrichment_serializes_deduplicated_teacher(monkeypatch):
     """Two aliases sharing one physical teacher never overlap collectives."""
     import asyncio

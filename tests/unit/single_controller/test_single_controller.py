@@ -348,7 +348,6 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
-    ctrl._advantage_metric_values = {}
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
     )
@@ -416,7 +415,6 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
-    ctrl._advantage_metric_values = {}
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=None)
     )
@@ -478,7 +476,6 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
-    ctrl._advantage_metric_values = {}
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
     )
@@ -533,7 +530,6 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
-    ctrl._advantage_metric_values = {}
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=None)
     )
@@ -589,7 +585,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
                 {
                     "prompt_ids_for_adv": torch.zeros(2, 3, dtype=torch.long),
                     "total_reward": torch.zeros(2),
-                    "token_mask": torch.ones(2, 3),
+                    "token_mask": torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.0, 0.0]]),
                     "sample_mask": torch.ones(2),
                     "generation_logprobs": torch.full((2, 3), 0.5),
                     "prev_logprobs": torch.full((2, 3), 0.5),
@@ -617,7 +613,6 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
     }
-    ctrl._advantage_metric_values = {}
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
@@ -646,10 +641,9 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         torch.full((2, 3), 0.25),
     )
     assert "advantages" in (enriched.fields or [])
-    assert ctrl._advantage_metric_values == {}
-    assert ctrl._opd_stat_sum == pytest.approx(1.5)
-    assert ctrl._opd_stat_sumsq == pytest.approx(0.375)
-    assert ctrl._opd_stat_count == 6
+    assert ctrl._opd_stat_sum == pytest.approx(1.0)
+    assert ctrl._opd_stat_sumsq == pytest.approx(0.25)
+    assert ctrl._opd_stat_count == 4
 
 
 def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None:
@@ -822,7 +816,6 @@ def _train_pump_controller(*, sampler) -> object:
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
     }
-    ctrl._advantage_metric_values = {}
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0

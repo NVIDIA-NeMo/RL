@@ -272,9 +272,14 @@ def _build_clusters(
                 gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
                     "pipeline_parallel_size", 1
                 )
-            else:
+            elif backend == "sglang":
                 gpus_per_instance = generation_config_dict["sglang_cfg"].get(
                     "gpus_per_server", 1
+                )
+            else:
+                raise ValueError(
+                    "single_controller_utils.setup only supports vllm or sglang "
+                    f"generation; got {backend!r}"
                 )
             nodes_per_instance = (
                 gpus_per_instance + inference_gpus_per_node - 1

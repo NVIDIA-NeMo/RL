@@ -295,7 +295,6 @@ class SingleControllerActor:
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
         }
-        self._advantage_metric_values: dict[str, list[float]] = {}
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
@@ -1112,14 +1111,6 @@ class SingleControllerActor:
                 )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 step_metrics.update(
-                    {
-                        name: float(sum(values) / len(values))
-                        for name, values in self._advantage_metric_values.items()
-                        if values
-                    }
-                )
-                self._advantage_metric_values.clear()
-                step_metrics.update(
                     _pooled_opd_metrics(
                         self._opd_stat_sum,
                         self._opd_stat_sumsq,
@@ -1857,10 +1848,6 @@ class SingleControllerActor:
             self._opd_stat_sum += float(valid.sum())
             self._opd_stat_sumsq += float((valid * valid).sum())
             self._opd_stat_count += int(valid.numel())
-        else:
-            estimator_metrics = getattr(self._advantage_estimator, "last_metrics", {})
-            for name, value in estimator_metrics.items():
-                self._advantage_metric_values.setdefault(name, []).append(float(value))
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if seq_logprob_error_threshold is not None:

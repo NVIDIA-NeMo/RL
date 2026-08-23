@@ -64,6 +64,9 @@ LP_SEED_FIELDS = (
     "sample_mask",
 )
 
+# Text-only inputs fetched by frozen MOPD teachers for logprob inference.
+TEACHER_LP_FIELDS = (INPUT_IDS, INPUT_LENGTHS)
+
 # Fields requested for KV-scale calibration. Positive include-list:
 # calibration only handles seq-dim tensor inputs, so we name them
 # explicitly. Train-side deltas (logprobs/advantages/masks) and

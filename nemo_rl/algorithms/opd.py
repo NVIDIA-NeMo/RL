@@ -22,7 +22,6 @@ IS truncation lives in loss_functions.ClippedPGLoss (ICE-POP mode).
 from __future__ import annotations
 
 import asyncio
-import threading
 import time
 import uuid
 from typing import Any, Optional
@@ -33,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from nemo_rl.data_plane.column_io import read_columns, write_columns
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
+from nemo_rl.data_plane.schema import TEACHER_LP_FIELDS
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     prepare_segment_topology,
@@ -242,7 +242,7 @@ class TQTeacherLogprobCoordinator:
         # Physical (deduplicated) groups own locks, not routing aliases. Two
         # aliases sharing one checkpoint therefore share one collective FIFO.
         self._teacher_locks = {
-            group_alias: threading.Lock() for group_alias in self._teacher_worker_groups
+            group_alias: asyncio.Lock() for group_alias in self._teacher_worker_groups
         }
         self._teacher_batches = 0
         self._teacher_samples = 0
@@ -291,7 +291,7 @@ class TQTeacherLogprobCoordinator:
         self,
         meta: KVBatchMeta,
         group_alias: str,
-    ) -> tuple[float, float]:
+    ) -> float:
         """Run the blocking TQ-read, teacher inference, and TQ-write sequence."""
         if not meta.sequence_lengths:
             raise ValueError("MOPD teacher enrichment requires sequence_lengths")
@@ -313,7 +313,7 @@ class TQTeacherLogprobCoordinator:
                 source_data = read_columns(
                     self._dp_client,
                     source_meta,
-                    select_fields=["input_ids", "input_lengths"],
+                    select_fields=TEACHER_LP_FIELDS,
                     pad_value_dict={"input_ids": 0},
                 )
                 input_ids = source_data["input_ids"]
@@ -331,7 +331,7 @@ class TQTeacherLogprobCoordinator:
                     partition_id=meta.partition_id,
                     task_name=meta.task_name,
                     sample_ids=temporary_sample_ids,
-                    fields=["input_ids", "input_lengths"],
+                    fields=list(TEACHER_LP_FIELDS),
                     sequence_lengths=[meta.sequence_lengths[-1]] * pad_count,
                 )
                 # Keep this write inside the cleanup lifetime. A backend may
@@ -348,10 +348,8 @@ class TQTeacherLogprobCoordinator:
                 )
                 padded_meta = meta.concat(pad_meta)
 
-            lock_started_at = time.perf_counter()
-            with self._teacher_locks[group_alias]:
-                inference_started_at = time.perf_counter()
-                teacher.get_logprobs_from_meta(padded_meta)
+            inference_started_at = time.perf_counter()
+            teacher.get_logprobs_from_meta(padded_meta)
             inference_finished_at = time.perf_counter()
         except BaseException as enrichment_error:
             if temporary_sample_ids:
@@ -372,10 +370,7 @@ class TQTeacherLogprobCoordinator:
                 sample_ids=temporary_sample_ids,
                 partition_id=meta.partition_id,
             )
-        return (
-            inference_started_at - lock_started_at,
-            inference_finished_at - inference_started_at,
-        )
+        return inference_finished_at - inference_started_at
 
     async def enrich(
         self,
@@ -385,22 +380,27 @@ class TQTeacherLogprobCoordinator:
         """Write teacher logprobs before the replay-buffer slot becomes ready."""
         alias, group_alias = self._resolve_teacher(record)
         started_at = time.perf_counter()
-        # asyncio cannot cancel a running thread. Shield and explicitly drain
-        # it so replay-buffer rollback never clears rows while teacher workers
-        # are still fetching from or writing to those rows.
-        enrichment_task = asyncio.create_task(
-            asyncio.to_thread(self._enrich_sync, meta, group_alias)
-        )
-        try:
-            lock_wait_s, inference_time_s = await asyncio.shield(enrichment_task)
-        except asyncio.CancelledError:
+        lock_started_at = time.perf_counter()
+        # Wait for a physical teacher without occupying a default-executor
+        # thread. Only the active inference consumes a thread-pool slot.
+        async with self._teacher_locks[group_alias]:
+            lock_wait_s = time.perf_counter() - lock_started_at
+            # asyncio cannot cancel a running thread. Shield and explicitly
+            # drain it so replay-buffer rollback never clears rows while teacher
+            # workers are still fetching from or writing to those rows.
+            enrichment_task = asyncio.create_task(
+                asyncio.to_thread(self._enrich_sync, meta, group_alias)
+            )
             try:
-                await enrichment_task
-            except BaseException as drain_error:
-                raise asyncio.CancelledError(
-                    f"cancelled while draining teacher enrichment for {group_alias!r}"
-                ) from drain_error
-            raise
+                inference_time_s = await asyncio.shield(enrichment_task)
+            except asyncio.CancelledError:
+                try:
+                    await enrichment_task
+                except BaseException as drain_error:
+                    raise asyncio.CancelledError(
+                        f"cancelled while draining teacher enrichment for {group_alias!r}"
+                    ) from drain_error
+                raise
         total_time_s = time.perf_counter() - started_at
 
         teacher_model_by_agent_name = self._opd_cfg["teacher_model_by_agent_name"]
@@ -411,7 +411,6 @@ class TQTeacherLogprobCoordinator:
         self._teacher_lock_wait_time_s += lock_wait_s
         self._aliases_seen.add(alias)
         self._models_seen.add(teacher_model_by_agent_name[alias])
-        record.rollout_metrics["teacher_logprob_time"] = total_time_s
         print(
             f"[teacher_logprob] group={group_alias} samples={meta.size} "
             f"lock_wait={lock_wait_s:.2f}s inference={inference_time_s:.2f}s "
