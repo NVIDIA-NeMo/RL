@@ -101,8 +101,12 @@ def monkey_patch_vllm_ray_executor(fp8_config):
             original_initialize_worker = RayWorkerProc.initialize_worker
 
             def patched_initialize_worker(self, *args, **kwargs):
-                if not fp8_patches_applied:
-                    apply_fp8_patches(None, fp8_config)
+                # Resolve state in the worker's module because cloudpickle snapshots
+                # globals referenced by nested functions.
+                from nemo_rl.models.generation.vllm.quantization import fp8
+
+                if not fp8.fp8_patches_applied:
+                    fp8.apply_fp8_patches(None, fp8_config)
 
                 return original_initialize_worker(self, *args, **kwargs)
 

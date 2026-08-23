@@ -561,10 +561,19 @@ def test_multi_gpu_fp8_patches_ray_v2_worker_before_model_load(
     )
 
     fp8.monkey_patch_vllm_ray_executor(fp8_config)
-    RayWorkerProc.initialize_worker(object(), 0, {})
+    patched_initialize_worker = RayWorkerProc.initialize_worker
+    # cloudpickle reconstructs nested functions with a distinct globals dict.
+    worker_initialize_worker = types.FunctionType(
+        patched_initialize_worker.__code__,
+        patched_initialize_worker.__globals__.copy(),
+        closure=patched_initialize_worker.__closure__,
+    )
+    worker_initialize_worker(object(), 0, {})
+    worker_initialize_worker(object(), 0, {})
 
     assert events == [
         ("apply_fp8_patches", fp8_config),
+        ("initialize_worker", None),
         ("initialize_worker", None),
     ]
 
