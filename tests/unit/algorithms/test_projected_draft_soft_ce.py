@@ -88,6 +88,40 @@ def test_projected_soft_ce_routes_at_tile_boundary(
     "num_tokens",
     [pytest.param(4, id="one_tile"), pytest.param(5, id="multiple_tiles")],
 )
+@pytest.mark.parametrize(
+    "invalid_bin_id",
+    [pytest.param(-1, id="negative"), pytest.param(2, id="too_large")],
+)
+def test_projected_soft_ce_rejects_out_of_range_bin_ids(
+    num_tokens: int,
+    invalid_bin_id: int,
+) -> None:
+    """Both routes reject invalid bins before projection or scatter operations."""
+    generator = torch.Generator().manual_seed(8642)
+    hidden_size, vocab_size = 3, 7
+    student_hidden = torch.randn(num_tokens, hidden_size, generator=generator)
+    output_weight = torch.randn(vocab_size, hidden_size, generator=generator)
+    selected_teacher_logits = torch.randn(num_tokens, vocab_size, generator=generator)
+    bin_ids = torch.zeros(num_tokens, dtype=torch.long)
+    bin_ids[-1] = invalid_bin_id
+
+    with pytest.raises(ValueError, match=r"bin_ids must lie in \[0, 2\)"):
+        projected_streaming_vocab_parallel_soft_ce(
+            student_hidden=student_hidden,
+            output_weight=output_weight,
+            selected_teacher_logits=selected_teacher_logits,
+            mask=torch.ones(num_tokens),
+            bin_ids=bin_ids,
+            weights=torch.ones(2),
+            token_chunk_size=4,
+            tp_group=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "num_tokens",
+    [pytest.param(4, id="one_tile"), pytest.param(5, id="multiple_tiles")],
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_projected_soft_ce_matches_dense_hidden_gradient(
     num_tokens: int,
