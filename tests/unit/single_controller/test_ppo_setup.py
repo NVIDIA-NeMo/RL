@@ -31,6 +31,11 @@ from nemo_rl.algorithms.advantage_estimator import (
     GAEConfig,
     GeneralizedAdvantageEstimator,
 )
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    ReadyFirstSamplerConfig,
+    WeightFifoSamplerConfig,
+    WindowedSamplerConfig,
+)
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
@@ -234,6 +239,31 @@ class TestPPOValidation:
     def test_rejects_non_gae_estimator(self):
         with pytest.raises(ValueError):
             PPOConfig(adv_estimator={"name": "grpo"})
+
+    @pytest.mark.parametrize(
+        "sampler_config",
+        [WindowedSamplerConfig(), ReadyFirstSamplerConfig(), WeightFifoSamplerConfig()],
+        ids=lambda cfg: cfg.name,
+    )
+    def test_rejects_samplers_that_drop_rollouts_by_weight_version(
+        self, sampler_config
+    ):
+        """Critic warmup advances the version while the policy is frozen, so a
+        version-based sampler would evict rollouts that are not actually stale."""
+        mc = _ppo_master_config()
+        mc.async_rl.sampler = sampler_config
+
+        with pytest.raises(
+            ValueError,
+            match=rf"sampler.name='in_order', but got '{sampler_config.name}'",
+        ):
+            validate_single_controller_config(mc)
+
+    def test_grpo_is_free_to_use_any_sampler(self):
+        mc = _make_master_config()
+        mc.async_rl.sampler = WindowedSamplerConfig()
+
+        validate_single_controller_config(mc)
 
 
 class TestAdvantageEstimatorSelection:
