@@ -67,6 +67,49 @@ def _config() -> DSparkDraftConfig:
     )
 
 
+def test_dspark_builds_an_asymmetric_qwen_attention_body() -> None:
+    provider = DSparkSpeculator(
+        DSparkDraftConfig(
+            enabled=True,
+            model_name=None,
+            block_size=8,
+            anchors_per_sample=2,
+            mask_token_id=151669,
+            target_hidden_state_layer_ids=[1, 12, 23, 34, 45],
+            num_layers=5,
+            markov_rank=8,
+            confidence_enabled=True,
+            confidence_with_markov=True,
+        )
+    )
+    target = SimpleNamespace(
+        num_layers=48,
+        tensor_model_parallel_size=1,
+        use_cpu_initialization=True,
+        fp16=False,
+        bf16=False,
+        params_dtype=torch.float32,
+        hidden_size=8,
+        ffn_hidden_size=24,
+        num_attention_heads=4,
+        num_query_groups=1,
+        kv_channels=4,
+        rotary_base=10_000.0,
+        layernorm_epsilon=1e-6,
+        init_method_std=0.02,
+        vocab_size=32,
+    )
+
+    adapter = provider.build_model(
+        model_provider=target,
+        pg_collection=SimpleNamespace(tp=None),
+        policy_model_chunk=SimpleNamespace(),
+    )
+
+    assert adapter is not None
+    assert adapter.body.layers[0].self_attn.q_proj.weight.shape == (16, 8)
+
+
 def test_dspark_registry_resolves_public_training_provider() -> None:
     provider = resolve_draft_speculator(_config())
 
