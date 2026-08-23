@@ -109,6 +109,20 @@ _MAX_HASH_MISMATCH_LOGS = 20
 _QUANTILES = ((0.50, "p50_ms", 20), (0.90, "p90_ms", 40))
 
 
+class _WriteScheme(NamedTuple):
+    """How a field was reduced when it was written, so a read can replay it.
+
+    A positional ``("scoped", n)`` / ``("rows", width)`` tuple carried two
+    different quantities in one slot, discriminated by a magic string, under
+    an annotation that said ``int``. Naming both makes each read site say
+    which one it means.
+    """
+
+    batch_scoped: bool
+    n_rows: int
+    row_width: int
+
+
 class _FieldDigest(NamedTuple):
     """One fingerprint per row, plus how far it can be trusted.
 
@@ -456,6 +470,17 @@ def _step_deltas(snap: dict[str, Any], prev: dict[str, Any]) -> dict[str, float]
     }
 
 
+def _row_len(digest: _FieldDigest, row: int) -> int:
+    """How long ``row`` was, whichever scheme the digest used.
+
+    A per-row digest stores the one width its uniform rows shared; a
+    batch-scoped one stores every row's length.
+    """
+    if not digest.row_lens:
+        return -1
+    return digest.row_lens[row] if digest.batch_scoped else digest.row_lens[0]
+
+
 def _op_step_stats(
     by_op: dict[str, Any], prev_ops: dict[str, Any]
 ) -> dict[str, dict[str, float]]:
@@ -572,6 +597,37 @@ def _volume_mb(per_op: dict[str, dict[str, float]]) -> dict[str, float]:
         for op, row in per_op.items()
         if row["mb"] > 0
     }
+
+
+# Per-op detail lives under one namespace so it can be recognised by what it
+# is rather than by what it is not. A deny-list of "middles that are not op
+# tags" was a list against an open set: every later ``step/<x>/<field>``
+# series -- queue depth, retry counts -- would have become a phantom row in
+# the breakdown table beside put and get until someone remembered to extend
+# the list.
+_BY_OP = "step/by_op/"
+
+
+# Namespaces that publish one value per op, and the table column each fills.
+_BY_OP_NAMESPACES = {"percent_of_dataplane": "percent_of_dataplane", "volume_mb": "mb"}
+
+
+def _op_series(by_op: dict[str, Any], prev_ops: dict[str, Any]) -> dict[str, float]:
+    """Every per-op series for one step, from two snapshots.
+
+    The two step-metric paths share this rather than each assembling the same
+    keys: the helpers below exist so the single-process and cluster views
+    cannot drift on series *names*, and duplicating the six lines that build
+    those names one level up would have given the drift back.
+    """
+    per_op = _op_step_stats(by_op, prev_ops)
+    metrics = _percent_of_dataplane(per_op)
+    metrics.update(_volume_mb(per_op))
+    for op, row in per_op.items():
+        for field_name, value in row.items():
+            if field_name != "mb":  # published once, under volume_mb/by_op
+                metrics[f"{_BY_OP}{op}/{field_name}"] = value
+    return metrics
 
 
 def _percent_of_dataplane(per_op: dict[str, dict[str, float]]) -> dict[str, float]:
@@ -859,12 +915,7 @@ def cluster_step_metrics(
     metrics.update(
         _hash_deltas(merged.get("hash_verify") or {}, prev.get("hash_verify") or {})
     )
-    per_op = _op_step_stats(merged["by_op"], prev.get("by_op", {}))
-    metrics.update(_percent_of_dataplane(per_op))
-    metrics.update(_volume_mb(per_op))
-    for op, row in per_op.items():
-        for field_name, value in row.items():
-            metrics[f"step/{op}/{field_name}"] = value
+    metrics.update(_op_series(merged["by_op"], prev.get("by_op", {})))
     return metrics
 
 
@@ -880,8 +931,6 @@ _HEADLINE = (
     "step/comm_volume_mb",
     "now/bytes_outstanding_mb",
     "now/n_processes",
-    "step/self/overhead_ms",
-    "step/self/frac",
 )
 _HEADLINE_PREFIXES = (
     "step/percent_of_dataplane/",
@@ -889,10 +938,6 @@ _HEADLINE_PREFIXES = (
     "step/hash/",
     "step/self/",
 )
-# ``step/<x>/<field>`` is the per-op shape, so these reserved middles must
-# not be mistaken for op tags -- ``step/self/overhead_ms`` was becoming a
-# "self" row in the breakdown table beside put and get.
-_RESERVED_NAMESPACES = frozenset({"percent_of_dataplane", "volume_mb", "hash", "self"})
 
 
 def headline_series(metrics: dict[str, float]) -> dict[str, float]:
@@ -960,15 +1005,16 @@ def breakdown_table(
     per_op: dict[str, dict[str, float]] = {}
     for key, value in metrics.items():
         parts = key.split("/")
-        if len(parts) == 4 and parts[:3] == ["step", "percent_of_dataplane", "by_op"]:
-            per_op.setdefault(parts[3], {})["percent_of_dataplane"] = value
+        if len(parts) == 4 and parts[0] == "step" and parts[2] == "by_op":
+            column = _BY_OP_NAMESPACES.get(parts[1])
+            if column:
+                per_op.setdefault(parts[3], {})[column] = value
         elif (
-            len(parts) == 3
-            and parts[0] == "step"
-            and parts[1] not in _RESERVED_NAMESPACES
-            and parts[2] in _BREAKDOWN_COLUMNS
+            len(parts) == 4
+            and parts[:2] == ["step", "by_op"]
+            and parts[3] in _BREAKDOWN_COLUMNS
         ):
-            per_op.setdefault(parts[1], {})[parts[2]] = value
+            per_op.setdefault(parts[2], {})[parts[3]] = value
     rows = [
         [op, *(stats.get(col) for col in _BREAKDOWN_COLUMNS)]
         # By wall time, which orders identically to ``percent_of_dataplane`` (that is
@@ -1115,7 +1161,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # of that same batch; the row count is what detects a shard read.
         # partition -> field -> rows the field's digest was reduced over,
         # for batch-scoped fields only. An absent field was reduced per row.
-        self._batch_scope: dict[str, dict[str, int]] = {}
+        self._batch_scope: dict[str, dict[str, _WriteScheme]] = {}
         self._hash_mismatches_logged = 0
         # Set by ``_emit`` to the inner client's wall time for the op just
         # run, so the wrapping methods can subtract it and bill the rest to
@@ -1199,12 +1245,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self_ms = snap["self_ms"] - prev.get("self_ms", 0.0)
         metrics["step/self/overhead_ms"] = self_ms
         metrics["step/self/frac"] = self_ms / wall_ms if wall_ms > 0 else 0.0
-        per_op = _op_step_stats(snap["by_op"], prev.get("by_op", {}))
-        metrics.update(_percent_of_dataplane(per_op))
-        metrics.update(_volume_mb(per_op))
-        for op, row in per_op.items():
-            for field_name, value in row.items():
-                metrics[f"step/{op}/{field_name}"] = value
+        metrics.update(_op_series(snap["by_op"], prev.get("by_op", {})))
         return metrics
 
     def _record_put(self, partition_id: str, keys: list[str], n_bytes: int) -> None:
@@ -1351,7 +1392,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 lengths = (offsets[1:] - offsets[:-1]).tolist()
                 # Uniform rows: the values buffer already *is* the rectangle,
                 # so reshaping it is a view and the per-row reduction is free.
-                rectangle = v.values() if len(set(lengths)) == 1 else None
+                uniform = lengths.count(lengths[0]) == n_rows
+                rectangle = v.values() if uniform else None
             elif v.shape[0] != n_rows:
                 stats.fields_skipped += 1
                 continue
@@ -1363,7 +1405,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 out[name] = _FieldDigest(
                     (torch.hash_tensor(flat, dim=1) ^ salt).tolist(),
                     batch_scoped=False,
-                    row_lens=(flat.shape[1],) * n_rows,
+                    # One width, not n_rows copies of it: the rows are
+                    # uniform by construction on this path.
+                    row_lens=(flat.shape[1],),
                 )
                 continue
             buffer = v.values() if v.is_nested else v
@@ -1394,13 +1438,14 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # side tell a shard of a batch-scoped field from a relayout.
         scheme = self._batch_scope.setdefault(partition_id, {})
         for name, digest in digests.items():
-            if digest.batch_scoped:
-                scheme[name] = ("scoped", len(sample_ids))
-            else:
-                # Width, not row count: a per-row scheme means the rows were
-                # uniform, so one number describes them all and lets a later
-                # ragged read still check whether any row changed length.
-                scheme[name] = ("rows", digest.row_lens[0] if digest.row_lens else 0)
+            # Width matters only for the per-row scheme -- uniform rows mean
+            # one number describes them all, and lets a later ragged read
+            # still check whether any row changed length.
+            scheme[name] = _WriteScheme(
+                batch_scoped=digest.batch_scoped,
+                n_rows=len(sample_ids),
+                row_width=digest.row_lens[0] if digest.row_lens else 0,
+            )
         self._stats.hash_verify.rows_recorded += len(sample_ids)
 
     def _check_hashes(self, partition_id: str, sample_ids: list[str], out: Any) -> None:
@@ -1411,7 +1456,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # Only the batch-scoped names: the scheme also records per-row fields
         # now, and handing the whole mapping over forced every field onto the
         # scoped path.
-        scoped_names = {n for n, how in scheme.items() if how[0] == "scoped"}
+        scoped_names = {n for n, how in scheme.items() if how.batch_scoped}
         digests = self._row_fingerprints(out, sample_ids, scoped_names)
         if not digests:
             return
@@ -1432,8 +1477,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 comparable[name] = digest
             elif recorded is None:
                 continue  # this process never wrote the field
-            elif recorded[0] == "scoped":
-                if recorded[1] == len(sample_ids):
+            elif recorded.batch_scoped:
+                if recorded.n_rows == len(sample_ids):
                     comparable[name] = digest
                 else:
                     stats.fields_skipped += 1  # a shard of a batch-scoped put
@@ -1446,7 +1491,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 # are still comparable, and a row that changed length *is* a
                 # divergence, so check that much and count the rest as the
                 # abstention it is.
-                length_only[name] = (digest, recorded[1])
+                length_only[name] = (digest, recorded.row_width)
                 stats.fields_skipped += 1
         for row, sample_id in enumerate(sample_ids):
             per_field = partition_hashes.get(sample_id)
@@ -1457,7 +1502,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 continue
             stats.rows_checked += 1
             for name, (digest, width) in length_only.items():
-                if per_field.get(name) is None or digest.row_lens[row] == width:
+                read_len = _row_len(digest, row)
+                if per_field.get(name) is None or read_len == width:
                     continue
                 stats.mismatches += 1
                 if self._hash_mismatches_logged < _MAX_HASH_MISMATCH_LOGS:
@@ -1469,7 +1515,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
                         sample_id,
                         name,
                         width,
-                        digest.row_lens[row],
+                        read_len,
                     )
             for name, digest in comparable.items():
                 expected = per_field.get(name)
@@ -1494,7 +1540,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
                         "batch-scoped" if digest.batch_scoped else "per-row",
                         row,
                         len(sample_ids),
-                        digest.row_lens[row] if digest.row_lens else -1,
+                        _row_len(digest, row),
                     )
 
     def _run(

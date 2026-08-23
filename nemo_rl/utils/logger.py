@@ -233,6 +233,11 @@ class WandbLogger(LoggerInterface):
         wandb_init_config = dict(cfg)
         wandb_init_config.pop("log_nemo_gym_full_result_tables", None)
         self.run = wandb.init(**wandb_init_config, dir=log_dir)
+        # Highest step already committed. wandb accepts a log against a
+        # committed step, returns cleanly, and drops it -- a silent data loss
+        # that cost a whole feature's series once, because the caller ran
+        # after the log that ends the step and nothing said so.
+        self._committed_step = -1
 
         if os.environ.get("RAY_BACKEND_LOG_LEVEL", "").lower() == "debug":
             print(
@@ -399,7 +404,18 @@ class WandbLogger(LoggerInterface):
             # Commit param defaults to None. By default if step is set, then commit defaults to False
             # Here, we have an explicit fork for commit in case W&B ever decides to change their default logic.
             self.run.log(metrics, step=step, commit=True)
+            self._committed_step = max(self._committed_step, step)
         else:
+            if step <= self._committed_step:
+                # Loud, because wandb is not: it would accept this and drop it.
+                logging.getLogger(__name__).warning(
+                    "wandb: %d metrics logged at step %d, which was already "
+                    "committed (step_finished=True) -- wandb will discard "
+                    "them. Log before the call that ends the step. Keys: %s",
+                    len(metrics),
+                    step,
+                    sorted(metrics)[:5],
+                )
             self.run.log(metrics, step=step)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
