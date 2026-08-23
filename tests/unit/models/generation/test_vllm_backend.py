@@ -108,6 +108,63 @@ def _make_component_selection_extension(backend, monkeypatch):
     return ext, calls
 
 
+def _make_mtp_component_selection_extension(backend, monkeypatch, method):
+    from nemo_rl.models.generation.vllm.speculator_runtime import ModelUpdateManifest
+
+    calls = []
+    target_model = SimpleNamespace()
+    draft_model = SimpleNamespace(
+        load_weights=lambda *, weights: calls.append(
+            ("mtp_loader", tuple(name for name, _ in weights))
+        )
+    )
+    draft_config = object()
+    ext = backend.VllmInternalWorkerExtension.__new__(
+        backend.VllmInternalWorkerExtension
+    )
+    ext.device = torch.device("cpu")
+    ext.model_config = object()
+    ext.model_runner = SimpleNamespace(
+        model=target_model,
+        drafter=SimpleNamespace(model=draft_model),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=[]),
+            cache_config=SimpleNamespace(cache_dtype="auto"),
+            speculative_config=SimpleNamespace(
+                method=method, draft_model_config=draft_config
+            ),
+        ),
+    )
+    ext.state_dict_info = {"model.weight": ((2,), torch.float32)}
+    ext._draft_runtime_adapter = None
+    ext._mtp_drafter_from_disk = False
+    ext._model_update_manifest = ModelUpdateManifest.from_state_dict_info(
+        ext.state_dict_info,
+        target_owner_ranks=(0,),
+        draft_owner_ranks=(),
+    )
+    ext._load_hf_weights = lambda weights: calls.append(
+        ("target_loader", tuple(name for name, _ in weights))
+    )
+    ext._load_draft_weights = lambda weights, **_: False
+    ext._trim_vocab_padding = lambda _model, weights: weights
+    monkeypatch.setattr(
+        backend, "get_pp_group", lambda: SimpleNamespace(rank_in_group=0)
+    )
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        lambda model, *_: calls.append(
+            ("mtp_finalizer" if model is draft_model else "target_finalizer",)
+        ),
+    )
+    monkeypatch.setattr(backend.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(backend.gc, "collect", lambda: None)
+    return ext, calls
+
+
 @pytest.mark.vllm
 def test_collective_target_only_receiver_omits_draft_then_full_sync_restores_it(
     monkeypatch,
@@ -149,6 +206,62 @@ def test_collective_target_only_receiver_omits_draft_then_full_sync_restores_it(
         ("draft_finalizer",),
         ("mtp_finalizer",),
     ]
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("method", ["mtp", "deepseek_mtp"])
+@pytest.mark.parametrize(
+    ("selection", "expected_calls"),
+    [
+        (
+            None,
+            [
+                ("target_loader", ("model.weight",)),
+                ("mtp_loader", ("model.weight",)),
+                ("target_finalizer",),
+                ("mtp_finalizer",),
+            ],
+        ),
+        (
+            WeightSyncSelection(),
+            [
+                ("target_loader", ("model.weight",)),
+                ("mtp_loader", ("model.weight",)),
+                ("target_finalizer",),
+                ("mtp_finalizer",),
+            ],
+        ),
+        (
+            WeightSyncSelection(draft=False),
+            [
+                ("target_loader", ("model.weight",)),
+                ("target_finalizer",),
+            ],
+        ),
+    ],
+)
+def test_collective_mtp_selection_controls_unprefixed_drafter_update(
+    monkeypatch, method, selection, expected_calls
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, calls = _make_mtp_component_selection_extension(
+        vllm_backend, monkeypatch, method
+    )
+
+    def receive(iterator, _group, _src, post_unpack_func):
+        entries = list(iterator)
+        assert tuple(name for name, _ in entries) == ("model.weight",)
+        post_unpack_func([(name, torch.ones(2)) for name, _ in entries])
+
+    monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", receive)
+
+    if selection is None:
+        assert ext.update_weights_from_collective()
+    else:
+        assert ext.update_weights_from_collective(selection)
+
+    assert calls == expected_calls
 
 
 @pytest.mark.vllm
@@ -297,7 +410,9 @@ def test_common_speculator_refit_loads_then_finalizes_target_and_draft(
         target_owner_ranks=(0,),
         draft_owner_ranks=(0,),
     )
-    coverage = ModelUpdateCoverage(ext._model_update_manifest, rank=0)
+    coverage = ModelUpdateCoverage(
+        ext._model_update_manifest, rank=0, draft_selected=True
+    )
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
     monkeypatch.setattr(
         "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
@@ -320,7 +435,7 @@ def test_common_speculator_refit_loads_then_finalizes_target_and_draft(
     with ext._weight_update_lifecycle("collective") as finalize:
         ext._load_weights(weights, coverage=coverage)
         coverage.require_complete()
-        finalize(coverage.has_draft)
+        finalize(coverage.draft_selected)
 
     assert call_order == [
         "load_target",

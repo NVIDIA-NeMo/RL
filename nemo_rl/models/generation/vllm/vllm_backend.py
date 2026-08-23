@@ -672,7 +672,7 @@ class VllmInternalWorkerExtension:
                 coverage.record_owner_skip(draft_input_names, component="draft")
         # MTP drafters co-trained with the policy receive their weights from the
         # policy stream (no `draft.` prefix), so feed it the policy weights too.
-        if coverage is None or coverage.has_draft:
+        if coverage is None or coverage.draft_selected:
             self._maybe_refit_mtp_drafter(policy_weights)
 
     def _get_sparse_delta_applier(self) -> Any:
@@ -728,7 +728,11 @@ class VllmInternalWorkerExtension:
         if manifest is None:
             return None
         pp_rank = int(getattr(get_pp_group(), "rank_in_group", 0))
-        return ModelUpdateCoverage(manifest.for_selection(selection), rank=pp_rank)
+        return ModelUpdateCoverage(
+            manifest.for_selection(selection),
+            rank=pp_rank,
+            draft_selected=selection.draft,
+        )
 
     def _maybe_process_draft_after_loading(
         self, process_weights_after_loading: Callable[[Any, Any, Any], None]
@@ -797,10 +801,7 @@ class VllmInternalWorkerExtension:
                             manifest.require_complete()
                             if coverage is not None:
                                 coverage.require_complete()
-                            if coverage is None:
-                                finalize(False)
-                            else:
-                                finalize(coverage.has_draft)
+                            finalize(selection.draft)
                         finally:
                             self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                         break
@@ -919,10 +920,7 @@ class VllmInternalWorkerExtension:
                 )
                 if coverage is not None:
                     coverage.require_complete()
-                if coverage is None:
-                    finalize(False)
-                else:
-                    finalize(coverage.has_draft)
+                finalize(selection.draft)
 
         except Exception as e:
             if self._weight_update_errors_are_fatal():

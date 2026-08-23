@@ -121,9 +121,16 @@ class ModelUpdateManifest:
 class ModelUpdateCoverage:
     """Validate exact input coverage while allowing explicit non-owner skips."""
 
-    def __init__(self, manifest: ModelUpdateManifest, *, rank: int) -> None:
+    def __init__(
+        self,
+        manifest: ModelUpdateManifest,
+        *,
+        rank: int,
+        draft_selected: bool,
+    ) -> None:
         self._manifest = manifest
         self._rank = rank
+        self._draft_selected = draft_selected
         self._expected = set(manifest.target.ordered_names)
         if manifest.draft is not None:
             self._expected.update(manifest.draft.ordered_names)
@@ -132,6 +139,10 @@ class ModelUpdateCoverage:
     @property
     def has_draft(self) -> bool:
         return self._manifest.draft is not None
+
+    @property
+    def draft_selected(self) -> bool:
+        return self._draft_selected
 
     @property
     def expected_names(self) -> tuple[str, ...]:

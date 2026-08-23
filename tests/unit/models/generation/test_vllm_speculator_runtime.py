@@ -166,6 +166,22 @@ def test_target_only_manifest_has_no_draft_names_bytes_or_finalizer() -> None:
     assert target_only.draft is None
 
 
+def test_coverage_keeps_draft_selection_separate_from_prefixed_payload() -> None:
+    manifest = ModelUpdateManifest.from_state_dict_info(
+        {"model.weight": ((2,), torch.float32)},
+        target_owner_ranks=(0,),
+        draft_owner_ranks=(),
+    )
+
+    full = ModelUpdateCoverage(manifest, rank=0, draft_selected=True)
+    target_only = ModelUpdateCoverage(manifest, rank=0, draft_selected=False)
+
+    assert not full.has_draft
+    assert full.draft_selected
+    assert not target_only.has_draft
+    assert not target_only.draft_selected
+
+
 def test_full_target_only_full_selection_is_reusable_without_mutating_manifest() -> (
     None
 ):
@@ -195,7 +211,7 @@ def test_target_only_coverage_rejects_forged_draft_payload() -> None:
         target_owner_ranks=(0,),
         draft_owner_ranks=(0,),
     ).for_selection(WeightSyncSelection(draft=False))
-    coverage = ModelUpdateCoverage(manifest, rank=0)
+    coverage = ModelUpdateCoverage(manifest, rank=0, draft_selected=False)
 
     with pytest.raises(SpeculatorRuntimeError, match="unexpected keys"):
         coverage.record_loaded(("draft.model.weight",))
@@ -210,7 +226,7 @@ def test_model_update_coverage_requires_every_input_exactly_once() -> None:
         target_owner_ranks=(0,),
         draft_owner_ranks=(0,),
     )
-    coverage = ModelUpdateCoverage(manifest, rank=0)
+    coverage = ModelUpdateCoverage(manifest, rank=0, draft_selected=True)
 
     coverage.record_loaded(("model.weight",))
     with pytest.raises(SpeculatorRuntimeError, match="missing keys"):
@@ -222,7 +238,7 @@ def test_model_update_coverage_requires_every_input_exactly_once() -> None:
     with pytest.raises(SpeculatorRuntimeError, match="duplicate keys"):
         coverage.record_loaded(("model.weight",))
 
-    coverage = ModelUpdateCoverage(manifest, rank=0)
+    coverage = ModelUpdateCoverage(manifest, rank=0, draft_selected=True)
     with pytest.raises(SpeculatorRuntimeError, match="duplicate keys"):
         coverage.record_loaded(("model.weight", "model.weight"))
 
@@ -236,7 +252,7 @@ def test_non_owner_records_draft_skip_but_still_requires_transport_coverage() ->
         target_owner_ranks=(0, 1),
         draft_owner_ranks=(1,),
     )
-    coverage = ModelUpdateCoverage(manifest, rank=0)
+    coverage = ModelUpdateCoverage(manifest, rank=0, draft_selected=True)
 
     coverage.record_loaded(("model.weight",))
     coverage.record_owner_skip(("draft.model.weight",), component="draft")
