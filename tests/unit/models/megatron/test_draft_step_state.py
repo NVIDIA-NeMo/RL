@@ -266,7 +266,10 @@ def test_split_accumulation_matches_monolithic_normalization() -> None:
     assert torch.equal(global_counts, monolithic.counts), (
         "split-accumulated counts must equal the monolithic denominator"
     )
-    torch.testing.assert_close(split_loss, monolithic_loss, rtol=1e-12, atol=1e-12)
+    # Numerators accumulate in float32 inside the loss, so chunked addition
+    # order can differ from the monolithic sum by fp32 rounding; the parity
+    # claim is identical normalization semantics, not bitwise equality.
+    torch.testing.assert_close(split_loss, monolithic_loss, rtol=1e-6, atol=1e-6)
     policy_count = token_mask[:, 1:].sum()
     assert torch.equal(global_counts.sum(), policy_count), (
         "draft rolled-mask count must equal the policy shifted-mask count"

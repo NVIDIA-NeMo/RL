@@ -28,6 +28,7 @@ DRAFT_STEP_PAYLOAD_KEY = "_draft_step_payload"
 def _mock_step_state_without_megatron() -> tuple[types.ModuleType, types.ModuleType]:
     module = types.ModuleType("nemo_rl.models.megatron.draft.step_state")
     module.DRAFT_STEP_PAYLOAD_KEY = DRAFT_STEP_PAYLOAD_KEY
+    module.DRAFT_LOSS_METRIC_KEY = "draft_loss"
     module.DraftStepState = MagicMock()
     package = types.ModuleType("nemo_rl.models.megatron.draft")
     package.step_state = module
