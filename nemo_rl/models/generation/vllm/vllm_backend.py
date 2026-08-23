@@ -1357,7 +1357,7 @@ class VllmInternalWorkerExtension:
                 # canonical [gate; up] bulk write above defers to here, and the MTP
                 # drafter's mirror of the same. The FP8 KV-cache per-layer k/v scales
                 # are finalized by the lifecycle on exit.
-                finalize(False)
+                finalize(True)
 
                 torch.cuda.empty_cache()
         except Exception as e:

@@ -265,6 +265,47 @@ def test_collective_mtp_selection_controls_unprefixed_drafter_update(
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize("method", ["mtp", "deepseek_mtp"])
+def test_nccl_reshard_full_sync_updates_unprefixed_mtp_drafter(monkeypatch, method):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, calls = _make_mtp_component_selection_extension(
+        vllm_backend, monkeypatch, method
+    )
+    ext.nccl_reshard_refit_info = {
+        "layer_names": [],
+        "per_layer_params": {},
+        "misc_meta": {"model.weight": {"shape": [2], "dtype": "torch.float32"}},
+    }
+    ext.hf_to_local_param_map = {}
+    ext.pp_comm_groups = {}
+
+    def receive(*, iterator, group, src, post_unpack_func, preflight_checked=False):
+        entries = list(iterator)
+        assert tuple(name for name, _ in entries) == ("model.weight",)
+        assert group is ext.model_update_group
+        assert src == 0
+        assert preflight_checked
+        post_unpack_func([(name, torch.ones(2)) for name, _ in entries])
+
+    monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", receive)
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_preflight_consumer", lambda *_: None
+    )
+    monkeypatch.setattr(vllm_backend.torch.cuda, "Stream", object)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.distributed, "get_rank", lambda: 1)
+
+    assert ext.nccl_reshard_refit()
+    assert calls == [
+        ("target_loader", ("model.weight",)),
+        ("mtp_loader", ("model.weight",)),
+        ("target_finalizer",),
+        ("mtp_finalizer",),
+    ]
+
+
+@pytest.mark.vllm
 def test_ipc_target_only_receiver_omits_draft_then_full_sync_restores_it(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.policy.utils import IPCProtocol, calculate_aligned_size
@@ -318,6 +359,60 @@ def test_ipc_target_only_receiver_omits_draft_then_full_sync_restores_it(monkeyp
         ("target_finalizer",),
         ("draft_finalizer",),
         ("mtp_finalizer",),
+    ]
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("method", ["mtp", "deepseek_mtp"])
+def test_ipc_mtp_selection_controls_unprefixed_drafter_at_termination(
+    monkeypatch, method
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.policy.utils import IPCProtocol, calculate_aligned_size
+
+    ext, calls = _make_mtp_component_selection_extension(
+        vllm_backend, monkeypatch, method
+    )
+    ext.maybe_init_zmq = lambda: None
+    ext._synchronize_before_ipc_data_ack = lambda: None
+
+    class Socket:
+        def __init__(self):
+            self.messages = []
+
+        def recv_pyobj(self):
+            return self.messages.pop(0)
+
+        def send(self, _payload):
+            pass
+
+    socket = Socket()
+    ext.zmq_socket = socket
+    monkeypatch.setattr(
+        vllm_backend,
+        "rebuild_cuda_tensor_from_ipc",
+        lambda *_: torch.zeros(calculate_aligned_size(8), dtype=torch.uint8),
+    )
+    payload = (object(), ["model.weight"], calculate_aligned_size(8))
+
+    socket.messages = [payload, IPCProtocol.COMPLETE]
+    assert ext.update_weights_via_ipc_zmq()
+    assert calls == [
+        ("target_loader", ("model.weight",)),
+        ("mtp_loader", ("model.weight",)),
+        ("target_finalizer",),
+        ("mtp_finalizer",),
+    ]
+
+    socket.messages = [payload, IPCProtocol.COMPLETE]
+    assert ext.update_weights_via_ipc_zmq(WeightSyncSelection(draft=False))
+    assert calls == [
+        ("target_loader", ("model.weight",)),
+        ("mtp_loader", ("model.weight",)),
+        ("target_finalizer",),
+        ("mtp_finalizer",),
+        ("target_loader", ("model.weight",)),
+        ("target_finalizer",),
     ]
 
 

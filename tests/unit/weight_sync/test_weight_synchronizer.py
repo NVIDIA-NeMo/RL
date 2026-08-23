@@ -571,6 +571,19 @@ class TestCollectiveWeightSynchronizer:
 
 
 class TestNcclReshardWeightSynchronizer:
+    def test_target_only_selection_is_rejected_before_transfer(self) -> None:
+        policy = _mock_policy()
+        generation = _mock_generation()
+        synchronizer = NcclReshardWeightSynchronizer(
+            policy, generation, _mock_cluster(), _mock_cluster()
+        )
+
+        with pytest.raises(ValueError, match="component-selective.*unsupported"):
+            synchronizer.sync_weights(selection=WeightSyncSelection(draft=False))
+
+        policy.nccl_reshard_refit.assert_not_called()
+        generation.nccl_reshard_refit.assert_not_called()
+
     def test_parallelism_includes_context_parallelism(self):
         policy = _mock_policy(
             cfg={
