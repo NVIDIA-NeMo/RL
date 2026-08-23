@@ -32,7 +32,6 @@ from __future__ import annotations
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import replace
 from typing import Any, Optional
 
 import ray
@@ -219,9 +218,8 @@ class TQPolicy(TQDriverMixin, Policy):
         leader-rank ``_write_back_result_field``; the Ray return is
         always None, so this dispatcher just waits for completion.
         """
-        self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("logprob_mb_tokens")
-        lp_meta = replace(
+        lp_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
                 LP_SEED_FIELDS,
@@ -323,13 +321,12 @@ class TQPolicy(TQDriverMixin, Policy):
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
 
-        self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
         # ``train_fields`` (rollout + logprob deltas + advantages + sample_mask;
         # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written
         # by workers + driver delta-writes. Caller may narrow to drop columns
         # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
-        train_meta = replace(
+        train_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
                 train_fields, enabled=self._router_replay_enabled
@@ -451,9 +448,8 @@ class TQPolicy(TQDriverMixin, Policy):
         the workers' open-step state and surface once via
         :meth:`finish_train_step`.
         """
-        self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
-        train_meta = replace(
+        train_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
                 DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
