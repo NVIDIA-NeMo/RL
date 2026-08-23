@@ -23,6 +23,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
+
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection
 from safetensors.torch import save_file
 
 
@@ -519,6 +521,45 @@ async def test_async_weight_updates_check_every_internal_worker(
         worker.llm.reset_encoder_cache.assert_awaited_once_with()
     else:
         worker.llm.reset_encoder_cache.assert_not_awaited()
+
+
+@pytest.mark.vllm
+def test_sync_weight_update_forwards_target_only_selection_to_each_vllm_rank():
+    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
+
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+    worker.llm = SimpleNamespace(collective_rpc=MagicMock(return_value=[True]))
+    selection = WeightSyncSelection(draft=False)
+
+    assert worker.update_weights_via_ipc_zmq(selection=selection) is True
+
+    worker.llm.collective_rpc.assert_called_once_with(
+        "update_weights_via_ipc_zmq", args=(selection,)
+    )
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+async def test_async_weight_update_forwards_target_only_selection_to_each_vllm_rank():
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = SimpleNamespace(
+        collective_rpc=AsyncMock(return_value=[True]), reset_encoder_cache=AsyncMock()
+    )
+    selection = WeightSyncSelection(draft=False)
+
+    assert (
+        await worker.update_weights_from_collective_async(selection=selection) is True
+    )
+
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        "update_weights_from_collective", args=(selection,)
+    )
 
 
 @pytest.mark.vllm

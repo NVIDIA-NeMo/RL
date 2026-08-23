@@ -13,9 +13,10 @@
 # limitations under the License.
 
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection, WeightSynchronizer
 
 __all__ = [
     "WeightSynchronizer",
+    "WeightSyncSelection",
     "create_weight_synchronizer",
 ]

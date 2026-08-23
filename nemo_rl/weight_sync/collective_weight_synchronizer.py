@@ -34,7 +34,7 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection, WeightSynchronizer
 
 
 class CollectiveWeightSynchronizer(WeightSynchronizer):
@@ -67,9 +67,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
     def sync_weights(
         self,
         *,
+        selection: WeightSyncSelection = WeightSyncSelection(),
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        self.validate_selection(selection)
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
@@ -77,12 +79,21 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         )
         with timer_context:
             sender_spec = self._generation.get_collective_sender_spec()
+            policy_kwargs: dict[str, Any] = {
+                "kv_scales": kv_scales,
+                "buffer_size_bytes": sender_spec.buffer_size_bytes,
+                "num_buffers": sender_spec.num_buffers,
+            }
+            generation_kwargs: dict[str, Any] = {}
+            if not selection.draft:
+                policy_kwargs["selection"] = selection
+                generation_kwargs["selection"] = selection
             futures_train = self._policy.broadcast_weights_for_collective(
-                kv_scales=kv_scales,
-                buffer_size_bytes=sender_spec.buffer_size_bytes,
-                num_buffers=sender_spec.num_buffers,
+                **policy_kwargs
             )
-            futures_inference = self._generation.update_weights_from_collective()
+            futures_inference = self._generation.update_weights_from_collective(
+                **generation_kwargs
+            )
 
             ray.get(futures_train)
             results = ray.get(futures_inference)
@@ -96,6 +107,10 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
                 )
 
         self._stale = False
+
+    @property
+    def supports_component_selection(self) -> bool:
+        return True
 
     @property
     def is_stale(self) -> bool:

@@ -38,9 +38,22 @@ at the synchronizer level.
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Optional
 
 from nemo_rl.utils.timer import Timer
+
+
+@dataclass(frozen=True, slots=True)
+class WeightSyncSelection:
+    """Components included in one policy-to-generation weight transfer."""
+
+    target: bool = True
+    draft: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.target:
+            raise ValueError("target policy must synchronize on every policy step")
 
 
 class WeightSynchronizer(ABC):
@@ -62,6 +75,7 @@ class WeightSynchronizer(ABC):
     def sync_weights(
         self,
         *,
+        selection: WeightSyncSelection = WeightSyncSelection(),
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> Optional[dict[str, float]]:
@@ -98,6 +112,18 @@ class WeightSynchronizer(ABC):
         pass
 
     @property
+    def supports_component_selection(self) -> bool:
+        """Whether this transport can omit the draft component safely."""
+        return False
+
+    def validate_selection(self, selection: WeightSyncSelection) -> None:
+        if not selection.draft and not self.supports_component_selection:
+            raise ValueError(
+                "component-selective draft refit is unsupported by "
+                f"{type(self).__name__}"
+            )
+
+    @property
     @abstractmethod
     def is_stale(self) -> bool:
         """Whether the generation backend's weights are out of date.
@@ -125,3 +151,39 @@ class WeightSynchronizer(ABC):
     def shutdown(self) -> None:
         """Release all communication resources."""
         pass
+
+
+def require_component_selection(
+    synchronizer: WeightSynchronizer, schedule_mode: str
+) -> None:
+    """Reject sparse cadence on a transport that cannot omit draft bytes."""
+    if schedule_mode != "always" and not synchronizer.supports_component_selection:
+        raise ValueError(
+            "component-selective draft refit is unsupported by "
+            f"{type(synchronizer).__name__}; use update_schedule.mode=always"
+        )
+
+
+def preflight_component_selection(
+    *,
+    schedule_mode: str,
+    generation_backend: str,
+    colocated: bool,
+    refit_transport: str | None,
+    remote_sparse: bool,
+) -> None:
+    """Fail before worker construction for a known-incompatible transport."""
+    if schedule_mode == "always":
+        return
+    supported = (
+        generation_backend == "vllm"
+        and not remote_sparse
+        and refit_transport not in {"checkpoint_engine", "nccl_reshard"}
+        and (colocated or refit_transport is None)
+    )
+    if not supported:
+        raise ValueError(
+            "component-selective draft refit is unsupported by the resolved "
+            f"transport: backend={generation_backend!r}, colocated={colocated}, "
+            f"refit_transport={refit_transport!r}, remote_sparse={remote_sparse}"
+        )

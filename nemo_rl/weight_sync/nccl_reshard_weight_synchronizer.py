@@ -42,7 +42,7 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection, WeightSynchronizer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     make_nccl_reshard_refit_info_wire_safe,
 )
@@ -105,9 +105,11 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
     def sync_weights(
         self,
         *,
+        selection: WeightSyncSelection = WeightSyncSelection(),
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        self.validate_selection(selection)
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None

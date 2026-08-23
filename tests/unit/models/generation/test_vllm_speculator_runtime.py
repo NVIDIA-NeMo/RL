@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection
 from nemo_rl.models.generation.vllm.speculator_runtime import (
     DraftRuntimeAdapter,
     ModelUpdateCoverage,
@@ -146,6 +147,58 @@ def test_model_update_manifest_is_ordered_and_component_aware() -> None:
     assert manifest.draft.owner_ranks == (1,)
     assert manifest.draft.loader == "draft.load_weights"
     assert manifest.draft.finalizer == "process_weights_after_loading"
+
+
+def test_target_only_manifest_has_no_draft_names_bytes_or_finalizer() -> None:
+    manifest = ModelUpdateManifest.from_state_dict_info(
+        {
+            "model.weight": ((2,), torch.float32),
+            "draft.model.weight": ((3,), torch.float32),
+        },
+        target_owner_ranks=(0,),
+        draft_owner_ranks=(0,),
+    )
+
+    target_only = manifest.for_selection(WeightSyncSelection(draft=False))
+
+    assert target_only.target.ordered_names == ("model.weight",)
+    assert target_only.target.byte_count == 8
+    assert target_only.draft is None
+
+
+def test_full_target_only_full_selection_is_reusable_without_mutating_manifest() -> (
+    None
+):
+    manifest = ModelUpdateManifest.from_state_dict_info(
+        {
+            "model.weight": ((2,), torch.float32),
+            "draft.model.weight": ((3,), torch.float32),
+        },
+        target_owner_ranks=(0,),
+        draft_owner_ranks=(0,),
+    )
+
+    target_only = manifest.for_selection(WeightSyncSelection(draft=False))
+    full_again = manifest.for_selection(WeightSyncSelection())
+
+    assert target_only.draft is None
+    assert full_again.draft is not None
+    assert full_again.draft.ordered_names == ("draft.model.weight",)
+
+
+def test_target_only_coverage_rejects_forged_draft_payload() -> None:
+    manifest = ModelUpdateManifest.from_state_dict_info(
+        {
+            "model.weight": ((2,), torch.float32),
+            "draft.model.weight": ((3,), torch.float32),
+        },
+        target_owner_ranks=(0,),
+        draft_owner_ranks=(0,),
+    ).for_selection(WeightSyncSelection(draft=False))
+    coverage = ModelUpdateCoverage(manifest, rank=0)
+
+    with pytest.raises(SpeculatorRuntimeError, match="unexpected keys"):
+        coverage.record_loaded(("draft.model.weight",))
 
 
 def test_model_update_coverage_requires_every_input_exactly_once() -> None:

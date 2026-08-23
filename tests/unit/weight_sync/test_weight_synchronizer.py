@@ -32,7 +32,11 @@ from nemo_rl.weight_sync.factory import create_weight_synchronizer
 from nemo_rl.weight_sync.http_weight_synchronizer import (
     HTTPWeightSynchronizer,
 )
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import (
+    WeightSyncSelection,
+    WeightSynchronizer,
+    preflight_component_selection,
+)
 from nemo_rl.weight_sync.ipc_weight_synchronizer import (
     IPCWeightSynchronizer,
 )
@@ -104,6 +108,103 @@ class TestWeightSynchronizerABC:
 
         with pytest.raises(TypeError):
             IncompleteSync()  # type: ignore[abstract]
+
+
+def test_selection_rejects_target_false() -> None:
+    with pytest.raises(ValueError, match="target policy"):
+        WeightSyncSelection(target=False, draft=True)
+
+
+@pytest.mark.parametrize(
+    ("generation_backend", "colocated", "refit_transport", "remote_sparse"),
+    [
+        ("sglang", True, None, False),
+        ("megatron", True, None, False),
+        ("vllm", False, "checkpoint_engine", False),
+        ("vllm", False, "nccl_reshard", False),
+        ("vllm", True, None, True),
+    ],
+)
+def test_component_selection_preflight_rejects_unsupported_transport(
+    generation_backend: str,
+    colocated: bool,
+    refit_transport: str | None,
+    remote_sparse: bool,
+) -> None:
+    with pytest.raises(ValueError, match="component-selective.*unsupported"):
+        preflight_component_selection(
+            schedule_mode="fixed",
+            generation_backend=generation_backend,
+            colocated=colocated,
+            refit_transport=refit_transport,
+            remote_sparse=remote_sparse,
+        )
+
+
+@patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+def test_ipc_target_only_forwards_same_selection_to_both_endpoints(mock_ray) -> None:
+    mock_ray.get.return_value = [True]
+    policy = _mock_policy()
+    generation = _mock_generation()
+
+    IPCWeightSynchronizer(policy, generation).sync_weights(
+        selection=WeightSyncSelection(draft=False)
+    )
+
+    assert policy.stream_weights_via_ipc_zmq.call_args.kwargs["selection"] == (
+        WeightSyncSelection(target=True, draft=False)
+    )
+    assert generation.update_weights_via_ipc_zmq.call_args.kwargs["selection"] == (
+        WeightSyncSelection(target=True, draft=False)
+    )
+
+
+@patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+def test_ipc_default_sync_preserves_legacy_endpoint_call_shape(mock_ray) -> None:
+    mock_ray.get.return_value = [True]
+    policy = _mock_policy()
+    generation = _mock_generation()
+
+    IPCWeightSynchronizer(policy, generation).sync_weights()
+
+    assert "selection" not in policy.stream_weights_via_ipc_zmq.call_args.kwargs
+    assert "selection" not in generation.update_weights_via_ipc_zmq.call_args.kwargs
+
+
+@patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+def test_collective_target_only_forwards_same_selection_to_both_endpoints(
+    mock_ray,
+) -> None:
+    mock_ray.get.return_value = [True]
+    policy = _mock_policy()
+    generation = _mock_generation()
+    synchronizer = CollectiveWeightSynchronizer(
+        policy, generation, _mock_cluster(), _mock_cluster()
+    )
+
+    synchronizer.sync_weights(selection=WeightSyncSelection(draft=False))
+
+    assert policy.broadcast_weights_for_collective.call_args.kwargs["selection"] == (
+        WeightSyncSelection(target=True, draft=False)
+    )
+    assert generation.update_weights_from_collective.call_args.kwargs["selection"] == (
+        WeightSyncSelection(target=True, draft=False)
+    )
+
+
+@patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+def test_collective_default_sync_preserves_legacy_endpoint_call_shape(mock_ray) -> None:
+    mock_ray.get.return_value = [True]
+    policy = _mock_policy()
+    generation = _mock_generation()
+    synchronizer = CollectiveWeightSynchronizer(
+        policy, generation, _mock_cluster(), _mock_cluster()
+    )
+
+    synchronizer.sync_weights()
+
+    assert "selection" not in policy.broadcast_weights_for_collective.call_args.kwargs
+    assert "selection" not in generation.update_weights_from_collective.call_args.kwargs
 
 
 # ---------------------------------------------------------------------------

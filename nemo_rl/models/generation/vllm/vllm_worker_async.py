@@ -54,6 +54,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
 )
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1418,6 +1419,8 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def update_weights_via_ipc_zmq_async(
         self,
+        *,
+        selection: WeightSyncSelection = WeightSyncSelection(),
     ) -> bool:
         """Async version of update_weights_via_ipc_zmq."""
         try:
@@ -1432,7 +1435,7 @@ class VllmAsyncGenerationWorkerImpl(
 
             # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_via_ipc_zmq", args=tuple()
+                "update_weights_via_ipc_zmq", args=(selection,)
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1456,7 +1459,9 @@ class VllmAsyncGenerationWorkerImpl(
             traceback.print_exc()
             return False
 
-    async def update_weights_from_collective_async(self) -> bool:
+    async def update_weights_from_collective_async(
+        self, *, selection: WeightSyncSelection = WeightSyncSelection()
+    ) -> bool:
         """Async version of update_weights_from_collective."""
         try:
             assert self.llm is not None, (
@@ -1469,7 +1474,7 @@ class VllmAsyncGenerationWorkerImpl(
                 )
 
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_from_collective", args=(selection,)
             )
 
             if asyncio.iscoroutine(result_or_coro):

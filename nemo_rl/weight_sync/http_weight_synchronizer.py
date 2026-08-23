@@ -33,7 +33,7 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection, WeightSynchronizer
 
 
 class HTTPWeightSynchronizer(WeightSynchronizer):
@@ -63,9 +63,11 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
     def sync_weights(
         self,
         *,
+        selection: WeightSyncSelection = WeightSyncSelection(),
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        self.validate_selection(selection)
         assert kv_scales is None, (
             "HTTP transport (SGLang) does not support FP8 KV cache scale sync. "
             "`kv_scales` is accepted only for interface uniformity; if this "

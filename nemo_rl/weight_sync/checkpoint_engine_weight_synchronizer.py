@@ -20,7 +20,7 @@ import ray
 
 from nemo_rl.models.generation.interfaces import CheckpointEngineConfig
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection, WeightSynchronizer
 
 _MEBIBYTE = 1024 * 1024
 
@@ -209,9 +209,11 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
     def sync_weights(
         self,
         *,
+        selection: WeightSyncSelection = WeightSyncSelection(),
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        self.validate_selection(selection)
         self._stale = True
         self._ensure_checkpoint_engine_ready()
         context = (

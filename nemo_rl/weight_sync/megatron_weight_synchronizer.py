@@ -18,7 +18,7 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection, WeightSynchronizer
 
 
 class MegatronWeightSynchronizer(WeightSynchronizer):
@@ -94,9 +94,11 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
     def sync_weights(
         self,
         *,
+        selection: WeightSyncSelection = WeightSyncSelection(),
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> Optional[dict[str, float]]:
+        self.validate_selection(selection)
         if self._colocated:
             # The wake below carries any configured reshard; the loop already slept the engine
             # before training, so no suspend is needed.

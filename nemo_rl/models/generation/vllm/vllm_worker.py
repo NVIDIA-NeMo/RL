@@ -64,6 +64,7 @@ from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection
 
 logger = logging.getLogger(__name__)
 
@@ -1157,7 +1158,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self) -> bool:
+    def update_weights_via_ipc_zmq(
+        self, *, selection: WeightSyncSelection = WeightSyncSelection()
+    ) -> bool:
         """Update weights from IPC handles via ZMQ socket."""
         try:
             assert self.llm is not None, (
@@ -1171,7 +1174,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
             result_or_coro = self.llm.collective_rpc(
                 "update_weights_via_ipc_zmq",
-                args=tuple(),
+                args=(selection,),
             )
             worker_results = cast(list[bool], result_or_coro)
 
@@ -1189,7 +1192,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             return False
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(
+        self, *, selection: WeightSyncSelection = WeightSyncSelection()
+    ) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -1202,7 +1207,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_from_collective", args=(selection,)
             )
             worker_results = cast(list[bool], result_or_coro)
 

@@ -36,7 +36,7 @@ from nemo_rl.utils.weight_transfer_http import (
     vllm_refit_api_key,
     vllm_refit_endpoints,
 )
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection, WeightSynchronizer
 
 _REMOTE_SPARSE_TRANSPORTS = {
     "vllm_s3_sparse": "s3",
@@ -109,9 +109,11 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
     def sync_weights(
         self,
         *,
+        selection: WeightSyncSelection = WeightSyncSelection(),
         timer: Timer | None = None,
         kv_scales: dict[str, float] | None = None,
     ) -> dict[str, float]:
+        self.validate_selection(selection)
         if self._poisoned:
             raise RuntimeError(
                 "Sparse refit synchronizer was poisoned by a prior failed sync: "

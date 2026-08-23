@@ -52,7 +52,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     collect_sharded_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
 )
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection, WeightSynchronizer
 
 logger = logging.getLogger(__name__)
 
@@ -1061,7 +1061,9 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         ray.get(futures)
 
-    def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
+    def update_weights_via_ipc_zmq(
+        self, *, selection: WeightSyncSelection = WeightSyncSelection()
+    ) -> list[ray.ObjectRef]:
         """Update weights of the policy using IPC handles via ZMQ socket."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
@@ -1076,13 +1078,16 @@ class VllmGeneration(GenerationInterface):
         # Use run_all_workers_single_data since no data needs to be passed
         futures = self.worker_group.run_all_workers_single_data(
             method_name,
+            selection=selection,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(
+        self, *, selection: WeightSyncSelection = WeightSyncSelection()
+    ) -> list[ray.ObjectRef]:
         """Update weights of the policy using collective communication."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
@@ -1097,6 +1102,7 @@ class VllmGeneration(GenerationInterface):
         # Use run_all_workers_single_data for methods that don't need data
         futures = self.worker_group.run_all_workers_single_data(
             method_name,
+            selection=selection,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
 

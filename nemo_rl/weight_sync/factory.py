@@ -31,7 +31,10 @@ from nemo_rl.models.generation.constants import (
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import (
+    WeightSynchronizer,
+    require_component_selection,
+)
 
 
 def create_weight_synchronizer(
@@ -42,6 +45,7 @@ def create_weight_synchronizer(
     train_cluster: Optional[Any] = None,
     inference_cluster: Optional[Any] = None,
     refit_buffer_size_gb: Optional[float | int] = None,
+    draft_update_schedule_mode: str = "always",
 ) -> WeightSynchronizer:
     """Create the appropriate WeightSynchronizer for the given deployment.
 
@@ -74,6 +78,10 @@ def create_weight_synchronizer(
             f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
         )
 
+    def checked(synchronizer: WeightSynchronizer) -> WeightSynchronizer:
+        require_component_selection(synchronizer, draft_update_schedule_mode)
+        return synchronizer
+
     checkpoint_engine_config = checkpoint_engine_refit_config(generation.cfg)
     if checkpoint_engine_config is not None:
         if colocated:
@@ -94,8 +102,10 @@ def create_weight_synchronizer(
             CheckpointEngineWeightSynchronizer,
         )
 
-        return CheckpointEngineWeightSynchronizer(
-            policy, generation, checkpoint_engine_config
+        return checked(
+            CheckpointEngineWeightSynchronizer(
+                policy, generation, checkpoint_engine_config
+            )
         )
 
     if refit_buffer_size_gb is not None and refit_buffer_size_gb <= 0:
@@ -108,12 +118,14 @@ def create_weight_synchronizer(
 
         # One synchronizer serves both colocation modes; colocated is the
         # degenerate path (no cross-group collective to wire).
-        return MegatronWeightSynchronizer(
-            policy=policy,
-            generation=generation,
-            colocated=colocated,
-            train_cluster=train_cluster,
-            inference_cluster=inference_cluster,
+        return checked(
+            MegatronWeightSynchronizer(
+                policy=policy,
+                generation=generation,
+                colocated=colocated,
+                train_cluster=train_cluster,
+                inference_cluster=inference_cluster,
+            )
         )
 
     if not colocated:
@@ -132,22 +144,26 @@ def create_weight_synchronizer(
                 NcclReshardWeightSynchronizer,
             )
 
-            return NcclReshardWeightSynchronizer(
-                policy=policy,
-                generation=generation,
-                train_cluster=train_cluster,
-                inference_cluster=inference_cluster,
+            return checked(
+                NcclReshardWeightSynchronizer(
+                    policy=policy,
+                    generation=generation,
+                    train_cluster=train_cluster,
+                    inference_cluster=inference_cluster,
+                )
             )
 
         from nemo_rl.weight_sync.collective_weight_synchronizer import (
             CollectiveWeightSynchronizer,
         )
 
-        return CollectiveWeightSynchronizer(
-            policy=policy,
-            generation=generation,
-            train_cluster=train_cluster,
-            inference_cluster=inference_cluster,
+        return checked(
+            CollectiveWeightSynchronizer(
+                policy=policy,
+                generation=generation,
+                train_cluster=train_cluster,
+                inference_cluster=inference_cluster,
+            )
         )
 
     if generation_backend == SGLANG_BACKEND:
@@ -155,18 +171,22 @@ def create_weight_synchronizer(
             HTTPWeightSynchronizer,
         )
 
-        return HTTPWeightSynchronizer(
-            policy=policy,
-            generation=generation,
-            refit_buffer_size_gb=refit_buffer_size_gb,
+        return checked(
+            HTTPWeightSynchronizer(
+                policy=policy,
+                generation=generation,
+                refit_buffer_size_gb=refit_buffer_size_gb,
+            )
         )
 
     from nemo_rl.weight_sync.ipc_weight_synchronizer import (
         IPCWeightSynchronizer,
     )
 
-    return IPCWeightSynchronizer(
-        policy=policy,
-        generation=generation,
-        refit_buffer_size_gb=refit_buffer_size_gb,
+    return checked(
+        IPCWeightSynchronizer(
+            policy=policy,
+            generation=generation,
+            refit_buffer_size_gb=refit_buffer_size_gb,
+        )
     )

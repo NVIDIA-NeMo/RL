@@ -21,6 +21,10 @@ from nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer import (
     VllmRemoteSparseWeightSynchronizer,
     validate_vllm_remote_sparse_refit,
 )
+from nemo_rl.weight_sync.interfaces import (
+    WeightSyncSelection,
+    require_component_selection,
+)
 
 _MODULE = "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer"
 
@@ -94,6 +98,16 @@ def test_validate_remote_sparse_refit_accepts_supported_scope():
             "storage": {"s3_bucket": "bucket"},
         }
     )
+
+
+def test_remote_sparse_rejects_target_only_selection_before_transfer() -> None:
+    synchronizer = object.__new__(VllmRemoteSparseWeightSynchronizer)
+
+    with pytest.raises(ValueError, match="component-selective.*unsupported"):
+        synchronizer.validate_selection(WeightSyncSelection(draft=False))
+
+    with pytest.raises(ValueError, match="component-selective.*unsupported"):
+        require_component_selection(synchronizer, "fixed")
 
 
 @pytest.mark.parametrize(

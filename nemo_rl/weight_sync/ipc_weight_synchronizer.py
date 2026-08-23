@@ -34,7 +34,7 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection, WeightSynchronizer
 
 
 class IPCWeightSynchronizer(WeightSynchronizer):
@@ -66,9 +66,11 @@ class IPCWeightSynchronizer(WeightSynchronizer):
     def sync_weights(
         self,
         *,
+        selection: WeightSyncSelection = WeightSyncSelection(),
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        self.validate_selection(selection)
         self._policy.offload_before_refit()
         self._generation.prepare_for_generation(tags=["weights"])
 
@@ -82,11 +84,21 @@ class IPCWeightSynchronizer(WeightSynchronizer):
             with timer_context:
                 buffer_size_bytes = self._compute_buffer_size()
 
-                futures_train = self._policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes,
-                    kv_scales=kv_scales,
+                policy_kwargs: dict[str, Any] = {
+                    "buffer_size_bytes": buffer_size_bytes,
+                    "kv_scales": kv_scales,
+                }
+                generation_kwargs: dict[str, Any] = {}
+                if not selection.draft:
+                    # Policy serialization gains this keyword in the policy
+                    # integration task. Preserve the deployed full-sync call
+                    # shape until then.
+                    policy_kwargs["selection"] = selection
+                    generation_kwargs["selection"] = selection
+                futures_train = self._policy.stream_weights_via_ipc_zmq(**policy_kwargs)
+                futures_inference = self._generation.update_weights_via_ipc_zmq(
+                    **generation_kwargs
                 )
-                futures_inference = self._generation.update_weights_via_ipc_zmq()
 
                 ray.get(futures_train)
                 results = ray.get(futures_inference)
@@ -103,6 +115,10 @@ class IPCWeightSynchronizer(WeightSynchronizer):
             self._generation.prepare_for_generation(tags=["kv_cache"])
 
         self._stale = not sync_succeeded
+
+    @property
+    def supports_component_selection(self) -> bool:
+        return True
 
     @property
     def is_stale(self) -> bool:

@@ -50,6 +50,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     RefitCtx,
     _extract_layer_prefix,
 )
+from nemo_rl.weight_sync.interfaces import WeightSyncSelection
 
 logger = logging.getLogger(__name__)
 
@@ -671,7 +672,8 @@ class VllmInternalWorkerExtension:
                 coverage.record_owner_skip(draft_input_names, component="draft")
         # MTP drafters co-trained with the policy receive their weights from the
         # policy stream (no `draft.` prefix), so feed it the policy weights too.
-        self._maybe_refit_mtp_drafter(policy_weights)
+        if coverage is None or coverage.has_draft:
+            self._maybe_refit_mtp_drafter(policy_weights)
 
     def _get_sparse_delta_applier(self) -> Any:
         if self._sparse_delta_applier is None:
@@ -708,7 +710,7 @@ class VllmInternalWorkerExtension:
                     self._maybe_process_draft_after_loading(
                         process_weights_after_loading
                     )
-            self._maybe_process_mtp_drafter_after_loading()
+                    self._maybe_process_mtp_drafter_after_loading()
 
         try:
             yield finalize
@@ -719,12 +721,14 @@ class VllmInternalWorkerExtension:
             self._mark_refit_unusable(error)
             raise
 
-    def _new_model_update_coverage(self) -> ModelUpdateCoverage | None:
+    def _new_model_update_coverage(
+        self, selection: WeightSyncSelection = WeightSyncSelection()
+    ) -> ModelUpdateCoverage | None:
         manifest = self._model_update_manifest
         if manifest is None:
             return None
         pp_rank = int(getattr(get_pp_group(), "rank_in_group", 0))
-        return ModelUpdateCoverage(manifest, rank=pp_rank)
+        return ModelUpdateCoverage(manifest.for_selection(selection), rank=pp_rank)
 
     def _maybe_process_draft_after_loading(
         self, process_weights_after_loading: Callable[[Any, Any, Any], None]
@@ -760,7 +764,9 @@ class VllmInternalWorkerExtension:
         torch.cuda.current_stream().synchronize()
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self) -> bool:
+    def update_weights_via_ipc_zmq(
+        self, selection: WeightSyncSelection = WeightSyncSelection()
+    ) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
 
         Returns:
@@ -772,8 +778,13 @@ class VllmInternalWorkerExtension:
 
         try:
             self.maybe_init_zmq()
-            manifest = _IPCWeightManifest(self.state_dict_info)
-            coverage = self._new_model_update_coverage()
+            coverage = self._new_model_update_coverage(selection)
+            expected_names = (
+                coverage.expected_names
+                if coverage is not None
+                else tuple(self.state_dict_info)
+            )
+            manifest = _IPCWeightManifest(expected_names)
             with self._weight_update_lifecycle("ipc") as finalize:
                 while True:
                     # Blocking receive with timeout (this is the main operation)
@@ -876,7 +887,9 @@ class VllmInternalWorkerExtension:
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(
+        self, selection: WeightSyncSelection = WeightSyncSelection()
+    ) -> bool:
         """Update the model weights from collective communication."""
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
@@ -884,15 +897,22 @@ class VllmInternalWorkerExtension:
         )
 
         try:
-            coverage = self._new_model_update_coverage()
+            coverage = self._new_model_update_coverage(selection)
             with self._weight_update_lifecycle("collective") as finalize:
                 load_weights = self._load_weights
                 if coverage is not None:
                     load_weights = lambda weights: self._load_weights(
                         weights, coverage=coverage
                     )
+                selected_names = (
+                    coverage.expected_names
+                    if coverage is not None
+                    else tuple(self.state_dict_info)
+                )
                 packed_broadcast_consumer(
-                    iterator=iter(self.state_dict_info.items()),
+                    iterator=iter(
+                        (name, self.state_dict_info[name]) for name in selected_names
+                    ),
                     group=self.model_update_group,
                     src=0,
                     post_unpack_func=load_weights,
