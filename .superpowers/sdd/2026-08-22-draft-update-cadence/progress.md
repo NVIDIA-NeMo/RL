@@ -20,7 +20,7 @@
 ### Progress
 
 - [x] Exact Task 5B base verified at `5495e172058d08ecf1cf027e4c356d1d44610471` with a good signature.
-- [ ] Replay reviewed receiver commits through `864ff419adfc8ddb55b281076770eb1d5e0c5a46` as new signed+DCO commits.
+- [x] Replayed reviewed receiver commits through `864ff419adfc8ddb55b281076770eb1d5e0c5a46` as new signed+DCO commits: `26df6b303`, `1c1df3815`, `507ac23d9`, `252da7549`.
 - [ ] Dispatch bounded producer implementation with strict RED→GREEN evidence.
 - [ ] Run independent read-only review and fix loop if needed.
 - [ ] Run final scoped verification and report without push or job submission.
