@@ -288,6 +288,28 @@ def test_lm_policy_threads_capture_and_surfaces_visible_publisher_receipt() -> N
 
 
 class TestTQPolicySplitFanout:
+    def test_capture_current_draft_identity_selects_world_publisher(self):
+        p, wg = _make_tq_policy()
+        rows = [
+            {
+                "world_rank": 0,
+                "draft_update_receipt_publisher_rank": 1,
+            },
+            {
+                "world_rank": 1,
+                "draft_update_receipt_publisher_rank": 1,
+                "draft_update_receipt": _RECEIPT,
+            },
+        ]
+        with patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray:
+            mock_ray.get.return_value = rows
+            receipt = p.capture_current_draft_state_receipt(version=7, global_step=3)
+
+        wg.run_all_workers_single_data.assert_called_once_with(
+            "capture_current_draft_state_receipt", version=7, global_step=3
+        )
+        assert receipt == _RECEIPT
+
     def test_begin_consumes_single_data_futures_with_ray_get(self):
         """run_all_workers_single_data returns plain ObjectRefs, not a
         MultiWorkerFuture — the fan-out must ray.get them (PR #2683

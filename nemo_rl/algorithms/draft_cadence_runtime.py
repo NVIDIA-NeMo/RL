@@ -29,6 +29,7 @@ from nemo_rl.algorithms.draft_update_schedule import (
     validate_decision_ledger_receipt,
 )
 from nemo_rl.models.policy.draft_config import DraftConfig, DraftUpdateScheduleConfig
+from nemo_rl.weight_sync.interfaces import DraftApplyRequest
 
 
 def resolve_cadence_schedule_config(
@@ -41,10 +42,6 @@ def resolve_cadence_schedule_config(
     if schedule is None:
         raise ValueError(
             "cadence runtime requires a provider-backed draft update schedule"
-        )
-    if schedule.mode == "adaptive":
-        raise ValueError(
-            "adaptive draft cadence requires selected-rollout acceptance provenance"
         )
     return cast(DraftUpdateScheduleConfig, schedule)
 
@@ -137,6 +134,48 @@ def require_cadence_step_receipts(
         raise RuntimeError(
             "successful draft apply receipt is required before cadence publication"
         )
+
+
+def write_draft_apply_identity(
+    root: Path,
+    decision: DraftUpdateDecision,
+    worker_receipt: Mapping[str, object],
+) -> DraftApplyRequest:
+    """Durably bind a selected refit to the canonical trainable-draft roots."""
+    required = {
+        "successful": True,
+        "decision_id": decision.decision_id,
+        "global_step": decision.global_step,
+    }
+    if any(worker_receipt.get(key) != value for key, value in required.items()):
+        raise ValueError("draft state identity receipt disagrees with decision")
+    for key in ("draft_model_sha256", "draft_optimizer_sha256"):
+        value = worker_receipt.get(key)
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or set(value) - set("0123456789abcdef")
+        ):
+            raise ValueError(f"draft state identity receipt lacks {key}")
+    identity_root = root.resolve() / "draft-apply-identities"
+    identity_root.mkdir(parents=True, exist_ok=True)
+    path = identity_root / f"{uuid.uuid4().hex}-decision_{decision.decision_id}.json"
+    write_json_exclusive_atomic(
+        path,
+        {
+            "schema_version": 1,
+            "domain": "nemo-rl-draft-apply-identity-v1",
+            **required,
+            "draft_model_sha256": worker_receipt["draft_model_sha256"],
+            "draft_optimizer_sha256": worker_receipt["draft_optimizer_sha256"],
+        },
+    )
+    raw = path.read_bytes()
+    return DraftApplyRequest(
+        version=decision.decision_id,
+        snapshot_path=str(path.resolve()),
+        sha256=hashlib.sha256(raw).hexdigest(),
+    )
 
 
 def write_json_exclusive_atomic(path: Path, payload: object) -> None:

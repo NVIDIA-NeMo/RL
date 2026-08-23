@@ -1219,6 +1219,26 @@ class MegatronPolicyWorkerImpl(
             output["draft_update_receipt"] = captured["receipt"]
         return output
 
+    def capture_current_draft_state_receipt(
+        self, *, version: int, global_step: int
+    ) -> dict[str, Any]:
+        """Capture canonical roots for the loaded trainable draft state."""
+        identity_decision = DraftUpdateDecision(
+            global_step=global_step,
+            decision_id=version,
+            update_requested=True,
+            draft_refit_requested=False,
+            reason="always",
+            observed_acceptance=None,
+            forced=False,
+            applied_draft_version=version,
+        )
+        return self._maybe_capture_draft_update_receipt(
+            capture_draft_update_receipt=True,
+            draft_update_decision=identity_decision,
+            draft_update_successful=True,
+        )
+
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,

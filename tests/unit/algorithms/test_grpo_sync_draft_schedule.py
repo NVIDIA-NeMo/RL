@@ -35,7 +35,7 @@ from nemo_rl.models.policy.draft_config import (
     AlwaysDraftUpdateScheduleConfig,
     FixedDraftUpdateScheduleConfig,
 )
-from nemo_rl.weight_sync.interfaces import WeightSyncSelection
+from nemo_rl.weight_sync.interfaces import DraftApplyRequest, WeightSyncSelection
 
 
 class SyncHarness:
@@ -71,19 +71,23 @@ class SyncHarness:
         transaction = self.transaction_store.begin(decision)
         self.training_decisions.append(decision)
 
-        def sync_weights(*, selection):
+        draft_apply_request = None
+        if decision.draft_refit_requested:
+            path = self.root / f"draft-v{decision.decision_id}.bin"
+            raw = f"draft-{decision.decision_id}".encode()
+            path.write_bytes(raw)
+            draft_apply_request = DraftApplyRequest(
+                version=decision.decision_id,
+                snapshot_path=str(path.resolve()),
+                sha256=hashlib.sha256(raw).hexdigest(),
+            )
+
+        def sync_weights(*, selection, draft_apply_request=None):
             self.sync_selections.append(selection)
             receipt = {"successful": True}
             if selection.draft:
-                path = self.root / f"draft-v{decision.decision_id}.bin"
-                raw = f"draft-{decision.decision_id}".encode()
-                path.write_bytes(raw)
-                receipt["draft_apply_receipt"] = {
-                    "successful": True,
-                    "version": decision.decision_id,
-                    "snapshot_path": str(path.resolve()),
-                    "sha256": hashlib.sha256(raw).hexdigest(),
-                }
+                assert draft_apply_request is not None
+                receipt["draft_apply_receipt"] = draft_apply_request.receipt()
             return receipt
 
         apply_scheduled_refit(
@@ -96,6 +100,7 @@ class SyncHarness:
             transaction_store=self.transaction_store,
             runtime_writer=None,
             terminal_evidence=None,
+            draft_apply_request=draft_apply_request,
             sync_weights=sync_weights,
             publish_target_version=lambda: setattr(
                 self, "target_weight_version", self.target_weight_version + 1
@@ -166,18 +171,20 @@ def test_sync_update_receipt_is_durable_before_transfer_and_publication(
     snapshot_path.write_bytes(b"draft-v1")
     events = []
 
-    def sync_weights(*, selection):
+    request = DraftApplyRequest(
+        version=1,
+        snapshot_path=str(snapshot_path),
+        sha256=hashlib.sha256(b"draft-v1").hexdigest(),
+    )
+
+    def sync_weights(*, selection, draft_apply_request):
         assert 1 in evidence.update_receipts_by_decision
         assert save_state.draft_terminal_evidence == evidence.state_dict()
+        assert draft_apply_request == request
         events.append("transfer")
         return {
             "successful": True,
-            "draft_apply_receipt": {
-                "successful": True,
-                "version": 1,
-                "snapshot_path": str(snapshot_path),
-                "sha256": hashlib.sha256(b"draft-v1").hexdigest(),
-            },
+            "draft_apply_receipt": draft_apply_request.receipt(),
         }
 
     apply_scheduled_refit(
@@ -199,6 +206,7 @@ def test_sync_update_receipt_is_durable_before_transfer_and_publication(
         transaction_store=store,
         runtime_writer=writer,
         terminal_evidence=evidence,
+        draft_apply_request=request,
         sync_weights=sync_weights,
         publish_target_version=lambda: events.append("publish-target"),
         publish_draft_version=lambda _version: events.append("publish-draft"),
@@ -215,6 +223,8 @@ def test_missing_update_receipt_closes_without_claiming_refit_attempt(
     decision = scheduler.decide(global_step=1, acceptance=None)
     store = FileDraftStepTransactionStore(tmp_path / "transactions")
     sync_weights = MagicMock()
+    snapshot_path = tmp_path / "draft-v1.bin"
+    snapshot_path.write_bytes(b"draft-v1")
 
     with pytest.raises(RuntimeError, match="lacks worker receipt"):
         apply_scheduled_refit(
@@ -233,6 +243,11 @@ def test_missing_update_receipt_closes_without_claiming_refit_attempt(
                 CadenceRuntimeConfig(enabled=True, result_dir=str(tmp_path / "runtime"))
             ),
             terminal_evidence=CadenceTerminalEvidence({}, {}),
+            draft_apply_request=DraftApplyRequest(
+                version=1,
+                snapshot_path=str(snapshot_path),
+                sha256=hashlib.sha256(b"draft-v1").hexdigest(),
+            ),
             sync_weights=sync_weights,
             publish_target_version=MagicMock(),
             publish_draft_version=MagicMock(),

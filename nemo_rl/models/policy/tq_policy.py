@@ -515,6 +515,29 @@ class TQPolicy(Policy):
 
         return aggregated_results
 
+    def capture_current_draft_state_receipt(
+        self, *, version: int, global_step: int
+    ) -> dict[str, Any]:
+        """Collect one WORLD-consensus identity for the loaded draft state."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "capture_current_draft_state_receipt",
+            version=version,
+            global_step=global_step,
+        )
+        results = ray.get(futures)
+        from nemo_rl.models.megatron.draft.receipt import (
+            select_published_draft_update_receipt,
+        )
+
+        receipt = select_published_draft_update_receipt(
+            results,
+            capture_draft_update_receipt=True,
+            receipt_required=True,
+        )
+        if receipt is None:
+            raise RuntimeError("current draft state identity receipt is absent")
+        return receipt
+
     # ── split-API fanout (SC async path) ───────────────────────────────────
     #
     # Counterpart to :meth:`train_from_meta`, consumed directly by

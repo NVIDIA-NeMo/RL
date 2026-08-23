@@ -32,11 +32,12 @@ against both entrypoints and diffing the wandb runs.
 from __future__ import annotations
 
 import gc
+import json
 import os
 import warnings
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -69,10 +70,12 @@ from nemo_rl.algorithms.draft_cadence_runtime import (
     initialize_cadence_scheduler,
     initialize_or_recover_cadence_resume,
     preflight_cadence_receipt_capability,
-    produce_cadence_decision,
     require_cadence_step_receipts,
+    write_draft_apply_identity,
 )
+from nemo_rl.algorithms.draft_update_observation import prepare_sync_draft_decision
 from nemo_rl.algorithms.draft_update_schedule import (
+    AppliedDraftSnapshot,
     DraftDecisionLedger,
     DraftUpdateDecision,
     DraftUpdateScheduler,
@@ -80,8 +83,10 @@ from nemo_rl.algorithms.draft_update_schedule import (
     DraftStepTransactionStore,
     FileDraftStepTransactionStore,
     close_applied_draft_snapshot,
+    close_initial_draft_snapshot,
     close_draft_step_transaction,
     decision_outcome_payload,
+    validate_applied_draft_snapshot,
 )
 from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
@@ -111,7 +116,7 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
-from nemo_rl.weight_sync.interfaces import WeightSyncSelection
+from nemo_rl.weight_sync.interfaces import DraftApplyRequest, WeightSyncSelection
 
 
 def _raise_if_message_level_advantage_penalties_enabled(
@@ -508,6 +513,7 @@ def apply_scheduled_refit(
     transaction_store: DraftStepTransactionStore,
     runtime_writer: CadenceRuntimeWriter | None,
     terminal_evidence: CadenceTerminalEvidence | None,
+    draft_apply_request: DraftApplyRequest | None,
     sync_weights: Callable[..., Mapping[str, object]],
     publish_target_version: Callable[[], None],
     publish_draft_version: Callable[[int], None],
@@ -540,6 +546,10 @@ def apply_scheduled_refit(
         target=True,
         draft=decision.draft_refit_requested,
     )
+    if selection.draft != (draft_apply_request is not None):
+        raise RuntimeError(
+            "selected draft refit and digest-bound apply request disagree"
+        )
     transfer_attempted = False
     try:
         if runtime_writer is not None:
@@ -558,7 +568,10 @@ def apply_scheduled_refit(
         elif terminal_evidence is not None:
             raise RuntimeError("terminal evidence is enabled without runtime writer")
         transfer_attempted = True
-        sync_receipt = sync_weights(selection=selection)
+        sync_kwargs: dict[str, object] = {"selection": selection}
+        if draft_apply_request is not None:
+            sync_kwargs["draft_apply_request"] = draft_apply_request
+        sync_receipt = sync_weights(**sync_kwargs)
         if sync_receipt.get("successful") is not True:
             raise RuntimeError("target weight transfer receipt failed")
         applied_snapshot = None
@@ -566,11 +579,25 @@ def apply_scheduled_refit(
             raw_receipt = sync_receipt.get("draft_apply_receipt")
             if not isinstance(raw_receipt, Mapping):
                 raise RuntimeError("draft apply receipt is absent")
+            update_receipt = train_results.get("draft_update_receipt")
+            require_cadence_step_receipts(
+                decision,
+                worker_receipt=(
+                    update_receipt if isinstance(update_receipt, Mapping) else None
+                ),
+                apply_receipt=raw_receipt,
+            )
             applied_snapshot = close_applied_draft_snapshot(
                 decision,
                 raw_receipt,
                 snapshot_path=Path(str(raw_receipt["snapshot_path"])),
             )
+            durable_apply_receipt = transaction_store.write_durable_apply_receipt(
+                transaction,
+                snapshot=applied_snapshot,
+            )
+            if durable_apply_receipt.get("successful") is not True:
+                raise RuntimeError("draft apply receipt was not durably persisted")
     except BaseException as transfer_error:
         outcome = decision_outcome_payload(
             decision,
@@ -693,9 +720,13 @@ def grpo_train_sync(
         else None
     )
     cadence_evidence = (
-        CadenceTerminalEvidence.from_state(grpo_save_state.draft_terminal_evidence)
-        if grpo_save_state.draft_terminal_evidence is not None
-        else CadenceTerminalEvidence({}, {})
+        (
+            CadenceTerminalEvidence.from_state(grpo_save_state.draft_terminal_evidence)
+            if grpo_save_state.draft_terminal_evidence is not None
+            else CadenceTerminalEvidence({}, {})
+        )
+        if cadence_writer is not None
+        else None
     )
     if cadence_writer is not None:
         cadence_ledger: DraftDecisionLedger | None = DraftDecisionLedger(
@@ -709,6 +740,7 @@ def grpo_train_sync(
         resume_checkpoint = checkpointer.get_latest_checkpoint_path()
         draft_config = master_config.policy.get("draft")
         if resume_checkpoint is not None:
+            assert cadence_ledger is not None
             resume = initialize_or_recover_cadence_resume(
                 draft_config,
                 saved=grpo_save_state.draft_update_schedule,
@@ -735,12 +767,15 @@ def grpo_train_sync(
             )
     else:
         cadence_ledger = None
+        cadence_transactions = None
         cadence_scheduler = None
         resume_checkpoint = None
 
     def close_cadence_terminal() -> None:
         if cadence_writer is None:
             return
+        if cadence_evidence is None:
+            raise RuntimeError("cadence runtime terminal evidence is absent")
         final_checkpoint = checkpointer.get_latest_checkpoint_path()
         if final_checkpoint is None:
             raise RuntimeError("enabled cadence runtime requires a final checkpoint")
@@ -787,6 +822,7 @@ def grpo_train_sync(
             "(nemo_rl.models.policy.tq_policy.TQPolicy). examples/run_grpo.py "
             "constructs it via the policy_factory when data_plane.enabled=True."
         )
+    tq_policy = cast("TQPolicy", policy)
 
     # TQ-resident tensors live on CPU; baseline/std are computed on the
     # slice without a CUDA hop. The flag is a no-op here — warn so users
@@ -815,13 +851,142 @@ def grpo_train_sync(
         master_config=master_config,
         dp_cfg=dp_cfg,
     )
+    cadence_serving_version_published = False
+
+    def publish_target_version() -> None:
+        nonlocal POLICY_GENERATION_STALE
+        POLICY_GENERATION_STALE = False
+
+    def publish_draft_version(version: int) -> None:
+        nonlocal cadence_serving_version_published
+        ray.get(rollout_actor.publish_applied_draft_version.remote(version))
+        cadence_serving_version_published = True
+
+    def publish_initial_draft_version() -> None:
+        if cadence_scheduler is not None and not cadence_serving_version_published:
+            publish_draft_version(cadence_scheduler.state.applied_draft_version)
+
+    def refit_stale_policy_generation(
+        *,
+        refit_timer: Timer | None = None,
+        kv_scales: dict[str, float] | None = None,
+    ) -> None:
+        """Perform the startup apply once, then preserve draft selectivity."""
+        if cadence_scheduler is None:
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                timer=refit_timer,
+                kv_scales=kv_scales,
+            )
+            return
+        if cadence_serving_version_published:
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                timer=refit_timer,
+                kv_scales=kv_scales,
+                selection=WeightSyncSelection(target=True, draft=False),
+            )
+            return
+        preflight_cadence_receipt_capability(
+            cadence_scheduler,
+            update_receipts_supported=bool(
+                getattr(policy, "supports_draft_update_receipts", False)
+            ),
+            apply_receipts_supported=bool(
+                getattr(policy, "supports_draft_apply_receipts", False)
+            ),
+        )
+        if cadence_writer is None:
+            raise RuntimeError("startup draft apply lacks a durable identity root")
+        state_receipt = tq_policy.capture_current_draft_state_receipt(
+            version=cadence_scheduler.state.applied_draft_version,
+            global_step=total_steps,
+        )
+        raw_snapshot = grpo_save_state.applied_draft_snapshot
+        if raw_snapshot is None:
+            identity_decision = DraftUpdateDecision(
+                global_step=total_steps,
+                decision_id=0,
+                update_requested=True,
+                draft_refit_requested=True,
+                reason="always",
+                observed_acceptance=None,
+                forced=False,
+                applied_draft_version=0,
+            )
+            request = write_draft_apply_identity(
+                cadence_writer.root,
+                identity_decision,
+                state_receipt,
+            )
+        else:
+            version = raw_snapshot.get("version")
+            path = raw_snapshot.get("path")
+            size_bytes = raw_snapshot.get("size_bytes")
+            sha256 = raw_snapshot.get("sha256")
+            if (
+                type(version) is not int
+                or not isinstance(path, str)
+                or type(size_bytes) is not int
+                or not isinstance(sha256, str)
+            ):
+                raise ValueError("applied draft identity schema is invalid")
+            snapshot = AppliedDraftSnapshot(
+                version=version,
+                path=path,
+                size_bytes=size_bytes,
+                sha256=sha256,
+            )
+            validate_applied_draft_snapshot(cadence_scheduler, snapshot)
+            identity = json.loads(Path(snapshot.path).read_text())
+            if any(
+                identity.get(key) != state_receipt.get(key)
+                for key in ("draft_model_sha256", "draft_optimizer_sha256")
+            ):
+                raise RuntimeError(
+                    "loaded draft checkpoint differs from applied identity"
+                )
+            request = DraftApplyRequest(
+                version=snapshot.version,
+                snapshot_path=snapshot.path,
+                sha256=snapshot.sha256,
+            )
+        sync_receipt = refit_policy_generation(
+            policy,
+            policy_generation,
+            colocated_inference,
+            timer=refit_timer,
+            kv_scales=kv_scales,
+            selection=WeightSyncSelection(target=True, draft=True),
+            draft_apply_request=request,
+        )
+        apply_receipt = sync_receipt.get("draft_apply_receipt")
+        if not isinstance(apply_receipt, Mapping):
+            raise RuntimeError("startup draft apply receipt is absent")
+        if raw_snapshot is None:
+            installed = close_initial_draft_snapshot(
+                apply_receipt, Path(request.snapshot_path)
+            )
+            grpo_save_state.applied_draft_snapshot = {
+                "version": installed.version,
+                "path": installed.path,
+                "size_bytes": installed.size_bytes,
+                "sha256": installed.sha256,
+            }
+        elif apply_receipt != request.receipt():
+            raise RuntimeError("resumed draft apply receipt differs from identity")
+        publish_initial_draft_version()
 
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
         if POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_stale_policy_generation()
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
@@ -872,6 +1037,7 @@ def grpo_train_sync(
         pending_carry: Optional[BatchedDataDict] = None
         pending_unfiltered_rewards: list[torch.Tensor] = []
         dynamic_sampling_num_gen_batches = 0
+        cadence_rollout_metric_batches: list[Mapping[str, object]] = []
 
         for batch in wrapped_dataloader:
             metrics_logging_data: dict = {}
@@ -943,12 +1109,9 @@ def grpo_train_sync(
                                 calibration_data, include_q=True
                             )["layers"]
 
-                        refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
-                            timer=timer,
-                            kv_scales=kv_scales_cache if sync_kv_scales else None,
+                        refit_stale_policy_generation(
+                            refit_timer=timer,
+                            kv_scales=(kv_scales_cache if sync_kv_scales else None),
                         )
                         _log_completed_draft_refit(
                             master_config,
@@ -984,6 +1147,15 @@ def grpo_train_sync(
                     # ``dynamic_sampling_num_gen_batches`` is incremented
                     # to 1 just above before this branch — keep these in
                     # sync if either is renamed.
+                    capture_draft_science = cadence_scheduler is not None and (
+                        cadence_scheduler.config.mode == "adaptive"
+                        or cadence_writer is not None
+                    )
+                    expected_applied_draft_version = (
+                        cadence_scheduler.state.applied_draft_version
+                        if capture_draft_science
+                        else None
+                    )
                     (
                         meta,
                         driver_carry,
@@ -995,8 +1167,12 @@ def grpo_train_sync(
                             partition_id=policy.tq_partition_id,
                             group_size=master_config.grpo.num_generations_per_prompt,
                             first_iter=(dynamic_sampling_num_gen_batches == 1),
+                            capture_draft_science=capture_draft_science,
+                            expected_applied_draft_version=expected_applied_draft_version,
                         )
                     )
+                    if capture_draft_science:
+                        cadence_rollout_metric_batches.append(rollout_metrics)
 
                     metrics_logging_data["mean_gen_tokens_per_sample"] = (
                         rollout_metrics["mean_gen_tokens_per_sample"]
@@ -1264,14 +1440,26 @@ def grpo_train_sync(
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
-                    cadence_decision = produce_cadence_decision(
-                        cadence_scheduler, global_step=total_steps + 1
-                    )
-                    require_cadence_step_receipts(
-                        cadence_decision,
-                        worker_receipt=None,
-                        apply_receipt=None,
-                    )
+                    if cadence_scheduler is None:
+                        cadence_decision = None
+                        cadence_transaction = None
+                    else:
+                        prepared_cadence = prepare_sync_draft_decision(
+                            cadence_scheduler,
+                            cadence_rollout_metric_batches,
+                            cadence_runtime_enabled=cadence_writer is not None,
+                            evidence=cadence_evidence,
+                            global_step=total_steps + 1,
+                        )
+                        cadence_decision = prepared_cadence.decision
+                        cadence_evidence = prepared_cadence.terminal_evidence
+                        if cadence_transactions is None or cadence_ledger is None:
+                            raise RuntimeError(
+                                "cadence decision lacks durable controller stores"
+                            )
+                        cadence_transaction = cadence_transactions.begin(
+                            cadence_decision
+                        )
                     # Meta-driven train: workers fetch the union of
                     # rollout + driver-written + worker-written columns
                     # from TQ, train, return aggregated metrics via Ray.
@@ -1283,11 +1471,11 @@ def grpo_train_sync(
                         train_fields=train_fields,
                         master_config=master_config,
                         draft_update_decision=cadence_decision,
+                        capture_draft_update_receipt=(
+                            cadence_decision is not None
+                            and cadence_decision.update_requested
+                        ),
                     )
-                    draft_config = master_config.policy.get("draft")
-                    if draft_config is not None and draft_config.enabled:
-                        pending_draft_refit_step = total_steps + 1
-
                 if sync_kv_scales:
                     with timer.time("recompute_kv_scales"):
                         print(
@@ -1312,6 +1500,63 @@ def grpo_train_sync(
                             include_q=True,
                         )["layers"]
                         POLICY_GENERATION_STALE = True
+
+                if cadence_decision is not None:
+                    if (
+                        cadence_transaction is None
+                        or cadence_transactions is None
+                        or cadence_ledger is None
+                    ):
+                        raise RuntimeError(
+                            "cadence decision lacks an open durable transaction"
+                        )
+                    draft_apply_request = None
+                    if cadence_decision.draft_refit_requested:
+                        worker_receipt = train_results.get("draft_update_receipt")
+                        if not isinstance(worker_receipt, Mapping):
+                            raise RuntimeError(
+                                "selected draft refit lacks a worker state identity"
+                            )
+                        if cadence_writer is None:
+                            raise RuntimeError(
+                                "selected draft refit lacks a durable identity root"
+                            )
+                        draft_apply_request = write_draft_apply_identity(
+                            cadence_writer.root,
+                            cadence_decision,
+                            worker_receipt,
+                        )
+                    assert cadence_scheduler is not None
+                    apply_scheduled_refit(
+                        cadence_decision,
+                        train_results,
+                        cadence_scheduler,
+                        transaction=cadence_transaction,
+                        decision_ledger=cadence_ledger,
+                        grpo_save_state=grpo_save_state,
+                        transaction_store=cadence_transactions,
+                        runtime_writer=cadence_writer,
+                        terminal_evidence=cadence_evidence,
+                        draft_apply_request=draft_apply_request,
+                        sync_weights=lambda **kwargs: refit_policy_generation(
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            timer=timer,
+                            kv_scales=(kv_scales_cache if sync_kv_scales else None),
+                            **kwargs,
+                        ),
+                        publish_target_version=publish_target_version,
+                        publish_draft_version=publish_draft_version,
+                    )
+                    _log_completed_draft_refit(
+                        master_config,
+                        pending_step=(
+                            cadence_decision.global_step
+                            if cadence_decision.draft_refit_requested
+                            else None
+                        ),
+                    )
 
                 # Stash input_ids and content before clear_samples so the
                 # late log_data jsonl block can use them. The clear below
@@ -1574,6 +1819,10 @@ def grpo_train_sync(
                                 raise RuntimeError(
                                     "enabled cadence runtime has no ledger"
                                 )
+                            if cadence_evidence is None:
+                                raise RuntimeError(
+                                    "enabled cadence runtime has no terminal evidence"
+                                )
                             if master_config.data["use_multiple_dataloader"]:
                                 raise RuntimeError(
                                     "enabled cadence runtime requires one digest-bound dataloader state"
@@ -1754,6 +2003,7 @@ def grpo_train_sync(
             )
 
             dynamic_sampling_num_gen_batches = 0
+            cadence_rollout_metric_batches = []
 
             memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
 

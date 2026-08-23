@@ -16,6 +16,7 @@ from nemo_rl.algorithms.draft_cadence_runtime import (
     preflight_cadence_receipt_capability,
     produce_cadence_decision,
     require_cadence_step_receipts,
+    write_draft_apply_identity,
 )
 from nemo_rl.algorithms.draft_update_schedule import (
     DraftDecisionLedger,
@@ -100,14 +101,42 @@ def test_legacy_resume_compatibility_is_limited_to_always_schedule() -> None:
         )
 
 
-def test_adaptive_schedule_fails_before_decision_without_task7_provenance() -> None:
-    with pytest.raises(ValueError, match="acceptance provenance"):
-        initialize_cadence_scheduler(
-            _dflash_config(enabled=True, schedule=AdaptiveDraftUpdateScheduleConfig()),
-            None,
-            origin_step=0,
-            resuming_from_checkpoint=False,
-        )
+def test_adaptive_schedule_initializes_for_task7_selected_rollout_provenance() -> None:
+    scheduler = initialize_cadence_scheduler(
+        _dflash_config(enabled=True, schedule=AdaptiveDraftUpdateScheduleConfig()),
+        None,
+        origin_step=0,
+        resuming_from_checkpoint=False,
+    )
+
+    assert scheduler is not None
+    assert scheduler.config.mode == "adaptive"
+
+
+def test_selected_draft_identity_binds_world_roots_exclusively(
+    tmp_path: Path,
+) -> None:
+    scheduler = DraftUpdateScheduler.create(
+        AlwaysDraftUpdateScheduleConfig(), origin_step=0
+    )
+    decision = scheduler.decide(global_step=1, acceptance=None)
+    receipt = {
+        "successful": True,
+        "decision_id": 1,
+        "global_step": 1,
+        "draft_model_sha256": "a" * 64,
+        "draft_optimizer_sha256": "b" * 64,
+    }
+
+    request = write_draft_apply_identity(tmp_path, decision, receipt)
+
+    assert request.version == 1
+    assert request.receipt()["sha256"] == request.sha256
+    assert (
+        b"nemo-rl-draft-apply-identity-v1" in Path(request.snapshot_path).read_bytes()
+    )
+    retry_request = write_draft_apply_identity(tmp_path, decision, receipt)
+    assert retry_request.snapshot_path != request.snapshot_path
 
 
 def test_missing_task4_or_task5_receipt_fails_before_cadence_apply() -> None:
