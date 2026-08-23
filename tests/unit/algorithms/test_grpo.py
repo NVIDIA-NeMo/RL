@@ -14,6 +14,7 @@
 
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -2890,6 +2891,38 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
             val_dataset=None,
         )
     assert master_config.policy["generation"]["vllm_kwargs"]["hf_overrides"] == {}
+
+
+@pytest.mark.parametrize(
+    "refit_transport",
+    ["nixl", "package.engine:CustomCheckpointEngine"],
+)
+def test_setup_rejects_colocated_checkpoint_engine_before_logger_setup(
+    mock_grpo_components,
+    refit_transport: str,
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["refit_transport"] = refit_transport
+    if ":" in refit_transport:
+        master_config.policy["generation"]["refit_cfg"] = {
+            refit_transport: {"update_weights_bucket_memory_ratio": 0.1}
+        }
+    master_config.policy["draft"] = SimpleNamespace(
+        update_schedule=SimpleNamespace(mode="fixed")
+    )
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(ValueError, match="component-selective.*unsupported"),
+    ):
+        setup(
+            master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+
+    mock_logger.assert_not_called()
 
 
 def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> None:

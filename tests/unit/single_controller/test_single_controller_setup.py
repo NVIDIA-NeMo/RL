@@ -269,6 +269,27 @@ class TestSetup:
         patched_factories["_build_generation"].assert_not_called()
         patched_factories["_build_trainer"].assert_not_called()
 
+    @pytest.mark.parametrize(
+        "refit_transport",
+        ["nixl", "package.engine:CustomCheckpointEngine"],
+    )
+    def test_fixed_cadence_rejects_checkpoint_engine_before_worker_setup(
+        self, patched_factories, refit_transport: str
+    ):
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"]["refit_transport"] = refit_transport
+        mc.policy["draft"] = SimpleNamespace(
+            update_schedule=SimpleNamespace(mode="fixed")
+        )
+
+        with pytest.raises(ValueError, match="component-selective.*unsupported"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_generation"].assert_not_called()
+        patched_factories["_build_trainer"].assert_not_called()
+
     def test_fixed_cadence_rejects_unsupported_backend_before_worker_setup(
         self, patched_factories
     ):

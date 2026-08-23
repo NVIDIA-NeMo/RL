@@ -176,10 +176,7 @@ def preflight_component_selection(
     if schedule_mode == "always":
         return
     supported = (
-        generation_backend == "vllm"
-        and not remote_sparse
-        and refit_transport not in {"checkpoint_engine", "nccl_reshard"}
-        and (colocated or refit_transport is None)
+        generation_backend == "vllm" and not remote_sparse and refit_transport is None
     )
     if not supported:
         raise ValueError(

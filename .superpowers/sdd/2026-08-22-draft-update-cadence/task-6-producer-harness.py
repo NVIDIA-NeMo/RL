@@ -169,6 +169,40 @@ def _run_megatron_green() -> None:
     )
 
 
+def _run_checkpoint_engine_preflight() -> None:
+    source = Path("nemo_rl/weight_sync/interfaces.py").read_text()
+    tree = ast.parse(source)
+    function = next(
+        copy.deepcopy(node)
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "preflight_component_selection"
+    )
+    namespace: dict[str, object] = {}
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), "interfaces.py", "exec"),
+        namespace,
+    )
+    preflight = typing.cast(typing.Callable[..., None], namespace[function.name])
+    for transport in ("nixl", "package.engine:CustomCheckpointEngine"):
+        try:
+            preflight(
+                schedule_mode="fixed",
+                generation_backend="vllm",
+                colocated=True,
+                refit_transport=transport,
+                remote_sparse=False,
+            )
+        except ValueError:
+            continue
+        raise AssertionError(
+            "RED: colocated checkpoint-engine transport passed component preflight: "
+            f"{transport}"
+        )
+    print("GREEN: colocated checkpoint-engine transports reject before worker setup")
+
+
 if __name__ == "__main__":
     _run_policy_red_and_green()
     _run_megatron_green()
+    _run_checkpoint_engine_preflight()

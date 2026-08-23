@@ -123,6 +123,8 @@ def test_selection_rejects_target_false() -> None:
         ("vllm", False, "checkpoint_engine", False),
         ("vllm", False, "nccl_reshard", False),
         ("vllm", True, None, True),
+        ("vllm", True, "nixl", False),
+        ("vllm", True, "package.engine:CustomCheckpointEngine", False),
     ],
 )
 def test_component_selection_preflight_rejects_unsupported_transport(
