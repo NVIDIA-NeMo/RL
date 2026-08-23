@@ -53,10 +53,12 @@ from nemo_rl.algorithms.grpo import (
     compute_and_apply_seq_logprob_error_masking,
 )
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.ppo import _compute_critic_metrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
     algo_config,
+    is_ppo_run,
     validate_sampler_buffer_capacity,
     validate_single_controller_config,
 )
@@ -130,6 +132,8 @@ class SingleControllerActor:
         self._master_config = master_config
         self._algo_cfg = algo_config(master_config)
         self._async_cfg = master_config.async_rl
+        self._is_ppo: bool = is_ppo_run(master_config)
+
         self._policy_logprobs_required = not (
             master_config.loss_fn.force_on_policy_ratio
             and self._algo_cfg.seq_logprob_error_threshold is None
@@ -850,16 +854,35 @@ class SingleControllerActor:
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
 
-        Per step:
-          1. sampler.evict drops stale groups from the buffer and clears their TQ rows.
-          2. sampler.select returns K prompt groups (or None) and drops them from the
-             buffer; DP rows survive so the trainer can read them. Already trainable —
-             buffer wrote training-shaped rows at rollout time.
-          3. _advantage_stage(train_meta).
-          4. trainer.train_microbatches_from_meta + finish_train_step.
-          5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
-             per dropped group, then sync.
+        Per step, with 1-4 running per streaming chunk and 5-6 once the chunk
+        loop closes:
+            1. Select the rollouts to train on.
+                a. sampler.evict drops stale groups from the buffer and clears their
+                    TQ rows.
+                b. sampler.select returns K prompt groups, or None, and removes them from
+                    the buffer. The DP rows survive, already training-shaped because the
+                    buffer wrote them that way at rollout time.
+                c. One _buffer_capacity permit is released per group that left the buffer.
+            2. Prepare the batch.
+                a. Policy and reference logprobs.
+                b. Value model forward (PPO only), with the policy parked on CPU
+                    so the critic never shares the training GPUs with it.
+                c. _advantage_stage.
+            3. Train on the chunk.
+                a. Value model (PPO only): train_from_meta, which is a whole
+                    optimizer step. That is why a PPO step is pinned to a single
+                    chunk -- the value workers have no split train API yet (#2625).
+                b. Policy model: train_microbatches_from_meta, which only
+                    accumulates gradients.
+            4. Clear the batch. dp_client.clear_samples on the consumed sample_ids.
+            5. Train the policy model -- finish_train_step all_reduces the
+                accumulated gradients, rescales, and runs optimizer.step.
+            6. Refit the model. Sync the new policy weights to generation.
         """
+        policy_training_start_step = (
+            self._algo_cfg.policy_training_start_step if self._is_ppo else 0
+        )
+
         while self._train_steps < self._algo_cfg.max_num_steps:
             version_during_step = self._trainer_version
             groups_dispatched = 0
@@ -868,6 +891,10 @@ class SingleControllerActor:
             step_open = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
+            # One chunk per step on the PPO path, so this is the step's value model update.
+            value_result: Optional[dict[str, Any]] = None
+            # Always True off the PPO path: the start step is pinned to 0 there.
+            is_policy_training_step = self._train_steps >= policy_training_start_step
 
             with self._timer.time("total_step_time"):
                 # Re-read on every iteration rather than once: a prompt stamped for this
@@ -876,7 +903,7 @@ class SingleControllerActor:
                 while groups_dispatched < self._target_groups_for_step(
                     version_during_step
                 ):
-                    # Wait for a selectable batch
+                    # ---- 1. Select the rollouts to train on ----
                     with self._timer.time("exposed_generation"):
                         await asyncio.sleep(0)
 
@@ -945,6 +972,7 @@ class SingleControllerActor:
                         for _ in range(num_groups):
                             self._buffer_capacity.release()
 
+                    # ---- 2. Prepare the batch ----
                     # Compute prev_logprobs / ref_logprobs
                     if (
                         self._policy_logprobs_required
@@ -972,6 +1000,12 @@ class SingleControllerActor:
                                     train_meta,
                                 )
 
+                    # Value model forward
+                    if self._is_ppo:
+                        with self._timer.time("value_inference"):
+                            await asyncio.to_thread(self._trainer.finish_inference)
+                            train_meta = await self._value_stage(train_meta)
+
                     # Compute advantages
                     with self._timer.time("advantage_calculation"):
                         (
@@ -979,24 +1013,34 @@ class SingleControllerActor:
                             has_valid_training_tokens,
                         ) = await self._advantage_stage(train_meta)
 
+                    # ---- 3. Train the model -- train_microbatches_from_meta ----
                     # Filtering can leave a streaming chunk with no training tokens.
                     # Consume that chunk without F/B, then continue the same optimizer
-                    # step with the next chunk. Always restore training mode because
-                    # log-prob inference may have switched the model to inference mode.
-                    with self._timer.time("training_prep"):
-                        await asyncio.to_thread(self._trainer.prepare_for_training)
-                    if has_valid_training_tokens:
-                        with self._timer.time("policy_training"):
-                            if not step_open:
+                    # step with the next chunk.
+
+                    # Value model first, then policy, as in the legacy PPO epoch loop.
+                    if self._is_ppo and has_valid_training_tokens:
+                        with self._timer.time("value_training"):
+                            value_result = await self._value_train(train_meta)
+
+                    if is_policy_training_step:
+                        # Always restore training mode because log-prob inference may have
+                        # switched the model to inference mode.
+                        with self._timer.time("training_prep"):
+                            await asyncio.to_thread(self._trainer.prepare_for_training)
+
+                        if has_valid_training_tokens:
+                            with self._timer.time("policy_training"):
+                                if not step_open:
+                                    await asyncio.to_thread(
+                                        self._trainer.begin_train_step,
+                                        self._loss_fn,
+                                    )
+                                    step_open = True
                                 await asyncio.to_thread(
-                                    self._trainer.begin_train_step,
-                                    self._loss_fn,
+                                    self._trainer.train_microbatches_from_meta,
+                                    train_meta,
                                 )
-                                step_open = True
-                            await asyncio.to_thread(
-                                self._trainer.train_microbatches_from_meta,
-                                train_meta,
-                            )
 
                     if train_meta.sequence_lengths:
                         self._step_log_dict["sequence_lengths"].extend(
@@ -1017,6 +1061,7 @@ class SingleControllerActor:
                             )
                         )
 
+                    # ---- 4. Clear the batch ----
                     # Refresh min_sample_version
                     curr_min_sample_version = min(
                         t["weight_version"]
@@ -1058,23 +1103,34 @@ class SingleControllerActor:
                         self._algo_cfg.num_prompts_per_step,
                     )
 
+                # ---- 5. Train the policy model -- finish_train_step ----
                 log.info(
                     "train_pump: step %d closing on %d chunk(s), %d group(s)",
                     version_during_step,
                     chunks_dispatched,
                     groups_dispatched,
                 )
-                if not step_open:
-                    raise RuntimeError(
-                        "SingleController has no valid response tokens after "
-                        "filtering. Check grpo.seq_logprob_error_threshold to "
-                        "avoid an optimizer step with an empty batch."
-                    )
 
-                with self._timer.time("policy_training"):
-                    result = await asyncio.to_thread(self._trainer.finish_train_step)
+                policy_result: Optional[dict[str, Any]] = None
+                if is_policy_training_step:
+                    if not step_open:
+                        raise RuntimeError(
+                            "SingleController has no valid response tokens after "
+                            "filtering. Check grpo.seq_logprob_error_threshold to "
+                            "avoid an optimizer step with an empty batch."
+                        )
 
-                step_metrics = aggregate_step_metrics(result)
+                    with self._timer.time("policy_training"):
+                        policy_result = await asyncio.to_thread(
+                            self._trainer.finish_train_step
+                        )
+
+                # Aggregate step metrics
+                step_metrics = {}
+                if policy_result is not None:
+                    step_metrics.update(aggregate_step_metrics(policy_result))
+                if value_result is not None:
+                    step_metrics.update(_compute_critic_metrics(value_result))
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
@@ -1109,6 +1165,8 @@ class SingleControllerActor:
                     for step, promoted in self._batch_promotions.items()
                     if step > version_during_step
                 }
+
+                # ---- 6. Refit the model ----
                 with self._timer.time("weight_sync"):
                     calibration_data = (
                         BatchedDataDict.from_batches(calibration_batches)
@@ -1567,6 +1625,28 @@ class SingleControllerActor:
             vars(save_state),
             self._master_config,
         )
+        if self._is_ppo:
+            # The critic shares the training GPUs, so the two weight saves are
+            # serialized. The critic goes first because offloading the policy runs
+            # finalize_async_save, which would block on the policy's own write if
+            # that had already been staged.
+            await asyncio.to_thread(self._trainer.offload_to_cpu)
+            # The value model writes synchronously, so unlike the policy below it is
+            # fully on disk when this returns and needs no finalize wait.
+            await asyncio.to_thread(self._value.prepare_for_training)
+            await asyncio.to_thread(
+                self._value.save_checkpoint,
+                weights_path=os.path.join(checkpoint_path, "value", "weights"),
+                optimizer_path=os.path.join(checkpoint_path, "value", "optimizer")
+                if self._checkpointer.save_optimizer
+                else None,
+                tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
+                checkpointing_cfg=self._master_config.checkpointing,
+            )
+            await asyncio.to_thread(self._value.finish_training)
+            # Also covers a warmup step, which never ran prepare_for_training in
+            # the pump and would otherwise save from CPU-resident params.
+            await asyncio.to_thread(self._trainer.prepare_for_training)
         # With async_save this returns after D2H staging; disk writes finish
         # in the background.
         await asyncio.to_thread(
@@ -1677,6 +1757,38 @@ class SingleControllerActor:
         self._rollout_permitted.set()
         return aborted_stale_inflight_groups
 
+    async def _value_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
+        """Run the PPO value model's forward pass over the selected chunk.
+
+        Tensors never touch SC: workers fetch the sequence columns from
+        DataPlane and commit the per-token prediction back under ``values``,
+        which the advantage stage then reads alongside the rewards. The value model
+        is loaded and offloaded around the call, so it holds the training GPUs
+        only for the duration of the forward.
+
+        Returns:
+            The batch metadata with the ``values`` column recorded on it.
+        """
+        await asyncio.to_thread(self._value.prepare_for_inference)
+        await asyncio.to_thread(self._value.get_values_from_meta, meta)
+        await asyncio.to_thread(self._value.finish_inference)
+        return meta.with_fields([self._advantage_cfg.values_field])
+
+    async def _value_train(self, meta: KVBatchMeta) -> dict[str, Any]:
+        """Run one value model optimizer step against this chunk's GAE returns.
+
+        Returns:
+            The aggregated value model train result, shaped like Value.train's.
+        """
+        await asyncio.to_thread(self._value.prepare_for_training)
+        result = await asyncio.to_thread(
+            self._value.train_from_meta,
+            meta,
+            self._value_loss_fn,  # pyrefly: ignore
+        )
+        await asyncio.to_thread(self._value.finish_training)
+        return result
+
     async def _advantage_stage(self, meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
         """Fetch advantage inputs, compute advantages, and write them back.
 
@@ -1773,20 +1885,32 @@ class SingleControllerActor:
                 data,
                 adv_cfg.reference_logprobs_field,
             )
+        if self._is_ppo:
+            kwargs["values"] = tensor_field(data, adv_cfg.values_field)
 
         # Training predicts token t from position t - 1, so token_mask[:, 1:]
         # is the exact mask used when global_valid_toks and the loss are built.
         has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
+        # Value-model estimators (GAE) hand back the regression target alongside
+        # the advantages; the group-relative ones return a bare tensor.
+        returns: Optional[torch.Tensor] = None
         if has_valid_training_tokens:
-            advantages = self._advantage_estimator.compute_advantage(
+            result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
                 mask=mask,
                 repeated_batch=repeated_batch,
                 **kwargs,
             )
+            if self._is_ppo:
+                advantages, returns = result
+            else:
+                advantages = result
         else:
             advantages = torch.zeros_like(mask)
+            if self._is_ppo:
+                returns = torch.zeros_like(mask)
+
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
         self._step_log_dict["masked_advantages"].append(
@@ -1796,6 +1920,10 @@ class SingleControllerActor:
         fields_to_put = {adv_cfg.output_field: advantages}
         if seq_logprob_error_threshold is not None:
             fields_to_put[adv_cfg.sample_mask_field] = sample_mask
+        new_fields = [adv_cfg.output_field]
+        if returns is not None:
+            fields_to_put[adv_cfg.returns_field] = returns
+            new_fields.append(adv_cfg.returns_field)
 
         await self._call_dp(
             "put_samples",
@@ -1804,7 +1932,7 @@ class SingleControllerActor:
             fields=fields_for_put(meta, fields_to_put),
         )
         return (
-            meta.with_fields([adv_cfg.output_field]),
+            meta.with_fields(new_fields),
             has_valid_training_tokens,
         )
 
@@ -1825,4 +1953,6 @@ class SingleControllerActor:
             fields.append(adv_cfg.generation_logprobs_field)
         if self._reference_logprobs_required:
             fields.append(adv_cfg.reference_logprobs_field)
+        if self._is_ppo:
+            fields.append(adv_cfg.values_field)
         return list(dict.fromkeys(fields))
