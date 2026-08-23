@@ -1416,13 +1416,16 @@ def grpo_train_sync(
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
+            # Before the step_finished=True log below, which commits the step:
+            # anything logged against a committed step is dropped by wandb, so
+            # these series were computed, printed, and silently discarded.
+            _log_data_plane_metrics(policy, logger, total_steps + 1, total_time)
             logger.log_metrics(
                 timing_metrics,
                 total_steps + 1,
                 prefix="timing/train",
                 step_finished=True,
             )
-            _log_data_plane_metrics(policy, logger, total_steps + 1, total_time)
 
             dynamic_sampling_num_gen_batches = 0
 
