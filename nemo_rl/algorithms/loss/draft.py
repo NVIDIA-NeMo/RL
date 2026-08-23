@@ -757,6 +757,7 @@ def projected_streaming_vocab_parallel_soft_ce(
     elif weights.ndim != 1 or weights.shape[0] < 1:
         raise ValueError(f"weights must be a nonempty vector, got {weights.shape}.")
     num_bins = weights.shape[0]
+    num_tokens = student_hidden.numel() // student_hidden.shape[-1]
 
     if bin_ids is None:
         if num_bins != 1:
@@ -774,7 +775,7 @@ def projected_streaming_vocab_parallel_soft_ce(
                 f"bin_ids and mask must share a device, got {bin_ids.device} and "
                 f"{mask.device}."
             )
-        if bin_ids.numel() > 0:
+        if num_tokens > token_chunk_size and bin_ids.numel() > 0:
             min_bin = int(bin_ids.min())
             max_bin = int(bin_ids.max())
             if min_bin < 0 or max_bin >= num_bins:
@@ -783,7 +784,6 @@ def projected_streaming_vocab_parallel_soft_ce(
                     f"[{min_bin}, {max_bin}]."
                 )
 
-    num_tokens = student_hidden.numel() // student_hidden.shape[-1]
     if num_tokens <= token_chunk_size:
         vocab_parallel_hidden = _SumTensorParallelHiddenGradient.apply(
             student_hidden,

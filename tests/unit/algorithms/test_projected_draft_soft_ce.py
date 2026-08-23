@@ -122,6 +122,51 @@ def test_projected_soft_ce_rejects_out_of_range_bin_ids(
     "num_tokens",
     [pytest.param(4, id="one_tile"), pytest.param(5, id="multiple_tiles")],
 )
+def test_projected_soft_ce_validates_explicit_bin_ids_once_per_call(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+) -> None:
+    """Each projected route performs one min/max bounds-validation pair."""
+    generator = torch.Generator().manual_seed(97531)
+    hidden_size, vocab_size = 3, 7
+    bin_ids = torch.arange(num_tokens, dtype=torch.long).remainder_(2)
+    validation_calls: list[str] = []
+    tensor_min = torch.Tensor.min
+    tensor_max = torch.Tensor.max
+
+    def record_min(tensor: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        if tensor is bin_ids:
+            validation_calls.append("min")
+        return tensor_min(tensor, *args, **kwargs)
+
+    def record_max(tensor: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        if tensor is bin_ids:
+            validation_calls.append("max")
+        return tensor_max(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "min", record_min)
+    monkeypatch.setattr(torch.Tensor, "max", record_max)
+
+    projected_streaming_vocab_parallel_soft_ce(
+        student_hidden=torch.randn(num_tokens, hidden_size, generator=generator),
+        output_weight=torch.randn(vocab_size, hidden_size, generator=generator),
+        selected_teacher_logits=torch.randn(
+            num_tokens, vocab_size, generator=generator
+        ),
+        mask=torch.ones(num_tokens),
+        bin_ids=bin_ids,
+        weights=torch.ones(2),
+        token_chunk_size=4,
+        tp_group=None,
+    )
+
+    assert validation_calls == ["min", "max"]
+
+
+@pytest.mark.parametrize(
+    "num_tokens",
+    [pytest.param(4, id="one_tile"), pytest.param(5, id="multiple_tiles")],
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_projected_soft_ce_matches_dense_hidden_gradient(
     num_tokens: int,
