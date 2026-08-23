@@ -81,6 +81,12 @@ run_test env VICTIM_STATE=serving uv run --no-sync bash ./tests/functional/grpo_
 # Checkpoint save/restore (upstream #3429).
 run_test uv run --no-sync bash ./tests/functional/grpo_checkpoint_single_controller.sh
 
+# PPO on SC: the critic forward/train stages, GAE returns reaching the data plane,
+# critic-only warmup, ppo_epochs, and the value model's half of the checkpoint. None
+# of the GRPO runs above touch any of it -- they build no value model at all -- so a
+# regression in the PPO path is invisible to every other test in this file.
+run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controller.sh
+
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
     coverage combine .coverage*
