@@ -343,45 +343,64 @@ def _expanded_optimizer_factory_leaves(
 
 def _factory_flattened_leaf_ranges(
     full_leaves: Sequence[Any],
-    state_leaves: Sequence[Any],
     *,
     model_key: str,
     state_key: str,
+    source_tensor: torch.Tensor,
+    local_state_tensor: torch.Tensor,
     source_local_numel: int,
     flattened_range: tuple[int, int],
-) -> list[tuple[Any, Any, tuple[int, int]]]:
+) -> list[tuple[str, Any, torch.Tensor, tuple[int, int]]]:
     source_start, source_end = flattened_range
+    if (
+        source_start < 0
+        or source_end <= source_start
+        or source_end > source_local_numel
+        or local_state_tensor.numel() != source_end - source_start
+    ):
+        raise RuntimeError("invalid factory optimizer local flattened slice")
+    flattened_full_leaves = [leaf.data.reshape(-1) for leaf in full_leaves]
+    if (
+        sum(leaf.numel() for leaf in flattened_full_leaves) != source_local_numel
+        or source_tensor.numel() != source_local_numel
+        or not torch.equal(
+            torch.cat(flattened_full_leaves), source_tensor.detach().reshape(-1)
+        )
+    ):
+        raise RuntimeError(
+            "factory full leaves have a gap, overlap, or source-order mismatch"
+        )
     cursor = 0
-    state_index = 0
-    ranged_leaves: list[tuple[Any, Any, tuple[int, int]]] = []
+    local_cursor = 0
+    ranged_leaves: list[tuple[str, Any, torch.Tensor, tuple[int, int]]] = []
     covered = 0
     for full_leaf in full_leaves:
         leaf_numel = full_leaf.data.numel()
         overlap_start = max(source_start, cursor)
         overlap_end = min(source_end, cursor + leaf_numel)
         if overlap_start < overlap_end:
-            if state_index >= len(state_leaves):
-                raise RuntimeError("factory dropped a flattened optimizer leaf")
-            state_leaf = state_leaves[state_index]
-            state_index += 1
-            if (
-                not full_leaf.key.startswith(model_key)
-                or not state_leaf.key.startswith(state_key)
-                or full_leaf.key[len(model_key) :] != state_leaf.key[len(state_key) :]
-            ):
-                raise RuntimeError("factory optimizer leaf identity mismatch")
+            if not full_leaf.key.startswith(model_key):
+                raise RuntimeError("factory model leaf identity mismatch")
             local_range = (overlap_start - cursor, overlap_end - cursor)
-            if state_leaf.data.numel() != local_range[1] - local_range[0]:
-                raise RuntimeError(
-                    f"factory flattened leaf size mismatch for {state_leaf.key}"
+            piece_numel = local_range[1] - local_range[0]
+            state_piece = local_state_tensor.reshape(-1).narrow(
+                0, local_cursor, piece_numel
+            )
+            ranged_leaves.append(
+                (
+                    f"{state_key}{full_leaf.key[len(model_key) :]}",
+                    full_leaf,
+                    state_piece,
+                    local_range,
                 )
-            ranged_leaves.append((state_leaf, full_leaf, local_range))
-            covered += state_leaf.data.numel()
+            )
+            local_cursor += piece_numel
+            covered += piece_numel
         cursor += leaf_numel
     if (
         cursor != source_local_numel
         or covered != source_end - source_start
-        or state_index != len(state_leaves)
+        or local_cursor != local_state_tensor.numel()
     ):
         raise RuntimeError("factory flattened leaves do not cover the local slice")
     return ranged_leaves
@@ -575,27 +594,26 @@ def _distributed_optimizer_records(
             if isinstance(sharded, ShardedTensorFactory):
                 logical_key = f"{sharded.key}/{key}"
                 full_leaves = _sharded_tensor_leaves(sharded)
-                leaves = _expanded_optimizer_factory_leaves(
-                    sharded,
-                    logical_key=logical_key,
-                    tensor=tensor,
-                    replica_id=replica_id,
-                    flattened_range=flattened_range,
-                )
-                for leaf, full_leaf, leaf_range in _factory_flattened_leaf_ranges(
+                for (
+                    leaf_key,
+                    full_leaf,
+                    state_piece,
+                    leaf_range,
+                ) in _factory_flattened_leaf_ranges(
                     full_leaves,
-                    leaves,
                     model_key=sharded.key,
                     state_key=logical_key,
+                    source_tensor=sharded.data,
+                    local_state_tensor=tensor,
                     source_local_numel=sharded.data.numel(),
                     flattened_range=flattened_range,
                 ):
                     records.append(
                         _record_from_sharded_tensor(
                             component="optimizer",
-                            logical_key=leaf.key,
+                            logical_key=leaf_key,
                             sharded=full_leaf,
-                            tensor=leaf.data,
+                            tensor=state_piece,
                             replica_id=replica_id,
                             flattened_range=leaf_range,
                         )

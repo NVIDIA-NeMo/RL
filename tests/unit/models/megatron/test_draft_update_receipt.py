@@ -355,8 +355,24 @@ def test_factory_transforms_regular_optimizer_moments_on_a_copy(
     )
 
 
-def test_distributed_factory_receives_flattened_range_and_keeps_all_leaves(
+@pytest.mark.parametrize(
+    ("owned_range", "expected"),
+    [
+        ((0, 2), {"draft.weight/exp_avg.left": ((0, 2), [1.0, 2.0])}),
+        ((2, 4), {"draft.weight/exp_avg.right": ((0, 2), [1.0, 2.0])}),
+        (
+            (1, 3),
+            {
+                "draft.weight/exp_avg.left": ((1, 2), [1.0]),
+                "draft.weight/exp_avg.right": ((0, 1), [2.0]),
+            },
+        ),
+    ],
+)
+def test_distributed_factory_partitions_local_slice_from_full_leaves(
     monkeypatch: pytest.MonkeyPatch,
+    owned_range: tuple[int, int],
+    expected: dict[str, tuple[tuple[int, int], list[float]]],
 ) -> None:
     receipt = _receipt_module()
     _, _, distributed_cls = _install_fake_optimizer_modules(monkeypatch)
@@ -381,10 +397,7 @@ def test_distributed_factory_receives_flattened_range_and_keeps_all_leaves(
             else (int(flattened_range.start), int(flattened_range.stop))
         )
         build_ranges.append(interval)
-        if flattened_range is None:
-            left, right = data[:2], data[2:]
-        else:
-            left, right = data[:1], data[1:]
+        left, right = torch.chunk(data, 2)
         return {
             "left": sharded_tensor_cls(
                 f"{key}.left",
@@ -423,7 +436,7 @@ def test_distributed_factory_receives_flattened_range_and_keeps_all_leaves(
         param_groups=[{"params": [torch.nn.Parameter(torch.ones(2))], "lr": 0.1}]
     )
     optimizer._get_model_param_range_map = lambda _: {
-        "param": SimpleNamespace(start=1, end=3)
+        "param": SimpleNamespace(start=owned_range[0], end=owned_range[1])
     }
     optimizer._get_main_param_and_optimizer_states = lambda _: {
         "param": torch.tensor([10.0, 11.0]),
@@ -431,17 +444,47 @@ def test_distributed_factory_receives_flattened_range_and_keeps_all_leaves(
     }
 
     records = receipt.canonical_draft_state_records(model, optimizer)
-    moment_keys = {
-        record.logical_key
+    moments = {
+        record.logical_key: record
         for record in records
         if record.component == "optimizer" and "exp_avg" in record.logical_key
     }
 
-    assert (1, 3) in build_ranges
-    assert moment_keys == {
-        "draft.weight/exp_avg.left",
-        "draft.weight/exp_avg.right",
-    }
+    assert all(interval is None for interval in build_ranges)
+    assert set(moments) == set(expected)
+    for key, (expected_range, expected_values) in expected.items():
+        expected_record = receipt.CanonicalDraftStateRecord.for_flattened_tensor(
+            component="optimizer",
+            logical_key=key,
+            global_shape=(2,),
+            global_offset=(0,),
+            base_local_shape=(2,),
+            flattened_range=expected_range,
+            local_tensor=torch.tensor(expected_values),
+            replica_id=0,
+        )
+        assert moments[key].flattened_range == expected_range
+        assert moments[key].tensor_sha256 == expected_record.tensor_sha256
+
+
+def test_distributed_factory_rejects_nonpartitioning_full_leaves() -> None:
+    receipt = _receipt_module()
+    source = torch.tensor([0.0, 1.0, 2.0, 3.0])
+    full_leaves = [
+        SimpleNamespace(key="draft.weight.left", data=source[:2]),
+        SimpleNamespace(key="draft.weight.right", data=source[1:3]),
+    ]
+
+    with pytest.raises(RuntimeError, match="gap, overlap, or source-order"):
+        receipt._factory_flattened_leaf_ranges(
+            full_leaves,
+            model_key="draft.weight",
+            state_key="draft.weight/exp_avg",
+            source_tensor=source,
+            local_state_tensor=torch.tensor([1.0, 2.0]),
+            source_local_numel=4,
+            flattened_range=(0, 2),
+        )
 
 
 def test_schema_rejects_gapped_flattened_optimizer_coverage() -> None:
