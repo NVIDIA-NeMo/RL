@@ -24,6 +24,7 @@ from __future__ import annotations
 from time import monotonic
 
 import logging
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -418,9 +419,11 @@ def test_step_metrics_tail_is_exact_not_bucketed():
     client._emit("put", "p", 1, 8, monotonic() - 0.030, "ok")  # a 30 ms call
     metrics = client.get_step_metrics(1.0)
 
-    assert "put/p90_ms" not in metrics and "step/put/p50_ms" not in metrics
-    assert metrics["step/put/max_ms"] >= 30.0
-    assert metrics["step/put/max_ms"] != pytest.approx(24.85, abs=0.5), "bucket edge"
+    assert "put/p90_ms" not in metrics and "step/by_op/put/p50_ms" not in metrics
+    assert metrics["step/by_op/put/max_ms"] >= 30.0
+    assert metrics["step/by_op/put/max_ms"] != pytest.approx(24.85, abs=0.5), (
+        "bucket edge"
+    )
     # and one call supports no percentile at all, in either view
     assert "p90_ms" not in client.snapshot()["by_op"]["put"]
     client.close()
@@ -449,11 +452,15 @@ def test_latency_breakdown_stacks_to_wall_ms():
     assert fit["bandwidth_mb_s"] == pytest.approx(mb_per_s, rel=0.05)
 
     # the two components are the split of ONE call, and they add to the mean
-    total = metrics["step/put/overhead_ms"] + metrics["step/put/transfer_ms"]
-    assert total == pytest.approx(metrics["step/put/mean_ms"], rel=0.05)
+    total = (
+        metrics["step/by_op/put/overhead_ms"] + metrics["step/by_op/put/transfer_ms"]
+    )
+    assert total == pytest.approx(metrics["step/by_op/put/mean_ms"], rel=0.05)
     # per call, the overhead term IS the fitted constant
-    assert metrics["step/put/overhead_ms"] == pytest.approx(fixed_ms, rel=0.05)
-    assert "step/put/overhead_frac" not in metrics, "a ratio is derivable from these"
+    assert metrics["step/by_op/put/overhead_ms"] == pytest.approx(fixed_ms, rel=0.05)
+    assert "step/by_op/put/overhead_frac" not in metrics, (
+        "a ratio is derivable from these"
+    )
     client.close()
 
 
@@ -463,9 +470,9 @@ def test_step_max_is_scoped_to_the_step():
     reported max must fall again when a step is quicker."""
     client = MetricsDataPlaneClient(NoOpDataPlaneClient())
     client._emit("put", "p", 1, 8, monotonic() - 0.050, "ok")  # slow step
-    slow = client.get_step_metrics(1.0)["step/put/max_ms"]
+    slow = client.get_step_metrics(1.0)["step/by_op/put/max_ms"]
     client._emit("put", "p", 1, 8, monotonic() - 0.001, "ok")  # quick step
-    quick = client.get_step_metrics(1.0)["step/put/max_ms"]
+    quick = client.get_step_metrics(1.0)["step/by_op/put/max_ms"]
 
     assert slow >= 50.0
     assert quick < slow, "step max must reset, not carry the lifetime worst"
@@ -889,10 +896,10 @@ def test_cluster_percentiles_never_exceed_the_measured_max():
     merged = merge_snapshots([_rank_with([120.0] * 20) for _ in range(8)])
     metrics = cluster_step_metrics(merged, {}, 1.0)
 
-    assert metrics["step/put/max_ms"] == pytest.approx(120.0, abs=2.0)
-    assert metrics["step/put/p50_ms"] <= metrics["step/put/max_ms"]
-    assert metrics["step/put/p90_ms"] <= metrics["step/put/max_ms"]
-    assert metrics["step/put/p50_ms"] <= metrics["step/put/p90_ms"]
+    assert metrics["step/by_op/put/max_ms"] == pytest.approx(120.0, abs=2.0)
+    assert metrics["step/by_op/put/p50_ms"] <= metrics["step/by_op/put/max_ms"]
+    assert metrics["step/by_op/put/p90_ms"] <= metrics["step/by_op/put/max_ms"]
+    assert metrics["step/by_op/put/p50_ms"] <= metrics["step/by_op/put/p90_ms"]
 
 
 def test_cluster_percentiles_withheld_below_a_useful_sample_count():
@@ -901,9 +908,11 @@ def test_cluster_percentiles_withheld_below_a_useful_sample_count():
     few = merge_snapshots([_rank_with([120.0] * 3) for _ in range(2)])  # 6 calls
     many = merge_snapshots([_rank_with([120.0] * 20) for _ in range(8)])  # 160
 
-    assert "step/put/p50_ms" not in cluster_step_metrics(few, {}, 1.0)
-    assert "step/put/max_ms" in cluster_step_metrics(few, {}, 1.0), "max always works"
-    assert "step/put/p50_ms" in cluster_step_metrics(many, {}, 1.0)
+    assert "step/by_op/put/p50_ms" not in cluster_step_metrics(few, {}, 1.0)
+    assert "step/by_op/put/max_ms" in cluster_step_metrics(few, {}, 1.0), (
+        "max always works"
+    )
+    assert "step/by_op/put/p50_ms" in cluster_step_metrics(many, {}, 1.0)
 
 
 def test_cluster_series_declare_delta_or_level():
@@ -1019,12 +1028,12 @@ def test_breakdown_table_rows_by_op_worst_first():
         "step/wall_ms": 100.0,
         "step/percent_of_dataplane/by_op/get": 10.0,
         "step/percent_of_dataplane/by_op/put": 90.0,
-        "step/get/calls": 8,
-        "step/get/wall_ms": 10.0,
-        "step/get/max_ms": 2.0,
-        "step/put/calls": 2,
-        "step/put/wall_ms": 90.0,
-        "step/put/max_ms": 50.0,
+        "step/by_op/get/calls": 8,
+        "step/by_op/get/wall_ms": 10.0,
+        "step/by_op/get/max_ms": 2.0,
+        "step/by_op/put/calls": 2,
+        "step/by_op/put/wall_ms": 90.0,
+        "step/by_op/put/max_ms": 50.0,
         "step/comm_volume_mb": 1.0,  # not per-op, must not become a row
         "now/bytes_outstanding_mb": 0.0,  # a level, likewise
     }
@@ -1043,7 +1052,11 @@ def test_breakdown_table_leaves_withheld_series_empty():
     is absent from the series — the table must carry None there rather than
     a zero that would read as a measurement."""
     columns, rows = breakdown_table(
-        {"step/put/calls": 3, "step/put/wall_ms": 5.0, "step/put/max_ms": 2.0}
+        {
+            "step/by_op/put/calls": 3,
+            "step/by_op/put/wall_ms": 5.0,
+            "step/by_op/put/max_ms": 2.0,
+        }
     )
     row = rows[0]
     assert row[columns.index("p90_ms")] is None
@@ -1074,11 +1087,13 @@ def test_cluster_view_carries_the_latency_split():
         ranks.append(client.snapshot())
 
     metrics = cluster_step_metrics(merge_snapshots(ranks), {}, 1.0)
-    assert "step/get/overhead_ms" in metrics, "cluster view must carry the split"
+    assert "step/by_op/get/overhead_ms" in metrics, "cluster view must carry the split"
 
-    total = metrics["step/get/overhead_ms"] + metrics["step/get/transfer_ms"]
-    assert total == pytest.approx(metrics["step/get/mean_ms"], rel=0.05)
-    assert metrics["step/get/overhead_ms"] == pytest.approx(fixed_ms, rel=0.05)
+    total = (
+        metrics["step/by_op/get/overhead_ms"] + metrics["step/by_op/get/transfer_ms"]
+    )
+    assert total == pytest.approx(metrics["step/by_op/get/mean_ms"], rel=0.05)
+    assert metrics["step/by_op/get/overhead_ms"] == pytest.approx(fixed_ms, rel=0.05)
 
     columns, rows = breakdown_table(metrics)
     row = rows[0]
@@ -1099,12 +1114,12 @@ def test_cluster_per_op_time_is_reported_per_call():
         merge_snapshots([_rank_with([10.0] * 5) for _ in range(32)]), {}, 1.0
     )
 
-    assert small["step/put/mean_ms"] == pytest.approx(10.0, rel=0.15)
-    assert large["step/put/mean_ms"] == pytest.approx(
-        small["step/put/mean_ms"], rel=0.15
+    assert small["step/by_op/put/mean_ms"] == pytest.approx(10.0, rel=0.15)
+    assert large["step/by_op/put/mean_ms"] == pytest.approx(
+        small["step/by_op/put/mean_ms"], rel=0.15
     ), "mean must not move with cluster size"
-    assert large["step/put/wall_ms"] == pytest.approx(
-        4 * small["step/put/wall_ms"], rel=0.15
+    assert large["step/by_op/put/wall_ms"] == pytest.approx(
+        4 * small["step/by_op/put/wall_ms"], rel=0.15
     ), "the sum does move with cluster size"
 
     columns, rows = breakdown_table(small)
@@ -1128,12 +1143,12 @@ def test_each_quantile_waits_for_the_samples_it_needs():
             client._emit("put", "p", 1, 1_000, now - (5.0 + i % 7) / 1e3, "ok")
         return cluster_step_metrics(merge_snapshots([client.snapshot()]), {}, 1.0)
 
-    assert "step/put/p50_ms" not in metrics_for(10), "too thin for either"
+    assert "step/by_op/put/p50_ms" not in metrics_for(10), "too thin for either"
     mid = metrics_for(30)
-    assert "step/put/p50_ms" in mid, "a median off 30 calls is real"
-    assert "step/put/p90_ms" not in mid, "a p90 off 30 calls is not"
+    assert "step/by_op/put/p50_ms" in mid, "a median off 30 calls is real"
+    assert "step/by_op/put/p90_ms" not in mid, "a p90 off 30 calls is not"
     both = metrics_for(58)
-    assert "step/put/p50_ms" in both and "step/put/p90_ms" in both
+    assert "step/by_op/put/p50_ms" in both and "step/by_op/put/p90_ms" in both
 
 
 def test_no_quantile_finer_than_the_sample_size_can_resolve():
@@ -1333,7 +1348,7 @@ def test_cluster_step_max_reopens_each_step():
                 "put", "p", 1, 1_000, now - (slowest_ms if i == 0 else 5.0) / 1e3, "ok"
             )
         merged = merge_snapshots([client.snapshot(reset_step_window=True)])
-        seen.append(cluster_step_metrics(merged, prev, 1.0)["step/put/max_ms"])
+        seen.append(cluster_step_metrics(merged, prev, 1.0)["step/by_op/put/max_ms"])
         prev = merged
 
     assert seen[1] == pytest.approx(50.0, abs=1.0), "the spike shows"
@@ -1360,8 +1375,8 @@ def test_breakdown_table_ignores_reserved_namespaces():
     series and was becoming a "self" row in the table beside put and get."""
     columns, rows = breakdown_table(
         {
-            "step/put/calls": 2,
-            "step/put/wall_ms": 9.0,
+            "step/by_op/put/calls": 2,
+            "step/by_op/put/wall_ms": 9.0,
             "step/self/overhead_ms": 6.2,
             "step/hash/mismatches": 0,
             "step/percent_of_dataplane/by_cause/transfer": 40.0,
@@ -1433,7 +1448,9 @@ def test_write_and_read_volume_are_not_computed_for_nobody():
     assert "step/bytes_written_mb" not in metrics
     assert "step/bytes_read_mb" not in metrics
     assert metrics["step/comm_volume_mb"] > 0, "the total is still reported"
-    assert metrics["step/put/mb"] == pytest.approx(0.004), "and split per op"
+    assert metrics["step/volume_mb/by_op/put"] == pytest.approx(0.004), (
+        "and split per op, under one key rather than two"
+    )
     client.close()
 
 
@@ -1504,9 +1521,9 @@ def test_volume_namespace_does_not_become_a_breakdown_row():
     ``volume_mb`` op beside put and get."""
     columns, rows = breakdown_table(
         {
-            "step/get/calls": 3,
-            "step/get/wall_ms": 9.0,
-            "step/get/mb": 18.0,
+            "step/by_op/get/calls": 3,
+            "step/by_op/get/wall_ms": 9.0,
+            "step/by_op/get/mb": 18.0,
             "step/volume_mb/by_op/get": 18.0,
         }
     )
@@ -1570,3 +1587,24 @@ def test_a_believable_mismatch_rate_is_not_second_guessed(caplog):
         _hash_deltas(hv, {})
 
     assert "more likely a bug" not in caplog.text
+
+
+def test_wandb_logger_warns_when_a_step_is_written_after_it_commits():
+    """wandb accepts a log against a committed step, returns cleanly, and
+    drops it. That silently cost this feature every one of its series until
+    someone read a finished run back out of the API -- so the Logger says so
+    rather than leaving each call site to remember the ordering."""
+    from nemo_rl.utils.logger import WandbLogger
+
+    logged: list[dict] = []
+    logger_obj = WandbLogger.__new__(WandbLogger)
+    logger_obj.run = type("R", (), {"log": lambda self, m, **kw: logged.append(m)})()
+    logger_obj._committed_step = -1
+
+    with patch.object(logging.getLogger("nemo_rl.utils.logger"), "warning") as warn:
+        logger_obj.log_metrics({"a": 1.0}, step=3, step_finished=True)
+        assert warn.call_count == 0, "the committing log is fine"
+        logger_obj.log_metrics({"b": 2.0}, step=3)
+        assert warn.call_count == 1, "the one after it is not"
+        logger_obj.log_metrics({"c": 3.0}, step=4)
+        assert warn.call_count == 1, "a later step is fine again"
