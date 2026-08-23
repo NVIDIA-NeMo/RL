@@ -2297,3 +2297,85 @@ class TestAggregateTrainingStatistics:
 
         # Verify global_loss is on CPU
         assert metrics["global_loss"].device == torch.device("cpu")
+
+
+class TestTopkGatherAtIndices:
+    """Gather-at-indices mode of TopkLogitsPostProcessor (SDPO trust-region teacher)."""
+
+    def _make_processor(self, k, enable_seq_packing=False):
+        from nemo_rl.models.automodel.train import TopkLogitsPostProcessor
+
+        return TopkLogitsPostProcessor(
+            cfg={},
+            device_mesh=None,
+            cp_mesh=None,
+            tp_mesh=None,
+            cp_size=1,
+            k=k,
+            enable_seq_packing=enable_seq_packing,
+        )
+
+    def test_gather_matches_torch_gather_unpacked(self):
+        torch.manual_seed(0)
+        B, S, V, K = 2, 5, 16, 3
+        logits = torch.randn(B, S, V)
+        idx = torch.randint(0, V, (B, S, K))
+        proc = self._make_processor(k=K)
+        vals, out_idx = proc._gather_at_indices(
+            logits, idx, None, torch.tensor([S, S])
+        )
+        expected = torch.gather(logits.to(torch.float32), -1, idx)
+        assert torch.allclose(vals, expected)
+        assert torch.equal(out_idx, idx)
+
+    def test_gather_trims_indices_to_microbatch_seq_len(self):
+        # The forward may trim the microbatch below the full-batch padded S.
+        torch.manual_seed(0)
+        B, S_mb, S_full, V, K = 2, 4, 6, 16, 3
+        logits = torch.randn(B, S_mb, V)
+        idx = torch.randint(0, V, (B, S_full, K))
+        proc = self._make_processor(k=K)
+        vals, out_idx = proc._gather_at_indices(
+            logits, idx, None, torch.tensor([S_mb, S_mb])
+        )
+        assert vals.shape == (B, S_mb, K)
+        expected = torch.gather(logits.to(torch.float32), -1, idx[:, :S_mb, :])
+        assert torch.allclose(vals, expected)
+
+    def test_gather_packed_roundtrip(self):
+        # Pack indices -> gather on packed logits; values must match the
+        # per-sequence unpacked gather.
+        from types import SimpleNamespace
+
+        torch.manual_seed(0)
+        V, K = 16, 3
+        lengths = [3, 5]
+        S = max(lengths)
+        T_packed = sum(lengths) + 2  # packed padding tail
+        cu_seqlens = torch.tensor([0, 3, 8])
+        packed_logits = torch.randn(1, T_packed, V)
+        idx = torch.randint(0, V, (len(lengths), S, K))
+        proc = self._make_processor(k=K, enable_seq_packing=True)
+        processed_inputs = SimpleNamespace(
+            flash_attn_kwargs=SimpleNamespace(cu_seqlens_q=cu_seqlens)
+        )
+        vals, out_idx = proc._gather_at_indices(
+            packed_logits, idx, processed_inputs, torch.tensor(lengths)
+        )
+        assert vals.shape == (1, T_packed, K)
+        for i, (start, ln) in enumerate(zip([0, 3], lengths)):
+            expected = torch.gather(
+                packed_logits[0, start : start + ln, :].to(torch.float32),
+                -1,
+                idx[i, :ln, :],
+            )
+            assert torch.allclose(vals[0, start : start + ln, :], expected)
+            assert torch.equal(out_idx[0, start : start + ln, :], idx[i, :ln, :])
+
+    def test_gather_rejects_wrong_k(self):
+        torch.manual_seed(0)
+        logits = torch.randn(1, 4, 16)
+        idx = torch.randint(0, 16, (1, 4, 5))
+        proc = self._make_processor(k=3)
+        with pytest.raises(AssertionError, match="must equal k"):
+            proc._gather_at_indices(logits, idx, None, torch.tensor([4]))

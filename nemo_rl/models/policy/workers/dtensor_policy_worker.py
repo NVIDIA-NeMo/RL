@@ -1487,6 +1487,11 @@ class DTensorPolicyWorkerImpl(
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
         """
+        if "topk_gather_indices" in data:
+            raise NotImplementedError(
+                "topk_gather_indices (gather-at-indices mode, used by the SDPO "
+                "trust-region teacher) is only implemented for the DTensor v2 backend."
+            )
         self.timer.start("get_topk_logits")
         topk_batch_size = (
             micro_batch_size

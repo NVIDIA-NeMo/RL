@@ -49,6 +49,7 @@ from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     cp_load_balanced_to_contiguous,
     distributed_vocab_topk,
+    gather_logits_at_global_indices,
     get_logprobs_from_vocab_parallel_logits,
 )
 from nemo_rl.models.automodel.data import (
@@ -920,7 +921,16 @@ class TopkLogitsPostProcessor:
         """
         input_lengths = data_dict["input_lengths"]
 
-        if self.cp_size > 1:
+        # Gather-at-indices mode: when the microbatch carries
+        # "topk_gather_indices" [b, S, k], evaluate the logits at those global
+        # vocab indices instead of computing top-k. Used by the SDPO
+        # trust-region teacher to evaluate the reference policy at the current
+        # teacher's top-k indices.
+        if "topk_gather_indices" in data_dict:
+            vals, idx = self._gather_at_indices(
+                logits, data_dict["topk_gather_indices"], processed_inputs, input_lengths
+            )
+        elif self.cp_size > 1:
             logits = redistribute_logits_for_cp(
                 logits, self.device_mesh, self.cp_mesh, sequence_dim
             )
@@ -1001,6 +1011,69 @@ class TopkLogitsPostProcessor:
             idx = unpacked_idx
 
         return vals, idx
+
+    def _gather_at_indices(
+        self,
+        logits: torch.Tensor,
+        gather_indices: torch.Tensor,
+        processed_inputs: ProcessedInputs,
+        input_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate logits at caller-provided global vocab indices.
+
+        Returns (values, indices) in the same packed/unpacked format the top-k
+        path produces at this point, so the sequence-packing unpack step in
+        __call__ applies unchanged. Differentiability is not needed here (the
+        teacher forward runs under no_grad).
+        """
+        if self.cp_size > 1:
+            raise NotImplementedError(
+                "topk_gather_indices does not support context parallelism yet"
+            )
+        assert gather_indices.shape[-1] == self.k, (
+            f"topk_gather_indices last dim ({gather_indices.shape[-1]}) must equal k ({self.k})"
+        )
+        device = to_local_if_dtensor(logits).device
+        gi = gather_indices.to(device=device, dtype=torch.long)
+
+        if self.enable_seq_packing:
+            # Pack [b, S, k] -> [1, T_packed, k]: the inverse of the unpack
+            # loop in __call__. Positions beyond each sequence's real length
+            # (and the packed padding tail) stay 0; the unpack step never
+            # reads them.
+            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            packed_len = int(logits.shape[1])
+            gi_packed = torch.zeros(
+                (1, packed_len, self.k), dtype=torch.long, device=device
+            )
+            for i in range(gi.shape[0]):
+                start = int(cu_seqlens[i].item())
+                seq_len_actual = int(input_lengths[i].item())
+                gi_packed[0, start : start + seq_len_actual, :] = gi[
+                    i, :seq_len_actual, :
+                ]
+            gi = gi_packed
+        else:
+            # The forward may trim the microbatch to its own max length; the
+            # provided indices are padded to the full-batch S.
+            gi = gi[:, : int(logits.shape[1]), :]
+
+        if isinstance(logits, DTensor):
+            local_logits = logits.to_local()
+            tp_group = self.tp_mesh.get_group()
+            tp_rank = torch.distributed.get_rank(tp_group)
+            v_local = int(local_logits.shape[-1])
+            vals = gather_logits_at_global_indices(
+                local_logits,
+                gi,
+                tp_group=tp_group,
+                cp_group=None,
+                vocab_start_index=tp_rank * v_local,
+                vocab_end_index=(tp_rank + 1) * v_local,
+            )
+        else:
+            vals = torch.gather(logits.to(torch.float32), dim=-1, index=gi)
+        return vals, gi
 
 
 class FullLogitsPostProcessor:

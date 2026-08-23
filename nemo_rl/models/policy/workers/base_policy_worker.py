@@ -204,6 +204,27 @@ class AbstractPolicyWorker:
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
 
+    @wrap_with_nvtx_name("policy_worker/get_reference_policy_topk_logits")
+    def get_reference_policy_topk_logits(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[Any]:
+        """Run get_topk_logits under the frozen reference-policy weights.
+
+        When ``data`` carries "topk_gather_indices" [B, S, k], the reference
+        logits are evaluated at those global vocab indices instead of taking
+        the reference's own top-k — this is how the SDPO trust-region teacher
+        obtains reference logits aligned with the current teacher's indices.
+        Requires the worker to have been initialized with a reference model.
+        """
+        with self.use_reference_model():
+            return self.get_topk_logits(
+                data=data, k=k, micro_batch_size=micro_batch_size
+            )
+
     def finalize_async_save(self) -> None:
         """Block until any in-flight async checkpoint write completes. No-op by default."""
         pass

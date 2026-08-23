@@ -669,6 +669,65 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return stacked
 
+    def get_reference_policy_topk_logits(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """get_topk_logits under the frozen reference-policy weights.
+
+        Pass "topk_gather_indices" [B, S, k] in ``data`` to evaluate the
+        reference logits at those global vocab indices instead of the
+        reference's own top-k (SDPO trust-region teacher). Requires the policy
+        to have been initialized with init_reference_model=True.
+        """
+        with (
+            timer.time("get_reference_policy_topk_logits/shard_data")
+            if timer
+            else nullcontext()
+        ):
+            sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
+
+        with (
+            timer.time("get_reference_policy_topk_logits/submit_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_reference_policy_topk_logits",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+            )
+
+        # Same stacking as get_topk_logits: avoid from_batches (it flattens
+        # rows for tensors with ndim>2).
+        worker_batches = self.worker_group.get_all_worker_results(futures)
+        stacked: BatchedDataDict[TopkLogitsOutputSpec] = BatchedDataDict()
+        stacked["topk_logits"] = torch.cat(
+            [wb["topk_logits"] for wb in worker_batches], dim=0
+        )
+        stacked["topk_indices"] = torch.cat(
+            [wb["topk_indices"] for wb in worker_batches], dim=0
+        )
+
+        if unsorted_data_indices is not None:
+            stacked.reorder_data(unsorted_data_indices)
+
+        return stacked
+
     def get_full_logits_ipc(
         self,
         data: BatchedDataDict[GenerationDatumSpec],

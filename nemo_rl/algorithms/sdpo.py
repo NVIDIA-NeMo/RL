@@ -138,6 +138,21 @@ class SDPOConfig(TypedDict):
     success_reward_threshold: float  # reward >= this counts as "successful"
     max_reprompt_len: int  # max tokens in teacher prompt
     topk_logits_k: int  # K in top-k logit distillation
+    # Teacher regularization (paper §2.3; reference repo's TrustRegionTeacher).
+    # "none" (default): teacher = current policy conditioned on feedback —
+    #   paper Table 4 shows this eventually diverges.
+    # "trust_region": teacher logits = lerp(ref, current, teacher_mix_coef)
+    #   at the current teacher's top-k indices, where ref is the frozen init
+    #   policy. Blending the target toward init denies self-amplifying drift
+    #   a self-consistent teacher without penalizing genuine improvement.
+    teacher_regularization: NotRequired[str]
+    # Paper A.2 Eq. 10's alpha: weight of the CURRENT policy in the lerp
+    # (0 = pure init teacher, 1 = unregularized). Paper Table 4 uses 0.01
+    # (the default). Lerping raw logits instead of Eq. 10's log-probs is
+    # equivalent: the difference is a per-position additive constant that
+    # cancels under the loss's top-k log_softmax renormalization.
+    # Only read when teacher_regularization="trust_region".
+    teacher_mix_coef: NotRequired[float]
     reprompt_template: NotRequired[str]  # uses {prompt} and {solution} placeholders
     remove_thinking_from_demo: NotRequired[bool]  # strip <think>…</think> from demos
     # "peer_rollout" (default): teacher conditions on a successful peer rollout.
@@ -795,6 +810,13 @@ def setup(
         _ref_kl_penalty = float(
             getattr(loss_config, "reference_policy_kl_penalty", 0.0) or 0.0
         )
+    # The trust-region teacher needs the frozen reference weights snapshotted
+    # even when no ref-KL penalty is configured. grpo.setup loads the
+    # reference model iff this stub's penalty > 0, so nudge it with an
+    # epsilon nothing else reads: sdpo_train derives need_ref_logprobs from
+    # the ACTUAL loss config, not this stub.
+    if sdpo_config.get("teacher_regularization", "none") == "trust_region" and _ref_kl_penalty == 0.0:
+        _ref_kl_penalty = 1e-12
     # grpo.setup asserts that skip_reference_policy_logprobs_calculation=True
     # is only combined with penalty == 0, so keep the stub flag consistent.
     # The flag only gates grpo's OWN train loop, which SDPO never runs —
@@ -959,6 +981,23 @@ def sdpo_train(
     combined_template = sdpo_cfg.get("combined_template", _DEFAULT_COMBINED_TEMPLATE)
     combined_success_template = sdpo_cfg.get("combined_success_template", _DEFAULT_COMBINED_SUCCESS_TEMPLATE)
     make_div_by = policy_cfg.get("make_sequence_length_divisible_by", 1)
+
+    teacher_regularization = sdpo_cfg.get("teacher_regularization", "none")
+    teacher_mix_coef = float(sdpo_cfg.get("teacher_mix_coef", 0.01))  # paper Table 4: alpha = 0.01
+    if teacher_regularization not in ("none", "trust_region"):
+        raise ValueError(
+            f"sdpo.teacher_regularization must be 'none' or 'trust_region', got {teacher_regularization!r}"
+        )
+    if teacher_regularization == "trust_region" and not (0.0 <= teacher_mix_coef < 1.0):
+        raise ValueError(
+            f"sdpo.teacher_mix_coef must be in [0, 1) for the trust-region teacher "
+            f"(1.0 would be the unregularized teacher), got {teacher_mix_coef}"
+        )
+    if teacher_regularization == "trust_region":
+        print(
+            f"  ✓ Trust-region teacher: logits = lerp(ref, current, {teacher_mix_coef})",
+            flush=True,
+        )
 
     # SDPO+GRPO hybrid: build the GRPO advantage estimator used by
     # the policy-gradient term. Only active when loss_fn is the hybrid.
@@ -1172,6 +1211,40 @@ def sdpo_train(
                     )
                     teacher_topk_logits_raw = teacher_topk["topk_logits"]
                     teacher_topk_indices_raw = teacher_topk["topk_indices"]
+
+                # ── Trust-region teacher (paper §2.3; reference repo's
+                # TrustRegionTeacher). Blend the frozen init policy's logits
+                # into the distillation target so the teacher cannot follow
+                # the student into self-amplifying drift:
+                #   teacher_logits = lerp(ref, current, mix_coef)
+                # evaluated at the current teacher's top-k indices (reverse KL
+                # needs the teacher where the student has mass, which the
+                # current-policy top-k approximates).
+                if teacher_regularization == "trust_region":
+                    print("Computing trust-region reference teacher logits...", flush=True)
+                    with timer.time("teacher_trust_region_ref_logits"):
+                        ref_gather_data = BatchedDataDict(
+                            {
+                                "input_ids": teacher_data["input_ids"],
+                                "input_lengths": teacher_data["input_lengths"],
+                                "topk_gather_indices": teacher_topk_indices_raw.to(torch.long),
+                            }
+                        )
+                        ref_topk = policy.get_reference_policy_topk_logits(
+                            ref_gather_data,
+                            k=topk_logits_k,
+                            timer=timer,
+                        )
+                        ref_logits_at_idx = ref_topk["topk_logits"].to(
+                            device=teacher_topk_logits_raw.device,
+                            dtype=teacher_topk_logits_raw.dtype,
+                        )
+                        teacher_topk_logits_raw = torch.lerp(
+                            ref_logits_at_idx,
+                            teacher_topk_logits_raw,
+                            teacher_mix_coef,
+                        )
+                        del ref_gather_data, ref_topk, ref_logits_at_idx
 
                 # Align teacher top-k tensors to student sequence positions
                 with timer.time("teacher_topk_alignment"):
