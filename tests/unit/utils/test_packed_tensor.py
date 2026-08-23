@@ -168,6 +168,33 @@ def test_packed_broadcast_single_large_tensor():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_stages_mixed_cpu_cuda_tensors():
+    """Frozen CPU parameters can be packed with trainable CUDA parameters."""
+    params = [
+        ("frozen_vision.weight", torch.randn(8, dtype=torch.float32)),
+        ("language.weight", torch.randn(8, dtype=torch.float32).cuda()),
+    ]
+    mock_group = MockCommunicationGroup()
+
+    with patch(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size",
+        return_value=10_000,
+    ):
+        packed_broadcast_producer(
+            iterator=iter(params),
+            group=mock_group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+        )
+
+    assert mock_group.broadcast_count == 1
+    assert mock_group.broadcasted_tensors[0].device.type == "cuda"
+    assert mock_group.broadcasted_tensors[0].numel() == sum(
+        tensor.numel() * tensor.element_size() for _, tensor in params
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_packed_broadcast_multiple_batches():
     """Test that tensors are properly batched when exceeding target size."""
     # Create many small tensors

@@ -36,6 +36,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
+    ReinforceBaselineAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
@@ -48,6 +49,9 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import (
+    logical_rollout_geometric_is_gate,
+)
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -182,6 +186,8 @@ class RewardScalingConfig(BaseModel, extra="allow"):
 
 class AsyncGRPOConfig(BaseModel, extra="allow"):
     enabled: bool = False
+    # Number of complete optimizer batches admitted to the bounded FIFO.
+    async_queue_size: int = Field(default=1, ge=1)
     # Maximum trajectory age in training steps for samples drawn from the
     # async replay buffer. Trajectories older than this are excluded during
     # sampling; buffer sizing also scales with this value.
@@ -2167,23 +2173,22 @@ def _validate_context_compaction_training_config(
         )
 
     adv_config = _config_value(grpo_config, "adv_estimator", {"name": "grpo"})
-    if _config_value(adv_config, "name", "grpo") != "grpo":
-        errors.append("only the standard GRPO advantage estimator is supported")
+    if _config_value(adv_config, "name", "grpo") not in {
+        "grpo",
+        "reinforce_baseline",
+    }:
+        errors.append(
+            "only GRPO and Molt reinforce_baseline advantage estimators are supported"
+        )
     if loss_config.sequence_level_importance_ratios:
         errors.append("sequence-level importance ratios are not supported")
     if not loss_config.token_level_loss:
         errors.append("sequence-level loss reduction is not supported")
-    if loss_config.truncated_importance_sampling_type == "seq-mask-tis":
-        errors.append("sequence-level TIS masking is not supported")
+
     if loss_config.use_kl_in_reward:
         errors.append("KL-in-reward advantage rewriting is not supported")
     if loss_config.positive_example_nll_weight != 0:
         errors.append("positive-example sequence weighting is not supported")
-    if async_grpo_enabled and loss_config.force_on_policy_ratio:
-        errors.append(
-            "async replay requires measured token-level importance ratios; "
-            "force_on_policy_ratio is not supported"
-        )
     if async_grpo_enabled and not loss_config.use_importance_sampling_correction:
         errors.append(
             "async replay requires token-level importance sampling correction"
@@ -2352,21 +2357,12 @@ def _validate_async_context_compaction_replay_groups(
             )
 
         generation_weight_version = trajectory.get("generation_weight_version")
-        target_weight_version = trajectory.get("target_weight_version")
-        if (
-            isinstance(generation_weight_version, bool)
-            or not isinstance(generation_weight_version, int)
-            or isinstance(target_weight_version, bool)
-            or not isinstance(target_weight_version, int)
+        if isinstance(generation_weight_version, bool) or not isinstance(
+            generation_weight_version, int
         ):
             raise ValueError(
                 f"Async context-compaction replay group {group_index} is missing "
-                "integer generation/target weight provenance"
-            )
-        if target_weight_version != current_weight_version:
-            raise ValueError(
-                f"Async context-compaction replay group {group_index} targets "
-                f"weight {target_weight_version}, expected {current_weight_version}"
+                "integer generation weight provenance"
             )
         trajectory_age = current_weight_version - generation_weight_version
         if trajectory_age < 0 or trajectory_age > max_age_steps:
@@ -2555,6 +2551,11 @@ def _create_advantage_estimator(master_config: MasterConfig):
     elif adv_estimator_name == "grpo":
         adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GRPO advantage estimator")
+    elif adv_estimator_name == "reinforce_baseline":
+        adv_estimator = ReinforceBaselineAdvantageEstimator(
+            adv_estimator_config, loss_config
+        )
+        print("  ✓ Using Molt REINFORCE group-mean baseline")
     elif adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
         adv_estimator = OPDAdvantageEstimator({"name": "opd"}, loss_config)
@@ -2820,10 +2821,48 @@ def _resolve_logprob_skip_flags(
             "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
             "Computing prev_logprobs anyway for seq-level error masking."
         )
+    skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
+    if (
+        master_config.loss_fn.force_on_policy_ratio
+        and master_config.loss_fn.use_importance_sampling_correction
+    ):
+        # Molt keeps PPO's optimization ratio at one while independently
+        # correcting actor/rollout mismatch. NeMo-RL therefore still needs the
+        # pre-update actor logprobs for behavior-policy IS.
+        skip_prev_logprobs = False
     return (
-        opd_module._skip_prev_logprobs(master_config),
+        skip_prev_logprobs,
         master_config.grpo.skip_reference_policy_logprobs_calculation,
     )
+
+
+def _precompute_logical_rollout_is_gate(
+    train_data: BatchedDataDict,
+    loss_config: ClippedPGLossConfig,
+) -> None:
+    """Attach a Molt geometric IS gate computed over the full trace batch."""
+    if (
+        loss_config.truncated_importance_sampling_type != "seq-mask-tis"
+        or "logical_rollout_ids" not in train_data
+    ):
+        return
+    if not loss_config.use_importance_sampling_correction:
+        raise ValueError("logical-rollout IS gating requires IS correction")
+    ratio_min = loss_config.truncated_importance_sampling_ratio_min
+    ratio_max = loss_config.truncated_importance_sampling_ratio
+    if ratio_min is None or ratio_max is None:
+        raise ValueError("logical-rollout IS gating requires both ratio bounds")
+
+    row_kept, _, _ = logical_rollout_geometric_is_gate(
+        train_data["prev_logprobs"][:, 1:]
+        - train_data["generation_logprobs"][:, 1:],
+        train_data["token_mask"][:, 1:],
+        train_data["sample_mask"],
+        train_data["logical_rollout_ids"],
+        ratio_min=ratio_min,
+        ratio_max=ratio_max,
+    )
+    train_data["logical_rollout_is_keep"] = row_kept
 
 
 def compute_and_apply_seq_logprob_error_masking(
@@ -3619,6 +3658,10 @@ def grpo_train(
 
                         del logprob_data
                         del extra_multimodal_data
+
+                _precompute_logical_rollout_is_gate(
+                    train_data, master_config.loss_fn
+                )
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
@@ -4583,14 +4626,9 @@ def async_grpo_train(
         },
     }
 
-    # Calculate optimal buffer size based on generation limits to prevent length bias
-    # Each weight version generates exactly num_prompts_per_step trajectories
-    # With max_age_steps, we keep trajectories from multiple weight versions
     num_prompts_per_step = master_config.grpo.num_prompts_per_step
-    late_arrival_slack = 2
-    optimal_buffer_size = (
-        num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
-    )
+    async_queue_size = master_config.grpo.async_grpo.async_queue_size
+    optimal_buffer_size = num_prompts_per_step * async_queue_size
 
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
         max_size=optimal_buffer_size
@@ -4697,7 +4735,7 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
-            return
+            raise
     else:
         print("🔄 Preparing policy generation for inference...")
         try:
@@ -4708,7 +4746,7 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
-            return
+            raise
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
@@ -4775,61 +4813,27 @@ def async_grpo_train(
     if policy_generation is not None:
         policy_generation.clear_logger_metrics()
 
-    # Wait for initial buffer fill for the current training step.
-    print(
-        f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
-    )
+    # Wait for one complete FIFO training batch.
+    print("⏳ Waiting for replay FIFO to have one complete training batch...")
     timer.start("init/total")
     wait_iterations = 0
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
-        current_step_ready = ray.get(
-            replay_buffer.has_complete_batch.remote(
-                step, num_prompts_per_step, max_trajectory_age_steps
-            )
-        )
+        current_step_ready = buffer_size_current >= num_prompts_per_step
 
         print(
             f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
-            f"step {step} ready={current_step_ready}"
+            f"batch_ready={current_step_ready}"
         )
 
         if current_step_ready:
-            # Keep the async pipeline one step ahead before entering training.
-
-            # A restored buffer may already contain `step`, allowing startup to
-            # consume it before the collector generates `step + 1`. After refit,
-            # the collector advances to targets starting at `step + 2`, leaving
-            # `step + 1` permanently missing. Wait for the initial collector,
-            # whose range includes both steps, to complete the lookahead first.
-            max_num_steps = master_config.grpo.max_num_steps
-            need_lookahead = max_trajectory_age_steps > 0 and step + 1 < max_num_steps
-            if need_lookahead:
-                next_step_ready = ray.get(
-                    replay_buffer.has_complete_batch.remote(
-                        step + 1, num_prompts_per_step, max_trajectory_age_steps
-                    )
-                )
-                if not next_step_ready:  # pragma: no cover
-                    print(
-                        f"  Pipeline barrier: step {step} ready but "
-                        f"step {step + 1} not yet — waiting for lookahead fill "
-                        f"to prevent resume deadlock"
-                    )
-                    wait_iterations += 1
-                    time.sleep(1.0)
-                    continue
             break
 
-        trajectories_needed = ray.get(
-            replay_buffer.get_trajectories_needed.remote(
-                step, num_prompts_per_step, max_trajectory_age_steps
-            )
-        )
-        if buffer_size_current >= min_trajectories_needed and trajectories_needed > 0:
+        trajectories_needed = max(0, num_prompts_per_step - buffer_size_current)
+        if buffer_size_current >= min_trajectories_needed and trajectories_needed:
             print(
-                f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
-                f"trajectories for step {step}"
+                f"  ⏳ FIFO fill in progress: need {trajectories_needed} more "
+                "prompt groups"
             )
 
         collector_status = ray.get(trajectory_collector.get_status.remote())
@@ -5250,6 +5254,10 @@ def async_grpo_train(
                                 train_data["prev_logprobs"]
                             )
 
+                _precompute_logical_rollout_is_gate(
+                    train_data, master_config.loss_fn
+                )
+
                 # Seq-level logprob error metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
@@ -5644,26 +5652,39 @@ def async_grpo_train(
                             ),
                             checkpointing_cfg=master_config.checkpointing,
                         )
-                        # Get dataloader state from trajectory collector
-                        actual_dataloader_state = ray.get(
-                            trajectory_collector.get_dataloader_state.remote()
-                        )
+                        # Freeze FIFO admission and settle admitted workers before
+                        # capturing the algorithm state. This prevents a prompt
+                        # group from moving between the dataloader, in-flight set,
+                        # and replay snapshots while they are serialized.
+                        ray.get(trajectory_collector.pause.remote())
+                        try:
+                            ray.get(
+                                trajectory_collector.wait_for_pending_generations.remote()
+                            )
+                            actual_dataloader_state = ray.get(
+                                trajectory_collector.get_dataloader_state.remote()
+                            )
+                            replay_buffer_state = ray.get(
+                                replay_buffer.state_dict.remote()
+                            )
+                            rollouts_state = ray.get(
+                                trajectory_collector.get_rollouts_state.remote()
+                            )
+                        finally:
+                            ray.get(trajectory_collector.resume.remote())
+
                         torch.save(
                             actual_dataloader_state,
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        print("📦 Saving replay buffer state...")
-                        replay_buffer_state = ray.get(replay_buffer.state_dict.remote())
+                        print("📦 Saving replay FIFO state...")
                         torch.save(
                             replay_buffer_state,
                             os.path.join(checkpoint_path, "replay_buffer.pt"),
                         )
                         print(
-                            "✅ Saved replay buffer with "
+                            "✅ Saved replay FIFO with "
                             f"{len(replay_buffer_state['trajectories'])} trajectories"
-                        )
-                        rollouts_state = ray.get(
-                            trajectory_collector.get_rollouts_state.remote()
                         )
                         torch.save(
                             rollouts_state,
@@ -5855,6 +5876,7 @@ def async_grpo_train(
         import traceback
 
         traceback.print_exc()
+        raise
 
     finally:
         # Finalize any pending async checkpoint before tearing down workers.

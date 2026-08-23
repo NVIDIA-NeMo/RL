@@ -945,6 +945,34 @@ class TestApplyPerformanceConfig:
         assert model_cfg.apply_rope_fusion is True
         assert model_cfg.bias_activation_fusion is True
 
+    def test_multimodal_freeze_overrides_reach_model_provider(self):
+        """Policy freeze settings replace checkpoint-derived provider defaults."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(
+            gated_linear_unit=True,
+            freeze_vision_model=False,
+            freeze_vision_projection=False,
+            freeze_sound_encoder=False,
+            freeze_sound_projection=False,
+        )
+        config = self._config()
+        config["megatron_cfg"].update(
+            {
+                "freeze_vision_model": True,
+                "freeze_vision_projection": True,
+                "freeze_sound_encoder": True,
+                "freeze_sound_projection": True,
+            }
+        )
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.freeze_vision_model is True
+        assert model_cfg.freeze_vision_projection is True
+        assert model_cfg.freeze_sound_encoder is True
+        assert model_cfg.freeze_sound_projection is True
+
     def test_activation_checkpointing_enabled(self):
         """Test activation checkpointing configuration."""
         from nemo_rl.models.megatron.setup import _apply_performance_config

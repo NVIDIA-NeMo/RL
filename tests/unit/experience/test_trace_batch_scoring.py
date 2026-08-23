@@ -19,7 +19,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    GRPOAdvantageEstimator,
+    ReinforceBaselineAdvantageEstimator,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.trace_batch_scoring import (
@@ -85,12 +89,16 @@ def _message_logs(bundle: dict) -> list[list[dict]]:
 
 def _estimator() -> GRPOAdvantageEstimator:
     return GRPOAdvantageEstimator(
-        {
-            "use_leave_one_out_baseline": False,
-            "normalize_rewards": True,
-        },
+        AdvEstimatorConfig(
+            use_leave_one_out_baseline=False,
+            normalize_rewards=True,
+        ),
         ClippedPGLossConfig(),
     )
+
+
+def _reinforce_baseline_estimator() -> ReinforceBaselineAdvantageEstimator:
+    return ReinforceBaselineAdvantageEstimator({}, ClippedPGLossConfig())
 
 
 def _rollout_batch(bundles: list[dict]) -> dict:
@@ -173,6 +181,48 @@ def test_one_compacted_rollout_expands_after_its_scalar_advantage_is_fixed():
         1.0,
         0.0,
     ]
+
+
+def test_reinforce_baseline_is_invariant_when_one_rollout_splits_into_traces():
+    split_rollout = _rekey_rollout(
+        _fixture("k2_compaction.json"),
+        rollout_id="split-rollout",
+        group_id="shared-group",
+        source_row_index=0,
+        reward=1.0,
+    )
+    unsplit_rollout = _rekey_rollout(
+        _fixture("without_compaction.json"),
+        rollout_id="unsplit-rollout",
+        group_id="shared-group",
+        source_row_index=1,
+        reward=3.0,
+    )
+
+    prepared = prepare_trace_batch_for_scoring(
+        _rollout_batch([split_rollout, unsplit_rollout]),
+        prompt_ids=torch.tensor([[42], [42]]),
+        advantage_estimator=_reinforce_baseline_estimator(),
+        expected_rollouts_per_group=2,
+        batch_quantum=4,
+        optimizer_step_id="step-reinforce-baseline",
+        pad_token_id=999,
+    )
+
+    # Both logical rollouts contain five eligible action tokens. The split
+    # rollout must therefore have the same statistical weight as the unsplit
+    # rollout, rather than three times the weight because it occupies 3 rows.
+    assert prepared["rollout_advantages"] == pytest.approx(
+        {"split-rollout": -1.0, "unsplit-rollout": 1.0}
+    )
+    assert [row["advantage"] for row in prepared["plan"]["rows"]] == pytest.approx(
+        [-1.0, -1.0, -1.0, 1.0]
+    )
+    train_data = prepared["materialization"]["train_data"]
+    eligible = train_data["token_mask"].bool()
+    assert train_data["advantages"][eligible].tolist() == pytest.approx(
+        [-1.0] * 5 + [1.0] * 5
+    )
 
 
 def test_logprob_data_matches_existing_worker_input_contract():
@@ -275,10 +325,10 @@ def test_post_rollout_reward_rewriting_fails_closed():
         )
 
 
-def test_non_grpo_advantage_estimator_fails_closed():
+def test_unsupported_advantage_estimator_fails_closed():
     bundle = _fixture("without_compaction.json")
 
-    with pytest.raises(TypeError, match="standard GRPOAdvantageEstimator"):
+    with pytest.raises(TypeError, match="GRPOAdvantageEstimator"):
         prepare_trace_batch_for_scoring(
             _rollout_batch([bundle]),
             prompt_ids=torch.tensor([[1]]),

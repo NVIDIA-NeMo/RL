@@ -27,7 +27,10 @@ from nemo_rl.algorithms.loss import (
     prepare_loss_input,
 )
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
-from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    CrossTokenizerDistillationLossFn,
+    logical_rollout_geometric_is_gate,
+)
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     build_exact_token_map,
@@ -1582,6 +1585,9 @@ def test_clipped_pg_loss_tis_min_bound_defaults_to_zero(
     data["advantages"][0, 1:] = torch.ones(3)
     data["generation_logprobs"][0, 1:] = torch.zeros(3)
     next_token_logprobs = torch.log(torch.tensor([[0.1, 1.0, 3.0]]))
+    # force_on_policy_ratio only controls the PPO ratio. Behavior IS remains
+    # independently sourced from prev_logprobs.
+    data["prev_logprobs"][0, 1:] = next_token_logprobs
 
     loss, metrics = loss_fn(
         next_token_logprobs=next_token_logprobs,
@@ -1650,6 +1656,110 @@ def test_clipped_pg_loss_seq_mask_tis():
     )
     assert not torch.isnan(actual_loss2), "Loss is NaN — nan_to_num fix not working"
     assert not torch.isinf(actual_loss2), "Loss is inf — nan_to_num fix not working"
+
+
+def test_logical_rollout_geometric_is_gate_is_segmentation_invariant():
+    ratio_min, ratio_max = 0.9, 1.1
+    unsplit_log_ratios = torch.log(torch.tensor([[0.5, 2.0, 0.8, 1.25]]))
+    split_log_ratios = unsplit_log_ratios.reshape(2, 2)
+
+    unsplit = logical_rollout_geometric_is_gate(
+        unsplit_log_ratios,
+        torch.ones_like(unsplit_log_ratios),
+        torch.ones(1),
+        torch.tensor([17]),
+        ratio_min=ratio_min,
+        ratio_max=ratio_max,
+    )
+    split = logical_rollout_geometric_is_gate(
+        split_log_ratios,
+        torch.ones_like(split_log_ratios),
+        torch.ones(2),
+        torch.tensor([17, 17]),
+        ratio_min=ratio_min,
+        ratio_max=ratio_max,
+    )
+
+    torch.testing.assert_close(unsplit[1], split[1])
+    assert unsplit[0].tolist() == [True]
+    assert split[0].tolist() == [True, True]
+
+    rejected = logical_rollout_geometric_is_gate(
+        split_log_ratios + torch.log(torch.tensor(2.0)),
+        torch.ones_like(split_log_ratios),
+        torch.ones(2),
+        torch.tensor([17, 17]),
+        ratio_min=ratio_min,
+        ratio_max=ratio_max,
+    )
+    assert rejected[0].tolist() == [False, False]
+    assert rejected[2].tolist() == [False]
+
+
+def test_logical_rollout_geometric_is_gate_rejects_empty_and_nonfinite():
+    log_ratios = torch.tensor(
+        [
+            [float("nan"), 0.0],
+            [float("inf"), 0.0],
+            [123.0, 456.0],
+        ]
+    )
+    token_mask = torch.tensor([[1, 1], [1, 1], [0, 0]])
+    row_kept, logical_ratios, logical_kept = logical_rollout_geometric_is_gate(
+        log_ratios,
+        token_mask,
+        torch.ones(3),
+        torch.tensor([1, 2, 3]),
+        ratio_min=0.9,
+        ratio_max=1.1,
+    )
+
+    assert torch.isfinite(logical_ratios).all()
+    assert row_kept.tolist() == [True, False, False]
+    assert logical_kept.tolist() == [True, False, False]
+
+
+def test_clipped_pg_loss_logical_rollout_gate_keeps_raw_is_and_forces_ppo_only():
+    data, _, seq_len, _ = _setup_clipped_pg_test_data(
+        batch_size=3, seq_len=3, device="cpu"
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            force_on_policy_ratio=True,
+            use_importance_sampling_correction=True,
+            truncated_importance_sampling_type="seq-mask-tis",
+            truncated_importance_sampling_ratio_min=0.9,
+            truncated_importance_sampling_ratio=1.1,
+        )
+    )
+
+    # Rows 0 and 1 are two physical traces of logical rollout 10. Their
+    # combined geometric ratio is 1, so all four raw token weights survive.
+    # Logical rollout 20 has ratio 3 and is rejected in full.
+    raw_weights = torch.tensor([[0.5, 2.0], [1.0, 1.0], [3.0, 3.0]])
+    data["logical_rollout_ids"] = torch.tensor([10, 10, 20])
+    data["advantages"][:, 1:] = 1.0
+    data["generation_logprobs"][:, 1:] = 0.0
+    data["prev_logprobs"][:, 1:] = torch.log(raw_weights)
+
+    # Deliberately differs from prev_logprobs: PPO must still report ratio=1,
+    # while behavior IS must use prev_logprobs/generation_logprobs.
+    next_token_logprobs = torch.zeros((3, seq_len - 1), requires_grad=True)
+    loss, metrics = loss_fn(
+        next_token_logprobs=next_token_logprobs,
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"][:, 1:]
+        ),
+    )
+
+    torch.testing.assert_close(loss, -raw_weights[:2].sum() / raw_weights.numel())
+    assert metrics["probs_ratio"] == pytest.approx(1.0)
+    assert metrics["is_oob_ratio"] == pytest.approx(0.5)
+    loss.backward()
+    assert torch.isfinite(next_token_logprobs.grad).all()
 
 
 def test_masked_mean_all_zeros():

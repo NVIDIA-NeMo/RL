@@ -61,7 +61,7 @@ policy:
       lr: ${oc.decode:${oc.env:OSWORLD_LEARNING_RATE,2e-7}}
       min_lr: ${oc.decode:${oc.env:OSWORLD_LEARNING_RATE,2e-7}}
   generation:
-    max_new_tokens: 4096
+    max_new_tokens: ${oc.decode:${oc.env:OSWORLD_MAX_NEW_TOKENS,4096}}
     temperature: ${oc.decode:${oc.env:OSWORLD_TEMPERATURE,1.0}}
     top_p: ${oc.decode:${oc.env:OSWORLD_TOP_P,1.0}}
     vllm_cfg:
@@ -71,9 +71,11 @@ policy:
         chat_template_content_format: string
     vllm_kwargs:
       limit_mm_per_prompt:
-        image: ${oc.decode:${oc.env:OSWORLD_MAX_ACTIVE_IMAGES,8}}
+        # Must admit one candidate beyond Gym's active-history guard so the
+        # tokenize preflight can trigger compaction before generation.
+        image: ${oc.decode:${oc.env:OSWORLD_VLLM_MAX_IMAGES,9}}
       mm_processor_cache_gb: 0
-      max_num_batched_tokens: 16384
+      max_num_batched_tokens: ${oc.decode:${oc.env:OSWORLD_MAX_MODEL_LEN,8192}}
       mamba_ssm_cache_dtype: float32
       enable_chunked_prefill: false
 
@@ -106,6 +108,10 @@ env:
                 keep_last_image_groups: ${oc.decode:${oc.env:OSWORLD_CC_KEEP_LAST_IMAGE_GROUPS,1}}
             schedule:
               actions_per_chunk: ${oc.decode:${oc.env:OSWORLD_CC_ACTIONS_PER_CHUNK,2}}
+            guards:
+              # This is the Gym-side live-history high watermark. It is
+              # independent of vLLM's multimodal admission limit above.
+              max_active_images: ${oc.decode:${oc.env:OSWORLD_MAX_ACTIVE_IMAGES,8}}
 
 logger:
   log_dir: ${oc.env:OSWORLD_RESULTS_DIR,logs/osworld-context-compaction}

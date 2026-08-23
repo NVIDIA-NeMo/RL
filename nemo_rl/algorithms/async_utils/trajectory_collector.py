@@ -117,9 +117,11 @@ class AsyncTrajectoryCollector:
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
 
-        # Simple lock to prevent race conditions when checking/spawning workers
+        # Admission gate. Closing it and capturing the generation weight use the
+        # same lock, making prepare_for_refit a deterministic boundary.
         self._generation_check_lock: _threading.Lock = _threading.Lock()
-        # Track which target weights are currently being generated (globally)
+        self._refit_epoch = 0
+        # Legacy-only target reservations; active FIFO admission does not use it.
         self._generating_targets: set[int] = set()
         self._next_nemo_gym_task_index = next_nemo_gym_task_index
 
@@ -193,7 +195,8 @@ class AsyncTrajectoryCollector:
         return None
 
     def set_weight_version(self, version: int) -> None:
-        self.current_weight_version = version
+        with self._generation_check_lock:
+            self.current_weight_version = version
 
         # Resume collection if it was paused due to generation limits
         was_paused = not self._generation_limit_cleared.is_set()
@@ -204,38 +207,8 @@ class AsyncTrajectoryCollector:
             print(f"🔄 Updated weight version to {version}")
 
     def _should_pause_for_generation_limits(self) -> bool:
-        """Check if collection should be paused due to generation limits."""
-        try:
-            target_weights = self._calculate_target_weights(self.current_weight_version)
-            num_prompts = int(self.master_config.grpo.num_prompts_per_step)
-            max_age_steps = int(
-                self.master_config.grpo.async_grpo.max_trajectory_age_steps
-            )
-            last_consumed_target = ray.get(
-                self.replay_buffer.get_last_target_weight_already_generated.remote()
-            )
-
-            # Check if any target weight in our range needs generation
-            with self._generation_check_lock:
-                for target_weight in target_weights:
-                    if target_weight <= last_consumed_target:
-                        continue
-                    if target_weight in self._generating_targets:
-                        continue
-                    trajectories_needed = ray.get(
-                        self.replay_buffer.get_trajectories_needed.remote(
-                            target_weight, num_prompts, max_age_steps
-                        )
-                    )
-                    if trajectories_needed > 0:
-                        return False  # Found a target that needs generation
-
-            print(
-                f"⏸️ All target weights {target_weights} already generated or in progress, pausing"
-            )
-            return True
-        except Exception:
-            return False
+        """Capacity reservations provide the only generation backpressure."""
+        return False
 
     def start_collection(self, dataloader: StatefulDataLoader) -> None:
         """Start collecting trajectories from dataloader."""
@@ -362,120 +335,93 @@ class AsyncTrajectoryCollector:
         self._next_nemo_gym_task_index += len(stamped_rows)
 
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
-        """Process a single batch and generate for one target weight."""
-        target_weight: Optional[int] = None
+        """Admit one bounded FIFO producer and start its persistent worker."""
+        reserved_groups = 0
         worker_started = False
         try:
-            generation_weight_version = self.current_weight_version
             num_generations = self.master_config.grpo.num_generations_per_prompt
             num_prompts_in_batch = batch.size
-            num_prompts_per_step = int(self.master_config.grpo.num_prompts_per_step)
-            max_age_steps = int(
-                self.master_config.grpo.async_grpo.max_trajectory_age_steps
-            )
-
-            # Get the next target weight that needs generation
-            target_weight = self._get_next_target_for_generation(
-                generation_weight_version
-            )
-
-            if target_weight is None:
-                print(
-                    f"🔄 No targets need generation for weight {generation_weight_version}"
-                )
-                return
-            reserved_target = target_weight
-
-            print(
-                f"🎯 Generating for target weight {reserved_target} from generation_weight_version {generation_weight_version}"
-            )
-
-            trajectories_needed = ray.get(
-                self.replay_buffer.get_trajectories_needed.remote(
-                    reserved_target, num_prompts_per_step, max_age_steps
-                )
-            )
-            num_prompts_to_generate = min(num_prompts_in_batch, trajectories_needed)
-            if num_prompts_to_generate == 0:
-                print(
-                    f"🔄 Target {reserved_target} already has enough trajectories, skipping"
-                )
-                self._release_target(reserved_target)
-                return
-
-            if num_prompts_to_generate < num_prompts_in_batch:
-                print(
-                    f"🎯 Gap-filling for target weight {reserved_target}: "
-                    f"generating {num_prompts_to_generate}/{num_prompts_in_batch} "
-                    f"prompts (need {trajectories_needed} more trajectories)"
-                )
-
-            # Generate all prompt groups needed for this target in one batched worker.
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
 
             use_nemo_gym = _should_use_nemo_gym(self.master_config)
 
-            if not self._refit_pause_cleared.is_set() and self.running:
-                with self._threads_lock:
-                    active_threads = len(self._inflight_threads)
-                print(
-                    "⏸️ Waiting for refit to complete before starting new "
-                    f"generation ({active_threads} threads still active)"
-                )
-                with self._efficiency_timer.time("idle/refit_event_wait"):
-                    self._refit_pause_cleared.wait()
-                generation_weight_version = self.current_weight_version
+            while self.running:
+                if not self._refit_pause_cleared.is_set():
+                    with self._efficiency_timer.time("idle/refit_event_wait"):
+                        self._refit_pause_cleared.wait()
+                    continue
 
-            rollout_batch = batch.slice(0, num_prompts_to_generate)
-            if use_nemo_gym:
-                self._stamp_nemo_gym_task_indices(rollout_batch)
-            repeated_batch = rollout_batch.repeat_interleave(num_generations)
-            # Compaction identity belongs to each logical generation replica,
-            # not only to the source prompt. Stamp it even when CC training is
-            # disabled so contract-v2 rollout IDs remain unique and stable.
-            from nemo_rl.algorithms.grpo import (
-                _assign_context_compaction_generation_replica_indices,
-            )
-
-            _assign_context_compaction_generation_replica_indices(
-                repeated_batch,
-                num_generations_per_prompt=num_generations,
-            )
-
-            def _run_rollout_batch() -> None:
-                asyncio.run(
-                    self._run_rollout_batch_worker(
-                        repeated_batch=repeated_batch,
-                        generation_weight_version=generation_weight_version,
-                        target_weight_version=reserved_target,
-                        num_generations=num_generations,
-                        use_nemo_gym=use_nemo_gym,
+                with self._generation_check_lock:
+                    if not self._refit_pause_cleared.is_set():
+                        continue
+                    reserved_groups = ray.get(
+                        self.replay_buffer.reserve.remote(num_prompts_in_batch)
                     )
-                )
+                    if reserved_groups:
+                        generation_weight_version = self.current_weight_version
+                        admission_refit_epoch = self._refit_epoch
+                        rollout_batch = batch.slice(0, reserved_groups)
+                        if use_nemo_gym:
+                            self._stamp_nemo_gym_task_indices(rollout_batch)
+                        repeated_batch = rollout_batch.repeat_interleave(
+                            num_generations
+                        )
+                        from nemo_rl.algorithms.grpo import (
+                            _assign_context_compaction_generation_replica_indices,
+                        )
 
-            worker = _threading.Thread(target=_run_rollout_batch, daemon=True)
-            try:
-                with self._threads_lock:
-                    self._inflight_threads.add(worker)
-                worker.start()
-                worker_started = True
-            except Exception:
-                with self._threads_lock:
-                    self._inflight_threads.discard(worker)
-                raise
+                        _assign_context_compaction_generation_replica_indices(
+                            repeated_batch,
+                            num_generations_per_prompt=num_generations,
+                        )
+                        reservation_tracker = [reserved_groups]
+
+                        def _run_rollout_batch() -> None:
+                            asyncio.run(
+                                self._run_rollout_batch_worker(
+                                    repeated_batch=repeated_batch,
+                                    generation_weight_version=generation_weight_version,
+                                    target_weight_version=None,
+                                    num_generations=num_generations,
+                                    use_nemo_gym=use_nemo_gym,
+                                    reservation_tracker=reservation_tracker,
+                                    admission_refit_epoch=admission_refit_epoch,
+                                )
+                            )
+
+                        worker = _threading.Thread(
+                            target=_run_rollout_batch, daemon=True
+                        )
+                        with self._threads_lock:
+                            self._inflight_threads.add(worker)
+                        try:
+                            # Worker start is inside the atomic admission boundary.
+                            worker.start()
+                            worker_started = True
+                        except Exception:
+                            with self._threads_lock:
+                                self._inflight_threads.discard(worker)
+                            raise
+                        break
+
+                if not worker_started:
+                    with self._efficiency_timer.time("idle/buffer_full_backoff"):
+                        time.sleep(0.01)
+
+            if not worker_started:
+                return
 
             backend = "NeMo-Gym" if use_nemo_gym else "native"
             print(
-                f"📊 Started one {backend} batch worker for "
-                f"{num_prompts_to_generate} prompt groups at "
-                f"target_weight={reserved_target}"
+                f"📊 Started one {backend} FIFO worker for "
+                f"{reserved_groups} prompt groups at weight={generation_weight_version}"
             )
 
             self._cleanup_finished_threads()
 
         except Exception as e:
-            if target_weight is not None and not worker_started:
-                self._release_target(target_weight)
+            if reserved_groups and not worker_started:
+                ray.get(self.replay_buffer.release_reserved.remote(reserved_groups))
             print(f"❌ Error processing batch: {e}")
             import traceback
 
@@ -506,8 +452,12 @@ class AsyncTrajectoryCollector:
         start_time = time.time()
         print("🔄 Preparing for refit: pausing new generations...")
 
-        # Pause new generation starts
-        self._refit_pause_cleared.clear()
+        # Close admission while holding the same lock used to reserve capacity,
+        # capture the start weight, and start a worker. Once this returns, every
+        # in-flight worker was admitted before this refit snapshot.
+        with self._generation_check_lock:
+            self._refit_pause_cleared.clear()
+            self._refit_epoch += 1
         print("⏸️ New generation starts paused")
 
         # Check if we're using async engine
@@ -577,7 +527,8 @@ class AsyncTrajectoryCollector:
             except Exception as e:
                 print(f"⚠️ Failed to invalidate generation backend KV caches: {e}")
 
-        self._refit_pause_cleared.set()
+        with self._generation_check_lock:
+            self._refit_pause_cleared.set()
 
     def wait_for_pending_generations(self) -> None:
         """Wait for all in-flight generation threads to complete."""
@@ -792,9 +743,7 @@ class AsyncTrajectoryCollector:
                 ),
                 generation_policy_version=(
                     f"async-policy-weight-{generation_weight_version:08d}"
-                    if self.master_config.grpo.get(
-                        "context_compaction_training", {}
-                    ).get("enabled", False)
+                    if self.master_config.grpo.context_compaction_training.enabled
                     else None
                 ),
             ):
@@ -828,11 +777,13 @@ class AsyncTrajectoryCollector:
         self,
         repeated_batch: BatchedDataDict[DatumSpec],
         generation_weight_version: int,
-        target_weight_version: int,
+        target_weight_version: int | None,
         num_generations: int,
         use_nemo_gym: bool,
+        reservation_tracker: list[int] | None = None,
+        admission_refit_epoch: int | None = None,
     ) -> None:
-        """Own one target reservation while collecting its rollout batch."""
+        """Persist until an admitted rollout batch is committed or fails."""
         worker_start = time.perf_counter()
         try:
             await self._collect_rollout_batch(
@@ -841,6 +792,8 @@ class AsyncTrajectoryCollector:
                 target_weight_version=target_weight_version,
                 num_generations=num_generations,
                 use_nemo_gym=use_nemo_gym,
+                reservation_tracker=reservation_tracker,
+                admission_refit_epoch=admission_refit_epoch,
             )
         except Exception as error:
             self._efficiency_timer.record(
@@ -855,7 +808,13 @@ class AsyncTrajectoryCollector:
 
             traceback.print_exc()
         finally:
-            self._release_target(target_weight_version)
+            if reservation_tracker and reservation_tracker[0]:
+                await self.replay_buffer.release_reserved.remote(
+                    reservation_tracker[0]
+                )
+                reservation_tracker[0] = 0
+            if target_weight_version is not None:
+                self._release_target(target_weight_version)
             with self._threads_lock:
                 self._inflight_threads.discard(_threading.current_thread())
 
@@ -894,10 +853,12 @@ class AsyncTrajectoryCollector:
         self,
         rollout_result: RolloutGroupResult,
         generation_weight_version: int,
-        target_weight_version: int,
+        target_weight_version: int | None,
         expected_prompt_groups: int,
         buffered_group_indices: set[int],
         collection_started_at: float,
+        reservation_tracker: list[int] | None = None,
+        admission_refit_epoch: int | None = None,
     ) -> None:
         """Push one prompt group to the replay buffer with bounded backoff."""
         final_batch_cpu = rollout_result.final_batch.to("cpu")
@@ -935,13 +896,33 @@ class AsyncTrajectoryCollector:
         rollout_metrics["trajectory_duration_s"] = (
             time.perf_counter() - collection_started_at
         )
+        # The start version is captured atomically at admission. The end version
+        # is sampled conservatively at commit, so any refit crossed by a
+        # multi-turn rollout (or its enqueue wait) is marked mixed.
+        with self._generation_check_lock:
+            refits_crossed = (
+                max(0, self._refit_epoch - admission_refit_epoch)
+                if admission_refit_epoch is not None
+                else 0
+            )
+            end_weight_version = max(
+                self.current_weight_version,
+                generation_weight_version + refits_crossed,
+            )
         trajectory_group = {
             "batch": final_batch_cpu,
             "rollout_metrics": rollout_metrics,
             "timestamp": time.time(),
             "generation_weight_version": generation_weight_version,
-            "target_weight_version": target_weight_version,
+            "start_weight_version": generation_weight_version,
+            "end_weight_version": end_weight_version,
+            "mixed_weight_versions": (
+                end_weight_version != generation_weight_version
+                or refits_crossed > 0
+            ),
         }
+        if target_weight_version is not None:
+            trajectory_group["target_weight_version"] = target_weight_version
         if rollout_result.task_index is not None:
             trajectory_group[NEMO_GYM_TASK_INDEX_KEY] = rollout_result.task_index
 
@@ -953,8 +934,11 @@ class AsyncTrajectoryCollector:
                     trajectory_group,
                     generation_weight_version,
                     target_weight_version,
+                    reserved=reservation_tracker is not None,
                 )
                 if status == "success":
+                    if reservation_tracker is not None:
+                        reservation_tracker[0] -= 1
                     buffered_group_indices.add(rollout_result.group_index)
                     group_description = f"group_index={rollout_result.group_index}"
                     if rollout_result.task_index is not None:
@@ -963,7 +947,8 @@ class AsyncTrajectoryCollector:
                         )
                     print(
                         "📦 Buffered prompt group "
-                        f"({group_description}, target_weight={target_weight_version}) "
+                        f"({group_description}, start_weight={generation_weight_version}, "
+                        f"end_weight={end_weight_version}) "
                         f"[{len(buffered_group_indices)}/{expected_prompt_groups} buffered]"
                     )
                     return
@@ -991,9 +976,11 @@ class AsyncTrajectoryCollector:
         self,
         repeated_batch: BatchedDataDict[DatumSpec],
         generation_weight_version: int,
-        target_weight_version: int,
+        target_weight_version: int | None,
         num_generations: int,
         use_nemo_gym: bool,
+        reservation_tracker: list[int] | None = None,
+        admission_refit_epoch: int | None = None,
     ) -> None:
         """Run one backend batch and enqueue every completed prompt group."""
         collection_started_at = time.perf_counter()
@@ -1048,6 +1035,8 @@ class AsyncTrajectoryCollector:
                                 expected_prompt_groups=expected_prompt_groups,
                                 buffered_group_indices=buffered_group_indices,
                                 collection_started_at=collection_started_at,
+                                reservation_tracker=reservation_tracker,
+                                admission_refit_epoch=admission_refit_epoch,
                             )
                         )
                     )

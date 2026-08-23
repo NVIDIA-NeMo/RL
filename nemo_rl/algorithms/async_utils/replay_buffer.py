@@ -43,11 +43,14 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
         self.trajectories = []  # List[dict[str, Any]]
-        # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
-        self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
-        self.target_weight_versions = []  # it is the weight-version of the trainer where this trajectory will be used.
-
+        # Admission order is the scheduling order.  A version is the oldest
+        # weight that may have contributed tokens to the prompt group.
+        self.trajectory_versions = []
+        # Kept only to read/write older checkpoints and satisfy old diagnostics.
+        # It has no scheduling meaning.
+        self.target_weight_versions = []
         self.last_target_weight_already_generated = -1
+        self._reserved_slots = 0
         self._lock = _threading.Lock()
 
     @staticmethod
@@ -73,29 +76,50 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         self,
         trajectory: dict[str, Any],
         weight_version: int,
-        target_weight_version: int,
+        target_weight_version: int | None = None,
+        *,
+        reserved: bool = False,
     ) -> str:
-        """Add a per-prompt trajectory group with metadata.
-
-        Args:
-            trajectory: data dict
-            weight_version: version of the model weights used for generation
-            target_weight_version: version of the model weights this trajectory is intended for training
-        """
+        """Commit one complete prompt group at the FIFO tail."""
         with self._lock:
-            if len(self.trajectories) >= self.max_size:
+            if reserved:
+                if self._reserved_slots <= 0:
+                    raise RuntimeError("add(reserved=True) without a reserved slot")
+                self._reserved_slots -= 1
+            elif len(self.trajectories) + self._reserved_slots >= self.max_size:
                 return "full"
 
-            print("🔍 ReplayBuffer.add: Adding trajectory")
             self.trajectories.append(trajectory)
-            self.trajectory_versions.append(weight_version)
+            self.trajectory_versions.append(int(weight_version))
             self.target_weight_versions.append(target_weight_version)
-            # Do not advance last_target_weight_already_generated here. A target
-            # is only safe to skip once training consumes a complete batch for it.
-            print(
-                f"ReplayBuffer state: {len(self.trajectories)} groups, versions={self.trajectory_versions}, targets={self.target_weight_versions}, last_target_weight_already_generated={self.last_target_weight_already_generated}"
-            )
             return "success"
+
+    def reserve(self, num_prompt_groups: int) -> int:
+        """Atomically reserve FIFO capacity for admitted rollout workers."""
+        if num_prompt_groups < 0:
+            raise ValueError("num_prompt_groups must be non-negative")
+        if num_prompt_groups > self.max_size:
+            raise ValueError(
+                f"cannot reserve batch of {num_prompt_groups} groups in "
+                f"max_size={self.max_size} FIFO"
+            )
+        with self._lock:
+            available = self.max_size - len(self.trajectories) - self._reserved_slots
+            granted = num_prompt_groups if available >= num_prompt_groups else 0
+            self._reserved_slots += granted
+            return granted
+
+    def release_reserved(self, num_prompt_groups: int) -> None:
+        """Release capacity for admitted groups that did not complete."""
+        if num_prompt_groups < 0:
+            raise ValueError("num_prompt_groups must be non-negative")
+        with self._lock:
+            if num_prompt_groups > self._reserved_slots:
+                raise RuntimeError(
+                    f"cannot release {num_prompt_groups} slots; "
+                    f"only {self._reserved_slots} are reserved"
+                )
+            self._reserved_slots -= num_prompt_groups
 
     def get_debug_info(self) -> dict:
         """Get debug information about buffer state."""
@@ -104,6 +128,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             "trajectory_versions": self.trajectory_versions,
             "target_weight_versions": self.target_weight_versions,
             "max_size": self.max_size,
+            "reserved_slots": self._reserved_slots,
         }
         if self.trajectories:
             durations = []
@@ -186,12 +211,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         current_weight_version: int,
         max_age_steps: int,
     ) -> Optional[dict[str, Any]]:
-        """Sample per-prompt trajectory groups intended for the current training step.
-
-        Only returns trajectories with target_weight_version == current_weight_version.
-        If insufficient trajectories are available, returns None to stall training
-        until the remaining trajectories are generated. This ensures no trajectory
-        loses its last chance to be used for its intended training step.
+        """Consume one complete FIFO batch, evicting stale entries at the head.
 
         Returns:
             Dictionary with 'trajectories', 'avg_trajectory_age',
@@ -199,118 +219,30 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             or None if insufficient data.
         """
         with self._lock:
-            if not self.trajectories:
-                return None
+            min_valid_version = max(0, current_weight_version - max_age_steps)
+            evicted_stale_count = 0
+            while (
+                self.trajectory_versions
+                and self.trajectory_versions[0] < min_valid_version
+            ):
+                self._remove_indices([0])
+                evicted_stale_count += 1
 
             total_trajectories = len(self.trajectories)
-            print("🔍 ReplayBuffer sampling debug:")
-            print(f"   {current_weight_version=}, {max_age_steps=}")
-            print(f"   {self.trajectory_versions=}")
-
-            # For debugging: check for unexpected old trajectories
-            version_counts = Counter(self.trajectory_versions)
-            print(f"   {version_counts=}")
-
-            # Compute minimum valid version based on age window
-            # max_age_steps=1 means trajectories from the last 1 step are valid
-            min_valid_version = max(0, current_weight_version - max_age_steps)
-            print(f"   {min_valid_version=}")
-
-            # Evict old trajectories that are beyond the age window. This can
-            # happen after checkpoint restore when old trajectories remain.
-            old_indices = [
-                i
-                for i, v in enumerate(self.trajectory_versions)
-                if v < min_valid_version
-            ]
-            evicted_stale_count = len(old_indices)
-            if old_indices:
-                print(
-                    f"   Evicting {evicted_stale_count} stale trajectories "
-                    f"(version < {min_valid_version})"
-                )
-                self._remove_indices(old_indices)
-                total_trajectories = len(self.trajectories)
-
-            # Filter for valid trajectories without modifying the buffer
-            valid_indices = [
-                i
-                for i, v in enumerate(self.trajectory_versions)
-                if min_valid_version <= v <= current_weight_version
-            ]
-            print(
-                f"   valid_indices: {len(valid_indices)}/{total_trajectories} trajectories within age window"
-            )
-            if not valid_indices:
-                print("No trajectories available for sampling.")
+            if total_trajectories < num_prompt_groups:
                 return None
 
-            # Enforce exact number of groups if available; otherwise, signal to wait
-            if len(valid_indices) < num_prompt_groups:
-                print(
-                    f"Insufficient valid groups: have {len(valid_indices)}, need {num_prompt_groups}. Waiting for buffer to fill."
-                )
-                return None
-
-            # Only select trajectories intended for the current training step
-            # This ensures no trajectory loses its "last chance" to be used for its intended step
-            intended_indices = [
-                i
-                for i in valid_indices
-                if self.target_weight_versions[i] == current_weight_version
-            ]
-
-            print(
-                f"   🎯 Found {len(intended_indices)} trajectories intended for current step {current_weight_version}"
-            )
-
-            # Stall training if we don't have enough trajectories intended for this step
-            if len(intended_indices) < num_prompt_groups:
-                print(
-                    f"   ⏸️ STALLING: Need {num_prompt_groups} trajectories for step {current_weight_version}, but only {len(intended_indices)} are ready"
-                )
-                print(
-                    f"   ⏸️ Training will wait for remaining {num_prompt_groups - len(intended_indices)} trajectories to be generated"
-                )
-                return None
-
-            # Select exactly the trajectories intended for this step (FIFO within same target)
-            selected: list[int] = intended_indices[:num_prompt_groups]
-            print(
-                f"   ✅ Selected {len(selected)} trajectories all intended for step {current_weight_version}"
-            )
-
-            sampled_weights = [self.trajectory_versions[i] for i in selected]
+            selected = list(range(num_prompt_groups))
+            sampled_weights = self.trajectory_versions[:num_prompt_groups]
             avg_trajectory_age = current_weight_version - sum(sampled_weights) / len(
                 sampled_weights
             )
-            print(
-                f"✅ Selected counts by generation weight-version: {Counter(sampled_weights)}"
-            )
-            print(f"📊 Average trajectory age: {avg_trajectory_age:.2f} steps")
-            print(
-                f"🎯 All selected trajectories target step {current_weight_version} (100% target match)"
-            )
-
-            # Remove selected items in reverse order to maintain correct indices
-            sampled_items = [self.trajectories[i] for i in selected]
+            sampled_items = self.trajectories[:num_prompt_groups]
             self._remove_indices(selected)
 
-            old_last_target = self.last_target_weight_already_generated
             self.last_target_weight_already_generated = max(
                 self.last_target_weight_already_generated,
                 current_weight_version,
-            )
-            if self.last_target_weight_already_generated > old_last_target:
-                print(
-                    "Advanced last_target_weight_already_generated: "
-                    f"{old_last_target} -> "
-                    f"{self.last_target_weight_already_generated} "
-                    f"(consumed batch for step {current_weight_version})"
-                )
-
-            print(
-                f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {self.target_weight_versions}"
             )
 
             return {
@@ -331,13 +263,16 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             self.trajectories.clear()
             self.trajectory_versions.clear()
             self.target_weight_versions.clear()
+            self._reserved_slots = 0
 
     def state_dict(self) -> dict[str, Any]:
         """Return serializable state for checkpointing."""
         with self._lock:
             return {
+                "format_version": 2,
                 "trajectories": list(self.trajectories),
                 "trajectory_versions": list(self.trajectory_versions),
+                # Retained for checkpoint readers from the target-pinned era.
                 "target_weight_versions": list(self.target_weight_versions),
                 "last_target_weight_already_generated": (
                     self.last_target_weight_already_generated
@@ -352,29 +287,15 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         current_training_step: int | None = None,
         max_age_steps: int | None = None,
     ) -> None:
-        """Restore replay buffer state from a checkpoint.
+        """Restore FIFO order, migrating target-pinned checkpoints in place.
 
-        Args:
-            state: State returned by ``state_dict``.
-            num_prompts_per_step: Number of prompt groups required for one
-                training step. When provided, incomplete target steps can be
-                removed or prepared for gap filling.
-            current_training_step: Step being resumed. When provided with
-                ``num_prompts_per_step``, past target steps are dropped and
-                incomplete current/future target steps are kept for gap filling.
-            max_age_steps: Maximum allowed age for restored trajectories. When
-                provided, stale trajectories are removed during restore.
-
-        Raises:
-            ValueError: If the checkpoint is missing required fields or has
-                inconsistent parallel list lengths.
+        Legacy target versions are accepted but never used to reorder or select.
+        Staleness is intentionally evaluated only when the trainer dequeues.
         """
         with self._lock:
             required_keys = {
                 "trajectories",
                 "trajectory_versions",
-                "target_weight_versions",
-                "last_target_weight_already_generated",
             }
             missing_keys = required_keys - set(state)
             if missing_keys:
@@ -382,18 +303,19 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
             trajectories = list(state["trajectories"])
             trajectory_versions = list(state["trajectory_versions"])
-            target_weight_versions = list(state["target_weight_versions"])
-            if not (
-                len(trajectories)
-                == len(trajectory_versions)
-                == len(target_weight_versions)
-            ):
+            target_weight_versions = list(
+                state.get("target_weight_versions", [None] * len(trajectories))
+            )
+            if not len(trajectories) == len(trajectory_versions):
                 raise ValueError(
                     "Checkpoint has inconsistent replay buffer lengths: "
                     f"trajectories={len(trajectories)}, "
-                    f"trajectory_versions={len(trajectory_versions)}, "
-                    f"target_weight_versions={len(target_weight_versions)}"
+                    f"trajectory_versions={len(trajectory_versions)}"
                 )
+            if len(target_weight_versions) != len(trajectories):
+                # Old target metadata is dispensable.  Do not reject otherwise
+                # usable FIFO data because that parallel list was malformed.
+                target_weight_versions = [None] * len(trajectories)
 
             if "max_size" in state and state["max_size"] != self.max_size:
                 print(
@@ -405,30 +327,13 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             self.trajectories = trajectories
             self.trajectory_versions = trajectory_versions
             self.target_weight_versions = target_weight_versions
-            self.last_target_weight_already_generated = state[
-                "last_target_weight_already_generated"
-            ]
-
-            if current_training_step is not None and num_prompts_per_step is not None:
-                self._prepare_for_training_step(
-                    current_step=current_training_step,
-                    num_prompts_per_step=num_prompts_per_step,
-                )
-            elif num_prompts_per_step is not None and self.trajectories:
-                self._remove_incomplete_target_steps(num_prompts_per_step)
-
-            if max_age_steps is not None and self.trajectories:
-                self._remove_stale_trajectories(max_age_steps)
-                if current_training_step is None and num_prompts_per_step is not None:
-                    self._remove_incomplete_target_steps(num_prompts_per_step)
-
-            self._truncate_to_max_size(current_training_step)
-
-            print(
-                f"ReplayBuffer restored: {len(self.trajectories)} trajectories, "
-                "last_target_weight_already_generated="
-                f"{self.last_target_weight_already_generated}"
+            self.last_target_weight_already_generated = int(
+                state.get("last_target_weight_already_generated", -1)
             )
+            self._reserved_slots = 0
+            self._truncate_to_max_size()
+
+            print(f"ReplayBuffer restored: {len(self.trajectories)} FIFO groups")
 
     def _prepare_for_training_step(
         self, current_step: int, num_prompts_per_step: int
@@ -552,16 +457,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             f"Truncating restored buffer from {len(self.trajectories)} "
             f"to max_size={self.max_size}"
         )
-        if current_training_step is None:
-            indices_to_keep = list(
-                range(len(self.trajectories) - self.max_size, len(self.trajectories))
-            )
-        else:
-            prioritized_indices = sorted(
-                range(len(self.trajectories)),
-                key=lambda i: (self.target_weight_versions[i], i),
-            )
-            indices_to_keep = sorted(prioritized_indices[: self.max_size])
+        indices_to_keep = list(range(self.max_size))
 
         self.trajectories = [self.trajectories[i] for i in indices_to_keep]
         self.trajectory_versions = [
@@ -577,9 +473,9 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         num_prompts_per_step: int,
         max_age_steps: int | None = None,
     ) -> int:
-        """Return additional trajectories needed for ``target_step``."""
+        """Compatibility readiness helper for the unpinned FIFO queue."""
         with self._lock:
-            current_count = self._count_for_target(target_step, max_age_steps)
+            current_count = self._ready_fifo_count(target_step, max_age_steps)
             return max(0, num_prompts_per_step - current_count)
 
     def has_complete_batch(
@@ -588,10 +484,25 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         num_prompts_per_step: int,
         max_age_steps: int | None = None,
     ) -> bool:
-        """Return whether ``target_step`` has enough trajectories to train."""
+        """Return whether one complete FIFO batch can be consumed."""
         with self._lock:
-            current_count = self._count_for_target(target_step, max_age_steps)
+            current_count = self._ready_fifo_count(target_step, max_age_steps)
             return current_count >= num_prompts_per_step
+
+    def _ready_fifo_count(
+        self, current_weight_version: int, max_age_steps: int | None
+    ) -> int:
+        """Count entries after the stale prefix without mutating the queue."""
+        if max_age_steps is None:
+            return len(self.trajectories)
+        min_valid_version = max(0, current_weight_version - max_age_steps)
+        first_valid = 0
+        while (
+            first_valid < len(self.trajectory_versions)
+            and self.trajectory_versions[first_valid] < min_valid_version
+        ):
+            first_valid += 1
+        return len(self.trajectories) - first_valid
 
     def _remove_incomplete_target_steps(self, num_prompts_per_step: int) -> None:
         """Remove target steps without a complete batch.

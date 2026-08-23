@@ -265,6 +265,16 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
     }
+    # Ray can deserialize actor constructor arguments before actor-level
+    # env_vars have updated the worker process's import path. Transformers
+    # configs loaded with trust_remote_code are pickled by their generated
+    # ``transformers_modules.*`` class name, so publish that package at the
+    # job level and make it importable before any actor arguments are decoded.
+    hf_modules_cache = os.environ.get("HF_MODULES_CACHE")
+    if hf_modules_cache:
+        transformers_modules = os.path.join(hf_modules_cache, "transformers_modules")
+        if os.path.isfile(os.path.join(transformers_modules, "__init__.py")):
+            runtime_env["py_modules"] = [transformers_modules]
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
     # sort cvd to ensure consistent tag

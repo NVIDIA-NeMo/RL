@@ -22,15 +22,19 @@ class ReplayBufferProtocol(Protocol):  # pragma: no cover
         self,
         trajectory: dict[str, Any],
         weight_version: int,
-        target_weight_version: int,
+        target_weight_version: int | None = None,
+        *,
+        reserved: bool = False,
     ) -> str:
-        """Add a per-prompt trajectory group with metadata.
+        """Commit one complete prompt group to the FIFO tail."""
+        ...
 
-        Args:
-            trajectory: data dict
-            weight_version: version of the model weights used for generation
-            target_weight_version: version of the model weights this trajectory is intended for training
-        """
+    def reserve(self, num_prompt_groups: int) -> int:
+        """Reserve bounded queue capacity for admitted rollout work."""
+        ...
+
+    def release_reserved(self, num_prompt_groups: int) -> None:
+        """Release reservations for rollout work that did not complete."""
         ...
 
     def sample(
@@ -39,12 +43,7 @@ class ReplayBufferProtocol(Protocol):  # pragma: no cover
         current_weight_version: int,
         max_age_steps: int,
     ) -> Optional[dict[str, Any]]:
-        """Sample per-prompt trajectory groups intended for the current training step.
-
-        Only returns trajectories with target_weight_version == current_weight_version.
-        If insufficient trajectories are available, returns None to stall training
-        until the remaining trajectories are generated. This ensures no trajectory
-        loses its last chance to be used for its intended training step.
+        """Consume one complete prompt-group batch in FIFO order.
 
         Returns:
             Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data

@@ -1,0 +1,95 @@
+# Molt-style fully asynchronous OSWorld training on NeMo-RL + NeMo-Gym.
+#
+# NeMo-Gym remains the agent/runtime boundary and NeMo-RL remains the trainer.
+# A continuous rollout producer overlaps generation with optimization, while
+# weight-versioned replay and token-level IS filtering bound policy staleness.
+
+defaults: grpo_nemotron_omni_30ba3b_osworld_cc.yaml
+
+policy:
+  # TP8 x CP2 requires padding in 32-token units.
+  make_sequence_length_divisible_by: ${oc.decode:${oc.env:MOLT_SEQUENCE_LENGTH_DIVISOR,32}}
+  # The first logprob pass fills the frozen projected-image cache. Keep
+  # optimizer state off GPU during that one-time RADIO pass.
+  offload_optimizer_for_logprob: ${oc.decode:${oc.env:MOLT_OFFLOAD_OPTIMIZER_FOR_LOGPROB,true}}
+  megatron_cfg:
+    tensor_model_parallel_size: ${oc.decode:${oc.env:MOLT_TENSOR_PARALLEL_SIZE,8}}
+    pipeline_model_parallel_size: ${oc.decode:${oc.env:MOLT_PIPELINE_PARALLEL_SIZE,1}}
+    # EP=16 is used for the regular 2-train-node topology. A 2-node debug
+    # allocation (1 train + 1 inference) uses EP=8 so all expert groups fit
+    # within the single 8-GPU training node.
+    expert_model_parallel_size: ${oc.decode:${oc.env:MOLT_EXPERT_MODEL_PARALLEL_SIZE,16}}
+    # 48K multimodal trajectories exceed one H100's activation budget at
+    # CP=1. The regular two-trainer-node topology shards sequence activations
+    # across both nodes while preserving the full logical context.
+    context_parallel_size: ${oc.decode:${oc.env:MOLT_CONTEXT_PARALLEL_SIZE,2}}
+    # Match the official Nemotron Omni RL recipe: optimize the language policy
+    # while running the fixed sensory towers and projectors without autograd.
+    # This is required for long multi-image OSWorld traces; force_eval_mode
+    # alone does not freeze parameters or release their backward activations.
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    freeze_sound_encoder: true
+    freeze_sound_projection: true
+    optimizer:
+      # Keep the 48K multimodal activation budget on GPU by moving optimizer
+      # state to host memory for this long-context recipe.
+      optimizer_cpu_offload: ${oc.decode:${oc.env:MOLT_OPTIMIZER_CPU_OFFLOAD,false}}
+      optimizer_offload_fraction: ${oc.decode:${oc.env:MOLT_OPTIMIZER_OFFLOAD_FRACTION,1.0}}
+  generation:
+    # NeMo-RL async GRPO requires a persistent generation pool separate from
+    # the training workers. With three nodes this reserves one 8-GPU node for
+    # vLLM and leaves two nodes (16 ranks, matching EP=16) for Megatron.
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: ${oc.decode:${oc.env:GPUS_PER_NODE,8}}
+        num_nodes: ${oc.decode:${oc.env:MOLT_INFERENCE_NODES,1}}
+
+grpo:
+  adv_estimator:
+    # Molt's Omni recipe uses an ordinary prompt-group mean baseline followed
+    # by whitening over every eligible action token in the optimizer window.
+    name: reinforce_baseline
+  async_grpo:
+    enabled: true
+    # Molt's bounded producer/consumer payload queue.
+    async_queue_size: ${oc.decode:${oc.env:MOLT_ASYNC_QUEUE_SIZE,1}}
+    # Independently reject queued groups that have become too stale.
+    max_trajectory_age_steps: ${oc.decode:${oc.env:MOLT_MAX_STALENESS,1}}
+    # Publish each optimizer update without draining in-flight Gym episodes.
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+
+loss_fn:
+  # Correct pi_train / pi_rollout mismatch for stale asynchronous samples.
+  use_importance_sampling_correction: true
+  # Molt gates the complete logical rollout by the geometric mean behavior
+  # ratio. Surviving action tokens retain their raw token-level IS weights.
+  truncated_importance_sampling_type: seq-mask-tis
+  truncated_importance_sampling_ratio_min: ${oc.decode:${oc.env:MOLT_IS_RATIO_MIN,0.95}}
+  truncated_importance_sampling_ratio: ${oc.decode:${oc.env:MOLT_IS_RATIO_MAX,1.05}}
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  # Keep PPO's optimization ratio at one while independently correcting
+  # actor/rollout mismatch with the behavior-policy IS term above.
+  force_on_policy_ratio: true
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10.0
+  reference_policy_kl_penalty: 0.0
+
+checkpointing:
+  # Long OSWorld episodes can consume most of a Slurm segment per optimizer
+  # step. Save every completed step and retain only the newest useful states so
+  # a wall-time boundary neither loses progress nor recreates the prior
+  # multi-terabyte checkpoint accumulation.
+  save_period: ${oc.decode:${oc.env:CHECKPOINT_SAVE_PERIOD,1}}
+  keep_top_k: ${oc.decode:${oc.env:CHECKPOINT_KEEP_TOP_K,2}}
+  checkpoint_must_save_by: ${oc.env:OSWORLD_CHECKPOINT_MUST_SAVE_BY,00:03:40:00}
+
+logger:
+  log_dir: ${oc.env:OSWORLD_RESULTS_DIR,logs/osworld-cc-molt-async}
+  wandb:
+    group: ${oc.env:WANDB_GROUP,osworld-cc-molt-async}
+    name: ${oc.env:WANDB_RUN_NAME,osworld-cc-molt-async}

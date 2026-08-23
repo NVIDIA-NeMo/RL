@@ -49,6 +49,7 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -680,6 +681,79 @@ class MegatronPolicyWorkerImpl(
             return
         self.model.load_state_dict(extra_state, strict=False)
 
+    def _replace_raw_images_with_cached_embeddings(
+        self,
+        data: BatchedDataDict[Any],
+    ) -> bool:
+        """Use host projected features when every image in this DP=1 slice is cached."""
+        cache_keys = data.get("image_cache_keys")
+        raw_key = (
+            "pixel_values"
+            if "pixel_values" in data
+            else "images"
+            if "images" in data
+            else None
+        )
+        if not isinstance(cache_keys, PackedTensor) or raw_key is None:
+            return False
+
+        # Later PP stages never own RADIO. Still retain an empty multimodal
+        # marker so model_forward preserves the existing position_ids=None path.
+        if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+            data["image_embeddings"] = PackedTensor(
+                [None] * len(cache_keys),
+                dim_to_pack=0,
+            )
+        else:
+            from megatron.core.utils import unwrap_model
+
+            unwrapped = unwrap_model(self.model)
+            chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+            cache_owner = next(
+                (
+                    chunk
+                    for chunk in chunks
+                    if hasattr(chunk, "_vision_embedding_cache")
+                ),
+                None,
+            )
+            if cache_owner is None:
+                return False
+
+            row_embeddings: list[Optional[torch.Tensor]] = []
+            for row_keys in cache_keys.tensors:
+                if row_keys is None:
+                    row_embeddings.append(None)
+                    continue
+                embeddings = []
+                for encoded_key in row_keys:
+                    key = tuple(int(value) for value in encoded_key.tolist())
+                    cached = cache_owner._vision_embedding_cache.get(key)
+                    if cached is None:
+                        # Mixed raw/cached model input is intentionally
+                        # unsupported. Let the model fill every missing entry
+                        # from this raw batch during the low-memory pass.
+                        return False
+                    embeddings.append(cached)
+                row_embeddings.append(
+                    torch.cat(embeddings, dim=0) if embeddings else None
+                )
+            data["image_embeddings"] = PackedTensor(
+                row_embeddings,
+                dim_to_pack=0,
+            )
+
+        for key in (
+            "pixel_values",
+            "images",
+            "imgs_sizes",
+            "num_frames",
+            "vision_packed_seq_params",
+            "image_cache_keys",
+        ):
+            data.pop(key, None)
+        return True
+
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -702,6 +776,7 @@ class MegatronPolicyWorkerImpl(
             "check_dim_skip_keys is only supported by the v2 DTensor worker; "
             "Megatron does not run cross-tokenizer distillation."
         )
+        self._replace_raw_images_with_cached_embeddings(data)
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
@@ -1247,6 +1322,7 @@ class MegatronPolicyWorkerImpl(
         land in ``param.main_grad`` and per-microbatch metrics accumulate
         in the open-step state until ``finish_train_step`` surfaces them.
         """
+        self._replace_raw_images_with_cached_embeddings(data)
         state = self._assert_step_open()
         try:
             self._train_microbatch_body(state, data)
@@ -1603,6 +1679,7 @@ class MegatronPolicyWorkerImpl(
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        self._replace_raw_images_with_cached_embeddings(data)
         self.timer.start("get_logprobs")
         no_grad = torch.no_grad()
         no_grad.__enter__()

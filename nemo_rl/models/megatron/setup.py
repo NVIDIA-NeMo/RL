@@ -881,6 +881,20 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply performance optimization configuration."""
     model_cfg.parallel_output = True
 
+    # Frozen multimodal components are provider-level model settings. HF and
+    # checkpoint-derived providers carry their original values, so explicitly
+    # apply the NeMo-RL policy overrides before the provider builds the model.
+    # Without this bridge the config reports the towers as frozen while their
+    # parameters still require gradients.
+    for freeze_key in (
+        "freeze_vision_model",
+        "freeze_vision_projection",
+        "freeze_sound_encoder",
+        "freeze_sound_projection",
+    ):
+        if freeze_key in config["megatron_cfg"] and hasattr(model_cfg, freeze_key):
+            setattr(model_cfg, freeze_key, config["megatron_cfg"][freeze_key])
+
     # Activation checkpointing
     if config["megatron_cfg"]["activation_checkpointing"]:
         granularity = config["megatron_cfg"].get("recompute_granularity", "full")

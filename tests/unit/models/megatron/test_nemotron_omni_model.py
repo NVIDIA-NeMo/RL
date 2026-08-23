@@ -382,6 +382,112 @@ def test_nemotron_omni_parallel_forward_and_logprob_contract(
     distributed_test_runner(test_fn, world_size=world_size)
 
 
+def _run_frozen_projected_image_cache_contract(rank: int, world_size: int) -> None:
+    assert world_size == 2
+    os.environ["NEMOTRON_OMNI_VISION_CACHE_MAX_ENTRIES"] = "4"
+    model = _build_distributed_model(context_parallel_size=2)
+    model.eval()
+    core_model = model.module
+    core_model.freeze(
+        freeze_vision_model=True,
+        freeze_vision_projection=True,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    input_ids, lengths, images, image_sizes = _expanded_fixture(device)
+    processed = process_microbatch(
+        {"input_ids": input_ids, "input_lengths": lengths},
+        seq_length_key="input_lengths",
+        pad_individual_seqs_to_multiple_of=4,
+        pack_sequences=True,
+        model_slices_context_parallel_inputs=True,
+    )
+    cache_keys = torch.tensor([[11, 12], [21, 22]], dtype=torch.int64, device=device)
+
+    with torch.no_grad():
+        projected = core_model._encode_images(
+            images,
+            image_sizes,
+            None,
+            None,
+        )
+        raw_output = model(
+            input_ids=processed.input_ids_cp_sharded,
+            attention_mask=processed.attention_mask,
+            packed_seq_params=processed.packed_seq_params,
+            pixel_values=images,
+            imgs_sizes=image_sizes,
+        )
+        projected_output = model(
+            input_ids=processed.input_ids_cp_sharded,
+            attention_mask=processed.attention_mask,
+            packed_seq_params=processed.packed_seq_params,
+            image_embeddings=projected,
+        )
+        uncached_calls = 0
+        original_uncached_encode = core_model._encode_images_uncached
+
+        def tracked_uncached_encode(*args, **kwargs):
+            nonlocal uncached_calls
+            uncached_calls += 1
+            return original_uncached_encode(*args, **kwargs)
+
+        core_model._encode_images_uncached = tracked_uncached_encode
+        first_cached_output = model(
+            input_ids=processed.input_ids_cp_sharded,
+            attention_mask=processed.attention_mask,
+            packed_seq_params=processed.packed_seq_params,
+            pixel_values=images,
+            imgs_sizes=image_sizes,
+            image_cache_keys=cache_keys,
+        )
+        first_pass_calls = uncached_calls
+        second_cached_output = model(
+            input_ids=processed.input_ids_cp_sharded,
+            attention_mask=processed.attention_mask,
+            packed_seq_params=processed.packed_seq_params,
+            pixel_values=images,
+            imgs_sizes=image_sizes,
+            image_cache_keys=cache_keys,
+        )
+
+    torch.testing.assert_close(projected_output, raw_output, rtol=0, atol=0)
+    # The production model projects in BF16, making this bit-identical. This
+    # tiny test model projects in FP32, so its required host-BF16 cache incurs
+    # the expected one-time quantization.
+    torch.testing.assert_close(first_cached_output, raw_output, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(second_cached_output, raw_output, rtol=1e-2, atol=1e-2)
+    assert first_pass_calls == 2
+    assert uncached_calls == first_pass_calls
+    assert len(core_model._vision_embedding_cache) == 2
+    assert all(
+        value.device.type == "cpu" and value.dtype == torch.bfloat16
+        for value in core_model._vision_embedding_cache.values()
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        model(
+            input_ids=processed.input_ids_cp_sharded,
+            attention_mask=processed.attention_mask,
+            packed_seq_params=processed.packed_seq_params,
+            pixel_values=images,
+            image_embeddings=projected,
+            imgs_sizes=image_sizes,
+        )
+
+    del model, raw_output, projected_output, first_cached_output
+    del second_cached_output, projected
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.distributed.barrier()
+    parallel_state.destroy_model_parallel()
+
+
+def test_nemotron_omni_frozen_projected_image_cache_contract(
+    distributed_test_runner,
+):
+    distributed_test_runner(_run_frozen_projected_image_cache_contract, world_size=2)
+
+
 def _run_padded_multirow_attention_contract(rank: int, world_size: int) -> None:
     assert world_size == 2
     for variable in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
