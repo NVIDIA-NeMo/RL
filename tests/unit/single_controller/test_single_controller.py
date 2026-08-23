@@ -413,6 +413,7 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -479,6 +480,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=None)
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -539,6 +541,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -592,6 +595,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=None)
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -737,6 +741,7 @@ def _train_pump_controller(*, sampler) -> object:
         # is disabled.
         checkpointing={"enabled": False, "save_period": 10},
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._async_cfg = SimpleNamespace(
         min_groups_for_streaming_train=1,
         rollout_failure=SimpleNamespace(min_step_batch_fraction=0.9),
