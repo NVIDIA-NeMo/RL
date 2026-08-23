@@ -1,9 +1,0 @@
-# Data-plane observability e2e: real GRPO traffic through TransferQueue with
-# per-op metrics and the wire-in/wire-out hash guard both on. Short run --
-# the point is the data_plane/* series, not convergence.
-defaults: grpo-llama3.2-1b-instruct-1n8g-fsdp2tp1.v3.yaml
-data_plane:
-  enabled: true
-  observability:
-    enabled: true
-    verify_tensor_hash: true

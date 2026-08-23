@@ -82,23 +82,6 @@ def _patch_transformers_tokenizer_class_set():
                 pretrained_model_name_or_path, *args, **kwargs
             )
 
-    # Second defect in the same pinned range: ``TokenizersBackend._decode``
-    # reads ``clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output``
-    # whenever cleanup is enabled, but some builds never set it, so the first
-    # ``batch_decode`` of generated tokens raises AttributeError one step into
-    # a rollout. Supplying the class-level default transformers itself uses
-    # restores the intended behaviour -- BPE skips cleanup, everything else
-    # still gets it -- rather than disabling cleanup, which would change
-    # decoded text for WordPiece and Unigram models. Instances that do define
-    # the attribute shadow this, so it is inert on a fixed build.
-    from transformers.tokenization_utils_tokenizers import TokenizersBackend
-
-    _BPE_CLEANUP = (
-        "clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output"
-    )
-    if not hasattr(TokenizersBackend, _BPE_CLEANUP):
-        setattr(TokenizersBackend, _BPE_CLEANUP, False)
-
     AutoTokenizer.from_pretrained = _patched_from_pretrained
 
 
