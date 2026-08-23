@@ -158,9 +158,8 @@ def patched_factories():
             "create_weight_synchronizer",
             return_value=MagicMock(name="weight_sync"),
         ) as mock_weight_sync,
-        patch.object(
-            sc_setup_mod,
-            "_create_advantage_estimator",
+        patch(
+            "nemo_rl.algorithms.grpo._create_advantage_estimator",
             return_value=MagicMock(name="adv"),
         ) as mock_adv,
         patch.object(

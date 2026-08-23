@@ -29,6 +29,8 @@ class SetupTimingMetrics:
     generation_init_load_time_s: Optional[float] = None
 
     policy_init_time_s: Optional[float] = None
+    # PPO only: the critic shares the training GPUs, so it is built after the policy.
+    value_init_time_s: Optional[float] = None
     nemo_gym_init_time_s: Optional[float] = None
     collective_init_time_s: Optional[float] = None
     # Non-colocated megatron's post-init weight sync into the engine.
@@ -81,6 +83,9 @@ def print_setup_timing_summary(metrics: SetupTimingMetrics) -> None:
         print(f"  Generation init: {metrics.generation_init_time_s:.1f}s")
 
     print(f"  Policy init: {metrics.policy_init_time_s:.1f}s")
+
+    if metrics.value_init_time_s:
+        print(f"  Value init: {metrics.value_init_time_s:.1f}s")
 
     if metrics.nemo_gym_init_time_s:
         print(f"  NeMo-Gym init: {metrics.nemo_gym_init_time_s:.1f}s")

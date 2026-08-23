@@ -37,20 +37,22 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
-    _create_advantage_estimator,
     _get_effort_config,
     _get_grpo_save_state,
 )
-from nemo_rl.algorithms.grpo import MasterConfig as GrpoMasterConfig
+from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import MseValueLossFn
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
     print_setup_timing_summary,
 )
+from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
+    is_ppo_run,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.utils import set_seed
@@ -91,6 +93,7 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
@@ -126,6 +129,10 @@ class SingleControllerActorArgs:
     # serving backend set to it. Parameterized with the Impl class because the decorated
     # GenerationRouterActor name is an ActorClass instance, not a type.
     generation_router: Optional[ray.actor.ActorHandle[GenerationRouterImpl]] = None
+    # None on a GRPO run. Both are set together on the PPO path: the critic and
+    # the MSE loss it trains under.
+    value_handle: Optional[TQValue] = None
+    value_loss_fn: Optional[LossFunction] = None
 
 
 def _build_clusters(
@@ -313,6 +320,40 @@ def _build_trainer(
     return trainer, time.perf_counter() - t0
 
 
+def _build_value(
+    train_cluster: RayVirtualCluster,
+    master_config: MasterConfig,
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    weights_path: Optional[Path],
+    optimizer_path: Optional[Path],
+) -> tuple[TQValue, float]:
+    """Build the TQ-mediated PPO critic (driver-side TQValue).
+
+    Args:
+        train_cluster: Ray virtual cluster the critic shares with the trainer.
+        master_config: SC MasterConfig.
+        tokenizer: Tokenizer used by the value model.
+        weights_path: Checkpointed value weights to resume from, or None.
+        optimizer_path: Checkpointed value optimizer state to resume from, or None.
+
+    Returns:
+        A tuple of (TQValue critic, wall time spent in this call).
+    """
+    t0 = time.perf_counter()
+    value = TQValue(
+        cluster=train_cluster,
+        config=master_config.value,
+        tokenizer=tokenizer,
+        name_prefix="lm_value",
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
+        init_optimizer=True,
+        dp_cfg=master_config.data_plane,
+    )
+    return value, time.perf_counter() - t0
+
+
 def _spinup_gym(
     master_config: MasterConfig,
     base_urls: list[str],
@@ -383,11 +424,19 @@ def _clamp_max_num_steps(
 
 def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     """Set train_iters from max_num_steps after its dataloader clamp."""
+    max_num_steps = algo_config(master_config).max_num_steps
+
+    # policy
     policy_config = master_config.policy
-    if not policy_config.get("megatron_cfg", {}).get("enabled", False):
+    if policy_config.get("megatron_cfg", {}).get("enabled", False):
+        policy_config["megatron_cfg"]["train_iters"] = max_num_steps
+
+    # value
+    if not is_ppo_run(master_config):
         return
-    algo_cfg = algo_config(master_config)
-    policy_config["megatron_cfg"]["train_iters"] = algo_cfg.max_num_steps
+    value_config = master_config.value
+    if value_config.get("megatron_cfg", {}).get("enabled", False):
+        value_config["megatron_cfg"]["train_iters"] = max_num_steps  # type: ignore
 
 
 def _maybe_attach_fleet_health(
@@ -490,6 +539,20 @@ def _maybe_start_generation_router(generation: Any, master_config: MasterConfig)
     return router
 
 
+def _build_advantage_estimator(master_config: MasterConfig) -> Any:
+    """Build the advantage estimator from whichever algorithm's factory applies."""
+    if is_ppo_run(master_config):
+        # TODO(#2625): raw_reward passes this factory but yields no returns, so
+        # the critic train would then fetch a column nobody wrote.
+        from nemo_rl.algorithms.ppo import _create_advantage_estimator
+
+        return _create_advantage_estimator(cast(PPOMasterConfig, master_config))
+    else:
+        from nemo_rl.algorithms.grpo import _create_advantage_estimator
+
+        return _create_advantage_estimator(cast(GRPOMasterConfig, master_config))
+
+
 def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
     """Translate ``async_rl.rollout_failure`` into the rollout layer's policy object."""
     failure_config = master_config.async_rl.rollout_failure
@@ -570,6 +633,10 @@ def setup_single_controller(
     )
     save_state = _get_grpo_save_state(loaded_state)
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
+        last_checkpoint_path,
+        model_component="value",
+    )
 
     # ==========================
     # Setup Dataset & Environments
@@ -630,10 +697,47 @@ def setup_single_controller(
     # is disabled or NeMo-Gym is not in play -- it is Gym that needs one stable URL.
     generation_router = None
 
+    def _build_trainer_and_value() -> tuple[Any, Optional[TQValue], dict[str, float]]:
+        """Build the trainer, then the critic when this is a PPO run.
+
+        Serial, and with the trainer offloaded in between, because both worker
+        groups live on the same training GPUs: leaving the policy resident
+        while the critic loads is what OOMs a tight fit. The trainer comes back
+        to GPU before returning so callers see the same state GRPO leaves them.
+
+        Returns:
+            A tuple of (TQPolicy trainer, TQValue critic or None, per-phase wall
+            times keyed as "trainer_time" and "value_time").
+        """
+        time_metrics: dict[str, float] = {}
+        trainer, time_metrics["trainer_time"] = _build_trainer(
+            train_cluster,
+            master_config,
+            tokenizer,
+            processor,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+        )
+        if not is_ppo_run(master_config):
+            return trainer, None, time_metrics
+
+        trainer.offload_to_cpu()
+        value, time_metrics["value_time"] = _build_value(
+            train_cluster,
+            master_config,
+            tokenizer,
+            weights_path=value_weights_path,
+            optimizer_path=value_optimizer_path,
+        )
+        # Blocks on the critic's async Ray __init__, then parks it on CPU.
+        value.finish_training()
+        trainer.prepare_for_training()
+        return trainer, value, time_metrics
+
     def _build_generation_then_trainer(
         defer_generation_model_load: bool, generation=None
-    ) -> tuple[Any, Any, dict[str, float]]:
-        """Build generation then trainer serially.
+    ) -> tuple[Any, Any, Optional[TQValue], dict[str, float]]:
+        """Build generation then trainer (and critic) serially.
 
         Args:
             defer_generation_model_load: If True, generation is a pre-reserved handle and this call
@@ -641,8 +745,9 @@ def setup_single_controller(
             generation: Pre-reserved generation handle when defer_generation_model_load=True; None otherwise.
 
         Returns:
-            A tuple of (finalized generation object, TQPolicy trainer,
-            per-phase wall times keyed as "gen_time" and "trainer_time").
+            A tuple of (finalized generation object, TQPolicy trainer, TQValue
+            critic or None, per-phase wall times keyed as "gen_time",
+            "trainer_time" and "value_time").
         """
         time_metrics = {}
 
@@ -656,17 +761,11 @@ def setup_single_controller(
                 inference_cluster, master_config
             )
 
-        # trainer
-        trainer, time_metrics["trainer_time"] = _build_trainer(
-            train_cluster,
-            master_config,
-            tokenizer,
-            processor,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-        )
+        # trainer (+ critic when PPO)
+        trainer, value, train_side_metrics = _build_trainer_and_value()
+        time_metrics.update(train_side_metrics)
 
-        return generation, trainer, time_metrics
+        return generation, trainer, value, time_metrics
 
     if not use_nemo_gym and master_config.async_rl.generation_router.enabled:
         # The router exists to hand NeMo-Gym one URL; the native path calls generation
@@ -722,15 +821,7 @@ def setup_single_controller(
                 inference_cluster=inference_cluster,
                 master_config=master_config,
             )
-        build_tasks["trainer"] = partial(
-            _build_trainer,
-            train_cluster=train_cluster,
-            master_config=master_config,
-            tokenizer=tokenizer,
-            processor=processor,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-        )
+        build_tasks["trainer"] = _build_trainer_and_value
 
     # Submit build tasks and get results
     with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
@@ -738,14 +829,16 @@ def setup_single_controller(
         results = {k: f.result() for k, f in submitted.items()}
 
     if colocated:
-        generation, trainer, time_metrics = results["generation_trainer"]
+        generation, trainer, value, time_metrics = results["generation_trainer"]
         gen_load_time = time_metrics["gen_time"]
-        setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
     else:
         generation, gen_load_time = results["generation"]
-        trainer, trainer_time = results["trainer"]
-        setup_timing_metrics.policy_init_time_s = trainer_time
+        trainer, value, time_metrics = results["trainer"]
     setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
+
+    setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
+    if "value_time" in time_metrics:
+        setup_timing_metrics.value_init_time_s = time_metrics["value_time"]
 
     if use_nemo_gym:
         env_handles["nemo_gym"], gym_time = results["nemo_gym"]
@@ -783,10 +876,13 @@ def setup_single_controller(
     # ==========================
     # Setup Algorithm + Rollout Wiring
     # ==========================
-    advantage_estimator = _create_advantage_estimator(
-        cast(GrpoMasterConfig, master_config)
-    )
+    advantage_estimator = _build_advantage_estimator(master_config)
     loss_fn: LossFunction = ClippedPGLossFn(master_config.loss_fn)
+    value_loss_fn: Optional[LossFunction] = (
+        MseValueLossFn(master_config.value_loss_fn)  # type: ignore
+        if is_ppo_run(master_config)
+        else None
+    )
 
     pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
     tq_buffer = TQReplayBuffer(
@@ -812,7 +908,7 @@ def setup_single_controller(
             env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
         ),
         retry_policy=_build_retry_policy(master_config),
-        effort_config=_get_effort_config(cast(GrpoMasterConfig, master_config)),
+        effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
     )
 
     # Print setup timing metrics
@@ -840,5 +936,8 @@ def setup_single_controller(
         last_checkpoint_path=last_checkpoint_path,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,
+        # PPO extras
+        value_handle=value,
+        value_loss_fn=value_loss_fn,
     )
     return actor_args, setup_timing_metrics
