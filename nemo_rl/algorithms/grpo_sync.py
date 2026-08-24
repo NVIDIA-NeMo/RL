@@ -1482,6 +1482,10 @@ def grpo_train_sync(
                             and cadence_decision.update_requested
                         ),
                     )
+                    if cadence_decision is None:
+                        draft_config = master_config.policy.get("draft")
+                        if draft_config is not None and draft_config.enabled:
+                            pending_draft_refit_step = total_steps + 1
                 if sync_kv_scales:
                     with timer.time("recompute_kv_scales"):
                         print(
