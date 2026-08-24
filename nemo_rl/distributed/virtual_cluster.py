@@ -286,6 +286,14 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     If that cluster uses the same CUDA_VISIBLE_DEVICES or Slurm managed tag we will reuse it.
     Otherwise, we will detach and start a fresh local cluster.
 
+    Any process env var that must reach every worker (e.g. a backend engine
+    knob such as data_plane's) has to be set before this call, in the caller
+    — this function snapshots ``dict(os.environ)`` below into
+    ``runtime_env["env_vars"]``, which is the only point such a setting
+    becomes cluster-wide. See
+    :func:`~nemo_rl.data_plane.factory.maybe_configure_data_plane_env`, which
+    a data-plane-enabled launcher calls immediately before this one.
+
     Args:
         log_dir: Optional directory to store Ray logs and temp files.
     """
