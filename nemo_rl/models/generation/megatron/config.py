@@ -65,6 +65,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
     video_num_frames: NotRequired[int]
     video_temporal_patch_size: NotRequired[int]
     video_target_num_patches: NotRequired[int]
+    video_maintain_aspect_ratio: NotRequired[bool]
     multimodal_prompt_config: NotRequired[dict]
     megatron_inference_wrapper: NotRequired[str]
 
