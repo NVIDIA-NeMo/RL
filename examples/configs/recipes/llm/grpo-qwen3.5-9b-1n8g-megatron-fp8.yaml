@@ -1,0 +1,46 @@
+defaults: grpo-qwen3.5-9b-1n8g-megatron.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3.5-9b-1n8g-megatron-fp8
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+policy:
+  # Unlike the bf16 parent, train packed (dense FP8 microbatches; the FP8
+  # sequence alignment is carried by make_sequence_length_divisible_by below
+  # either way).
+  sequence_packing:
+    enabled: true
+  # Qwen3.5 self-packs sequences inside the model (delegate_pack_to_model),
+  # which bypasses the packing path's automatic FP8 padding — individual
+  # sequences must carry the TE alignment themselves: 8 (fwd product per TP
+  # shard) x TP4 = 32, which also covers the wgrad token dim (%16).
+  make_sequence_length_divisible_by: 32
+  megatron_cfg:
+    moe_router_dtype: fp32
+    freeze_config:
+      freeze_vision_model: true
+      freeze_vision_projection: true
+      freeze_language_model: false
+    fp8_cfg:
+      enabled: true
+    optimizer:
+      use_precision_aware_optimizer: false
+    env_vars:
+      NVTE_FP8_BLOCK_SCALING_FP32_SCALES: '1'
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 1
+      precision: fp8
+      use_deep_gemm: true
+      quantization_ignored_layer_kws:
+      - linear_attn.conv1d
+      - linear_attn.in_proj_a
+      - linear_attn.in_proj_b
+      - visual
+      env_vars:
+        VLLM_USE_RAY_V2_EXECUTOR_BACKEND: '0'
+logger:
+  wandb:
+    name: grpo-qwen3.5-9b-1n8g-megatron-fp8

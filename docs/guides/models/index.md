@@ -20,3 +20,10 @@ For the full list of supported models, see
 Other model-specific guides currently live directly under
 [Guides](../../index.md) (for example, [DeepSeek](../deepseek.md)) and are
 migrated into this hub as their guidance grows.
+
+```{toctree}
+:hidden:
+
+nemotron/index.md
+qwen/index.md
+```

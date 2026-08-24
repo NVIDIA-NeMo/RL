@@ -45,6 +45,7 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     get_topk_projection,
     localize_alignment,
     parse_projection_file,
+    slice_sparse_projection_cols,
     valid_chunk_mask,
 )
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
@@ -681,6 +682,7 @@ class XtokenShardTestActor:
     def run_tp(self):
         from nemo_rl.algorithms.x_token.loss_utils import (
             project_student_to_teacher_vocab,
+            slice_sparse_projection_cols,
         )
         from nemo_rl.distributed.model_utils import (
             vocab_parallel_argmax,
@@ -730,6 +732,21 @@ class XtokenShardTestActor:
             )
             ref = (full_probs.reshape(-1, Vs) @ m.to_dense()).reshape(B, T, Vt)
             torch.testing.assert_close(proj, ref, rtol=1e-4, atol=1e-4)
+
+            # Column-slicing the projection must compose with the per-rank ROW
+            # slice that project_student_to_teacher_vocab does internally: the
+            # two act on different axes. _compute_p_kl relies on this to
+            # produce only the top-k teacher columns instead of all V_t.
+            cols = torch.tensor([1, 3, 5], device="cuda")
+            proj_sliced = project_student_to_teacher_vocab(
+                full_probs[:, :, sl].contiguous(),
+                slice_sparse_projection_cols(m, cols),
+                tp_group=tp,
+            )
+            torch.testing.assert_close(
+                proj_sliced, ref[..., cols], rtol=1e-4, atol=1e-4
+            )
+            assert proj_sliced.shape == (B, T, cols.numel())
             return {"success": True, "error": None}
         except Exception:
             return {"success": False, "error": traceback.format_exc()}
@@ -835,3 +852,73 @@ def test_tp2cp1_sharded_helpers(register_actor):
 
 def test_tp1cp2_sharded_helpers(register_actor):
     _run(register_actor, tp_size=1, cp_size=2, method="run_cp")
+
+
+class TestSliceSparseProjectionCols:
+    """Column-slicing the projection must equal slicing the dense product.
+
+    ``_compute_p_kl`` relies on this: it folds the top-k column slice into the
+    sparse matrix instead of projecting all V_t columns and discarding most of
+    them. Every teacher column of ``M.t() @ p`` is an independent contraction
+    over the student axis, so the reorder is value-preserving.
+    """
+
+    @staticmethod
+    def _random_sparse(v_s: int, v_t: int, nnz: int, seed: int = 0):
+        generator = torch.Generator().manual_seed(seed)
+        dense = torch.zeros(v_s, v_t)
+        flat = torch.randint(0, v_s * v_t, (nnz,), generator=generator)
+        dense.view(-1)[flat] = torch.randn(flat.numel(), generator=generator)
+        return dense, dense.to_sparse_coo().coalesce()
+
+    def test_matches_dense_column_slice(self):
+        dense, sparse = self._random_sparse(40, 60, nnz=200)
+        cols = torch.tensor([3, 7, 11, 40, 59])
+
+        sliced = slice_sparse_projection_cols(sparse, cols).to_dense()
+
+        assert sliced.shape == (40, cols.numel())
+        assert torch.equal(sliced, dense[:, cols])
+
+    def test_projection_commutes_with_the_column_slice(self):
+        """slice-then-project == project-then-slice.
+
+        Not asserted bitwise: the two matmuls contract over the same values but
+        have different widths (V_t vs k), so BLAS is free to block and
+        accumulate them differently. The per-column accumulation *set* is what
+        is preserved, which is what makes the reorder legal.
+        """
+        generator = torch.Generator().manual_seed(3)
+        dense, sparse = self._random_sparse(40, 60, nnz=200, seed=1)
+        cols = torch.tensor([1, 2, 17, 33, 58])
+        student = torch.randn(5, 40, generator=generator)
+
+        project_then_slice = (student @ dense)[:, cols]
+        slice_then_project = (
+            student @ slice_sparse_projection_cols(sparse, cols).to_dense()
+        )
+
+        torch.testing.assert_close(
+            project_then_slice, slice_then_project, rtol=1e-6, atol=1e-6
+        )
+
+    def test_columns_with_no_entries_are_kept_as_zeros(self):
+        dense = torch.zeros(6, 10)
+        dense[0, 4] = 1.5
+        sparse = dense.to_sparse_coo().coalesce()
+        # column 9 has no entries at all
+        cols = torch.tensor([4, 9])
+
+        sliced = slice_sparse_projection_cols(sparse, cols).to_dense()
+
+        assert sliced.shape == (6, 2)
+        assert sliced[0, 0].item() == pytest.approx(1.5)
+        assert sliced[:, 1].abs().sum().item() == 0.0
+
+    def test_selecting_every_column_is_the_identity(self):
+        dense, sparse = self._random_sparse(12, 9, nnz=30, seed=2)
+        cols = torch.arange(9)
+
+        sliced = slice_sparse_projection_cols(sparse, cols).to_dense()
+
+        assert torch.equal(sliced, dense)
