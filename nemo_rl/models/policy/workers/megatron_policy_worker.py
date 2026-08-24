@@ -480,6 +480,9 @@ class MegatronPolicyWorkerImpl(
         self._refit_param_info_hf: Optional[
             dict[str, tuple[torch.Size, torch.dtype]]
         ] = None
+        self._mxfp8_prequant_scratch_cache: dict[
+            tuple[torch.device, torch.dtype], torch.Tensor
+        ] = {}
         # Pinned host staging for the reference-policy swap; only populated when
         # megatron_cfg["pinned_reference_swap"] is enabled. Buffer contents are
         # only live within a single use_reference_model call (every copy
@@ -2670,8 +2673,20 @@ class MegatronPolicyWorkerImpl(
 
         # Yield the original parameters first, MXFP8-quantizing on the trainer
         # when pre-quantized refit is enabled for the parameter.
-        for name, tensor in base_iter:
-            yield from self._maybe_prequantize_param(name, tensor)
+        if self._refit_prequant_names:
+            # Trainer workers only need this optional vLLM helper during MXFP8 refit.
+            from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+                iter_mxfp8_prequantized_params,
+            )
+
+            yield from iter_mxfp8_prequantized_params(
+                base_iter,
+                self._refit_prequant_names,
+                scratch_cache=self._mxfp8_prequant_scratch_cache,
+            )
+        else:
+            for name, tensor in base_iter:
+                yield from self._maybe_prequantize_param(name, tensor)
 
         if include_draft and self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
