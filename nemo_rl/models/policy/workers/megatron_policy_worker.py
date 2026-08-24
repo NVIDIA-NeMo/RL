@@ -1665,6 +1665,16 @@ class MegatronPolicyWorkerImpl(
             num_zeros_in_grad, mp_group=pg_collection.mp
         )
 
+        # Mirrors train(): without re-enabling the pre-hook __init__ removed, the
+        # param all-gather never runs and each forward sees only its own shard.
+        if self._first_train_step_forward_pre_hook_disabled and update_successful:
+            self.enable_forward_pre_hook()
+            get_model_config(
+                self.model
+            ).param_sync_func = self._first_train_step_param_sync_func
+            self._first_train_step_param_sync_func = None
+            self._first_train_step_forward_pre_hook_disabled = False
+
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
             torch.cuda.empty_cache()
 
