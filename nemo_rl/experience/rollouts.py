@@ -21,7 +21,7 @@ import json
 import statistics
 import warnings
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -54,7 +54,10 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
-from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
+from nemo_rl.environments.nemo_gym import (
+    DEFAULT_THINKING_TAGS,
+    get_pad_dynamic_image_shapes,
+)
 from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
@@ -77,6 +80,8 @@ TokenizerType = PreTrainedTokenizerBase
 def attach_initial_nemo_gym_image_payloads(
     batch: BatchedDataDict[DatumSpec],
     processor: Any,
+    *,
+    env_config: Mapping[str, Any],
 ) -> None:
     """Attach initial Gym image tensors once, before prompt repeat.
 
@@ -85,7 +90,17 @@ def attach_initial_nemo_gym_image_payloads(
     prompt batch, allowing ``repeat_interleave(..., share_immutable_media=True)``
     to retain one physical processor output per prompt. Flag-off runs never call
     this helper.
+
+    Takes ``master_config.env`` and resolves ``pad_dynamic_image_shapes``
+    itself, mirroring the per-turn attach inside the NeMo-Gym actor. Resolving
+    here rather than at each call site means a caller cannot supply the wrong
+    value -- the divergence between the two attach paths that this helper
+    previously had. The flag only matters for a turn carrying more than one
+    image at differing resolutions, where the processor returns a ragged CHW
+    list; without it the processor is asked to stack those and raises before
+    the shapes are read.
     """
+    pad_dynamic_image_shapes = get_pad_dynamic_image_shapes(env_config)
     for message_log, extra_env_info in zip(
         batch["message_log"], batch["extra_env_info"]
     ):
@@ -114,6 +129,7 @@ def attach_initial_nemo_gym_image_payloads(
             user_message,
             images=images,
             processor=processor,
+            pad_dynamic_image_shapes=pad_dynamic_image_shapes,
         )
 
 
@@ -183,20 +199,41 @@ def _reattach_original_multimodal_payloads(
     for result, original_log in zip(results, original_message_logs):
         if not result.pop("_initial_multimodal_data_omitted", False):
             continue
-        original_user_messages = [
-            message for message in original_log if message.get("role") == "user"
-        ]
-        for log_key in ("input_message_log", "message_log"):
-            target_log = result.get(log_key)
-            if not target_log:
-                continue
-            target_user_messages = [
-                message for message in target_log if message.get("role") == "user"
-            ]
-            for original, target in zip(original_user_messages, target_user_messages):
-                for key, value in original.items():
-                    if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
-                        target[key] = value
+        _reattach_static_multimodal_payloads_to_result(result, original_log)
+
+
+def _reattach_static_multimodal_payloads_to_result(
+    result: dict[str, Any],
+    source_message_log: list[dict[str, Any]],
+) -> None:
+    """Restore static media to each Gym-authored message-log representation."""
+    for log_key in ("input_message_log", "message_log"):
+        target_log = result.get(log_key)
+        if not target_log:
+            continue
+        attach_static_multimodal_payload(target_log, source_message_log)
+
+
+def attach_static_multimodal_payload(
+    target_message_log: list[dict[str, Any]],
+    source_message_log: list[dict[str, Any]],
+) -> None:
+    """Copy policy-ready media from static source turns to Gym-authored turns."""
+    source_users = [
+        message for message in source_message_log if message.get("role") == "user"
+    ]
+    target_users = [
+        message for message in target_message_log if message.get("role") == "user"
+    ]
+    if len(target_users) < len(source_users):
+        raise ValueError(
+            "Cannot attach static multimodal payload: Gym returned fewer user "
+            "turns than the source prompt."
+        )
+    for source, target in zip(source_users, target_users):
+        for key, value in source.items():
+            if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
+                target[key] = value
 
 
 def _add_r3_fallback_metrics(
@@ -2348,6 +2385,14 @@ async def run_async_nemo_gym_rollout(
         raise ValueError(
             "returns_entire_batch requires num_generations to equal the batch size"
         )
+    # Media is restored by row index: result[0] uses message_log[0], result[1]
+    # uses message_log[1], and so on. Reject mismatches instead of attaching a
+    # video's tensors to the wrong prompt.
+    original_message_logs = input_batch.get("message_log")
+    if original_message_logs is not None and len(original_message_logs) != len(
+        nemo_gym_rows
+    ):
+        raise ValueError("NeMo-Gym message-log count must match the rollout-row count")
 
     timer = Timer()
     timer_prefix = "timing/rollout"
@@ -2411,16 +2456,16 @@ async def run_async_nemo_gym_rollout(
 
                 _tensorize_nemo_gym_result(result)
                 completed_group = accumulator.add(rowidx, result)
+                if original_message_logs is not None:
+                    _reattach_static_multimodal_payloads_to_result(
+                        result, original_message_logs[rowidx]
+                    )
+                    result.pop("_initial_multimodal_data_omitted", None)
                 if completed_group is not None:
                     group_input_batch = input_batch.slice(
                         completed_group.group_index * num_generations,
                         (completed_group.group_index + 1) * num_generations,
                     )
-                    if deduplicate_multimodal_data:
-                        _reattach_original_multimodal_payloads(
-                            completed_group.results,
-                            group_input_batch["message_log"],
-                        )
                     rollout_result = _postprocess_single_nemo_gym_group(
                         nemo_gym_rows=completed_group.rows,
                         results=completed_group.results,
