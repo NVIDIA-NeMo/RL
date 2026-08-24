@@ -190,7 +190,9 @@ def get_tokenizer(
         tokenizer = processor.tokenizer
     else:
         tokenizer = NeMoAutoTokenizer.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            **(tokenizer_config.get("tokenizer_kwargs") or {}),
         )
 
     if tokenizer.pad_token is None:

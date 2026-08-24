@@ -146,6 +146,18 @@ def test_get_tokenizer_custom_jinja_template(conversation_messages):
     assert formatted == expected
 
 
+def test_get_tokenizer_forwards_tokenizer_kwargs():
+    """Test get_tokenizer unpacks tokenizer_kwargs into from_pretrained."""
+    config = {
+        "name": "meta-llama/Llama-3.2-1B-Instruct",
+        "tokenizer_kwargs": {"use_fast": False},
+    }
+    tokenizer = get_tokenizer(config)
+    # use_fast=False produces the slow Python tokenizer; is_fast is True
+    # only for the HuggingFace fast (Rust-backed) variant.
+    assert not tokenizer.is_fast
+
+
 def test_maybe_pad_last_batch():
     """Test maybe_pad_last_batch function for various scenarios"""
     # Test case 1: No padding needed
