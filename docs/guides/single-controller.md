@@ -166,12 +166,14 @@ SC reads its async knobs from `async_rl:` and **requires `grpo.async_grpo: null`
 | *(no legacy equivalent — matches legacy `max_trajectory_age + 1` batches in flight)* | `max_inflight_prompts: num_prompts_per_step × (max_lookahead_versions + 1)` |
 | *(no legacy equivalent — legacy sizes its buffer to `num_prompts_per_step × max_trajectory_age_steps × 2`)* | `max_buffered_rollouts: num_prompts_per_step × (max_lookahead_versions + 1)` (tight; see the [Config → behavior map](#config--behavior-map) for per-sampler values) |
 
+Checkpointing carries over as-is: `checkpointing.enabled: true` works on SC. Alongside the usual training state, the checkpoint holds a `replay_buffer.pt` and the dataloader position, so a resumed run keeps rollouts that were committed but not yet trained on. The one constraint is `checkpointing.metric_name` — see [Known Missing Features](#known-missing-features).
+
 ## Known Missing Features
 
 The SC path is still under active development. Feature gaps are tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625). Notable items:
 
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
 - Generation backend: only vLLM is supported and validated; Megatron generation, SGLang, and TRT-LLM have not been tested on SC.
-- Checkpointing and validation are not yet supported (setup raises if enabled).
+- Validation is not yet supported: there is no validation loop, so `grpo.val_period` has no effect and only `train:<name>` metrics are collected. `checkpointing.metric_name` must therefore be `null` or a `train:` metric — `validate_single_controller_config` raises otherwise, since top-k checkpoint retention would silently degrade to a no-op on a `val:` metric.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported.
