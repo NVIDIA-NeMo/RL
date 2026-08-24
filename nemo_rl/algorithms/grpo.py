@@ -3653,6 +3653,19 @@ def grpo_train(
                 log_data["content"] = flat_messages["content"]
                 log_data["rewards"] = rewards.tolist()
                 if master_config.grpo.use_dynamic_sampling:
+                    # Every other field logged here (content, token_ids, ...)
+                    # reflects the filtered-and-sliced batch, so `rewards`
+                    # must stay row-aligned to it; `filtered_rewards` is kept
+                    # as an explicit alias rather than being deduplicated
+                    # away, since other tooling may key on its presence. The
+                    # true pre-filter reward (`this_round_unfiltered_rewards`,
+                    # used for metrics["reward"] below) is intentionally NOT
+                    # used here: it reflects only the most recent generation
+                    # batch, not the (possibly multi-round) accumulated and
+                    # sliced batch this log entry describes, so it is not
+                    # row-aligned with `content` and using it here would
+                    # raise inside log_batched_dict_as_jsonl whenever the two
+                    # sizes differ.
                     log_data["filtered_rewards"] = rewards.tolist()
                     log_data["rewards"] = repeated_batch["total_reward"].tolist()
                 log_data["input_lengths"] = input_lengths.tolist()

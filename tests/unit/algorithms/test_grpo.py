@@ -2084,27 +2084,52 @@ def test_dapo_dynamic_sampling_cache_preserves_reward_alignment(
     )
 
 
-def test_grpo_train_reward_metric_uses_preserved_unfiltered_rewards():
-    """metrics["reward"] must keep reporting the pre-filter, per-round
-    reward, distinct from metrics["filtered_reward"].
+def test_grpo_train_this_round_unfiltered_rewards_usage():
+    """`this_round_unfiltered_rewards` must be used for exactly one thing:
+    `metrics["reward"]`. Not for `log_data["rewards"]`.
 
     Now that `dynamic_sampling` no longer overwrites `total_reward` on the
     returned batch with the unfiltered per-round reward (see
     test_dapo_dynamic_sampling_discard_slice_preserves_reward_alignment),
     `repeated_batch["total_reward"]` after the call is the *filtered*
-    reward. Sourcing metrics["reward"] from it directly would silently
-    make it identical to metrics["filtered_reward"], collapsing a
-    diagnostic that is supposed to show the raw generation quality
-    separately from the reward of the samples that end up training.
-    grpo_train builds this dict inline, so this test locks the literal in
-    place via source inspection rather than invoking the function, which
-    would require standing up rollout, policy, and generation actors.
+    reward, row-aligned with the samples that end up training. Two things
+    downstream read it under `use_dynamic_sampling`, with opposite needs:
+
+    - `metrics["reward"]` is a diagnostic deliberately distinct from
+      `metrics["filtered_reward"]` (raw generation quality vs. reward of
+      the trained samples), so it must keep reading the preserved
+      pre-filter reward instead, or it would silently collapse to the
+      same value as `metrics["filtered_reward"]`.
+    - `log_data["rewards"]` is logged row-for-row against `content` and
+      `token_ids`, which reflect the filtered-and-sliced batch, not the
+      single most recent generation batch `this_round_unfiltered_rewards`
+      holds. It must keep reading the filtered `total_reward`, or it would
+      raise inside `log_batched_dict_as_jsonl` whenever the two sizes
+      differ (over-generation or a multi-round accumulation).
+
+    grpo_train builds both of these inline, so this test locks the two
+    literals in place via source inspection rather than invoking the
+    function, which would require standing up rollout, policy, and
+    generation actors.
     """
     source = inspect.getsource(grpo_train)
     assert 'metrics["reward"] = this_round_unfiltered_rewards.numpy()' in source, (
         "grpo_train no longer sources metrics['reward'] from the reward "
         "captured before dynamic_sampling filtering; it would silently "
         "become identical to metrics['filtered_reward']"
+    )
+    # The training-data JSONL's `rewards` field must stay row-aligned with
+    # `content`/`token_ids`, which reflect the filtered-and-sliced batch, not
+    # the single most recent generation batch `this_round_unfiltered_rewards`
+    # holds. Using the latter here would raise inside
+    # log_batched_dict_as_jsonl whenever the two sizes differ (over-generation
+    # or a multi-round accumulation), rather than merely being a less useful
+    # diagnostic like the metrics-dict case above.
+    assert 'log_data["rewards"] = repeated_batch["total_reward"].tolist()' in source, (
+        "grpo_train's training-data JSONL no longer sources log_data['rewards'] "
+        "from the filtered total_reward; if it now reads "
+        "this_round_unfiltered_rewards instead, it will crash whenever that "
+        "tensor's length differs from the logged content's"
     )
 
 
