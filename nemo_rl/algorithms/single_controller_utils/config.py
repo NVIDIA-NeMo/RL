@@ -745,6 +745,14 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     reference_policy_kl_penalty = getattr(
         master_config.loss_fn, "reference_policy_kl_penalty", 0
     )
+
+    if reference_policy_kl_penalty < 0:
+        raise ValueError(
+            "loss_fn.reference_policy_kl_penalty="
+            f"{reference_policy_kl_penalty} must not be negative; "
+            "use 0 to disable the KL penalty."
+        )
+
     if (
         reference_policy_kl_penalty
         and master_config.grpo.skip_reference_policy_logprobs_calculation
@@ -759,7 +767,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
 
     if (
-        reference_policy_kl_penalty <= 0
+        reference_policy_kl_penalty == 0
         and not master_config.grpo.skip_reference_policy_logprobs_calculation
     ):
         print(
