@@ -398,6 +398,59 @@ On a GB300 node (RoCE, `mlx5_8`; `mlx5_17` present but with no active port):
 | real engine, GDR, mooncake defaults | FAIL, `ERR_CONTEXT` (-202) — the peermem route above |
 | real engine, GDR, DMA-BUF route | PASS — published base is a CUDA VA, every key returns `device=cuda` and byte-exact |
 
+### NVLink (MNNVL) is 40x RDMA, and register mode structurally cannot use it
+
+Measured on GB300, `tools/nvlink_crossnode.sbatch` + `tools/smoke_nvlink_normal_mode.py`:
+
+| Path | Warm bandwidth (512MB) |
+|---|---|
+| RDMA, point-to-point, best case | 18.2 GB/s |
+| RDMA, in situ during a real run | 0.6–3.9 GB/s (`peers=1` fan-out concentration) |
+| MNNVL NVLink, same node | **765 GB/s** |
+| MNNVL NVLink, cross node, same clique | **768 GB/s** |
+
+Cross-node costs nothing in steady state; the whole difference is first touch
+(76ms vs 6ms), which is `openSegment` + fabric handle import + address mapping,
+paid once per peer. Both nodes reported `CliqueId 3406`, `ClusterUUID
+cecca9d5-…`.
+
+Four facts govern whether this is reachable, and three of them are traps:
+
+1. **The transport is chosen by env var at install time, not by `protocol`.**
+   `transfer_engine_impl.cpp`: `MC_INTRANODE_NVLINK` → `nvlink_intra`; else
+   `MC_FORCE_MNNVL` or no HCAs → `nvlink`; else → `rdma`. Passing
+   `protocol="nvlink"` only swaps the *memory allocator*, which is why an early
+   run measured "nvlink" at RDMA speed. `nvlink_intra` is not compiled into the
+   pinned wheel — setting `MC_INTRANODE_NVLINK` fails engine init outright.
+2. **The fabric export needs `CU_MEM_HANDLE_TYPE_FABRIC` memory.**
+   `NvlinkTransport::allocatePinnedLocalMemory` builds buffers with
+   `cuMemCreate` + that handle type. Register mode registers whatever torch
+   allocated, and neither torch mode qualifies: the default caching allocator
+   uses `cudaMalloc` (no cuMem handle), and `expandable_segments` uses cuMem but
+   never requests a FABRIC handle. **So register mode cannot use NVLink at all**
+   — this is structural, not a misconfiguration.
+3. **Registration fails silently.** `registerLocalMemory` calls
+   `cuMemRetainAllocationHandle`, and when the memory did not come from
+   `cuMemCreate` it logs a warning and returns **0** — success, having published
+   nothing. The failure surfaces much later and on a different node as
+   `Requested address … not found!` → `batch_transfer_sync_read … status -1`.
+4. **`MC_FORCE_MNNVL` replaces RDMA rather than joining it.** A peer outside the
+   NVLink clique gets no path at all, not a slower one. `ENABLE_MULTI_PROTOCOL`
+   (comma-separated segments, per-buffer routing) is not compiled into the
+   pinned wheel, so there is no adaptive rdma/nvlink fallback to lean on.
+
+Also: `transfer_sync_read` returns **before** the copy completes on this path —
+unsynchronised repeats measured 0.00–0.02ms for 512MB. Any adopter must
+synchronise explicitly; this is a correctness issue, not just a benchmarking
+artifact.
+
+Consequence: adopting NVLink means moving sources into engine-allocated buffers
+(`allocate_managed_buffer`, which appears nowhere in the shipped code today),
+i.e. reintroducing the put-side copy register mode exists to avoid. It is a
+choice between the two, not a combination. At current payloads the data plane is
+0.12% of step time, so the case rests on headroom at larger scale rather than
+on today's throughput.
+
 ## Effort estimate (original, pre-implementation)
 
 Assumes someone fluent in both repos.

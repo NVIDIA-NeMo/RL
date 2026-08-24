@@ -28,24 +28,29 @@ from collections import defaultdict
 
 FIELD = re.compile(r"(\w+)=(\d+)")
 REPEATED = re.compile(r"repeated (\d+)x")
+CALL = re.compile(r"register_mode (put|get|clear): (.*)")
 
 
 def parse(path: str) -> tuple[dict[str, list[dict]], dict[str, int]]:
     calls: dict[str, list[dict]] = defaultdict(list)
     collapsed: dict[str, int] = defaultdict(int)
-    for line in open(path, errors="replace"):
-        m = re.search(r"register_mode (put|get|clear): (.*)", line)
-        if not m:
-            continue
-        op, rest = m.group(1), m.group(2)
-        row = {k: int(v) for k, v in FIELD.findall(rest)}
-        row["device"] = "cuda" if "device=cuda" in rest else (
-            "cpu" if "device=cpu" in rest else ""
-        )
-        rep = REPEATED.search(rest)
-        if rep:
-            collapsed[op] += int(rep.group(1)) - 1
-        calls[op].append(row)
+    with open(path, errors="replace") as handle:
+        for line in handle:
+            # Substring gate first: a driver log is millions of lines and only
+            # a few hundred match, so the regex should not see most of them.
+            if "register_mode " not in line:
+                continue
+            m = CALL.search(line)
+            if not m:
+                continue
+            op, rest = m.group(1), m.group(2)
+            row = {k: int(v) for k, v in FIELD.findall(rest)}
+            dev = re.search(r"device=(\w+)", rest)
+            row["device"] = dev.group(1) if dev else ""
+            rep = REPEATED.search(rest)
+            if rep:
+                collapsed[op] += int(rep.group(1)) - 1
+            calls[op].append(row)
     return calls, collapsed
 
 

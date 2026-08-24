@@ -91,13 +91,13 @@ def producer(protocol: str, device_name: str, mb: int, rows: int, out, gate) -> 
         meta = client.put(keys, views)
         put_ms = (perf_counter() - started) * 1e3
 
-        published = sum(int(e.get("size", 0)) for e in meta)
+        described = sum(int(e.get("size", 0)) for e in meta)
         out.put(
             {
                 "role": "producer",
                 "endpoint": client.endpoint,
                 "put_ms": put_ms,
-                "published_bytes": published,
+                "described_bytes": described,
                 "meta": meta,
                 "keys": keys,
                 "shape": (rows, elems),
@@ -204,11 +204,18 @@ def main() -> int:
             p.join(timeout=60)
         return 1
 
-    print(f"\nput:  {first['put_ms']:.2f}ms  published={first['published_bytes'] / 2**20:.1f} MB "
-          f"endpoint={first['endpoint']}")
-    if first["published_bytes"] == 0:
-        print("  WARNING: nothing published -- the fabric export path no-ops on "
-              "cudaMalloc memory; expect the get to fail")
+    # "described", not "published": this sums the sizes in *our* metadata, which
+    # says only that put built an entry per key. It cannot see whether Mooncake
+    # registered anything. Under MC_FORCE_MNNVL with the default allocator it
+    # read 64.0 MB on a run where NvlinkTransport's fabric export had published
+    # nothing at all (cuMemRetainAllocationHandle rejects cudaMalloc memory,
+    # logs a warning and returns 0), and the read then failed with status -1.
+    # Grep the engine log for "not allocated by cuMemCreate" to see that case;
+    # this number will not show it.
+    print(f"\nput:  {first['put_ms']:.2f}ms  described={first['described_bytes'] / 2**20:.1f} MB "
+          f"(our metadata, not proof of registration)  endpoint={first['endpoint']}")
+    if first["described_bytes"] == 0:
+        print("  WARNING: put produced no metadata at all")
 
     outcome = results.get(timeout=90)
     for p in procs:

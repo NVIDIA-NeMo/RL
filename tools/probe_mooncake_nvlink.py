@@ -58,16 +58,21 @@ def probe_symbols() -> None:
         print(f"  cannot import mooncake.engine: {exc}")
         return
     print(f"  module: {so}")
+    # One scan, then substring tests. This used to re-run `strings` per needle,
+    # five full passes over a large .so. USE_MNNVL is not in the needle list:
+    # it is a compile-time macro, never a string in the binary, so it always
+    # reported ABSENT -- a permanent false negative. probe_init() answers that
+    # question unambiguously instead.
+    try:
+        hit = subprocess.run(["strings", "-a", so], capture_output=True,
+                             text=True, timeout=120).stdout
+    except Exception as exc:  # noqa: BLE001
+        print(f"  strings failed: {exc}")
+        return
     for needle in ("NvlinkTransport", "IntraNodeNvlinkTransport",
                    "cudaIpcGetMemHandle", "cuMemExportToShareableHandle",
-                   "USE_MNNVL"):
-        try:
-            hit = subprocess.run(["strings", "-a", so], capture_output=True,
-                                 text=True, timeout=120).stdout
-            print(f"  {needle:32} {'present' if needle in hit else 'ABSENT'}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"  {needle:32} (strings failed: {exc})")
-            return
+                   "selectTransport route"):
+        print(f"  {needle:32} {'present' if needle in hit else 'ABSENT'}")
 
 
 def probe_init(protocol: str) -> None:
