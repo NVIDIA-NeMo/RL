@@ -360,6 +360,27 @@ class TestSGLangColocatedWeightSynchronizer:
         policy.update_weights_to_sglang_colocated.assert_not_called()
         assert sync.is_stale
 
+    def test_pause_failure_still_resumes_generation(self, mock_ray):
+        policy = _mock_policy()
+        gen = _mock_sglang_generation()
+        gen.pause_generation.side_effect = RuntimeError("pause failed")
+
+        with pytest.raises(RuntimeError, match="pause failed"):
+            SGLangColocatedWeightSynchronizer(policy, gen).sync_weights()
+
+        gen.continue_generation.assert_called_once()
+        policy.offload_after_refit.assert_called_once()
+
+    def test_prepare_failure_restores_policy_phase(self, mock_ray):
+        policy = _mock_policy()
+        gen = _mock_sglang_generation()
+        gen.prepare_for_generation.side_effect = RuntimeError("prepare failed")
+
+        with pytest.raises(RuntimeError, match="prepare failed"):
+            SGLangColocatedWeightSynchronizer(policy, gen).sync_weights()
+
+        policy.offload_after_refit.assert_called_once()
+
     def test_init_communicator(self, mock_ray):
         policy = _mock_policy()
         gen = _mock_sglang_generation()
@@ -476,17 +497,6 @@ class TestSGLangDisaggregatedWeightSynchronizer:
 
         with pytest.raises(ValueError, match="do not support kv_scales"):
             sync.sync_weights(kv_scales={"layer.0": 0.5})
-
-        gen.prepare_for_generation.assert_not_called()
-
-    def test_dtensor_policy_is_unsupported(self, mock_ray):
-        """Only Megatron implements the broadcast path; surface that, don't mask it."""
-        policy = _mock_policy()  # megatron_cfg.enabled = False
-        gen = _mock_sglang_generation()
-        sync = SGLangDisaggregatedWeightSynchronizer(policy, gen)
-
-        with pytest.raises(NotImplementedError, match="Megatron policy backend"):
-            sync.sync_weights()
 
         gen.prepare_for_generation.assert_not_called()
 
@@ -861,7 +871,7 @@ class TestFactory:
 
     def test_non_colocated_sglang_returns_sglang_disaggregated(self):
         """SGLang owns its own weight-update group, so no clusters are needed."""
-        policy = _mock_policy()
+        policy = _megatron_policy()
         gen = _mock_generation()
         sync = create_weight_synchronizer(
             policy=policy,
@@ -870,6 +880,17 @@ class TestFactory:
             colocated=False,
         )
         assert isinstance(sync, SGLangDisaggregatedWeightSynchronizer)
+
+    def test_non_colocated_sglang_rejects_dtensor_at_setup(self):
+        with pytest.raises(
+            NotImplementedError, match="Megatron policy backend.*issues/3745"
+        ):
+            create_weight_synchronizer(
+                policy=_mock_policy(),
+                generation=_mock_generation(),
+                generation_backend=SGLANG_BACKEND,
+                colocated=False,
+            )
 
     def test_non_colocated_missing_clusters_raises(self):
         policy = _mock_policy()

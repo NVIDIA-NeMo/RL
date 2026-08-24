@@ -135,8 +135,9 @@ class SGLangGeneration(GenerationInterface):
         if init_handles:
             ray.get(init_handles)
 
-        # Serializes weight refits against engine recovery across processes.
-        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+        # Serializes weight-update broadcasts. Engine recovery joins this lock
+        # when recovery support lands in #3613.
+        self.rollout_engine_lock = Lock.options(num_cpus=0, num_gpus=0).remote()
 
     # ------------------------------------------------------------------
     # Engine topology properties (formerly ``ServerGroup``)
@@ -166,10 +167,6 @@ class SGLangGeneration(GenerationInterface):
             self.gpu_offset + j * self.num_gpus_per_engine
             for j in range(len(self.engines))
         ]
-
-    def get_rollout_engine_urls(self) -> list[str]:
-        """Resolve node-0 engine HTTP base URLs once on the driver."""
-        return ray.get([e.get_base_url.remote() for e in self.rollout_engines])
 
     def _start_engines(
         self, port_cursors: dict[int, int] | None = None
@@ -362,13 +359,22 @@ class SGLangGeneration(GenerationInterface):
         ray.get([e.end_weight_update.remote() for e in engines])
 
     def shutdown(self) -> bool:
+        ok = True
         if self.weight_synchronizer is not None:
             # ``shutdown`` is reachable twice (explicit call + ``__del__``);
             # drop the handle so teardown stays one-shot.
             self.weight_synchronizer.shutdown()
             self.weight_synchronizer = None
 
-        ok = True
+        rollout_engine_lock = getattr(self, "rollout_engine_lock", None)
+        if rollout_engine_lock is not None:
+            try:
+                ray.kill(rollout_engine_lock)
+            except Exception as e:
+                logger.warning(f"Rollout-engine lock terminate failed: {e}")
+                ok = False
+            del self.rollout_engine_lock
+
         engines = [e for e in self.all_engines if e is not None]
         if engines:
             try:

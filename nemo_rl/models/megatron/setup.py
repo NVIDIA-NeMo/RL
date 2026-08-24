@@ -311,8 +311,21 @@ def destroy_parallel_state():
         pass
 
 
-def setup_distributed() -> None:
+def configure_refit_environment(config) -> None:
+    """Set the refit allocator mode before NCCL caches the value."""
+    generation_cfg = config.get("generation")
+    if generation_cfg is not None and not generation_cfg["colocated"]["enabled"]:
+        # Explicitly set NCCL_CUMEM_ENABLE for non-colocated refit.
+        # SGLang requires 0; the other refit communicators require 1.
+        # NCCL caches this process-wide at its first communicator creation, so
+        # set it before the training process group. See issue #564.
+        backend = generation_cfg["backend"]
+        os.environ["NCCL_CUMEM_ENABLE"] = "0" if backend == "sglang" else "1"
+
+
+def setup_distributed(config) -> None:
     """Handle NCCL settings, dtype mapping, and basic config setup."""
+    configure_refit_environment(config)
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles
     configure_dynamo_cache()
@@ -320,14 +333,6 @@ def setup_distributed() -> None:
     destroy_parallel_state()
     # Initialize process group
     torch.distributed.init_process_group("nccl")
-
-
-def configure_refit_environment(config) -> None:
-    """Set the refit allocator mode before NCCL caches the value."""
-    generation_cfg = config.get("generation")
-    if generation_cfg is not None and not generation_cfg["colocated"]["enabled"]:
-        backend = generation_cfg.get("backend")
-        os.environ["NCCL_CUMEM_ENABLE"] = "0" if backend == "sglang" else "1"
 
 
 def validate_and_set_config(

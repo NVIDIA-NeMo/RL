@@ -52,7 +52,8 @@ class Lock:
 
     def release(self):
         """Release the lock, allowing others to acquire."""
-        assert self._locked, "Lock is not acquired, cannot release."
+        if not self._locked:
+            raise RuntimeError("Lock is not acquired, cannot release.")
         self._locked = False
 
 

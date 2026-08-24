@@ -82,7 +82,6 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.megatron.setup import (
     build_inference_model,
-    configure_refit_environment,
     finalize_megatron_setup,
     handle_model_import,
     setup_distributed,
@@ -478,11 +477,8 @@ class MegatronPolicyWorkerImpl(
                 reserved_http_server_port
             )
 
-        # NCCL caches NCCL_CUMEM_ENABLE process-wide on first communicator init.
-        configure_refit_environment(config)
-
         # Step 1: Setup distributed
-        setup_distributed()
+        setup_distributed(config)
         log_gpu_memory_diagnostics(
             label="after_nccl_init", worker_type="MegatronPolicyWorker"
         )

@@ -129,6 +129,13 @@ def create_weight_synchronizer(
         #
         # SGLang owns its own weight-update process group, established
         # lazily on the first refit, so it needs neither cluster handle.
+        if not colocated and not policy.cfg["megatron_cfg"]["enabled"]:
+            raise NotImplementedError(
+                "Disaggregated SGLang weight synchronization is currently "
+                "supported only for the Megatron policy backend. See "
+                "https://github.com/NVIDIA-NeMo/RL/issues/3745."
+            )
+
         from nemo_rl.weight_sync.sglang_weight_synchronizer import (
             SGLangColocatedWeightSynchronizer,
             SGLangDisaggregatedWeightSynchronizer,

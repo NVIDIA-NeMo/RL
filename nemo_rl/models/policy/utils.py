@@ -588,6 +588,8 @@ def connect_colocate_topology(
     - ``worker_state["_ipc_gather_group"]``: ``ProcessGroup`` covering this
       trainer rank's engine, or ``None`` if the rank is a placeholder /
       not covered by any engine.
+    - ``worker_state["_ipc_gather_groups"]``: all subgroup handles created for
+      this layout, retained so a rebuild can destroy every live group.
     - ``worker_state["_ipc_gather_src"]``: the source rank inside the gather
       group (the first GPU index of the covering engine), or ``None``.
     - ``worker_state["_ipc_engine_index"]``: index into the caller's engine
@@ -615,8 +617,13 @@ def connect_colocate_topology(
     if worker_state.get("_ipc_layout_key") == layout_key:
         return
 
-    old_group = worker_state.get("_ipc_gather_group")
-    if old_group is not None:
+    old_groups = worker_state.get("_ipc_gather_groups")
+    if old_groups is None:
+        old_group = worker_state.get("_ipc_gather_group")
+        old_groups = [old_group] if old_group is not None else []
+    for old_group in old_groups:
+        if not isinstance(old_group, dist.ProcessGroup):
+            continue
         try:
             dist.destroy_process_group(old_group)
         except Exception:
@@ -626,6 +633,7 @@ def connect_colocate_topology(
 
     my_rank = dist.get_rank()
     new_group = None
+    new_groups = []
     new_src: Optional[int] = None
     new_engine_idx: Optional[int] = None
     for i, (offset, count) in enumerate(
@@ -633,12 +641,14 @@ def connect_colocate_topology(
     ):
         group_ranks = list(range(offset, offset + count))
         grp = dist.new_group(ranks=group_ranks, backend="gloo")
+        new_groups.append(grp)
         if my_rank in group_ranks:
             new_group = grp
             new_src = offset
             new_engine_idx = i
 
     worker_state["_ipc_gather_group"] = new_group
+    worker_state["_ipc_gather_groups"] = new_groups
     worker_state["_ipc_gather_src"] = new_src
     worker_state["_ipc_engine_index"] = new_engine_idx
     worker_state["_ipc_layout_key"] = layout_key
@@ -652,7 +662,10 @@ def _check_weight_sync_results(results: list) -> None:
         if isinstance(result, Mapping):
             success = result.get("success")
             error_msg = (
-                result.get("error_message") or result.get("error") or "unknown error"
+                result.get("error_message")
+                or result.get("error")
+                or result.get("message")
+                or "unknown error"
             )
         elif hasattr(result, "success"):
             success = result.success
@@ -1052,7 +1065,14 @@ def broadcast_hf_buckets_via_distributed_impl(
         dtypes = [tensor.dtype for _, tensor in bucket]
         shapes = [tensor.shape for _, tensor in bucket]
 
+        lock_timeout_s = 300
+        lock_deadline = _time.monotonic() + lock_timeout_s
         while not ray.get(rollout_engine_lock.acquire.remote()):
+            if _time.monotonic() >= lock_deadline:
+                raise TimeoutError(
+                    "Timed out after 300 seconds waiting for the SGLang "
+                    "rollout-engine lock."
+                )
             _time.sleep(0.1)
         try:
             refs = [

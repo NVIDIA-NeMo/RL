@@ -285,8 +285,10 @@ def validate_and_prepare_config(
             temperature=generation_cfg["temperature"],
         )
 
+    # Explicitly set NCCL_CUMEM_ENABLE for non-colocated refit.
+    # SGLang requires 0; the other refit communicators require 1. See issue #564.
+    # Keep the explicit ``is False`` guard: SFT/DPO have no generation config.
     if is_generation_colocated is False:
-        # SGLang uses CUMEM=0; other non-colocated refit communicators require 1.
         os.environ["NCCL_CUMEM_ENABLE"] = "0" if rollout_backend == "sglang" else "1"
 
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache

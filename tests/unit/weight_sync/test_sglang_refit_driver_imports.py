@@ -31,6 +31,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 REFIT_DRIVER_MODULES = (
+    "nemo_rl/models/generation/sglang/config.py",
     "nemo_rl/weight_sync/sglang_weight_synchronizer.py",
     "nemo_rl/weight_sync/factory.py",
 )
@@ -40,6 +41,34 @@ BACKEND_ONLY_ROOTS = frozenset({"megatron", "nemo_automodel", "transformer_engin
 POLICY_WORKER_MODULES = frozenset(
     {"megatron_policy_worker", "dtensor_policy_worker_v2"}
 )
+
+
+def test_refit_environment_is_configured_before_first_process_group() -> None:
+    """NCCL must see the refit allocator setting before its first communicator."""
+    path = REPO_ROOT / "nemo_rl/models/megatron/setup.py"
+    tree = ast.parse(path.read_text())
+    setup_distributed = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "setup_distributed"
+    )
+
+    configure_line = next(
+        node.lineno
+        for node in ast.walk(setup_distributed)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "configure_refit_environment"
+    )
+    init_process_group_line = next(
+        node.lineno
+        for node in ast.walk(setup_distributed)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "init_process_group"
+    )
+
+    assert configure_line < init_process_group_line
 
 
 @pytest.mark.parametrize("relative_path", REFIT_DRIVER_MODULES)

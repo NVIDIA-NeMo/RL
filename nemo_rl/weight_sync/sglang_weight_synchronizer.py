@@ -92,11 +92,8 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
         self._generation.prepare_refit_info(state_dict_info)
 
     def shutdown(self) -> None:
+        # Process groups live on policy/engine actors and are released with them.
         pass
-
-    @property
-    def _use_megatron(self) -> bool:
-        return bool(self._policy.cfg.get("megatron_cfg", {}).get("enabled", False))
 
     def _quantization_cfg(self) -> dict:
         return dict(self._generation.sglang_cfg["sglang_cfg"]["quantization"])
@@ -110,7 +107,6 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
         self,
         *,
         rollout_engines: list,
-        rollout_engine_lock,
         buffer_size_bytes: int,
         target_precision: str,
         sglang_quantization_cfg: dict,
@@ -137,7 +133,7 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
 
         (
             rollout_engines,
-            rollout_engine_lock,
+            _rollout_engine_lock,
             num_new_engines,
             engine_gpu_counts,
             engine_gpu_offsets,
@@ -152,12 +148,12 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
             self._generation.clear_updatable_num_new_engines()
 
         pause_mode = self._generation.pause_generation_mode
-        self._generation.pause_generation(mode=pause_mode)
         # Each acquired state gets its own guard: anything that raises between
         # pausing and the transfer -- invalidate_kv_cache or begin_weight_update
         # -- must still resume generation, or every engine stays paused for the
         # rest of the run with no error pointing at why.
         try:
+            self._generation.pause_generation(mode=pause_mode)
             if not self._generation.invalidate_kv_cache():
                 raise RuntimeError("SGLang KV cache invalidation failed before refit.")
 
@@ -169,7 +165,6 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
                 ray.get(
                     self._send_buckets(
                         rollout_engines=rollout_engines,
-                        rollout_engine_lock=rollout_engine_lock,
                         buffer_size_bytes=buffer_size_bytes,
                         target_precision=target_precision,
                         sglang_quantization_cfg=sglang_quantization_cfg,
@@ -229,7 +224,6 @@ class SGLangColocatedWeightSynchronizer(_SGLangWeightSynchronizer):
         self,
         *,
         rollout_engines: list,
-        rollout_engine_lock,
         buffer_size_bytes: int,
         target_precision: str,
         sglang_quantization_cfg: dict,
@@ -249,10 +243,10 @@ class SGLangColocatedWeightSynchronizer(_SGLangWeightSynchronizer):
     ) -> Optional[dict[str, float]]:
         self._reject_kv_scales(kv_scales)
         self._policy.offload_before_refit()
-        self._generation.prepare_for_generation(tags=["weights"])
 
         sync_succeeded = False
         try:
+            self._generation.prepare_for_generation(tags=["weights"])
             self._timed_refit(timer)
             sync_succeeded = True
         finally:
@@ -280,14 +274,13 @@ class SGLangDisaggregatedWeightSynchronizer(_SGLangWeightSynchronizer):
         self,
         *,
         rollout_engines: list,
-        rollout_engine_lock,
         buffer_size_bytes: int,
         target_precision: str,
         sglang_quantization_cfg: dict,
     ) -> list:
         return self._policy.update_weights_to_sglang_distributed(
             rollout_engines=rollout_engines,
-            rollout_engine_lock=rollout_engine_lock,
+            rollout_engine_lock=self._generation.rollout_engine_lock,
             buffer_size_bytes=buffer_size_bytes,
             target_precision=target_precision,
             sglang_quantization_cfg=sglang_quantization_cfg,
@@ -300,17 +293,10 @@ class SGLangDisaggregatedWeightSynchronizer(_SGLangWeightSynchronizer):
         kv_scales: Optional[dict[str, float]] = None,
     ) -> Optional[dict[str, float]]:
         self._reject_kv_scales(kv_scales)
-        if not self._use_megatron:
-            # Only Megatron implements the broadcast path; it depends on
-            # AutoBridge restoring full HF tensors on trainer rank 0.
-            raise NotImplementedError(
-                "Disaggregated SGLang weight synchronization is currently "
-                "supported only for the Megatron policy backend."
-            )
-        self._generation.prepare_for_generation(tags=["weights"])
 
         sync_succeeded = False
         try:
+            self._generation.prepare_for_generation(tags=["weights"])
             self._timed_refit(timer)
             sync_succeeded = True
         finally:

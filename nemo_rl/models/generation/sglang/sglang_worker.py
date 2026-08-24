@@ -355,17 +355,10 @@ class SGLangGenerationWorker:
         )
 
     def pause_generation(self, mode: str):
-        response = requests.post(
-            f"{self.server_base_url}/pause_generation",
-            json={"mode": mode},
-        )
-        response.raise_for_status()
-        return response
+        return self._make_request("pause_generation", {"mode": mode})
 
     def continue_generation(self):
-        response = requests.post(f"{self.server_base_url}/continue_generation", json={})
-        response.raise_for_status()
-        return response
+        return self._make_request("continue_generation", {})
 
     def begin_weight_update(self):
         """Open one engine-side session before the first refit bucket."""
