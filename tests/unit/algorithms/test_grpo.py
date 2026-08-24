@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ from nemo_rl.algorithms.grpo import (
     RewardScalingConfig,
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
+    _build_async_grpo_train_data,
     _apply_message_level_advantage_penalties,
     _get_grpo_save_state,
     _initial_grpo_save_state,
@@ -83,6 +85,7 @@ from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
     create_mock_batch,
+    create_mock_batch_with_responses,
 )
 
 
@@ -184,6 +187,115 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
+
+
+class TestBuildAsyncGrpoTrainData:
+    """positive_example_nll_weight (VAPO) reads data["rewards"] and silently
+    no-ops without it, so the async no-TQ train batch must carry the key."""
+
+    def _flat_messages(self, batch_size: int, seq_len: int) -> BatchedDataDict:
+        return BatchedDataDict(
+            {
+                "token_ids": torch.arange(
+                    batch_size * seq_len, dtype=torch.long
+                ).reshape(batch_size, seq_len),
+                "generation_logprobs": torch.zeros(batch_size, seq_len),
+                "token_loss_mask": torch.ones(batch_size, seq_len, dtype=torch.long),
+            }
+        )
+
+    def test_train_data_carries_rewards(self):
+        batch_size, seq_len = 4, 3
+        repeated_batch = create_mock_batch_with_responses(
+            num_samples=batch_size,
+            response_lengths=[seq_len] * batch_size,
+            initial_rewards=[1.0, 0.0, 1.0, 1.0],
+        )
+        flat_messages = self._flat_messages(batch_size, seq_len)
+
+        train_data = _build_async_grpo_train_data(
+            flat_messages,
+            input_lengths=torch.full((batch_size,), seq_len, dtype=torch.long),
+            repeated_batch=repeated_batch,
+            policy_config={"precision": "float32"},
+        )
+
+        assert "rewards" in train_data
+        assert torch.equal(train_data["rewards"], repeated_batch["total_reward"])
+
+    def test_rewards_row_matches_reward_hungry_loss_term(self):
+        """End-to-end: the key this function adds is exactly what
+        ClippedPGLossFn's VAPO term needs to activate."""
+        batch_size, seq_len = 4, 3
+        repeated_batch = create_mock_batch_with_responses(
+            num_samples=batch_size,
+            response_lengths=[seq_len] * batch_size,
+            initial_rewards=[1.0, 0.0, 1.0, 1.0],
+        )
+        flat_messages = self._flat_messages(batch_size, seq_len)
+        train_data = _build_async_grpo_train_data(
+            flat_messages,
+            input_lengths=torch.full((batch_size,), seq_len, dtype=torch.long),
+            repeated_batch=repeated_batch,
+            policy_config={"precision": "float32"},
+        )
+        train_data["advantages"] = torch.zeros(batch_size, seq_len)
+        train_data["prev_logprobs"] = -torch.rand(batch_size, seq_len)
+        train_data["reference_policy_logprobs"] = train_data["prev_logprobs"]
+        train_data["sample_mask"] = torch.ones(batch_size)
+
+        loss_fn = ClippedPGLossFn(
+            ClippedPGLossConfig(
+                reference_policy_kl_penalty=0.0,
+                positive_example_nll_weight=0.5,
+            )
+        )
+        _, metrics = loss_fn(
+            next_token_logprobs=train_data["prev_logprobs"][:, 1:],
+            data=train_data,
+            global_valid_seqs=train_data["sample_mask"].sum(),
+            global_valid_toks=(
+                train_data["token_mask"][:, 1:]
+                * train_data["sample_mask"].unsqueeze(-1)
+            ).sum(),
+        )
+
+        assert metrics["positive_nll_loss"] != 0.0
+
+
+def _extract_balanced_call(source: str, marker: str) -> str:
+    """Return `marker` plus everything up to its matching closing paren."""
+    start = source.index(marker)
+    depth = 0
+    for i in range(start, len(source)):
+        if source[i] == "(":
+            depth += 1
+        elif source[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return source[start : i + 1]
+    raise AssertionError(f"unbalanced parens after {marker!r}")
+
+
+def test_grpo_train_sync_train_data_carries_rewards():
+    """grpo_train's in-process training batch must expose data["rewards"].
+
+    ClippedPGLossFn's VAPO positive_example_nll_weight term reads
+    data["rewards"] and silently no-ops without it (see
+    TestBuildAsyncGrpoTrainData for the equivalent async-path test and the
+    end-to-end loss check). grpo_train builds this dict inline rather than
+    through an extracted, directly callable helper, so this test locks the
+    literal in place via source inspection instead of invoking the function,
+    which would require standing up rollout, policy, and generation actors.
+    """
+    source = inspect.getsource(grpo_train)
+    train_data_call = _extract_balanced_call(
+        source, "train_data = BatchedDataDict[ClippedPGLossDataDict]("
+    )
+    assert '"rewards"' in train_data_call, (
+        "grpo_train's train_data dict lost the 'rewards' key; "
+        "loss_fn.positive_example_nll_weight would silently no-op again"
+    )
 
 
 def test_initial_policy_generation_stale() -> None:
