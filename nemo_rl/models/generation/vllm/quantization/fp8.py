@@ -110,6 +110,9 @@ def monkey_patch_vllm_ray_executor(fp8_config):
 
                 return original_initialize_worker(self, *args, **kwargs)
 
+            # RayExecutorV2 creates ray.remote(RayWorkerProc) after this hook. Ray
+            # copies inherited methods onto its generated actor subclass and
+            # serializes it by value, so actors receive this driver-side replacement.
             RayWorkerProc.initialize_worker = patched_initialize_worker
             return
 
