@@ -745,6 +745,14 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     reference_policy_kl_penalty = getattr(
         master_config.loss_fn, "reference_policy_kl_penalty", 0
     )
+
+    if reference_policy_kl_penalty < 0:
+        raise ValueError(
+            "loss_fn.reference_policy_kl_penalty="
+            f"{reference_policy_kl_penalty} must not be negative; "
+            "use 0 to disable the KL penalty."
+        )
+
     if (
         reference_policy_kl_penalty
         and master_config.grpo.skip_reference_policy_logprobs_calculation
@@ -756,6 +764,16 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "computing them on the SingleController path. Set "
             "grpo.skip_reference_policy_logprobs_calculation=false, or set "
             "loss_fn.reference_policy_kl_penalty=0."
+        )
+
+    if (
+        reference_policy_kl_penalty == 0
+        and not master_config.grpo.skip_reference_policy_logprobs_calculation
+    ):
+        print(
+            "Reference policy logprob calculation will be skipped since "
+            "`loss_fn.reference_policy_kl_penalty` is 0, so no reference "
+            "model was initialized."
         )
 
     _validate_failure_settings(async_config, num_prompts_per_step)

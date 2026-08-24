@@ -158,6 +158,72 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     assert "transport=stub" not in output
 
 
+@pytest.mark.parametrize(
+    ("reference_policy_kl_penalty", "skip_reference_logprobs", "expected_required"),
+    [
+        (0.0, False, False),
+        (0.0, True, False),
+        (0.01, False, True),
+    ],
+)
+def test_reference_logprobs_required_only_when_kl_enabled(
+    monkeypatch,
+    tmp_path,
+    reference_policy_kl_penalty: float,
+    skip_reference_logprobs: bool,
+    expected_required: bool,
+) -> None:
+    """KL-disabled SingleController runs do not request reference logprobs."""
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    master_config = MasterConfig.model_construct(
+        policy={"train_global_batch_size": 8},
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=2,
+            num_generations_per_prompt=4,
+            skip_reference_policy_logprobs_calculation=skip_reference_logprobs,
+        ),
+        loss_fn=ClippedPGLossConfig(
+            force_on_policy_ratio=False,
+            reference_policy_kl_penalty=reference_policy_kl_penalty,
+        ),
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=1,
+            max_buffered_rollouts=4,
+        ),
+        logger={},
+        env={},
+        checkpointing=_checkpointing_config(tmp_path),
+    )
+    actor_args = SimpleNamespace(
+        partition_id="rollout_data",
+        dp_client=None,
+        gen_handle=None,
+        trainer_handle=None,
+        dataloader=None,
+        weight_synchronizer=FakeWeightSynchronizer(),
+        advantage_estimator=None,
+        loss_fn=None,
+        tq_buffer=None,
+        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        env_handles={},
+        fleet_monitor=None,
+        generation_router=None,
+        train_cluster=None,
+        inference_cluster=None,
+        save_state=_initial_grpo_save_state(),
+        last_checkpoint_path=None,
+    )
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+
+    controller = controller_cls(
+        master_config=master_config,
+        actor_args=actor_args,
+        setup_timing_metrics=SetupTimingMetrics(),
+    )
+
+    assert controller._reference_logprobs_required is expected_required
+
+
 def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
     """setup_timing_metrics is forwarded to Logger.log_metrics under timing/setup."""
     logger = MagicMock()
