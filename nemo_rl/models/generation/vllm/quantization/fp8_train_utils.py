@@ -135,17 +135,49 @@ def iter_mxfp8_prequantized_params(
     if scratch_cache is None:
         scratch_cache = {}
 
-    pending: dict[tuple[str, str], list[tuple[int, str, torch.Tensor]]] = {}
+    pending: dict[
+        tuple[str, str],
+        list[tuple[int, str, torch.Tensor, torch.cuda.Stream | None]],
+    ] = {}
     current_prefix: str | None = None
 
-    def quantize_one(name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    def yield_on_current_stream(
+        entries: Iterable[tuple[str, torch.Tensor]],
+        producer_stream: torch.cuda.Stream | None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        for output_name, output_tensor in entries:
+            if producer_stream is not None:
+                consumer_stream = torch.cuda.current_stream(output_tensor.device)
+                if consumer_stream != producer_stream:
+                    consumer_stream.wait_stream(producer_stream)
+                output_tensor.record_stream(consumer_stream)
+            yield output_name, output_tensor
+
+    def quantize_one(
+        name: str,
+        tensor: torch.Tensor,
+        source_stream: torch.cuda.Stream | None = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
         if tensor.dtype == torch.float8_e4m3fn:
             raise ValueError(
                 "MXFP8 prequantization requires BF16 trainer-exported weights; "
                 f"{name} is already stored as E4M3."
             )
+        producer_stream = (
+            torch.cuda.current_stream(tensor.device) if tensor.is_cuda else None
+        )
+        if (
+            producer_stream is not None
+            and source_stream is not None
+            and source_stream != producer_stream
+        ):
+            producer_stream.wait_stream(source_stream)
+            tensor.record_stream(producer_stream)
         value, scale = quantize_fn(tensor)
-        return [(name, value), (name + "_scale_from_checkpoint", scale)]
+        yield from yield_on_current_stream(
+            ((name, value), (name + "_scale_from_checkpoint", scale)),
+            producer_stream,
+        )
 
     def flush_group(
         group_key: tuple[str, str],
@@ -155,7 +187,7 @@ def iter_mxfp8_prequantized_params(
         while group:
             chunk = group[:max_experts_per_batch]
             del group[:max_experts_per_batch]
-            tensors = [tensor for _expert_id, _name, tensor in chunk]
+            tensors = [tensor for _expert_id, _name, tensor, _stream in chunk]
             batchable = len(chunk) > 1 and len({item[0] for item in chunk}) == len(
                 chunk
             )
@@ -169,8 +201,8 @@ def iter_mxfp8_prequantized_params(
                     for tensor in tensors
                 )
             if not batchable:
-                for _expert_id, name, tensor in chunk:
-                    yield from quantize_one(name, tensor)
+                for _expert_id, name, tensor, source_stream in chunk:
+                    yield from quantize_one(name, tensor, source_stream)
                 continue
 
             first = tensors[0]
@@ -179,10 +211,18 @@ def iter_mxfp8_prequantized_params(
                     "MXFP8 prequantization requires BF16 trainer-exported weights."
                 )
             required_numel = len(chunk) * first.numel()
+            stack_stream = (
+                torch.cuda.current_stream(first.device) if first.is_cuda else None
+            )
+            if stack_stream is not None:
+                for tensor, (_expert_id, _name, _tensor, source_stream) in zip(
+                    tensors, chunk
+                ):
+                    if source_stream is not None and source_stream != stack_stream:
+                        stack_stream.wait_stream(source_stream)
+                    tensor.record_stream(stack_stream)
             stream_id = (
-                int(torch.cuda.current_stream(first.device).cuda_stream)
-                if first.is_cuda
-                else None
+                int(stack_stream.cuda_stream) if stack_stream is not None else None
             )
             cache_key = (first.device, first.dtype, stream_id)
             scratch = scratch_cache.get(cache_key)
@@ -197,9 +237,7 @@ def iter_mxfp8_prequantized_params(
             with torch.no_grad():
                 torch.stack(tensors, dim=0, out=stacked)
 
-            producer_stream = (
-                torch.cuda.current_stream(first.device) if first.is_cuda else None
-            )
+            producer_stream = stack_stream
             value, scale = quantize_fn(stacked.view(-1, stacked.shape[-1]))
             value = value.view_as(stacked)
             scale_columns = first.shape[-1] // MXFP8_BLOCK_SIZE
@@ -209,19 +247,15 @@ def iter_mxfp8_prequantized_params(
                 else (*first.shape[:-1], scale_columns)
             )
             scale = scale.view(len(chunk), *scale_shape)
-            for index, (_expert_id, name, _tensor) in enumerate(chunk):
-                for output_name, output_tensor in (
+            entries = (
+                entry
+                for index, (_expert_id, name, _tensor, _stream) in enumerate(chunk)
+                for entry in (
                     (name, value[index]),
                     (name + "_scale_from_checkpoint", scale[index]),
-                ):
-                    if producer_stream is not None:
-                        consumer_stream = torch.cuda.current_stream(
-                            output_tensor.device
-                        )
-                        if consumer_stream != producer_stream:
-                            consumer_stream.wait_stream(producer_stream)
-                        output_tensor.record_stream(consumer_stream)
-                    yield output_name, output_tensor
+                )
+            )
+            yield from yield_on_current_stream(entries, producer_stream)
 
     def flush_pending() -> Iterator[tuple[str, torch.Tensor]]:
         while pending:
@@ -246,7 +280,10 @@ def iter_mxfp8_prequantized_params(
         current_prefix = prefix
         group_key = (prefix, projection)
         group = pending.setdefault(group_key, [])
-        group.append((int(match.group("expert_id")), name, tensor))
+        source_stream = (
+            torch.cuda.current_stream(tensor.device) if tensor.is_cuda else None
+        )
+        group.append((int(match.group("expert_id")), name, tensor, source_stream))
         if len(group) == max_experts_per_batch:
             yield from flush_group(group_key)
 
