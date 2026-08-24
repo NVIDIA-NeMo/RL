@@ -11,8 +11,7 @@ For the full list of supported models, see
 ## Families
 
 - **[GLM](glm/index.md)** — GLM-5.1 and GLM-5.2 GRPO recipes on the Megatron
-  backend, including 131K-token training, colocated and non-colocated vLLM, and
-  cuDNN or TileLang DSA kernels.
+  backend, colocated and non-colocated with vLLM.
 - **[Nemotron](nemotron/index.md)** — post-training recipes for Nemotron 3
   Nano, Nano Omni, Super, Ultra, and Nemotron 3.5 Lightning, spanning the
   Megatron and AutoModel backends.
