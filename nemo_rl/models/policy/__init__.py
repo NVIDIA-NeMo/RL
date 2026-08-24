@@ -606,3 +606,9 @@ class PolicyConfig(TypedDict):
     disable_modelopt_layer_spec: NotRequired[bool]
 
     is_vlm: NotRequired[bool]
+
+    # FQN of a worker extension class to use instead of the resolved default
+    # policy worker. Must be a subclass of the resolved worker and cannot be
+    # combined with quant_cfg. Its runtime environment must already be in
+    # ACTOR_ENVIRONMENT_REGISTRY.
+    worker_extension_cls_fqn: NotRequired[str | None]
