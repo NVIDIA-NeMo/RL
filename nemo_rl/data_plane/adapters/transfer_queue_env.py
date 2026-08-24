@@ -164,8 +164,10 @@ def _reject_nvlink_transport_env() -> None:
     with the default caching allocator mooncake logs ``not allocated by
     cuMemCreate`` and returns success having published nothing, so the reader
     fails with ``status -1`` much later and on another node; with
-    ``expandable_segments`` the read fails the same way, though no warning or
-    export failure is logged and the mechanism there is not established.
+    ``expandable_segments`` the memory *is* fabric-exportable, but mooncake
+    publishes the extent ``cuMemGetAddressRange`` reports -- for a VMM
+    suballocation that is the physical chunk (20 MiB of a 64 MiB tensor,
+    measured), so any read past it fails the reader's containment check.
     ``mooncake_cpu`` never reaches the branch at all: the store brings up its
     own transport pinned to ``protocol: rdma``.
 

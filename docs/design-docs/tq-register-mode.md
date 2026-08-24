@@ -423,6 +423,7 @@ column, so this understates both backends by the same construction.
 
 ### NVLink (MNNVL) is 40x RDMA, and register mode cannot reach it as it stands
 
+Wheel under test: `mooncake-transfer-engine-cuda13 == 0.3.11.post1`.
 Measured on GB300, `tools/nvlink_crossnode.sbatch` + `tools/smoke_nvlink_normal_mode.py`:
 
 | Path | Warm bandwidth (512MB) |
@@ -454,13 +455,35 @@ Four facts govern whether this is reachable, and three of them are traps:
      logs `Memory region ... is not allocated by cuMemCreate` and returns 0
      having published nothing, so the reader hits `Requested address ... not
      found!`.
-   - **`expandable_segments`** — also fails, mechanism **unverified**. The only
-     log line is the reader's `not found!`; there is no `cuMemCreate` warning
-     and no `cuMemExportToShareableHandle` / `cuMemImportFromShareableHandle` /
-     `cuMemAddressReserve` failure, so registration appears to have succeeded
-     and something later did not. A plausible reading is that torch's VMM
-     allocation never requests a FABRIC handle type, but that was inferred, not
-     observed, and has not been checked against the wheel's actual source.
+   - **`expandable_segments`** — fabric-exportable, and it still fails, for a
+     different and now *measured* reason. `tools/probe_fabric_export.py` runs
+     mooncake's own registration sequence against a torch tensor:
+
+     ```
+     torch 64MB expandable (ptr=0x640000000, 67108864 bytes)
+       cuMemRetainAllocationHandle -> 0 (CUDA_SUCCESS)
+       cuMemGetAddressRange_v2     -> 0 (CUDA_SUCCESS) base=0x640000000 size=20971520
+       export(FABRIC)              -> 0 (CUDA_SUCCESS)
+     ```
+
+     The memory *is* exportable — the earlier claim that torch "never requests
+     a FABRIC handle type" was wrong. What breaks is the published extent:
+     `registerLocalMemory` publishes `real_addr`/`real_size` from
+     `cuMemGetAddressRange`, which for a VMM-backed suballocation describes the
+     **physical chunk** (20 MiB) rather than the registered region (64 MiB). The
+     reader then requires `entry.addr <= dest && dest + len <= entry.addr +
+     entry.length`, so a get at +16 MiB asks for `0x641000000..0x641800000`
+     against a published end of `0x641400000` and fails with `not found!` — the
+     exact addresses seen in the e2e run.
+
+     Mooncake's own buffers escape this by accident: `cuMemGetAddressRange`
+     returns `CUDA_ERROR_NOT_FOUND` for them, which trips a fallback that
+     publishes the caller's full length. The call *succeeding* with a partial
+     range is what does the damage, because the fallback never fires.
+
+     Upstream-reportable: for VMM memory the registered region should be
+     published as `[addr, addr+length)` (or registered per chunk), not taken
+     from `cuMemGetAddressRange`.
 
    So: not reachable with torch-allocated sources as they are today. That is
    weaker than "impossible" — allocating register mode's sources through
@@ -471,14 +494,24 @@ Four facts govern whether this is reachable, and three of them are traps:
    `cuMemCreate` it logs a warning and returns **0** — success, having published
    nothing. The failure surfaces much later and on a different node as
    `Requested address … not found!` → `batch_transfer_sync_read … status -1`.
-4. **The store rejects `protocol=nvlink` outright.** Setting
+4. **The store and the engine have different protocol whitelists.**
+   `client_service.cpp` dispatches on `rdma`, `tcp`, `ascend`/`ubshmem`/
+   `sunrise_link`, `cxl`, `cxi`, `ub`, `nvlink_intra`, then falls through to
+   `unsupported_protocol`. Plain `nvlink` is not a case, even though the engine
+   installs it happily. The one NVLink protocol the store *does* accept,
+   `nvlink_intra`, is the transport this wheel does not compile
+   (`USE_INTRA_NVLINK=OFF`, confirmed: `MC_INTRANODE_NVLINK=1` gives
+   `Failed to install Intra-Node NVLink transport`). So the store supports an
+   NVLink protocol the wheel lacks, and the wheel provides one the store
+   rejects — two dead ends that do not overlap.
+5. **The store rejects `protocol=nvlink` outright.** Setting
    `data_plane.mooncake_cpu.protocol: nvlink` does reach mooncake — its log
    flips to `auto discovery is disabled for protocol: nvlink` — and it then
    refuses: `unsupported_protocol protocol=nvlink`, `Failed to initialize
    transfer engine`, retried 20 times, ending in `Mooncake store setup failed
    with error code: -1` before any segment is mounted. So the store cannot be
    moved off RDMA by configuration at all.
-5. **`MC_FORCE_MNNVL` replaces RDMA rather than joining it.** A peer outside the
+6. **`MC_FORCE_MNNVL` replaces RDMA rather than joining it.** A peer outside the
    NVLink clique gets no path at all, not a slower one. `ENABLE_MULTI_PROTOCOL`
    (comma-separated segments, per-buffer routing) is not compiled into the
    pinned wheel, so there is no adaptive rdma/nvlink fallback to lean on.
