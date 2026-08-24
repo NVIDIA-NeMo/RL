@@ -24,7 +24,7 @@ import time
 
 import pytest
 
-from nemo_rl.distributed.refit_watchdog import RefitAbortWatchdog
+from nemo_rl.distributed.refit_watchdog import RefitAborted, RefitAbortWatchdog
 
 
 class _FakeGroup:
@@ -86,6 +86,77 @@ class TestFires:
             time.sleep(0.4)
         assert guard.fired is True
         assert group.abort_calls == 1
+
+
+class TestAnEscapeAfterTheAbortIsNamedAsOne:
+    """Whatever a transport raises after its communicator is aborted must be RefitAborted.
+
+    Only ``StatelessProcessGroup.broadcast`` names the abort, and the nccl_reshard bulk
+    path never calls it -- it hands ``nccl_communicator`` straight to xferdtensor. So on
+    that transport an abort landing on any parameter but the last escaped as an unrelated
+    type, ``_sync_weights`` (which catches only ``RefitAborted`` and ``RayActorError``)
+    missed it, and the rebuild-and-retry never ran.
+    """
+
+    def test_an_attribute_error_after_the_abort_becomes_refit_aborted(self):
+        """The communicator is None post-abort, so the next use raises AttributeError."""
+        with pytest.raises(RefitAborted):
+            with RefitAbortWatchdog(_FakeGroup(), 0.05):
+                time.sleep(0.4)
+                raise AttributeError("'NoneType' object has no attribute 'split'")
+
+    def test_the_original_error_is_kept_as_the_cause(self):
+        """The abort is the cause; the transport error is still needed to diagnose it."""
+        original = AttributeError("'NoneType' object has no attribute 'send'")
+        with pytest.raises(RefitAborted) as caught:
+            with RefitAbortWatchdog(_FakeGroup(), 0.05):
+                time.sleep(0.4)
+                raise original
+        assert caught.value.__cause__ is original
+
+    def test_an_arbitrary_transport_error_is_translated_too(self):
+        """Stands in for nccl4py's NcclInvalid, which is not importable here."""
+
+        class NcclInvalid(RuntimeError):
+            pass
+
+        with pytest.raises(RefitAborted):
+            with RefitAbortWatchdog(_FakeGroup(), 0.05):
+                time.sleep(0.4)
+                raise NcclInvalid("communicator pointer was zeroed")
+
+    def test_a_refit_aborted_is_not_wrapped_in_another_one(self):
+        already = RefitAborted("named by broadcast")
+        with pytest.raises(RefitAborted) as caught:
+            with RefitAbortWatchdog(_FakeGroup(), 0.05):
+                time.sleep(0.4)
+                raise already
+        assert caught.value is already
+
+    def test_an_error_without_a_fired_deadline_passes_through(self):
+        """The guard must not relabel failures it had nothing to do with."""
+        with pytest.raises(ValueError, match="unrelated"):
+            with RefitAbortWatchdog(_FakeGroup(), 30.0) as guard:
+                raise ValueError("unrelated")
+        assert guard.fired is False
+
+    def test_a_disarmed_guard_never_translates(self):
+        with pytest.raises(ValueError, match="unrelated"):
+            with RefitAbortWatchdog(_FakeGroup(), None):
+                raise ValueError("unrelated")
+
+    def test_a_keyboard_interrupt_is_left_alone(self):
+        """Not a consequence of the abort, and relabelling it hides why we are exiting."""
+        with pytest.raises(KeyboardInterrupt):
+            with RefitAbortWatchdog(_FakeGroup(), 0.05):
+                time.sleep(0.4)
+                raise KeyboardInterrupt
+
+    def test_the_clean_return_still_reports_through_fired(self):
+        """No exception to translate, so the existing `if guard.fired:` sites still work."""
+        with RefitAbortWatchdog(_FakeGroup(), 0.05) as guard:
+            time.sleep(0.4)
+        assert guard.fired is True
 
 
 class TestDoesNotFire:

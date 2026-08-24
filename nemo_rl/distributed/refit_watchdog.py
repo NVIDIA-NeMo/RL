@@ -171,6 +171,37 @@ class RefitAbortWatchdog:
             self._thread.join(timeout=5.0)
             self._thread = None
 
+        # A refit is many operations. The abort releases the one in flight; a LATER one on
+        # the aborted group fails with whatever that transport happens to raise. Only
+        # StatelessProcessGroup.broadcast() names the abort, and the nccl_reshard bulk path
+        # never calls it -- it hands nccl_communicator straight to xferdtensor -- so the
+        # escape is an AttributeError (communicator now None) or an nccl4py NcclInvalid (a
+        # local bound before the abort, used after). _sync_weights catches only
+        # (RefitAborted, RayActorError), so the run died instead of rebuilding.
+        #
+        # Translated here rather than at each call site because this is the one boundary
+        # every escape must cross, and because a per-site check cannot see an abort that
+        # lands MID-call: _exchange_exact_overlaps binds the communicator into a parameter
+        # and uses it several statements later.
+        #
+        # Cannot fire spuriously: _fired is set only after the deadline elapsed and abort()
+        # ran. The `exc is None` path is untouched, so the existing `if guard.fired:` sites
+        # still raise their own more specific messages.
+        #
+        # Exception, not BaseException: a KeyboardInterrupt or SystemExit that happens to
+        # land inside a fired window is not a consequence of the abort, and relabelling it
+        # would hide the real reason the process is going away.
+        if (
+            self._fired
+            and isinstance(exc, Exception)
+            and not isinstance(exc, RefitAborted)
+        ):
+            raise RefitAborted(
+                "the refit was aborted after its "
+                f"{self._timeout_s}s deadline; the error below is a consequence of the "
+                "abort, not its cause"
+            ) from exc
+
 
 def hold_refit_for_fault_injection() -> None:
     """Block a refit receive while a test holds it open. Inert unless asked.
