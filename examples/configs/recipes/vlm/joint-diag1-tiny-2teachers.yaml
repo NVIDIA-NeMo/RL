@@ -24,6 +24,7 @@ grpo:
   max_num_steps: 200
   async_grpo:
     in_flight_weight_updates: false
+  deduplicate_multimodal_data: true
   adv_estimator:
     name: opd
 loss_fn:
