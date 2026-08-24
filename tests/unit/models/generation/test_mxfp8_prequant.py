@@ -387,6 +387,95 @@ def test_batched_expert_prequantization_waits_when_consumer_stream_changes():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_prequantization_fallback_waits_when_consumer_stream_changes():
+    from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
+
+    name = "model.layers.0.self_attn.q_proj.weight"
+    tensor = torch.full((2, 64), 7, device="cuda")
+
+    def delayed_quantize(input_tensor):
+        value = torch.empty_like(input_tensor)
+        torch.cuda._sleep(5_000_000)
+        value.copy_(input_tensor)
+        scale = torch.full(
+            (*input_tensor.shape[:-1], 2), 3, dtype=torch.uint8, device="cuda"
+        )
+        return value, scale
+
+    output = fp8_train_utils.iter_mxfp8_prequantized_params(
+        [(name, tensor)],
+        {name},
+        quantize_fn=delayed_quantize,
+    )
+    producer_stream = torch.cuda.Stream()
+    consumer_stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(producer_stream):
+        next(output)
+    with torch.cuda.stream(consumer_stream):
+        scale_name, scale = next(output)
+        observed = scale.clone()
+    consumer_stream.synchronize()
+
+    assert scale_name == name + "_scale_from_checkpoint"
+    assert torch.all(observed == 3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("second_up_shape", [(2, 64), (3, 64)])
+def test_batched_expert_prequantization_waits_for_pending_input_stream(
+    second_up_shape,
+):
+    from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
+
+    def expert_name(expert_id, projection):
+        return f"model.layers.0.mlp.experts.{expert_id}.{projection}_proj.weight"
+
+    def params():
+        yield expert_name(0, "gate"), torch.ones(2, 64, device="cuda")
+        delayed_up = torch.empty(2, 64, device="cuda")
+        torch.cuda._sleep(5_000_000)
+        delayed_up.fill_(7)
+        yield expert_name(0, "up"), delayed_up
+        yield expert_name(0, "down"), torch.ones(4, 32, device="cuda")
+        yield expert_name(1, "gate"), torch.full((2, 64), 2, device="cuda")
+        yield expert_name(1, "up"), torch.full(second_up_shape, 3, device="cuda")
+        yield expert_name(1, "down"), torch.full((4, 32), 4, device="cuda")
+
+    selected_names = {
+        expert_name(expert_id, projection)
+        for expert_id in range(2)
+        for projection in ("gate", "up", "down")
+    }
+    output = fp8_train_utils.iter_mxfp8_prequantized_params(
+        params(),
+        selected_names,
+        quantize_fn=lambda input_tensor: (
+            input_tensor.clone(),
+            torch.ones(
+                (*input_tensor.shape[:-1], input_tensor.shape[-1] // 32),
+                dtype=torch.uint8,
+                device="cuda",
+            ),
+        ),
+        max_experts_per_batch=2,
+    )
+    producer_stream = torch.cuda.Stream()
+    consumer_stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(producer_stream):
+        gate_entries = [next(output) for _ in range(4)]
+    with torch.cuda.stream(consumer_stream):
+        up_name, up_tensor = next(output)
+        observed = up_tensor.clone()
+    consumer_stream.synchronize()
+
+    assert len(gate_entries) == 4
+    assert up_name == expert_name(0, "up")
+    torch.testing.assert_close(observed, torch.full_like(observed, 7))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "is_gated,intermediate_size,hidden_size",
     [
