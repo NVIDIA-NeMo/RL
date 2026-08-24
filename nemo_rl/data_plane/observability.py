@@ -551,7 +551,7 @@ def _hash_deltas(hv: dict[str, int], prev_hv: dict[str, int]) -> dict[str, float
     """
     if not hv or not hv.get("rows_recorded"):
         return {}
-    deltas = {
+    deltas: dict[str, float] = {
         f"step/hash/{name}": hv[name] - prev_hv.get(name, 0)
         for name in (
             "rows_checked",
