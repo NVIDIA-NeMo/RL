@@ -2141,6 +2141,10 @@ def _build_async_grpo_train_data(
             "generation_logprobs": flat_messages["generation_logprobs"],
             "token_mask": flat_messages["token_loss_mask"],
             "sample_mask": repeated_batch["loss_multiplier"],
+            # Consumed by ClippedPGLossFn's VAPO positive-example NLL term
+            # (loss_fn.positive_example_nll_weight); without this key that
+            # term silently evaluates to zero regardless of the config.
+            "rewards": repeated_batch["total_reward"],
         }
     )
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
@@ -3169,6 +3173,15 @@ def grpo_train(
                             "generation_logprobs": flat_messages["generation_logprobs"],
                             "token_mask": flat_messages["token_loss_mask"],
                             "sample_mask": repeated_batch["loss_multiplier"],
+                            # Consumed by ClippedPGLossFn's VAPO positive-example
+                            # NLL term (loss_fn.positive_example_nll_weight);
+                            # without this key that term silently evaluates to
+                            # zero regardless of the config. `rewards` tracks
+                            # `repeated_batch` row-for-row here: dynamic sampling
+                            # has already filtered it above, and neither
+                            # overlong filtering nor the mask-sample filter below
+                            # drop rows, they only zero loss_multiplier.
+                            "rewards": rewards,
                         }
                     )
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
