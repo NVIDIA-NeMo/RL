@@ -889,17 +889,18 @@ class TestPPOWarmupCheckpoint:
         )
         return _ppo_save_actor(tmp_path, [])
 
-    def test_warmup_step_writes_no_policy_optimizer(self, actor):
-        asyncio.run(actor._save_checkpoint({}, is_policy_training_step=False))
+    @pytest.mark.parametrize("is_policy_training_step", [False, True])
+    def test_the_policy_optimizer_is_written_only_once_it_has_stepped(
+        self, actor, is_policy_training_step
+    ):
+        asyncio.run(
+            actor._save_checkpoint({}, is_policy_training_step=is_policy_training_step)
+        )
 
-        assert actor._trainer.save_kwargs["optimizer_path"] is None
-        # The critic trains from step 0, so its optimizer is still written.
+        written = actor._trainer.save_kwargs["optimizer_path"] is not None
+        assert written is is_policy_training_step
+        # The critic trains from step 0, so its optimizer is always written.
         assert actor._value.save_kwargs["optimizer_path"] is not None
-
-    def test_training_step_writes_the_policy_optimizer(self, actor):
-        asyncio.run(actor._save_checkpoint({}, is_policy_training_step=True))
-
-        assert actor._trainer.save_kwargs["optimizer_path"] is not None
 
     def test_warmup_step_skips_the_top_k_metric(self, actor):
         """No policy metrics exist yet, so the checkpoint just is not a candidate."""

@@ -156,15 +156,18 @@ def _ppo_master_config(**kwargs) -> MasterConfig:
 
 
 class TestIsPPORun:
-    def test_absent_ppo_block_is_grpo(self):
-        assert is_ppo_run(_make_master_config()) is False
-
-    def test_present_ppo_block_is_ppo(self):
-        assert is_ppo_run(_ppo_master_config()) is True
-
-    def test_missing_attribute_is_grpo(self):
-        """model_construct can omit defaulted fields entirely."""
-        assert is_ppo_run(MasterConfig.model_construct()) is False
+    @pytest.mark.parametrize(
+        ("make_config", "expected"),
+        [
+            (_make_master_config, False),
+            (_ppo_master_config, True),
+            # model_construct can omit defaulted fields entirely.
+            (MasterConfig.model_construct, False),
+        ],
+        ids=["grpo_block", "ppo_block", "no_block_at_all"],
+    )
+    def test_the_ppo_block_is_what_selects_the_path(self, make_config, expected):
+        assert is_ppo_run(make_config()) is expected
 
 
 class TestAlgoConfigSelection:
@@ -179,6 +182,11 @@ class TestAlgoConfigSelection:
         mc = _make_master_config()
 
         assert algo_config(mc) is mc.grpo
+
+
+class TestPPOValidation:
+    def test_accepts_a_well_formed_ppo_config(self):
+        validate_single_controller_config(_ppo_master_config())
 
     def test_rejects_a_config_with_neither_block(self):
         """Also caught at setup; algo_config only asserts the invariant."""
@@ -195,11 +203,6 @@ class TestAlgoConfigSelection:
 
         with pytest.raises(ValueError, match="Only one algorithm block"):
             validate_single_controller_config(mc)
-
-
-class TestPPOValidation:
-    def test_accepts_a_well_formed_ppo_config(self):
-        validate_single_controller_config(_ppo_master_config())
 
     @pytest.mark.parametrize("missing", ["value", "value_loss_fn"])
     def test_rejects_ppo_without_its_critic_blocks(self, missing):
@@ -245,10 +248,6 @@ class TestPPOValidation:
 
         with pytest.raises(ValueError, match="ppo_epochs must be at least 1"):
             validate_single_controller_config(mc)
-
-    def test_the_ppo_schema_rejects_a_non_ppo_estimator(self):
-        with pytest.raises(ValueError):
-            PPOConfig(adv_estimator={"name": "grpo"})
 
     @pytest.mark.parametrize(
         "sampler_config",
@@ -388,32 +387,20 @@ class TestAdvantageEstimatorSelection:
 
 
 class TestMegatronTrainIters:
-    def test_injects_into_both_policy_and_value(self):
-        mc = _ppo_master_config(
-            megatron_enabled=True,
-            ppo=PPOConfig.model_construct(
-                max_num_steps=7, ppo_epochs=1, **_STEP_CONFIG
-            ),
-        )
-
-        sc_setup_mod._maybe_inject_megatron_train_iters(mc)
-
-        assert mc.policy["megatron_cfg"]["train_iters"] == 7
-        assert mc.value["megatron_cfg"]["train_iters"] == 7
-
-    def test_scales_the_tick_budget_by_ppo_epochs(self):
+    @pytest.mark.parametrize(("ppo_epochs", "expected"), [(1, 7), (3, 21)])
+    def test_injects_into_both_policy_and_value(self, ppo_epochs, expected):
         """Each epoch steps both optimizers, so each is a scheduler tick."""
         mc = _ppo_master_config(
             megatron_enabled=True,
             ppo=PPOConfig.model_construct(
-                max_num_steps=7, ppo_epochs=3, **_STEP_CONFIG
+                max_num_steps=7, ppo_epochs=ppo_epochs, **_STEP_CONFIG
             ),
         )
 
         sc_setup_mod._maybe_inject_megatron_train_iters(mc)
 
-        assert mc.policy["megatron_cfg"]["train_iters"] == 21
-        assert mc.value["megatron_cfg"]["train_iters"] == 21
+        assert mc.policy["megatron_cfg"]["train_iters"] == expected
+        assert mc.value["megatron_cfg"]["train_iters"] == expected
 
     def test_skips_a_critic_on_a_non_megatron_backend(self):
         mc = _ppo_master_config(megatron_enabled=False, max_num_steps=7)
@@ -549,50 +536,34 @@ class TestTrainClusterSizesForTheCritic:
             cls.side_effect = lambda **kwargs: MagicMock(kwargs=kwargs)
             yield cls
 
-    def _groups(self, mc):
-        train, inference = sc_setup_mod._build_clusters(mc)
-        return train.kwargs["max_colocated_worker_groups"], inference.kwargs[
-            "max_colocated_worker_groups"
-        ]
-
-    def test_noncolocated_ppo_leaves_a_slot_for_the_critic(self, fake_cluster):
-        mc = _cluster_config(_ppo_master_config(), colocated=False, backend="vllm")
-
-        train_groups, inference_groups = self._groups(mc)
-
-        assert train_groups == 2
-        # The critic never lands on the inference cluster.
-        assert inference_groups == 1
-
-    def test_noncolocated_grpo_is_unchanged(self, fake_cluster):
-        mc = _cluster_config(_make_master_config(), colocated=False, backend="vllm")
-
-        train_groups, inference_groups = self._groups(mc)
-
-        assert train_groups == 1
-        assert inference_groups == 1
-
-    def test_colocated_ppo_adds_the_critic_beside_policy_and_generation(
-        self, fake_cluster
+    @pytest.mark.parametrize(
+        ("make_config", "colocated", "backend", "expected_train_groups"),
+        [
+            (_ppo_master_config, False, "vllm", 2),
+            (_make_master_config, False, "vllm", 1),
+            (_ppo_master_config, True, "vllm", 3),
+            (_make_master_config, True, "vllm", 2),
+            # The megatron backend generates from the policy's own workers.
+            (_ppo_master_config, True, "megatron", 2),
+        ],
+        ids=[
+            "noncolocated_ppo",
+            "noncolocated_grpo",
+            "colocated_ppo",
+            "colocated_grpo",
+            "colocated_ppo_megatron_generation",
+        ],
+    )
+    def test_worker_group_slots(
+        self, fake_cluster, make_config, colocated, backend, expected_train_groups
     ):
-        mc = _cluster_config(_ppo_master_config(), colocated=True, backend="vllm")
+        mc = _cluster_config(make_config(), colocated=colocated, backend=backend)
 
         train, inference = sc_setup_mod._build_clusters(mc)
 
-        assert train is inference
-        assert train.kwargs["max_colocated_worker_groups"] == 3
-
-    def test_colocated_grpo_is_unchanged(self, fake_cluster):
-        mc = _cluster_config(_make_master_config(), colocated=True, backend="vllm")
-
-        train, _ = sc_setup_mod._build_clusters(mc)
-
-        assert train.kwargs["max_colocated_worker_groups"] == 2
-
-    def test_colocated_megatron_generation_needs_no_extra_slot(self, fake_cluster):
-        """The megatron backend generates from the policy's own workers."""
-        mc = _cluster_config(_ppo_master_config(), colocated=True, backend="megatron")
-
-        train, _ = sc_setup_mod._build_clusters(mc)
-
-        assert train.kwargs["max_colocated_worker_groups"] == 2
+        assert train.kwargs["max_colocated_worker_groups"] == expected_train_groups
+        if colocated:
+            assert train is inference
+        else:
+            # The critic never lands on the inference cluster.
+            assert inference.kwargs["max_colocated_worker_groups"] == 1

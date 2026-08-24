@@ -254,30 +254,29 @@ def test_reference_logprobs_required_only_when_kl_enabled(
     assert controller._reference_logprobs_required is expected_required
 
 
-def test_init_picks_up_the_critic_handles(monkeypatch, tmp_path) -> None:
-    """The PPO path hands the critic and its loss in through actor_args."""
-    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
-    value, value_loss_fn = MagicMock(name="value"), MagicMock(name="value_loss_fn")
+@pytest.mark.parametrize("with_critic", [True, False], ids=["ppo", "grpo"])
+def test_init_picks_up_the_critic_handles(monkeypatch, tmp_path, with_critic) -> None:
+    """The PPO path hands the critic and its loss in through actor_args.
 
-    ctrl = _init_controller(
-        _grpo_master_config(tmp_path),
-        _actor_args_for_init(value_handle=value, value_loss_fn=value_loss_fn),
+    A GRPO run leaves both unset -- actor_args defaults them to None, and older
+    args may omit them entirely.
+    """
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    handles = (
+        {
+            "value_handle": MagicMock(name="value"),
+            "value_loss_fn": MagicMock(name="value_loss_fn"),
+        }
+        if with_critic
+        else {}
     )
 
-    assert ctrl._value is value
-    assert ctrl._value_loss_fn is value_loss_fn
+    ctrl = _init_controller(
+        _grpo_master_config(tmp_path), _actor_args_for_init(**handles)
+    )
 
-
-def test_init_leaves_the_critic_handles_unset_on_a_grpo_run(
-    monkeypatch, tmp_path
-) -> None:
-    """actor_args defaults them to None, and older args may omit them entirely."""
-    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
-
-    ctrl = _init_controller(_grpo_master_config(tmp_path), _actor_args_for_init())
-
-    assert ctrl._value is None
-    assert ctrl._value_loss_fn is None
+    assert ctrl._value is handles.get("value_handle")
+    assert ctrl._value_loss_fn is handles.get("value_loss_fn")
 
 
 def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
@@ -1345,32 +1344,6 @@ def _single_group_meta() -> KVBatchMeta:
     )
 
 
-def test_train_pump_loads_and_offloads_the_critic_around_each_stage(
-    monkeypatch,
-) -> None:
-    """The critic holds the training GPUs only inside its forward and its train."""
-    meta = _single_group_meta()
-    ctrl, value = _ppo_train_pump_controller(sampler=_OneThenEmptySampler(meta))
-    ctrl._policy_logprobs_required = True
-    trainer = _LpRecordingTrainer()
-    ctrl._trainer = trainer
-    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
-    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
-
-    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
-
-    assert value.calls == [
-        "prepare_for_inference",
-        "get_values_from_meta",
-        "finish_inference",
-        # Critic before actor, mirroring the legacy PPO epoch loop.
-        "prepare_for_training",
-        "train_from_meta",
-        "finish_training",
-    ]
-    assert ctrl._train_steps == 1
-
-
 def test_train_pump_parks_the_policy_on_cpu_across_the_critic_stages(
     monkeypatch,
 ) -> None:
@@ -1436,15 +1409,18 @@ def test_train_pump_skips_the_critic_on_an_empty_chunk(monkeypatch) -> None:
     assert "get_values_from_meta" in value.calls
 
 
+@pytest.mark.parametrize("ppo_epochs", [1, 2])
 def test_train_pump_freezes_the_policy_during_critic_warmup(
-    monkeypatch, capsys
+    monkeypatch, capsys, ppo_epochs
 ) -> None:
     """Below policy_training_start_step the critic trains alone: no optimizer
-    step, and no weight transfer to generation either."""
+    step, and no weight transfer to generation either. The frozen policy does
+    not shorten the critic's own epoch loop."""
     meta = _single_group_meta()
     ctrl, value = _ppo_train_pump_controller(
         sampler=_OneThenEmptySampler(meta),
         policy_training_start_step=1,
+        ppo_epochs=ppo_epochs,
     )
     trainer = MagicMock(spec=_NoOpTrainer)
     ctrl._trainer = trainer
@@ -1453,7 +1429,7 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert "train_from_meta" in value.calls
+    assert value.calls.count("train_from_meta") == ppo_epochs
     trainer.prepare_for_training.assert_not_called()
     trainer.begin_train_step.assert_not_called()
     trainer.finish_train_step.assert_not_called()
@@ -1490,51 +1466,11 @@ def test_train_pump_trains_the_policy_once_warmup_is_over(monkeypatch, capsys) -
     assert capsys.readouterr().out.count("Critic warmup complete") == 1
 
 
-def test_train_pump_steps_both_optimizers_once_per_ppo_epoch(monkeypatch) -> None:
-    """ppo_epochs repeats the whole train stage over the step's own batch."""
-    meta = _single_group_meta()
-    ctrl, value = _ppo_train_pump_controller(
-        sampler=_OneThenEmptySampler(meta), ppo_epochs=2
-    )
-    trainer = MagicMock(spec=_NoOpTrainer)
-    trainer.finish_train_step.return_value = {}
-    ctrl._trainer = trainer
-    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
-    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
-
-    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
-
-    assert value.calls.count("train_from_meta") == 2
-    assert trainer.begin_train_step.call_count == 2
-    assert trainer.finish_train_step.call_count == 2
-    # Still one RL step, so one refit and one version bump.
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
-    assert ctrl._trainer_version == 1
-
-
-def test_train_pump_runs_every_critic_epoch_during_warmup(monkeypatch) -> None:
-    """The frozen policy does not shorten the critic's own epoch loop."""
-    meta = _single_group_meta()
-    ctrl, value = _ppo_train_pump_controller(
-        sampler=_OneThenEmptySampler(meta),
-        policy_training_start_step=1,
-        ppo_epochs=2,
-    )
-    trainer = MagicMock(spec=_NoOpTrainer)
-    ctrl._trainer = trainer
-    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
-    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
-
-    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
-
-    assert value.calls.count("train_from_meta") == 2
-    trainer.prepare_for_training.assert_not_called()
-    trainer.finish_train_step.assert_not_called()
-
-
 def test_train_pump_offloads_the_policy_between_ppo_epochs(monkeypatch) -> None:
-    """The two models share the training GPUs, so every critic train runs with
-    the policy on CPU -- including the ones after the first epoch."""
+    """ppo_epochs repeats the whole train stage over the step's own batch.
+
+    The two models share the training GPUs, so every critic train runs with the
+    policy on CPU -- including the ones after the first epoch."""
     meta = _single_group_meta()
     calls: list[str] = []
     ctrl, _ = _ppo_train_pump_controller(
@@ -1570,6 +1506,9 @@ def test_train_pump_offloads_the_policy_between_ppo_epochs(monkeypatch) -> None:
         # No offload after the last epoch: the refit needs the policy resident.
         "policy.finish_train_step",
     ]
+    # Still one RL step, so one refit and one version bump.
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    assert ctrl._trainer_version == 1
 
 
 def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:

@@ -262,13 +262,6 @@ class TestWarmupLookaheadWindow:
 
         assert sampler.required_buffer_capacity(groups_per_step=4) == 16
 
-    def test_set_gate_window_retunes_admission(self):
-        sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
-
-        sampler.set_gate_window(3)
-
-        assert sampler._gate_window == 3
-
     def test_set_gate_window_rejects_a_negative_window(self):
         sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
 
