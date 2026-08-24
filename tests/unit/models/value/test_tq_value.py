@@ -121,7 +121,9 @@ class TestTQValueFanout:
         meta = _meta()
         with (
             patch.object(TQValue, "_stamp_pad_seqlen"),
-            patch.object(TQValue, "_packing_args", return_value=(None, None)),
+            patch.object(
+                TQValue, "_packing_args", return_value=(None, None)
+            ) as mock_packing,
             patch(
                 "nemo_rl.models.value.tq_value.shard_meta_for_dp",
                 return_value=([meta, meta], None),
@@ -137,24 +139,8 @@ class TestTQValueFanout:
             wg.run_all_workers_sharded_data.call_args.args[0] == "get_values_presharded"
         )
         wg.get_all_worker_results.assert_called_once()
-
-    def test_get_values_from_meta_uses_the_logprob_packing_budget(self):
-        """The forward pass is inference-shaped, so it must size microbatches
-        off logprob_mb_tokens rather than the (larger) train budget."""
-        v, _ = _make_tq_value()
-        meta = _meta()
-        with (
-            patch.object(TQValue, "_stamp_pad_seqlen"),
-            patch.object(
-                TQValue, "_packing_args", return_value=(None, None)
-            ) as mock_packing,
-            patch(
-                "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-                return_value=([meta, meta], None),
-            ),
-        ):
-            v.get_values_from_meta(meta)
-
+        # The forward pass is inference-shaped, so it sizes microbatches off
+        # logprob_mb_tokens rather than the (larger) train budget.
         assert mock_packing.call_args.args[0] == "logprob_mb_tokens"
 
     def test_train_from_meta_requests_the_value_train_columns(self):
