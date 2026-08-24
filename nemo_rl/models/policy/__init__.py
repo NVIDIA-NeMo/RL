@@ -491,9 +491,12 @@ class MegatronConfig(TypedDict):
     # Use batch-invariant kernels (cuBLAS workspace shrink, FA num_splits=1, TE GEMM pin)
     # for deterministic execution regardless of batch size. Required for zero-KL.
     batch_invariant_mode: NotRequired[bool]
-    # Master switch: when True, forces batch_invariant_mode=True to eliminate
-    # train/gen KL mismatch sources.
-    # Router replay and moe_grouped_gemm must be configured explicitly.
+    # Master switch for zero train/gen KL with colocated generation.backend='megatron'.
+    # _apply_zero_train_gen_mismatch resolves it into batch_invariant_mode, eager MoE
+    # permute, transformer_engine generation, raw_logprobs, and chunked prefill off,
+    # overriding conflicting YAML with a warning. Seeds attention_backend=flash and
+    # flash_attention_version=4 when absent. enable_prefix_caching, router replay,
+    # moe_grouped_gemm and the CUDA graph knobs must be configured explicitly.
     zero_train_gen_mismatch: NotRequired[bool]
 
 

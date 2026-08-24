@@ -31,7 +31,6 @@ policy:
     moe_token_dispatcher_type: alltoall
     moe_router_dtype: fp32
     moe_pad_experts_for_cuda_graph_inference: false
-    moe_permute_fusion: false
     cuda_graph_impl: none
     optimizer:
       lr: 1.0e-06
@@ -44,15 +43,13 @@ policy:
       lr_warmup_init: 1.0e-06
   generation:
     backend: megatron
-    colocated:
-      enabled: true
     max_new_tokens: 8192
     mcore_generation_config:
+      # CUDA graphs are off for now
       use_cuda_graphs_for_non_decode_steps: false
       cuda_graph_impl: none
       num_cuda_graphs: 0
       inference_cuda_graph_scope: none
-      enable_chunked_prefill: false
       enable_prefix_caching: false
       kv_cache_management_mode: recompute
       static_kv_memory_pointers: false

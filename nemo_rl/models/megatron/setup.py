@@ -1672,17 +1672,25 @@ def _enable_batch_invariant_kernels_if_requested(config: PolicyConfig) -> None:
 
 
 def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
-    """Propagate zero_train_gen_mismatch flag to its constituent sub-knobs.
+    """Resolve zero_train_gen_mismatch into its sub-knobs and install its patches.
 
-    When True, forces batch_invariant_mode=True, attention_backend=flash (FA4 via
-    TE), and the Transformer Engine generation layer spec so generation and scoring
-    share aligned MoE paths.
-    MoE batch_invariant_mode requires DeepGEMM in the mcore worker venv (see
-    pyproject.toml mcore extra). Also applies TE cuBLAS workspace shrink and TP=1
-    log-softmax via zero_train_gen_kl_patches.core_patches, deterministic MoE
-    fixed-order combine (train + generation) via moe_zero_kl_patches.py.
-    Generation uses ``logprobs_mode=raw_logprobs`` so gen uses ``F.log_softmax``
-    (not FlashInfer processed log-probs). moe_grouped_gemm must be configured explicitly.
+    With ``policy.generation.backend='megatron'`` this flag carries the whole
+    zero train/gen KL contract, so recipes need not repeat the knobs forced
+    below; a conflicting value is overridden with a warning. The CUDA graph
+    knobs stay under recipe control while graphs are off pending post-refit
+    invalidation, and moe_grouped_gemm and router replay must be set explicitly.
+
+    Generation must be colocated (the default): it then shares the model built
+    here, which is what lets these worker-side settings reach generation at all.
+
+    In-process this applies TE cuBLAS workspace shrink and TP=1 log-softmax via
+    zero_train_gen_kl_patches.core_patches, plus deterministic MoE fixed-order
+    combine (train + generation) via moe_zero_kl_patches. MoE
+    batch_invariant_mode requires DeepGEMM in the mcore worker venv (see
+    pyproject.toml mcore extra).
+
+    Raises:
+        ValueError: If generation does not run colocated on the Megatron backend.
     """
     if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
         return
@@ -1696,15 +1704,56 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     )
 
     mc = config["megatron_cfg"]
-    mc["batch_invariant_mode"] = True
+    # Each forced knob otherwise runs a different kernel in generation than in
+    # training (fused MoE permute, chunked prefill) or reads log-probs off another
+    # path, so a user value can only reintroduce the mismatch this flag exists to
+    # remove. enable_prefix_caching stays under recipe control.
+    forced = [
+        (
+            mc,
+            "policy.megatron_cfg",
+            {"batch_invariant_mode": True, "moe_permute_fusion": False},
+        )
+    ]
+    generation = config.get("generation")
+    if generation is not None:
+        colocated = generation["colocated"]["enabled"]
+        if generation["backend"] != "megatron" or not colocated:
+            raise ValueError(
+                "policy.megatron_cfg.zero_train_gen_mismatch=true requires colocated "
+                "generation on the megatron backend, so that generation runs the "
+                "training model and its kernels. Got backend="
+                f"'{generation['backend']}', colocated.enabled={colocated}."
+            )
+        forced.append(
+            (
+                generation["mcore_generation_config"],
+                "policy.generation.mcore_generation_config",
+                {
+                    "transformer_impl": "transformer_engine",
+                    # processed_logprobs routes through FlashInfer
+                    # log(renorm(softmax)); the TP=1 train patch uses F.log_softmax.
+                    "logprobs_mode": "raw_logprobs",
+                    "enable_chunked_prefill": False,
+                },
+            )
+        )
+    for cfg, config_path, values in forced:
+        for key, value in values.items():
+            if key in cfg and cfg[key] != value:
+                warnings.warn(
+                    f"zero_train_gen_mismatch=true overrides {config_path}.{key}"
+                    f"={cfg[key]!r} with {value!r}: the configured value would "
+                    "reintroduce train/generation mismatch.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            cfg[key] = value
+
+    # Seeded, not forced: FA4 is what the zero-KL beds are certified on, but the
+    # attention backend stays a user choice.
     mc.setdefault("attention_backend", "flash")
     mc.setdefault("flash_attention_version", 4)
-    generation = config.get("generation")
-    if generation is not None and "mcore_generation_config" in generation:
-        generation["mcore_generation_config"]["transformer_impl"] = "transformer_engine"
-        # Match the TP=1 train log-softmax patch: Megatron processed_logprobs
-        # routes through FlashInfer log(renorm(softmax)), not F.log_softmax.
-        generation["mcore_generation_config"]["logprobs_mode"] = "raw_logprobs"
     apply_te_gemm_cublas_pinned_patch()
     apply_log_softmax_determinism_patch()
     apply_moe_determinism_patches()
