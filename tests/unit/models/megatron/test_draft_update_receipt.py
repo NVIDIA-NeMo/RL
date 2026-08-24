@@ -550,6 +550,106 @@ def test_distributed_factory_partitions_local_slice_from_full_leaves(
         assert moments[key].tensor_sha256 == expected_record.tensor_sha256
 
 
+def _precision_aware_distributed_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    include_state: bool = True,
+    parameter_state: Any | None = None,
+) -> tuple[Any, _DraftModel, Any]:
+    receipt = _receipt_module()
+    _, _, distributed_cls = _install_fake_optimizer_modules(monkeypatch)
+    sharded_tensor_cls, _ = _install_fake_mapping_module(monkeypatch)
+    monkeypatch.setattr(
+        receipt,
+        "validate_pinned_distributed_optimizer_class",
+        lambda cls: None,
+    )
+    parameter = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    sharded_parameter = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    model = _DraftModel(
+        parameter,
+        {
+            "weight": sharded_tensor_cls(
+                "draft.weight",
+                parameter,
+                parameter.dtype,
+                (2,),
+                (2,),
+                (0,),
+                None,
+                (0, 0, 0),
+            )
+        },
+    )
+    optimizer = object.__new__(distributed_cls)
+    optimizer.distributed_optimizer_instance_id = 0
+    optimizer.config = SimpleNamespace(
+        use_precision_aware_optimizer_no_fp8_or_ds_fp8=True
+    )
+    optimizer.model_param_group_index_map = {parameter: (0, 0)}
+    inner_optimizer = SimpleNamespace(
+        param_groups=[{"params": [sharded_parameter], "lr": 0.1}]
+    )
+    if include_state:
+        inner_optimizer.state = (
+            {} if parameter_state is None else {sharded_parameter: parameter_state}
+        )
+    optimizer.optimizer = inner_optimizer
+    optimizer._get_model_param_range_map = lambda _: {
+        "param": SimpleNamespace(start=0, end=2)
+    }
+    optimizer._get_main_param_and_optimizer_states = MagicMock(
+        side_effect=KeyError("master_param")
+    )
+    return receipt, model, optimizer
+
+
+@pytest.mark.parametrize("parameter_state", [None, {}])
+def test_uninitialized_precision_aware_distributed_optimizer_emits_false_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    parameter_state: Any | None,
+) -> None:
+    receipt, model, optimizer = _precision_aware_distributed_fixture(
+        monkeypatch,
+        parameter_state=parameter_state,
+    )
+
+    records = receipt.canonical_draft_state_records(model, optimizer)
+
+    markers = [record for record in records if record.record_kind == "state_marker"]
+    assert len(markers) == 1
+    assert markers[0].logical_key == "draft.weight/state_initialized"
+    assert markers[0].scalar_value is False
+    optimizer._get_main_param_and_optimizer_states.assert_not_called()
+
+
+def test_precision_aware_distributed_optimizer_requires_state_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt, model, optimizer = _precision_aware_distributed_fixture(
+        monkeypatch,
+        include_state=False,
+    )
+
+    with pytest.raises(AttributeError, match="state"):
+        receipt.canonical_draft_state_records(model, optimizer)
+
+
+def test_precision_aware_distributed_optimizer_rejects_malformed_parameter_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt, model, optimizer = _precision_aware_distributed_fixture(
+        monkeypatch,
+        parameter_state=False,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="distributed optimizer parameter state must be a mapping",
+    ):
+        receipt.canonical_draft_state_records(model, optimizer)
+
+
 def test_distributed_factory_rejects_nonpartitioning_full_leaves() -> None:
     receipt = _receipt_module()
     source = torch.tensor([0.0, 1.0, 2.0, 3.0])

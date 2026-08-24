@@ -567,7 +567,31 @@ def _distributed_optimizer_records(
             continue
         range_map = optimizer._get_model_param_range_map(parameter)["param"]
         flattened_range = (int(range_map.start), int(range_map.end))
-        state = optimizer._get_main_param_and_optimizer_states(parameter)
+        group_index, group_order = optimizer.model_param_group_index_map[parameter]
+        sharded_parameter = optimizer.optimizer.param_groups[group_index]["params"][
+            group_order
+        ]
+        precision_aware = getattr(
+            getattr(optimizer, "config", None),
+            "use_precision_aware_optimizer_no_fp8_or_ds_fp8",
+            False,
+        )
+        if precision_aware:
+            optimizer_state = optimizer.optimizer.state
+            if not isinstance(optimizer_state, Mapping):
+                raise RuntimeError("distributed optimizer state must be a mapping")
+            precision_aware_state = optimizer_state.get(sharded_parameter, {})
+            if not isinstance(precision_aware_state, Mapping):
+                raise RuntimeError(
+                    "distributed optimizer parameter state must be a mapping"
+                )
+            state = (
+                optimizer._get_main_param_and_optimizer_states(parameter)
+                if precision_aware_state
+                else {}
+            )
+        else:
+            state = optimizer._get_main_param_and_optimizer_states(parameter)
         initialized = any(key != "param" for key in state)
         records.append(
             CanonicalDraftStateRecord.for_scalar(
