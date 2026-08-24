@@ -208,12 +208,7 @@ on_policy_distillation:
       general:
         # pin RADIO eval mode (architecture keys no longer inherit)
         radio_force_cpe_eval_mode: true
-      # The omni policy's empty_unused_memory_level: 2 leaks to teachers and
-      # empties the CUDA cache after EVERY logprob micro-batch — at 131k
-      # chunked scoring this collapses teacher throughput (job 6451777
-      # py-spy: GPUs 0%, workers thrashing; zero groups scored in >20min).
-      # The text runs score this same teacher at 131k fast with level 1.
-      empty_unused_memory_level: 1
+        empty_unused_memory_level: 1
 logger:
   log_dir: logs/mopd-super-omni-joint-opd-hsg
   wandb:

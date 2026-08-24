@@ -210,13 +210,13 @@ on_policy_distillation:
       # py-spy: GPUs 0%, workers thrashing; zero groups scored in >20min).
       # The text runs score this same teacher at 131k fast with level 1.
       empty_unused_memory_level: 1
-        # explicit values for the MTP-bearing text teacher (checkpoint has ONE
-        # mtp layer: mtp_layers_block_type ['attention','moe']); the student's
-        # mtp_num_layers: 0 must not leak (hybrid_model forward asserts >0).
-        mtp_num_layers: 1
-        mtp_use_repeated_layer: false
-        mtp_loss_scaling_factor: 0.0
-        mtp_detach_heads: true
+      # explicit values for the MTP-bearing text teacher (checkpoint has ONE
+      # mtp layer: mtp_layers_block_type ['attention','moe']); the student's
+      # mtp_num_layers: 0 must not leak (hybrid_model forward asserts >0).
+      mtp_num_layers: 1
+      mtp_use_repeated_layer: false
+      mtp_loss_scaling_factor: 0.0
+      mtp_detach_heads: true
 logger:
   log_dir: logs/mopd-super-omni-joint-opd-hsg
   wandb:
