@@ -21,7 +21,9 @@ from megatron.core.inference.utils import device_memory_summary
 
 
 def build_image_preprocessing_config(
-    image_processor: Any, *, dynamic_resolution: bool
+    image_processor: Any,
+    *,
+    dynamic_resolution: bool,
 ) -> ImageProcessingConfig:
     """Translate an HF image processor to an MCore config."""
 
@@ -82,6 +84,7 @@ def build_video_preprocessing_config(
     generation_config: dict[str, Any],
     *,
     frame_manifest_magic: bytes,
+    video_maintain_aspect_ratio: bool = True,
 ) -> VideoProcessingConfig | None:
     """Build video preprocessing when explicitly enabled by generation config."""
     temporal_patch_size = generation_config.get("video_temporal_patch_size")
@@ -99,6 +102,7 @@ def build_video_preprocessing_config(
         image_config=image_config,
         num_frames=int(generation_config["video_num_frames"]),
         temporal_patch_size=int(temporal_patch_size),
+        video_maintain_aspect_ratio=video_maintain_aspect_ratio,
         frame_manifest_magic=frame_manifest_magic,
     )
 
