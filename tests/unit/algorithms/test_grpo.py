@@ -42,6 +42,7 @@ from nemo_rl.algorithms.grpo import (
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
     _needs_hf_refit_handshake,
+    _raise_if_reasoning_length_reward_enabled_without_nemo_gym,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
@@ -61,6 +62,8 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.reward_functions import (
+    GRPORewardShapingConfig,
+    ReasoningLengthRewardConfig,
     RewardShapingConfig,
     apply_reward_shaping,
 )
@@ -317,7 +320,11 @@ def mock_grpo_components():
                 advantage_clip_low=None,
                 advantage_clip_high=None,
                 reward_scaling=RewardScalingConfig.model_construct(enabled=False),
-                reward_shaping=RewardShapingConfig.model_construct(enabled=False),
+                reward_shaping=GRPORewardShapingConfig.model_construct(
+                    enabled=False,
+                    mode="response_length",
+                    reasoning_length=ReasoningLengthRewardConfig(),
+                ),
                 use_dynamic_sampling=False,
                 async_grpo=AsyncGRPOConfig.model_construct(
                     enabled=False,
@@ -439,7 +446,10 @@ def test_grpo_config_nested_defaults_are_populated():
 
     assert isinstance(first.async_grpo, AsyncGRPOConfig)
     assert isinstance(first.adv_estimator, AdvEstimatorConfig)
-    assert isinstance(first.reward_shaping, RewardShapingConfig)
+    assert isinstance(first.reward_shaping, GRPORewardShapingConfig)
+    assert isinstance(
+        first.reward_shaping.reasoning_length, ReasoningLengthRewardConfig
+    )
     assert isinstance(first.reward_scaling, RewardScalingConfig)
     assert first.async_grpo.enabled is False
     assert first.async_grpo.max_generation_failures == 0
@@ -449,6 +459,10 @@ def test_grpo_config_nested_defaults_are_populated():
     assert first.async_grpo is not second.async_grpo
     assert first.adv_estimator is not second.adv_estimator
     assert first.reward_shaping is not second.reward_shaping
+    assert (
+        first.reward_shaping.reasoning_length
+        is not second.reward_shaping.reasoning_length
+    )
     assert first.reward_scaling is not second.reward_scaling
 
 
@@ -724,6 +738,26 @@ def test_raise_if_reward_penalties_enabled_without_nemo_gym_allows_nemo_gym(
     )
 
     _raise_if_reward_penalties_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=True
+    )
+
+
+def test_raise_if_reasoning_length_reward_enabled_without_nemo_gym(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.reward_shaping = GRPORewardShapingConfig(
+        enabled=True,
+        mode="reasoning_length",
+        reasoning_length={"reasoning_end_token_id": 13},
+    )
+
+    with pytest.raises(ValueError, match="mode=reasoning_length requires"):
+        _raise_if_reasoning_length_reward_enabled_without_nemo_gym(
+            master_config, enable_nemo_gym=False
+        )
+
+    _raise_if_reasoning_length_reward_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=True
     )
 
@@ -1321,6 +1355,83 @@ def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components)
 
     mock_grpo_components["checkpointer"].shutdown.assert_called_once()
     mock_grpo_components["policy"].shutdown.assert_called_once()
+
+
+def test_async_grpo_applies_response_length_shaping_before_advantages(
+    mock_grpo_components,
+):
+    """Native response-length shaping must affect async GRPO advantages."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.grpo.reward_shaping = GRPORewardShapingConfig(
+        enabled=True,
+        mode="response_length",
+        max_response_length=6,
+        overlong_buffer_length=2,
+        overlong_buffer_penalty=1.0,
+    )
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch["message_log"] = [
+        [
+            {
+                "role": "user",
+                "content": "test",
+                "token_ids": torch.tensor([1, 2, 3]),
+            },
+            {
+                "role": "assistant",
+                "content": "response",
+                "token_ids": torch.tensor([4, 5, 6, 7, 8]),
+                "generation_logprobs": torch.zeros(5),
+            },
+        ]
+    ]
+    mock_batch["total_reward"] = torch.tensor([1.0])
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 5.0}
+
+    advantage_estimator = MagicMock()
+    advantage_estimator.compute_advantage.return_value = torch.zeros(1, 2)
+    advantage_estimator.last_metrics = {}
+
+    with (
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        _patched_logprob_phase(mock_grpo_components["policy"]),
+        patch(
+            "nemo_rl.algorithms.grpo._create_advantage_estimator",
+            return_value=advantage_estimator,
+        ),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    advantage_kwargs = advantage_estimator.compute_advantage.call_args.kwargs
+    torch.testing.assert_close(advantage_kwargs["rewards"], torch.tensor([0.5]))
+    torch.testing.assert_close(
+        advantage_kwargs["repeated_batch"]["unshaped_total_reward"],
+        torch.tensor([1.0]),
+    )
+    torch.testing.assert_close(
+        advantage_kwargs["std_rewards"],
+        torch.tensor([1.0]),
+    )
 
 
 @pytest.mark.parametrize(
@@ -4323,6 +4434,40 @@ def test_grpo_advantage_estimator_small_nonzero_std():
 
     # Verify opposite signs
     assert result[0, 0] * result[1, 0] < 0
+
+
+def test_grpo_advantage_estimator_uses_raw_rewards_for_shaped_reward_std():
+    """Length shaping must not amplify an outlier via tiny peer variance."""
+    estimator_config = AdvEstimatorConfig.model_construct(
+        use_leave_one_out_baseline=True,
+        normalize_rewards=True,
+    )
+    estimator = GRPOAdvantageEstimator(estimator_config, ClippedPGLossConfig())
+
+    prompt_ids = torch.zeros((16, 1), dtype=torch.long)
+    # One incorrect result and 15 correct results with tiny length-dependent
+    # differences reproduce the sustained 16-node validation outlier.
+    shaped_rewards = torch.tensor(
+        [0.0] + [0.95 + i * 1.0e-3 for i in range(15)],
+        dtype=torch.float32,
+    )
+    raw_rewards = torch.tensor([0.0] + [1.0] * 15, dtype=torch.float32)
+    mask = torch.ones((16, 3), dtype=torch.float32)
+
+    unstable = estimator.compute_advantage(prompt_ids, shaped_rewards, mask)
+    stable = estimator.compute_advantage(
+        prompt_ids,
+        shaped_rewards,
+        mask,
+        std_rewards=raw_rewards,
+    )
+
+    assert unstable[0, 0].abs() > 100
+    assert stable.abs().max() < 5
+    assert stable[0, 0] == pytest.approx(
+        -shaped_rewards[1:].mean().item(),
+        abs=1.0e-5,
+    )
 
 
 # ============================================================================

@@ -65,6 +65,7 @@ grpo:
   
   reward_shaping:
     enabled: true
+    mode: response_length
     overlong_buffer_length: 4096     # Threshold before penalties apply (paper uses 4096)
     overlong_buffer_penalty: 1.0     # Penalty per excess token
     max_response_length: 20480       # Hard maximum generation length
@@ -75,7 +76,7 @@ grpo:
 - **`batch_multiplier`**: Factor that scales the initial prompt pool size for sampling.
 - **`dynamic_sampling_max_gen_batches`**: Maximum number of batches to be used for accumulating nonzero standard deviation prompts.
 - **`reward_scaling`**: When enabled, clamps each reward in the batch to [source_min, source_max] and linearly rescales it to [target_min, target_max]. Defaults: source_min=0.0, source_max=1.0, target_min=0.0, target_max=1.0.
-- **`reward_shaping`**: When enabled, applies the overlong penalty mechanism described in the Reward Shaping section above. Responses exceeding `max_response_length - overlong_buffer_length` receive penalties proportional to their excess length, helping to reduce reward noise and stabilize training.
+- **`reward_shaping`**: With `mode: response_length`, applies the overlong penalty mechanism described above in synchronous or asynchronous GRPO. Responses exceeding `max_response_length - overlong_buffer_length` receive penalties proportional to their excess length, helping to reduce reward noise and stabilize training.
 
 > [!NOTE]
 > When dynamic sampling is enabled, monitor the `filtered_reward` metric to track the average reward of the prompts with std > 0.

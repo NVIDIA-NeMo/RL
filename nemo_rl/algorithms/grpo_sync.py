@@ -692,7 +692,7 @@ def grpo_train_sync(
                         driver_carry,
                         master_config.grpo.reward_scaling,
                     )
-                    if master_config.grpo.reward_shaping.enabled:
+                    if master_config.grpo.reward_shaping.response_length_enabled:
                         driver_carry = apply_reward_shaping(
                             driver_carry,
                             master_config.grpo.reward_shaping,
@@ -703,6 +703,7 @@ def grpo_train_sync(
                             driver_carry["total_reward"],
                             torch.ones_like(driver_carry["total_reward"]),
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                            std_rewards=driver_carry.get("unshaped_total_reward"),
                         )
                     )
                     # Mirror std onto meta so dynamic_sampling can filter
@@ -894,6 +895,7 @@ def grpo_train_sync(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
                         mask=mask,
+                        std_rewards=driver_carry.get("unshaped_total_reward"),
                         repeated_batch=adv_inputs,
                         logprobs_policy=prev_logprobs,
                         logprobs_reference=reference_policy_logprobs,

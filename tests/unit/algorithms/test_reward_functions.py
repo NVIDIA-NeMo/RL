@@ -17,12 +17,174 @@ import torch
 
 from nemo_rl.algorithms.grpo import RewardScalingConfig, scale_rewards
 from nemo_rl.algorithms.reward_functions import (
+    GRPORewardShapingConfig,
+    ReasoningLengthRewardConfig,
     RewardShapingConfig,
+    apply_length_aware_reward,
     apply_reward_shaping,
+    length_aware_regularization_reward,
+    reasoning_chain_token_length,
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from tests.unit.algorithms.utils import create_mock_batch_with_responses
+
+
+def test_length_aware_regularization_reward_boundaries():
+    assert length_aware_regularization_reward(0, tau1=10, tau2=20) == 1.0
+    assert length_aware_regularization_reward(10, tau1=10, tau2=20) == 1.0
+    assert length_aware_regularization_reward(15, tau1=10, tau2=20) == 0.5
+    assert length_aware_regularization_reward(20, tau1=10, tau2=20) == 0.0
+    assert length_aware_regularization_reward(21, tau1=10, tau2=20) == 0.0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"tau1": -1},
+        {"tau1": 20, "tau2": 20},
+        {"tau1": 21, "tau2": 20},
+        {"weight": -0.1},
+        {"composition": "correctness_gated", "weight": 1.1},
+        {"reasoning_end_token_id": -1},
+    ],
+)
+def test_reasoning_length_reward_config_rejects_invalid_values(kwargs):
+    config_values = {"reasoning_end_token_id": 13, **kwargs}
+    with pytest.raises(ValueError):
+        ReasoningLengthRewardConfig(**config_values)
+
+
+def test_grpo_reward_shaping_requires_reasoning_end_token_for_active_mode():
+    with pytest.raises(ValueError, match="reasoning_end_token_id"):
+        GRPORewardShapingConfig(enabled=True, mode="reasoning_length")
+
+
+def test_grpo_reward_shaping_selects_one_processing_stage():
+    response_length = GRPORewardShapingConfig(enabled=True)
+    reasoning_length = GRPORewardShapingConfig(
+        enabled=True,
+        mode="reasoning_length",
+        reasoning_length={"reasoning_end_token_id": 13},
+    )
+
+    assert response_length.response_length_enabled is True
+    assert response_length.reasoning_length_enabled is False
+    assert reasoning_length.response_length_enabled is False
+    assert reasoning_length.reasoning_length_enabled is True
+
+
+def test_reasoning_chain_token_length_uses_end_token_and_counts_unfinished_turn():
+    message_log = [
+        {"role": "user", "token_ids": torch.tensor([8, 9])},
+        {"role": "assistant", "token_ids": torch.tensor([1, 2, 13, 7])},
+        {"role": "assistant", "token_ids": torch.tensor([3, 4, 5])},
+    ]
+
+    assert reasoning_chain_token_length(message_log, reasoning_end_token_id=13) == 5
+
+
+def test_apply_length_aware_reward_correctness_gates_base_reward():
+    results = [
+        {
+            "message_log": [
+                {"role": "assistant", "token_ids": torch.tensor([1, 2, 3, 13])}
+            ],
+            "full_result": {"reward": base_reward},
+        }
+        for base_reward in (1.0, 0.5, 0.0)
+    ]
+    config = ReasoningLengthRewardConfig(
+        tau1=2,
+        tau2=4,
+        weight=0.2,
+        composition="correctness_gated",
+        reasoning_end_token_id=13,
+    )
+
+    metrics = apply_length_aware_reward(results, config)
+
+    assert metrics.component_rewards == [0.5, 0.5, 0.5]
+    assert metrics.reasoning_chain_lengths == [3, 3, 3]
+    assert metrics.unshaped_rewards == [1.0, 0.5, 0.0]
+    assert [result["full_result"]["reward"] for result in results] == pytest.approx(
+        [0.9, 0.45, 0.0]
+    )
+
+
+def test_apply_length_aware_reward_adds_component_when_configured():
+    results = [
+        {
+            "message_log": [
+                {"role": "assistant", "token_ids": torch.tensor([1, 2, 3, 13])}
+            ],
+            "full_result": {"reward": 0.0},
+        }
+    ]
+    config = ReasoningLengthRewardConfig(
+        tau1=2,
+        tau2=4,
+        weight=0.2,
+        composition="additive",
+        reasoning_end_token_id=13,
+    )
+
+    apply_length_aware_reward(results, config)
+
+    assert results[0]["full_result"]["reward"] == pytest.approx(0.1)
+
+
+def test_apply_length_aware_reward_excludes_assistant_prompt_history():
+    input_message_log = [
+        {"role": "user", "token_ids": torch.tensor([7])},
+        {"role": "assistant", "token_ids": torch.tensor([4, 5, 6, 13])},
+        {"role": "user", "token_ids": torch.tensor([8])},
+    ]
+    results = [
+        {
+            "input_message_log": input_message_log,
+            "message_log": [
+                *input_message_log,
+                {"role": "assistant", "token_ids": torch.tensor([1, 13])},
+            ],
+            "full_result": {"reward": 1.0},
+        }
+    ]
+    config = ReasoningLengthRewardConfig(
+        tau1=1,
+        tau2=3,
+        weight=0.5,
+        composition="correctness_gated",
+        reasoning_end_token_id=13,
+    )
+
+    metrics = apply_length_aware_reward(results, config)
+
+    assert metrics.reasoning_chain_lengths == [1]
+    assert metrics.component_rewards == [1.0]
+    assert results[0]["full_result"]["reward"] == pytest.approx(1.0)
+
+
+def test_apply_length_aware_reward_rejects_multi_component_rewards():
+    results = [
+        {
+            "message_log": [{"role": "assistant", "token_ids": torch.tensor([1, 13])}],
+            "full_result": {"reward": 0.5},
+        },
+        {
+            "message_log": [{"role": "assistant", "token_ids": torch.tensor([1, 13])}],
+            "full_result": {
+                "reward": 1.0,
+                "reward_components": {"accuracy": 1.0},
+            },
+        },
+    ]
+    config = ReasoningLengthRewardConfig(reasoning_end_token_id=13)
+
+    with pytest.raises(ValueError, match="reward_components"):
+        apply_length_aware_reward(results, config)
+
+    assert results[0]["full_result"]["reward"] == 0.5
 
 
 def test_reward_scaling_disabled():
