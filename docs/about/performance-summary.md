@@ -43,26 +43,30 @@ The performance data includes:
 
 ---
 
-## NeMo RL v0.6
+## NeMo RL v0.7
 
 ### H100 BF16 Benchmarks
-* GRPO Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2); DAPO dataset: [DAPOMath17k](https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k); SWE dataset: refer to [Nemotron super-v3 documentation - stage 2.2](https://github.com/NVIDIA-NeMo/RL/blob/super-v3/docs/guides/nemotron-3-super.md#stage-22---swe-2-64-nodes)
+* GRPO Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2); DAPO dataset: [DAPOMath17k](https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k)
 * System: DGX-H100
 * Precision: Training BF16, Generation BF16
 * Training Backend: Megatron Core.
 
 | Algorithm | Model     |On/Off policy|T-Max Sequence Length|G-Average Seq len|#-GPUs|G-GBS|T-GBS|Generation [TP,PP]|Training [TP,CP,EP,PP,VPP]|Tokens / sec / GPU|Total Step time(s)|
 |---------  |-------    |--------     |-----                |-----            |------|---- |---- |----              |----                      |---               |---|
-| GRPO      |DeepSeek V3|On policy    |1,536                |701              |256   |512  |512  |[32,1]            |[1,1,16,16,n/a]           |12.1              | 134|
-| GRPO      |DeepSeek V3|On policy    |1,536                |697              |512   |512  |512  |[32,1]            |[1,1,16,16,n/a]           |7.24              | 111|
-| GRPO      |DeepSeek V3|1-step Off   |1,536                |710              |512   |512  |512  |[32,1]            |[1,1,16,16,n/a]           |12.8              | 64.1|
-| GRPO      |Qwen3-235B |On policy    |8,192                |5,698            |128   |512  |512  |[16,1]            |[2,2,16,8,n/a]            |58.9              | 395|
-| GRPO      |Qwen3-235B |On policy    |8,192                |5,713            |256   |512  |512  |[16,1]            |[2,2,16,8,n/a]            |37.4              | 312|
-| GRPO      |Qwen3-235B |1-step Off   |8,192                |5,721            |256   |512  |512  |[8,1]             |[4,1,16,8,n/a]            |58.7              | 231|
-| GRPO      |Qwen3-30B3A|On policy    |4,096                |3,203            |32    |2,048|512  |[2,1]             |[1,1,8,1,n/a]             |1102               | 192|
-| GRPO      |Qwen3-30B3A|1-step Off   |4,096                |3,201            |32    |2,048|512  |[2,1]             |[1,1,8,2,n/a]             |1414               | 152|
-| GRPO      |Qwen3-30B3A|8-step Off   |4,096                |3,206            |192   |2,048|512  |[2,1]             |[1,1,8,1,n/a]             |1025               | 34.5|
-| SWE       |Nemotron-3-Nano-30B-A3B|1-step Off   |131,072  |31,599           |128   |512  |512  |[8,1]             |[8,8,8,1,n/a]             |37.5               | 430|
+| GRPO | DeepSeek V3 | On policy | 1,536 | 722 | 256 | 512 | 512 | [32,1] | [1,1,16,16,n/a] | 17.8 | 93 |
+| GRPO | DeepSeek V3 | On policy | 1,536 | 724 | 512 | 512 | 512 | [32,1] | [1,1,16,16,n/a] | 10.2 | 81.2 |
+| GRPO | DeepSeek V3 | 1-step Off | 1,536 | 729 | 512 | 512 | 512 | [32,1] | [1,1,16,16,n/a] | 18 | 46.6 |
+| GRPO | Qwen3-235B | On policy | 8,192 | 5,719 | 128 | 512 | 512 | [16,1] | [2,2,16,8,n/a] | 63.7 | 367 |
+| GRPO | Qwen3-235B | On policy | 8,192 | 5,698 | 256 | 512 | 512 | [16,1] | [2,2,16,8,n/a] | 40.8 | 285 |
+| GRPO | Qwen3-235B | 1-step Off | 8,192 | 5,695 | 256 | 512 | 512 | [8,1] | [4,1,16,8,n/a] | 58.3 | 204 |
+| GRPO | Qwen3-30B3A | On policy | 4,096 | 3,198 | 32 | 2,048 | 512 | [2,1] | [1,1,8,1,n/a] | 1,232 | 171 |
+| GRPO | Qwen3-30B3A | 1-step Off | 4,096 | 3,203 | 32 | 2,048 | 512 | [2,1] | [1,1,8,2,n/a] | 1,522 | 141 |
+| GRPO | Qwen3-30B3A | 8-step Off | 4,096 | 3,203 | 192 | 2,048 | 512 | [2,1] | [1,1,8,1,n/a] | 1,067 | 33.1 |
+| GRPO | Qwen3-32B | 1-step Off | 4,096 | 3,258 | 64 | 64 | 2048 | [4,1] | [4,1,1,4,n/a] | 675 | 161 |
+| GRPO | Qwen3-32B | On policy | 4,096 | 3,256 | 32 | 64 | 2048 | [4,1] | [4,1,1,4,n/a] | 665 | 323 |
+| GRPO | Qwen3-30B3A | On policy | 40,960 | 8,170 | 32 | 64 | 512 | [2,1] | [4,8,8,1,n/a] | 262 | 2,022 |
+| GRPO | Nemotron-3-Super-120BA12B | On policy | 8,192 | 3,197 | 256 | 32 | 256 | [8,1] | [4,1,32,1,n/a] | 30.7 | 108 |
+| GRPO | Nemotron-3-Super-120BA12B | 1-step Off | 8,192 | 3,207 | 256 | 32 | 256 | [8,1] | [4,1,32,1,n/a] | 48.6 | 71.9 |
 
 ### H100 FP8 Benchmarks
 * GRPO Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2)
@@ -72,7 +76,7 @@ The performance data includes:
 
 | Algorithm | Model     |On/Off policy|T-Max Sequence Length|G-Average Seq len|#-GPUs|G-GBS|T-GBS|Generation [TP,PP]|Training [TP,CP,EP,PP,VPP]|Tokens / sec / GPU|Total Step time(s)|
 |---------  |-------    |--------     |-----                |-----            |------|---- |---- |----              |----                      |---               |---|
-| GRPO      |DeepSeek V3|1-step Off   |1,536                |721              |512   |512  |512  |[16,1]            |[1,1,16,16,n/a]           |14.1              | 59.2|
+| GRPO | DeepSeek V3 | 1-step Off | 1,536 | 738 | 512 | 512 | 512 | [16,1] | [1,1,16,16,n/a] | 14 | 61.9 |
 
 ### GB200 BF16 Benchmarks
 * GRPO Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2)
@@ -82,17 +86,20 @@ The performance data includes:
 
 | Algorithm | Model     |On/Off policy|T-Max Sequence Length|G-Average Seq len|#-GPUs|G-GBS|T-GBS|Generation [TP,PP]|Training [TP,CP,EP,PP,VPP]|Tokens / sec / GPU|Total Step time(s)|
 |---------  |-------    |--------     |-----                |-----            |------|---- |---- |----              |----                      |---               |---|
-| GRPO      |DeepSeek V3|On policy    |1,536                |711              |128   |512  |512  |[32,1]            |[1,1,16,8,n/a]            |30.2              | 108|
-| GRPO      |DeepSeek V3|On policy    |1,536                |700              |256   |512  |512  |[32,1]            |[1,1,16,8,n/a]            |16.4              | 98.7|
-| GRPO      |DeepSeek V3|1-step Off   |1,536                |708              |256   |512  |512  |[16,1]            |[1,1,16,8,n/a]            |26.7              | 61.7|
-| GRPO      |Qwen3-235B |On policy    |8,192                |5,709            |64    |512  |512  |[8,1]            |[2,2,16,4,n/a]            |163              | 286|
-| GRPO      |Qwen3-235B |On policy    |8,192                |5,693            |128   |512  |512  |[8,1]            |[2,2,16,4,n/a]            |67.4              | 345|
-| GRPO      |Qwen3-235B |1-step Off   |8,192                |5,705            |128   |512  |512  |[8,1]             |[4,1,16,4,n/a]            |85.5              | 278|
-| GRPO      |Qwen3-30B3A|On policy    |4,096                |3,199            |16    |2,048|512  |[1,1]             |[1,1,16,1,n/a]             |1,910               | 221|
-| GRPO      |Qwen3-30B3A|1-step Off   |4,096                |3,197            |16    |2,048|512  |[1,1]             |[1,1,16,1,n/a]             |1,406               | 301|
+| GRPO | DeepSeek V3 | On policy | 1,536 | 719 | 128 | 512 | 512 | [32,1] | [1,1,16,8,n/a] | 42 | 78.5 |
+| GRPO | DeepSeek V3 | On policy | 1,536 | 728 | 256 | 512 | 512 | [32,1] | [1,1,16,8,n/a] | 23.6 | 70.7 |
+| GRPO | DeepSeek V3 | 1-step Off | 1,536 | 719 | 256 | 512 | 512 | [16,1] | [1,1,16,8,n/a] | 47.9 | 35 |
+| GRPO | Qwen3-235B | On policy | 8,192 | 5,707 | 64 | 512 | 512 | [8,1] | [2,2,16,4,n/a] | 174 | 268 |
+| GRPO | Qwen3-235B | On policy | 8,192 | 5,711 | 128 | 512 | 512 | [8,1] | [2,2,16,4,n/a] | 111 | 210 |
+| GRPO | Qwen3-235B | 1-step Off | 8,192 | 5,699 | 128 | 512 | 512 | [8,1] | [4,1,16,4,n/a] | 146 | 160 |
+| GRPO | Qwen3-30B3A | On policy | 4,096 | 3,198 | 16 | 2,048 | 512 | [1,1] | [1,1,16,1,n/a] | 2,265 | 186 |
+| GRPO | Qwen3-30B3A | 1-step Off | 4,096 | 3,200 | 16 | 2,048 | 512 | [1,1] | [1,1,16,1,n/a] | 1,748 | 242 |
+| GRPO | Nemotron-3-Super-120BA12B | 1-step Off | 8,192 | 3,177 | 128 | 32 | 256 | [4,1] | [2,1,16,1,n/a] | 92.2 | 76 |
+| GRPO | Qwen3-32B | 1-step Off | 4,096 | 3,255 | 32 | 64 | 2048 | [1,1] | [2,1,1,1,n/a] | 1,539 | 140 |
+| GRPO | Qwen3-32B | On policy | 4,096 | 3,254 | 16 | 64 | 2048 | [2,1] | [2,1,1,4,n/a] | 1,458 | 295 |
+| GRPO | Nemotron-3-Super-120BA12B | On policy | 8,192 | 3,219 | 128 | 32 | 256 | [4,1] | [2,1,16,1,n/a] | 56.5 | 119 |
 
 Note:
 
 * All Mixture-of-expert (MoE) model training uses token drop-less. 
 * The following metrics are extracted from the average of 5 steps: G-Average Seq len, Tokens/sec/gpu, Total Step time(s). Because of the averaging, the numbers in the table do not completely match the equation stated in Performance Metrics above but the difference is small.
-* There was a change in pretrained checkpoint (see [docs/guides/deepseek.md](https://github.com/NVIDIA-NeMo/RL/blob/r0.6.0/docs/guides/deepseek.md)) for DeepSeek V3 leading to lower Average Seq len. The reported throughput is not comparable across versions. Please use equivalent checkpoints for comparison. For example, using the newer checkpoint `DeepSeek V3 on-policy GRPO #-GPUs: 128` v0.5.0 performs at `26.1 Tokens / sec / GPU` compared to v0.6.0 at `30.2 Tokens / sec / GPU`.
