@@ -1234,6 +1234,65 @@ class TestAsyncTrajectoryCollector:
         assert metrics["payload_bytes/nemo_gym_return/logical_media"] == 150
         assert metrics["payload_ratio/nemo_gym_return/physical_to_logical"] == 0.2
 
+    def test_nemo_gym_forwards_length_adjustment_config(self, monkeypatch):
+        collector = self.create_local_collector()
+        collector.master_config.grpo.length_bonus = {
+            "default": {
+                "enabled": True,
+                "reasoning_end_token_id": 13,
+            },
+            "profile_band": {
+                "enabled": True,
+                "defaults": {
+                    "reasoning": {"a": 1024, "b": 4096, "f": 0.95},
+                },
+            },
+        }
+        collector.master_config.policy["generation"] = {
+            "stop_token_ids": [1],
+            "stop_strings": ["stop"],
+        }
+        repeated_batch = BatchedDataDict(
+            {
+                "extra_env_info": [
+                    {"_ng_task_index": 7},
+                    {"_ng_task_index": 7},
+                ],
+                "loss_multiplier": torch.ones(2),
+            }
+        )
+        captured_kwargs = {}
+
+        async def fake_rollouts(**kwargs):
+            captured_kwargs.update(kwargs)
+            yield SimpleNamespace(
+                task_index=7,
+                final_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+                rollout_metrics={},
+            )
+
+        import nemo_rl.experience.rollouts as rollouts_mod
+
+        monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_rollouts)
+
+        async def collect_groups():
+            return [
+                group
+                async for group in collector._iter_rollout_groups(
+                    repeated_batch=repeated_batch,
+                    num_generations=2,
+                    use_nemo_gym=True,
+                    task_index_to_group_index={7: 0},
+                )
+            ]
+
+        groups = asyncio.run(collect_groups())
+
+        assert len(groups) == 1
+        assert captured_kwargs["length_adjustment_config"] == (
+            collector.master_config.grpo.model_dump()
+        )
+
     def test_collection_loop_marks_errored_on_crash(self):
         """A crash sets errored (not data_exhausted) so driver guards fail fast."""
         collector = self.create_local_collector()

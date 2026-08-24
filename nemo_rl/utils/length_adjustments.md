@@ -49,6 +49,8 @@ grpo:
       profile_band_total: false
       profile_band_reasoning: false
       profile_band_answer: false
+      reasoning_end_token_id: null
+      profile_band: null
     agent_overrides:
       math_with_judge_simple_agent:
         enabled: true
@@ -117,6 +119,8 @@ grpo:
 | `profile_band_total` | Enables per-prompt `{a,b,f}` multiplier on total length for correct rollouts. |
 | `profile_band_reasoning` | Enables per-prompt `{a,b,f}` multiplier on reasoning length for correct rollouts. |
 | `profile_band_answer` | Enables per-prompt `{a,b,f}` multiplier on answer length for correct rollouts. |
+| `reasoning_end_token_id` | Optional model-specific reasoning-end token used to split newly generated assistant token IDs exactly. |
+| `profile_band` | Optional global `{total,reasoning,answer}` band used when a dataset row has no `profile_band` metadata. |
 | `group_length_penalty_profile_gate` | Gates group-relative length coefficients using a per-prompt `profile_band` threshold. |
 | `group_length_penalty_profile_gate_channel` | Selects which profile-band channel to gate on: `reasoning`, `answer`, or `total`. |
 | `group_length_penalty_profile_gate_field` | Selects which field from the chosen profile-band channel to use as the gate threshold, usually `a`. |
@@ -415,7 +419,8 @@ Config keys:
 - `profile_band_reasoning`
 - `profile_band_answer`
 
-This uses per-row `profile_band` metadata with channel-specific `{a, b, f}` values:
+This uses channel-specific `{a, b, f}` values. Per-row `profile_band` metadata
+takes precedence when present:
 
 ```json
 {
@@ -426,6 +431,29 @@ This uses per-row `profile_band` metadata with channel-specific `{a, b, f}` valu
   }
 }
 ```
+
+To count reasoning separately from the final answer, configure the model's
+reasoning-end token under `length_bonus.default`. Global profile-band defaults
+remain under the canonical `length_bonus.profile_band.defaults` block:
+
+```yaml
+grpo:
+  length_bonus:
+    default:
+      enabled: true
+      length_type: tokens
+      reasoning_end_token_id: 13
+    profile_band:
+      enabled: true
+      defaults:
+        reasoning: {a: 1024, b: 4096, f: 0.95}
+```
+
+When `reasoning_end_token_id` is set, reasoning and answer lengths are computed
+from newly generated assistant token IDs only. The original prompt prefix is
+excluded, and the first matching end token in each generated assistant turn is
+the boundary. This supports models such as Nemotron Omni whose prompt opens the
+reasoning block and whose generation emits only the closing token.
 
 For an enabled channel, the multiplier is:
 
