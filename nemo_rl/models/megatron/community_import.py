@@ -25,6 +25,25 @@ from megatron.core.transformer import ModuleSpec
 from nemo_rl.models.policy import MegatronConfig
 
 
+VLM_TOWER_OVERRIDE_KEYS = (
+    "radio_force_cpe_eval_mode",
+    "freeze_vision_model",
+    "freeze_vision_projection",
+    "freeze_sound_encoder",
+    "freeze_sound_projection",
+)
+
+# Model-architecture keys that must never leak from a student config onto a
+# teacher: the teacher's structure comes from its own checkpoint, or from an
+# explicit per-teacher override. TeacherWorkerGroup strips these at clone time.
+TEACHER_ARCHITECTURE_KEYS = VLM_TOWER_OVERRIDE_KEYS + (
+    "mtp_num_layers",
+    "mtp_use_repeated_layer",
+    "mtp_loss_scaling_factor",
+    "mtp_detach_heads",
+)
+
+
 def iter_vlm_config_overrides(
     megatron_config: MegatronConfig,
 ) -> Iterator[tuple[str, Any]]:
@@ -33,14 +52,7 @@ def iter_vlm_config_overrides(
     Only keys present in the recipe are yielded, so omitting one keeps the
     provider's own default rather than silently forcing False.
     """
-    keys = (
-        "radio_force_cpe_eval_mode",
-        "freeze_vision_model",
-        "freeze_vision_projection",
-        "freeze_sound_encoder",
-        "freeze_sound_projection",
-    )
-    for key in keys:
+    for key in VLM_TOWER_OVERRIDE_KEYS:
         if key in megatron_config:
             yield key, megatron_config[key]
 
@@ -138,17 +150,7 @@ def import_model_from_hf_name(
             # Match the import-time behaviour in megatron/setup.py: a key the
             # recipe set explicitly must not be dropped just because this
             # provider lacks the field, or a frozen tower silently trains.
-            # Exception: inference-only teachers cloned from a cross-
-            # architecture student's config (flag set by TeacherWorkerGroup)
-            # drop such keys with a warning instead.
             if not hasattr(model_provider, key):
-                if megatron_config.get("_drop_unsupported_tower_keys"):
-                    warnings.warn(
-                        f"Dropping megatron_cfg key '{key}' inherited from the "
-                        f"student: {type(model_provider).__name__} has no such "
-                        "field (cross-architecture teacher)."
-                    )
-                    continue
                 raise ValueError(
                     f"megatron_cfg set '{key}' but "
                     f"{type(model_provider).__name__} has no such field; this "

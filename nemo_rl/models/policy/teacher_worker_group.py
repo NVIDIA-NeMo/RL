@@ -29,6 +29,7 @@ import numpy as np
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.opd import TeacherResourceConfig
+from nemo_rl.models.megatron.community_import import TEACHER_ARCHITECTURE_KEYS
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     SequencePackingArgs,
@@ -146,16 +147,27 @@ class TeacherWorkerGroup:
             teacher_cfg.expert_model_parallel_size
         )
 
+        # Architecture keys never inherit from the student: a teacher's model
+        # structure comes from its own checkpoint, or from an explicit
+        # per-teacher override (applied below, after the strip). Inheriting
+        # them breaks cross-architecture pairs (e.g. a VLM student's tower
+        # keys crash a text teacher at load; its mtp_num_layers=0 crashes an
+        # MTP-bearing teacher at first forward).
+        stripped = {
+            key: cfg["megatron_cfg"].pop(key)
+            for key in TEACHER_ARCHITECTURE_KEYS
+            if key in cfg["megatron_cfg"]
+        }
+        if stripped:
+            warnings.warn(
+                f"Teacher '{self.alias}': not inheriting architecture keys "
+                f"from the student config: {stripped}. The teacher checkpoint's "
+                "own values apply; set teacher_overrides to pin explicitly."
+            )
+
         # Apply any additional megatron config overrides from teacher config.
         for key, value in teacher_cfg.megatron_cfg_overrides.items():
             cfg["megatron_cfg"][key] = value
-
-        # Teachers clone the student's megatron_cfg, so a cross-architecture
-        # teacher (e.g. text teacher under a VLM student) inherits tower keys
-        # its provider lacks. Students keep the strict raise (a dropped freeze
-        # flag would silently train a frozen tower); frozen inference-only
-        # teachers drop such keys with a warning instead.
-        cfg["megatron_cfg"]["_drop_unsupported_tower_keys"] = True
 
         # Teachers run Megatron inference-only. Don't let the student's other
         # backend or parameter-adding features leak onto the frozen teacher.

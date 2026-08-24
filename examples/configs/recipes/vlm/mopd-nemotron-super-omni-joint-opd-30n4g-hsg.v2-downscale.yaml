@@ -208,6 +208,11 @@ on_policy_distillation:
       # The text runs score this same teacher at 131k fast with level 1.
       empty_unused_memory_level: 1
     teacher_overrides:
+      string_match_simple_agent:
+        # pin: architecture keys no longer inherit from the student; keep the
+        # RADIO eval-mode behavior the proven omni runs had. Freeze flags are
+        # left to the checkpoint (irrelevant for an inference-only teacher).
+        radio_force_cpe_eval_mode: true
       # text teacher: TP8/EP16/CP1 over 4n4g (DP=2). CP was 2 (the text-run
       # shape), but on this stack the teacher's FIRST CP2 forward hung
       # silently in lazy 2-rank P2P NCCL init (job 6448223: first-forward
