@@ -145,7 +145,12 @@ def test_batched_expert_prequantization_preserves_wire_entries_and_reuses_scratc
             else:
                 shape = (2, 64)
                 fill_value = expert_id + (1 if projection == "gate" else 3)
-            tensor = torch.full(shape, fill_value, requires_grad=True)
+            tensor = torch.full(
+                shape,
+                fill_value,
+                dtype=torch.bfloat16,
+                requires_grad=True,
+            )
             params.append((name, tensor))
             expected[name] = tensor
 
