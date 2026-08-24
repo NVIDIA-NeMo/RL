@@ -7,7 +7,7 @@ NUM_NODES=2
 STEPS_PER_RUN=40
 MAX_STEPS=40
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=60
+NUM_MINUTES=40
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -37,17 +37,16 @@ grep -q "weight_sync=CollectiveWeightSynchronizer" $RUN_LOG
 # Convert tensorboard logs to json
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Only run metrics if the target step is reached. Thresholds are the legacy
-# recipe's, at the step where this run has consumed the same data. SC has no
-# validation loop, so its validation/accuracy assertion has no counterpart.
+# Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
         'data["train/token_mult_prob_error"]["40"] < 1.1' \
         'median(data["train/max_seq_mult_prob_error"]) < 1.2' \
         'len(data["train/critic/loss"]) == 40' \
-        'min(data["train/critic/loss"]) >= 0' \
-        'data["train/reward"]["40"] > 0.75'
+        'max(data["train/critic/loss"]) < 1.5' \
+        'mean(data["train/critic/explained_var"], range_start=-10) > 0.5' \
+        'mean(data["train/reward"], range_start=-10) > 0.75'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
