@@ -246,7 +246,7 @@ class VllmAsyncGenerationWorkerImpl(
     def _start_vllm_metrics_logger(self) -> None:
         """Start a background thread that periodically collects vLLM logger metrics.
 
-        Controlled by vllm_metrics_logger_interval (default: 0.5) in vllm_cfg.
+        Controlled by the required vllm_metrics_logger_interval in vllm_cfg.
         Runs only on the model-owner actor.
         """
         from vllm.v1.metrics.reader import Gauge, Counter, get_metrics_snapshot
@@ -325,6 +325,30 @@ class VllmAsyncGenerationWorkerImpl(
                 "generation_tokens": copy.deepcopy(self.generation_tokens),
             }
         return metric
+
+    def drain_latest_vllm_logger_metrics(self) -> dict[str, Any]:
+        """Return latest samples and prune histories after a telemetry poll."""
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return {}
+
+        with self._vllm_metrics_lock:
+            histories = {
+                "inflight_batch_sizes": self.inflight_batch_sizes,
+                "num_pending_samples": self.num_pending_samples,
+                "kv_cache_usage_perc": self.kv_cache_usage_perc,
+                "generation_tokens": self.generation_tokens,
+            }
+            latest = {
+                name: [values[-1]] if values else []
+                for name, values in histories.items()
+            }
+            # Keep worker-owned histories distinct from the lists handed to Ray;
+            # the sampling thread may append immediately after this lock exits.
+            self.inflight_batch_sizes = list(latest["inflight_batch_sizes"])
+            self.num_pending_samples = list(latest["num_pending_samples"])
+            self.kv_cache_usage_perc = list(latest["kv_cache_usage_perc"])
+            self.generation_tokens = list(latest["generation_tokens"])
+            return {name: list(values) for name, values in latest.items()}
 
     def clear_vllm_logger_metrics(self) -> None:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):

@@ -286,6 +286,38 @@ class TestSetup:
         with pytest.raises(ValueError, match="data_plane.enabled=True"):
             setup_single_controller(mc, MagicMock())
 
+    def test_warns_when_rollout_telemetry_lacks_vllm_metrics(self, patched_factories):
+        mc = _make_master_config()
+        mc.rollout_checkpointing.telemetry_interval_s = 30.0
+        mc.policy["generation"]["vllm_cfg"] = {"async_engine": True}
+
+        with pytest.warns(UserWarning, match="vLLM token, request, and KV-cache"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_warns_when_vllm_telemetry_uses_sync_engine(self, patched_factories):
+        mc = _make_master_config()
+        mc.rollout_checkpointing.telemetry_interval_s = 30.0
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": False,
+            "enable_vllm_metrics_logger": True,
+        }
+
+        with pytest.warns(UserWarning, match="async_engine=true"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_non_vllm_telemetry_warning_has_no_vllm_config_guidance(
+        self, patched_factories
+    ):
+        mc = _make_master_config(backend="sglang")
+        mc.rollout_checkpointing.telemetry_interval_s = 30.0
+
+        with pytest.warns(UserWarning) as warning_records:
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        messages = [str(record.message) for record in warning_records]
+        assert any("backend='sglang'" in message for message in messages)
+        assert all("enable_vllm_metrics_logger" not in message for message in messages)
+
     def test_rejects_mooncake_data_plane_checkpointing(self):
         mc = _make_master_config()
         mc.data_plane.update(
