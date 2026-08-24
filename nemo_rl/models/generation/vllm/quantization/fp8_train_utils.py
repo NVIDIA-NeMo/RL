@@ -110,7 +110,8 @@ def iter_mxfp8_prequantized_params(
     quantize_fn: Callable[
         [torch.Tensor], tuple[torch.Tensor, torch.Tensor]
     ] = mxfp8_e4m3_quantize_for_refit,
-    scratch_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] | None = None,
+    scratch_cache: dict[tuple[torch.device, torch.dtype, int | None], torch.Tensor]
+    | None = None,
     max_experts_per_batch: int = 16,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Batch expert weights while preserving the existing refit wire entries.
@@ -123,7 +124,8 @@ def iter_mxfp8_prequantized_params(
         params: Exported Hugging Face parameter names and tensors.
         selected_names: Parameter names selected for MXFP8 prequantization.
         quantize_fn: MXFP8 quantization function.
-        scratch_cache: Reusable stacking buffers keyed by device and dtype.
+        scratch_cache: Reusable stacking buffers keyed by device, dtype, and
+            CUDA stream.
         max_experts_per_batch: Maximum number of experts per quantization call.
 
     Yields:
@@ -178,7 +180,12 @@ def iter_mxfp8_prequantized_params(
                     "MXFP8 prequantization requires BF16 trainer-exported weights."
                 )
             required_numel = len(chunk) * first.numel()
-            cache_key = (first.device, first.dtype)
+            stream_id = (
+                int(torch.cuda.current_stream(first.device).cuda_stream)
+                if first.is_cuda
+                else None
+            )
+            cache_key = (first.device, first.dtype, stream_id)
             scratch = scratch_cache.get(cache_key)
             if scratch is None or scratch.numel() < required_numel:
                 scratch = torch.empty(
@@ -193,11 +200,13 @@ def iter_mxfp8_prequantized_params(
 
             value, scale = quantize_fn(stacked.view(-1, stacked.shape[-1]))
             value = value.view_as(stacked)
-            scale = scale.view(
-                len(chunk),
-                *first.shape[:-1],
-                first.shape[-1] // MXFP8_BLOCK_SIZE,
+            scale_columns = first.shape[-1] // MXFP8_BLOCK_SIZE
+            scale_shape = (
+                first.shape[:-1]
+                if scale_columns == 1
+                else (*first.shape[:-1], scale_columns)
             )
+            scale = scale.view(len(chunk), *scale_shape)
             for index, (_expert_id, name, _tensor) in enumerate(chunk):
                 yield name, value[index]
                 yield name + "_scale_from_checkpoint", scale[index]
@@ -221,14 +230,6 @@ def iter_mxfp8_prequantized_params(
         prefix = match.group("prefix")
         projection = match.group("projection")
         if current_prefix is not None and prefix != current_prefix:
-            yield from flush_pending()
-        elif projection == "down_proj" and any(
-            key[1] != "down_proj" for key in pending
-        ):
-            yield from flush_pending()
-        elif projection != "down_proj" and any(
-            key[1] == "down_proj" for key in pending
-        ):
             yield from flush_pending()
         current_prefix = prefix
         group_key = (prefix, projection)
