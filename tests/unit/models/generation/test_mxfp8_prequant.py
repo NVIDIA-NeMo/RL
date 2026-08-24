@@ -129,7 +129,7 @@ def test_batched_expert_prequantization_preserves_wire_entries_and_reuses_scratc
             (*tensor.shape[:-1], tensor.shape[-1] // MXFP8_BLOCK_SIZE),
             dtype=torch.uint8,
         )
-        return tensor.clone(), scales
+        return tensor.detach().clone(), scales
 
     def expert_name(expert_id, projection):
         return f"model.layers.0.mlp.experts.{expert_id}.{projection}_proj.weight"
@@ -139,12 +139,16 @@ def test_batched_expert_prequantization_preserves_wire_entries_and_reuses_scratc
     for expert_id in range(2):
         for projection in ("gate", "up"):
             name = expert_name(expert_id, projection)
-            tensor = torch.full((2, 64), expert_id + (1 if projection == "gate" else 3))
+            tensor = torch.full(
+                (2, 64),
+                expert_id + (1 if projection == "gate" else 3),
+                requires_grad=True,
+            )
             params.append((name, tensor))
             expected[name] = tensor
     for expert_id in range(2):
         name = expert_name(expert_id, "down")
-        tensor = torch.full((4, 32), expert_id + 5)
+        tensor = torch.full((4, 32), expert_id + 5, requires_grad=True)
         params.append((name, tensor))
         expected[name] = tensor
 
