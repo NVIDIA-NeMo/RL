@@ -29,7 +29,7 @@ import numpy as np
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.opd import TeacherResourceConfig
-from nemo_rl.models.megatron.community_import import TEACHER_ARCHITECTURE_KEYS
+from nemo_rl.models.megatron.config_keys import TEACHER_ARCHITECTURE_KEYS
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     SequencePackingArgs,

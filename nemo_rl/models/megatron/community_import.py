@@ -22,26 +22,8 @@ import torch
 from megatron.bridge import AutoBridge
 from megatron.core.transformer import ModuleSpec
 
+from nemo_rl.models.megatron.config_keys import VLM_TOWER_OVERRIDE_KEYS
 from nemo_rl.models.policy import MegatronConfig
-
-
-VLM_TOWER_OVERRIDE_KEYS = (
-    "radio_force_cpe_eval_mode",
-    "freeze_vision_model",
-    "freeze_vision_projection",
-    "freeze_sound_encoder",
-    "freeze_sound_projection",
-)
-
-# Model-architecture keys that must never leak from a student config onto a
-# teacher: the teacher's structure comes from its own checkpoint, or from an
-# explicit per-teacher override. TeacherWorkerGroup strips these at clone time.
-TEACHER_ARCHITECTURE_KEYS = VLM_TOWER_OVERRIDE_KEYS + (
-    "mtp_num_layers",
-    "mtp_use_repeated_layer",
-    "mtp_loss_scaling_factor",
-    "mtp_detach_heads",
-)
 
 
 def iter_vlm_config_overrides(
