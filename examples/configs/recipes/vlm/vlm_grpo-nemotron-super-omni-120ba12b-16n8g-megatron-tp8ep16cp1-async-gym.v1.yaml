@@ -1,0 +1,16 @@
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+
+# Config-only performance variant. Keep the parent model, data, 16K sequence
+# limit, TP8/EP16 learner topology, TP4 rollout topology, and age-one async
+# refit contract.
+policy:
+  sequence_packing:
+    logprob_mb_tokens: 32768
+  megatron_cfg:
+    activation_checkpointing: false
+    context_parallel_size: 1
+  generation:
+    vllm_kwargs:
+      max_num_seqs: 64
+      compilation_config:
+        cudagraph_mode: FULL_AND_PIECEWISE
