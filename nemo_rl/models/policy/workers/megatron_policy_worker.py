@@ -480,9 +480,6 @@ class MegatronPolicyWorkerImpl(
         self._refit_param_info_hf: Optional[
             dict[str, tuple[torch.Size, torch.dtype]]
         ] = None
-        self._mxfp8_prequant_scratch_cache: dict[
-            tuple[torch.device, torch.dtype], torch.Tensor
-        ] = {}
         # Pinned host staging for the reference-policy swap; only populated when
         # megatron_cfg["pinned_reference_swap"] is enabled. Buffer contents are
         # only live within a single use_reference_model call (every copy
@@ -2682,7 +2679,6 @@ class MegatronPolicyWorkerImpl(
             yield from iter_mxfp8_prequantized_params(
                 base_iter,
                 self._refit_prequant_names,
-                scratch_cache=self._mxfp8_prequant_scratch_cache,
             )
         else:
             for name, tensor in base_iter:
