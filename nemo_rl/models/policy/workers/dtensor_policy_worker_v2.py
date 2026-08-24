@@ -512,11 +512,9 @@ class DTensorPolicyWorkerV2Impl(
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
 
                         if num_valid_samples > 0:
-                            # ClippedPGLossFn already materializes the loss
-                            # metric with the other scalars; avoid a second
-                            # GPU-to-CPU synchronization here. Metrics were
-                            # divided by num_global_batches upstream, so undo
-                            # that scaling for the per-global-batch loss, as in v1.
+                            # Metrics were materialized together by the loss;
+                            # undo this worker's per-global-batch scaling without
+                            # synchronizing the loss tensor again.
                             mb_losses.append(loss_metrics["loss"] * num_global_batches)
                             all_mb_metrics.append(loss_metrics)
 
