@@ -220,8 +220,10 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     # Group staleness comes from the valid rollout's calls (wv 4), not the fallback.
     assert (finalized.group_min_wv, finalized.group_max_wv) == (4, 4)
     assert finalized.metrics["finalize/invalid_row_rate"] == 0.5
-    assert finalized.metrics["finalize/heuristic_terminal_count"] == 1.0
-    assert finalized.metrics["finalize/heuristic_terminal_fraction"] == 0.5
+    assert finalized.metrics["finalize/terminal_selection_heuristic_count"] == 1.0
+    assert finalized.metrics["finalize/terminal_selection_heuristic_fraction"] == 0.5
+    assert finalized.metrics["finalize/terminal_selection_declared_count"] == 0.0
+    assert finalized.metrics["finalize/terminal_witness_disagreement_count"] == 0.0
 
     rows = _fetch_rows(tq_client, rollout_ids)
     sample_mask = torch.as_tensor(rows["sample_mask"]).flatten()

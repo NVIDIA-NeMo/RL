@@ -708,8 +708,12 @@ Depending on your data shape, you may want to change these values."""
             isinstance(terminal_logical_request_id, str) and terminal_logical_request_id
         ):
             # A harness that reports no terminal id still gets its manifest
-            # fetched; receipt assembly falls back to heuristic selection.
+            # fetched; receipt assembly attributes the terminal from the
+            # scored response, falling back to heuristic selection.
             terminal_logical_request_id = None
+        scored_response = nemo_gym_result.get("response")
+        if not isinstance(scored_response, dict):
+            scored_response = None
         receipt = None
         try:
             manifest = await self._control(
@@ -721,6 +725,7 @@ Depending on your data shape, you may want to change these values."""
                 rollout_id,
                 manifest,
                 terminal_logical_request_id=terminal_logical_request_id,
+                scored_response=scored_response,
                 reward=float(nemo_gym_result.get("reward") or 0.0),
             )
         except (RuntimeError, OSError) as error:
@@ -740,19 +745,30 @@ Depending on your data shape, you may want to change these values."""
         manifest: dict,
         *,
         terminal_logical_request_id: Optional[str],
+        scored_response: Optional[dict] = None,
         reward: float,
     ) -> dict:
         """Build the token-free RolloutReceipt payload from a ledger manifest.
 
-        With a declared terminal (``terminal_logical_request_id``), the
-        terminal row is the manifest row whose ``logical_request_id`` equals
-        the response id the agent actually kept; a declared id that matches no
-        row masks the rollout and never falls back. Without a declaration,
-        Gym's ``select_terminal_call`` infers the terminal from the manifest's
-        parent links (fail-closed: ambiguity masks). The receipt records which
-        path chose the terminal in ``terminal_selection``. Retry duplicates
-        are dead-branch rows: they stay in the manifest (their staged rows are
-        fetched, verified, and cleaned) but never join the terminal chain —
+        Terminal selection is staged, fail-closed at every stage:
+
+        1. Witness attribution (``resolve_terminal``): the declared response
+           id (``terminal_logical_request_id``), the scored response's
+           envelope id, and its content fingerprints each independently name
+           a manifest row through ``CallRecord.response_id`` and the recorded
+           fingerprints. Agreeing witnesses attribute; a declared id that
+           matches no row masks and never falls back; disagreeing witnesses
+           attribute nothing.
+        2. Heuristic fallback (``select_terminal_call``): with no witness,
+           the manifest's explicit parent links infer the terminal
+           (fail-closed: ambiguity masks).
+
+        The receipt records the resolving stage in ``terminal_selection``
+        (``declared``/``response_id``/``content``/``heuristic`` — failed
+        selections stamp the last stage attempted) and the witness trail in
+        ``terminal_attribution_reason``. Retry duplicates are dead-branch
+        rows: they stay in the manifest (their staged rows are fetched,
+        verified, and cleaned) but never join the terminal chain —
         ``verify_and_linearize`` tolerates rows unreferenced by the terminal
         chain.
 
@@ -769,6 +785,11 @@ Depending on your data shape, you may want to change these values."""
         marks a call whose completion WAS served — a hole in the chain —
         and poisons.
         """
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.attribution import resolve_terminal
+        from nemo_gym.token_id_capture.staging.records import CallRecord
+        from nemo_gym.token_id_capture.staging.terminal import select_terminal_call
+
         records = [dict(record) for record in manifest.get("records") or []]
         failures = list(manifest.get("failures") or [])
         deduped: dict[str, dict] = {}
@@ -776,34 +797,32 @@ Depending on your data shape, you may want to change these values."""
             deduped.setdefault(str(record.get("model_call_id")), record)
         terminal_record = None
         selection_reason = None
-        if terminal_logical_request_id is not None:
-            terminal_selection = "declared"
-            terminal_record = next(
-                (
-                    record
-                    for record in deduped.values()
-                    if record.get("logical_request_id") == terminal_logical_request_id
-                ),
-                None,
+        attribution_reason = None
+        terminal_selection = "heuristic"
+        parsed_records = None
+        try:
+            parsed_records = [
+                CallRecord.model_validate(record) for record in deduped.values()
+            ]
+        except ValueError:
+            selection_reason = "invalid_manifest_row"
+        if parsed_records is not None:
+            attribution = resolve_terminal(
+                parsed_records,
+                scored_response,
+                declared_response_id=terminal_logical_request_id,
             )
-        else:
-            terminal_selection = "heuristic"
-            # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-            from nemo_gym.token_id_capture.staging.records import CallRecord
-            from nemo_gym.token_id_capture.staging.terminal import (
-                select_terminal_call,
-            )
-
-            try:
-                selection = select_terminal_call(
-                    [
-                        CallRecord.model_validate(record)
-                        for record in deduped.values()
-                    ]
-                )
-            except ValueError:
-                selection_reason = "invalid_manifest_row"
+            attribution_reason = attribution.reason or None
+            if attribution.attributed:
+                terminal_selection = attribution.method
+                terminal_record = deduped[attribution.model_call_id]
+            elif terminal_logical_request_id is not None:
+                # A declaration is authoritative: a declared id the ledger
+                # cannot confirm masks and never falls back to the heuristic.
+                terminal_selection = "declared"
+                selection_reason = None
             else:
+                selection = select_terminal_call(parsed_records)
                 if selection.terminal_model_call_id is not None:
                     terminal_record = deduped[selection.terminal_model_call_id]
                 else:
@@ -830,6 +849,7 @@ Depending on your data shape, you may want to change these values."""
             "capture_poisoned": failure_reason is not None,
             "failure_reason": failure_reason,
             "terminal_selection": terminal_selection,
+            "terminal_attribution_reason": attribution_reason,
         }
 
     def _postprocess_nemo_gym_to_nemo_rl_result(

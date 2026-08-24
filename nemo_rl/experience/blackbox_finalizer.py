@@ -557,18 +557,33 @@ class BlackboxFinalizer:
                 if isinstance(receipt, dict) and receipt.get("capture_poisoned")
             )
         )
-        # Heuristic terminal selection is a fallback for harnesses that do not
-        # declare the response they kept; a nonzero fraction on a declaring
-        # harness is a regression signal.
-        heuristic_receipts = sum(
+        # Per-method terminal-selection breakdown. Witness methods
+        # (declared/response_id/content) resolve from evidence; heuristic is
+        # the no-witness parent-link fallback — a nonzero heuristic fraction
+        # on a declaring harness is a regression signal. Failed selections
+        # stamp the last stage attempted, so masked rollouts stay visible in
+        # their method's bucket (cross-reference finalize/invalid_row_rate).
+        for method in ("declared", "response_id", "content", "heuristic"):
+            method_receipts = sum(
+                1
+                for receipt in receipts
+                if isinstance(receipt, dict)
+                and receipt.get("terminal_selection") == method
+            )
+            metrics[f"finalize/terminal_selection_{method}_count"] = float(
+                method_receipts
+            )
+            metrics[f"finalize/terminal_selection_{method}_fraction"] = (
+                method_receipts / len(receipts)
+            )
+        witness_disagreements = sum(
             1
             for receipt in receipts
             if isinstance(receipt, dict)
-            and receipt.get("terminal_selection") == "heuristic"
+            and "witness_disagreement" in str(receipt.get("terminal_attribution_reason") or "")
         )
-        metrics["finalize/heuristic_terminal_count"] = float(heuristic_receipts)
-        metrics["finalize/heuristic_terminal_fraction"] = heuristic_receipts / len(
-            receipts
+        metrics["finalize/terminal_witness_disagreement_count"] = float(
+            witness_disagreements
         )
         for row in rows:
             if not row.valid:

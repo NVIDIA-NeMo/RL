@@ -88,6 +88,7 @@ def _manifest(record: StagedCallRecord) -> CallRecord:
         staging_key=record.staging_key,
         chain_hash=record.chain_hash,
         cumulative_hash=record.cumulative_hash,
+        response_id=f"chatcmpl-{record.model_call_id}",
     )
 
 
@@ -138,6 +139,7 @@ def build_fixture_artifacts(
         rollout_id=rollout_id,
         terminal_model_call_id=records[-1].model_call_id,
         manifest=[_manifest(record) for record in records],
+        terminal_selection="declared",
     )
     snapshots = [
         StagedCallSnapshot.model_validate(record.model_dump()) for record in records
