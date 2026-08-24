@@ -42,10 +42,8 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # The upstream fix was expected around 5.12, but 5.12.1 still ships both
-    # registry entries, so the patch is still load-bearing there. The sglang
-    # worker venv pins transformers==5.12.1 (sglang requirement), while other
-    # backend venvs retain their prior 5.5.x or 5.8.1 pins, so this runs on all.
+    # Transformers 5.12.1 still ships both registry entries, so the patch remains
+    # load-bearing across the currently supported backend environments.
     # TODO: remove this patch (and the assert below) once the deepseek_v3
     # entries actually disappear upstream.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764

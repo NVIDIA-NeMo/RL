@@ -1023,6 +1023,54 @@ class TestForwardWithPostProcessingFn:
         # Verify result shape
         assert result.shape == (batch_size,)
 
+    def test_forward_with_score_post_processor_rejects_cp(
+        self,
+        mock_model,
+        base_cfg,
+    ):
+        batch_size = 4
+        seq_len = 64
+        input_ids = torch.randint(0, 32000, (batch_size, seq_len))
+        processed_inputs = ProcessedInputs(
+            input_ids=input_ids,
+            seq_len=seq_len,
+            attention_mask=torch.ones(batch_size, seq_len, dtype=torch.bool),
+            position_ids=torch.arange(seq_len).repeat(batch_size, 1),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+        )
+        processed_mb = ProcessedMicrobatch(
+            data_dict=BatchedDataDict(
+                {
+                    "input_ids": input_ids,
+                    "input_lengths": torch.full((batch_size,), seq_len),
+                    "sample_mask": torch.ones(batch_size, dtype=torch.bool),
+                }
+            ),
+            processed_inputs=processed_inputs,
+            original_batch_size=batch_size,
+            original_seq_len=seq_len,
+        )
+        prepared = PreparedModelForward(
+            model_batch={"input_ids": input_ids},
+            cp_size=2,
+            cp_sharder=MagicMock(),
+            model_context_factory=nullcontext,
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="ScorePostProcessor does not support context_parallel_size > 1",
+        ):
+            forward_with_post_processing_fn(
+                model=mock_model,
+                prepared=prepared,
+                post_processing_fn=ScorePostProcessor(cfg=base_cfg),
+                processed_mb=processed_mb,
+            )
+
+        mock_model.assert_not_called()
+
 
 # =====================
 # Test automodel_forward_backward
@@ -1938,6 +1986,128 @@ class TestAutomodelForwardBackwardWithGradients:
         # Verify gradients were computed
         assert model.proj.weight.grad is not None
         assert len(results) == 1
+
+    @pytest.mark.parametrize(
+        ("input_type", "expected_scale"),
+        [
+            (LossInputType.LOGIT, 3.0),
+            (LossInputType.LOGPROB, 3.0),
+            (LossInputType.DISTILLATION, 3.0),
+            (LossInputType.DISTILLATION_CROSS_TOKENIZER, 6.0),
+        ],
+    )
+    @patch("nemo_rl.models.automodel.train.prepare_loss_input")
+    @patch("nemo_rl.models.automodel.train.prepare_model_forward")
+    def test_gradient_scale_follows_cp_fanout_contract(
+        self,
+        mock_prepare_model_forward: MagicMock,
+        mock_prepare_loss_input: MagicMock,
+        input_type: LossInputType,
+        expected_scale: float,
+        base_cfg: dict[str, Any],
+        mock_device_mesh: MagicMock,
+        mock_cp_mesh: MagicMock,
+    ) -> None:
+        """Backward applies DP and CP scaling exactly once for each CP contract."""
+
+        def fake_prepare_loss_input(
+            logits: torch.Tensor,
+            data_dict: BatchedDataDict[Any],
+            _loss_fn: Any,
+            **_kwargs: Any,
+        ) -> tuple[dict[str, torch.Tensor], BatchedDataDict[Any]]:
+            return {"logits": logits}, data_dict
+
+        mock_prepare_loss_input.side_effect = fake_prepare_loss_input
+
+        class ScaleModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+            def forward(self, input_ids: torch.Tensor, **_kwargs: Any) -> MagicMock:
+                logits = self.weight * torch.ones_like(
+                    input_ids, dtype=self.weight.dtype
+                )
+                return MagicMock(logits=logits)
+
+        def run(*, cp_size: int, dp_size: int) -> torch.Tensor:
+            model = ScaleModel()
+            loss_fn = MagicMock(input_type=input_type)
+
+            def compute_loss(
+                *,
+                logits: torch.Tensor,
+                data: BatchedDataDict[Any],
+                global_valid_seqs: torch.Tensor,
+                global_valid_toks: torch.Tensor,
+            ) -> tuple[torch.Tensor, dict[str, float]]:
+                del data, global_valid_seqs, global_valid_toks
+                loss = logits.mean()
+                return loss, {"loss": loss.item()}
+
+            loss_fn.side_effect = compute_loss
+            loss_post_processor = LossPostProcessor(
+                loss_fn=loss_fn,
+                cfg=base_cfg,
+                cp_mesh=mock_cp_mesh,
+                cp_size=cp_size,
+                dp_size=dp_size,
+            )
+
+            input_ids = torch.zeros((1, 4), dtype=torch.long)
+            processed_inputs = ProcessedInputs(
+                input_ids=input_ids,
+                seq_len=4,
+                attention_mask=torch.ones((1, 4), dtype=torch.bool),
+                position_ids=torch.arange(4).unsqueeze(0),
+                flash_attn_kwargs={},
+                vlm_kwargs={},
+            )
+            processed_mb = ProcessedMicrobatch(
+                data_dict=BatchedDataDict(
+                    {
+                        "input_ids": input_ids,
+                        "input_lengths": torch.tensor([4]),
+                        "sample_mask": torch.ones(1, dtype=torch.bool),
+                    }
+                ),
+                processed_inputs=processed_inputs,
+                original_batch_size=1,
+                original_seq_len=4,
+            )
+
+            # Keep model preparation at CP1 so this test isolates the backward
+            # scale from sharder collectives. The LossPostProcessor and training
+            # loop still use the requested CP/DP sizes and execute real autograd.
+            mock_prepare_model_forward.return_value = PreparedModelForward(
+                model_batch={"input_ids": input_ids},
+                cp_size=1,
+                cp_sharder=None,
+                model_context_factory=nullcontext,
+            )
+
+            automodel_forward_backward(
+                model=model,
+                data_iterator=iter([processed_mb]),
+                post_processing_fn=loss_post_processor,
+                device_mesh=mock_device_mesh,
+                padding_token_id=0,
+                autocast_context_factory=nullcontext,
+                forward_only=False,
+                global_valid_seqs=torch.tensor(1),
+                global_valid_toks=torch.tensor(4),
+                dp_size=dp_size,
+                cp_size=cp_size,
+            )
+
+            assert model.weight.grad is not None
+            return model.weight.grad.clone()
+
+        baseline_grad = run(cp_size=1, dp_size=1)
+        scaled_grad = run(cp_size=2, dp_size=3)
+
+        torch.testing.assert_close(scaled_grad, baseline_grad * expected_scale)
 
 
 # =====================

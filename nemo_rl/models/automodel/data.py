@@ -202,6 +202,7 @@ def get_microbatch_iterator(
         mbs: Microbatch size
         dp_mesh: Data parallel mesh
         tokenizer: Tokenizer for processing
+
     Returns:
         Tuple of (processed_microbatch_iterator, iterator_length)
     """
@@ -252,6 +253,7 @@ def process_microbatch(
         tokenizer: Tokenizer for padding value
         enable_seq_packing: Whether sequence packing is enabled
         cfg: Configuration dictionary
+
     Returns:
         ProcessedInputs containing all tensors and metadata for forward pass
     """

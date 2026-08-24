@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -34,6 +34,11 @@ from nemo_rl.distributed.model_utils import (
     get_next_token_logprobs_from_logits,
 )
 
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.context_parallel import (
+        ContextParallelSharder,
+    )
+
 
 def prepare_loss_input(
     logits: torch.Tensor,
@@ -45,7 +50,7 @@ def prepare_loss_input(
     sampling_params: Optional[TrainingSamplingParams] = None,
     d2t: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
-    cp_sharder: Optional[Any] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 
@@ -197,12 +202,21 @@ def prepare_loss_input(
                 if context_parallel_group is not None
                 else 1
             )
+            full_seq_len = full_logprobs.shape[1]
+            if full_seq_len % cp_size != 0:
+                raise ValueError(
+                    "Student sequence length must be divisible by the student "
+                    "context parallel size, but got "
+                    f"sequence_length={full_seq_len}, cp_size={cp_size}. "
+                    "Set policy.make_sequence_length_divisible_by to a multiple of "
+                    "policy.dtensor_cfg.context_parallel_size."
+                )
             cp_rank = (
                 torch.distributed.get_rank(context_parallel_group)
                 if context_parallel_group is not None
                 else 0
             )
-            local_seq_len = full_logprobs.shape[1] // cp_size
+            local_seq_len = full_seq_len // cp_size
             seq_start = cp_rank * local_seq_len
             next_token_mask = (
                 data["token_mask"].to(full_logprobs.device).roll(shifts=-1, dims=1)

@@ -81,7 +81,7 @@ def test_reduce_tensor_modified_preserves_cpu_reduction(monkeypatch):
     monkeypatch.setattr(
         reductions,
         "_reduce_tensor_original",
-        reductions.reduce_tensor,
+        getattr(reductions, "_reduce_tensor_original", reductions.reduce_tensor),
         raising=False,
     )
 

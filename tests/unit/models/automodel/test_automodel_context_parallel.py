@@ -14,17 +14,28 @@
 
 """Contract tests for NeMo-RL's Automodel context-parallel integration."""
 
+import os
 from contextlib import nullcontext
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.distributed.device_mesh import init_device_mesh
 
 try:
     import nemo_automodel  # noqa: F401
 except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    ShardLayout,
+    round_robin_local_indices,
+    shard_batch_identity,
+)
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -35,8 +46,96 @@ from nemo_rl.models.automodel.data import ProcessedInputs
 from nemo_rl.models.automodel.train import (
     FullLogitsPostProcessor,
     LossPostProcessor,
+    _cp_gather_logits,
     prepare_model_forward,
 )
+
+
+def _has_gloo() -> bool:
+    return dist.is_available() and dist.is_gloo_available()
+
+
+def _real_cp_sharder_worker(rank: int, world_size: int, init_file: str) -> None:
+    """Exercise the real token gather and its autograd fanout on two ranks."""
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        device_mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("cp",))
+        sharder = ContextParallelSharder(
+            device_mesh=device_mesh,
+            shard_batch=shard_batch_identity,
+            local_token_global_indices=round_robin_local_indices,
+            shard_layout=ShardLayout(original_seq_len=6, padded_seq_len=8),
+        )
+
+        full_logits = torch.arange(18, dtype=torch.float32).reshape(1, 6, 3)
+        cp1_grad = torch.ones_like(full_logits)
+        expected_local_grad = sharder.shard_token_tensor(cp1_grad, seq_dim=1, fill=0.0)
+
+        local_logits = sharder.shard_token_tensor(
+            full_logits, seq_dim=1, fill=0.0
+        ).detach()
+        local_logits.requires_grad_(True)
+        gathered_logits = _cp_gather_logits(local_logits, sharder)
+
+        # The sharder pads 6 -> 8 for the round-robin CP layout, then the real
+        # collective restores canonical order and trims back to the CP1 shape.
+        torch.testing.assert_close(gathered_logits, full_logits)
+        gathered_logits.sum().backward()
+
+        # Every CP rank consumes the gathered loss, so differentiable
+        # all_gather sums one identical contribution per rank. Pad slots are
+        # trimmed from the loss and therefore retain zero gradient.
+        torch.testing.assert_close(local_logits.grad, expected_local_grad * world_size)
+
+        normalized_local_logits = sharder.shard_token_tensor(
+            full_logits, seq_dim=1, fill=0.0
+        ).detach()
+        normalized_local_logits.requires_grad_(True)
+        normalized_gathered_logits = _cp_gather_logits(normalized_local_logits, sharder)
+        processor = LossPostProcessor(
+            loss_fn=MagicMock(input_type=LossInputType.LOGIT),
+            cfg={},
+            cp_mesh=device_mesh["cp"],
+            cp_size=world_size,
+            dp_size=1,
+        )
+        (normalized_gathered_logits.sum() / processor.cp_gradient_fanout).backward()
+        torch.testing.assert_close(normalized_local_logits.grad, expected_local_grad)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not _has_gloo(), reason="gloo backend unavailable")
+def test_real_cp_sharder_forward_and_gradient_fanout_parity(tmp_path) -> None:
+    ctx = mp.get_context("spawn")
+    processes = [
+        ctx.Process(
+            target=_real_cp_sharder_worker,
+            args=(rank, 2, str(tmp_path / "cp-sharder-init")),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=60)
+        if process.is_alive():
+            for child in processes:
+                if child.is_alive():
+                    child.terminate()
+                    child.join()
+            pytest.fail("two-rank Gloo CP sharder test timed out")
+        assert process.exitcode == 0
 
 
 class _PermutationTokenLayout:
@@ -249,6 +348,40 @@ def test_full_logits_postprocessor_emits_contiguous_cp_window() -> None:
 
 
 @pytest.mark.automodel
+def test_full_logits_postprocessor_rejects_non_divisible_cp_sequence() -> None:
+    local_logits = torch.randn(1, 3, 4)
+    cp_mesh = MagicMock()
+    cp_sharder = MagicMock()
+    cp_sharder.gather_token_tensor.return_value = torch.randn(1, 5, 4)
+    processor = FullLogitsPostProcessor(
+        cfg={},
+        cp_mesh=cp_mesh,
+        cp_size=2,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "X-token teacher sequence length must be divisible by the teacher "
+            "context parallel size"
+        ),
+    ):
+        processor(
+            logits=local_logits,
+            data_dict=BatchedDataDict({}),
+            processed_inputs=MagicMock(),
+            original_batch_size=1,
+            original_seq_len=5,
+            cp_sharder=cp_sharder,
+        )
+
+    cp_sharder.gather_token_tensor.assert_called_once_with(
+        local_logits.float(), seq_dim=1, trim=True
+    )
+    cp_mesh.get_group.assert_not_called()
+
+
+@pytest.mark.automodel
 @pytest.mark.parametrize(
     ("input_type", "expected_fanout"),
     [
@@ -256,7 +389,6 @@ def test_full_logits_postprocessor_emits_contiguous_cp_window() -> None:
         (LossInputType.LOGPROB, 2),
         (LossInputType.DISTILLATION, 2),
         (LossInputType.DISTILLATION_CROSS_TOKENIZER, 1),
-        (LossInputType.DRAFT, 1),
     ],
 )
 def test_loss_cp_gradient_fanout_contract(
@@ -272,3 +404,28 @@ def test_loss_cp_gradient_fanout_contract(
     )
 
     assert processor.cp_gradient_fanout == expected_fanout
+
+
+@pytest.mark.automodel
+def test_loss_cp_rejects_unsupported_draft_input() -> None:
+    loss_fn = MagicMock(input_type=LossInputType.DRAFT)
+    processor = LossPostProcessor(
+        loss_fn=loss_fn,
+        cfg={},
+        cp_mesh=None,
+        cp_size=2,
+        dp_size=1,
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"Loss input type LossInputType\.DRAFT is not supported",
+    ):
+        processor(
+            logits=torch.empty(0),
+            data_dict=BatchedDataDict({}),
+            processed_inputs=MagicMock(),
+            global_valid_seqs=torch.tensor(1),
+            global_valid_toks=torch.tensor(1),
+            cp_sharder=MagicMock(),
+        )

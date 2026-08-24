@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, fields
-from typing import Any, Dict, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -53,6 +53,11 @@ from nemo_rl.distributed.model_utils import (
     vocab_parallel_argmax,
 )
 from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.context_parallel import (
+        ContextParallelSharder,
+    )
 
 
 def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
@@ -1008,7 +1013,7 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     projection_matrix_paths: list[Optional[str]],
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-    cp_sharder: Optional[Any] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
 ) -> tuple[
     torch.Tensor,
     Dict[int, torch.Tensor],

@@ -156,6 +156,36 @@ def test_automodel_cp_layout_localizes_xtoken_windows_after_global_shift():
     rebuild_teacher.assert_called_once_with(teacher_ipc, cp_group=cp_group, device=0)
 
 
+def test_automodel_cp_layout_rejects_non_divisible_student_sequence():
+    cp_group = object()
+    local_logits = torch.randn(1, 3, 2)
+    cp_sharder = MagicMock()
+    cp_sharder.gather_token_tensor.return_value = torch.randn(1, 5, 2)
+
+    with (
+        patch("torch.cuda.current_device", return_value=0),
+        patch("torch.distributed.get_world_size", return_value=2),
+        pytest.raises(
+            ValueError,
+            match=(
+                "X-token student sequence length must be divisible by the student "
+                "context parallel size"
+            ),
+        ),
+    ):
+        prepare_xtoken_cross_tokenizer_loss_input(
+            local_logits,
+            {},
+            projection_matrix_paths=[],
+            context_parallel_group=cp_group,
+            cp_sharder=cp_sharder,
+        )
+
+    cp_sharder.gather_token_tensor.assert_called_once_with(
+        local_logits, seq_dim=1, trim=True
+    )
+
+
 # ---------------------------------------------------------------------------
 # chunk_average_log_probs
 # ---------------------------------------------------------------------------

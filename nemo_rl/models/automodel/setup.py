@@ -17,7 +17,6 @@
 import importlib
 import inspect
 import os
-from datetime import timedelta
 from functools import partial
 from typing import Any, Optional, Union
 
@@ -445,10 +444,7 @@ def setup_distributed(
     """
     # Initialize process group
     backend = "nccl" if not runtime_config.cpu_offload else "cuda:nccl,cpu:gloo"
-    # Large multi-node checkpoints can materialize at different speeds on each
-    # node. Keep the default process group alive long enough for lagging ranks
-    # to reach the first DTensor initialization collective.
-    torch.distributed.init_process_group(backend=backend, timeout=timedelta(minutes=30))
+    torch.distributed.init_process_group(backend=backend)
     world_size = torch.distributed.get_world_size()
 
     # Extract configuration values
@@ -658,8 +654,9 @@ def setup_model_and_optimizer(
     from torch.nn.attention import SDPBackend
 
     if cp_size > 1:
-        # Match Automodel's `get_train_context` in `cp_utils.py` where only
-        # flash and efficient backends are supported
+        # Match Automodel's `get_train_context` in
+        # `components/distributed/context_parallel/utils.py`, where only flash
+        # and efficient backends are supported.
         sdpa_method = [
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,

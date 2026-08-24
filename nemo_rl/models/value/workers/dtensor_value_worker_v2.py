@@ -110,6 +110,14 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
 
         Note: Value models don't need a reference model since they don't compute KL divergence.
         """
+        if config["dtensor_cfg"]["context_parallel_size"] > 1:
+            raise NotImplementedError(
+                "DTensorValueWorkerV2 cannot be initialized with "
+                "context_parallel_size > 1 because its get_values() scoring path "
+                "does not support context parallelism. Set "
+                "value.dtensor_cfg.context_parallel_size=1."
+            )
+
         # Apply patches
         apply_transformer_engine_patch()
 

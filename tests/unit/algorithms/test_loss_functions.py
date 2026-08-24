@@ -2755,6 +2755,45 @@ def test_cross_tokenizer_prepare_loss_input_partitions_canonical_ce(
     assert prepared_data is data
 
 
+def test_cross_tokenizer_prepare_loss_input_rejects_nondivisible_cp_window(
+    tmp_path, monkeypatch
+):
+    """Automodel CP rejects canonical CE windows that cannot partition evenly."""
+    loss_fn = CrossTokenizerDistillationLossFn(
+        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    )
+    next_token_logprobs = torch.tensor(
+        [[-1.0, -2.0, -3.0, -4.0, -5.0]], requires_grad=True
+    )
+    cp_group = object()
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros((1, 6), dtype=torch.long),
+            "token_mask": torch.ones((1, 6)),
+            "sample_mask": torch.ones(1),
+        }
+    )
+
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.utils.prepare_xtoken_cross_tokenizer_loss_input",
+        lambda *args, **kwargs: (torch.empty(0), {}, {}, None, cp_group),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.utils.get_cp_sharded_next_token_logprobs",
+        lambda *args, **kwargs: next_token_logprobs,
+    )
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 4)
+
+    with pytest.raises(ValueError, match=r"sequence_length=6, cp_size=4"):
+        prepare_loss_input(
+            torch.empty(0),
+            data,
+            loss_fn,
+            context_parallel_group=cp_group,
+            cp_sharder=object(),
+        )
+
+
 def test_cross_tokenizer_precomputed_ce_reduces_partitioned_cp_window(
     tmp_path, monkeypatch
 ):

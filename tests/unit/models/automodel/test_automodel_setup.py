@@ -15,7 +15,6 @@
 """Unit tests for automodel setup utilities."""
 
 import os
-from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -706,9 +705,7 @@ class TestSetupDistributed:
 
         result = setup_distributed(mock_config, mock_runtime_config)
 
-        mock_torch_dist.init_process_group.assert_called_once_with(
-            backend="nccl", timeout=timedelta(minutes=30)
-        )
+        mock_torch_dist.init_process_group.assert_called_once_with(backend="nccl")
         assert isinstance(result, DistributedContext)
         assert result.device_mesh == mock_device_mesh
         assert result.moe_mesh == mock_moe_mesh
@@ -755,7 +752,7 @@ class TestSetupDistributed:
         result = setup_distributed(mock_config, runtime_config)
 
         mock_torch_dist.init_process_group.assert_called_once_with(
-            backend="cuda:nccl,cpu:gloo", timeout=timedelta(minutes=30)
+            backend="cuda:nccl,cpu:gloo"
         )
         assert isinstance(result, DistributedContext)
 

@@ -32,6 +32,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig as AutomodelCheckpointingConfig,
 )
 from nemo_automodel.components.checkpoint.config import (
+    SaveConsolidatedMode,
     _normalize_save_consolidated,
 )
 from torch import nn
@@ -40,6 +41,20 @@ from transformers import AutoTokenizer
 
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.native_checkpoint import save_tokenizer_on_rank0
+
+
+def _normalize_supported_save_consolidated(
+    value: bool | str | SaveConsolidatedMode,
+) -> SaveConsolidatedMode:
+    """Normalize the consolidated-save mode supported by NeMo-RL."""
+    mode = _normalize_save_consolidated(value)
+    if mode == SaveConsolidatedMode.FINAL:
+        raise ValueError(
+            "save_consolidated: final is not supported because NeMo-RL does not "
+            "mark final checkpoint saves. Use save_consolidated: true to export "
+            "consolidated weights."
+        )
+    return mode
 
 
 def _patch_qwen_vl_vision_key_mapping() -> None:
@@ -171,7 +186,9 @@ class AutomodelCheckpointManager:
             model_save_format=config_updates.get("model_save_format", "safetensors"),
             model_cache_dir=config_updates.get("model_cache_dir", ""),
             model_repo_id=config_updates.get("model_repo_id", ""),
-            save_consolidated=config_updates.get("save_consolidated", False),
+            save_consolidated=_normalize_supported_save_consolidated(
+                config_updates.get("save_consolidated", False)
+            ),
             is_peft=config_updates.get("is_peft", False),
             is_async=config_updates.get("is_async", False),
             dequantize_base_checkpoint=config_updates.get(
@@ -225,7 +242,7 @@ class AutomodelCheckpointManager:
                 # CheckpointingConfig.__post_init__, which setattr bypasses. Without this
                 # a bool True would silently compare unequal to SaveConsolidatedMode.EVERY
                 # and disable consolidated HF export.
-                v = _normalize_save_consolidated(v)
+                v = _normalize_supported_save_consolidated(v)
             setattr(cfg, k, v)
 
         # Rebuild _addons list based on updated config
@@ -322,16 +339,16 @@ class AutomodelCheckpointManager:
                 "model_save_format",
                 "save_consolidated",
                 "is_peft",
-                "peft_config",
                 "model_cache_dir",
                 "model_repo_id",
                 "is_async",
                 "dequantize_base_checkpoint",
             }
         }
+        save_peft_config = checkpointing_cfg.get("peft_config")
         if lora_enabled:
             checkpoint_kwargs["is_peft"] = True
-            checkpoint_kwargs["peft_config"] = peft_config
+            save_peft_config = peft_config
 
         checkpoint_root = _infer_checkpoint_root(weights_path)
 
@@ -343,7 +360,7 @@ class AutomodelCheckpointManager:
         self.checkpointer.save_model(
             model=model,
             weights_path=weights_path,
-            peft_config=checkpoint_kwargs.get("peft_config"),
+            peft_config=save_peft_config,
             tokenizer=tokenizer if tokenizer_path is None else None,
         )
 
