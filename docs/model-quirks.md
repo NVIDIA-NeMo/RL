@@ -77,3 +77,24 @@ optimizer is created). Note the following sharp edges:
 
 Every shipped recipe sets `freeze_config`, so in-repo recipes are unaffected.
 This matters only for custom configs.
+
+## Megatron Parameter Freezing (`freeze_config`)
+
+The Megatron backend has its own `freeze_config` at a different path
+(`policy.megatron_cfg.freeze_config`) with **different keys** than the
+AutoModel version above — the dict is forwarded to the Megatron model's
+`freeze()` method, so the keys follow that model's signature and vary
+by model family (audio-capable models add e.g. `freeze_audio_model`):
+
+```yaml
+policy:
+  megatron_cfg:
+    freeze_config:
+      freeze_vision_model: true
+      freeze_vision_projection: true
+      freeze_language_model: false
+```
+
+The two configs are not interchangeable: copying the AutoModel keys
+(`freeze_vision_tower` / `freeze_audio_tower`) here raises a `TypeError`
+from the model's `freeze()`.

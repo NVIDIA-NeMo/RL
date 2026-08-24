@@ -47,7 +47,11 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
-from nemo_rl.algorithms.grpo import GRPOSaveState, _write_latest_checkpoint_status
+from nemo_rl.algorithms.grpo import (
+    GRPOSaveState,
+    _write_latest_checkpoint_status,
+    compute_and_apply_seq_logprob_error_masking,
+)
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -256,6 +260,7 @@ class SingleControllerActor:
             "rewards": [],
             "masked_advantages": [],
             "sequence_lengths": [],
+            "seq_logprob_error_metrics": [],
         }
 
         print(
@@ -964,22 +969,29 @@ class SingleControllerActor:
 
                     # Compute advantages
                     with self._timer.time("advantage_calculation"):
-                        train_meta = await self._advantage_stage(train_meta)
+                        (
+                            train_meta,
+                            has_valid_training_tokens,
+                        ) = await self._advantage_stage(train_meta)
 
-                    # Train
+                    # Filtering can leave a streaming chunk with no training tokens.
+                    # Consume that chunk without F/B, then continue the same optimizer
+                    # step with the next chunk. Always restore training mode because
+                    # log-prob inference may have switched the model to inference mode.
                     with self._timer.time("training_prep"):
                         await asyncio.to_thread(self._trainer.prepare_for_training)
-                    with self._timer.time("policy_training"):
-                        if not step_open:
+                    if has_valid_training_tokens:
+                        with self._timer.time("policy_training"):
+                            if not step_open:
+                                await asyncio.to_thread(
+                                    self._trainer.begin_train_step,
+                                    self._loss_fn,
+                                )
+                                step_open = True
                             await asyncio.to_thread(
-                                self._trainer.begin_train_step,
-                                self._loss_fn,
+                                self._trainer.train_microbatches_from_meta,
+                                train_meta,
                             )
-                            step_open = True
-                        await asyncio.to_thread(
-                            self._trainer.train_microbatches_from_meta,
-                            train_meta,
-                        )
 
                     if train_meta.sequence_lengths:
                         self._step_log_dict["sequence_lengths"].extend(
@@ -1047,6 +1059,13 @@ class SingleControllerActor:
                     chunks_dispatched,
                     groups_dispatched,
                 )
+                if not step_open:
+                    raise RuntimeError(
+                        "SingleController has no valid response tokens after "
+                        "filtering. Check grpo.seq_logprob_error_threshold to "
+                        "avoid an optimizer step with an empty batch."
+                    )
+
                 with self._timer.time("policy_training"):
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
 
@@ -1176,8 +1195,8 @@ class SingleControllerActor:
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
             # TODO: per-step train_data jsonl dump, vllm metrics logger,
-            #   histogram log, rollout_metrics, seq_logprob_error_metrics,
-            #   pretty-print "Training Results" block, print_performance_metrics.
+            #   histogram log, rollout_metrics, pretty-print "Training Results"
+            #   block, print_performance_metrics.
             print(f"step_metrics={step_metrics}", flush=True)
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
@@ -1653,7 +1672,7 @@ class SingleControllerActor:
         self._rollout_permitted.set()
         return aborted_stale_inflight_groups
 
-    async def _advantage_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
+    async def _advantage_stage(self, meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
         """Fetch advantage inputs, compute advantages, and write them back.
 
         SC owns the prompt-group-scoped advantage stage because the selected
@@ -1661,9 +1680,13 @@ class SingleControllerActor:
         DP sharding. Tensor payloads still move through DataPlane: SC fetches
         only the configured advantage input columns and writes the computed
         ``advantages`` column back under the same ``sample_ids``.
+
+        Returns:
+            The updated batch metadata and whether the batch contains at least
+            one valid training token.
         """
         if self._advantage_estimator is None:
-            return meta
+            return meta, True
         adv_cfg = self._advantage_cfg
 
         data = await self._call_dp(
@@ -1681,6 +1704,51 @@ class SingleControllerActor:
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
+
+        seq_logprob_error_threshold = (
+            self._master_config.grpo.seq_logprob_error_threshold
+        )
+        # Match the legacy path: whenever real policy logprobs are available,
+        # report sequence-level generation/training mismatch. A threshold adds
+        # masking; leaving it unset keeps this metrics-only.
+        if self._policy_logprobs_required:
+            masking_data = BatchedDataDict(
+                {
+                    "token_mask": token_mask,
+                    "sample_mask": sample_mask,
+                    "prev_logprobs": tensor_field(
+                        data,
+                        adv_cfg.policy_logprobs_field,
+                    ),
+                    "generation_logprobs": tensor_field(
+                        data,
+                        adv_cfg.generation_logprobs_field,
+                    ),
+                }
+            )
+            num_valid_seqs_before = float(
+                ((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
+                .sum()
+                .item()
+            )
+            seq_error_metrics = compute_and_apply_seq_logprob_error_masking(
+                train_data=masking_data,
+                rewards=rewards,
+                seq_logprob_error_threshold=seq_logprob_error_threshold,
+            )
+            sample_mask = masking_data["sample_mask"]
+            num_valid_seqs_after = float(
+                ((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
+                .sum()
+                .item()
+            )
+            seq_error_metrics["num_masked_seqs_by_logprob_error"] = (
+                seq_error_metrics.pop("num_masked_seqs")
+            )
+            seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
+            seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
+            self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
+
         mask = token_mask * sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {
@@ -1703,29 +1771,39 @@ class SingleControllerActor:
                 adv_cfg.reference_logprobs_field,
             )
 
-        advantages = self._advantage_estimator.compute_advantage(
-            prompt_ids=prompt_ids,
-            rewards=rewards,
-            mask=mask,
-            repeated_batch=repeated_batch,
-            **kwargs,
-        )
+        # Training predicts token t from position t - 1, so token_mask[:, 1:]
+        # is the exact mask used when global_valid_toks and the loss are built.
+        has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
+        if has_valid_training_tokens:
+            advantages = self._advantage_estimator.compute_advantage(
+                prompt_ids=prompt_ids,
+                rewards=rewards,
+                mask=mask,
+                repeated_batch=repeated_batch,
+                **kwargs,
+            )
+        else:
+            advantages = torch.zeros_like(mask)
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
         self._step_log_dict["masked_advantages"].append(
             response_advantages.detach().cpu()
         )
 
+        fields_to_put = {adv_cfg.output_field: advantages}
+        if seq_logprob_error_threshold is not None:
+            fields_to_put[adv_cfg.sample_mask_field] = sample_mask
+
         await self._call_dp(
             "put_samples",
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
-            fields=fields_for_put(
-                meta,
-                {adv_cfg.output_field: advantages},
-            ),
+            fields=fields_for_put(meta, fields_to_put),
         )
-        return meta.with_fields([adv_cfg.output_field])
+        return (
+            meta.with_fields([adv_cfg.output_field]),
+            has_valid_training_tokens,
+        )
 
     # ── utility helpers ────────────────────────────────────────────────────
 
@@ -1740,6 +1818,8 @@ class SingleControllerActor:
         ]
         if self._policy_logprobs_required:
             fields.append(adv_cfg.policy_logprobs_field)
+        if self._policy_logprobs_required:
+            fields.append(adv_cfg.generation_logprobs_field)
         if self._reference_logprobs_required:
             fields.append(adv_cfg.reference_logprobs_field)
         return list(dict.fromkeys(fields))
