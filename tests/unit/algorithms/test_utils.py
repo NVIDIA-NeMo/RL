@@ -14,6 +14,7 @@
 
 import math
 from datetime import datetime
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -150,12 +151,37 @@ def test_get_tokenizer_forwards_tokenizer_kwargs():
     """Test get_tokenizer unpacks tokenizer_kwargs into from_pretrained."""
     config = {
         "name": "meta-llama/Llama-3.2-1B-Instruct",
-        "tokenizer_kwargs": {"use_fast": False},
+        "tokenizer_kwargs": {"model_max_length": 123},
     }
-    tokenizer = get_tokenizer(config)
-    # use_fast=False produces the slow Python tokenizer; is_fast is True
-    # only for the HuggingFace fast (Rust-backed) variant.
-    assert not tokenizer.is_fast
+    with patch("nemo_rl.algorithms.utils.AutoTokenizer") as mock_auto_tokenizer:
+        get_tokenizer(config)
+
+    mock_auto_tokenizer.from_pretrained.assert_called_once_with(
+        "meta-llama/Llama-3.2-1B-Instruct",
+        trust_remote_code=True,
+        model_max_length=123,
+    )
+
+
+def test_get_processor_forwards_tokenizer_kwargs():
+    """Test get_tokenizer forwards tokenizer_kwargs through AutoProcessor."""
+    config = {
+        "name": "Qwen/Qwen2.5-VL-3B-Instruct",
+        "tokenizer_kwargs": {"model_max_length": 123, "use_fast": False},
+    }
+    with patch("nemo_rl.algorithms.utils.AutoProcessor") as mock_auto_processor:
+        get_tokenizer(config, get_processor=True)
+
+    mock_auto_processor.from_pretrained.assert_called_once_with(
+        "Qwen/Qwen2.5-VL-3B-Instruct",
+        trust_remote_code=True,
+        use_fast=False,
+        model_max_length=123,
+    )
+    assert config["tokenizer_kwargs"] == {
+        "model_max_length": 123,
+        "use_fast": False,
+    }
 
 
 def test_maybe_pad_last_batch():
