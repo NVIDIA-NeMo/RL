@@ -14,6 +14,7 @@
 import logging
 import os
 import random
+import shlex
 import socket
 import sys
 import time
@@ -65,22 +66,22 @@ class PY_EXECUTABLES:
     SYSTEM = sys.executable
 
     # Use NeMo-RL direct dependencies.
-    BASE = f"uv run --locked --directory {git_root}"
+    BASE = f"uv run --locked --directory {shlex.quote(git_root)}"
 
     # Use NeMo-RL direct dependencies and vllm.
-    VLLM = f"uv run --locked --extra vllm --directory {git_root}"
+    VLLM = f"uv run --locked --extra vllm --directory {shlex.quote(git_root)}"
 
     # Use NeMo-RL direct dependencies and fsdp.
-    FSDP = f"uv run --locked --extra fsdp --directory {git_root}"
+    FSDP = f"uv run --locked --extra fsdp --directory {shlex.quote(git_root)}"
 
     # Use NeMo-RL direct dependencies and nemo-automodel.
-    AUTOMODEL = f"uv run --locked --extra automodel --directory {git_root}"
+    AUTOMODEL = f"uv run --locked --extra automodel --directory {shlex.quote(git_root)}"
 
     # Use NeMo-RL direct dependencies and Megatron.
-    MCORE = f"uv run --locked --extra mcore --directory {git_root}"
+    MCORE = f"uv run --locked --extra mcore --directory {shlex.quote(git_root)}"
 
     # Use NeMo-Gym dependencies
-    NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
+    NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {shlex.quote(git_root)}"
 
     # Default env for the vLLM generation workers (see
     # ray_actor_environment_registry.py). It carries nemo_gym so the worker can
@@ -88,23 +89,29 @@ class PY_EXECUTABLES:
     # worker's env at runtime: worker venvs are cached by actor class name, so
     # a venv prebuilt with plain `--extra vllm` would be reused as-is and the
     # nemo_gym import would fail.
-    VLLM_GYM = f"uv run --locked --extra vllm --extra nemo_gym --directory {git_root}"
+    VLLM_GYM = (
+        f"uv run --locked --extra vllm --extra nemo_gym "
+        f"--directory {shlex.quote(git_root)}"
+    )
 
     # Use NeMo-RL direct dependencies and SGLang.
-    SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
+    SGLANG = f"uv run --locked --extra sglang --directory {shlex.quote(git_root)}"
 
     # Use NeMo-RL direct dependencies and TRT-LLM.
-    TRTLLM = f"uv run --locked --extra trtllm --directory {git_root}"
+    TRTLLM = f"uv run --locked --extra trtllm --directory {shlex.quote(git_root)}"
 
     # Use NeMo-RL direct dependencies and ModelOpt.
     MODELOPT_VLLM = (
-        f"uv run --locked --extra modelopt --extra vllm --directory {git_root}"
+        f"uv run --locked --extra modelopt --extra vllm "
+        f"--directory {shlex.quote(git_root)}"
     )
     MODELOPT_AUTOMODEL = (
-        f"uv run --locked --extra modelopt --extra automodel --directory {git_root}"
+        f"uv run --locked --extra modelopt --extra automodel "
+        f"--directory {shlex.quote(git_root)}"
     )
     MODELOPT_MCORE = (
-        f"uv run --locked --extra modelopt --extra mcore --directory {git_root}"
+        f"uv run --locked --extra modelopt --extra mcore "
+        f"--directory {shlex.quote(git_root)}"
     )
 
     @classmethod
@@ -129,7 +136,7 @@ def uv_py_executable(extras: Sequence[str]) -> str:
     if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1":
         return PY_EXECUTABLES.SYSTEM
     extra_flags = "".join(f"--extra {extra} " for extra in extras)
-    return f"uv run --locked {extra_flags}--directory {git_root}"
+    return f"uv run --locked {extra_flags}--directory {shlex.quote(git_root)}"
 
 
 # Default port ranges — kept below the OS ephemeral range.  On some DGX/GB200
