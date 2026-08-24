@@ -34,6 +34,7 @@ try:
     from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
         DTensorPolicyWorkerV2Impl,
         _maybe_adapt_tensor_to_hf,
+        _uses_expandable_segments,
         dtensor_params_generator,
         get_train_context,
     )
@@ -1003,3 +1004,28 @@ class TestGetTrainContext:
             sequence_dim,
         ], "sequence_dim should be replicated for each buffer"
         assert len(call_kwargs["cp_seq_dims"]) == 3
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize(
+    ("alloc_conf", "expected"),
+    [
+        ("expandable_segments:True", True),
+        ("expandable_segments: true ", True),
+        ("max_split_size_mb:512,expandable_segments:True", True),
+        ("max_split_size_mb:512", False),
+        ("expandable_segments:False", False),
+        ("expandable_segments:0", False),
+    ],
+)
+def test_uses_expandable_segments(alloc_conf, expected, monkeypatch):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", alloc_conf)
+    assert _uses_expandable_segments() is expected
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_uses_expandable_segments_unset_env(monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    assert _uses_expandable_segments() is False

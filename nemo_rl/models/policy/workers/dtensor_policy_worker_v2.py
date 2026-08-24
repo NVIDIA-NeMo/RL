@@ -14,6 +14,7 @@
 
 import contextlib
 import gc
+import os
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional
@@ -198,6 +199,19 @@ def get_train_context(
         if autocast_enabled:
             stack.enter_context(torch.autocast(device_type="cuda", dtype=dtype))
         yield
+
+
+def _uses_expandable_segments() -> bool:
+    """Return True if PYTORCH_CUDA_ALLOC_CONF enables expandable_segments."""
+    for entry in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "").split(","):
+        key, _, value = entry.partition(":")
+        if key.strip() == "expandable_segments" and value.strip().lower() not in (
+            "",
+            "false",
+            "0",
+        ):
+            return True
+    return False
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -1111,6 +1125,15 @@ class DTensorPolicyWorkerV2Impl(
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
+        if _uses_expandable_segments():
+            warnings.warn(
+                "PYTORCH_CUDA_ALLOC_CONF enables expandable_segments, but "
+                "the colocated IPC weight refit cannot share tensors in "
+                "expandable segments. update_weights_via_ipc_zmq will likely "
+                "fail with 'pidfd_getfd: Operation not permitted'. Remove "
+                "expandable_segments from this worker's allocator config.",
+                stacklevel=2,
+            )
         if kv_scales is not None:
             raise NotImplementedError(
                 "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
