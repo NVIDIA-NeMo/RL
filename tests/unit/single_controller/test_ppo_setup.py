@@ -246,7 +246,7 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="ppo_epochs must be at least 1"):
             validate_single_controller_config(mc)
 
-    def test_rejects_non_gae_estimator(self):
+    def test_the_ppo_schema_rejects_a_non_ppo_estimator(self):
         with pytest.raises(ValueError):
             PPOConfig(adv_estimator={"name": "grpo"})
 
@@ -292,6 +292,39 @@ class TestPPOValidation:
         validate_single_controller_config(
             self._warmup_ckpt_config(constant_structure=False)
         )
+
+    @pytest.mark.parametrize(
+        "enable",
+        [
+            lambda cfg: setattr(cfg, "overlong_filtering", True),
+            lambda cfg: setattr(cfg, "use_dynamic_sampling", True),
+            lambda cfg: setattr(cfg.reward_scaling, "enabled", True),
+            lambda cfg: setattr(cfg.reward_shaping, "enabled", True),
+        ],
+        ids=[
+            "overlong_filtering",
+            "use_dynamic_sampling",
+            "reward_scaling",
+            "reward_shaping",
+        ],
+    )
+    def test_rejects_shaping_the_sc_path_does_not_implement(self, enable):
+        mc = _ppo_master_config()
+        enable(mc.ppo)
+
+        with pytest.raises(
+            NotImplementedError, match="not supported on the SingleController"
+        ):
+            validate_single_controller_config(mc)
+
+    def test_rejects_shaping_on_a_grpo_run_too(self):
+        mc = _make_master_config()
+        mc.grpo.overlong_filtering = True
+
+        with pytest.raises(
+            NotImplementedError, match=r"grpo\.overlong_filtering"
+        ):
+            validate_single_controller_config(mc)
 
     def test_grpo_is_free_to_use_any_sampler(self):
         mc = _make_master_config()

@@ -708,8 +708,9 @@ def _validate_failure_settings(
 def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
-    Both directions: a critic the PPO path needs and does not have, and a critic
-    a GRPO run carries and would never build.
+    Both directions on the critic: one the PPO path needs and does not have, and
+    one a GRPO run carries and would never build. Plus the reward shaping and
+    filtering knobs SC reads on neither path.
     """
     grpo = getattr(master_config, "grpo", None)
     ppo = getattr(master_config, "ppo", None)
@@ -721,6 +722,28 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
     algo_cfg = algo_config(master_config)
+
+    # SC reads none of these on either path, so an enabled one describes shaping
+    # this run does not do. Async GRPO rejects three of them the same way.
+    unsupported = [
+        name
+        for name, enabled in (
+            ("overlong_filtering", algo_cfg.overlong_filtering),
+            ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
+            ("reward_scaling", algo_cfg.reward_scaling.enabled),
+            ("reward_shaping", algo_cfg.reward_shaping.enabled),
+        )
+        if enabled
+    ]
+    if unsupported:
+        prefix = "ppo" if is_ppo_run(master_config) else "grpo"
+        names = ", ".join(f"{prefix}.{name}" for name in unsupported)
+        raise NotImplementedError(
+            f"{names} not supported on the SingleController path, which "
+            "implements none of them -- the run would silently skip the "
+            "shaping. Disable them."
+        )
+
     if not is_ppo_run(master_config):
         # A value block without `ppo` is inert -- nothing builds the critic --
         # and a config carrying one is asking for PPO by every reading except
