@@ -30,6 +30,7 @@ sdpo:
   success_reward_threshold: 1.0      # reward must equal 1.0 to count as "successful"
   max_reprompt_len: 4096             # max tokens in the reprompted teacher prompt
   topk_logits_k: 100                 # K in top-k logit distillation (paper §A.2)
+  topk_source: "student"            # paper §2.2: top-K indices from the STUDENT forward, teacher gathered at those indices ("teacher" = legacy teacher-selected top-k; needs DTensor v2)
   remove_thinking_from_demo: false   # strip <think>…</think> from demonstrations
   # GRPO advantage estimator for the hybrid's policy-gradient term.
   adv_estimator:
@@ -254,6 +255,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:

@@ -20,11 +20,15 @@ sdpo:
   val_at_end: true
   max_val_samples: 131
   val_batch_size: 64
+  val_num_generations_per_prompt: 4  # paper Table 12 (Section 4): 4 validation rollouts per prompt
   seed: 42
   # SDPO-specific
   success_reward_threshold: 1.0      # all train tests must pass
   max_reprompt_len: 12288            # teacher prompt may include long error logs
   topk_logits_k: 20                  # paper Table 12 (Section 4 / LCBv6): K=20
+  teacher_regularization: "trust_region"  # paper §2.3/A.2 Eq.10: unregularized teacher diverges (Table 4; observed in run nttalvt9). Blends frozen-init logits into the distillation target.
+  teacher_mix_coef: 0.01             # paper Table 4: trust-region & EMA both use alpha=0.01 (alpha = weight of CURRENT policy in Eq.10); trust-region scores best there (50.6 vs EMA 49.3, frozen-ref 48.8, unregularized 36.1)
+  topk_source: "student"             # paper §2.2: top-K indices from the STUDENT forward, teacher gathered at those indices ("teacher" = legacy teacher-selected top-k; needs DTensor v2)
   remove_thinking_from_demo: true    # strip <think>...</think> from peer demos so {solution} slot stays content-only
   feedback_source: "combined"        # paper Table 2: peer-rollout demo + env feedback
   log_sample_every_n_steps: 1        # dump one fail + one pass per step (stdout + W&B Table)
@@ -34,9 +38,11 @@ loss_fn:
   success_reward_threshold: 1.0
   kl_type: "reverse"                 # paper Table 12 (Section 4 / LCBv6): Reverse-KL (JS is only used for Section 3 / math)
   mixed_kl_weight: 0.5               # unused when kl_type="reverse"
-  zero_outside_topk: true
-  reference_policy_kl_penalty: 0.0   # trust-region anchor disabled (no ref-policy forward pass)
-  reference_policy_kl_type: "k3"     # unused while penalty=0
+  zero_outside_topk: true            # ignored when tail_mode="k_plus_one" (the bucket replaces the tail correction)
+  tail_mode: "k_plus_one"            # paper A.3 / ref core_algos: append log(1-sum p) remainder buckets to BOTH true-log-prob distributions; KL over K+1 categories ("legacy" = old teacher-renormalize + -100 tail)
+  rollout_importance_sampling_clip: 2  # paper Table 12 (Section 4): truncated IS over rollout prefixes, needed with mini-batch (off-policy) updates
+  reference_policy_kl_penalty: 0.00  # additive student-side anchor to the frozen-init policy (grad-carrying since 53d01e7c); complements sdpo.teacher_regularization, which anchors the TARGET
+  reference_policy_kl_type: "k3"
 
 checkpointing:
   enabled: true
@@ -56,7 +62,7 @@ policy:
     name: ${policy.model_name}
     chat_template_kwargs: {"enable_thinking": false}   # paper Table 12: Thinking off
   hf_config_overrides: {}
-  train_global_batch_size: 256       # 32 prompts × 8 gens (paper Table 12)
+  train_global_batch_size: 8         # paper Table 12 (Section 4): mini batch size 1 question × 8 rollouts → 32 sequential (off-policy) updates per rollout step; pairs with loss_fn.rollout_importance_sampling_clip
   train_micro_batch_size: 1
   generation_batch_size: 16
   logprob_batch_size: ${policy.train_micro_batch_size}
@@ -217,6 +223,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: 0.6               # paper Table 12 (Section 4): validation at temp 0.6
+    val_top_p: 0.95                    # paper Table 12 (Section 4): validation top-p 0.95
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:
@@ -234,7 +243,7 @@ policy:
       tensor_parallel_size: 2
       pipeline_parallel_size: 1
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.5
+      gpu_memory_utilization: 0.35
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: False
       use_deep_gemm: False

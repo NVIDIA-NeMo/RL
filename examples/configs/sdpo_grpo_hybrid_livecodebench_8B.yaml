@@ -32,6 +32,7 @@ sdpo:
   success_reward_threshold: 1.0      # all train tests must pass
   max_reprompt_len: 12288            # teacher prompt may include long error logs
   topk_logits_k: 20                  # paper Table 12 (Section 4 / LCBv6): K=20
+  topk_source: "student"             # paper §2.2: top-K indices from the STUDENT forward, teacher gathered at those indices ("teacher" = legacy teacher-selected top-k; needs DTensor v2)
   remove_thinking_from_demo: true    # strip <think>...</think> from peer demos so {solution} slot stays content-only
   feedback_source: "combined"        # paper Table 2: peer-rollout demo + env feedback
   log_sample_every_n_steps: 1        # dump one fail + one pass per step (stdout + W&B Table)
@@ -255,6 +256,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:
