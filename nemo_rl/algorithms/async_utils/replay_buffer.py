@@ -49,6 +49,10 @@ from nemo_rl.experience.interfaces import (
     PromptGroupRecord,
 )
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.experience.trace_replay import (
+    trace_replay_content_equal,
+    trace_replay_group_identity,
+)
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 DATA_PLANE_CHECKPOINT_DIR = "data_plane"
@@ -317,6 +321,24 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             target_weight_version: version of the model weights this trajectory is intended for training
         """
         with self._lock:
+            incoming_identity = trace_replay_group_identity(trajectory)
+            if incoming_identity is not None:
+                for index, buffered_trajectory in enumerate(self.trajectories):
+                    buffered_identity = trace_replay_group_identity(buffered_trajectory)
+                    if buffered_identity is None:
+                        continue
+                    if buffered_identity != incoming_identity:
+                        continue
+                    if (
+                        not trace_replay_content_equal(buffered_trajectory, trajectory)
+                        or self.trajectory_versions[index] != weight_version
+                        or self.target_weight_versions[index] != target_weight_version
+                    ):
+                        raise ValueError(
+                            "ReplayBuffer received conflicting content for rollout "
+                            f"IDs {sorted(incoming_identity)!r}"
+                        )
+                    return "success"
             if len(self.trajectories) >= self.max_size:
                 return "full"
 
@@ -524,7 +546,14 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             )
 
             # Remove selected items in reverse order to maintain correct indices
-            sampled_items = [self.trajectories[i] for i in selected]
+            sampled_items = []
+            for index in selected:
+                trajectory = self.trajectories[index]
+                trajectory["generation_weight_version"] = self.trajectory_versions[
+                    index
+                ]
+                trajectory["target_weight_version"] = self.target_weight_versions[index]
+                sampled_items.append(trajectory)
             self._remove_indices(selected)
 
             old_last_target = self.last_target_weight_already_generated

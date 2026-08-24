@@ -782,6 +782,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        scheduler_step_increment: Optional[int] = None,
         timer: Optional[Timer] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
@@ -796,6 +797,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        if scheduler_step_increment is not None and scheduler_step_increment <= 0:
+            raise ValueError("scheduler_step_increment must be positive")
         # Shard and replicate the batch
         with timer.time("policy_training/sharding_data") if timer else nullcontext():
             sharded_data = self._shard_for_train(data, batch_size)
@@ -833,6 +836,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "gbs": batch_size,
                     "mbs": micro_batch_size,
                     "check_dim_skip_keys": check_dim_skip_keys,
+                    **(
+                        {"scheduler_step_increment": scheduler_step_increment}
+                        if scheduler_step_increment is not None
+                        else {}
+                    ),
                 },
             )
         results = self.worker_group.get_all_worker_results(futures)
