@@ -148,6 +148,7 @@ def _make_manager(
     )
     mgr._stats = RolloutStats()
     mgr._skipped_prompts = 0
+    mgr._consecutive_infra_drops = 0
     return mgr
 
 
