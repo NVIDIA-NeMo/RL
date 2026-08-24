@@ -65,6 +65,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         ),
         async_rl=AsyncRLConfig(min_groups_for_streaming_train=1),
         logger={},
+        env={},
     )
     actor_args = SimpleNamespace(
         partition_id="rollout_data",
@@ -76,7 +77,8 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        rollout_manager=SimpleNamespace(_tq_buffer=None, recovery_ledger=None),
+        env_handles={},
         train_cluster=None,
         inference_cluster=None,
     )
@@ -115,6 +117,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
             max_buffered_rollouts=4,
         ),
         logger={},
+        env={},
         # __init__ builds a CheckpointManager + TimeoutChecker from this block.
         checkpointing=_checkpointing_config(tmp_path),
     )
@@ -128,7 +131,8 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        rollout_manager=SimpleNamespace(_tq_buffer=None, recovery_ledger=None),
+        env_handles={},
         train_cluster=None,
         inference_cluster=None,
         save_state=_initial_grpo_save_state(),
@@ -165,6 +169,7 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
             max_buffered_rollouts=4,
         ),
         logger={},
+        env={},
         # __init__ builds a CheckpointManager + TimeoutChecker from this block.
         checkpointing=_checkpointing_config(tmp_path),
     )
@@ -181,9 +186,13 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        rollout_manager=SimpleNamespace(_tq_buffer=None, recovery_ledger=None),
         train_cluster=None,
         inference_cluster=None,
+        # A real field of SingleControllerActorArgs. Read directly rather than via a
+        # getattr default, so omitting it breaks here instead of silently degrading
+        # watchdog.gym_subprocess_check into a no-op at runtime.
+        env_handles={},
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
         data_plane_checkpoint_metadata=None,
@@ -373,6 +382,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._trainer_version = 0
     ctrl._train_steps = 0
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._rollout_recovery_ledger = None
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],

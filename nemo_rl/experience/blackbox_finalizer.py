@@ -505,6 +505,7 @@ class BlackboxFinalizer:
         rewards: list[float],
         *,
         fallback_weight_version: int,
+        canonical_sample_ids: Optional[list[str]] = None,
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
 
@@ -515,6 +516,11 @@ class BlackboxFinalizer:
         """
         assert len(rollout_ids) == len(receipts) == len(rewards), (
             "rollout_ids, receipts, and rewards must be parallel"
+        )
+        if canonical_sample_ids is None:
+            canonical_sample_ids = rollout_ids
+        assert len(canonical_sample_ids) == len(rollout_ids), (
+            "canonical_sample_ids must be one per rollout"
         )
         _group_t0 = time.perf_counter()
         rows = [
@@ -699,9 +705,9 @@ class BlackboxFinalizer:
             train_batch=train_batch,
             weight_version=group_min_wv,
         )
-        assert sample_ids == rollout_ids, (
-            "canonical sample ids must equal the ledger-registered rollout ids: "
-            f"{sample_ids} != {rollout_ids}"
+        assert sample_ids == canonical_sample_ids, (
+            "canonical sample ids must equal the stable logical rollout ids: "
+            f"{sample_ids} != {canonical_sample_ids}"
         )
         _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
         _put_t0 = time.perf_counter()

@@ -14,9 +14,9 @@
 
 """SingleController: asyncio orchestrator for the RL training loop.
 
-CPU-only Ray actor that runs two concurrent pumps and coordinates the
-other actors via lightweight RPCs. SC sends control signals and reads
-metadata only — model tensors still move through DataPlane or NCCL.
+CPU-only Ray actor that runs two concurrent pumps plus a watchdog, and
+coordinates the other actors via lightweight RPCs. SC sends control signals
+and reads metadata only — model tensors still move through DataPlane or NCCL.
 
 Data flow:
   _rollout_pump  → gen.generate_and_push(prompt, dp_client) ← RPC to GenWorker
@@ -75,6 +75,8 @@ from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -93,11 +95,14 @@ Generation = Union[VllmGeneration, SGLangGeneration]
 class SingleControllerActor:
     """CPU-only Ray actor that orchestrates the RL training loop.
 
-    Owns two concurrent asyncio tasks:
-      - _rollout_pump: dispatches prompts to GenerationWorkerActor
-      - _train_pump:   claims DataPlane meta, trains, clears consumed rows,
-                       then runs _sync_weights (drain gate + weight
-                       synchronization) inline after each optimizer step
+    Owns three concurrent asyncio tasks:
+      - _rollout_pump:  dispatches prompts to GenerationWorkerActor
+      - _train_pump:    claims DataPlane meta, trains, clears consumed rows,
+                        then runs _sync_weights (drain gate + weight
+                        synchronization) inline after each optimizer step
+      - _watchdog_pump: publishes rollout counters and reports stalls or
+                        unhealthy environments, which are the failures that
+                        otherwise produce no signal at all
 
     All other actors are passive — they expose methods and wait to be called.
     """
@@ -138,10 +143,22 @@ class SingleControllerActor:
         self._loss_fn = actor_args.loss_fn
         self._buffer = actor_args.tq_buffer
         self._rollout_manager = actor_args.rollout_manager
+        self._rollout_recovery_ledger = self._rollout_manager.recovery_ledger
+        # Direct access, deliberately. A getattr default here reads as defensive but
+        # buys a silent failure mode: rename or drop the field and
+        # watchdog.gym_subprocess_check: true degrades to a health check that iterates
+        # nothing and reports nothing -- the exact class of silent failure this work
+        # exists to remove. A missing field should break loudly at construction, where
+        # it costs five minutes, not quietly at hour three of a run.
+        self._env_handles = actor_args.env_handles
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
         self._finalizer_actors = list(actor_args.finalizer_actors)
+        if self._finalizer_actors and self._rollout_recovery_ledger is None:
+            raise RuntimeError(
+                "token-capture finalizer actors require a rollout recovery ledger"
+            )
         self._available_finalizers: asyncio.Queue[Any] = asyncio.Queue()
         for actor in self._finalizer_actors:
             self._available_finalizers.put_nowait(actor)
@@ -274,30 +291,42 @@ class SingleControllerActor:
 
         await self._maybe_restore_replay_buffer()
 
-        # Start the rollout and train pumps
+        # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
+        watchdog_task = asyncio.create_task(self._watchdog_pump())
+        tasks = (rollout_task, train_task, watchdog_task)
         try:
             done, _ = await asyncio.wait(
-                {rollout_task, train_task}, return_when=asyncio.FIRST_COMPLETED
+                set(tasks), return_when=asyncio.FIRST_COMPLETED
             )
+            if watchdog_task in done:
+                # The watchdog loops forever, so finishing at all means it raised --
+                # a stall or an unhealthy environment. Surface that ahead of the
+                # pumps, whose own symptom would just be "waiting".
+                await watchdog_task
             if rollout_task in done:
                 # Propagate rollout failures immediately. A normally exhausted
                 # rollout pump leaves the train pump to drain committed groups.
                 await rollout_task
             await train_task
         finally:
-            rollout_task.cancel()
-            train_task.cancel()
-            await asyncio.gather(rollout_task, train_task, return_exceptions=True)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             for actor in self._finalizer_actors:
                 try:
                     ray.kill(actor, no_restart=True)
                 except Exception as error:
                     print(f"finalizer actor termination failed: {error}", flush=True)
-            self._logger.finish()
-            # Flush the last checkpoint's background finalization before exit.
-            await asyncio.to_thread(self._checkpointer.shutdown)
+            try:
+                self._weight_synchronizer.shutdown()
+            except Exception as e:  # teardown must not mask the original failure
+                print(f"Error during weight-synchronizer shutdown: {e}", flush=True)
+            finally:
+                self._logger.finish()
+                # Flush the last checkpoint's background finalization before exit.
+                await asyncio.to_thread(self._checkpointer.shutdown)
 
         return {
             "train_steps": self._train_steps,
@@ -467,14 +496,15 @@ class SingleControllerActor:
         try:
             await self._call_dp(
                 "clear_samples",
-                sample_ids=list(request.rollout_ids),
+                sample_ids=list(request.canonical_sample_ids),
                 partition_id=self._partition_id,
             )
         except Exception as error:
             errors.append(
                 RuntimeError(
                     "pre-publication canonical cleanup failed for "
-                    f"group={request.group_id!r}, ids={request.rollout_ids!r}"
+                    f"group={request.group_id!r}, "
+                    f"ids={request.canonical_sample_ids!r}"
                 )
             )
             errors[-1].__cause__ = error
@@ -500,6 +530,11 @@ class SingleControllerActor:
                 errors,
             )
         self._buffer.abort(request.group_id)
+        if (
+            self._rollout_recovery_ledger is not None
+            and request.group_id in self._rollout_recovery_ledger
+        ):
+            self._rollout_recovery_ledger.discard_group(request.group_id)
 
     async def _cleanup_known_finalization_request(
         self, request: "FinalizationRequest"
@@ -536,11 +571,15 @@ class SingleControllerActor:
             # observes either the complete group or neither half of it while
             # tensor payloads remain outside the SingleController process.
             async with self._data_plane_checkpoint_barrier.mutation():
+                ledger = self._rollout_recovery_ledger
+                assert ledger is not None
+                ledger.mark_finalization_started(request.group_id)
                 try:
                     rpc_submitted = True
                     finalized = await actor.finalize.remote(request)
                 except BaseException:
                     self._finalizer_unknown_outcomes += 1
+                    ledger.mark_finalization_unknown(request.group_id)
                     print(
                         "FATAL: finalizer actor RPC failed after submission; canonical "
                         f"publication outcome is unknown for group {request.group_id}. "
@@ -593,6 +632,12 @@ class SingleControllerActor:
                             [commit_error, cleanup_error],
                         )
                     raise
+                ledger.mark_group_finalized(
+                    request.group_id,
+                    meta=finalized.meta,
+                    group_min_weight_version=finalized.group_min_wv,
+                    group_max_weight_version=finalized.group_max_wv,
+                )
         finally:
             self._active_finalizers -= 1
             # Cancellation before RPC submission leaves the actor untouched;
@@ -779,6 +824,53 @@ class SingleControllerActor:
             flush=True,
         )
 
+    @staticmethod
+    def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
+        """Return stable prompt-group IDs in their canonical sample order."""
+        group_ids: list[str] = []
+        for sample_id in meta.sample_ids:
+            if "_g" not in sample_id:
+                raise ValueError(
+                    f"canonical rollout sample ID has no generation suffix: "
+                    f"{sample_id!r}"
+                )
+            group_id, generation_index = sample_id.rsplit("_g", 1)
+            if not group_id or not generation_index.isdigit():
+                raise ValueError(f"invalid canonical rollout sample ID: {sample_id!r}")
+            if not group_ids or group_ids[-1] != group_id:
+                group_ids.append(group_id)
+        return group_ids
+
+    def _claim_train_meta(self, meta: KVBatchMeta, *, num_groups: int) -> list[str]:
+        """Bind a sampler selection to the ledger's current optimizer step."""
+        ledger = self._rollout_recovery_ledger
+        if ledger is None:
+            return self._group_ids_from_meta(meta)
+        group_ids = self._group_ids_from_meta(meta)
+        if len(group_ids) != num_groups:
+            raise ValueError(
+                f"sampler selected {num_groups} groups but canonical metadata "
+                f"contains {len(group_ids)} group IDs"
+            )
+
+        missing_group_ids = [
+            group_id for group_id in group_ids if group_id not in ledger
+        ]
+        if missing_group_ids:
+            raise RuntimeError(
+                "sampler selected canonical rollout group(s) missing from the "
+                "rollout recovery ledger: "
+                f"{missing_group_ids!r}. Restore TQ, replay metadata, and rollout "
+                "lineage from the same checkpoint."
+            )
+        ledger.claim_groups_for_training(
+            group_ids,
+            train_step=self._train_steps,
+            trainer_version=self._trainer_version,
+            expected_group_count=self._master_config.grpo.num_prompts_per_step,
+        )
+        return group_ids
+
     # ── the three pumps + the inline advantage stage ───────────────────────
 
     async def _rollout_pump(self) -> None:
@@ -817,13 +909,18 @@ class SingleControllerActor:
                         target_step=target_step,
                         inflight_registry=self._inflight_by_group_id,
                     )
-                    self._inflight_rollouts -= 1
-                    inflight_count_released = True
-                    sem.release()
-                    generation_permit_released = True
-                    await self._finalize_with_actor(request)
+                    if request is None:
+                        outcome = RolloutOutcome.SKIPPED
+                    else:
+                        self._inflight_rollouts -= 1
+                        inflight_count_released = True
+                        sem.release()
+                        generation_permit_released = True
+                        await self._finalize_with_actor(request)
+                        self._rollout_manager.stats.committed += 1
+                        outcome = RolloutOutcome.COMMITTED
                 else:
-                    await self._rollout_manager.generate_and_push(
+                    outcome = await self._rollout_manager.generate_and_push(
                         prompt,
                         target_step=target_step,
                         inflight_registry=self._inflight_by_group_id,
@@ -840,6 +937,12 @@ class SingleControllerActor:
                     self._inflight_rollouts -= 1
                 if not generation_permit_released:
                     sem.release()
+
+            if outcome is RolloutOutcome.SKIPPED:
+                # Nothing was committed, so the train pump will never see this group
+                # and never release its permit on our behalf.
+                self._buffer_capacity.release()
+                return
 
             if self._async_cfg.diagnostics:
                 content = ""
@@ -949,9 +1052,24 @@ class SingleControllerActor:
                         await asyncio.sleep(0)
 
                         # Evict stale groups
-                        evicted = await self._sampler.evict(
-                            current_train_weight=self._trainer_version,
-                        )
+                        if self._rollout_recovery_ledger is None:
+                            evicted = await self._sampler.evict(
+                                current_train_weight=self._trainer_version,
+                            )
+                        else:
+                            async with self._data_plane_checkpoint_barrier.mutation():
+                                group_ids_before_evict = set(self._buffer.group_ids)
+                                evicted = await self._sampler.evict(
+                                    current_train_weight=self._trainer_version,
+                                )
+                                evicted_group_ids = group_ids_before_evict - set(
+                                    self._buffer.group_ids
+                                )
+                                for group_id in evicted_group_ids:
+                                    if group_id in self._rollout_recovery_ledger:
+                                        self._rollout_recovery_ledger.discard_group(
+                                            group_id
+                                        )
                         evicted_stale_prompt_groups += evicted
                         if evicted:
                             print(
@@ -969,11 +1087,26 @@ class SingleControllerActor:
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
-                        train_meta, num_groups = await self._sampler.select(
-                            current_train_weight=self._trainer_version,
-                            min_prompt_groups=min_prompt_groups,
-                            max_prompt_groups=max_prompt_groups,
-                        )
+                        if self._rollout_recovery_ledger is None:
+                            train_meta, num_groups = await self._sampler.select(
+                                current_train_weight=self._trainer_version,
+                                min_prompt_groups=min_prompt_groups,
+                                max_prompt_groups=max_prompt_groups,
+                            )
+                        else:
+                            # Selection removes local replay ownership. Keep that
+                            # removal and the matching ledger claim in one mutation
+                            # boundary so a later periodic checkpoint cannot split them.
+                            async with self._data_plane_checkpoint_barrier.mutation():
+                                train_meta, num_groups = await self._sampler.select(
+                                    current_train_weight=self._trainer_version,
+                                    min_prompt_groups=min_prompt_groups,
+                                    max_prompt_groups=max_prompt_groups,
+                                )
+                                if train_meta is not None:
+                                    self._claim_train_meta(
+                                        train_meta, num_groups=num_groups
+                                    )
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:
@@ -999,10 +1132,7 @@ class SingleControllerActor:
 
                         consumed_metas.append(train_meta)
                         consumed_group_count += num_groups
-                        selected_group_ids = {
-                            sample_id.rsplit("_g", 1)[0]
-                            for sample_id in train_meta.sample_ids
-                        }
+                        selected_group_ids = self._group_ids_from_meta(train_meta)
                         for group_id in selected_group_ids:
                             for name, value in self._finalizer_metrics_by_group.pop(
                                 group_id, {}
@@ -1086,7 +1216,16 @@ class SingleControllerActor:
                 with self._timer.time("policy_training"):
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
 
-                await self._cleanup_consumed_metas(consumed_metas)
+                if self._rollout_recovery_ledger is not None:
+                    self._rollout_recovery_ledger.mark_train_step_applied(
+                        self._train_steps
+                    )
+                async with self._data_plane_checkpoint_barrier.mutation():
+                    await self._cleanup_consumed_metas(consumed_metas)
+                    if self._rollout_recovery_ledger is not None:
+                        self._rollout_recovery_ledger.release_applied_train_step(
+                            self._train_steps
+                        )
                 for _ in range(consumed_group_count):
                     self._buffer_capacity.release()
 
@@ -1200,6 +1339,110 @@ class SingleControllerActor:
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
                 break
+
+    async def _watchdog_pump(self) -> None:
+        """Report rollout health, and detect stalls nothing else catches.
+
+        Progress is the pair (committed groups, completed train steps) rather than a
+        timestamp: both counters already exist, and "neither has moved" is the property
+        that actually matters.
+
+        Deliberately *not* conditioned on rollouts being in flight. An earlier version
+        required that, on the reasoning that an idle controller has legitimately no
+        work -- and a fault-injection run walked straight through the gap. Killing a
+        generation worker wedged the loop with zero rollouts in flight and zero
+        failures recorded: the rollout pump was blocked on backpressure behind a train
+        pump that could no longer finish a step, so nothing was in flight to count.
+        The watchdog observed six minutes of idleness and said nothing.
+
+        What separates a real stall from an idle gap is whether work remains, so that
+        is what is checked instead.
+        """
+        watchdog_cfg = self._async_cfg.watchdog
+        max_num_steps = self._master_config.grpo.max_num_steps
+        last_progress = (-1, -1)
+        last_progress_at = time.monotonic()
+
+        while True:
+            await asyncio.sleep(watchdog_cfg.interval_s)
+            now = time.monotonic()
+
+            stats = self._rollout_manager.stats
+            progress = (stats.committed, self._train_steps)
+            if progress != last_progress:
+                last_progress = progress
+                last_progress_at = now
+            idle_s = now - last_progress_at
+
+            metrics = dict(stats.as_metrics())
+            metrics["rollout/inflight"] = float(self._inflight_rollouts)
+            metrics["rollout/idle_s"] = idle_s
+            metrics["rollout/train_steps"] = float(self._train_steps)
+            self._logger.log_metrics(metrics, step=self._train_steps)
+
+            if watchdog_cfg.gym_subprocess_check:
+                # Bounded by one tick so a wedged environment cannot stop the pump, and
+                # routed through stall_action so "warn" means warn -- see
+                # _check_env_health.
+                problems = await self._check_env_health(watchdog_cfg.interval_s)
+                if problems:
+                    detail = "; ".join(problems)
+                    if watchdog_cfg.stall_action == "abort":
+                        raise RuntimeError(
+                            f"environment health check failed -- {detail}"
+                        )
+                    print(f"WARNING: environment health -- {detail}", flush=True)
+
+            work_remains = self._train_steps < max_num_steps
+            if work_remains and idle_s > watchdog_cfg.stall_timeout_s:
+                message = (
+                    f"no rollout committed and no train step completed in "
+                    f"{idle_s:.0f}s ({self._inflight_rollouts} rollouts in flight, "
+                    f"{stats.committed} groups committed, step "
+                    f"{self._train_steps}/{max_num_steps}, "
+                    f"stall_timeout_s={watchdog_cfg.stall_timeout_s})"
+                )
+                if watchdog_cfg.stall_action == "abort":
+                    raise RolloutStall(message)
+                print(f"WARNING: rollout stall -- {message}", flush=True)
+
+    async def _check_env_health(self, timeout_s: float) -> list[str]:
+        """Ask each environment actor that exposes a health check whether it is whole.
+
+        Returns the problems found, empty when everything is well. It *reports* rather
+        than raises so the caller can route the verdict through ``stall_action``, the
+        same way the stall path does. Raising here bypassed ``stall_action`` entirely:
+        under the documented default (``"warn"``, which promises to "only report"), and
+        with ``gym_subprocess_check`` defaulting to true, an unhealthy environment killed
+        the run -- a run-ending path switched on by default, in a feature whose whole
+        posture is inert-by-default.
+
+        Each probe is bounded. ``NemoGym`` is an asyncio actor, so a *wedged* environment
+        -- precisely the case this check exists to catch -- left the await hanging
+        forever, the pump never ticked again, and stall detection was dead exactly when
+        it was needed. A probe that does not answer within one tick IS the unhealthy
+        signal; it is not a reason to stop watching.
+
+        Environments without the method are skipped rather than treated as unhealthy;
+        only NeMo-Gym has subprocess servers to lose.
+        """
+        problems: list[str] = []
+        for env_name, handle in self._env_handles.items():
+            health_check = getattr(handle, "health_check", None)
+            if health_check is None:
+                continue
+            try:
+                await asyncio.wait_for(
+                    self._ray_get(health_check.remote()), timeout=timeout_s
+                )
+            except asyncio.TimeoutError:
+                problems.append(
+                    f"environment {env_name!r} did not answer its health check within "
+                    f"{timeout_s}s"
+                )
+            except Exception as error:
+                problems.append(f"environment {env_name!r} reported unhealthy: {error}")
+        return problems
 
     async def _abort_stale_inflight(self) -> int:
         """Abort in-flight rollouts that the sampler can no longer select."""
