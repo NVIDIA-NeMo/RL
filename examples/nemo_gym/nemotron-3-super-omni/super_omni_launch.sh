@@ -126,12 +126,21 @@ mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}"
          "${MEGATRON_CONFIG_LOCK_DIR}" "${HF_MODULES_CACHE_DIR}"
 export OMP_NUM_THREADS=16
 
-SNAPSHOT_DIR=$(realpath "$(bash "${CODE_DIR}/tools/code_snapshot.sh" "${EXP_NAME}")")
-echo "Refreshing tracked files in code snapshot: ${SNAPSHOT_DIR}"
-(
-    cd "${CODE_DIR}"
-    rsync -a --files-from=<(git ls-files --recurse-submodules --cached --full-name) ./ "${SNAPSHOT_DIR}/"
-)
+if [[ "${NO_SNAPSHOT:-0}" == "1" ]]; then
+    # Run the repo directly: uncommitted changes take effect, no snapshot
+    # refresh step. Results/logs land under the repo. Meant for fast
+    # iteration/diagnostics; production runs should keep snapshots so a
+    # queued job can't be changed underneath by later edits.
+    SNAPSHOT_DIR="${CODE_DIR}"
+    echo "NO_SNAPSHOT=1: running directly from ${CODE_DIR}"
+else
+    SNAPSHOT_DIR=$(realpath "$(bash "${CODE_DIR}/tools/code_snapshot.sh" "${EXP_NAME}")")
+    echo "Refreshing tracked files in code snapshot: ${SNAPSHOT_DIR}"
+    (
+        cd "${CODE_DIR}"
+        rsync -a --files-from=<(git ls-files --recurse-submodules --cached --full-name) ./ "${SNAPSHOT_DIR}/"
+    )
+fi
 cd "${SNAPSHOT_DIR}"
 
 # Megatron is imported from the checkout rather than the container's

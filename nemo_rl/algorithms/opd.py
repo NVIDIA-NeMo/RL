@@ -61,7 +61,12 @@ class NonColocatedTeachersConfig(BaseModel, extra="allow"):
     default_teacher_cfg: TeacherResourceConfig = Field(
         default_factory=TeacherResourceConfig
     )
-    teacher_overrides: dict[str, TeacherResourceConfig] = Field(default_factory=dict)
+    # Deliberately UNTYPED values: override blocks are partial by nature, and
+    # validating them as TeacherResourceConfig here would fill schema defaults
+    # for every omitted field (e.g. gpus_per_node=8), which later clobber
+    # default_teacher_cfg in the defaults<-override merge. Validation happens
+    # after the merge in create_teacher_configs_from_opd_config.
+    teacher_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class OnPolicyDistillationConfig(BaseModel, extra="allow"):
