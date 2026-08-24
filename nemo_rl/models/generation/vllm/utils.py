@@ -17,6 +17,10 @@ from typing import Any, Optional
 
 import torch
 
+from nemo_rl.data.multimodal_utils import (
+    VLLM_CONTENT_KEY,
+    VLLM_MULTI_MODAL_DATA_KEY,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_FALLBACK_DTYPE,
@@ -92,37 +96,26 @@ def format_prompt_for_vllm_generation(
         token_ids = valid_ids.tolist()
         return {"prompt_token_ids": token_ids}
 
-    def _get_multi_modal_data(index: int) -> dict[str, Any]:
-        multi_modal_data = {}
-        images = data.get("vllm_images", None)
-        if images is not None and len(images[index]) > 0:
-            multi_modal_data["image"] = (
-                images[index][0] if len(images[index]) == 1 else images[index]
-            )
-        audios = data.get("vllm_audios", None)
-        if audios is not None and len(audios[index]) > 0:
-            multi_modal_data["audio"] = (
-                audios[index][0] if len(audios[index]) == 1 else audios[index]
-            )
-        videos = data.get("vllm_videos", None)
-        if videos is not None and len(videos[index]) > 0:
-            multi_modal_data["video"] = (
-                videos[index][0] if len(videos[index]) == 1 else videos[index]
-            )
-        return multi_modal_data
+    content_rows = data.get(VLLM_CONTENT_KEY)
+    multi_modal_rows = data.get(VLLM_MULTI_MODAL_DATA_KEY)
 
-    # Native image, audio, and video side channels share this formatter path.
-    if "vllm_content" in data:
+    def _get_multi_modal_data(index: int) -> dict[str, Any]:
+        if multi_modal_rows is None or multi_modal_rows[index] is None:
+            return {}
+        return dict(multi_modal_rows[index])
+
+    # vLLM-ready content and modality data share this formatter path.
+    if content_rows is not None or multi_modal_rows is not None:
         # VLM generation using content and multi_modal_data
         for i in range(start_idx, end_idx):
-            msg = data["vllm_content"][i]
+            msg = content_rows[i] if content_rows is not None else None
             multi_modal_data = _get_multi_modal_data(i)
             if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
                 continue
             # Raw processor content is valid only for the initial turn. Later
             # turns use the updated pre-tokenized conversation plus the same
-            # native media, preventing vLLM from regenerating the stale prompt.
+            # modality data, preventing vLLM from regenerating the stale prompt.
             prompt_dict = {"prompt": msg} if msg is not None else _get_regular_prompt(i)
             prompt_dict["multi_modal_data"] = multi_modal_data
             prompts.append(prompt_dict)

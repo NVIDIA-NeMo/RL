@@ -233,8 +233,8 @@ class TestVLMProcessorMMPRTiny:
         assert "ground_truth" in result["extra_env_info"]
         assert result["extra_env_info"]["ground_truth"] == "A"
         assert "vllm_content" in result
-        assert "vllm_images" in result
-        assert len(result["vllm_images"]) == 1
+        assert "vllm_multi_modal_data" in result
+        assert "image" in result["vllm_multi_modal_data"]
         assert result["task_name"] == "mmpr-tiny"
         user_message = result["message_log"][0]
         assert torch.equal(user_message["num_frames"].as_tensor(), torch.tensor([1]))

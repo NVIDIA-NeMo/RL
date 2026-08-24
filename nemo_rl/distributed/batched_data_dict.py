@@ -33,7 +33,7 @@ from typing_extensions import Self
 
 from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
-    NATIVE_MULTIMODAL_KEYS,
+    VLLM_PROMPT_KEYS,
     PackedTensor,
 )
 from nemo_rl.data.packing import get_packer
@@ -59,7 +59,7 @@ def _prepare_multimodal_sharing(
 ) -> dict[int, Any]:
     """Enable PackedTensor provenance and return deepcopy memo entries.
 
-    PackedTensor is an explicit multimodal type. Raw native-vLLM payloads are
+    PackedTensor is an explicit multimodal type. Raw vLLM-ready payloads are
     shared only under named media keys or typed content parts. Containers are
     still deep-copied so rollout rows may diverge safely.
     """
@@ -75,7 +75,7 @@ def _prepare_multimodal_sharing(
             for key, child in item.items():
                 visit(
                     child,
-                    in_media_context or typed_media or key in NATIVE_MULTIMODAL_KEYS,
+                    in_media_context or typed_media or key in VLLM_PROMPT_KEYS,
                 )
             return
         if isinstance(item, (list, tuple)):
@@ -937,7 +937,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     shared_leaves = (
                         _prepare_multimodal_sharing(
                             item,
-                            media_context=k in NATIVE_MULTIMODAL_KEYS,
+                            media_context=k in VLLM_PROMPT_KEYS,
                         )
                         if share_immutable_media
                         else {}

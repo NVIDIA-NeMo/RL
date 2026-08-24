@@ -503,15 +503,12 @@ def vlm_hf_data_processor(
     ### only one round of interaction is assumed, this can easily be extended to a conversational setting
     user_message: dict[str, Any] = {"role": "user", "content": []}
     #
-    images = []
-    audios = []
-    videos = []
+    vllm_modality_items: dict[str, list[Any]] = {}
     load_video_kwargs: dict[str, Any] = {}
     if isinstance(problem, list):
         for content in problem:
-            # for image, video, audio, just append it
-            # for text, format the prompt to the problem
-            if content["type"] == "text":
+            content_type = content["type"]
+            if content_type == "text":
                 user_message["content"].append(
                     {
                         "type": "text",
@@ -520,16 +517,18 @@ def vlm_hf_data_processor(
                         else content["text"],
                     }
                 )
-            elif content["type"] == "image":
+                continue
+            if content_type == "image":
                 user_message["content"].append(content)
-                images.append(content["image"])
-            elif content["type"] == "audio":
+                vllm_value = resolve_to_image(content["image"])
+            elif content_type == "audio":
                 user_message["content"].append(content)
                 # Store as (audio_array, sample_rate) tuple for vLLM
-                audios.append(
-                    (content["audio"], processor.feature_extractor.sampling_rate)
+                vllm_value = (
+                    content["audio"],
+                    processor.feature_extractor.sampling_rate,
                 )
-            elif content["type"] == "video":
+            elif content_type == "video":
                 from transformers.video_utils import load_video
 
                 if not load_video_kwargs:
@@ -543,14 +542,15 @@ def vlm_hf_data_processor(
                     )[0]
                 # Replace path with loaded frames so apply_chat_template can consume it
                 user_message["content"].append({"type": "video", "video": video_value})
-                videos.append(video_value)
+                vllm_value = video_value
             else:
-                raise ValueError(f"Unsupported content type: {content['type']}")
+                raise ValueError(f"Unsupported content type: {content_type}")
+            vllm_modality_items.setdefault(content_type, []).append(vllm_value)
     else:
         # conversation consists of a text-only message
         user_message["content"] = task_data_spec.prompt.format(problem)
 
-    images = [resolve_to_image(image) for image in images]
+    images = vllm_modality_items.get("image", [])
     # Detect processors that use <image> placeholder style (e.g., NemotronOmni/InternVL)
     # vs OpenAI content list style (e.g., Qwen-VL, Gemma).
     # These processors expand <image> tokens in __call__ but NOT in apply_chat_template,
@@ -654,15 +654,18 @@ def vlm_hf_data_processor(
     ### append to user message
     message_log.append(user_message)
 
+    vllm_multi_modal_data = {
+        modality: items[0] if len(items) == 1 else items
+        for modality, items in vllm_modality_items.items()
+    }
+
     length = sum(len(m["token_ids"]) for m in message_log)
     loss_multiplier = 1.0
     if length >= max_seq_length:
         # Treat truncated messages as text only
         vllm_kwargs = {
             "vllm_content": None,
-            "vllm_images": [],
-            "vllm_audios": [],
-            "vllm_videos": [],
+            "vllm_multi_modal_data": {},
         }
 
         # make smaller and mask out
@@ -678,9 +681,7 @@ def vlm_hf_data_processor(
         # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images/audios) for the entire conversation
         vllm_kwargs = {
             "vllm_content": string_formatted_dialog,
-            "vllm_images": images,
-            "vllm_audios": audios,
-            "vllm_videos": videos,
+            "vllm_multi_modal_data": vllm_multi_modal_data,
         }
 
     output: DatumSpec = {

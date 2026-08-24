@@ -43,8 +43,8 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.multimodal_utils import (
-    NATIVE_MULTIMODAL_KEYS,
-    VLLM_MULTIMODAL_DATA_KEYS,
+    VLLM_MULTI_MODAL_DATA_KEY,
+    VLLM_PROMPT_KEYS,
     PackedTensor,
     attach_image_model_inputs_to_message,
     extract_input_images_from_responses_messages,
@@ -141,21 +141,22 @@ def _add_multimodal_generation_payload(
     *,
     deduplicate_multimodal_data: bool,
 ) -> None:
-    """Attach one policy-ready or native-vLLM media representation.
+    """Attach one policy-ready or vLLM-ready media representation.
 
     The compact policy representation remains in ``message_log`` for later
-    logprob/training construction. When every active row has a native vLLM
+    logprob/training construction. When every active row has a vLLM-ready
     prompt, sending that representation as well is redundant.
     """
     generation_config = getattr(policy_generation, "cfg", {})
-    native_content = active_batch.get("vllm_content")
+    multi_modal_rows = active_batch.get(VLLM_MULTI_MODAL_DATA_KEY)
 
     def row_has_formatter_consumed_media(row_index: int) -> bool:
-        for key in VLLM_MULTIMODAL_DATA_KEYS:
-            rows = active_batch.get(key)
-            if rows is None or row_index >= len(rows):
-                continue
-            value = rows[row_index]
+        if multi_modal_rows is None or row_index >= len(multi_modal_rows):
+            return False
+        row = multi_modal_rows[row_index]
+        if not row:
+            return False
+        for value in row.values():
             if value is None:
                 continue
             if isinstance(value, (list, tuple, dict, str, bytes)):
@@ -165,21 +166,21 @@ def _add_multimodal_generation_payload(
                 return True
         return False
 
-    use_native_vllm_only = (
+    use_vllm_prompt_only = (
         deduplicate_multimodal_data
         and generation_config.get("backend") == "vllm"
-        and native_content is not None
+        and multi_modal_rows is not None
         and all(
             row_has_formatter_consumed_media(row_index)
-            for row_index in range(len(native_content))
+            for row_index in range(len(multi_modal_rows))
         )
     )
-    if not use_native_vllm_only:
+    if not use_vllm_prompt_only:
         generation_input_data.update(
             flat_messages.get_multimodal_dict(as_tensors=False)
         )
 
-    for key in NATIVE_MULTIMODAL_KEYS:
+    for key in VLLM_PROMPT_KEYS:
         if key in active_batch:
             generation_input_data[key] = active_batch[key]
 
@@ -191,7 +192,7 @@ def _reattach_original_multimodal_payloads(
     """Restore exact prompt media omitted by a remote Gym rollout.
 
     User turns are matched by their ordinal position. Only explicit
-    ``PackedTensor`` values and named native-generation media are restored, so
+    ``PackedTensor`` values and named vLLM-ready media are restored, so
     arbitrary non-text metadata is never misclassified as media. Newly returned
     Gym media is left untouched unless it occupies the corresponding original
     prompt key.
@@ -232,7 +233,7 @@ def attach_static_multimodal_payload(
         )
     for source, target in zip(source_users, target_users):
         for key, value in source.items():
-            if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
+            if isinstance(value, PackedTensor) or key in VLLM_PROMPT_KEYS:
                 target[key] = value
 
 
@@ -857,7 +858,7 @@ def run_multi_turn_rollout(
         max_rollout_turns: Maximum number of agent-environment interaction turns.
         max_seq_len: Maximum sequence length allowed.
         greedy: Whether to use greedy decoding.
-        deduplicate_multimodal_data: Send only native media through the vLLM
+        deduplicate_multimodal_data: Send only vLLM-ready media through the vLLM
             generation boundary while retaining compact policy media for
             logprob and training.
 
@@ -1107,8 +1108,8 @@ async def async_generate_response_for_sample_turn(
         tokenizer: Tokenizer to use
         max_seq_len: Maximum sequence length
         greedy: Whether to use greedy decoding
-        sample_multimodal_data: Native vLLM media fields for this sample.
-        deduplicate_multimodal_data: Avoid sending both native and policy-ready
+        sample_multimodal_data: vLLM-ready media fields for this sample.
+        deduplicate_multimodal_data: Avoid sending both vLLM-ready and policy-ready
             media through the async generation boundary.
 
     Returns:
@@ -1207,7 +1208,7 @@ async def run_sample_multi_turn_rollout(
     task_name = initial_sample_state["task_name"]
     sample_multimodal_data = {
         key: initial_sample_state[key]
-        for key in NATIVE_MULTIMODAL_KEYS
+        for key in VLLM_PROMPT_KEYS
         if key in initial_sample_state
     }
 
@@ -1507,7 +1508,7 @@ async def _run_multi_turn_rollout_async(
             "stop_strings": input_batch.get("stop_strings", [None] * batch_size)[i],
             "idx": input_batch.get("idx", list(range(batch_size)))[i],
         }
-        for key in NATIVE_MULTIMODAL_KEYS:
+        for key in VLLM_PROMPT_KEYS:
             if key in input_batch:
                 sample_state[key] = input_batch[key][i]
         sample_initial_states.append(sample_state)
