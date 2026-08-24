@@ -485,6 +485,16 @@ Four facts govern whether this is reachable, and three of them are traps:
      published as `[addr, addr+length)` (or registered per chunk), not taken
      from `cuMemGetAddressRange`.
 
+     **But that is not the whole failure.** The prediction it implies — that a
+     storage small enough to sit inside one physical chunk would work — was
+     tested and is false. With an 8 MB storage (chunk is 20 MiB) the read still
+     fails `status -1`, and this time mooncake logs *nothing*: no `not found!`,
+     no export or import failure. So the handle is published and located, and
+     the NVLink transfer itself fails silently. There are at least two
+     independent failure modes; only the extent one is understood. Fixing the
+     extent upstream would not, on this evidence, be enough to make register
+     mode work over NVLink.
+
    So: not reachable with torch-allocated sources as they are today. That is
    weaker than "impossible" — allocating register mode's sources through
    mooncake's own allocator (see the `_prepare_source` note below) would sidestep

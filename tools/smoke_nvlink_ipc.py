@@ -46,6 +46,19 @@ from time import perf_counter
 # every adapter import below is function-local. See smoke_register_mode_gdr.py.
 
 
+def _force_nvlink_after_env() -> None:
+    """Set MC_FORCE_MNNVL *after* configure_engine_env has run.
+
+    configure_engine_env refuses this variable outright, because on a real run
+    it is useless and was measured to end in a host OOM. This tool is the
+    experiment that guard is based on, so it needs to get past it -- and the
+    ordering is not a trick: mooncake reads MC_* when its extension loads, and
+    every adapter import here is function-local and happens after this point.
+    Enabled only by --force-mnnvl, never by default.
+    """
+    os.environ["MC_FORCE_MNNVL"] = "1"
+
+
 def _engine_env() -> None:
     from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 
@@ -74,11 +87,14 @@ def _client(protocol: str, device_name: str):
     )
 
 
-def producer(protocol: str, device_name: str, mb: int, rows: int, out, gate) -> None:
+def producer(protocol: str, device_name: str, mb: int, rows: int, out, gate,
+             force_mnnvl: bool = False) -> None:
     try:
         import torch
 
         _engine_env()
+        if force_mnnvl:
+            _force_nvlink_after_env()
         torch.cuda.set_device(0)
         client = _client(protocol, device_name)
         elems = (mb * 2**20) // (rows * 4)
@@ -112,7 +128,8 @@ def producer(protocol: str, device_name: str, mb: int, rows: int, out, gate) -> 
         gate.set()
 
 
-def consumer(protocol: str, device_name: str, inbox, out, gate) -> None:
+def consumer(protocol: str, device_name: str, inbox, out, gate,
+             force_mnnvl: bool = False) -> None:
     try:
         import torch
 
@@ -123,6 +140,8 @@ def consumer(protocol: str, device_name: str, inbox, out, gate) -> None:
             return
 
         _engine_env()
+        if force_mnnvl:
+            _force_nvlink_after_env()
         torch.cuda.set_device(1)
         client = _client(protocol, device_name)
         rows, elems = published["shape"]
@@ -160,6 +179,12 @@ def main() -> int:
     parser.add_argument("--mb", type=int, default=64)
     parser.add_argument("--rows", type=int, default=8)
     parser.add_argument(
+        "--force-mnnvl",
+        action="store_true",
+        help="set MC_FORCE_MNNVL after configure_engine_env, which otherwise "
+        "refuses it; installs mooncake's NVLink transport instead of RDMA",
+    )
+    parser.add_argument(
         "--device-name",
         default=None,
         help="engine device filter; a name no HCA carries (e.g. no_such_nic0) "
@@ -186,9 +211,10 @@ def main() -> int:
     procs = [
         ctx.Process(target=producer,
                     args=(args.protocol, device_name, args.mb, args.rows,
-                          to_consumer, gate)),
+                          to_consumer, gate, args.force_mnnvl)),
         ctx.Process(target=consumer,
-                    args=(args.protocol, device_name, to_consumer, results, gate)),
+                    args=(args.protocol, device_name, to_consumer, results, gate,
+                          args.force_mnnvl)),
     ]
     # The producer's message is both the handshake and the consumer's input, so
     # it is forwarded rather than duplicated: read it, report it, pass it on.
