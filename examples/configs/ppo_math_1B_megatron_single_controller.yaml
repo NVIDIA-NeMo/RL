@@ -178,7 +178,7 @@ logger:
 
 # TransferQueue data plane is mandatory for the SingleController path. The whole
 # block is spelled out because the PPO config chain has none; the fields have no
-# defaults. Values are grpo_math_1B.yaml's except defualt enabled.
+# defaults. Values are grpo_math_1B.yaml's except default enabled.
 # See nemo_rl/data_plane/README.md for more details.
 data_plane:
   enabled: true
