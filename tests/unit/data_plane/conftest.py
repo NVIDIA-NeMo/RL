@@ -33,7 +33,7 @@ import pytest
 
 from nemo_rl.data_plane import build_data_plane_client
 
-from ._rollout_shapes import mooncake_available
+from ._rollout_shapes import mooncake_available, rdma_available
 
 
 def _make_tq_cfg(backend: str) -> dict:
@@ -41,11 +41,15 @@ def _make_tq_cfg(backend: str) -> dict:
         "enabled": True,
         "impl": "transfer_queue",
         "backend": backend,
-        "storage_capacity": 1024,
-        "num_storage_units": 1,
         "claim_meta_poll_interval_s": 0.5,
-        "global_segment_size": 8589934592,  # 8 GiB — sized for CI host RAM
-        "local_buffer_size": 1073741824,  # 1 GiB
+        "simple": {"storage_capacity": 1024, "num_storage_units": 1},
+        "mooncake_cpu": {
+            "global_segment_size": 8589934592,  # 8 GiB — sized for CI host RAM
+            "local_buffer_size": 1073741824,  # 1 GiB
+            # reuse_registered_buffers omitted on purpose: absent must mean on,
+            # so the fixture exercises the default the same way a user config
+            # that never mentions the flag does.
+        },
     }
 
 
@@ -66,6 +70,15 @@ def _session_tq_client_mooncake_cpu():
         pytest.skip(
             "mooncake not installed — skipping mooncake_cpu "
             "(set NEMO_RL_REQUIRE_MOONCAKE=1 to fail loud)"
+        )
+    # mooncake_cpu is RDMA-only, so it cannot run without an RDMA device. CI
+    # sets NEMO_RL_REQUIRE_MOONCAKE=1 on runners that have one, which turns
+    # this skip into a failure — otherwise losing the device passthrough would
+    # silently drop mooncake coverage and still go green.
+    if not rdma_available():
+        pytest.skip(
+            "no usable mlx5 RDMA device — mooncake_cpu requires RDMA "
+            "(set MC_MOONCAKE_DEVICE=<dev> to override)"
         )
     client = build_data_plane_client(_make_tq_cfg("mooncake_cpu"))
     yield client

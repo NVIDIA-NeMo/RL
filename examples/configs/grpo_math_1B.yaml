@@ -534,11 +534,19 @@ data_plane:
   enabled: false
   impl: transfer_queue
   backend: "simple"                  # TQ storage backend ('simple' or 'mooncake_cpu')
-  storage_capacity: 1000000          # max samples retained per partition
-  num_storage_units: 2               # storage shards
   claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
-  global_segment_size: 549755813888  # 512 GiB — used when backend == "mooncake_cpu"
-  local_buffer_size:   68719476736   # 64 GiB  — used when backend == "mooncake_cpu"
+  # Backend-specific blocks: only the one named by `backend` is read, and an
+  # absent block means that backend's defaults (see SimpleStorageConfig /
+  # MooncakeCpuConfig in nemo_rl/data_plane/interfaces.py).
+  simple:
+    storage_capacity: 1000000        # max samples retained per partition
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
+  mooncake_cpu:
+    # Per client process — see MooncakeCpuConfig before raising these.
+    global_segment_size: 68719476736 # 64 GiB/process
+    local_buffer_size:    4294967296 # 4 GiB/process
+    reuse_registered_buffers: true   # reuse RDMA-registered buffers
+    staging_buffer_size:   268435456 # 256 MiB/pool slot; bigger transfers bypass the pool
   # observability:                    # NotRequired
   #   enabled: false
 
