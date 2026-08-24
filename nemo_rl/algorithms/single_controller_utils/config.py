@@ -296,10 +296,26 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # the deadline knowing there is no second chance.
     #
     # None disarms it: no watchdog thread is started and the refit path is byte-identical
-    # to before. Set it well above a healthy refit -- observed at ~1.9s for a 1.5B model on
-    # GB200 -- because the cost of firing early is aborting a run that was merely slow,
-    # while the cost of firing late is only that a wedge lasts longer before it is broken.
-    refit_timeout_s: Optional[PositiveFloat] = None
+    # to before. Set it well above a healthy refit, because the cost of firing early is
+    # aborting a run that was merely slow, while the cost of firing late is only that a
+    # wedge lasts longer before it is broken.
+    #
+    # DEFAULTED, not None, because the deadline is what makes reactive recovery possible
+    # at all rather than a nicety on top of it. A Ray actor runs one task at a time
+    # (nothing here raises max_concurrency) and this group is a raw StatelessProcessGroup
+    # with no torch process-group watchdog behind it, so a shard dying mid-collective
+    # leaves every trainer blocked inside NCCL. The driver sees RayActorError and calls
+    # _recover_from_failed_refit, whose init_collective then queues behind the still-blocked
+    # task and never runs: the recovery itself wedges and the run ends on stall_timeout_s.
+    # Only the abort releases those ranks. With None as the default, a config that turned
+    # fleet health on got detection and quarantine but no refit recovery, silently.
+    #
+    # 300s is ~150x a healthy refit for a 1.5B model on GB200 (~1.9s measured), so it
+    # cannot fire on a merely-slow one at that scale. It is bandwidth-bound and roughly
+    # linear in parameter count, though: ~90s at 70B and ~500s at 405B on the same
+    # measurement, so a frontier-scale model needs this raised or it will abort a healthy
+    # refit. Set it explicitly there; set it to None to disarm the watchdog entirely.
+    refit_timeout_s: Optional[PositiveFloat] = 300.0
     # Restart dead shards and re-admit them at the next refit. Off by default: without
     # it the fleet only ever shrinks, which is safe but means a long run ends smaller
     # than it started. Recreating a vLLM worker mid-run is the most invasive thing this
