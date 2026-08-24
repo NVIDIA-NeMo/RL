@@ -514,8 +514,10 @@ class DTensorPolicyWorkerV2Impl(
                         if num_valid_samples > 0:
                             # ClippedPGLossFn already materializes the loss
                             # metric with the other scalars; avoid a second
-                            # GPU-to-CPU synchronization here.
-                            mb_losses.append(loss_metrics["loss"])
+                            # GPU-to-CPU synchronization here. Metrics were
+                            # divided by num_global_batches upstream, so undo
+                            # that scaling for the per-global-batch loss, as in v1.
+                            mb_losses.append(loss_metrics["loss"] * num_global_batches)
                             all_mb_metrics.append(loss_metrics)
 
                 grad_norm: Optional[float | torch.Tensor] = None

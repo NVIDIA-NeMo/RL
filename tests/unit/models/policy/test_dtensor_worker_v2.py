@@ -563,6 +563,17 @@ def test_dtensor_v2_mixed_precision_training_and_logprobs(
         assert loss_tensor.dtype == torch.float32, (
             f"Loss should be float32, got {loss_tensor.dtype}"
         )
+        num_global_batches = train_data.size // config["train_global_batch_size"]
+        scaled_metric_loss = sum(results["all_mb_metrics"]["loss"])
+        torch.testing.assert_close(
+            loss_tensor.sum(),
+            torch.tensor(
+                scaled_metric_loss * num_global_batches,
+                dtype=loss_tensor.dtype,
+            ),
+            rtol=1e-4,
+            atol=1e-5,
+        )
 
         policy.finish_training()
 
