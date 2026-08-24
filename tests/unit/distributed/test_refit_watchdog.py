@@ -20,11 +20,17 @@ returns without raising) was verified separately on real hardware.
 """
 
 import threading
+import pickle
 import time
 
 import pytest
 
-from nemo_rl.distributed.refit_watchdog import RefitAborted, RefitAbortWatchdog
+from nemo_rl.distributed.refit_watchdog import (
+    REFIT_ABORTED_TOKEN,
+    RefitAborted,
+    RefitAbortWatchdog,
+    is_refit_abort,
+)
 
 
 class _FakeGroup:
@@ -86,6 +92,56 @@ class TestFires:
             time.sleep(0.4)
         assert guard.fired is True
         assert group.abort_calls == 1
+
+
+class TestTheAbortSurvivesABoundaryThatDropsTheType:
+    """vLLM's EngineCore RPC keeps the message and discards the exception class.
+
+    ``v1/engine/core.py`` stringifies the worker exception into ``failure_message``;
+    ``v1/engine/core_client.py`` re-raises it as ``Exception(failure_message)``. So a
+    RefitAborted raised inside the engine reaches the Ray actor as a plain Exception, and
+    every ``except RefitAborted`` downstream of a collective_rpc was dead code.
+
+    Job 6484412 is what that cost: the deadline fired, the abort was named in the log, the
+    handler did not match, and the run wedged at step 4 for the rest of its wall-clock.
+    """
+
+    def test_every_message_carries_the_token(self):
+        assert REFIT_ABORTED_TOKEN in str(RefitAborted("a peer stopped participating"))
+
+    def test_the_token_is_not_stacked_on_re_wrap(self):
+        """Re-raising translates message to message; the prefix must not accumulate."""
+        once = RefitAborted("aborted")
+        twice = RefitAborted(str(once))
+        assert str(twice).count(REFIT_ABORTED_TOKEN) == 1
+
+    def test_it_survives_pickling(self):
+        """Ray pickles exceptions across the actor boundary."""
+        revived = pickle.loads(pickle.dumps(RefitAborted("aborted mid-collective")))
+        assert is_refit_abort(revived)
+        assert str(revived).count(REFIT_ABORTED_TOKEN) == 1
+
+    def test_a_real_refit_aborted_is_recognised(self):
+        assert is_refit_abort(RefitAborted("deadline exceeded"))
+
+    def test_the_vllm_flattened_form_is_recognised(self):
+        """The exact shape vLLM reconstructs: bare Exception, message preserved."""
+        inside_the_engine = RefitAborted(
+            "the refit was aborted after its 12.5s deadline"
+        )
+        flattened = Exception(
+            f"Call to nccl_reshard_refit method failed: {inside_the_engine}"
+        )
+
+        assert not isinstance(flattened, RefitAborted), "premise: the type is gone"
+        assert is_refit_abort(flattened), "but the abort must still be recognised"
+
+    def test_an_unrelated_failure_is_not_mistaken_for_an_abort(self):
+        """A real refit bug must not be relabelled as a deliberate abort and retried."""
+        assert not is_refit_abort(RuntimeError("CUDA out of memory"))
+        assert not is_refit_abort(
+            Exception("Call to nccl_reshard_refit method failed: shape mismatch")
+        )
 
 
 class TestAnEscapeAfterTheAbortIsNamedAsOne:
