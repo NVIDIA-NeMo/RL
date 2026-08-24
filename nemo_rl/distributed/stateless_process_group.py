@@ -129,7 +129,26 @@ class StatelessProcessGroup:
         The rendezvous store is dropped too. Each rebuild gets a fresh port, so holding
         the old one costs nothing functionally, but a run that recovers repeatedly would
         otherwise accumulate a bound TCPStore per recovery for the life of the worker.
+
+        **The split children are aborted first, and they are a third communicator family.**
+        The Python reshard path splits this communicator per replica group and caches the
+        children; NCCL gives a split child its own abort flag unless ``splitShare`` is set
+        (it defaults to 0), so aborting this communicator does not reach them. A rank
+        blocked on a child would never be released, and since it never returns, the
+        watchdog's guarded block never exits to have ``fired`` read -- a hang no
+        exception-translation fix can reach.
+
+        Imported locally to keep this module free of a ``weight_sync`` dependency at module
+        scope.
         """
+        # Before the parent: once nccl_communicator is None the cache keys derived from it
+        # cannot be recovered, and the children would be stranded as well as un-aborted.
+        from nemo_rl.weight_sync.xferdtensor_python import (
+            abort_xferdtensor_python_subcommunicators,
+        )
+
+        abort_xferdtensor_python_subcommunicators(self)
+
         communicator, self.nccl_communicator = self.nccl_communicator, None
         self.tcp_store = None
         self._aborted = True
