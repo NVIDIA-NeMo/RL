@@ -552,11 +552,10 @@ class VllmInternalWorkerExtension:
     def draft_refit_preflight_report(self) -> dict[str, Any]:
         """JSON-safe snapshot of the drafter refit surface for preflight checks.
 
-        Used by ``tools/draft_verification/vllm_refit_preflight.py`` (via
-        ``collective_rpc``) to validate, inside the serving container, that the
-        drafter loaded, its expected ``draft.*`` key set matches the trainer's
-        stream, integer/bool buffers keep their dtype, and no embed/lm_head
-        storage is aliased to the target model.
+        Invoked via ``collective_rpc`` to validate, inside the serving
+        container, that the drafter loaded, its expected ``draft.*`` key set
+        matches the trainer's stream, integer/bool buffers keep their dtype,
+        and no embed/lm_head storage is aliased to the target model.
         """
         method = self._speculative_method()
         draft_model = self._get_drafter_model()

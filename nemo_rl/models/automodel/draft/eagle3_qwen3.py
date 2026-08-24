@@ -39,7 +39,7 @@
 #   counts) instead of a locally normalized scalar so the RL runtime can apply
 #   NeMo-RL's global (DP-reduced, microbatch-slot) normalization. With a
 #   single rank and one microbatch, num/den reproduce the original
-#   speculators loss exactly (see tools/draft_verification/verify_eagle3_parity.py).
+#   speculators loss exactly.
 """Vendored Qwen3 EAGLE3 drafter with speculators-style TTT training forward."""
 
 from dataclasses import dataclass
