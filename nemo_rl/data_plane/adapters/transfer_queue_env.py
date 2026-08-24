@@ -150,6 +150,49 @@ def _wanted_engine_env(gdr: bool = False) -> dict[str, str]:
     return wanted
 
 
+# Mooncake picks its transport from these at engine-install time, before any
+# protocol argument is read (transfer_engine_impl.cpp): MC_INTRANODE_NVLINK ->
+# nvlink_intra, else MC_FORCE_MNNVL or no HCAs -> nvlink, else rdma.
+_NVLINK_TRANSPORT_ENV = ("MC_FORCE_MNNVL", "MC_INTRANODE_NVLINK")
+
+
+def _reject_nvlink_transport_env() -> None:
+    """Refuse to start when the launcher forces mooncake's NVLink transport.
+
+    No backend here can feed it. Register mode publishes torch-allocated
+    memory, and the fabric export needs an allocation made with
+    ``CU_MEM_HANDLE_TYPE_FABRIC`` -- the default caching allocator uses
+    ``cudaMalloc`` (no cuMem handle at all) and ``expandable_segments`` never
+    requests a FABRIC handle, so registration returns success having published
+    nothing and the reader fails with ``status -1`` much later, on another
+    node. ``mooncake_cpu`` never reaches the branch at all: the store brings up
+    its own transport pinned to ``protocol: rdma``.
+
+    Measured on GB300, 6n4g qwen3-30b: with ``MC_FORCE_MNNVL=1`` the run dies of
+    a host OOM ~9 minutes in, twice out of two, while the identical run without
+    it completes five steps. The flag buys nothing even when it does not kill
+    the run -- step times on stock main were unchanged and the MNNVL allocator
+    was never selected.
+
+    So this is a hard failure rather than a warning: the variable cannot help,
+    it demonstrably harms, and its failure mode is a nine-minute OOM with
+    nothing pointing back at the cause.
+    """
+    forced = [k for k in _NVLINK_TRANSPORT_ENV if k in os.environ]
+    if not forced:
+        return
+    raise RuntimeError(
+        f"{', '.join(forced)} is set, which makes mooncake install its NVLink "
+        "transport instead of RDMA. No data-plane backend can use it: register "
+        "mode registers torch memory, which is never fabric-exportable, and "
+        "mooncake_cpu's store pins its own transport to rdma. Setting it has "
+        "been measured to end the run in a host OOM. Unset it. Reaching the "
+        "NVLink path needs buffers allocated through mooncake's own allocator "
+        "(allocate_managed_buffer), which nothing in this repo does yet -- see "
+        "docs/design-docs/tq-register-mode.md."
+    )
+
+
 def configure_engine_env(cfg: DataPlaneConfig) -> None:
     """Set the mooncake knobs that must be identical in every process.
 
@@ -177,6 +220,8 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
 
     if cfg["backend"] not in MOONCAKE_ENGINE_BACKENDS:
         return
+
+    _reject_nvlink_transport_env()
 
     # Function-local import: this module keeps its *module* imports free of
     # anything that could load the engine (see the docstring), and interfaces

@@ -159,6 +159,8 @@ def clean_env(monkeypatch):
     monkeypatch.delenv("MC_ENABLE_DEST_DEVICE_AFFINITY", raising=False)
     monkeypatch.delenv("MC_STORE_MEMCPY", raising=False)
     monkeypatch.delenv("WITH_NVIDIA_PEERMEM", raising=False)
+    monkeypatch.delenv("MC_FORCE_MNNVL", raising=False)
+    monkeypatch.delenv("MC_INTRANODE_NVLINK", raising=False)
     monkeypatch.setattr(tq_env, "_engine_already_imported", lambda: None)
 
 
@@ -286,3 +288,35 @@ def test_engine_already_imported_detects_a_loaded_module(monkeypatch):
     for name in tq_env._ENGINE_MODULES:
         monkeypatch.delitem(sys.modules, name, raising=False)
     assert tq_env._engine_already_imported() is None
+
+
+@pytest.mark.parametrize("var", ["MC_FORCE_MNNVL", "MC_INTRANODE_NVLINK"])
+def test_forcing_the_nvlink_transport_is_refused(clean_env, fake_fabric, var):
+    """These select a transport no backend here can feed, and they kill the run.
+
+    Mooncake picks its transport from these at install time, before any
+    protocol argument is read. Register mode registers torch memory, which is
+    never fabric-exportable, and mooncake_cpu's store pins its own transport to
+    rdma -- so the flag cannot help. Measured on GB300 (6n4g qwen3-30b) it ends
+    the run in a host OOM about nine minutes in, twice out of two, where the
+    same run without it completes five steps. Failing at configure time turns
+    that into an immediate, explained error.
+    """
+    fake_fabric({"mlx5_0": "Ethernet"})
+    os.environ[var] = "1"
+    with pytest.raises(RuntimeError, match=var):
+        tq_env.configure_engine_env(_mooncake_cfg())
+
+
+def test_nvlink_guard_does_not_fire_for_the_simple_backend(clean_env, fake_fabric):
+    """``simple`` has no engine, so mooncake's transport choice cannot apply."""
+    fake_fabric({"mlx5_0": "Ethernet"})
+    os.environ["MC_FORCE_MNNVL"] = "1"
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "simple"})
+
+
+def test_engine_env_is_unaffected_when_nvlink_is_not_forced(clean_env, fake_fabric):
+    """The guard must be invisible on the normal path."""
+    fake_fabric({"mlx5_0": "Ethernet"})
+    tq_env.configure_engine_env(_mooncake_cfg())
+    assert os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
