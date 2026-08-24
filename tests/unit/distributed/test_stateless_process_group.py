@@ -268,6 +268,116 @@ class TestAbort:
 
         assert communicator.aborts == 1
 
+    def test_the_split_children_are_aborted_and_dropped(self):
+        """The third communicator family, which aborting the parent does not reach.
+
+        NCCL gives a split child its own abort flag unless splitShare is set, and it
+        defaults to 0 -- so a rank blocked on a child survives the parent's abort. It
+        never returns, so the watchdog's block never exits to have `fired` read: a hang
+        no exception translation can reach.
+        """
+        from nemo_rl.weight_sync import xferdtensor_python as xp
+
+        communicator = _FakeCommunicator()
+        group = _group(communicator)
+        child, stale = _FakeCommunicator(), _FakeCommunicator()
+        key = (id(communicator), "replica-0")
+        xp._SUBCOMM_CACHE[key] = child
+        xp._INACTIVE_SUBCOMM_CACHE[key] = stale
+        try:
+            group.abort()
+            # Read inside the try: the cleanup below removes these keys either way, so
+            # asserting after it would pass whether or not abort() dropped them.
+            still_active = key in xp._SUBCOMM_CACHE
+            still_inactive = key in xp._INACTIVE_SUBCOMM_CACHE
+        finally:
+            xp._SUBCOMM_CACHE.pop(key, None)
+            xp._INACTIVE_SUBCOMM_CACHE.pop(key, None)
+
+        assert child.aborts == 1, (
+            "a blocked rank on the child is otherwise never released"
+        )
+        assert stale.aborts == 1
+        assert not still_active, (
+            "the cache is keyed on id(nccl_communicator), so a rebuild would otherwise "
+            "strand these for the life of the worker"
+        )
+        assert not still_inactive
+
+    def test_the_children_are_aborted_not_destroyed(self):
+        """destroy()/finalize() are collective; a dead peer cannot join them.
+
+        Using the existing clear_xferdtensor_python_caches here would have moved the hang
+        from the child collective to the child teardown rather than removing it.
+        """
+        from nemo_rl.weight_sync import xferdtensor_python as xp
+
+        class _Child(_FakeCommunicator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.destroys = 0
+                self.finalizes = 0
+
+            def destroy(self) -> None:
+                self.destroys += 1
+
+            def finalize(self) -> None:
+                self.finalizes += 1
+
+        communicator = _FakeCommunicator()
+        group = _group(communicator)
+        child = _Child()
+        key = (id(communicator), "replica-0")
+        xp._SUBCOMM_CACHE[key] = child
+        try:
+            group.abort()
+        finally:
+            xp._SUBCOMM_CACHE.pop(key, None)
+
+        assert child.aborts == 1
+        assert child.destroys == 0, "destroy() is collective and hangs on a dead peer"
+        assert child.finalizes == 0
+
+    def test_another_groups_children_are_left_alone(self):
+        from nemo_rl.weight_sync import xferdtensor_python as xp
+
+        mine, theirs = _FakeCommunicator(), _FakeCommunicator()
+        group = _group(mine)
+        other_child = _FakeCommunicator()
+        other_key = (id(theirs), "replica-0")
+        xp._SUBCOMM_CACHE[other_key] = other_child
+        try:
+            group.abort()
+            still_cached = other_key in xp._SUBCOMM_CACHE
+        finally:
+            xp._SUBCOMM_CACHE.pop(other_key, None)
+
+        assert other_child.aborts == 0
+        assert still_cached, "another group's children are not ours to evict"
+
+    def test_a_failing_child_abort_does_not_stop_the_parent(self):
+        """The caller may be blocked on the parent, or on a sibling that would release."""
+        from nemo_rl.weight_sync import xferdtensor_python as xp
+
+        class _Exploding(_FakeCommunicator):
+            def abort(self) -> None:
+                raise RuntimeError("child abort failed")
+
+        communicator = _FakeCommunicator()
+        group = _group(communicator)
+        bad, good = _Exploding(), _FakeCommunicator()
+        keys = ((id(communicator), "a"), (id(communicator), "b"))
+        xp._SUBCOMM_CACHE[keys[0]] = bad
+        xp._SUBCOMM_CACHE[keys[1]] = good
+        try:
+            group.abort()
+        finally:
+            for k in keys:
+                xp._SUBCOMM_CACHE.pop(k, None)
+
+        assert good.aborts == 1
+        assert communicator.aborts == 1, "the parent must still be released"
+
     def test_the_reference_is_dropped_before_abort_is_called(self):
         """If abort() itself raises, the group must not keep serving a dead comm.
 
