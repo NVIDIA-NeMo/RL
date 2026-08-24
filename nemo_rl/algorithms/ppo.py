@@ -16,6 +16,7 @@ import os
 import time
 import traceback
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -50,6 +51,8 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
+    apply_mask_sample_filter,
+    apply_message_level_advantage_penalties,
     print_efficiency_summary,
     print_performance_metrics,
     set_seed,
@@ -73,14 +76,21 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
+from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollouts import (
+    RewardPenaltyConfig,
+    get_nemo_gym_effort_config,
+    get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
+    should_mask_flagged_samples,
+    validate_reward_penalties_use_nemo_gym,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
+    GenerationSamplingParams,
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.sglang.config import SGLangConfig
@@ -101,6 +111,7 @@ from nemo_rl.utils.logger import (
     LoggerConfig,
     print_message_log_samples,
     should_log_nemo_gym_full_result_tables,
+    should_log_nemo_gym_responses,
 )
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
@@ -172,12 +183,12 @@ class PPOConfig(BaseModel, extra="allow"):
     max_num_steps: int = 100000
     max_rollout_turns: int = 1
     val_period: int = 20
-    val_batch_size: int = 256
+    val_batch_size: int | None = 256
     val_at_start: bool = True
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool = False
-    max_val_samples: int = 256
+    max_val_samples: int | None = 256
     skip_reference_policy_logprobs_calculation: bool = True
     seed: int = 42
     overlong_filtering: bool = False
@@ -212,6 +223,10 @@ class PPOConfig(BaseModel, extra="allow"):
     # Nullable sequence-level multiplicative probability-error threshold.
     # None logs metrics without masking; values above the threshold are excluded.
     seq_logprob_error_threshold: float | None = None
+    # Advantage assigned to invalid tool-call assistant-message tokens.
+    invalid_tool_call_advantage: float | None = None
+    # Advantage assigned to malformed-thinking assistant-message tokens.
+    malformed_thinking_advantage: float | None = None
     # Asynchronous PPO uses a replay buffer with non-colocated generation.
     async_ppo: AsyncPPOConfig = Field(default_factory=AsyncPPOConfig)
 
@@ -289,6 +304,58 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: PPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
+
+
+def validate_async_ppo_config(
+    config: MasterConfig, policy_generation: GenerationInterface | None
+) -> None:
+    """Validate Async PPO requirements and unsupported features.
+
+    Args:
+        config: Resolved PPO configuration.
+        policy_generation: Configured generation backend, when available.
+
+    Raises:
+        ValueError: If a required Async PPO setting is disabled.
+        NotImplementedError: If an unsupported feature is enabled.
+    """
+    generation_config = config.policy["generation"]
+    backend = generation_config.get("backend") if generation_config else None
+    vllm_config = generation_config.get("vllm_cfg") if generation_config else None
+    async_engine = bool(vllm_config and vllm_config.get("async_engine"))
+    if backend != "vllm" or not async_engine:
+        raise ValueError(
+            "Async PPO requires policy.generation.backend=vllm and "
+            "policy.generation.vllm_cfg.async_engine=true"
+        )
+    if not config.loss_fn.use_importance_sampling_correction:
+        raise ValueError(
+            "Async PPO requires loss_fn.use_importance_sampling_correction=true"
+        )
+    if config.loss_fn.force_on_policy_ratio:
+        raise ValueError("Async PPO requires loss_fn.force_on_policy_ratio=false")
+    if generation_config["colocated"]["enabled"]:
+        raise ValueError("Async PPO requires non-colocated generation")
+    if config.ppo.max_num_epochs != -1:
+        raise NotImplementedError(
+            "Async PPO does not support an epoch limit; set "
+            "ppo.max_num_epochs=-1 and use ppo.max_num_steps to control "
+            "training length"
+        )
+
+    unsupported_features = {
+        "Dynamic sampling": config.ppo.use_dynamic_sampling,
+        "Reward scaling": config.ppo.reward_scaling.enabled,
+        "Reward shaping": config.ppo.reward_shaping.enabled,
+        "Multiple dataloaders": config.data["use_multiple_dataloader"],
+        "FP8 KV-scale synchronization": bool(
+            getattr(policy_generation, "requires_kv_scale_sync", False)
+        ),
+    }
+    for feature, enabled in unsupported_features.items():
+        if enabled:
+            raise NotImplementedError(f"{feature} is not supported with async PPO")
 
 
 # ===============================================================================
@@ -305,6 +372,7 @@ def setup(
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
+    Optional[EnvironmentInterface],
     ValueInterface,
     tuple[RayVirtualCluster, RayVirtualCluster],
     StatefulDataLoader,
@@ -319,9 +387,10 @@ def setup(
     """Main entry point for running PPO algorithm.
 
     Returns:
-        tuple of (policy, policy_generation, value_model, clusters,
+        tuple of (policy, policy_generation, nemo_gym_actor, value_model, clusters,
         dataloader, val_dataloader, loss_fn, value_loss_fn, logger,
-        checkpointer, ppo_save_state, master_config).
+        checkpointer, ppo_save_state, master_config). ``nemo_gym_actor`` is None
+        unless ``env.should_use_nemo_gym`` is enabled.
     """
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
@@ -405,6 +474,36 @@ def setup(
             "See https://github.com/NVIDIA-NeMo/RL/issues/2953."
         )
 
+    backend = generation_config["backend"]
+    enable_nemo_gym = should_use_nemo_gym(master_config)
+    validate_reward_penalties_use_nemo_gym(
+        master_config.reward_penalties,
+        enable_nemo_gym=enable_nemo_gym,
+    )
+    if not enable_nemo_gym and (
+        ppo_config.invalid_tool_call_advantage is not None
+        or ppo_config.malformed_thinking_advantage is not None
+    ):
+        raise ValueError(
+            "ppo.invalid_tool_call_advantage and "
+            "ppo.malformed_thinking_advantage require the NeMo-Gym path "
+            "(env.should_use_nemo_gym=true)"
+        )
+    if enable_nemo_gym and backend != "vllm":
+        raise NotImplementedError(
+            "PPO NeMo Gym currently requires the vLLM generation backend"
+        )
+    if enable_nemo_gym:
+        unsupported_features = {
+            "PPO reward scaling": ppo_config.reward_scaling.enabled,
+            "PPO reward shaping": ppo_config.reward_shaping.enabled,
+            "PPO training top-k sampling": generation_config["top_k"] is not None,
+            "PPO validation top-k sampling": generation_config["val_top_k"] is not None,
+        }
+        for feature, enabled in unsupported_features.items():
+            if enabled:
+                raise NotImplementedError(f"{feature} is not supported with NeMo Gym")
+
     # Set seed for all random number generators
     set_seed(ppo_config.seed)
 
@@ -458,6 +557,12 @@ def setup(
         assert val_dataset is not None, (
             "Validation dataset is required if validation is enabled"
         )
+        assert ppo_config.val_batch_size is not None, (
+            "ppo.val_batch_size must be set when validation is enabled"
+        )
+        assert ppo_config.max_val_samples is not None, (
+            "ppo.max_val_samples must be set when validation is enabled"
+        )
         val_dataloader = StatefulDataLoader(
             val_dataset,
             batch_size=ppo_config.val_batch_size,
@@ -492,7 +597,6 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
-    backend = generation_config["backend"]
     if not colocated_inference and backend != "vllm":
         raise NotImplementedError(
             "Non-colocated PPO generation currently supports only vLLM; "
@@ -721,6 +825,8 @@ def setup(
     # ==========================
     print("\n▶ Setting up model and training...", flush=True)
 
+    nemo_gym_actor: Optional[EnvironmentInterface] = None
+
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
 
     # Dictionary to store worker initialization timing stats for logging
@@ -801,6 +907,38 @@ def setup(
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
+    def init_policy_and_value():
+        """Initialize policy and value workers serially on the training GPUs."""
+        policy, policy_time = init_policy()
+        # Block until the policy worker's __init__ completes and offload to
+        # CPU, freeing GPU for value model initialization. Policy will be
+        # reloaded before the vLLM refit step below.
+        policy.offload_to_cpu()
+
+        print("  ⚙️  Initializing value model for GAE...", flush=True)
+        value_model, value_time = init_value()
+        # Block until the value worker's __init__ completes and offload
+        # model + optimizer to CPU. Without this, __init__ runs asynchronously
+        # in the Ray actor and may overlap with vLLM generation, causing
+        # GPU OOM.
+        value_model.finish_training()
+        print(f"  ✓ Value model initialized in {value_time:.2f}s", flush=True)
+        return policy, policy_time, value_model, value_time
+
+    def init_nemo_gym(base_urls: list[str]):
+        """Initialize NeMo Gym against the generation server URLs."""
+        t0 = time.perf_counter()
+        actor = spinup_nemo_gym_actor(
+            env_configs=env_configs,
+            base_urls=base_urls,
+            model_name=generation_config["model_name"],
+            tokenizer=tokenizer,
+            enable_router_replay=False,
+            routed_experts_dtype="int16",
+            use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+        )
+        return actor, time.perf_counter() - t0
+
     def initialize_generation_with_policy(
         init_generation_fn,
         generation_name: str,
@@ -825,22 +963,9 @@ def setup(
         policy_generation, generation_time = init_generation_fn()
         worker_init_timing_metrics[init_time_key] = generation_time
 
-        policy, policy_time = init_policy()
-        # Block until the policy worker's __init__ completes and offload to
-        # CPU, freeing GPU for value model initialization. Policy will be
-        # reloaded before the vLLM refit step below.
-        policy.offload_to_cpu()
+        policy, policy_time, value_model, value_time = init_policy_and_value()
         worker_init_timing_metrics["policy_init_time_s"] = policy_time
-
-        print("  ⚙️  Initializing value model for GAE...", flush=True)
-        value_model, value_time = init_value()
-        # Block until the value worker's __init__ completes and offload
-        # model + optimizer to CPU. Without this, __init__ runs asynchronously
-        # in the Ray actor and may overlap with vLLM generation, causing
-        # GPU OOM.
-        value_model.finish_training()
         worker_init_timing_metrics["value_init_time_s"] = value_time
-        print(f"  ✓ Value model initialized in {value_time:.2f}s", flush=True)
 
         return policy_generation, policy, value_model
 
@@ -878,12 +1003,69 @@ def setup(
             "hf_config_overrides", {}
         )
 
-        policy_generation, policy, value_model = initialize_generation_with_policy(
-            init_generation_fn=init_vllm,
-            generation_name="vLLM",
-            init_time_key="vllm_init_time_s",
-            worker_init_timing_metrics=worker_init_timing_metrics,
-        )
+        if enable_nemo_gym:
+            vllm_reserve_t0 = time.perf_counter()
+            deferred_vllm = VllmGeneration(
+                cluster=inference_cluster,
+                config=generation_config,
+                defer_model_load=True,
+            )
+            vllm_reserve_time = time.perf_counter() - vllm_reserve_t0
+
+            def init_vllm_deferred():
+                t0 = time.perf_counter()
+                deferred_vllm.load_and_start()
+                deferred_vllm.finish_generation()
+                return deferred_vllm, time.perf_counter() - t0
+
+            init_tasks = {}
+            if colocated_inference:
+
+                def init_vllm_then_policy_value():
+                    pg, vllm_time = init_vllm_deferred()
+                    p, policy_time, v, value_time = init_policy_and_value()
+                    return pg, vllm_time, p, policy_time, v, value_time
+
+                init_tasks["vllm_policy_value"] = init_vllm_then_policy_value
+            else:
+                init_tasks["vllm"] = init_vllm_deferred
+                init_tasks["policy_value"] = init_policy_and_value
+            init_tasks["nemo_gym"] = lambda: init_nemo_gym(
+                deferred_vllm.dp_openai_server_base_urls
+            )
+
+            with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                submitted = {
+                    name: executor.submit(fn) for name, fn in init_tasks.items()
+                }
+                results = {name: future.result() for name, future in submitted.items()}
+
+            if colocated_inference:
+                (
+                    policy_generation,
+                    vllm_time,
+                    policy,
+                    policy_time,
+                    value_model,
+                    value_time,
+                ) = results["vllm_policy_value"]
+            else:
+                policy_generation, vllm_time = results["vllm"]
+                policy, policy_time, value_model, value_time = results["policy_value"]
+            nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
+            worker_init_timing_metrics["vllm_init_time_s"] = (
+                vllm_reserve_time + vllm_time
+            )
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["value_init_time_s"] = value_time
+            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
+        else:
+            policy_generation, policy, value_model = initialize_generation_with_policy(
+                init_generation_fn=init_vllm,
+                generation_name="vLLM",
+                init_time_key="vllm_init_time_s",
+                worker_init_timing_metrics=worker_init_timing_metrics,
+            )
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
@@ -980,6 +1162,7 @@ def setup(
     return (
         policy,
         policy_generation,
+        nemo_gym_actor,
         value_model,
         (train_cluster, inference_cluster),
         dataloader,
@@ -1390,13 +1573,19 @@ def ppo_train(
                         policy_generation.clear_logger_metrics()
 
                     if should_use_nemo_gym(master_config):
-                        generation_config = master_config.policy["generation"]
+                        generation_config = {
+                            **master_config.policy["generation"],
+                            "stop_token_ids": None,
+                            "stop_strings": None,
+                        }
                         nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                             policy_generation=policy_generation,
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
-                            max_seq_len=None,
+                            max_seq_len=master_config.policy[
+                                "max_total_sequence_length"
+                            ],
                             generation_config=generation_config,
                             log_full_result_tables=should_log_nemo_gym_full_result_tables(
                                 wandb_enabled=master_config.logger["wandb_enabled"],
@@ -1404,8 +1593,13 @@ def ppo_train(
                             ),
                             max_rollout_turns=None,
                             greedy=False,
+                            reward_penalty_config=master_config.reward_penalties,
+                            effort_config=get_nemo_gym_effort_config(master_config.env),
+                            thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+                            mask_env_flagged_samples=should_mask_flagged_samples(
+                                master_config.env
+                            ),
                         )
-                        input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
@@ -1469,6 +1663,10 @@ def ppo_train(
                             truncated = torch.tensor(truncated, dtype=torch.bool)
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    metrics["num_mask_sample_filtered"] = apply_mask_sample_filter(
+                        repeated_batch
+                    )
 
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -1603,6 +1801,18 @@ def ppo_train(
                     train_data["advantages"] = advantages
                     if returns is not None:
                         train_data["returns"] = returns
+                    metrics.update(
+                        apply_message_level_advantage_penalties(
+                            train_data=train_data,
+                            message_logs=repeated_batch["message_log"],
+                            invalid_tool_call_advantage=(
+                                master_config.ppo.invalid_tool_call_advantage
+                            ),
+                            malformed_thinking_advantage=(
+                                master_config.ppo.malformed_thinking_advantage
+                            ),
+                        )
+                    )
 
                 # PPO: Multiple training steps per rollout
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
@@ -1717,6 +1927,27 @@ def ppo_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+
+                if should_use_nemo_gym(
+                    master_config
+                ) and not should_log_nemo_gym_responses(master_config.env):
+                    log_data = {
+                        "content": flat_messages["content"],
+                        "rewards": rewards.tolist(),
+                        "input_lengths": input_lengths.tolist(),
+                        "token_ids": train_data["input_ids"].tolist(),
+                        "token_loss_mask": train_data["token_mask"].tolist(),
+                        "sample_loss_mask": train_data["sample_mask"].tolist(),
+                        "advantages": train_data["advantages"].tolist(),
+                        "generation_logprobs": train_data[
+                            "generation_logprobs"
+                        ].tolist(),
+                        "prev_logprobs": train_data["prev_logprobs"].tolist(),
+                    }
+                    logger.log_batched_dict_as_jsonl(
+                        log_data, f"train_data_step{total_steps + 1}.jsonl"
+                    )
+                    del log_data
 
                 # Metrics
                 flat_advantages = train_data["advantages"]
@@ -2228,6 +2459,8 @@ def async_ppo_train(
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    replay_buffer_restore_metadata: dict[str, int] = {}
+    rollouts_state: dict[str, int] = {}
     if last_checkpoint_path is not None:
         replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
         if os.path.exists(replay_buffer_path):
@@ -2238,7 +2471,7 @@ def async_ppo_train(
                 max_trajectory_age_steps=max_trajectory_age_steps,
                 warmup_generation_lead_steps=warmup_generation_lead_steps,
             )
-            ray.get(
+            replay_buffer_restore_metadata = ray.get(
                 replay_buffer.load_from_path.remote(
                     replay_buffer_path,
                     num_prompts_per_step=num_prompts_per_step,
@@ -2253,6 +2486,16 @@ def async_ppo_train(
                 "Starting with an empty replay buffer."
             )
 
+        rollouts_path = os.path.join(last_checkpoint_path, "rollouts.pt")
+        if os.path.exists(rollouts_path):
+            # weights_only=False: this is a trusted same-job checkpoint artifact.
+            rollouts_state = torch.load(rollouts_path, weights_only=False)
+
+    next_nemo_gym_task_index = max(
+        int(rollouts_state.get(NEXT_NEMO_GYM_TASK_INDEX_KEY, 0)),
+        int(replay_buffer_restore_metadata.get(NEXT_NEMO_GYM_TASK_INDEX_KEY, 0)),
+    )
+
     trajectory_collector = AsyncTrajectoryCollector.options(
         runtime_env=make_actor_runtime_env(
             "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
@@ -2264,6 +2507,7 @@ def async_ppo_train(
         master_config=master_config,
         replay_buffer=replay_buffer,
         start_step=step,
+        next_nemo_gym_task_index=next_nemo_gym_task_index,
     )
 
     def _raise_if_collector_stopped(waiting_for: str) -> None:
@@ -2468,6 +2712,10 @@ def async_ppo_train(
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
 
+                    metrics["num_mask_sample_filtered"] = apply_mask_sample_filter(
+                        repeated_batch
+                    )
+
                     # PPO's inline loss-mask setup (unmask all assistant messages),
                     # matching sync ppo_train — deliberately NOT GRPO's helper,
                     # which only unmasks generated assistant messages.
@@ -2592,6 +2840,18 @@ def async_ppo_train(
                     train_data["advantages"] = advantages
                     if returns is not None:
                         train_data["returns"] = returns
+                    metrics.update(
+                        apply_message_level_advantage_penalties(
+                            train_data=train_data,
+                            message_logs=repeated_batch["message_log"],
+                            invalid_tool_call_advantage=(
+                                master_config.ppo.invalid_tool_call_advantage
+                            ),
+                            malformed_thinking_advantage=(
+                                master_config.ppo.malformed_thinking_advantage
+                            ),
+                        )
+                    )
 
                 # ---- 7. ppo_epochs inner loop (critic, then actor) ----
                 # Each epoch: value on GPU -> train -> off. Then, once past critic
@@ -2893,27 +3153,35 @@ def async_ppo_train(
                             "✅ Saved replay buffer with "
                             f"{num_buffered_trajectories} trajectories"
                         )
+                        rollouts_state = ray.get(
+                            trajectory_collector.get_rollouts_state.remote()
+                        )
+                        torch.save(
+                            rollouts_state,
+                            os.path.join(checkpoint_path, "rollouts.pt"),
+                        )
                         checkpointer.begin_finalization(
                             checkpoint_path,
                             wait_fn=policy.finalize_async_save,
                         )
 
             # ---- Logging ----
-            log_data = {
-                "content": flat_messages_content,
-                "rewards": rewards.tolist(),
-                "input_lengths": input_lengths.tolist(),
-                "token_ids": train_data["input_ids"].tolist(),
-                "token_loss_mask": train_data["token_mask"].tolist(),
-                "sample_loss_mask": train_data["sample_mask"].tolist(),
-                "advantages": train_data["advantages"].tolist(),
-                "generation_logprobs": train_data["generation_logprobs"].tolist(),
-                "prev_logprobs": train_data["prev_logprobs"].tolist(),
-            }
-            logger.log_batched_dict_as_jsonl(
-                log_data, f"train_data_step{step + 1}.jsonl"
-            )
-            del log_data
+            if not should_log_nemo_gym_responses(master_config.env):
+                log_data = {
+                    "content": flat_messages_content,
+                    "rewards": rewards.tolist(),
+                    "input_lengths": input_lengths.tolist(),
+                    "token_ids": train_data["input_ids"].tolist(),
+                    "token_loss_mask": train_data["token_mask"].tolist(),
+                    "sample_loss_mask": train_data["sample_mask"].tolist(),
+                    "advantages": train_data["advantages"].tolist(),
+                    "generation_logprobs": train_data["generation_logprobs"].tolist(),
+                    "prev_logprobs": train_data["prev_logprobs"].tolist(),
+                }
+                logger.log_batched_dict_as_jsonl(
+                    log_data, f"train_data_step{step + 1}.jsonl"
+                )
+                del log_data
             del flat_messages_content
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
@@ -3054,29 +3322,71 @@ def validate(
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
-        max_batches = (
-            master_config.ppo.max_val_samples // master_config.ppo.val_batch_size
+        max_val_samples = master_config.ppo.max_val_samples
+        assert max_val_samples is not None, (
+            "ppo.max_val_samples must be set before PPO validation"
         )
+        val_batch_size = master_config.ppo.val_batch_size
+        assert val_batch_size is not None, (
+            "ppo.val_batch_size must be set before PPO validation"
+        )
+        max_batches = max_val_samples // val_batch_size
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
 
             additional_metrics_to_report = dict()
 
-            rollout_fn = (
-                run_async_multi_turn_rollout
-                if should_use_async_rollouts(master_config.policy["generation"])
-                else run_multi_turn_rollout
-            )
-            val_batch, gen_metrics = rollout_fn(
-                policy_generation=policy_generation,
-                input_batch=val_batch,
-                tokenizer=tokenizer,
-                task_to_env=val_task_to_env,
-                max_seq_len=master_config.policy["max_total_sequence_length"],
-                max_rollout_turns=master_config.ppo.max_rollout_turns,
-                greedy=False,
-            )
+            if should_use_nemo_gym(master_config):
+                generation_config = {
+                    **master_config.policy["generation"],
+                    "stop_token_ids": None,
+                    "stop_strings": None,
+                }
+                val_sampling_params = GenerationSamplingParams(
+                    temperature=generation_config["val_temperature"],
+                    top_p=generation_config["val_top_p"],
+                    top_k=generation_config["val_top_k"],
+                )
+                nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
+                    policy_generation=policy_generation,
+                    input_batch=val_batch,
+                    tokenizer=tokenizer,
+                    task_to_env=val_task_to_env,
+                    max_seq_len=master_config.policy["max_total_sequence_length"],
+                    generation_config=generation_config,
+                    sampling_params=val_sampling_params,
+                    log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                        wandb_enabled=master_config.logger["wandb_enabled"],
+                        wandb_config=master_config.logger["wandb"],
+                    ),
+                    max_rollout_turns=None,
+                    greedy=False,
+                    reward_penalty_config=master_config.reward_penalties,
+                    effort_config=get_nemo_gym_effort_config(master_config.env),
+                    thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+                    mask_env_flagged_samples=should_mask_flagged_samples(
+                        master_config.env
+                    ),
+                )
+                val_batch = nemo_gym_rollout_result.final_batch
+                gen_metrics = nemo_gym_rollout_result.rollout_metrics
+                additional_metrics_to_report = gen_metrics
+            else:
+                rollout_fn = (
+                    run_async_multi_turn_rollout
+                    if should_use_async_rollouts(master_config.policy["generation"])
+                    else run_multi_turn_rollout
+                )
+                val_batch, gen_metrics = rollout_fn(
+                    policy_generation=policy_generation,
+                    input_batch=val_batch,
+                    tokenizer=tokenizer,
+                    task_to_env=val_task_to_env,
+                    max_seq_len=master_config.policy["max_total_sequence_length"],
+                    max_rollout_turns=master_config.ppo.max_rollout_turns,
+                    greedy=False,
+                )
 
             total_rewards.extend(val_batch["total_reward"].tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])

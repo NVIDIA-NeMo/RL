@@ -63,7 +63,7 @@ Set `ppo.async_ppo.enabled: true` to overlap rollout generation with training. A
 
 Async PPO reuses the trajectory collector, replay buffer, and weight-versioning infrastructure described in the [Async GRPO guide](async-grpo.md); this section focuses on PPO-specific behavior and constraints.
 
-Async PPO requires non-colocated vLLM generation with `vllm_cfg.async_engine: true`, `loss_fn.use_importance_sampling_correction: true`, and `loss_fn.force_on_policy_ratio: false`. Dynamic sampling, reward scaling, reward shaping, multiple dataloaders, NeMo Gym, colocated generation, and FP8 KV-scale synchronization are not supported yet.
+Async PPO requires non-colocated vLLM generation with `vllm_cfg.async_engine: true`, `loss_fn.use_importance_sampling_correction: true`, and `loss_fn.force_on_policy_ratio: false`. Dynamic sampling, `ppo.reward_scaling`, `ppo.reward_shaping`, multiple dataloaders, colocated generation, and FP8 KV-scale synchronization are not supported yet. NeMo Gym rollouts are supported through [run_ppo_nemo_gym.py](../../examples/nemo_gym/run_ppo_nemo_gym.py), including Gym reward penalties, effort-level shaping, sample masking, and message-level advantage overrides.
 
 `max_trajectory_age_steps` is the normal policy-training age limit. The recommended value is `1`; larger values improve overlap but increase off-policy bias in GAE. When `policy_training_start_step > 0`, set `warmup_generation_lead_steps` to a larger value to bank additional rollout batches while the policy is frozen for critic warmup. The collector caps frozen-policy targets at `policy_training_start_step + max_trajectory_age_steps`, so their actual policy-update age remains within the normal limit. The buffer keeps these batches valid through that frontier and then restores the normal age limit. `null` uses `max_trajectory_age_steps` as the generation lead throughout.
 
@@ -246,6 +246,9 @@ ppo:
   overlong_filtering: false
   # null logs mismatch metrics without masking; set a threshold to mask sequences.
   seq_logprob_error_threshold: null
+  # Optional NeMo-Gym assistant-message advantage overrides.
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
 
   async_ppo:
     enabled: false
@@ -295,6 +298,7 @@ value_loss_fn:
 - **`ppo.ppo_epochs`**: Number of training updates per rollout batch
 - **`ppo.policy_training_start_step`**: Number of critic-only warmup steps before policy training begins
 - **`ppo.seq_logprob_error_threshold`**: Nullable sequence-level multiplicative probability-error threshold. PPO always logs sequence-level train/generation mismatch metrics; when this is set, sequences above the threshold are excluded from advantage and loss computation.
+- **`ppo.invalid_tool_call_advantage` / `ppo.malformed_thinking_advantage`**: Optional NeMo-Gym overrides for the actor advantage on flagged assistant-message token spans. They do not alter critic returns.
 - **`ppo.async_ppo`**: Enables replay-buffer-based asynchronous PPO. See [Asynchronous PPO](#asynchronous-ppo) for requirements and staleness controls.
 - **`ppo.adv_estimator.name`**: Set to `"gae"` for GAE advantage estimation (PPO default)
 - **`ppo.adv_estimator.gae_lambda`**: GAE $\lambda$ parameter (bias-variance tradeoff, typically 0.95)

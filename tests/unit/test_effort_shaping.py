@@ -14,7 +14,11 @@
 
 import pytest
 
-from nemo_rl.experience.rollouts import EffortLevelsConfig, _apply_effort_shaping
+from nemo_rl.experience.rollouts import (
+    EffortLevelsConfig,
+    _apply_effort_shaping,
+    get_nemo_gym_effort_config,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,6 +58,33 @@ def test_effort_levels_config_defaults():
     assert cfg.low_penalty == 1.0
     assert cfg.low_ub == 64000
     assert cfg.low_string == ""
+
+
+def test_get_nemo_gym_effort_config_resolves_nested_config():
+    config = get_nemo_gym_effort_config(
+        {
+            "nemo_gym": {
+                "effort_levels": {
+                    "low_weight": 0.1,
+                    "low_penalty": 2.0,
+                    "low_ub": 256,
+                    "low_string": "brief",
+                }
+            }
+        }
+    )
+
+    assert config == EffortLevelsConfig(
+        low_weight=0.1,
+        low_penalty=2.0,
+        low_ub=256,
+        low_string="brief",
+    )
+
+
+@pytest.mark.parametrize("env_config", [{}, {"nemo_gym": {}}, {"nemo_gym": None}])
+def test_get_nemo_gym_effort_config_returns_none_when_unset(env_config):
+    assert get_nemo_gym_effort_config(env_config) is None
 
 
 # ---------------------------------------------------------------------------

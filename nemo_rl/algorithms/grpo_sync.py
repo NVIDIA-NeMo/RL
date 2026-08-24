@@ -54,7 +54,6 @@ from nemo_rl.algorithms.grpo import (
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
     _resolve_logprob_skip_flags,
-    _should_log_nemo_gym_responses,
     _validation_early_stop_message,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
@@ -82,7 +81,11 @@ from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.checkpoint import CheckpointManager
-from nemo_rl.utils.logger import Logger, print_message_log_samples
+from nemo_rl.utils.logger import (
+    Logger,
+    print_message_log_samples,
+    should_log_nemo_gym_responses,
+)
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -972,7 +975,7 @@ def grpo_train_sync(
                 # the NonTensorStack wire field via materialize.
                 _log_input_ids: Optional[torch.Tensor] = None
                 _log_content: Optional[np.ndarray] = None
-                if not _should_log_nemo_gym_responses(master_config):
+                if not should_log_nemo_gym_responses(master_config.env):
                     _log_select = ["input_ids"]
                     if "content" in (meta.fields or []):
                         _log_select.append("content")
@@ -1223,7 +1226,7 @@ def grpo_train_sync(
             # ``token_ids`` we fetch the small ``input_ids`` column from
             # TQ at log time — same data-driven slice pattern as masking
             # / KV calibration.
-            if not _should_log_nemo_gym_responses(master_config):
+            if not should_log_nemo_gym_responses(master_config.env):
                 log_data: dict = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
@@ -1243,7 +1246,7 @@ def grpo_train_sync(
                 # input_ids was stashed before the step-end clear_samples (the
                 # keys are no longer in TQ at this point); ``_log_input_ids``
                 # is None when nemo_gym-responses logging path skipped the
-                # outer ``if not _should_log_nemo_gym_responses`` branch.
+                # outer ``if not should_log_nemo_gym_responses`` branch.
                 if _log_input_ids is not None:
                     log_data["token_ids"] = _log_input_ids.tolist()
                 # ``content`` (raw assistant text) is fetched from TQ as
