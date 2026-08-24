@@ -1049,11 +1049,6 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
-    if "use_mamba_mem_eff_path" in config["megatron_cfg"]:
-        model_cfg.use_mamba_mem_eff_path = config["megatron_cfg"][
-            "use_mamba_mem_eff_path"
-        ]
-
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
     model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
@@ -1679,9 +1674,9 @@ def _enable_batch_invariant_kernels_if_requested(config: PolicyConfig) -> None:
 def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     """Propagate zero_train_gen_mismatch flag to its constituent sub-knobs.
 
-    When True, forces batch_invariant_mode=True, use_mamba_mem_eff_path=False (Mamba
-    models only), attention_backend=flash (FA4 via TE), and the Transformer Engine
-    generation layer spec so generation and scoring share aligned MoE/Mamba paths.
+    When True, forces batch_invariant_mode=True, attention_backend=flash (FA4 via
+    TE), and the Transformer Engine generation layer spec so generation and scoring
+    share aligned MoE paths.
     MoE batch_invariant_mode requires DeepGEMM in the mcore worker venv (see
     pyproject.toml mcore extra). Also applies TE cuBLAS workspace shrink and TP=1
     log-softmax via zero_train_gen_kl_patches.core_patches, deterministic MoE
@@ -1695,19 +1690,13 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
 
     from nemo_rl.models.generation.megatron.zero_train_gen_kl_patches import (
         apply_log_softmax_determinism_patch,
-        apply_mamba_alignment_patch,
         apply_moe_determinism_patches,
         apply_te_bik_attention_assert_skip_patch,
         apply_te_gemm_cublas_pinned_patch,
-        policy_uses_mamba_layers,
     )
 
     mc = config["megatron_cfg"]
     mc["batch_invariant_mode"] = True
-    if policy_uses_mamba_layers(config):
-        mc.setdefault(
-            "use_mamba_mem_eff_path", False
-        )  # Disable Mamba's memory-efficient path
     mc.setdefault("attention_backend", "flash")
     mc.setdefault("flash_attention_version", 4)
     generation = config.get("generation")
@@ -1719,13 +1708,11 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     apply_te_gemm_cublas_pinned_patch()
     apply_log_softmax_determinism_patch()
     apply_moe_determinism_patches()
-    apply_mamba_alignment_patch(required=policy_uses_mamba_layers(config))
     apply_te_bik_attention_assert_skip_patch()
     # Starve PyTorch's own cuBLAS workspace so non-TE aten::mm/addmm paths also
     # pick workspace-free (splitK=1, reduction=NONE) algorithms.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")
     os.environ.setdefault("CUBLASLT_WORKSPACE_SIZE", "0")
-    os.environ.setdefault("MAMBA_DETERMINISTIC", "1")
 
 
 _BRIDGE_SIGNAL_HANDLER_PATCHED = False

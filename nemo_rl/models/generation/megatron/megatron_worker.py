@@ -321,14 +321,6 @@ class MegatronGenerationMixin:
 
         mamba_inference_state_config = MambaInferenceStateConfig.from_model(gen_model)
         is_hybrid_model = mamba_inference_state_config is not None
-        if is_hybrid_model and self.cfg.get("megatron_cfg", {}).get(
-            "zero_train_gen_mismatch"
-        ):
-            # Match the train scan's fp32 boundary-state precision so gen SSM cache
-            # doesn't diverge from train (gen defaults to bf16 otherwise).
-            mcore_generation_config.setdefault(
-                "mamba_inference_ssm_states_dtype", "float32"
-            )
         if is_hybrid_model:
             if (
                 mcore_generation_config.get("mamba_inference_ssm_states_dtype")
