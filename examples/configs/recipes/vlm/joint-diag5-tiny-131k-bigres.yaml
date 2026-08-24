@@ -23,7 +23,7 @@ checkpointing:
   checkpoint_dir: results/mopd-super-omni-joint-opd-hsg
   keep_top_k: 1000
 cluster:
-  num_nodes: 26
+  num_nodes: 30
   gpus_per_node: 4
 grpo:
   num_prompts_per_step: 8
@@ -62,7 +62,7 @@ policy:
     max_new_tokens: ${policy.max_total_sequence_length}
     colocated:
       resources:
-        num_nodes: 4
+        num_nodes: 8
         gpus_per_node: 4
     vllm_cfg:
       gpu_memory_utilization: 0.8
