@@ -69,6 +69,11 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.observability import (
+    MetricsDataPlaneClient,
+    breakdown_table,
+    headline_series,
+)
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
@@ -439,6 +444,44 @@ class SingleControllerActor:
         if asyncio.iscoroutine(result):
             return await result
         return result
+
+    def _log_data_plane_metrics(self, total_step_time: float) -> None:
+        """Log this step's data-plane cost. No-op unless observability is enabled.
+
+        The synchronous loop logs the same series from ``_log_data_plane_metrics``
+        in ``grpo_sync``; without this call the single-controller path enables
+        observability, pays for it, and emits nothing.
+
+        Driver scope only, and the prefix says so. This client issues the
+        advantage stage's get plus the post-train clear; the bulk traffic is
+        the trainer and generation workers' own clients, which are separate
+        processes with separate counters. ``grpo_sync`` prefers a cluster view
+        by fanning out over its policy worker group, but that hook
+        (``collect_data_plane_snapshots``) has no implementation on either
+        path today, so both report the driver's counters alone.
+        """
+        if not isinstance(self._dp_client, MetricsDataPlaneClient):
+            return  # observability disabled -> plain adapter
+
+        metrics = self._dp_client.get_step_metrics(total_step_time)
+        step = self._train_steps
+        self._logger.log_metrics(
+            headline_series(metrics), step, prefix="data_plane/driver"
+        )
+        try:
+            columns, rows = breakdown_table(metrics)
+        except Exception as exc:  # noqa: BLE001 - a panel must never fail a step
+            logging.getLogger(__name__).warning("data-plane breakdown failed: %s", exc)
+        else:
+            if rows:
+                self._logger.log_table(
+                    columns, rows, step, "data_plane/driver/breakdown"
+                )
+        print(
+            f"  • data plane: {metrics['step/wall_ms']:.0f}ms, "
+            f"{metrics['step/comm_volume_mb']:.1f} MB moved",
+            flush=True,
+        )
 
     # ── the three pumps + the inline advantage stage ───────────────────────
 
@@ -1204,6 +1247,7 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 timing_metrics, step=self._train_steps, prefix="timing/train"
             )
+            self._log_data_plane_metrics(total_time)
             self._timer.reset()
 
             # min sample version refers to the version each consumed sample was
