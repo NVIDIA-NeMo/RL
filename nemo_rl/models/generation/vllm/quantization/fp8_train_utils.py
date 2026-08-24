@@ -188,7 +188,8 @@ def iter_mxfp8_prequantized_params(
                 )
                 scratch_cache[cache_key] = scratch
             stacked = scratch[:required_numel].view(len(chunk), *first.shape)
-            torch.stack(tensors, dim=0, out=stacked)
+            with torch.no_grad():
+                torch.stack(tensors, dim=0, out=stacked)
 
             value, scale = quantize_fn(stacked.view(-1, stacked.shape[-1]))
             value = value.view_as(stacked)
