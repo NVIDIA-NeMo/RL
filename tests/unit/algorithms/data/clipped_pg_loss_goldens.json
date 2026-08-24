@@ -1,17 +1,10 @@
 {
   "schema_version": 1,
   "compatibility_contract": {
-    "scope": "Preserve loss, gradients, and metrics from the pinned legacy implementation except for the intentional corrections listed here.",
-    "intentional_corrections": [
-      {
-        "case": "gspo_sequence_is",
-        "metric": "sampling_importance_ratio",
-        "reason": "Reduce one sequence weight per valid sample instead of preserving the legacy [B, 1] by [B] broadcast."
-      }
-    ]
+    "scope": "Preserve loss, gradients, and metrics from the pinned origin/main implementation."
   },
   "provenance": {
-    "source_commit": "737c4d2cd629d19e5c576b67ef2a6105b6b1bbb3",
+    "source_commit": "aa739509ce3772a18a4d02da651b86c9e898e8cb",
     "source_file": "nemo_rl/algorithms/loss/loss_functions.py",
     "python_version": "3.12.8",
     "torch_version": "2.6.0",
@@ -642,7 +635,7 @@
           "gen_kl_error": 0.0615208729208074,
           "policy_kl_error": 0.05012223679533659,
           "js_divergence_error": 0.013649421513505665,
-          "sampling_importance_ratio": 2.8701240145096776,
+          "sampling_importance_ratio": 1.4350620072548388,
           "num_valid_samples": 2.0,
           "approx_entropy": 1.1051425199516978,
           "positive_nll_loss": 0.0
