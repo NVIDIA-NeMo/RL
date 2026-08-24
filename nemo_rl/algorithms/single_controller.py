@@ -22,9 +22,13 @@ Data flow:
   _rollout_pump  → gen.generate_and_push(prompt, dp_client) ← RPC to GenWorker
                      GenWorker → dp_client.put_samples(...)
   _train_pump    → sampler.evict/select against TQReplayBuffer
+                 → _value_stage(meta) (PPO only) → value.get_values_from_meta(...)
+                     Value → dp_client.get/put_samples(...) (via its own client)
                  → _advantage_stage(meta) → dp_client.get_samples(...)
                                         → adv_estimator.compute_advantage(...)
                                         → dp_client.put_samples(...)
+                 → _value_train(meta) (PPO only) → value.train_from_meta(...)
+                     Value → dp_client.get_samples(...)     (via its own client)
                  → trainer.begin/train_microbatches/finish_train_step (split API,
                      driver-side TQPolicy via asyncio.to_thread)
                      Trainer → dp_client.get_samples(...)   (via its own client)
