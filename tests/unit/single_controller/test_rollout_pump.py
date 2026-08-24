@@ -41,7 +41,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
+from nemo_rl.experience.rollout_manager import (
+    RolloutManager,
+    RolloutOutcome,
+    RolloutStats,
+)
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
 from tests.unit.experience.test_rollout_manager import (
@@ -127,6 +131,7 @@ def test_rollout_pump_stamps_target_steps(
     ctrl._rollout_permitted.set()
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._buffer_capacity = asyncio.Semaphore(2)
+    ctrl._rollout_slots = asyncio.Semaphore(2)
     ctrl._inflight_rollouts = 0
     ctrl._inflight_by_group_id = {}
     ctrl._dispatched_rollouts = set()
@@ -180,6 +185,7 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
     ctrl._rollout_permitted.set()
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._buffer_capacity = asyncio.Semaphore(2)
+    ctrl._rollout_slots = asyncio.Semaphore(2)
     ctrl._inflight_rollouts = 0
     ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
@@ -192,6 +198,51 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
     expected = 2 if expect_permit_released else 1
     assert ctrl._buffer_capacity._value == expected
     assert ctrl._inflight_rollouts == 0
+
+
+def test_actor_path_releases_capacity_when_capture_generation_is_skipped() -> None:
+    class _SkippedCaptureManager:
+        def __init__(self) -> None:
+            self.stats = RolloutStats(skipped=1)
+
+        async def generate_for_finalization(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, Any] | None = None,
+        ) -> None:
+            del prompt, target_step, inflight_registry
+            return None
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=1, diagnostics=False)
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+    )
+    ctrl._rollout_manager = _SkippedCaptureManager()
+    ctrl._finalizer_actors = [object()]
+    ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+    ctrl._dataloader = [
+        BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
+    ]
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._buffer_capacity = asyncio.Semaphore(1)
+    ctrl._rollout_slots = asyncio.Semaphore(1)
+    ctrl._inflight_rollouts = 0
+    ctrl._inflight_by_group_id = {}
+    ctrl._dispatched_rollouts = set()
+    ctrl._trainer_version = 0
+    ctrl._current_epoch = 0
+
+    asyncio.run(ctrl._rollout_pump())
+
+    assert ctrl._buffer_capacity._value == 1
+    assert ctrl._inflight_rollouts == 0
+    assert ctrl._rollout_exhausted.is_set()
 
 
 @pytest.mark.parametrize(
@@ -239,6 +290,7 @@ def test_rollout_pump_tops_up_restored_target_step(
     ctrl._rollout_permitted.set()
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._buffer_capacity = asyncio.Semaphore(4)
+    ctrl._rollout_slots = asyncio.Semaphore(2)
     ctrl._inflight_rollouts = 0
     ctrl._inflight_by_group_id = {}
     ctrl._dispatched_rollouts = set()
@@ -365,6 +417,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ctrl._rollout_permitted.set()
         ctrl._rollout_exhausted = asyncio.Event()
         ctrl._buffer_capacity = asyncio.Semaphore(2)
+        ctrl._rollout_slots = asyncio.Semaphore(2)
         ctrl._inflight_rollouts = 0
         ctrl._inflight_by_group_id = {}
         ctrl._dispatched_rollouts = set()
@@ -414,14 +467,6 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
             return task
 
     real_semaphore = asyncio.Semaphore
-    created_semaphores: list[asyncio.Semaphore] = []
-
-    def _recording_semaphore(value: int) -> asyncio.Semaphore:
-        semaphore = real_semaphore(value)
-        created_semaphores.append(semaphore)
-        return semaphore
-
-    monkeypatch.setattr(asyncio, "Semaphore", _recording_semaphore)
     monkeypatch.setattr(asyncio, "TaskGroup", _CancelBeforeStartTaskGroup)
 
     async def _main() -> None:
@@ -445,6 +490,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ctrl._rollout_permitted.set()
         ctrl._rollout_exhausted = asyncio.Event()
         ctrl._buffer_capacity = real_semaphore(1)
+        ctrl._rollout_slots = real_semaphore(1)
         ctrl._inflight_rollouts = 0
         ctrl._inflight_by_group_id = {}
         ctrl._dispatched_rollouts = set()
@@ -455,7 +501,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         await asyncio.sleep(0)
 
         assert ctrl._buffer_capacity._value == 1
-        assert created_semaphores[0]._value == 1
+        assert ctrl._rollout_slots._value == 1
         assert ctrl._inflight_rollouts == 0
         assert ctrl._dispatched_rollouts == set()
         assert ctrl._rollout_exhausted.is_set()
@@ -517,6 +563,7 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
         ctrl._rollout_permitted.set()
         ctrl._rollout_exhausted = asyncio.Event()
         ctrl._buffer_capacity = asyncio.Semaphore(2)
+        ctrl._rollout_slots = asyncio.Semaphore(1)
         ctrl._inflight_rollouts = 0
         ctrl._inflight_by_group_id = {}
         ctrl._dispatched_rollouts = set()
