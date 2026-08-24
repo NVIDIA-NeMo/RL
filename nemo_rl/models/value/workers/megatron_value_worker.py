@@ -57,6 +57,7 @@ from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.common import (
     broadcast_tensor,
+    get_aux_loss_track_names,
     get_moe_metrics,
 )
 from nemo_rl.models.megatron.data import (
@@ -635,6 +636,13 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                 per_layer_logging=self.cfg["megatron_cfg"].get(
                     "moe_per_layer_logging", False
                 ),
+                # Pre-initialize the aux-loss tracker on every PP rank so the
+                # cross-PP all_reduce inside get_moe_metrics does not hang when a
+                # rank recorded no aux loss this step (e.g. a stage with no MoE
+                # layer, or MTP MoE on the last stage).
+                num_layers=getattr(model_config, "num_layers", None),
+                mtp_num_layers=getattr(model_config, "mtp_num_layers", None),
+                track_names=get_aux_loss_track_names(model_config),
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics

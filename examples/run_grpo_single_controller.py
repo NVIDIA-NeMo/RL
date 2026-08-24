@@ -36,6 +36,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     setup_single_controller,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.models.generation import configure_generation_config
@@ -115,6 +116,8 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
+    # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
+    maybe_configure_data_plane_env(config.data_plane)
     init_ray()
 
     tokenizer = get_tokenizer(config.policy["tokenizer"])
