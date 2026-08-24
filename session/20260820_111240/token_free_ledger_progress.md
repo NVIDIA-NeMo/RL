@@ -60,7 +60,21 @@ Plan: `session/20260820_111240/token_free_ledger_plan.md` (all phases implemente
 - Login-node constraint: `rl-pr3456-delta-tests` venv hangs on `import ray`; Gym venv lacks torch/transformers.
   NeMo-RL hosting tests require GPU node (inside training container).
 
-## REMAINING: Slurm smoke
+## Slurm smoke — COMPLETE (2026-08-24)
+
+Job 6490451 (short QOS, 50:57 elapsed), W&B nmiv7zjc.
+
+- **5/5 step_metrics** — all steps completed, finite loss, 5–8 valid rows each step.
+- **token_in_rate 0.968–0.986** — ≈1 as expected.
+- **Zero integrity errors** — no chain_hash_mismatch, cumulative_hash_mismatch,
+  invalid_worker_commit_coordinates, worker_capture_failed, 409 Conflict, or UnknownRolloutError.
+- **Custody rows token-free** — 45 ledgers, 3,081 external rows:
+  - `cumulative_token_ids` present: **0** (expected 0) ✓
+  - `chain_hash` present: **3,081** (expected == total) ✓
+
+Implementation is fully validated end-to-end. All source, test, and Slurm checks passed.
+
+## OLD REMAINING: Slurm smoke
 
 1. Submit: `swe_nano_sc_capture.sh` with SC_EXP_NAME=swe-token-free-ledger-s43-0824,
    token_capture.staging_partition=rollout_staging_token_free_s43_0824, seed 43, 2 prompts/step, GBS 8,
