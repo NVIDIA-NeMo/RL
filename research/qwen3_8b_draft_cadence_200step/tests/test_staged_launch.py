@@ -30,7 +30,7 @@ class StagedLaunchContractTest(unittest.TestCase):
             'printf \'submit_dir=%s\\n\' "${SLURM_SUBMIT_DIR:-}" >> "${STAGE_RECEIPT}"\n'
             'printf \'wandb_resume=%s\\n\' "${WANDB_RESUME:-}" >> "${STAGE_RECEIPT}"\n'
         )
-        ray_sub.chmod(0o755)
+        ray_sub.chmod(0o644)
         archive = root / "source.tar"
         with tarfile.open(archive, "w") as stream:
             stream.add(source, arcname=".")
@@ -194,6 +194,22 @@ class StagedLaunchContractTest(unittest.TestCase):
                     canary=True,
                 )
 
+    def test_rendered_script_requires_readable_ray_sub_not_executable_mode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rendered = render_staged_array_script(
+                staged=self._archive(root),
+                result_root=root / "results",
+                expected_product_head="a" * 40,
+                scratch_parent=root / "scratch",
+                canary=True,
+            )
+            self.assertIn('[[ -f "${source_root}/ray.sub" ]]', rendered)
+            self.assertNotIn('[[ -x "${source_root}/ray.sub" ]]', rendered)
+            self.assertIn("STAGED_SOURCE_ERROR line=", rendered)
+
     def test_staged_array_argv_uses_lustre_chdir_and_segment_one(self) -> None:
         argv = build_staged_array_argv(
             script_path=Path("/lustre/results/staged-array.sh"),
@@ -205,6 +221,10 @@ class StagedLaunchContractTest(unittest.TestCase):
         self.assertIn("--array=0-12", argv)
         self.assertIn("--segment=1", argv)
         self.assertIn("--chdir=/lustre/results/q8c200-recovery", argv)
+        self.assertIn(
+            "--error=/lustre/results/q8c200-recovery/scheduler-logs/q8c200-%A_%a.err",
+            argv,
+        )
         self.assertIn("--test-only", argv)
         self.assertLess(argv.index("--test-only"), len(argv) - 1)
         self.assertNotIn("/home/", "\n".join(argv))

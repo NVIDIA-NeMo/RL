@@ -146,3 +146,9 @@ outputs on Lustre, and permits full arm submission only after an identical
 preflight-only startup canary terminates successfully. Recovery uses a new
 result root and W&B run generation; none of the failed array's manifests or
 ledgers may be overwritten.
+
+Startup canary `6479002` then exposed a separate staging assertion before Ray:
+the repository tracks `ray.sub` as mode `100644`, but the first wrapper required
+it to be executable even though it invokes the file through `bash`. The recovery
+wrapper now requires a regular file instead, records failing shell commands with
+an ERR trap, and routes scheduler stderr to a durable per-task `.err` file.

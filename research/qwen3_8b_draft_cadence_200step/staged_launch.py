@@ -84,6 +84,15 @@ def render_staged_array_script(
     return f"""#!/usr/bin/env bash
 set -euo pipefail
 
+on_error() {{
+  local exit_code=$?
+  trap - ERR
+  printf 'STAGED_SOURCE_ERROR line=%s command=%q exit=%s\n' \\
+    "${{BASH_LINENO[0]}}" "${{BASH_COMMAND}}" "${{exit_code}}" >&2
+  exit "${{exit_code}}"
+}}
+trap on_error ERR
+
 : "${{SLURM_JOB_ID:?SLURM_JOB_ID is required}}"
 : "${{SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID is required}}"
 source_archive={source_archive}
@@ -119,7 +128,7 @@ if [[ -e "${{scratch_root}}" ]]; then
 fi
 mkdir -p "${{source_root}}"
 tar -xf "${{source_archive}}" -C "${{source_root}}"
-[[ -x "${{source_root}}/ray.sub" ]]
+[[ -f "${{source_root}}/ray.sub" ]]
 
 case "${{SLURM_ARRAY_TASK_ID}}" in
 {cases}
@@ -182,6 +191,7 @@ def build_staged_array_argv(
         "--segment=1",
         f"--chdir={result_root}",
         f"--output={result_root}/scheduler-logs/q8c200-%A_%a.out",
+        f"--error={result_root}/scheduler-logs/q8c200-%A_%a.err",
     ]
     if test_only:
         argv.append("--test-only")
