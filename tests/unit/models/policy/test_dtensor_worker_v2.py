@@ -1011,7 +1011,12 @@ class TestGetTrainContext:
 
 
 def _init_v2_worker_mocked(
-    monkeypatch, *, init_reference_model, weights_path, optimizer_path
+    monkeypatch,
+    *,
+    init_reference_model,
+    weights_path,
+    optimizer_path,
+    config_overrides=None,
 ):
     """Run DTensorPolicyWorkerV2Impl.__init__ with all heavy deps mocked.
 
@@ -1102,6 +1107,7 @@ def _init_v2_worker_mocked(
         "dtensor_cfg": {},
         "generation": {},
     }
+    config.update(config_overrides or {})
     worker = object.__new__(DTensorPolicyWorkerV2Impl)
     DTensorPolicyWorkerV2Impl.__init__(
         worker,
@@ -1117,13 +1123,14 @@ def _init_v2_worker_mocked(
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 def test_dtensor_v2_resume_with_reference_model_defers_checkpoint_load(monkeypatch):
-    """On resume with a KL reference, the reference must be captured from base
-    weights (checkpoint load deferred until after the capture)."""
+    """With ref_model_from_base_weights, a resume with a KL reference captures
+    the reference from base weights (checkpoint load deferred until after)."""
     worker, call_log, setup_mock, load_mock = _init_v2_worker_mocked(
         monkeypatch,
         init_reference_model=True,
         weights_path="/ckpt/weights",
         optimizer_path="/ckpt/optim",
+        config_overrides={"ref_model_from_base_weights": True},
     )
     # (a) base weights used for setup: checkpoint paths not passed through.
     assert setup_mock.call_args.kwargs["weights_path"] is None
@@ -1165,7 +1172,32 @@ def test_dtensor_v2_fresh_run_with_reference_model_does_not_defer(monkeypatch):
         init_reference_model=True,
         weights_path=None,
         optimizer_path=None,
+        config_overrides={"ref_model_from_base_weights": True},
     )
     assert setup_mock.call_args.kwargs["weights_path"] is None
     load_mock.assert_not_called()
+    assert worker.reference_model_state_dict == {"ref": "state"}
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_resume_with_reference_model_defaults_to_checkpoint_anchor(
+    monkeypatch,
+):
+    """Without ref_model_from_base_weights (default), a resume with a KL
+    reference keeps the current behavior: the checkpoint paths pass straight
+    through to setup and the reference is captured from the restored model."""
+    worker, call_log, setup_mock, load_mock = _init_v2_worker_mocked(
+        monkeypatch,
+        init_reference_model=True,
+        weights_path="/ckpt/weights",
+        optimizer_path="/ckpt/optim",
+    )
+    assert setup_mock.call_args.kwargs["weights_path"] == "/ckpt/weights"
+    assert setup_mock.call_args.kwargs["optimizer_path"] == "/ckpt/optim"
+    load_mock.assert_not_called()
+    assert call_log == [
+        "setup_model_and_optimizer",
+        "setup_reference_model_state",
+    ]
     assert worker.reference_model_state_dict == {"ref": "state"}

@@ -324,15 +324,19 @@ class DTensorPolicyWorkerV2Impl(
         )
 
         # Set up model and optimizer.
-        # When a reference policy is needed on a resumed run, defer the NeMo RL
-        # checkpoint load: setup_model_and_optimizer restores `weights_path`
-        # internally, and capturing the reference from the restored model
-        # re-anchors the KL reference to the resumed step on every resume (a
-        # rolling anchor). Each resume then grants the policy a fresh drift
-        # budget, which defeats the anchor over multi-window runs. Instead,
-        # build the model from the pristine base weights, capture the
-        # reference, then load the checkpoint below.
-        defer_checkpoint_load = init_reference_model and bool(weights_path)
+        # With `ref_model_from_base_weights: true`, a reference policy needed on
+        # a resumed run defers the NeMo RL checkpoint load:
+        # setup_model_and_optimizer restores `weights_path` internally, and
+        # capturing the reference from the restored model re-anchors the KL
+        # reference to the resumed step on every resume (a rolling anchor).
+        # Deferring instead builds the model from the pristine base weights,
+        # captures the reference, then loads the checkpoint below. By default
+        # (false) the reference follows the restored checkpoint weights.
+        defer_checkpoint_load = (
+            init_reference_model
+            and bool(weights_path)
+            and bool(config.get("ref_model_from_base_weights"))
+        )
         if defer_checkpoint_load:
             print(
                 "Deferring NeMo RL checkpoint load until after the KL reference "

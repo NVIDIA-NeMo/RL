@@ -573,6 +573,14 @@ class PolicyConfig(TypedDict):
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
     draft: NotRequired[DraftConfig | DraftConfigDisabled]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
+    # If true, the KL reference model is captured from the pristine base
+    # (model_name) weights even when resuming from a NeMo RL checkpoint, so the
+    # reference stays anchored to the same policy across resumes. If false
+    # (default), the reference is captured from the restored checkpoint weights,
+    # i.e. it re-anchors to the resumed step on every resume.
+    # Currently consumed by the DTensor v2 (automodel) path only; the Megatron
+    # path always anchors the reference to `pretrained_checkpoint`.
+    ref_model_from_base_weights: NotRequired[bool]
     router_replay: NotRequired[RouterReplayConfig | RouterReplayConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
