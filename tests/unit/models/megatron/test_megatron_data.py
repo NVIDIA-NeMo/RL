@@ -1209,6 +1209,13 @@ class TestGetMicrobatchIterator:
         cfg = {
             "dynamic_batching": {"enabled": True},
             "sequence_packing": {"enabled": False},
+            "make_sequence_length_divisible_by": 1,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "context_parallel_size": 1,
+                "fp8_cfg": {"enabled": False},
+            },
         }
 
         (
@@ -1380,6 +1387,24 @@ class TestGetMicrobatchIterator:
                 ]
                 == 32
             )
+
+    def test_non_packed_pad_factor_combines_tp_sequence_parallel_alignment(self):
+        """Dense sequence-parallel batches align to the TP scatter factor."""
+        from nemo_rl.models.megatron.data import (
+            _get_non_packed_sequence_pad_factor,
+        )
+
+        cfg = {
+            "make_sequence_length_divisible_by": 6,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 4,
+                "sequence_parallel": True,
+                "context_parallel_size": 1,
+                "fp8_cfg": {"enabled": False},
+            },
+        }
+
+        assert _get_non_packed_sequence_pad_factor(cfg) == 12
 
     @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")

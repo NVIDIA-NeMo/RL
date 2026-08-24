@@ -345,6 +345,7 @@ def forward_with_post_processing_fn(
             global_valid_toks=global_valid_toks,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
+        assert original_seq_length is not None
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             input_ids=input_ids,
@@ -352,6 +353,7 @@ def forward_with_post_processing_fn(
             original_seq_length=original_seq_length,
         )
     elif isinstance(post_processing_fn, TopkLogitsPostProcessor):
+        assert original_seq_length is not None
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
@@ -615,7 +617,7 @@ class LogprobsPostProcessor:
         data_dict: BatchedDataDict[Any],
         input_ids: torch.Tensor,
         cu_seqlens_padded: torch.Tensor,
-        original_seq_length: Optional[int] = None,
+        original_seq_length: int,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
 
@@ -626,13 +628,12 @@ class LogprobsPostProcessor:
             data_dict: Batched data dictionary containing input sequences
             input_ids: Processed input token IDs
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
+            original_seq_length: Sequence width before dense padding was applied
 
         Returns:
             Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
         """
         unpacked_input_ids = data_dict["input_ids"]
-        if original_seq_length is None:
-            original_seq_length = unpacked_input_ids.shape[1]
 
         def processor_fn_inner(output_tensor):
             if self.use_fused_linear_logprobs:
@@ -700,7 +701,7 @@ class TopkLogitsPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
         cu_seqlens_padded: torch.Tensor,
-        original_seq_length: Optional[int] = None,
+        original_seq_length: int,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes top-k logits and indices.
 
@@ -711,6 +712,7 @@ class TopkLogitsPostProcessor:
         Args:
             data_dict: Batched data dictionary
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
+            original_seq_length: Sequence width before dense padding was applied
 
         Returns:
             Callable: Function that takes output tensor and returns
@@ -719,8 +721,6 @@ class TopkLogitsPostProcessor:
         pack = self.cfg["sequence_packing"]["enabled"]
         cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
         unpacked_seqlen = data_dict["input_ids"].shape[1]
-        if original_seq_length is None:
-            original_seq_length = unpacked_seqlen
         seq_lengths = data_dict["input_lengths"]
 
         def processor_fn_inner(output_tensor):
