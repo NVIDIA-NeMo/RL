@@ -24,6 +24,7 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, cast
@@ -91,6 +92,12 @@ from nemo_rl.models.megatron.router_replay import (
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
+
+
+def _print_setup_milestone(milestone: str) -> None:
+    """Print a timestamped SingleController setup milestone immediately."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"[{timestamp}] SingleController setup: {milestone}", flush=True)
 
 
 @dataclass
@@ -521,6 +528,7 @@ def setup_single_controller(
         A tuple of (pre-built SC actor args, driver-side per-phase timings
         logged by the SC actor).
     """
+    _print_setup_milestone("started")
     validate_single_controller_config(master_config)
 
     # short names for config sections
@@ -606,6 +614,7 @@ def setup_single_controller(
 
     _clamp_max_num_steps(master_config, dataloader)
     _maybe_inject_megatron_train_iters(master_config)
+    _print_setup_milestone("Dataset & Environments setup complete")
 
     # ==========================
     # Setup Clusters & Workers
@@ -758,12 +767,14 @@ def setup_single_controller(
     # Attach fleet health before any rollout runs, so the very first request is
     # already health-aware.
     fleet_monitor = _maybe_attach_fleet_health(generation, master_config)
+    _print_setup_milestone("Clusters & Workers setup complete")
 
     # ==========================
     # Setup Data Plane Client & Weight Sync
     # ==========================
     # Connect-only DP client; TQPolicy already bootstrapped the controller.
     dp_client = build_data_plane_client(dp_config, bootstrap=False)
+    _print_setup_milestone("data plane client built")
 
     t0 = time.perf_counter()
     weight_synchronizer = create_weight_synchronizer(
@@ -776,6 +787,7 @@ def setup_single_controller(
         refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
     )
     weight_synchronizer.init_communicator()
+    _print_setup_milestone("weight synchronizer communicator initialized")
     setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
 
     # ==========================
@@ -784,6 +796,7 @@ def setup_single_controller(
     advantage_estimator = _create_advantage_estimator(
         cast(GrpoMasterConfig, master_config)
     )
+    _print_setup_milestone("advantage estimator created")
     loss_fn: LossFunction = ClippedPGLossFn(master_config.loss_fn)
 
     pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
@@ -793,6 +806,7 @@ def setup_single_controller(
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
         require_routed_experts=router_replay_enabled(policy_config),
     )
+    _print_setup_milestone("TQReplayBuffer created")
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -811,6 +825,7 @@ def setup_single_controller(
         ),
         retry_policy=_build_retry_policy(master_config),
     )
+    _print_setup_milestone("RolloutManager created")
 
     # Print setup timing metrics
     total_setup_time = time.perf_counter() - setup_start_time
