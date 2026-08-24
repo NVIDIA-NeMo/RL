@@ -36,7 +36,7 @@ loss_fn:
   force_on_policy_ratio: false
   use_kl_in_reward: false
 policy:
-  train_global_batch_size: 512
+  train_global_batch_size: 16
   # envelope: text OPD's sequence length (long text prompts/gens untruncated);
   # vision rows are far shorter and simply pack tighter.
   max_total_sequence_length: 16384
