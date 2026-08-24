@@ -27,7 +27,26 @@ git config --global --add safe.directory "$PROJECT_ROOT"
 set -eou pipefail
 
 EXP_NAME=$(basename "$0" .sh)
-EXP_DIR=$SCRIPT_DIR/$EXP_NAME
+
+# Per variant, not per script. The lane runs several of these back to back from this one file,
+# differing only by environment, and they all resolved to the same EXP_DIR -- which is
+# `rm -rf`'d on entry. So each variant destroyed its predecessor's run.log and
+# metrics.json, and by the time anyone looked only the last one's artifacts existed. That
+# is the opposite of what you want from a lane whose failures are debugged after the fact.
+#
+# Named for the variant rather than the run, so a re-run still overwrites its own
+# artifacts and the directory count stays fixed instead of growing per invocation.
+#
+# Read from the environment directly because the defaults for these are applied further
+# down, after this path has to be known. `if` rather than `[[ ... ]] && ...`: under the
+# `set -eou pipefail` above, a bare AND-list whose condition is false returns non-zero and
+# takes the script with it.
+EXP_VARIANT="${REFIT_TRANSPORT:-null}"
+if [[ "${KILL_DURING_REFIT:-false}" == "true" ]]; then EXP_VARIANT+="-refit"; fi
+if [[ "${FREEZE_VICTIM:-false}" == "true" ]]; then EXP_VARIANT+="-frozen"; fi
+if [[ "${RESTART_DEAD_SHARDS:-false}" == "true" ]]; then EXP_VARIANT+="-restart"; fi
+
+EXP_DIR=$SCRIPT_DIR/$EXP_NAME/$EXP_VARIANT
 LOG_DIR=$EXP_DIR/logs
 RUN_LOG=$EXP_DIR/run.log
 JSON_METRICS=$EXP_DIR/metrics.json
@@ -73,7 +92,7 @@ fi
 
 # How long to wait for device memory to come back: on entry, because the previous test in
 # the lane may still be releasing it, and on exit, so this test cannot poison the next one.
-# The lane runs five recovery variants back to back and then a chaos test, so every one of
+# The lane runs the recovery variants back to back and then a chaos test, so every one of
 # those handoffs is a chance to pass on a GPU that is still being reclaimed.
 GPU_WAIT_S=${GPU_WAIT_S:-120}
 GPU_SETTLE_S=${GPU_SETTLE_S:-60}
