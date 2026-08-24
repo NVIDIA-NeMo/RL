@@ -79,6 +79,13 @@ from tests.unit.models.generation.test_vllm_generation import (
 )
 
 
+def _caller_identity_row() -> dict[str, str]:
+    return {
+        "_nemo_rl_rollout_id": "rollout-1",
+        "_nemo_rl_group_id": "group-1",
+    }
+
+
 def test_multimodal_content_types_cover_responses_media_aliases():
     assert {
         "input_image",
@@ -1316,7 +1323,7 @@ def test_nemo_gym_dedup_redacts_initial_images_from_actor_return(
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
             _MockSelf(),
-            {},
+            _caller_identity_row(),
             nemo_gym_result,
             _Tokenizer(),
             include_initial_multimodal_data=include_initial_multimodal_data,
@@ -1409,14 +1416,14 @@ def test_nemo_gym_dedup_omits_actor_initial_tensor_and_preserves_later_media():
     )
     flag_off = postprocess(
         _MockSelf(),
-        {},
+        _caller_identity_row(),
         deepcopy(template),
         _Tokenizer(),
         include_initial_multimodal_data=True,
     )
     flag_on = postprocess(
         _MockSelf(),
-        {},
+        _caller_identity_row(),
         deepcopy(template),
         _Tokenizer(),
         include_initial_multimodal_data=False,
@@ -1531,7 +1538,7 @@ def test_nemo_gym_dedup_keeps_authoritative_changed_seed_media(
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
             _MockSelf(),
-            {},
+            _caller_identity_row(),
             nemo_gym_result,
             _Tokenizer(),
             include_initial_multimodal_data=False,

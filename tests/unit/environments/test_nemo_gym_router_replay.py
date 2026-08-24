@@ -22,6 +22,13 @@ class _Tokenizer:
         return [" ".join(map(str, token_ids)) for token_ids in batch]
 
 
+def _caller_identity_row() -> dict[str, str]:
+    return {
+        "_nemo_rl_rollout_id": "rollout-1",
+        "_nemo_rl_group_id": "group-1",
+    }
+
+
 def _routes(num_tokens: int) -> list[list[list[int]]]:
     return [[[token_idx, token_idx + 100]] for token_idx in range(num_tokens)]
 
@@ -56,7 +63,7 @@ def test_nemo_gym_postprocess_slices_routed_experts():
 
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
+            _MockSelf(), _caller_identity_row(), nemo_gym_result, _Tokenizer()
         )
     )
 
@@ -90,7 +97,7 @@ def test_nemo_gym_postprocess_requires_routed_experts_when_configured():
 
     with pytest.raises(ValueError, match="requires NeMo Gym output items"):
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
+            _MockSelf(), _caller_identity_row(), nemo_gym_result, _Tokenizer()
         )
 
 
@@ -116,7 +123,7 @@ def test_nemo_gym_postprocess_casts_routed_experts_to_configured_dtype():
 
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
+            _MockSelf(), _caller_identity_row(), nemo_gym_result, _Tokenizer()
         )
     )
 
