@@ -63,8 +63,20 @@ run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controll
 # dead rank and hangs in NCCL (job 6258553 sat there for 33 minutes). Asserting survival
 # here would assert a property this part does not implement.
 #
-# Needs >= 3 GPUs (2 generation + 1 trainer) and self-skips below that, so it is inert on
-# the 2-GPU L1 runners and only does its job on a larger box.
+# Everything from here to the chaos test below needs >= 3 GPUs (2 generation shards + 1
+# trainer) and self-skips with exit 0 below that.
+#
+# The lane derives one verdict from a single `grep "Finished successfully."`, so a skip and
+# a pass are the same signal and a green lane reads as though shard-death recovery were
+# covered. It is not: both L1 runners have 2 GPUs, so on CI every one of these completes in
+# under a second without executing a line of product code. Annotated rather than left
+# silent, so the run summary says which it was. The real coverage for these is manual, on
+# >= 3-GPU hardware -- the job IDs in the comments below are those runs.
+_SC_GPUS=$(nvidia-smi --list-gpus 2>/dev/null | wc -l || echo 0)
+if (( _SC_GPUS < 3 )); then
+    echo "::warning title=SingleController recovery tests skipped::Shard-death recovery and router failover need >= 3 GPUs; this runner has ${_SC_GPUS}. Those tests self-skipped and this lane proves nothing about them."
+fi
+
 run_test uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
 
 # ...and now the other half, which only this part of the stack can satisfy. Same kill,
@@ -102,9 +114,10 @@ run_test env KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functional/grp
 # regenerate the refit plan as well as the communicators. Nothing about that is exercised
 # by the step-boundary variant above, which recovers between refits and never aborts.
 #
-# Without this, the reshard abort path had only signature assertions behind it: the
-# deadline was plumbed and unit-tested, but no test had ever made a reshard refit
-# actually abort on hardware.
+# What this does NOT cover: the reshard ABORT. A killed actor produces ActorDiedError
+# within milliseconds, so this recovers off the actor-death path and the deadline is never
+# reached -- job 6405953 passed it with RefitAborted appearing zero times. Only the frozen
+# reshard variant below makes a reshard refit actually abort.
 run_test env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 # Restart and re-admission, which is a strictly stronger claim than surviving on a
 # smaller fleet: the engine is recreated and returns to the serving set. This is the only
@@ -125,8 +138,21 @@ run_test env RESTART_DEAD_SHARDS=true uv run --no-sync bash ./tests/functional/g
 # never becomes absent -- measured on 4xGB200 it reaches SUSPECT and stops there -- so the
 # reconcile correctly refuses to rebuild over a fleet that still holds a silent rank. The
 # gain being pinned is that the run ends attributably in seconds rather than wedging in
-# NCCL forever; abort-and-recover is what the two killed variants above cover.
+# NCCL forever; actor-death-and-recover is what the two killed variants above cover, which
+# is a different route -- they never reach the deadline at all.
 run_test env KILL_DURING_REFIT=true FREEZE_VICTIM=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
+
+# The reshard counterpart, and the fourth corner of {collective, nccl_reshard} x {kill,
+# freeze}. The other three were registered; this one was not, and it is the only one that
+# makes a RESHARD refit abort -- freezing is the only way to reach the deadline, since with
+# SIGKILL ActorDiedError always wins the race.
+#
+# It is the variant that exercises two fixes nothing else reaches. The reshard bulk path
+# never calls StatelessProcessGroup.broadcast, so before the translation in
+# RefitAbortWatchdog.__exit__ an abort here escaped as an AttributeError and _sync_weights
+# missed it. And this is the path that splits the parent communicator into per-replica
+# children, which the parent's abort does not reach on its own.
+run_test env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true FREEZE_VICTIM=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 
 # grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout
 # rather than between calls. Registered because pinning the victim state -- which is what
