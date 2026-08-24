@@ -192,7 +192,7 @@ def render_hydra_overrides(arm: Arm, *, result_dir: str) -> tuple[str, ...]:
         f"grpo.seed={arm.seed}",
         f"grpo.num_prompts_per_step={arm.prompts_per_step}",
         f"grpo.num_generations_per_prompt={arm.generations_per_prompt}",
-        "grpo.val_period=1000000",
+        "grpo.val_period=0",
         "grpo.val_at_start=false",
         "grpo.val_at_end=false",
         "grpo.async_grpo.enabled=false",

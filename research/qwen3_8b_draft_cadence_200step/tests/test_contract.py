@@ -121,6 +121,7 @@ class MatrixContractTest(unittest.TestCase):
         joined = "\n".join(overrides)
         for required in (
             "grpo.max_num_steps=200",
+            "grpo.val_period=0",
             "policy.generation.max_new_tokens=1024",
             "policy.train_global_batch_size=8",
             "checkpointing.save_period=50",
@@ -140,6 +141,7 @@ class MatrixContractTest(unittest.TestCase):
         self.assertIn(
             "++cadence_runtime.result_dir=/lustre/result/dflash-fixed-10", overrides
         )
+        self.assertNotIn("++grpo.val_period=1000000", overrides)
 
     def test_all_fields_use_hydra_force_add_or_override(self) -> None:
         for arm in build_arms():
