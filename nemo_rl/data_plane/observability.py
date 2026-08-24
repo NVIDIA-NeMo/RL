@@ -1403,7 +1403,13 @@ class MetricsDataPlaneClient(DataPlaneClient):
             if rectangle is not None and name not in batch_scoped_fields:
                 flat = _as_int_view(rectangle.reshape(n_rows, -1))
                 out[name] = _FieldDigest(
-                    (torch.hash_tensor(flat, dim=1) ^ salt).tolist(),
+                    # Salt on the host, as the batch-scoped path below already
+                    # does. Torch has no ``bitwise_xor`` CUDA kernel for
+                    # UInt64, so XOR-ing the digest tensor in place raises
+                    # ``NotImplementedError`` for any backend whose get returns
+                    # device tensors. The digests come back to the host for
+                    # comparison either way, so this costs nothing.
+                    [d ^ salt for d in torch.hash_tensor(flat, dim=1).tolist()],
                     batch_scoped=False,
                     # One width, not n_rows copies of it: the rows are
                     # uniform by construction on this path.
