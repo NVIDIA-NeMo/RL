@@ -750,6 +750,25 @@ def test_hash_fingerprint_handles_float8():
     assert len(digest.per_row) == 2
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_hash_fingerprint_handles_device_tensors():
+    """Torch has no ``bitwise_xor`` CUDA kernel for UInt64, so salting the
+    digest tensor before it leaves the device raises ``NotImplementedError``
+    for any backend whose get returns device tensors -- register mode under
+    GDR does. The digests must also match the host's, or a device-resident
+    get would verify against a host put as a mismatch on every row."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient(), verify_tensor_hash=True)
+    values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    ids = ["a", "b"]
+    on_host = client._row_fingerprints(TensorDict({"x": values}, batch_size=[2]), ids)[
+        "x"
+    ]
+    on_device = client._row_fingerprints(
+        TensorDict({"x": values.cuda()}, batch_size=[2]), ids
+    )["x"]
+    assert on_device.per_row == on_host.per_row
+
+
 def test_hash_verification_off_by_default():
     """Default construction must do no hashing work at all."""
     client = MetricsDataPlaneClient(NoOpDataPlaneClient())
