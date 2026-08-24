@@ -118,6 +118,132 @@ def test_refit_quantize_matches_receiver_path():
     assert torch.equal(got_scale.reshape(-1), ref_scale.reshape(-1))
 
 
+def test_batched_expert_prequantization_preserves_wire_entries_and_reuses_scratch():
+    from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
+
+    calls = []
+
+    def quantize(tensor):
+        calls.append(tuple(tensor.shape))
+        scales = torch.ones(
+            (*tensor.shape[:-1], tensor.shape[-1] // MXFP8_BLOCK_SIZE),
+            dtype=torch.uint8,
+        )
+        return tensor.clone(), scales
+
+    def expert_name(expert_id, projection):
+        return f"model.layers.0.mlp.experts.{expert_id}.{projection}_proj.weight"
+
+    params = [("model.layers.0.input_layernorm.weight", torch.ones(64))]
+    expected = {}
+    for expert_id in range(2):
+        for projection in ("gate", "up"):
+            name = expert_name(expert_id, projection)
+            tensor = torch.full((2, 64), expert_id + (1 if projection == "gate" else 3))
+            params.append((name, tensor))
+            expected[name] = tensor
+    for expert_id in range(2):
+        name = expert_name(expert_id, "down")
+        tensor = torch.full((4, 32), expert_id + 5)
+        params.append((name, tensor))
+        expected[name] = tensor
+
+    selected_names = set(expected)
+    scratch_cache = {}
+    output = dict(
+        fp8_train_utils.iter_mxfp8_prequantized_params(
+            iter(params),
+            selected_names,
+            quantize_fn=quantize,
+            scratch_cache=scratch_cache,
+        )
+    )
+
+    assert calls == [(4, 64), (4, 64), (8, 32)]
+    assert output[params[0][0]] is params[0][1]
+    for name, tensor in expected.items():
+        torch.testing.assert_close(output[name], tensor)
+        scale_name = name + "_scale_from_checkpoint"
+        assert output[scale_name].shape == (*tensor.shape[:-1], tensor.shape[-1] // 32)
+        assert torch.all(output[scale_name] == 1)
+
+    scratch = next(iter(scratch_cache.values()))
+    first_scratch_ptr = scratch.data_ptr()
+    calls.clear()
+    list(
+        fp8_train_utils.iter_mxfp8_prequantized_params(
+            iter(params),
+            selected_names,
+            quantize_fn=quantize,
+            scratch_cache=scratch_cache,
+        )
+    )
+    assert calls == [(4, 64), (4, 64), (8, 32)]
+    assert next(iter(scratch_cache.values())).data_ptr() == first_scratch_ptr
+
+
+def test_batched_expert_prequantization_bounds_batch_and_has_stable_order():
+    from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
+
+    calls = []
+
+    def quantize(tensor):
+        calls.append(tuple(tensor.shape))
+        scales = torch.ones(
+            (*tensor.shape[:-1], tensor.shape[-1] // MXFP8_BLOCK_SIZE),
+            dtype=torch.uint8,
+        )
+        return tensor.clone(), scales
+
+    def expert_name(expert_id, projection):
+        return f"model.layers.0.mlp.experts.{expert_id}.{projection}_proj.weight"
+
+    params = []
+    for expert_id in range(5):
+        for projection in ("gate", "up"):
+            params.append((expert_name(expert_id, projection), torch.ones(2, 64)))
+    for expert_id in range(5):
+        params.append((expert_name(expert_id, "down"), torch.ones(4, 32)))
+
+    output = list(
+        fp8_train_utils.iter_mxfp8_prequantized_params(
+            iter(params),
+            {name for name, _tensor in params},
+            quantize_fn=quantize,
+            max_experts_per_batch=2,
+        )
+    )
+
+    expected_names = []
+    for expert_ids, projection in (
+        ((0, 1), "gate"),
+        ((0, 1), "up"),
+        ((2, 3), "gate"),
+        ((2, 3), "up"),
+        ((4,), "gate"),
+        ((4,), "up"),
+        ((0, 1), "down"),
+        ((2, 3), "down"),
+        ((4,), "down"),
+    ):
+        for expert_id in expert_ids:
+            name = expert_name(expert_id, projection)
+            expected_names.extend((name, name + "_scale_from_checkpoint"))
+
+    assert [name for name, _tensor in output] == expected_names
+    assert calls == [
+        (4, 64),
+        (4, 64),
+        (4, 64),
+        (4, 64),
+        (2, 64),
+        (2, 64),
+        (8, 32),
+        (8, 32),
+        (4, 32),
+    ]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "is_gated,intermediate_size,hidden_size",
