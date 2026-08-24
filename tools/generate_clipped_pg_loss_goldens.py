@@ -243,19 +243,9 @@ def main() -> None:
         "schema_version": 1,
         "compatibility_contract": {
             "scope": (
-                "Preserve loss, gradients, and metrics from the pinned legacy "
-                "implementation except for the intentional corrections listed here."
+                "Preserve loss, gradients, and metrics from the pinned origin/main "
+                "implementation."
             ),
-            "intentional_corrections": [
-                {
-                    "case": "gspo_sequence_is",
-                    "metric": "sampling_importance_ratio",
-                    "reason": (
-                        "Reduce one sequence weight per valid sample instead of "
-                        "preserving the legacy [B, 1] by [B] broadcast."
-                    ),
-                }
-            ],
         },
         "provenance": {
             "source_commit": source_commit,

@@ -29,7 +29,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
 GOLDEN_PATH = Path(__file__).parent / "data" / "clipped_pg_loss_goldens.json"
 GOLDENS = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
 GOLDEN_CASES = {case["name"]: case for case in GOLDENS["cases"]}
-EXPECTED_LEGACY_COMMIT = "737c4d2cd629d19e5c576b67ef2a6105b6b1bbb3"
+EXPECTED_SOURCE_COMMIT = "aa739509ce3772a18a4d02da651b86c9e898e8cb"
 
 
 def _tensor(
@@ -127,51 +127,16 @@ def _assert_scalar_close(
     )
 
 
-def _expected_metric_under_compatibility_contract(
-    *, case_name: str, name: str, legacy_value: float
-) -> float:
-    if case_name != "gspo_sequence_is" or name != "sampling_importance_ratio":
-        return legacy_value
-
-    # The compatibility golden records sequence-level weights shaped [batch, 1]
-    # multiplied by a [batch] sample mask. That legacy broadcast produces
-    # [batch, batch], doubling this B=2 fixture's result. This documented
-    # compatibility exception instead reduces one weight per valid sample.
-    inputs = GOLDENS["base_inputs"]
-    prev_logprobs = torch.tensor(inputs["prev_logprobs"], dtype=torch.float64)[:, 1:]
-    generation_logprobs = torch.tensor(
-        inputs["generation_logprobs"], dtype=torch.float64
-    )[:, 1:]
-    token_mask = torch.tensor(inputs["token_mask"], dtype=torch.float64)[:, 1:]
-    sample_mask = torch.tensor(inputs["sample_mask"], dtype=torch.float64)
-    weights = torch.exp(
-        ((prev_logprobs - generation_logprobs) * token_mask).sum(dim=-1)
-    )
-    corrected_value = (weights * sample_mask).sum() / (sample_mask.sum() + 1e-8)
-    _assert_scalar_close(legacy_value, 2.0 * corrected_value)
-    return corrected_value.item()
-
-
 def test_clipped_pg_goldens_define_pinned_backward_compatibility_contract() -> None:
     assert GOLDENS["schema_version"] == 1
     assert GOLDENS["compatibility_contract"] == {
         "scope": (
-            "Preserve loss, gradients, and metrics from the pinned legacy "
-            "implementation except for the intentional corrections listed here."
+            "Preserve loss, gradients, and metrics from the pinned origin/main "
+            "implementation."
         ),
-        "intentional_corrections": [
-            {
-                "case": "gspo_sequence_is",
-                "metric": "sampling_importance_ratio",
-                "reason": (
-                    "Reduce one sequence weight per valid sample instead of preserving "
-                    "the legacy [B, 1] by [B] broadcast."
-                ),
-            }
-        ],
     }
     assert GOLDENS["provenance"] == {
-        "source_commit": EXPECTED_LEGACY_COMMIT,
+        "source_commit": EXPECTED_SOURCE_COMMIT,
         "source_file": "nemo_rl/algorithms/loss/loss_functions.py",
         "python_version": "3.12.8",
         "torch_version": "2.6.0",
@@ -184,7 +149,7 @@ def test_clipped_pg_goldens_define_pinned_backward_compatibility_contract() -> N
 def test_clipped_pg_full_eager_preserves_backward_compatibility(
     case_name: str,
 ) -> None:
-    """Preserve the pinned legacy numerics and documented compatibility exceptions."""
+    """Preserve the pinned origin/main numerics."""
     case = GOLDEN_CASES[case_name]
     expected = case["expected"]
     loss, gradients, metrics = _run_case(case, metrics_level="full")
@@ -201,14 +166,7 @@ def test_clipped_pg_full_eager_preserves_backward_compatibility(
 
     assert metrics.keys() == expected["metrics"].keys()
     for name, value in metrics.items():
-        _assert_scalar_close(
-            value,
-            _expected_metric_under_compatibility_contract(
-                case_name=case_name,
-                name=name,
-                legacy_value=expected["metrics"][name],
-            ),
-        )
+        _assert_scalar_close(value, expected["metrics"][name])
 
 
 @pytest.mark.parametrize("case_name", GOLDEN_CASES)
@@ -240,14 +198,7 @@ def test_clipped_pg_minimal_preserves_backward_compatible_loss_and_gradients(
         expected_metric_names.add("is_oob_ratio")
     assert metrics.keys() == expected_metric_names
     for name, value in metrics.items():
-        _assert_scalar_close(
-            value,
-            _expected_metric_under_compatibility_contract(
-                case_name=case_name,
-                name=name,
-                legacy_value=expected["metrics"][name],
-            ),
-        )
+        _assert_scalar_close(value, expected["metrics"][name])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
