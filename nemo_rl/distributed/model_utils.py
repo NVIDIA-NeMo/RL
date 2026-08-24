@@ -28,6 +28,9 @@ if TYPE_CHECKING:
     # megatron-core (optional "mcore" extra) is imported lazily below so this
     # module imports without mcore installed.
     from megatron.core.models.gpt import GPTModel
+    from nemo_automodel.components.distributed.context_parallel import (
+        ContextParallelSharder,
+    )
 
 
 def _compute_distributed_log_softmax_with_grad(
@@ -1746,7 +1749,7 @@ def get_next_token_logprobs_from_logits(
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     chunk_size: Optional[int] = None,
-    cp_sharder: Optional[Any] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
 ) -> torch.Tensor:
     """Compute token log-probabilities from logits, handling parallel and non-parallel cases.
 
@@ -2006,7 +2009,7 @@ def get_distillation_topk_logprobs_from_logits(
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-    cp_sharder: Optional[Any] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
 ):
     """Compute top-k log probabilities from logits."""
     if teacher_topk_indices.shape[-1] <= 0:

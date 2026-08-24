@@ -332,6 +332,11 @@ def forward_with_post_processing_fn(
         raise RuntimeError(
             "ContextParallelSharder is required when context_parallel_size > 1"
         )
+    if prepared.cp_size > 1 and isinstance(post_processing_fn, ScorePostProcessor):
+        raise NotImplementedError(
+            "ScorePostProcessor does not support context_parallel_size > 1 "
+            "on the automodel backend. Set context_parallel_size=1."
+        )
 
     # Model forward pass
     outputs = model_forward(model, prepared.model_batch)
@@ -518,6 +523,11 @@ def automodel_forward_backward(
                     ## by zero in the loss function to prevent them
                     ## from affecting the gradient calculation
 
+                    # FSDP averages gradients over its DP mesh (dp_size * cp_size),
+                    # while loss normalization expects their sum, so cancel that
+                    # average here. Replicated CP losses send each local model
+                    # contribution to cp_size loss consumers; divide by that fanout
+                    # to avoid overcounting. Partitioned losses have a fanout of 1.
                     loss = (
                         result
                         * dp_size
@@ -613,7 +623,7 @@ class LossPostProcessor:
         if token_layout is not None:
             input_type = self.loss_fn.input_type
             if input_type == LossInputType.LOGIT:
-                # Logit losses (value-head MSE, DPO) consume full-sequence logits
+                # Logit losses such as value-head MSE consume full-sequence logits
                 # against the canonical data_dict, so restore canonical order here
                 # while keeping any vocabulary (TP) sharding intact.
                 logits = _cp_gather_logits(logits, token_layout, sequence_dim)

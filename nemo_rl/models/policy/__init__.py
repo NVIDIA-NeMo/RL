@@ -42,10 +42,6 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # This whole patch exists only because Megatron-Bridge caps the transformers
-    # upper bound below 5.9 today, which forces us onto a transformers version
-    # that still has the deepseek_v3 tokenizer-blocklist bug. Once MBridge relaxes
-    # its transformers upper bound to >=5.12, we can drop this workaround.
     # TODO: remove this patch (and the assert below) once MBridge relaxes its
     # transformers upper bound past the deepseek_v3 fix.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764

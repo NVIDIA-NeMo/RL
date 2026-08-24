@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -34,6 +34,11 @@ from nemo_rl.distributed.model_utils import (
     get_next_token_logprobs_from_logits,
 )
 
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.context_parallel import (
+        ContextParallelSharder,
+    )
+
 
 def prepare_loss_input(
     logits: torch.Tensor,
@@ -45,7 +50,7 @@ def prepare_loss_input(
     sampling_params: Optional[TrainingSamplingParams] = None,
     d2t: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
-    cp_sharder: Optional[Any] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 

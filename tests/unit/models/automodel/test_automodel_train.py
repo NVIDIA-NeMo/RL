@@ -1023,6 +1023,54 @@ class TestForwardWithPostProcessingFn:
         # Verify result shape
         assert result.shape == (batch_size,)
 
+    def test_forward_with_score_post_processor_rejects_cp(
+        self,
+        mock_model,
+        base_cfg,
+    ):
+        batch_size = 4
+        seq_len = 64
+        input_ids = torch.randint(0, 32000, (batch_size, seq_len))
+        processed_inputs = ProcessedInputs(
+            input_ids=input_ids,
+            seq_len=seq_len,
+            attention_mask=torch.ones(batch_size, seq_len, dtype=torch.bool),
+            position_ids=torch.arange(seq_len).repeat(batch_size, 1),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+        )
+        processed_mb = ProcessedMicrobatch(
+            data_dict=BatchedDataDict(
+                {
+                    "input_ids": input_ids,
+                    "input_lengths": torch.full((batch_size,), seq_len),
+                    "sample_mask": torch.ones(batch_size, dtype=torch.bool),
+                }
+            ),
+            processed_inputs=processed_inputs,
+            original_batch_size=batch_size,
+            original_seq_len=seq_len,
+        )
+        prepared = PreparedModelForward(
+            model_batch={"input_ids": input_ids},
+            cp_size=2,
+            cp_sharder=MagicMock(),
+            model_context_factory=nullcontext,
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="ScorePostProcessor does not support context_parallel_size > 1",
+        ):
+            forward_with_post_processing_fn(
+                model=mock_model,
+                prepared=prepared,
+                post_processing_fn=ScorePostProcessor(cfg=base_cfg),
+                processed_mb=processed_mb,
+            )
+
+        mock_model.assert_not_called()
+
 
 # =====================
 # Test automodel_forward_backward

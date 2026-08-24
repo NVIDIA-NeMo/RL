@@ -658,6 +658,43 @@ class TestSaveCheckpointFunctional:
 
     @patch("torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.checkpoint.Checkpointer")
+    def test_save_passes_peft_config_only_to_save_model(
+        self, mock_checkpointer_cls, mock_get_rank, mock_meshes, mock_model
+    ):
+        """PEFT config is a save argument, not an Automodel config field."""
+        mock_get_rank.return_value = 0
+        mock_dp_mesh, mock_tp_mesh = mock_meshes
+
+        mock_checkpointer = MagicMock()
+        mock_checkpointer_cls.return_value = mock_checkpointer
+        peft_config = MagicMock()
+
+        manager = AutomodelCheckpointManager(
+            dp_mesh=mock_dp_mesh,
+            tp_mesh=mock_tp_mesh,
+        )
+        manager.init_checkpointer()
+
+        with TemporaryDirectory() as tmp_dir:
+            weights_path = os.path.join(tmp_dir, "weights")
+            manager.save_checkpoint(
+                model=mock_model,
+                weights_path=weights_path,
+                checkpointing_cfg={
+                    "enabled": True,
+                    "peft_config": peft_config,
+                },
+            )
+
+        mock_checkpointer.save_model.assert_called_once_with(
+            model=mock_model,
+            weights_path=weights_path,
+            peft_config=peft_config,
+            tokenizer=None,
+        )
+
+    @patch("torch.distributed.get_rank")
+    @patch("nemo_rl.models.automodel.checkpoint.Checkpointer")
     def test_save_model_only(
         self, mock_checkpointer_cls, mock_get_rank, mock_meshes, mock_model
     ):
