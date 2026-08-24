@@ -274,6 +274,7 @@ def apply_group_length_adjustments(
 
     default_cfg = length_cfg.get("default", {})
     agents_cfg = length_cfg.get("agent_overrides")
+    global_band = _resolve_global_profile_band(length_cfg.get("profile_band"))
     gdpo_feature_only = bool(length_cfg.get("_gdpo_feature_only", False))
     verbose = bool(length_cfg.get("verbose", False)) and not gdpo_feature_only
     gdpo_feature_verbose = bool(
@@ -281,7 +282,7 @@ def apply_group_length_adjustments(
         or (length_cfg.get("verbose", False) and gdpo_feature_only)
     )
     should_mutate_reward = not gdpo_feature_only
-    if not default_cfg.get("enabled", False) and not agents_cfg:
+    if not default_cfg.get("enabled", False) and not agents_cfg and not global_band:
         return
 
     num_gens = master_config["grpo"]["num_generations_per_prompt"]
@@ -306,6 +307,10 @@ def apply_group_length_adjustments(
         else:
             defaults[k] = default_cfg.get(k, 0.0)
     defaults.setdefault("top_percentile", 0.2)
+    # Channels listed under length_bonus.profile_band.defaults are implicitly
+    # enabled; per-agent overrides can still disable them.
+    for _ch in global_band:
+        defaults[f"profile_band_{_ch}"] = True
 
     n = len(results)
     original_rewards = [r["full_result"]["reward"] for r in results]
@@ -367,7 +372,7 @@ def apply_group_length_adjustments(
         total_lengths[g : g + group_size] = group_total[:group_size]
         group_rewards = original_rewards[g : g + num_gens]
         gate_info = _group_length_profile_gate_info(
-            band=results[g].get("profile_band"),
+            band=_merged_profile_band(results[g].get("profile_band"), global_band),
             params=params,
             rewards=group_rewards[:group_size],
             reasoning_lengths=group_reasoning[:group_size],
@@ -607,6 +612,7 @@ def apply_group_length_adjustments(
         defaults=defaults,
         num_gens=num_gens,
         should_mutate_reward=should_mutate_reward,
+        global_band=global_band,
     )
 
     if verbose or gdpo_feature_verbose:
@@ -665,6 +671,48 @@ def _print_gdpo_reward_feature_summary(
     print(f"{'=' * 70}\n", flush=True)
 
 
+def _resolve_global_profile_band(pb_cfg: Any) -> dict[str, dict[str, Any]]:
+    """Parse ``length_bonus.profile_band`` into per-channel {a, b, f} blocks.
+
+    Returns only channels ("total", "reasoning", "answer") present under
+    ``defaults`` with a complete, well-formed block. Empty dict when the
+    section is absent or disabled.
+    """
+    if not isinstance(pb_cfg, dict) or not pb_cfg.get("enabled", False):
+        return {}
+    pb_defaults = pb_cfg.get("defaults")
+    if not isinstance(pb_defaults, dict):
+        return {}
+    band: dict[str, dict[str, Any]] = {}
+    for ch in ("total", "reasoning", "answer"):
+        ch_cfg = pb_defaults.get(ch)
+        if not isinstance(ch_cfg, dict):
+            continue
+        a, b, f = ch_cfg.get("a"), ch_cfg.get("b"), ch_cfg.get("f")
+        if a is None or b is None or f is None or b <= a:
+            logger.warning(
+                f"length_bonus.profile_band.defaults.{ch} is malformed "
+                f"(a={a}, b={b}, f={f}); ignoring this channel"
+            )
+            continue
+        band[ch] = {"a": a, "b": b, "f": f}
+    return band
+
+
+def _merged_profile_band(
+    row_band: dict[str, Any] | None,
+    global_band: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Merge per-row profile_band over global defaults (row channel wins)."""
+    if not global_band:
+        return row_band
+    if not row_band:
+        return dict(global_band)
+    merged: dict[str, Any] = dict(global_band)
+    merged.update(row_band)
+    return merged
+
+
 def _apply_profile_band_multipliers(
     results: list[dict[str, Any]],
     original_rewards: list[float],
@@ -677,17 +725,21 @@ def _apply_profile_band_multipliers(
     defaults: dict[str, Any],
     num_gens: int,
     should_mutate_reward: bool,
+    global_band: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """Apply per-channel profile_band multipliers to correct rollouts.
 
     Each enabled channel contributes a multiplier in [0.0, 1.0] derived from the
-    per-row {a, b, f} block. Records multiplicative deltas as additive-equivalent
-    GDPO reward features, and mutates scalar rewards for length-bonus configs.
+    per-row {a, b, f} block, falling back to ``length_bonus.profile_band.defaults``
+    for channels the row does not provide. Records multiplicative deltas as
+    additive-equivalent GDPO reward features, and mutates scalar rewards for
+    length-bonus configs.
 
     Skips any group where the low-effort bypass already replaced the reward
     (parity with Phase 1 of ``apply_group_length_adjustments``).
     """
     n = len(results)
+    global_band = global_band or {}
     for g in range(0, n, num_gens):
         agent_name = agent_names[g]
         group_size = min(num_gens, n - g)
@@ -701,7 +753,7 @@ def _apply_profile_band_multipliers(
         use_ans = bool(params.get("profile_band_answer", False))
         if not (use_total or use_rsn or use_ans):
             continue
-        band = results[g].get("profile_band")
+        band = _merged_profile_band(results[g].get("profile_band"), global_band)
         if not band:
             continue
         ch_total = band.get("total") if use_total else None

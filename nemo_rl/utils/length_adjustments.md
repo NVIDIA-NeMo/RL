@@ -451,6 +451,54 @@ grpo:
       profile_band_total: true
 ```
 
+#### Global Defaults (dataset without per-prompt bands)
+
+When the dataset has no per-prompt `profile_band` metadata, global `{a, b, f}` values can be
+set directly in the config under `length_bonus.profile_band`. Only the channels listed under
+`defaults` are activated:
+
+```yaml
+grpo:
+  length_bonus:
+    profile_band:
+      enabled: true
+      defaults:
+        total: {a: 10000, b: 20000, f: 0.5}
+```
+
+```yaml
+grpo:
+  length_bonus:
+    profile_band:
+      enabled: true
+      defaults:
+        reasoning: {a: 9000, b: 14000, f: 0.9}
+```
+
+```yaml
+grpo:
+  length_bonus:
+    profile_band:
+      enabled: true
+      defaults:
+        answer: {a: 500, b: 1000, f: 0.9}
+```
+
+The first config applies the multiplier on total length only, the second on reasoning length
+only, and the last on answer length only. Multiple channels may be listed together.
+
+Semantics:
+
+- Channels under `defaults` are implicitly enabled — no need to also set
+  `profile_band_total/reasoning/answer: true` under `length_bonus.default`. Per-agent
+  `agent_overrides` can still disable a channel (e.g. `profile_band_total: false`).
+- Per-prompt `profile_band` metadata, when present on a row, takes precedence over the global
+  defaults on a per-channel basis (a row that only provides `total` still falls back to the
+  global `reasoning`/`answer` blocks if those are configured).
+- The global band also feeds profile-gated group-relative penalties
+  (`group_length_penalty_profile_gate`) when rows lack metadata.
+- A malformed channel block (missing `a`/`b`/`f`, or `b <= a`) is ignored with a warning.
+
 ### 7. Profile-Gated Group Relative-Length Scaling
 
 Config keys:
