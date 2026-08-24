@@ -46,12 +46,41 @@ class _Abortable(Protocol):
     def abort(self) -> None: ...
 
 
+# Carried in every RefitAborted message so the abort survives a boundary that preserves
+# the message but drops the type. vLLM's EngineCore RPC is exactly that boundary: it
+# stringifies the worker's exception into ``failure_message`` (v1/engine/core.py) and
+# re-raises it client-side as a bare ``Exception`` (v1/engine/core_client.py). Nothing we
+# can configure changes that, so the signal has to travel in the text.
+REFIT_ABORTED_TOKEN = "[refit-aborted]"
+
+
 class RefitAborted(RuntimeError):
     """A refit was cut short because a peer stopped participating.
 
     Raised by the worker that armed the watchdog, not by NCCL -- the aborted call itself
     returns cleanly, so this is the only signal the caller gets.
+
+    The constructor prefixes :data:`REFIT_ABORTED_TOKEN` to the message. Idempotent, so a
+    re-raise or an unpickle (``RuntimeError.__reduce__`` replays ``args``) does not stack
+    prefixes.
     """
+
+    def __init__(self, *args: object) -> None:
+        if args and isinstance(args[0], str) and REFIT_ABORTED_TOKEN not in args[0]:
+            args = (f"{REFIT_ABORTED_TOKEN} {args[0]}", *args[1:])
+        super().__init__(*args)
+
+
+def is_refit_abort(error: BaseException) -> bool:
+    """True for a RefitAborted, or for one flattened to a plain Exception in transit.
+
+    The type check alone is not enough anywhere downstream of a vLLM ``collective_rpc``:
+    the abort is raised inside the engine core process and arrives at the Ray actor as
+    ``Exception("Call to <method> method failed: ...")``. A bare ``except RefitAborted``
+    there is dead code, which is what job 6484412 demonstrated -- the deadline fired, the
+    abort was named, and the run still wedged because the handler never matched.
+    """
+    return isinstance(error, RefitAborted) or REFIT_ABORTED_TOKEN in str(error)
 
 
 class RefitAbortWatchdog:

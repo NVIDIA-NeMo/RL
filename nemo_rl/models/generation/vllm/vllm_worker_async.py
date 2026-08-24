@@ -58,7 +58,7 @@ from nemo_rl.models.generation.openai_server_utils import (
 LOGGER = logging.getLogger(__name__)
 
 
-from nemo_rl.distributed.refit_watchdog import RefitAborted
+from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -1491,13 +1491,20 @@ class VllmAsyncGenerationWorkerImpl(
                 return False
             await self._reset_encoder_cache_after_weight_update()
             return True
-        except RefitAborted:
-            # Must propagate, not be folded into `return False`. It is the
-            # controller's signal to rebuild over the survivors and retry;
-            # reported as a generic failure it would just fail the run, which
-            # is the wedge this exists to replace.
-            raise
         except Exception as e:
+            # Propagate a deliberate abort instead of folding it into `return False`. It
+            # is the controller's signal to rebuild over the survivors and retry; reported
+            # as a generic failure it just ends the run, which is the wedge this exists to
+            # replace.
+            #
+            # Matched by message, not by type, and that is not belt-and-braces. vLLM's
+            # EngineCore RPC stringifies the worker exception and re-raises it client-side
+            # as a bare Exception, so the RefitAborted raised inside the engine arrives
+            # here as Exception(str) and a plain `except RefitAborted` never fires. Job
+            # 6484412 is the proof: the deadline fired, the abort was named in the log, and
+            # the run still wedged at step 4 because this handler did not match.
+            if is_refit_abort(e):
+                raise RefitAborted(str(e)) from e
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
 
@@ -1559,12 +1566,20 @@ class VllmAsyncGenerationWorkerImpl(
                 return False
             await self._reset_encoder_cache_after_weight_update()
             return True
-        except RefitAborted:
-            # Propagate, do not fold into `return False`. It is the controller's signal
-            # to rebuild over the survivors and retry; reported as a generic failure it
-            # would just end the run, which is the wedge this exists to replace.
-            raise
         except Exception as e:
+            # Propagate a deliberate abort instead of folding it into `return False`. It
+            # is the controller's signal to rebuild over the survivors and retry; reported
+            # as a generic failure it just ends the run, which is the wedge this exists to
+            # replace.
+            #
+            # Matched by message, not by type, and that is not belt-and-braces. vLLM's
+            # EngineCore RPC stringifies the worker exception and re-raises it client-side
+            # as a bare Exception, so the RefitAborted raised inside the engine arrives
+            # here as Exception(str) and a plain `except RefitAborted` never fires. Job
+            # 6484412 is the proof: the deadline fired, the abort was named in the log, and
+            # the run still wedged at step 4 because this handler did not match.
+            if is_refit_abort(e):
+                raise RefitAborted(str(e)) from e
             print(f"Exception during nccl_reshard_refit: {e}", flush=True)
             import traceback
 

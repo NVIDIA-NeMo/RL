@@ -234,3 +234,44 @@ def test_every_generation_backend_accepts_what_the_synchronizer_sends(backend):
 def test_the_refit_deadline_is_one_of_those_kwargs():
     """Guards the guard: if the deadline stops being forwarded, the test above goes vacuous."""
     assert "refit_timeout_s" in _forwarded_by_policy("broadcast_weights_for_collective")
+
+
+# Refit entrypoints on the Ray-actor side of a vLLM collective_rpc. Everything these call
+# runs in the EngineCore process, whose RPC preserves the exception message and discards
+# the type -- so a RefitAborted raised inside the engine arrives here as a plain Exception.
+_VLLM_RPC_REFIT_ENTRYPOINTS = [
+    ("vllm/vllm_worker.py", "update_weights_from_collective"),
+    ("vllm/vllm_worker.py", "nccl_reshard_refit"),
+    ("vllm/vllm_worker_async.py", "update_weights_from_collective_async"),
+    ("vllm/vllm_worker_async.py", "nccl_reshard_refit_async"),
+]
+
+
+@pytest.mark.parametrize(("module", "method"), _VLLM_RPC_REFIT_ENTRYPOINTS)
+def test_the_abort_is_detected_by_message_not_by_type(module, method):
+    """A bare `except RefitAborted` here is dead code, and it silently wedges the run.
+
+    vLLM's EngineCore stringifies the worker exception into failure_message and re-raises
+    it client-side as Exception(...), so the type never crosses. All four of these once
+    had `except RefitAborted: raise` and none of them ever fired. Job 6484412: the
+    deadline fired, the abort was named in the log, the handler did not match, and the run
+    sat at step 4/24 until the harness killed it.
+    """
+    tree = ast.parse((GENERATION / module).read_text())
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == method
+        ):
+            called = {
+                c.func.id
+                for c in ast.walk(node)
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            }
+            assert "is_refit_abort" in called, (
+                f"{module}::{method} does not call is_refit_abort(). Its broad "
+                "`except Exception` will fold a deliberate abort into `return False`, so "
+                "the controller never rebuilds and the run wedges instead of recovering."
+            )
+            return
+    raise AssertionError(f"{module}::{method} not found")
