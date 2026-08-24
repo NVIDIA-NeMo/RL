@@ -19,6 +19,7 @@ import re
 import uuid
 from collections import defaultdict
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from io import BytesIO
 from typing import Any, Optional, Union
@@ -39,6 +40,7 @@ AUDIO_CONTENT_TYPES = frozenset({"input_audio", "audio", "audio_url"})
 MULTIMODAL_CONTENT_TYPES = frozenset(
     {*IMAGE_CONTENT_TYPES, *VIDEO_CONTENT_TYPES, *AUDIO_CONTENT_TYPES}
 )
+NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS = 8
 
 # List of allowed placeholder strings for different media types in the dataset string
 # e.g. "This is an example of <image>"
@@ -888,6 +890,16 @@ def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
     return f"data:image/{fmt.lower()};base64,{encoded}"
 
 
+def _encode_single_image_source(source: str) -> str:
+    """Resolve and encode one image source."""
+    image = resolve_to_image(source)
+    try:
+        data_url = image_to_data_url(image)
+    finally:
+        image.close()
+    return data_url
+
+
 def extract_input_image_sources_from_responses_messages(
     messages: Any,
 ) -> list[str | Image.Image]:
@@ -1033,13 +1045,13 @@ def attach_image_model_inputs_to_message(
 def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
     """Replace local image paths in NeMo Gym examples with base64 data URLs.
 
-    Walks each example's ``responses_create_params.input[].content[]`` items
-    and rewrites any ``input_image`` part whose ``image_url`` is a local path
-    (or ``file://`` URL) into a base64 ``data:`` URL via
-    :func:`image_to_data_url`. Parts whose URL already starts with ``http://``,
-    ``https://``, or ``data:`` are left untouched. Malformed items (non-dict
-    entries, missing/empty URLs, non-list ``input``/``content``) are skipped
-    without raising.
+    Walks each example's ``responses_create_params.input[].content[]`` items,
+    collects local image references, encodes each unique source once using a
+    bounded thread pool, and rewrites every corresponding image part with the
+    resulting base64 ``data:`` URL. Parts whose URL already starts with
+    ``http://``, ``https://``, or ``data:`` are left untouched. Malformed items
+    (non-dict entries, missing/empty URLs, non-list ``input``/``content``) are
+    skipped without raising.
 
     The examples are mutated in place; the same list is also returned for
     convenience so callers can chain the call.
@@ -1053,6 +1065,8 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
         The same ``nemo_gym_examples`` list, with local image references
         rewritten to base64 data URLs in place.
     """
+    targets_by_source: dict[str, list[tuple[dict, str]]] = {}
+
     for example in nemo_gym_examples:
         input_items = example.get("responses_create_params", {}).get("input", [])
         if not isinstance(input_items, list):
@@ -1082,7 +1096,27 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
                     continue
                 if url.startswith(("http://", "https://", "data:")):
                     continue
-                part[media_key] = image_to_data_url(resolve_to_image(url))
+                targets_by_source.setdefault(url, []).append((part, media_key))
+
+    sources = list(targets_by_source)
+    if sources:
+        with ThreadPoolExecutor(
+            max_workers=NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS
+        ) as executor:
+            encoded_by_source = dict(
+                zip(
+                    sources,
+                    executor.map(_encode_single_image_source, sources),
+                    strict=True,
+                )
+            )
+
+        # Keep payload mutation on the caller thread after worker-owned images
+        # have been closed and every unique source has been encoded.
+        for source, targets in targets_by_source.items():
+            data_url = encoded_by_source[source]
+            for part, media_key in targets:
+                part[media_key] = data_url
     return nemo_gym_examples
 
 
