@@ -211,6 +211,7 @@ class AbstractPolicyWorker:
         data: BatchedDataDict[Any],
         k: int,
         micro_batch_size: Optional[int] = None,
+        return_logsumexp: bool = False,
     ) -> BatchedDataDict[Any]:
         """Run get_topk_logits under the frozen reference-policy weights.
 
@@ -220,10 +221,13 @@ class AbstractPolicyWorker:
         obtains reference logits aligned with the current teacher's indices.
         Requires the worker to have been initialized with a reference model.
         """
+        topk_kwargs: dict[str, Any] = {"data": data, "k": k, "micro_batch_size": micro_batch_size}
+        # Only forward the flag when set: v1/megatron get_topk_logits don't
+        # accept it, and reference top-k without logsumexp works there too.
+        if return_logsumexp:
+            topk_kwargs["return_logsumexp"] = True
         with self.use_reference_model():
-            return self.get_topk_logits(
-                data=data, k=k, micro_batch_size=micro_batch_size
-            )
+            return self.get_topk_logits(**topk_kwargs)
 
     def finalize_async_save(self) -> None:
         """Block until any in-flight async checkpoint write completes. No-op by default."""

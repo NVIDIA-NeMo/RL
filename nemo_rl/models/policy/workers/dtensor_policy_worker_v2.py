@@ -751,6 +751,7 @@ class DTensorPolicyWorkerV2Impl(
         data: BatchedDataDict[Any],
         k: int,
         micro_batch_size: Optional[int] = None,
+        return_logsumexp: bool = False,
     ) -> BatchedDataDict[Any]:
         """Return per-position top-k logits and corresponding global indices.
 
@@ -761,6 +762,9 @@ class DTensorPolicyWorkerV2Impl(
         - If logits are TP-sharded DTensor, performs distributed global top-k across TP.
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
+        - With return_logsumexp=True, additionally returns "logsumexp" [B, S]
+          (full-vocab, fp32) so callers can form TRUE log-probs as
+          topk_logits - logsumexp (SDPO K+1 tail buckets).
         """
         topk_batch_size = (
             micro_batch_size
@@ -773,6 +777,7 @@ class DTensorPolicyWorkerV2Impl(
 
         out_topk_vals = []
         out_topk_idx = []
+        out_lse = []
         self.model.eval()
 
         # Create top-k post-processor
@@ -784,6 +789,7 @@ class DTensorPolicyWorkerV2Impl(
             cp_size=self.cp_size,
             k=k,
             enable_seq_packing=self.enable_seq_packing,
+            return_logsumexp=return_logsumexp,
         )
 
         with torch.no_grad():
@@ -810,7 +816,7 @@ class DTensorPolicyWorkerV2Impl(
                     autocast_enabled=self.autocast_enabled,
                 ):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
-                    (vals, idx), _metrics, _ = forward_with_post_processing_fn(
+                    _topk_out, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
                         post_processing_fn=topk_post_processor,
                         processed_mb=processed_mb,
@@ -819,6 +825,11 @@ class DTensorPolicyWorkerV2Impl(
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
+                    if return_logsumexp:
+                        vals, idx, lse = _topk_out
+                    else:
+                        vals, idx = _topk_out
+                        lse = None
 
                 # skip keeping the topk values for the dummy batches
                 if batch_idx >= iterator_len:
@@ -828,13 +839,16 @@ class DTensorPolicyWorkerV2Impl(
                 # Shapes remain [B, S, k].
                 out_topk_vals.append(vals.cpu())
                 out_topk_idx.append(idx.cpu())
+                if lse is not None:
+                    out_lse.append(lse.cpu())
 
         ret = BatchedDataDict[Any]()
         # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
         all_topk_vals_padded = []
         all_topk_idx_padded = []
+        all_lse_padded = []
         target_seq_len = seq_dim_size
-        for vals, idx in zip(out_topk_vals, out_topk_idx):
+        for mb_i, (vals, idx) in enumerate(zip(out_topk_vals, out_topk_idx)):
             pad_needed = target_seq_len - vals.shape[1]
             if pad_needed > 0:
                 # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
@@ -846,6 +860,13 @@ class DTensorPolicyWorkerV2Impl(
                 )
             all_topk_vals_padded.append(vals)
             all_topk_idx_padded.append(idx)
+            if return_logsumexp:
+                lse = out_lse[mb_i]
+                if pad_needed > 0:
+                    lse = torch.nn.functional.pad(
+                        lse, (0, pad_needed, 0, 0), mode="constant", value=0.0
+                    )
+                all_lse_padded.append(lse)
 
         ret["topk_logits"] = (
             torch.cat(all_topk_vals_padded, dim=0)
@@ -857,6 +878,12 @@ class DTensorPolicyWorkerV2Impl(
             if len(all_topk_idx_padded) > 1
             else all_topk_idx_padded[0]
         ).cpu()
+        if return_logsumexp:
+            ret["logsumexp"] = (
+                torch.cat(all_lse_padded, dim=0)
+                if len(all_lse_padded) > 1
+                else all_lse_padded[0]
+            ).cpu()
         return ret
 
     def get_full_logits_ipc(

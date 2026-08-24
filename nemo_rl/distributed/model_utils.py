@@ -1862,8 +1862,16 @@ def get_distillation_topk_logprobs_from_logits(
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    teacher_is_logprobs: bool = False,
 ):
-    """Compute top-k log probabilities from logits."""
+    """Compute top-k log probabilities from logits.
+
+    When ``teacher_is_logprobs=True``, ``teacher_topk_logits`` already holds
+    TRUE full-vocab log-probs (SDPO K+1 tail buckets: topk_logits - logsumexp,
+    possibly geometrically mixed with the reference for the trust-region
+    teacher) and is passed through instead of being renormalized within the
+    top-k.
+    """
     if teacher_topk_indices.shape[-1] <= 0:
         raise ValueError(
             f"topk must be positive, got {teacher_topk_indices.shape[-1]}. "
@@ -2008,7 +2016,14 @@ def get_distillation_topk_logprobs_from_logits(
     teacher_topk_logits = teacher_topk_logits.to(
         student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
     )
-    teacher_topk_logprobs = torch.nn.functional.log_softmax(teacher_topk_logits, dim=-1)
+    if teacher_is_logprobs:
+        # Already true log-probs; clamp guards tiny positive values from the
+        # trust-region log-prob lerp in reduced precision.
+        teacher_topk_logprobs = teacher_topk_logits.clamp(max=0.0)
+    else:
+        teacher_topk_logprobs = torch.nn.functional.log_softmax(
+            teacher_topk_logits, dim=-1
+        )
 
     # Single point of next-token alignment after TP/CP processing
     teacher_topk_logprobs = teacher_topk_logprobs[:, :-1, :]

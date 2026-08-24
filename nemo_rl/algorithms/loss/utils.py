@@ -120,17 +120,28 @@ def prepare_loss_input(
         loss_input = {"next_token_logprobs": logprobs}
 
     elif loss_fn.input_type == LossInputType.DISTILLATION:
-        calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
+        # K+1 tail buckets (paper A.3): the student side must be TRUE
+        # log-probs at the indices (the zero_outside_topk gather path), no
+        # entropy is needed (the bucket replaces the tail correction), and the
+        # teacher tensor already carries true log-probs from sdpo_train.
+        tail_buckets = getattr(loss_fn, "tail_mode", "legacy") == "k_plus_one"
+        zero_outside_topk = True if tail_buckets else loss_fn.zero_outside_topk
+        calculate_entropy = (
+            False
+            if tail_buckets
+            else (loss_fn.zero_outside_topk and loss_fn.kl_type != "forward")
+        )
         student_topk_logprobs, teacher_topk_logprobs, H_all = (
             get_distillation_topk_logprobs_from_logits(
                 student_logits=logits,
                 teacher_topk_logits=data["teacher_topk_logits"],
                 teacher_topk_indices=data["teacher_topk_indices"],
-                zero_outside_topk=loss_fn.zero_outside_topk,
+                zero_outside_topk=zero_outside_topk,
                 calculate_entropy=calculate_entropy,
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
+                teacher_is_logprobs=tail_buckets,
             )
         )
 
@@ -161,16 +172,24 @@ def prepare_loss_input(
             )
     elif loss_fn.input_type == LossInputType.DISTILLATION_AND_LOGPROB:
         sdpo_loss = loss_fn.sdpo_loss
-        calculate_entropy = sdpo_loss.zero_outside_topk and sdpo_loss.kl_type != "forward"
+        # See the DISTILLATION branch for the K+1 tail-bucket handling.
+        tail_buckets = getattr(sdpo_loss, "tail_mode", "legacy") == "k_plus_one"
+        zero_outside_topk = True if tail_buckets else sdpo_loss.zero_outside_topk
+        calculate_entropy = (
+            False
+            if tail_buckets
+            else (sdpo_loss.zero_outside_topk and sdpo_loss.kl_type != "forward")
+        )
         student_topk_logprobs, teacher_topk_logprobs, H_all = get_distillation_topk_logprobs_from_logits(
             student_logits=logits,
             teacher_topk_logits=data["teacher_topk_logits"],
             teacher_topk_indices=data["teacher_topk_indices"],
-            zero_outside_topk=sdpo_loss.zero_outside_topk,
+            zero_outside_topk=zero_outside_topk,
             calculate_entropy=calculate_entropy,
             vocab_parallel_rank=vocab_parallel_rank,
             vocab_parallel_group=vocab_parallel_group,
             context_parallel_group=context_parallel_group,
+            teacher_is_logprobs=tail_buckets,
         )
 
         logprobs = get_next_token_logprobs_from_logits(

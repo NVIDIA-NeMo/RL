@@ -1253,6 +1253,16 @@ class SDPOLossConfig(BaseModel, extra="allow"):
     # updates (paper Table 12: "Rollout importance sampling clip" = 2).
     # None disables (no extra logprob computation in the training forward).
     rollout_importance_sampling_clip: Optional[float] = None
+    # Tail construction (paper A.3 / reference core_algos.py):
+    # "legacy": teacher renormalized within its top-k + a -100 student tail
+    #   term (the original approximation; internally inconsistent).
+    # "k_plus_one": append a (K+1)-th remainder bucket log(1 - sum p) to BOTH
+    #   distributions built from TRUE log-probs and take the KL over K+1
+    #   categories. Requires teacher log-probs from sdpo_train
+    #   (get_topk_logits with return_logsumexp=True; DTensor v2 only).
+    #   zero_outside_topk is ignored in this mode — the bucket replaces the
+    #   tail correction.
+    tail_mode: str = "legacy"
 
 
 class SDPOLossDataDict(TypedDict):
@@ -1306,7 +1316,12 @@ class SDPOLossFn(LossFunction):
         self.reference_policy_kl_penalty: float = cfg.reference_policy_kl_penalty
         self.reference_policy_kl_type: str = cfg.reference_policy_kl_type
         self.rollout_importance_sampling_clip: Optional[float] = cfg.rollout_importance_sampling_clip
+        self.tail_mode: str = cfg.tail_mode
 
+        if self.tail_mode not in {"legacy", "k_plus_one"}:
+            raise ValueError(
+                f"SDPOLossFn: tail_mode must be 'legacy' or 'k_plus_one', got {self.tail_mode!r}"
+            )
         if self.kl_type not in {"forward", "reverse", "mixed", "js"}:
             raise ValueError(f"SDPOLossFn: kl_type must be one of forward/reverse/mixed/js, got {self.kl_type}")
         if not 0.0 <= self.mixed_kl_weight <= 1.0:
@@ -1352,8 +1367,32 @@ class SDPOLossFn(LossFunction):
         Returns:
             (loss, metrics)
         """
-        student_probs = student_topk_logprobs.exp()  # [B, S-1, K]
-        teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, K]
+        # K+1 tail buckets (paper A.3; reference core_algos.py:1112-1131):
+        # both tensors hold TRUE log-probs here (student from the full-vocab
+        # gather, teacher from topk_logits - logsumexp in sdpo_train, possibly
+        # geometrically mixed with the reference — the mixture's missing
+        # normalizer Z <= 1 lands in the teacher's remainder bucket, keeping
+        # it a valid categorical). Append log(1 - sum p) to both and run the
+        # usual divergence over K+1 categories; the legacy tail correction is
+        # skipped below (the bucket replaces it). The student bucket carries
+        # gradient through sum(exp(logprobs)).
+        if self.tail_mode == "k_plus_one":
+            # eps must be representable next to 1.0 in fp32 (spacing ~1.2e-7):
+            # 1.0 - 1e-8 rounds back to exactly 1.0, making the clamp a no-op
+            # and log1p(-1.0) = -inf -> 0 * -inf = NaN on near-deterministic
+            # tokens whose top-k mass is numerically 1.0.
+            eps = 1e-6
+            s_sum = student_topk_logprobs.exp().sum(dim=-1).clamp(max=1.0 - eps)
+            t_sum = teacher_topk_logprobs.exp().sum(dim=-1).clamp(max=1.0 - eps)
+            student_topk_logprobs = torch.cat(
+                [student_topk_logprobs, torch.log1p(-s_sum).unsqueeze(-1)], dim=-1
+            )
+            teacher_topk_logprobs = torch.cat(
+                [teacher_topk_logprobs, torch.log1p(-t_sum).unsqueeze(-1)], dim=-1
+            )
+
+        student_probs = student_topk_logprobs.exp()  # [B, S-1, K] (K+1 in bucket mode)
+        teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, K] (K+1 in bucket mode)
 
         if self.kl_type == "forward":
             per_token_kl = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
@@ -1382,7 +1421,11 @@ class SDPOLossFn(LossFunction):
         # ~zero contribution) and "js" (the JS midpoint distribution doesn't
         # factor into a clean single-direction tail; top-K truncation already
         # bounds the per-token loss and JS is bounded in [0, log 2] regardless).
-        if self.zero_outside_topk and self.kl_type not in {"forward", "js"}:
+        if (
+            self.tail_mode != "k_plus_one"
+            and self.zero_outside_topk
+            and self.kl_type not in {"forward", "js"}
+        ):
             assert H_all is not None, (
                 "SDPOLossFn requires H_all when zero_outside_topk=True; "
                 "the policy training forward must compute full-vocab entropy."

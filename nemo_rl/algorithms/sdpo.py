@@ -1075,6 +1075,19 @@ def sdpo_train(
             flush=True,
         )
 
+    # K+1 tail buckets (paper A.3): the teacher tensor shipped to the loss
+    # must be TRUE log-probs, so the teacher forwards also return the
+    # full-vocab logsumexp and the trust-region mix happens in log-prob space
+    # (Eq. 10's geometric mixture; its missing normalizer lands in the tail
+    # bucket). Read from the loss fn so config validation lives in one place.
+    _sdpo_leg = loss_fn.sdpo_loss if isinstance(loss_fn, SDPOHybridLossFn) else loss_fn
+    tail_buckets = getattr(_sdpo_leg, "tail_mode", "legacy") == "k_plus_one"
+    if tail_buckets:
+        print(
+            "  ✓ K+1 tail buckets (paper A.3): teacher shipped as true log-probs",
+            flush=True,
+        )
+
     # SDPO+GRPO hybrid: build the GRPO advantage estimator used by
     # the policy-gradient term. Only active when loss_fn is the hybrid.
     is_hybrid = isinstance(loss_fn, SDPOHybridLossFn)
@@ -1317,19 +1330,31 @@ def sdpo_train(
                         teacher_data,
                         k=topk_logits_k,
                         timer=timer,
+                        return_logsumexp=tail_buckets,
                     )
                     teacher_topk_logits_raw = teacher_topk["topk_logits"]
                     teacher_topk_indices_raw = teacher_topk["topk_indices"]
+                    if tail_buckets:
+                        # K+1 buckets need TRUE log-probs so the remainder
+                        # bucket 1 - sum(p) is meaningful downstream.
+                        teacher_topk_logits_raw = (
+                            teacher_topk_logits_raw.to(torch.float32)
+                            - teacher_topk["logsumexp"].unsqueeze(-1)
+                        )
 
                 # ── Trust-region teacher (paper §2.3; reference repo's
-                # TrustRegionTeacher). Blend the frozen init policy's logits
-                # into the distillation target so the teacher cannot follow
-                # the student into self-amplifying drift:
-                #   teacher_logits = lerp(ref, current, mix_coef)
-                # evaluated at the distillation indices — the student's top-k
-                # when topk_source="student" (exactly where the student has
-                # mass, which reverse KL needs), else the teacher's own top-k
-                # (a current-policy approximation of the same).
+                # TrustRegionTeacher). Blend the frozen init policy into the
+                # distillation target so the teacher cannot follow the student
+                # into self-amplifying drift, evaluated at the distillation
+                # indices — the student's top-k when topk_source="student"
+                # (exactly where the student has mass, which reverse KL
+                # needs), else the teacher's own top-k (a current-policy
+                # approximation of the same).
+                # Legacy tail: lerp raw logits (equivalent to Eq. 10 under the
+                # loss's top-k renormalization). K+1 buckets: lerp TRUE
+                # log-probs — exactly Eq. 10's unnormalized geometric mixture;
+                # its missing normalizer Z <= 1 lands in the teacher's
+                # remainder bucket, keeping a valid categorical.
                 if teacher_regularization == "trust_region":
                     print("Computing trust-region reference teacher logits...", flush=True)
                     with timer.time("teacher_trust_region_ref_logits"):
@@ -1344,11 +1369,19 @@ def sdpo_train(
                             ref_gather_data,
                             k=topk_logits_k,
                             timer=timer,
+                            return_logsumexp=tail_buckets,
                         )
                         ref_logits_at_idx = ref_topk["topk_logits"].to(
                             device=teacher_topk_logits_raw.device,
                             dtype=teacher_topk_logits_raw.dtype,
                         )
+                        if tail_buckets:
+                            ref_logits_at_idx = ref_logits_at_idx - ref_topk[
+                                "logsumexp"
+                            ].to(
+                                device=ref_logits_at_idx.device,
+                                dtype=ref_logits_at_idx.dtype,
+                            ).unsqueeze(-1)
                         teacher_topk_logits_raw = torch.lerp(
                             ref_logits_at_idx,
                             teacher_topk_logits_raw,

@@ -628,10 +628,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         k: int,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
+        return_logsumexp: bool = False,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
-        """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
+        """Dispatch get_topk_logits to workers (no CP/packed support initially).
+
+        With return_logsumexp=True the result also carries "logsumexp" [B, S]
+        (full-vocab, fp32; DTensor v2 backend only) so callers can form TRUE
+        log-probs as topk_logits - logsumexp.
+        """
         with timer.time("get_topk_logits/shard_data") if timer else nullcontext():
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
+
+        common_kwargs: dict[str, Any] = {"k": k, "micro_batch_size": micro_batch_size}
+        if return_logsumexp:
+            # Only forwarded when set: v1/megatron workers don't accept it.
+            common_kwargs["return_logsumexp"] = True
 
         with (
             timer.time("get_topk_logits/submit_topk_logits_futures")
@@ -652,7 +663,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+                common_kwargs=common_kwargs,
             )
 
         # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).
@@ -663,6 +674,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         stacked: BatchedDataDict[TopkLogitsOutputSpec] = BatchedDataDict()
         stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
         stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
+        if return_logsumexp:
+            stacked["logsumexp"] = torch.cat(
+                [wb["logsumexp"] for wb in worker_batches], dim=0
+            )
 
         if unsorted_data_indices is not None:
             stacked.reorder_data(unsorted_data_indices)
@@ -675,13 +690,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         k: int,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
+        return_logsumexp: bool = False,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """get_topk_logits under the frozen reference-policy weights.
 
         Pass "topk_gather_indices" [B, S, k] in ``data`` to evaluate the
         reference logits at those global vocab indices instead of the
         reference's own top-k (SDPO trust-region teacher). Requires the policy
-        to have been initialized with init_reference_model=True.
+        to have been initialized with init_reference_model=True. With
+        return_logsumexp=True the result also carries "logsumexp" [B, S].
         """
         with (
             timer.time("get_reference_policy_topk_logits/shard_data")
@@ -689,6 +706,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             else nullcontext()
         ):
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
+
+        common_kwargs: dict[str, Any] = {"k": k, "micro_batch_size": micro_batch_size}
+        if return_logsumexp:
+            common_kwargs["return_logsumexp"] = True
 
         with (
             timer.time("get_reference_policy_topk_logits/submit_futures")
@@ -709,7 +730,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+                common_kwargs=common_kwargs,
             )
 
         # Same stacking as get_topk_logits: avoid from_batches (it flattens
@@ -722,6 +743,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         stacked["topk_indices"] = torch.cat(
             [wb["topk_indices"] for wb in worker_batches], dim=0
         )
+        if return_logsumexp:
+            stacked["logsumexp"] = torch.cat(
+                [wb["logsumexp"] for wb in worker_batches], dim=0
+            )
 
         if unsorted_data_indices is not None:
             stacked.reorder_data(unsorted_data_indices)

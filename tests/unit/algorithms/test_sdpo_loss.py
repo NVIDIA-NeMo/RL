@@ -546,3 +546,143 @@ def test_sdpo_rollout_is_invalid_clip_raises():
         _is_clip_loss_fn(0.0)
     with pytest.raises(ValueError, match="rollout_importance_sampling_clip"):
         _is_clip_loss_fn(-1.0)
+
+
+def _bucket_loss_fn(kl_type="reverse", **extra):
+    return SDPOLossFn(
+        {
+            "kl_type": kl_type,
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": True,  # ignored in bucket mode
+            "success_reward_threshold": 1.0,
+            "tail_mode": "k_plus_one",
+            **extra,
+        }
+    )
+
+
+def test_sdpo_k_plus_one_zero_when_teacher_equals_student():
+    """Identical true log-probs -> identical buckets -> KL exactly 0."""
+    logits = torch.randn(2, 5, 16)
+    s, t, H, data, gvt = _build_inputs(
+        batch_size=2,
+        seq_len=6,
+        vocab_size=16,
+        student_logits=logits,
+        teacher_logits=logits.clone(),
+    )
+    for kl_type in ("forward", "reverse", "mixed", "js"):
+        loss_fn = _bucket_loss_fn(kl_type)
+        # H_all is not needed in bucket mode
+        loss, _ = loss_fn(s, t, None, data, torch.tensor(2.0), gvt)
+        assert torch.allclose(loss, torch.zeros_like(loss), atol=1e-5), (kl_type, loss.item())
+
+
+def test_sdpo_k_plus_one_matches_manual_categorical_kl():
+    """Bucket-mode reverse KL == KL of the manually built K+1 categoricals."""
+    s, t, H, data, gvt = _build_inputs(batch_size=2, seq_len=4, topk=3, vocab_size=12)
+    loss_fn = _bucket_loss_fn("reverse")
+    loss, metrics = loss_fn(s, t, None, data, torch.tensor(2.0), gvt)
+
+    # Manual: append log(1 - sum p) buckets to the true log-probs.
+    def bucketize(lp):
+        rest = torch.log1p(-lp.exp().sum(-1).clamp(max=1 - 1e-8))
+        return torch.cat([lp, rest.unsqueeze(-1)], dim=-1)
+
+    sb, tb = bucketize(s), bucketize(t)
+    per_token = (sb.exp() * (sb - tb)).sum(-1)  # [B, S-1]
+    token_mask = data["token_mask"][:, 1:]
+    expected = (per_token * token_mask).sum() / gvt
+    assert torch.allclose(loss, expected, atol=1e-6), (loss.item(), expected.item())
+
+
+def test_sdpo_k_plus_one_nonnegative_and_positive_when_different():
+    """Bucket KL is a KL of full categoricals -> guaranteed >= 0, and > 0 for
+    differing distributions (unlike the legacy truncated top-k sum, which can
+    go negative on partial sums)."""
+    torch.manual_seed(3)
+    s, t, H, data, gvt = _build_inputs(batch_size=4, seq_len=6, topk=5, vocab_size=32)
+    loss_fn = _bucket_loss_fn("reverse")
+    loss, metrics = loss_fn(s, t, None, data, torch.tensor(4.0), gvt)
+    assert loss.item() > 0
+    assert metrics["sdpo/per_pos_kl"] > 0
+
+
+def test_sdpo_k_plus_one_invalid_tail_mode_raises():
+    with pytest.raises(ValueError, match="tail_mode"):
+        SDPOLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": True,
+                "success_reward_threshold": 1.0,
+                "tail_mode": "buckets",
+            }
+        )
+
+
+def test_full_vocab_logsumexp_matches_torch():
+    """Non-distributed branch of the top-k post-processor's logsumexp helper."""
+    from nemo_rl.models.automodel.train import TopkLogitsPostProcessor
+
+    torch.manual_seed(0)
+    proc = TopkLogitsPostProcessor(
+        cfg={},
+        device_mesh=None,
+        cp_mesh=None,
+        tp_mesh=None,
+        cp_size=1,
+        k=3,
+        enable_seq_packing=False,
+        return_logsumexp=True,
+    )
+    logits = torch.randn(2, 2500, 64)  # > one 1024 seq chunk
+    lse = proc._full_vocab_logsumexp(logits)
+    assert torch.allclose(lse, torch.logsumexp(logits.to(torch.float32), dim=-1), atol=1e-5)
+
+
+def test_sdpo_k_plus_one_finite_on_deterministic_tokens():
+    """Regression for job 20553: near-deterministic tokens have top-k mass
+    numerically equal to 1.0 in fp32; the remainder bucket must stay finite
+    (1.0 - 1e-8 rounds to 1.0 in fp32, so a too-small eps makes log1p(-1) =
+    -inf and the loss NaN). Indices are student-selected, mirroring
+    topk_source="student"."""
+    import torch.nn.functional as F
+
+    B, S, K, V = 2, 5, 3, 16
+    # One dominant logit per position -> top-1 prob == 1.0 in fp32.
+    student_logits = torch.full((B, S - 1, V), -60.0)
+    student_logits[..., 0] = 60.0
+    teacher_logits = torch.full((B, S - 1, V), -60.0)
+    teacher_logits[..., 1] = 60.0  # teacher deterministic on a DIFFERENT token
+
+    student_logp = F.log_softmax(student_logits, dim=-1)
+    teacher_logp = F.log_softmax(teacher_logits, dim=-1)
+    idx = student_logits.topk(K, dim=-1).indices  # student-selected indices
+    s = student_logp.gather(-1, idx)
+    t = teacher_logp.gather(-1, idx)
+
+    data = {
+        "input_ids": torch.zeros(B, S, dtype=torch.long),
+        "token_mask": torch.ones(B, S),
+        "sample_mask": torch.ones(B),
+        "sdpo_mask": torch.ones(B),
+    }
+    gvt = torch.tensor(float(B * (S - 1)))
+
+    # Premise: student top-k mass is exactly 1.0 in fp32 -> the clamp must bite.
+    assert torch.isclose(s.exp().sum(-1).max(), torch.tensor(1.0))
+    # And the teacher has ~zero mass at these indices -> its bucket holds ~all mass.
+    assert t.exp().sum(-1).max() < 1e-6
+
+    for kl_type in ("forward", "reverse", "mixed", "js"):
+        loss_fn = _bucket_loss_fn(kl_type)
+        loss, metrics = loss_fn(s, t, None, data, torch.tensor(2.0), gvt)
+        assert torch.isfinite(loss), (kl_type, loss.item())
+        assert loss.item() >= 0
+        assert math.isfinite(metrics["sdpo/per_pos_kl"])
+    # And the gradient path stays finite too.
+    s_grad = s.clone().requires_grad_(True)
+    loss, _ = _bucket_loss_fn("reverse")(s_grad, t, None, data, torch.tensor(2.0), gvt)
+    loss.backward()
+    assert torch.isfinite(s_grad.grad).all()

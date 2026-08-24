@@ -2379,3 +2379,83 @@ class TestTopkGatherAtIndices:
         proc = self._make_processor(k=3)
         with pytest.raises(AssertionError, match="must equal k"):
             proc._gather_at_indices(logits, idx, None, torch.tensor([4]))
+
+
+class TestTopkReturnLogsumexp:
+    """return_logsumexp mode returns a 3-tuple through the full __call__ path."""
+
+    def test_call_returns_three_tuple_with_correct_lse(self):
+        from nemo_rl.models.automodel.train import TopkLogitsPostProcessor
+
+        torch.manual_seed(0)
+        B, S, V, K = 2, 6, 32, 4
+        logits = torch.randn(B, S, V)
+        proc = TopkLogitsPostProcessor(
+            cfg={},
+            device_mesh=None,
+            cp_mesh=None,
+            tp_mesh=None,
+            cp_size=1,
+            k=K,
+            enable_seq_packing=False,
+            return_logsumexp=True,
+        )
+        data_dict = BatchedDataDict({"input_lengths": torch.tensor([S, S])})
+        result = proc(
+            logits=logits,
+            data_dict=data_dict,
+            processed_inputs=None,
+            original_batch_size=B,
+            original_seq_len=S,
+        )
+        assert len(result) == 3
+        vals, idx, lse = result
+        exp_vals, exp_idx = torch.topk(logits.to(torch.float32), k=K, dim=-1)
+        assert torch.allclose(vals, exp_vals)
+        assert torch.equal(idx, exp_idx)
+        assert torch.allclose(lse, torch.logsumexp(logits.to(torch.float32), dim=-1), atol=1e-5)
+        # True log-probs derived the way sdpo_train does it sum to <= 1
+        p_sum = (vals - lse.unsqueeze(-1)).exp().sum(-1)
+        assert (p_sum <= 1.0 + 1e-5).all()
+
+    def test_forward_wrapper_metrics_handle_three_tuple(self):
+        # The exact unpack that crashed job 20549: forward_with_post_processing_fn
+        # builds its metrics dict from the post-processor result.
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from nemo_rl.models.automodel import train as am_train
+
+        torch.manual_seed(0)
+        B, S, V, K = 1, 4, 16, 3
+        logits = torch.randn(B, S, V)
+        proc = am_train.TopkLogitsPostProcessor(
+            cfg={},
+            device_mesh=None,
+            cp_mesh=None,
+            tp_mesh=None,
+            cp_size=1,
+            k=K,
+            enable_seq_packing=False,
+            return_logsumexp=True,
+        )
+        processed_mb = SimpleNamespace(
+            processed_inputs=SimpleNamespace(cp_buffers=None),
+            data_dict=BatchedDataDict({"input_lengths": torch.tensor([S])}),
+            original_batch_size=B,
+            original_seq_len=S,
+        )
+        with (
+            patch.object(am_train, "model_forward", return_value=logits),
+            patch.object(am_train, "extract_logits", return_value=logits),
+        ):
+            result, metrics, _ = am_train.forward_with_post_processing_fn(
+                model=None,
+                post_processing_fn=proc,
+                processed_mb=processed_mb,
+                is_reward_model=False,
+                allow_flash_attn_args=True,
+                sampling_params=None,
+            )
+        assert len(result) == 3
+        assert set(metrics) == {"topk_logits", "topk_indices", "logsumexp"}
