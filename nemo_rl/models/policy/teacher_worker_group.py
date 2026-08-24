@@ -147,15 +147,15 @@ class TeacherWorkerGroup:
         )
 
         # Apply any additional megatron config overrides from teacher config.
-        # The sentinel "__unset__" REMOVES a key: needed when the student is a
-        # VLM but this teacher is text-only, because iter_vlm_config_overrides
-        # is presence-based and import_model_from_hf_name raises if a VLM tower
-        # key is set for a provider that lacks the field.
         for key, value in teacher_cfg.megatron_cfg_overrides.items():
-            if value == "__unset__":
-                cfg["megatron_cfg"].pop(key, None)
-            else:
-                cfg["megatron_cfg"][key] = value
+            cfg["megatron_cfg"][key] = value
+
+        # Teachers clone the student's megatron_cfg, so a cross-architecture
+        # teacher (e.g. text teacher under a VLM student) inherits tower keys
+        # its provider lacks. Students keep the strict raise (a dropped freeze
+        # flag would silently train a frozen tower); frozen inference-only
+        # teachers drop such keys with a warning instead.
+        cfg["megatron_cfg"]["_drop_unsupported_tower_keys"] = True
 
         # Teachers run Megatron inference-only. Don't let the student's other
         # backend or parameter-adding features leak onto the frozen teacher.

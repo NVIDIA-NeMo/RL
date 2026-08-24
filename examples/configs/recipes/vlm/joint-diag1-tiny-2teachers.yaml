@@ -224,25 +224,13 @@ on_policy_distillation:
         precision: bf16
         micro_batch_size: 1
         moe_shared_expert_overlap: false
-        # text-only teacher under a VLM student: strip the omni base's VLM
-        # tower keys or import_model_from_hf_name raises "HybridModelProvider
-        # has no such field" (job 6442219). __unset__ removes the key.
-        radio_force_cpe_eval_mode: __unset__
-        freeze_vision_model: __unset__
-        freeze_vision_projection: __unset__
-        freeze_sound_encoder: __unset__
-        freeze_sound_projection: __unset__
-        # The VLM student's mtp_num_layers: 0 must not leak either: this
-        # teacher checkpoint HAS MTP layers (HF mtp_layers_block_type), and a
-        # 0-layer config over an MTP model hits `assert mtp_num_layers > 0` in
-        # hybrid_model.forward on every get_logprobs (job 6444954, 2.5k-error
-        # storm). Unset all four so the bridge derives them from the teacher's
-        # own HF config (the text runs worked only because their student also
-        # used mtp 5, so the leak happened to match).
-        mtp_num_layers: __unset__
-        mtp_use_repeated_layer: __unset__
-        mtp_loss_scaling_factor: __unset__
-        mtp_detach_heads: __unset__
+        # explicit values for the MTP-bearing text teacher (checkpoint has ONE
+        # mtp layer: mtp_layers_block_type ['attention','moe']); the student's
+        # mtp_num_layers: 0 must not leak (hybrid_model forward asserts >0).
+        mtp_num_layers: 1
+        mtp_use_repeated_layer: false
+        mtp_loss_scaling_factor: 0.0
+        mtp_detach_heads: true
         # duplicated from default_teacher_cfg in case per-alias overrides
         # don't inherit the default's extra keys
         empty_unused_memory_level: 1

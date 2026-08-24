@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
@@ -137,7 +138,17 @@ def import_model_from_hf_name(
             # Match the import-time behaviour in megatron/setup.py: a key the
             # recipe set explicitly must not be dropped just because this
             # provider lacks the field, or a frozen tower silently trains.
+            # Exception: inference-only teachers cloned from a cross-
+            # architecture student's config (flag set by TeacherWorkerGroup)
+            # drop such keys with a warning instead.
             if not hasattr(model_provider, key):
+                if megatron_config.get("_drop_unsupported_tower_keys"):
+                    warnings.warn(
+                        f"Dropping megatron_cfg key '{key}' inherited from the "
+                        f"student: {type(model_provider).__name__} has no such "
+                        "field (cross-architecture teacher)."
+                    )
+                    continue
                 raise ValueError(
                     f"megatron_cfg set '{key}' but "
                     f"{type(model_provider).__name__} has no such field; this "

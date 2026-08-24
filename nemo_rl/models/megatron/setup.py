@@ -684,6 +684,17 @@ def setup_model_config(
     # and consistent between logprob and training passes.
     for vlm_key, vlm_value in iter_vlm_config_overrides(config["megatron_cfg"]):
         if not hasattr(model_cfg, vlm_key):
+            # Inference-only teachers cloned from a cross-architecture
+            # student's config drop unsupported tower keys with a warning
+            # (flag set by TeacherWorkerGroup); students keep the strict
+            # raise so a frozen tower can never silently train.
+            if config["megatron_cfg"].get("_drop_unsupported_tower_keys"):
+                warnings.warn(
+                    f"Dropping megatron_cfg key '{vlm_key}' inherited from the "
+                    f"student: {type(model_cfg).__name__} has no such field "
+                    "(cross-architecture teacher)."
+                )
+                continue
             raise ValueError(
                 f"megatron_cfg set '{vlm_key}' but {type(model_cfg).__name__} has no "
                 "such field; this provider does not support that tower control."
