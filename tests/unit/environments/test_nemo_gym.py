@@ -1617,6 +1617,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             cfg = {}
             rch = _RolloutCollectionHelper()
             head_server_config = object()
+            _rollout_batch_index = 0
 
             def _require_spinup(self):
                 pass
@@ -1628,6 +1629,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
                 result_tokenizer,
                 *,
                 include_initial_multimodal_data,
+                generation_only,
             ):
                 del self
                 postprocess_calls.append(
@@ -1636,6 +1638,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
                         result,
                         result_tokenizer,
                         include_initial_multimodal_data,
+                        generation_only,
                     )
                 )
                 return {"message_log": []}
@@ -1648,7 +1651,9 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         ):
             streamed_results.append(result)
 
-        assert postprocess_calls == [(nemo_gym_row, nemo_gym_result, tokenizer, True)]
+        assert postprocess_calls == [
+            (nemo_gym_row, nemo_gym_result, tokenizer, True, False)
+        ]
         assert streamed_results[0][0] == 7
         assert streamed_results[0][1] == {"message_log": []}
 
