@@ -58,7 +58,7 @@ _GLOBAL_BATCH_SIZE = _NUM_PROMPTS_PER_STEP * _NUM_GENERATIONS_PER_PROMPT
 
 def _value_config(
     *,
-    megatron_enabled: bool = False,
+    megatron_enabled: bool = True,
     train_global_batch_size: int = _GLOBAL_BATCH_SIZE,
 ) -> dict:
     return {
@@ -149,7 +149,7 @@ def _ppo_master_config(**kwargs) -> MasterConfig:
         ),
     )
     kwargs.setdefault(
-        "value", _value_config(megatron_enabled=kwargs.get("megatron_enabled", False))
+        "value", _value_config(megatron_enabled=kwargs.get("megatron_enabled", True))
     )
     kwargs.setdefault("value_loss_fn", MseValueLossConfig())
     return _make_master_config(**kwargs)
@@ -322,8 +322,34 @@ class TestPPOValidation:
         mc.grpo.overlong_filtering = True
 
         with pytest.raises(
-            NotImplementedError, match=r"grpo\.overlong_filtering"
+            NotImplementedError, match="overlong_filtering not supported"
         ):
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_dtensor_critic(self):
+        """Only the Megatron value worker carries TQWorkerMixin."""
+        mc = _ppo_master_config(value=_value_config(megatron_enabled=False))
+
+        with pytest.raises(ValueError, match=r"value\.megatron_cfg\.enabled=true"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        "field", ["max_skipped_prompts", "max_consecutive_dropped_prompts"]
+    )
+    def test_rejects_a_drop_budget_under_ppo(self, field):
+        """A drop shortens the step; the critic shards against the configured size."""
+        mc = _ppo_master_config()
+        setattr(mc.async_rl.rollout_failure, field, 1)
+
+        with pytest.raises(ValueError, match=r"max_skipped_prompts=0"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_warmup_lookahead_on_a_grpo_run(self):
+        """GRPO never widens the window, but capacity is still sized for it."""
+        mc = _make_master_config()
+        mc.async_rl.sampler.warmup_lookahead_versions = 2
+
+        with pytest.raises(ValueError, match="PPO critic-warmup knob"):
             validate_single_controller_config(mc)
 
     def test_grpo_is_free_to_use_any_sampler(self):
@@ -462,16 +488,27 @@ class TestSetupBuildsTheCritic:
     ):
         """Both worker groups sit on the training cluster; leaving the policy
         resident through the critic's init is what OOMs a tight fit."""
+        calls: list[str] = []
         policy = patched_ppo_factories["policy"]
         value = patched_ppo_factories["value"]
+        policy.offload_to_cpu.side_effect = lambda: calls.append("policy.offload")
+        policy.prepare_for_training.side_effect = lambda: calls.append("policy.onload")
+        value.finish_training.side_effect = lambda: calls.append("critic.finish")
+        patched_ppo_factories["_build_value"].side_effect = lambda *a, **k: (
+            calls.append("critic.build"),
+            (value, 2.0),
+        )[1]
 
         setup_single_controller(
             _ppo_master_config(), tokenizer=MagicMock(pad_token_id=0)
         )
 
-        policy.offload_to_cpu.assert_called_once_with()
-        value.finish_training.assert_called_once_with()
-        policy.prepare_for_training.assert_called_once_with()
+        assert calls == [
+            "policy.offload",
+            "critic.build",
+            "critic.finish",
+            "policy.onload",
+        ]
 
     def test_grpo_run_builds_no_critic(self, patched_ppo_factories):
         actor_args, timing = setup_single_controller(

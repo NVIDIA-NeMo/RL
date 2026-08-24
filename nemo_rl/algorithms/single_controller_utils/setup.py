@@ -418,7 +418,7 @@ def _generation_max_seq_len(generation_config) -> int:
 def _clamp_max_num_steps(
     master_config: MasterConfig, dataloader: StatefulDataLoader
 ) -> None:
-    """Clamp grpo.max_num_steps to max_num_epochs * len(dataloader)."""
+    """Clamp max_num_steps to max_num_epochs * len(dataloader)."""
     algo_cfg = algo_config(master_config)
     max_num_epochs = algo_cfg.max_num_epochs
     if max_num_epochs is None or max_num_epochs <= 0:
@@ -610,7 +610,7 @@ def setup_single_controller(
     if algo_cfg.val_period > 0 or algo_cfg.val_at_start or algo_cfg.val_at_end:
         raise NotImplementedError(
             "SingleController doesn't support validation now, will support "
-            "later. Set grpo.val_period=0, val_at_start=false, val_at_end=false."
+            "later. Set val_period=0, val_at_start=false, val_at_end=false."
         )
     if dp_config is None or not dp_config.get("enabled", False):
         raise ValueError(
