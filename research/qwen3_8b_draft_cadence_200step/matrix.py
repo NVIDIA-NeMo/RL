@@ -219,7 +219,7 @@ def render_hydra_overrides(arm: Arm, *, result_dir: str) -> tuple[str, ...]:
         "data_plane.enabled=true",
         "checkpointing.enabled=true",
         "checkpointing.save_period=50",
-        "checkpointing.keep_top_k=null",
+        "checkpointing.keep_top_k=4",
         "checkpointing.metric_name=null",
         "checkpointing.save_optimizer=true",
         f"checkpointing.checkpoint_dir={result_dir}/checkpoints",

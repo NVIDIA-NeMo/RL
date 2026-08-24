@@ -124,7 +124,7 @@ class MatrixContractTest(unittest.TestCase):
             "policy.generation.max_new_tokens=1024",
             "policy.train_global_batch_size=8",
             "checkpointing.save_period=50",
-            "checkpointing.keep_top_k=null",
+            "checkpointing.keep_top_k=4",
             "checkpointing.metric_name=null",
             "cadence_runtime.enabled=true",
             "cadence_runtime.required_checkpoint_steps=[50,100,150,200]",

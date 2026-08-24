@@ -162,3 +162,9 @@ rejected key was `policy.generation.vllm_kwargs.max_num_seqs` on all 13 arms.
 All rendered fields now use Hydra's `++` force-add-or-override form, and the
 startup canary performs real `MasterConfig` composition for every arm before a
 new array may be submitted.
+
+The first composition-aware canary, `6479646`, then rejected
+`checkpointing.keep_top_k=null` because the current `MasterConfig` type requires
+an integer. The matrix now uses `keep_top_k=4`, which preserves the four required
+periodic checkpoints at steps 50, 100, 150, and 200 while keeping
+`metric_name=null` for recency-based retention.
