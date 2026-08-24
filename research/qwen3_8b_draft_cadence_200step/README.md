@@ -106,4 +106,6 @@ That exact path is explicitly mounted into the nested Pyxis container. This
 also prevents the 13 concurrent MCore jobs from racing on generated helper
 artifacts in one shared checkout. A preflight-only task-0 canary using the same
 archive, renderer, mount, and `ray.sub` path is mandatory before the recovered
-`0-12` array is submitted.
+`0-12` array is submitted. The canary also composes and validates all 13 final
+Hydra configurations as `MasterConfig` instances so a schema-invalid arm cannot
+pass the startup gate.

@@ -50,7 +50,7 @@ class StagedLaunchContractTest(unittest.TestCase):
             root = Path(directory)
             staged = self._archive(root)
             scratch = root / "scratch"
-            result_root = root / "results"
+            result_root = root / "results it's-valid"
             result_root.mkdir()
             receipt = root / "receipt.txt"
             script = root / "run.sh"
@@ -81,6 +81,7 @@ class StagedLaunchContractTest(unittest.TestCase):
             )
             self.assertIn(f"cd {expected_source}", lines[2])
             self.assertIn("launch preflight", lines[2])
+            self.assertIn("launch compose-preflight", lines[2])
             self.assertIn("--arm dflash-fixed-10", lines[2])
             self.assertNotIn("run_arm.sh", lines[2])
             self.assertEqual(lines[3], f"submit_dir={result_root}")

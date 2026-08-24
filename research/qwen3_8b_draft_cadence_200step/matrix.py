@@ -265,4 +265,7 @@ def render_hydra_overrides(arm: Arm, *, result_dir: str) -> tuple[str, ...]:
             f"policy.draft.update_schedule.{key}={_value(value)}"
             for key, value in arm.schedule.items()
         )
-    return tuple(overrides)
+    return tuple(
+        override if override.startswith(("+", "~")) else f"++{override}"
+        for override in overrides
+    )

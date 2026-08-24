@@ -64,12 +64,16 @@ def render_staged_array_script(
     target_cache = _quoted(str(Path(TARGET_SNAPSHOT).parents[3]))
     container = _quoted(CONTAINER)
     if canary:
-        quoted_result_dir_assignment = ""
+        quoted_result_dir_assignment = (
+            "quoted_result_root=$(printf '%q' \"${result_root}\")"
+        )
         command = (
             'export COMMAND="cd ${quoted_source} && python3 -m '
             "research.qwen3_8b_draft_cadence_200step.launch preflight "
             "--arm ${arm} --source-root ${quoted_source} "
-            f'--expected-product-head {expected_product_head}"'
+            f"--expected-product-head {expected_product_head} && python3 -m "
+            "research.qwen3_8b_draft_cadence_200step.launch compose-preflight "
+            '--result-root ${quoted_result_root}"'
         )
     else:
         quoted_result_dir_assignment = (

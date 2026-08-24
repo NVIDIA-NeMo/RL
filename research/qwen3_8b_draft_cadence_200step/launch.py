@@ -290,6 +290,30 @@ def _print_overrides(arm: Arm, result_dir: str) -> None:
         print(override)
 
 
+def validate_all_config_compositions(result_root: Path) -> None:
+    from omegaconf import OmegaConf
+
+    from nemo_rl.algorithms.grpo import MasterConfig
+    from nemo_rl.utils.config import (
+        load_config,
+        parse_hydra_overrides,
+        register_omegaconf_resolvers,
+    )
+
+    register_omegaconf_resolvers()
+    for arm in build_arms():
+        config = load_config(arm.config_path)
+        config = parse_hydra_overrides(
+            config,
+            list(render_hydra_overrides(arm, result_dir=str(result_root / arm.name))),
+        )
+        resolved = OmegaConf.to_container(config, resolve=True)
+        if not isinstance(resolved, dict):
+            raise TypeError(f"composed config for {arm.name} is not a mapping")
+        MasterConfig(**resolved)
+        print(f"CONFIG_COMPOSE_PASS {arm.name}")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -300,6 +324,8 @@ def main(argv: list[str] | None = None) -> None:
     preflight.add_argument("--arm", required=True)
     preflight.add_argument("--source-root", type=Path, required=True)
     preflight.add_argument("--expected-product-head", required=True)
+    compose = subparsers.add_parser("compose-preflight")
+    compose.add_argument("--result-root", type=Path, required=True)
     resume = subparsers.add_parser("resume-preflight")
     resume.add_argument("--arm", required=True)
     resume.add_argument("--result-dir", type=Path, required=True)
@@ -318,6 +344,9 @@ def main(argv: list[str] | None = None) -> None:
     identity.add_argument("--wandb-run-id", required=True)
     identity.add_argument("--slurm-job-id")
     args = parser.parse_args(argv)
+    if args.command == "compose-preflight":
+        validate_all_config_compositions(args.result_root)
+        return
     arm = _arm(args.arm)
     if args.command == "overrides":
         _print_overrides(arm, args.result_dir)

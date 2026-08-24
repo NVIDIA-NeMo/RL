@@ -152,3 +152,13 @@ the repository tracks `ray.sub` as mode `100644`, but the first wrapper required
 it to be executable even though it invokes the file through `bash`. The recovery
 wrapper now requires a regular file instead, records failing shell commands with
 an ERR trap, and routes scheduler stderr to a durable per-task `.err` file.
+
+Recovery canary `6479237` subsequently completed successfully, proving the
+signed source archive, node-local extraction, explicit Pyxis mount, Ray startup,
+and artifact preflight. The following array `6479331` reached the real GRPO
+entrypoint on every arm, then failed before training because the harness used a
+plain Hydra override for keys absent from the structured base config. The first
+rejected key was `policy.generation.vllm_kwargs.max_num_seqs` on all 13 arms.
+All rendered fields now use Hydra's `++` force-add-or-override form, and the
+startup canary performs real `MasterConfig` composition for every arm before a
+new array may be submitted.

@@ -132,14 +132,23 @@ class MatrixContractTest(unittest.TestCase):
             "policy.draft.optimizer.min_lr=5e-07",
             "policy.draft.optimizer.weight_decay=0.01",
             "policy.draft.update_schedule.fixed_interval=10",
-            "policy.generation.vllm_kwargs.compilation_config.cudagraph_mode=PIECEWISE",
+            "++policy.generation.vllm_kwargs.compilation_config.cudagraph_mode=PIECEWISE",
             "logger.wandb.project=sna-specdec",
             "logger.wandb.entity=nvidia",
         ):
             self.assertIn(required, joined)
         self.assertIn(
-            "cadence_runtime.result_dir=/lustre/result/dflash-fixed-10", overrides
+            "++cadence_runtime.result_dir=/lustre/result/dflash-fixed-10", overrides
         )
+
+    def test_all_fields_use_hydra_force_add_or_override(self) -> None:
+        for arm in build_arms():
+            with self.subTest(arm=arm.name):
+                overrides = render_hydra_overrides(
+                    arm, result_dir=f"/lustre/result/{arm.name}"
+                )
+                self.assertTrue(overrides)
+                self.assertTrue(all(item.startswith("++") for item in overrides))
 
     def test_product_preflight_fails_closed_on_incomplete_source(self) -> None:
         arm = next(arm for arm in build_arms() if arm.name == "dflash-adaptive")
