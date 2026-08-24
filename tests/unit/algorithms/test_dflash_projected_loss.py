@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
 import nemo_rl.algorithms.loss as loss_api
+import nemo_rl.algorithms.loss.draft as draft_loss
 from nemo_rl.algorithms.loss import loss_functions
 from nemo_rl.algorithms.loss.draft import (
     dflash_projected_vocab_parallel_soft_ce,
@@ -101,6 +104,30 @@ def test_dflash_adapter_maps_blocks_to_teacher_rows_and_position_bins() -> None:
     assert draft_hidden.grad is not None
     assert teacher_logits.grad is None
     assert output_weight.grad is None
+
+
+def test_dflash_adapter_checks_tp_metadata_once() -> None:
+    """The adapter owns TP agreement and the projected primitive must not repeat it."""
+    inputs = _inputs()
+
+    with patch.object(
+        draft_loss,
+        "_tp_assert_projected_metadata_agreement",
+        wraps=draft_loss._tp_assert_projected_metadata_agreement,
+    ) as agreement_check:
+        dflash_projected_vocab_parallel_soft_ce(
+            draft_hidden=inputs[0],
+            output_weight=inputs[1],
+            teacher_logits=inputs[2],
+            sample_rows=inputs[3],
+            label_positions=inputs[4],
+            loss_mask=inputs[5],
+            position_decay=0.5,
+            token_chunk_size=2,
+            tp_group=None,
+        )
+
+    agreement_check.assert_called_once()
 
 
 def test_dflash_adapter_excludes_anchor_even_when_input_mask_includes_it() -> None:
