@@ -32,18 +32,29 @@ policy:
   # which the critic needs before its forward and train stages.
   offload_optimizer_for_logprob: true
 
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
 # TransferQueue data plane is mandatory for the SingleController path. The whole
 # block is spelled out because the PPO config chain has none; the fields have no
-# defaults. Values are grpo_math_1B.yaml's.
+# defaults. Values are grpo_math_1B.yaml's except defualt enabled.
 data_plane:
   enabled: true
   impl: transfer_queue
   backend: "simple"
-  storage_capacity: 1000000
-  num_storage_units: 2
   claim_meta_poll_interval_s: 0.5
-  global_segment_size: 549755813888
-  local_buffer_size: 68719476736
+  simple:
+    storage_capacity: 1000000
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+  mooncake_cpu:
+    global_segment_size: 68719476736
+    local_buffer_size:    4294967296
+    reuse_registered_buffers: true
+    staging_buffer_size:   268435456
 
 # SC async-RL runtime knobs, replacing the nulled ppo.async_ppo block.
 async_rl:
@@ -53,6 +64,7 @@ async_rl:
     max_lookahead_versions: 1
     # override from the inherited recipe.
     warmup_lookahead_versions: 4
+  recompute_kv_cache_after_weight_updates: true
   # SC PPO assembles each step from a single chunk; the critic has no split
   # train API, so this must equal num_prompts_per_step.
   min_groups_for_streaming_train: ${ppo.num_prompts_per_step}
