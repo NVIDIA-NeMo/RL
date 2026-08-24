@@ -14,7 +14,7 @@
 
 from functools import lru_cache, partial
 from types import FunctionType
-from typing import Callable, Optional, Union, cast
+from typing import Any, Callable, Optional, Union, cast
 
 import torch
 from hydra.utils import get_class
@@ -815,9 +815,10 @@ def clip_grad_by_total_norm_(
 
 def _is_tp_duplicate(
     grad: Union[torch.Tensor, DTensor],
-    tp_group: torch.distributed.ProcessGroup,
+    tp_ranks: Optional[list[int]],
+    mesh_dim_cache: Optional[dict[Any, Optional[int]]] = None,
 ) -> bool:
-    """Whether every rank of ``tp_group`` holds an identical copy of ``grad``.
+    """Whether every rank of the TP group holds an identical copy of ``grad``.
 
     Tensor parallelism only shards the parameters named in the parallel plan
     (attention/MLP projections, embeddings). Everything else stays replicated:
@@ -826,37 +827,68 @@ def _is_tp_duplicate(
     parameters, and that gradient must contribute to the global norm exactly
     once.
 
-    A plain ``torch.Tensor`` is replicated by definition. A ``DTensor`` is
-    replicated when its placement on the mesh dimension backed by ``tp_group``
-    is not a ``Shard``. The mesh dimension is located by comparing group ranks
-    rather than object identity so that mesh slices (``mesh["tp"]``) resolve
-    correctly.
+    A plain ``torch.Tensor`` is replicated by definition. For a ``DTensor`` the
+    mesh dimension backed by the TP group is located by comparing group ranks
+    rather than object identity, so that mesh slices (``mesh["tp"]``) resolve
+    correctly, and the placement on that dimension decides the answer.
 
     Args:
         grad: The gradient to classify.
-        tp_group: Tensor-parallel process group, or ``None`` when TP is unused.
+        tp_ranks: Global ranks of the tensor-parallel group, or ``None`` when TP
+            is unused.
+        mesh_dim_cache: Optional cache reused across parameters so the mesh
+            dimension is resolved once per device mesh instead of once per
+            parameter.
 
     Returns:
-        bool: True when the gradient is duplicated across ``tp_group``.
+        bool: True when the gradient is duplicated across the TP group.
+
+    Raises:
+        ValueError: If the placement on the TP mesh dimension is neither
+            ``Shard`` nor ``Replicate``. A ``Partial`` gradient in particular is
+            neither: each rank holds a different addend, so counting it once
+            would drop the other ranks' contributions and counting it on every
+            rank would leave the ranks with different totals.
     """
-    if tp_group is None or not isinstance(grad, DTensor):
+    if tp_ranks is None or not isinstance(grad, DTensor):
         return True
 
     mesh = grad.device_mesh
-    tp_ranks = torch.distributed.get_process_group_ranks(tp_group)
-    for dim in range(mesh.ndim):
-        if torch.distributed.get_process_group_ranks(mesh.get_group(dim)) == tp_ranks:
-            return not isinstance(grad.placements[dim], Shard)
+    if mesh_dim_cache is None:
+        mesh_dim_cache = {}
+    if mesh not in mesh_dim_cache:
+        mesh_dim_cache[mesh] = next(
+            (
+                dim
+                for dim in range(mesh.ndim)
+                if torch.distributed.get_process_group_ranks(mesh.get_group(dim))
+                == tp_ranks
+            ),
+            None,
+        )
+    tp_dim = mesh_dim_cache[mesh]
 
     # The gradient does not live on the TP mesh at all, so it is replicated
     # across the group.
-    return True
+    if tp_dim is None:
+        return True
+
+    placement = grad.placements[tp_dim]
+    if isinstance(placement, Shard):
+        return False
+    if isinstance(placement, Replicate):
+        return True
+    raise ValueError(
+        f"Cannot compute a gradient norm for TP placement {placement!r}; only "
+        "Shard and Replicate are supported on the tensor-parallel mesh "
+        "dimension."
+    )
 
 
 def get_grad_norm(
     parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
-    dp_cp_group: torch.distributed.ProcessGroup,
-    tp_group: torch.distributed.ProcessGroup,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup],
+    tp_group: Optional[torch.distributed.ProcessGroup],
     norm_type: Union[int, float] = 2,
     dtype: torch.dtype = torch.float32,
 ) -> float:
@@ -881,13 +913,19 @@ def get_grad_norm(
         parameters = [parameters]
 
     # Grads, split by whether the TP group holds duplicate copies of them.
+    tp_ranks = (
+        torch.distributed.get_process_group_ranks(tp_group)
+        if tp_group is not None
+        else None
+    )
+    mesh_dim_cache: dict[Any, Optional[int]] = {}
     grads_for_norm = []
     tp_duplicate_grads = []
     for p in parameters:
         if p.grad is None:
             continue
         grad = p.grad.detach()
-        if _is_tp_duplicate(grad, tp_group):
+        if _is_tp_duplicate(grad, tp_ranks, mesh_dim_cache):
             tp_duplicate_grads.append(to_local_if_dtensor(grad))
         else:
             grads_for_norm.append(to_local_if_dtensor(grad))

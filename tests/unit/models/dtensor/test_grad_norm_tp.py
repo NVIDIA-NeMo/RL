@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 
 import pytest
@@ -76,10 +90,11 @@ class GradNormTPTestActor:
         )
         expected_inf = torch.cat([replicated_grad, sharded_grad]).abs().max().item()
 
+        tp_ranks = torch.distributed.get_process_group_ranks(tp_group)
         return {
             "rank": int(os.environ["RANK"]),
-            "classified_replicated": _is_tp_duplicate(replicated_param.grad, tp_group),
-            "classified_sharded": _is_tp_duplicate(sharded_param.grad, tp_group),
+            "classified_replicated": _is_tp_duplicate(replicated_param.grad, tp_ranks),
+            "classified_sharded": _is_tp_duplicate(sharded_param.grad, tp_ranks),
             "expected": expected,
             "inflated": inflated,
             "actual": actual,
@@ -132,10 +147,12 @@ def test_get_grad_norm_counts_tp_replicated_grads_once(
             workers_per_node=None,
             sharding_annotations=sharding,
         )
-        results = ray.get(
-            worker_group.run_all_workers_single_data("run_grad_norm_check")
-        )
-        worker_group.shutdown(force=True)
+        try:
+            results = ray.get(
+                worker_group.run_all_workers_single_data("run_grad_norm_check")
+            )
+        finally:
+            worker_group.shutdown(force=True)
     finally:
         cluster.shutdown()
 
