@@ -1,0 +1,45 @@
+defaults: vlm_grpo-nemotron-omni-30ba3b-2n8g-megatron-tp4ep4-gym-video.v1.yaml
+grpo:
+  max_num_epochs: 1000000
+  val_period: 0
+  length_bonus:
+    default:
+      enabled: true
+      length_type: tokens
+      reasoning_end_token_id: 13
+    profile_band:
+      enabled: true
+      defaults:
+        reasoning:
+          a: 1024
+          b: 4096
+          f: 0.95
+checkpointing:
+  save_period: 2
+  keep_top_k: 5
+policy:
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-08
+  generation:
+    max_new_tokens: 8192
+    vllm_cfg:
+      video:
+        num_frames: 64
+    vllm_kwargs:
+      mm_processor_cache_gb: 4
+      limit_mm_per_prompt:
+        image: 64
+        video:
+          count: 1
+          num_frames: 64
+      media_io_kwargs:
+        video:
+          num_frames: 64
+data:
+  shuffle: true
+  default:
+    num_frames: 64
