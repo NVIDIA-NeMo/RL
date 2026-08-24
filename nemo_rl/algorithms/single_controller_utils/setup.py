@@ -344,6 +344,10 @@ def _spinup_gym(
         enable_router_replay=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+        # The rollout pump dispatches one generate_and_push per in-flight prompt
+        # and each is exactly one run_rollouts call on this actor, so the
+        # in-flight cap is the actor's fan-in.
+        rollout_fan_in=master_config.async_rl.max_inflight_prompts,
     )
     return actor, time.perf_counter() - t0
 
