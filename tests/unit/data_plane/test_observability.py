@@ -21,9 +21,8 @@ built-in sinks.
 
 from __future__ import annotations
 
-from time import monotonic
-
 import logging
+from time import monotonic
 
 import pytest
 import torch
@@ -31,15 +30,15 @@ from tensordict import NonTensorData, NonTensorStack, TensorDict
 
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.observability import (
+    _QUANTILES,
     MetricsDataPlaneClient,
+    _estimate_encoded_bytes,
+    _hash_deltas,
+    _td_bytes,
     breakdown_table,
     cluster_step_metrics,
     headline_series,
-    _hash_deltas,
     merge_snapshots,
-    _estimate_encoded_bytes,
-    _QUANTILES,
-    _td_bytes,
 )
 
 from ._rollout_shapes import make_rollout_batch
