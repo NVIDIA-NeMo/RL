@@ -13,8 +13,5 @@ policy:
     cuda_graph_impl: none
   generation:
     backend: megatron
-    colocated:
-      enabled: true
     mcore_generation_config:
-      enable_chunked_prefill: false
       use_cuda_graphs_for_non_decode_steps: false

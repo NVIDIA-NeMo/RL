@@ -26,6 +26,7 @@ nemo_rl.models.megatron.setup, focusing on:
 
 import os
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -4040,21 +4041,23 @@ class TestForceSyncOptimizerFp32FromModel:
                 f"DistributedOptimizer no longer references {name!r}; "
                 "_force_sync_optimizer_fp32_from_model's level-1 sync is now a silent no-op."
             )
-def test_zero_train_gen_mismatch_forces_te_generation_spec():
-    """Zero train/gen mismatch must keep generation on the train-side TE MoE path."""
-    from nemo_rl.models.megatron.setup import _apply_zero_train_gen_mismatch
 
-    config = {
+
+def _zero_kl_config(megatron_cfg=None, mcore_generation_config=None, colocated=True):
+    return {
         "model_name": "Qwen/Qwen3-30B-A3B",
-        "megatron_cfg": {"zero_train_gen_mismatch": True},
+        "megatron_cfg": {"zero_train_gen_mismatch": True, **(megatron_cfg or {})},
         "generation": {
-            "mcore_generation_config": {
-                "transformer_impl": "inference_optimized",
-            }
+            "backend": "megatron",
+            "colocated": {"enabled": colocated},
+            "mcore_generation_config": mcore_generation_config or {},
         },
-        "router_replay": {"enabled": True},
     }
 
+
+@contextmanager
+def _stub_zero_kl_patches():
+    """Stub the in-process kernel patches so only config resolution is exercised."""
     with (
         patch(
             "nemo_rl.models.generation.megatron.zero_train_gen_kl_patches."
@@ -4065,40 +4068,72 @@ def test_zero_train_gen_mismatch_forces_te_generation_spec():
             "apply_te_gemm_cublas_pinned_patch"
         ),
     ):
-        _apply_zero_train_gen_mismatch(config)
+        yield apply_moe_patches
 
-    assert (
-        config["generation"]["mcore_generation_config"]["transformer_impl"]
-        == "transformer_engine"
+
+def test_zero_train_gen_mismatch_forces_te_generation_spec():
+    """Zero train/gen mismatch must keep generation on the train-side TE MoE path."""
+    from nemo_rl.models.megatron.setup import _apply_zero_train_gen_mismatch
+
+    config = _zero_kl_config(
+        mcore_generation_config={"transformer_impl": "inference_optimized"}
     )
-    assert (
-        config["generation"]["mcore_generation_config"]["logprobs_mode"]
-        == "raw_logprobs"
-    )
+    config["router_replay"] = {"enabled": True}
+
+    with _stub_zero_kl_patches() as apply_moe_patches:
+        with pytest.warns(UserWarning, match="transformer_impl"):
+            _apply_zero_train_gen_mismatch(config)
+
+    mcore_generation_config = config["generation"]["mcore_generation_config"]
+    assert mcore_generation_config["transformer_impl"] == "transformer_engine"
+    assert mcore_generation_config["logprobs_mode"] == "raw_logprobs"
+    assert mcore_generation_config["enable_chunked_prefill"] is False
+    assert config["megatron_cfg"]["batch_invariant_mode"] is True
+    assert config["megatron_cfg"]["moe_permute_fusion"] is False
+    assert config["megatron_cfg"]["attention_backend"] == "flash"
     assert config["megatron_cfg"]["flash_attention_version"] == 4
     apply_moe_patches.assert_called_once_with()
 
 
-def test_zero_train_gen_mismatch_enables_batch_invariant_mode():
-    """Zero train/gen mismatch must force batch_invariant_mode for MoE BIK."""
+def test_zero_train_gen_mismatch_warns_on_conflicting_knobs():
+    """Conflicting zero-KL knobs are overridden with a warning."""
     from nemo_rl.models.megatron.setup import _apply_zero_train_gen_mismatch
 
-    config = {
-        "model_name": "Qwen/Qwen3-30B-A3B",
-        "megatron_cfg": {"zero_train_gen_mismatch": True},
-        "generation": {"mcore_generation_config": {}},
-    }
+    config = _zero_kl_config(
+        megatron_cfg={"moe_permute_fusion": True},
+        mcore_generation_config={"enable_chunked_prefill": True},
+    )
 
-    with (
-        patch(
-            "nemo_rl.models.generation.megatron.zero_train_gen_kl_patches."
-            "apply_moe_determinism_patches"
-        ),
-        patch(
-            "nemo_rl.models.generation.megatron.zero_train_gen_kl_patches."
-            "apply_te_gemm_cublas_pinned_patch"
-        ),
-    ):
+    with _stub_zero_kl_patches():
+        with pytest.warns(UserWarning, match="moe_permute_fusion|enable_chunked_prefill"):
+            _apply_zero_train_gen_mismatch(config)
+
+    assert config["megatron_cfg"]["moe_permute_fusion"] is False
+    assert (
+        config["generation"]["mcore_generation_config"]["enable_chunked_prefill"]
+        is False
+    )
+
+
+def test_zero_train_gen_mismatch_enables_batch_invariant_mode():
+    """Zero train/gen mismatch must force batch_invariant_mode and eager permute."""
+    from nemo_rl.models.megatron.setup import _apply_zero_train_gen_mismatch
+
+    # CUDA graphs stay under recipe control, so an explicit value must survive.
+    config = _zero_kl_config(megatron_cfg={"cuda_graph_impl": "local"})
+
+    with _stub_zero_kl_patches():
         _apply_zero_train_gen_mismatch(config)
 
     assert config["megatron_cfg"]["batch_invariant_mode"] is True
+    assert config["megatron_cfg"]["moe_permute_fusion"] is False
+    assert config["megatron_cfg"]["cuda_graph_impl"] == "local"
+
+
+def test_zero_train_gen_mismatch_requires_colocated_generation():
+    """Only colocated generation runs the training model, so nothing else is valid."""
+    from nemo_rl.models.megatron.setup import _apply_zero_train_gen_mismatch
+
+    with _stub_zero_kl_patches():
+        with pytest.raises(ValueError, match="requires colocated generation"):
+            _apply_zero_train_gen_mismatch(_zero_kl_config(colocated=False))
