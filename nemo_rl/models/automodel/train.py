@@ -923,9 +923,10 @@ class TopkLogitsPostProcessor:
 
         # Gather-at-indices mode: when the microbatch carries
         # "topk_gather_indices" [b, S, k], evaluate the logits at those global
-        # vocab indices instead of computing top-k. Used by the SDPO
-        # trust-region teacher to evaluate the reference policy at the current
-        # teacher's top-k indices.
+        # vocab indices instead of computing top-k. Used by SDPO: the
+        # trust-region teacher evaluates the reference policy at the
+        # distillation indices, and topk_source="student" evaluates the
+        # teacher forward at the student's top-k (paper §2.2).
         if "topk_gather_indices" in data_dict:
             vals, idx = self._gather_at_indices(
                 logits, data_dict["topk_gather_indices"], processed_inputs, input_lengths

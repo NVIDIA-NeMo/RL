@@ -1278,7 +1278,9 @@ class SDPOLossFn(LossFunction):
              ≈ Σ_t  Σ_{ŷ ∈ topK}  π_θ(ŷ|x,y_<t) · [log π_θ(ŷ|x,y_<t) − log π_T(ŷ|x,f,y_<t)]
                + tail_correction_t       (when zero_outside_topk=True)
 
-    Top-k indices are chosen by the teacher. Tail correction uses the
+    The K distillation indices come in via ``data["teacher_topk_indices"]``;
+    ``sdpo.topk_source`` selects whether they are the teacher's own top-k
+    (legacy) or the student's top-k (paper §2.2). Tail correction uses the
     full-vocab student entropy H_all returned by the training forward, so the gather
     over top-k preserves an unbiased estimate of the full-vocabulary KL even with
     K << |V|.
@@ -1336,8 +1338,8 @@ class SDPOLossFn(LossFunction):
         """Compute the SDPO logit-level KL loss.
 
         Args:
-            student_topk_logprobs: log π_θ at teacher's top-k indices, shape [B, S-1, K].
-            teacher_topk_logprobs: log π_T at teacher's top-k indices, shape [B, S-1, K].
+            student_topk_logprobs: log π_θ at the distillation top-k indices, shape [B, S-1, K].
+            teacher_topk_logprobs: log π_T at the distillation top-k indices, shape [B, S-1, K].
             H_all: full-vocab student entropy, shape [B, S-1] (or None when not needed).
             data: must contain keys defined in SDPOLossDataDict.
             global_valid_seqs: number of valid sequences in this microbatch.

@@ -27,6 +27,7 @@ from nemo_rl.algorithms.sdpo import (
     _extract_environment_output,
     align_teacher_topk,
     build_sdpo_teacher_data,
+    project_student_topk_to_teacher,
 )
 
 
@@ -319,3 +320,125 @@ def test_align_teacher_topk_first_response_token_signal_nonzero():
     assert not torch.all(aligned_logits[0, 1] == 0), (
         "First response token's prediction position must be filled with teacher signal"
     )
+
+
+# ── project_student_topk_to_teacher: student-selected indices (paper §2.2) ───
+
+
+def test_project_student_topk_writes_at_teacher_prediction_positions():
+    """Student top-k indices must land at the TEACHER logit positions whose
+    predictions are the paired response tokens — the exact inverse of
+    align_teacher_topk's mapping.
+
+    Sequences (same as the align test):
+        student_token_mask: [0, 0, 0, 1, 1, 1, 0]          response @ [3,4,5]
+        teacher_token_mask: [0, 0, 0, 0, 0, 1, 1, 1, 0]    response @ [5,6,7]
+    Expected:
+        gather[4] = student_topk_indices[2]   (both predict response[0])
+        gather[5] = student_topk_indices[3]   (both predict response[1])
+        gather[6] = student_topk_indices[4]   (both predict response[2])
+        everything else = 0
+    """
+    K = 4
+    student_seq_len = 7
+
+    student_topk_indices = torch.arange(
+        student_seq_len * K, dtype=torch.long
+    ).reshape(1, student_seq_len, K) + 1  # non-zero, distinguishable per position
+
+    student_token_mask = torch.tensor([[0, 0, 0, 1, 1, 1, 0]], dtype=torch.long)
+    teacher_token_mask = torch.tensor(
+        [[0, 0, 0, 0, 0, 1, 1, 1, 0]], dtype=torch.long
+    )
+
+    gather = project_student_topk_to_teacher(
+        student_topk_indices=student_topk_indices,
+        student_token_mask=student_token_mask,
+        teacher_token_mask=teacher_token_mask,
+    )
+
+    assert gather.shape == (1, teacher_token_mask.shape[1], K)
+    assert torch.equal(gather[0, 4], student_topk_indices[0, 2])
+    assert torch.equal(gather[0, 5], student_topk_indices[0, 3])
+    assert torch.equal(gather[0, 6], student_topk_indices[0, 4])
+    filled = torch.tensor([4, 5, 6])
+    unfilled = torch.tensor([p for p in range(gather.shape[1]) if p not in filled.tolist()])
+    assert torch.all(gather[0, unfilled] == 0), (
+        "Non-response-prediction teacher positions must stay index 0"
+    )
+
+
+def test_project_student_topk_roundtrips_through_align():
+    """The invariant the loss depends on: after the teacher forward is gathered
+    at the projected indices and align_teacher_topk maps the result back to
+    student positions, the aligned indices at every loss-active position equal
+    the student's own top-k indices there."""
+    K = 3
+    student_seq_len = 7
+    teacher_seq_len = 9
+
+    student_topk_indices = torch.randint(1, 5000, (1, student_seq_len, K))
+    student_token_mask = torch.tensor([[0, 0, 0, 1, 1, 1, 0]], dtype=torch.long)
+    teacher_token_mask = torch.tensor(
+        [[0, 0, 0, 0, 0, 1, 1, 1, 0]], dtype=torch.long
+    )
+
+    gather = project_student_topk_to_teacher(
+        student_topk_indices=student_topk_indices,
+        student_token_mask=student_token_mask,
+        teacher_token_mask=teacher_token_mask,
+    )
+
+    # The gather-mode teacher forward returns the gather indices unchanged as
+    # its "topk_indices"; feed them straight back through the alignment step.
+    _, aligned_indices = align_teacher_topk(
+        teacher_topk_logits=torch.zeros(1, teacher_seq_len, K),
+        teacher_topk_indices=gather,
+        teacher_token_mask=teacher_token_mask,
+        student_seq_len=student_seq_len,
+        student_token_mask=student_token_mask,
+    )
+
+    # Loss-active positions are the response-prediction positions [2, 3, 4].
+    for pos in (2, 3, 4):
+        assert torch.equal(aligned_indices[0, pos], student_topk_indices[0, pos]), (
+            f"Aligned indices at student prediction position {pos} must equal "
+            "the student's top-k indices there"
+        )
+
+
+def test_project_student_topk_handles_no_demo_sample():
+    """A sample with no response tokens in either frame yields all-zero gather
+    indices (the sample is excluded from the loss by sdpo_mask anyway)."""
+    K = 2
+    student_topk_indices = torch.randint(1, 100, (1, 4, K))
+    student_token_mask = torch.zeros(1, 4, dtype=torch.long)
+    teacher_token_mask = torch.zeros(1, 6, dtype=torch.long)
+
+    gather = project_student_topk_to_teacher(
+        student_topk_indices=student_topk_indices,
+        student_token_mask=student_token_mask,
+        teacher_token_mask=teacher_token_mask,
+    )
+    assert torch.all(gather == 0)
+
+
+def test_project_student_topk_truncates_to_shorter_response():
+    """When the teacher response was truncated shorter than the student's
+    (max_reprompt_len), only the overlapping prefix is projected."""
+    K = 2
+    # Student: response @ [2, 3, 4]; teacher: response @ [3, 4] (one shorter).
+    student_topk_indices = torch.randint(1, 100, (1, 6, K))
+    student_token_mask = torch.tensor([[0, 0, 1, 1, 1, 0]], dtype=torch.long)
+    teacher_token_mask = torch.tensor([[0, 0, 0, 1, 1, 0]], dtype=torch.long)
+
+    gather = project_student_topk_to_teacher(
+        student_topk_indices=student_topk_indices,
+        student_token_mask=student_token_mask,
+        teacher_token_mask=teacher_token_mask,
+    )
+
+    # n = 2 pairs: teacher pred pos [2, 3] <- student pred pos [1, 2].
+    assert torch.equal(gather[0, 2], student_topk_indices[0, 1])
+    assert torch.equal(gather[0, 3], student_topk_indices[0, 2])
+    assert torch.all(gather[0, [0, 1, 4, 5]] == 0)

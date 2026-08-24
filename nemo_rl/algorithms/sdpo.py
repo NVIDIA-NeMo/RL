@@ -142,9 +142,10 @@ class SDPOConfig(TypedDict):
     # "none" (default): teacher = current policy conditioned on feedback —
     #   paper Table 4 shows this eventually diverges.
     # "trust_region": teacher logits = lerp(ref, current, teacher_mix_coef)
-    #   at the current teacher's top-k indices, where ref is the frozen init
-    #   policy. Blending the target toward init denies self-amplifying drift
-    #   a self-consistent teacher without penalizing genuine improvement.
+    #   at the distillation top-k indices (see topk_source), where ref is the
+    #   frozen init policy. Blending the target toward init denies
+    #   self-amplifying drift a self-consistent teacher without penalizing
+    #   genuine improvement.
     teacher_regularization: NotRequired[str]
     # Paper A.2 Eq. 10's alpha: weight of the CURRENT policy in the lerp
     # (0 = pure init teacher, 1 = unregularized). Paper Table 4 uses 0.01
@@ -153,6 +154,15 @@ class SDPOConfig(TypedDict):
     # cancels under the loss's top-k log_softmax renormalization.
     # Only read when teacher_regularization="trust_region".
     teacher_mix_coef: NotRequired[float]
+    # Which distribution's top-k defines the K distillation indices.
+    # "teacher" (default): the teacher's own top-k, computed in the teacher
+    #   forward. For reverse KL this drops exactly the tokens where the
+    #   student keeps mass the teacher wants suppressed.
+    # "student" (paper §2.2): the current policy's top-k on the STUDENT input;
+    #   the teacher (and trust-region reference) logits are gathered at those
+    #   indices via the gather-at-indices mode. Costs one extra no-grad
+    #   student forward per rollout step; requires the DTensor v2 backend.
+    topk_source: NotRequired[str]
     reprompt_template: NotRequired[str]  # uses {prompt} and {solution} placeholders
     remove_thinking_from_demo: NotRequired[bool]  # strip <think>…</think> from demos
     # "peer_rollout" (default): teacher conditions on a successful peer rollout.
@@ -723,6 +733,61 @@ def align_teacher_topk(
     return aligned_logits, aligned_indices
 
 
+def project_student_topk_to_teacher(
+    *,
+    student_topk_indices: torch.Tensor,  # [B, student_seq_len, K]
+    student_token_mask: torch.Tensor,  # [B, student_seq_len]  1 = response token
+    teacher_token_mask: torch.Tensor,  # [B, teacher_seq_len]  1 = response token
+) -> torch.Tensor:
+    """Scatter student-frame top-k vocab indices into the teacher's frame.
+
+    Inverse position mapping of ``align_teacher_topk``: the prediction OF the
+    j-th response token is produced by logits at ``resp_start + j - 1`` in
+    each frame, so student prediction position ``S_prompt + j - 1`` pairs with
+    teacher prediction position ``T_prompt + j - 1``. The result is passed to
+    the teacher forward as ``topk_gather_indices`` so the teacher's logits are
+    evaluated at the student's top-k (paper §2.2), and ``align_teacher_topk``
+    then maps the gathered logits back to student positions.
+
+    Positions that are not response-token predictions are filled with vocab
+    index 0 (a valid id, so the gather stays well-defined); the teacher logits
+    gathered there are dropped by the alignment step and masked by the loss.
+    """
+    B, _, K = student_topk_indices.shape
+    teacher_seq_len = teacher_token_mask.shape[1]
+    gather_indices = torch.zeros(
+        B,
+        teacher_seq_len,
+        K,
+        device=student_topk_indices.device,
+        dtype=student_topk_indices.dtype,
+    )
+
+    for i in range(B):
+        teacher_resp_pos = teacher_token_mask[i].bool().nonzero(as_tuple=True)[0]
+        student_resp_pos = student_token_mask[i].bool().nonzero(as_tuple=True)[0]
+
+        n = min(len(teacher_resp_pos), len(student_resp_pos))
+        if n == 0:
+            continue
+
+        teacher_pred_pos = teacher_resp_pos[:n] - 1
+        student_pred_pos = student_resp_pos[:n] - 1
+
+        # Same edge-case guard as align_teacher_topk: a response starting at
+        # position 0 has no prediction position for its first token.
+        if (teacher_pred_pos < 0).any() or (student_pred_pos < 0).any():
+            keep = (teacher_pred_pos >= 0) & (student_pred_pos >= 0)
+            teacher_pred_pos = teacher_pred_pos[keep]
+            student_pred_pos = student_pred_pos[keep]
+            if len(student_pred_pos) == 0:
+                continue
+
+        gather_indices[i, teacher_pred_pos] = student_topk_indices[i, student_pred_pos]
+
+    return gather_indices
+
+
 # ============================================================================
 # Setup
 # ============================================================================
@@ -999,6 +1064,17 @@ def sdpo_train(
             flush=True,
         )
 
+    topk_source = sdpo_cfg.get("topk_source", "teacher")
+    if topk_source not in ("teacher", "student"):
+        raise ValueError(
+            f"sdpo.topk_source must be 'teacher' or 'student', got {topk_source!r}"
+        )
+    if topk_source == "student":
+        print(
+            "  ✓ Student-selected top-k distillation indices (paper §2.2)",
+            flush=True,
+        )
+
     # SDPO+GRPO hybrid: build the GRPO advantage estimator used by
     # the policy-gradient term. Only active when loss_fn is the hybrid.
     is_hybrid = isinstance(loss_fn, SDPOHybridLossFn)
@@ -1202,6 +1278,39 @@ def sdpo_train(
                 with timer.time("logprob_inference_prep"):
                     policy.prepare_for_lp_inference()
 
+                # ── Student-selected top-k indices (paper §2.2) ──────────────
+                # "only computing the top-K logits of the student and the
+                # corresponding logits of the teacher": take the current
+                # policy's top-k on the STUDENT input and evaluate the teacher
+                # forward at those vocab indices (gather-at-indices mode).
+                # With reverse KL this keeps exactly the tokens where the
+                # student still has mass — the region the gradient most needs
+                # — instead of the teacher's own top-k.
+                if topk_source == "student":
+                    print("Computing student top-k indices...", flush=True)
+                    with timer.time("student_topk_indices"):
+                        student_topk_data = BatchedDataDict(
+                            {
+                                "input_ids": train_data["input_ids"],
+                                "input_lengths": train_data["input_lengths"],
+                            }
+                        )
+                        student_topk = policy.get_topk_logits(
+                            student_topk_data,
+                            k=topk_logits_k,
+                            timer=timer,
+                        )
+                        teacher_data["topk_gather_indices"] = (
+                            project_student_topk_to_teacher(
+                                student_topk_indices=student_topk["topk_indices"]
+                                .to(torch.long)
+                                .cpu(),
+                                student_token_mask=train_data["token_mask"].cpu(),
+                                teacher_token_mask=teacher_data["token_mask"].cpu(),
+                            )
+                        )
+                        del student_topk_data, student_topk
+
                 print("Computing teacher top-k logits...", flush=True)
                 with timer.time("teacher_topk_logits"):
                     teacher_topk = policy.get_topk_logits(
@@ -1217,9 +1326,10 @@ def sdpo_train(
                 # into the distillation target so the teacher cannot follow
                 # the student into self-amplifying drift:
                 #   teacher_logits = lerp(ref, current, mix_coef)
-                # evaluated at the current teacher's top-k indices (reverse KL
-                # needs the teacher where the student has mass, which the
-                # current-policy top-k approximates).
+                # evaluated at the distillation indices — the student's top-k
+                # when topk_source="student" (exactly where the student has
+                # mass, which reverse KL needs), else the teacher's own top-k
+                # (a current-policy approximation of the same).
                 if teacher_regularization == "trust_region":
                     print("Computing trust-region reference teacher logits...", flush=True)
                     with timer.time("teacher_trust_region_ref_logits"):
