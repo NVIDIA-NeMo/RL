@@ -1,0 +1,11 @@
+defaults: ../../../examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-swe1-2n4g-megatron-tp2pp2-rollout-only-specdec.yaml
+policy:
+  generation:
+    vllm_kwargs:
+      speculative_config:
+        method: dflash
+        model: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/modelopt-specdec/checkpoints/qwen3-30ba3b-thinking-nemotron-b8-s25391/dflash
+        num_speculative_tokens: 5
+        draft_tensor_parallel_size: 1
+      compilation_config:
+        cudagraph_capture_sizes: [6, 12, 24, 48, 96, 192, 384, 768, 1536]

@@ -1,0 +1,7 @@
+defaults: ../../../examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-swe1-2n4g-megatron-tp2pp2-rollout-only-specdec.yaml
+policy:
+  generation:
+    vllm_kwargs:
+      speculative_config: null
+      compilation_config:
+        cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]

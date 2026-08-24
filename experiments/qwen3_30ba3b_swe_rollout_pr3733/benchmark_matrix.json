@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "pr_head": "b580dd8927b88c996470d315e74d57bf0cb4090e",
+  "workload_label": "SWE trajectory-collection rollout-only",
+  "output_root_prefix": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/experiments",
+  "entrypoint": "examples/nemo_gym/run_grpo_nemo_gym.py",
+  "source_files_sha256": {
+    "examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-swe1-2n4g-megatron-tp2pp2-rollout-only-specdec.yaml": "6f1ec0bb2fd5da7ce6641ca6dc76f7c75f923e9f24707a6f0426e96a3fe4b871",
+    "examples/nemo_gym/grpo_qwen3_30ba3b_thinking_swe1.yaml": "0bc13cb62be37e3948eb0624f4cb669eaf0a5887335e0a79afc39bf6d83f08f7",
+    "examples/nemo_gym/run_grpo_nemo_gym.py": "4ee19e04186e49588a9c299e8c18991bdaa96ce3d33b0762e634fd51ba0f5ca6",
+    "nemo_rl/algorithms/grpo.py": "c08f2e1f79946bf5922b7efe3c438df337e65012d4e0b05e9036b19a0c8eb96d",
+    "nemo_rl/algorithms/single_controller_utils/setup.py": "0caa077a0f756fab1930db9c294bddcdbaf77f28ad4e1958948d98b03e58abb4",
+    "nemo_rl/environments/nemo_gym.py": "08023aaff3e270266517689f642d875a2eb150b2334b8be4f7793b11095b7e6d",
+    "nemo_rl/experience/rollouts.py": "6bdba6a4a207fa9e38db08d208a98a4b40eeff6b1e9e1bcd46ad51ca1790997b",
+    "nemo_rl/models/generation/vllm/config.py": "7bbc5c3aac835235dad44f5f7ca6258420b459cc867069c256bd7cef40aef42f",
+    "nemo_rl/models/generation/vllm/vllm_generation.py": "c37916f23a5bfcd625435cd522754d4abd525813105149dedc557fd04236c17d"
+  },
+  "recipe": "examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-swe1-2n4g-megatron-tp2pp2-rollout-only-specdec.yaml",
+  "target": {
+    "path": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home/hub/models--Qwen--Qwen3-30B-A3B-Thinking-2507/snapshots/144afc2f379b542fdd4e85a1fcd5e1f79112d95d",
+    "snapshot": "144afc2f379b542fdd4e85a1fcd5e1f79112d95d",
+    "config_sha256": "a1ee086a68d0cbfc87316da00ba4b8507bd1292978108e2496201a30a450f438",
+    "model_index_sha256": "8dde190b862c7c80ec7403c6495de00c60bbaf246ed479cee4506284989c584c",
+    "weight_files": 16,
+    "weight_bytes": 61066575656,
+    "weight_sha256": {
+      "model-00001-of-00016.safetensors": "d6f04f15f023d0a0eff2d073b4276dd0151100bd94b1799fa27166bf99d68a1c",
+      "model-00002-of-00016.safetensors": "1cc90a6c66e32b8ef75ecd3f4e184a17adc7bebc81833fff7249caa05208cc51",
+      "model-00003-of-00016.safetensors": "11708821e290005919b8bf2d8274929fb1e55bcca27872a9a21ccaec9088c0df",
+      "model-00004-of-00016.safetensors": "b2df42850cff934ddfd65e6bea496a3124cb94b70464529d0653a6bdded2ed9e",
+      "model-00005-of-00016.safetensors": "31ce04731fbf3b572f8342a48c3d974aeec2c3d03be425a881ce4e9b67bfa3aa",
+      "model-00006-of-00016.safetensors": "2e1a20ddcdc0e74edbcbd4fcd1c8a9b50ead8db64105f12a936d284602f34481",
+      "model-00007-of-00016.safetensors": "8a6c42fbe9a8cdef9095aa371429b5ecb290f2649a98396ee756470fe7b2f434",
+      "model-00008-of-00016.safetensors": "195c7e165e0ebd6ceb4ac9a63e0d2f938e9a12345ff6c49c3514e8706854e546",
+      "model-00009-of-00016.safetensors": "8ec0147957bfeaae8b30997c2a6729ae66c1422bf4fbbd32926e217a3f889c25",
+      "model-00010-of-00016.safetensors": "eb6294ba4427d5cbb5fedde8e93463e633b425027361980411c7d2fd87326ea3",
+      "model-00011-of-00016.safetensors": "298194ffc33a87636c8c0bb7ff397e4a3bd2331c47ba13fb5ee4f75b5bc330b0",
+      "model-00012-of-00016.safetensors": "fc4a51b2452eb2a0250eaf195d4850db457ec03db569ec22c6f630b7857358be",
+      "model-00013-of-00016.safetensors": "fa1056cfc9875bab67c38789dad6f1e8cd589a8ca01fbda2ae6b061146880543",
+      "model-00014-of-00016.safetensors": "4c7be0464c767cacfacca4fe1e36dc03e2b7df080054e5d4683a2f259ec0be71",
+      "model-00015-of-00016.safetensors": "cf7c761699afa8265c8a193bd582a49aaa5f2acb77669cf2f2225fb80b50874c",
+      "model-00016-of-00016.safetensors": "2f2dba3a7e094bd12ddce13f5f44edc4a39615d810faf9f20c42d4d136dc5956"
+    }
+  },
+  "drafts": {
+    "dflash": {
+      "path": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/modelopt-specdec/checkpoints/qwen3-30ba3b-thinking-nemotron-b8-s25391/dflash",
+      "config_sha256": "3462e700ded08b7c26f37deb16725100bfb29dee2eb380f2e053169ac1f4dd52",
+      "weight_files": 1,
+      "weight_bytes": 608231904,
+      "weight_sha256": {
+        "model.safetensors": "pending_compute_node_sha256"
+      },
+      "draft_query_width": "k_plus_one"
+    },
+    "dspark": {
+      "path": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/modelopt-specdec/checkpoints/qwen3-30ba3b-thinking-nemotron-b8-s25391/dspark",
+      "config_sha256": "9959d0ea5d0a85886b9d2c6b903872ea24905b9528725b4877b339f356a1f509",
+      "weight_files": 1,
+      "weight_bytes": 763819354,
+      "weight_sha256": {
+        "model.safetensors": "pending_compute_node_sha256"
+      },
+      "draft_query_width": "k",
+      "dspark_bonus_anchor": false
+    }
+  },
+  "data": {
+    "path": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/SpecDec-RL-main-vllm020-20260606/data/swebench_verified_prompts_all.jsonl",
+    "sha256": "38434589e57ac4494052cf826f2eca24eea5d75b6889cf9e37fbe9c18dc95c1a",
+    "lines": 500
+  },
+  "common": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "generation_batch_size": 64,
+    "validation_batch_size": 500,
+    "num_generations_per_prompt": 1,
+    "max_total_sequence_length": 131072,
+    "num_nodes": 2,
+    "generation_num_nodes": 1,
+    "gpus_per_node": 4,
+    "generation_tensor_parallel_size": 2,
+    "optimizer": null,
+    "scheduler": null,
+    "wandb_entity": "nvidia",
+    "wandb_project": "sna-specdec"
+  },
+  "request_buckets": [1, 2, 4, 8, 16, 32, 64, 128, 256],
+  "canary_arms": ["baseline", "dflash_k5"],
+  "arms": [
+    {"name": "baseline", "method": null, "num_speculative_tokens": 0, "draft": null, "config": "experiments/qwen3_30ba3b_swe_rollout_pr3733/configs/baseline.yaml", "config_sha256": "72febcf1b34922f4bde0430d54cbcbb5ef2bd0dc11a6c412a6d694af37ab9758"},
+    {"name": "dflash_k5", "method": "dflash", "num_speculative_tokens": 5, "draft": "dflash", "config": "experiments/qwen3_30ba3b_swe_rollout_pr3733/configs/dflash_k5.yaml", "config_sha256": "9255aa9d372c3f43d447d596393ce3e327b6987bd2a19442f60ad229ff0c6f54"},
+    {"name": "dflash_k7", "method": "dflash", "num_speculative_tokens": 7, "draft": "dflash", "config": "experiments/qwen3_30ba3b_swe_rollout_pr3733/configs/dflash_k7.yaml", "config_sha256": "46d52b3c3b341c8cd408f413fae8fd17680e87a6a70aff90b447fb60493b62fa"},
+    {"name": "dspark_k5", "method": "dspark", "num_speculative_tokens": 5, "draft": "dspark", "config": "experiments/qwen3_30ba3b_swe_rollout_pr3733/configs/dspark_k5.yaml", "config_sha256": "08deb643c7497aac14c3e00ac0aa496934445a136875cd23d3282803c00c5961"},
+    {"name": "dspark_k7", "method": "dspark", "num_speculative_tokens": 7, "draft": "dspark", "config": "experiments/qwen3_30ba3b_swe_rollout_pr3733/configs/dspark_k7.yaml", "config_sha256": "42ba188e20158d331868bb1f30a5de7b11bd6e2686c85707207555f57cf09f3a"}
+  ]
+}
