@@ -58,14 +58,12 @@ class NonColocatedTeachersConfig(BaseModel, extra="allow"):
     """Non-colocated (separate-GPU) teacher resourcing for on-policy distillation."""
 
     enabled: bool = False
-    default_teacher_cfg: TeacherResourceConfig = Field(
-        default_factory=TeacherResourceConfig
-    )
-    # Deliberately UNTYPED values: override blocks are partial by nature, and
-    # validating them as TeacherResourceConfig here would fill schema defaults
-    # for every omitted field (e.g. gpus_per_node=8), which later clobber
-    # default_teacher_cfg in the defaults<-override merge. Validation happens
-    # after the merge in create_teacher_configs_from_opd_config.
+    # Deliberately UNTYPED blocks: both are partial by nature, and validating
+    # them as TeacherResourceConfig here would fill schema defaults for every
+    # omitted field (e.g. gpus_per_node=8 on a 4-GPU/node cluster), clobbering
+    # the cluster-derived seed and the defaults<-override merge. Validation
+    # happens after the merge in create_teacher_configs_from_opd_config.
+    default_teacher_cfg: dict[str, Any] = Field(default_factory=dict)
     teacher_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
@@ -288,7 +286,9 @@ def reserve_teacher_clusters(
 
     opd_cfg = _opd_cfg(master_config)
     _validate_default_teacher_alias(opd_cfg)
-    teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
+    teacher_configs = create_teacher_configs_from_opd_config(
+        opd_cfg, cluster_gpus_per_node=master_config["cluster"]["gpus_per_node"]
+    )
 
     # Running topology of still-free nodes; each teacher consumes a segment and
     # passes the remainder to the next so teachers don't collide.
@@ -389,7 +389,9 @@ def create_teacher_worker_groups(
     teacher_model_by_agent_name = dict(opd_cfg.get("teacher_model_by_agent_name", {}))
     _validate_default_teacher_alias(opd_cfg)
 
-    teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
+    teacher_configs = create_teacher_configs_from_opd_config(
+        opd_cfg, cluster_gpus_per_node=master_config["cluster"]["gpus_per_node"]
+    )
     expected_aliases = {teacher_config.alias for teacher_config in teacher_configs}
     if set(teacher_clusters) != expected_aliases:
         raise ValueError(

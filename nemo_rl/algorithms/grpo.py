@@ -761,7 +761,9 @@ def setup(
         )
 
         opd_cfg = opd_module._opd_cfg(master_config)
-        teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
+        teacher_configs = create_teacher_configs_from_opd_config(
+            opd_cfg, cluster_gpus_per_node=cluster_config["gpus_per_node"]
+        )
         for tcfg in teacher_configs:
             assert tcfg.gpus_per_node <= cluster_config["gpus_per_node"], (
                 f"OPD teacher '{tcfg.alias}' requests gpus_per_node={tcfg.gpus_per_node} > "

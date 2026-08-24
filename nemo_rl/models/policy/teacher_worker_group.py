@@ -59,11 +59,14 @@ class TeacherConfig:
 
 def create_teacher_configs_from_opd_config(
     opd_cfg: dict[str, Any],
+    cluster_gpus_per_node: Optional[int] = None,
 ) -> list[TeacherConfig]:
     """Build per-teacher configs from on_policy_distillation config.
 
     Handles deduplication (multiple aliases sharing one checkpoint produce
-    one TeacherConfig) and per-teacher overrides on top of defaults.
+    one TeacherConfig) and per-teacher overrides on top of defaults. When
+    ``cluster_gpus_per_node`` is given it seeds ``gpus_per_node`` so teachers
+    match the actual cluster unless a config explicitly says otherwise.
     """
     teacher_model_by_agent_name: dict[str, str] = dict(
         opd_cfg.get("teacher_model_by_agent_name", {})
@@ -81,15 +84,17 @@ def create_teacher_configs_from_opd_config(
             continue
         seen_models.add(model_name)
 
-        # defaults <- per-alias override, then validated/typed by the schema.
+        # cluster seed <- defaults <- per-alias override, then schema-validated.
+        base: dict[str, Any] = {}
+        if cluster_gpus_per_node is not None:
+            base["gpus_per_node"] = int(cluster_gpus_per_node)
         raw_override = overrides.get(alias, {})
         if isinstance(raw_override, TeacherResourceConfig):
-            # Config loading may pre-validate override blocks, which fills
-            # schema defaults for every field; keep only what the yaml
-            # actually set so a PARTIAL per-alias override doesn't clobber
-            # default_teacher_cfg (e.g. gpus_per_node reverting to 8).
+            # Defensive: if a loader pre-validated the block, keep only what
+            # the yaml actually set so a PARTIAL override doesn't clobber
+            # defaults with schema-filled fields.
             raw_override = raw_override.model_dump(exclude_unset=True)
-        merged = {**default_cfg, **dict(raw_override)}
+        merged = {**base, **default_cfg, **dict(raw_override)}
         res = TeacherResourceConfig(**merged)
 
         # Unknown top-level keys (extra="allow") fold into megatron_cfg_overrides;
