@@ -1366,6 +1366,57 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
     assert train_metrics["aborted_stale_inflight_groups"] == 1
 
 
+def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
+    monkeypatch,
+) -> None:
+    metas = [
+        KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"sample-{index}"],
+            fields=[],
+            sequence_lengths=[1],
+            extra_info={"rollout_metrics": [metrics]},
+            tags=[{"weight_version": 0}],
+        )
+        for index, metrics in enumerate(
+            [
+                {
+                    "gen_tokens/min": 7,
+                    "gen_tokens/max": 10,
+                    "total_turns": 2,
+                    "accuracy": 0.25,
+                    "trajectory_duration_s": 1.0,
+                },
+                {
+                    "gen_tokens/min": 3,
+                    "gen_tokens/max": 20,
+                    "total_turns": 5,
+                    "accuracy": 0.75,
+                    "trajectory_duration_s": 3.0,
+                },
+            ]
+        )
+    ]
+    ctrl = _train_pump_controller(sampler=_SequenceSampler(metas))
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    train_call = ctrl._logger.log_metrics.call_args_list[0]
+    train_metrics = train_call.args[0]
+    assert train_metrics["gen_tokens/min"] == 3
+    assert train_metrics["gen_tokens/max"] == 20
+    assert train_metrics["total_turns"] == 7
+    assert train_metrics["accuracy"] == pytest.approx(0.5)
+    assert train_metrics["trajectory_duration_s"] == pytest.approx(2.0)
+    assert train_metrics["trajectory_duration_s/max"] == 3.0
+    assert train_metrics["trajectory_duration_s/p95"] == 3.0
+    assert train_call.kwargs == {"step": 1, "prefix": "train"}
+
+
 def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> None:
     """The logprob detour between chunks must not offload the trainer's grad
     buffers, because mcore's offload frees the gradients the earlier chunks of

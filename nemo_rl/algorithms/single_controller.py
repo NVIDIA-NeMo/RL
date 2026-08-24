@@ -56,6 +56,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _write_latest_checkpoint_status,
+    aggregate_rollout_metrics,
     compute_and_apply_seq_logprob_error_masking,
 )
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
@@ -78,7 +79,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
+from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
@@ -955,6 +956,7 @@ class SingleControllerActor:
             value_result: Optional[dict[str, Any]] = None
             # Always True off the PPO path: the start step is pinned to 0 there.
             is_policy_training_step = self._train_steps >= policy_training_start_step
+            selected_rollout_metrics: list[dict[str, Any]] = []
 
             with self._timer.time("total_step_time"):
                 # Re-read on every iteration rather than once: a prompt stamped for this
@@ -1031,6 +1033,10 @@ class SingleControllerActor:
                         # Release buffer capacity
                         for _ in range(num_groups):
                             self._buffer_capacity.release()
+
+                        selected_rollout_metrics.extend(
+                            train_meta.extra_info.pop(ROLLOUT_METRICS, [])
+                        )
 
                     # ---- 2. Prepare the batch ----
                     # Compute prev_logprobs / ref_logprobs
@@ -1239,6 +1245,15 @@ class SingleControllerActor:
                     step_metrics.update(_compute_critic_metrics(value_result))
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
+                )
+                per_group_rollout_metrics: dict[str, list[Any]] = {}
+                for group_metrics in selected_rollout_metrics:
+                    for metric_name, value in group_metrics.items():
+                        per_group_rollout_metrics.setdefault(metric_name, []).append(
+                            value
+                        )
+                step_metrics.update(
+                    aggregate_rollout_metrics(per_group_rollout_metrics)
                 )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 step_metrics.update(
