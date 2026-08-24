@@ -31,7 +31,6 @@ import requests
 from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _build_reasoning_parser,
     _build_tool_parser,
-    _ends_with_token_suffix,
     _make_parse_tool_calls,
 )
 from tests.unit.models.generation.chat_template_parity_common import (
@@ -411,16 +410,6 @@ def _parse_with_trtllm(
         "content": content or None if normalized_calls else content,
         "tool_calls": normalized_calls,
     }
-
-
-def test_ends_with_token_suffix() -> None:
-    suffixes = ((7,), (7, 8), (7, 9, 9))
-
-    assert _ends_with_token_suffix([1, 2, 7], suffixes)
-    assert _ends_with_token_suffix([1, 2, 7, 8], suffixes)
-    assert _ends_with_token_suffix([1, 7, 9, 9], suffixes)
-    assert not _ends_with_token_suffix([1, 7, 9], suffixes)
-    assert not _ends_with_token_suffix([], suffixes)
 
 
 @pytest.mark.parametrize("reasoning_parser", tuple(TRTLLM_REASONING_PARSERS))

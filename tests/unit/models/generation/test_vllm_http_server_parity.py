@@ -298,7 +298,10 @@ def _parse_with_vllm(
     content: str | None = raw_output
 
     if reasoning_parser is not None:
-        parser_input = "<think>" + raw_output if reasoning_at_start else raw_output
+        # vLLM has no reasoning_at_start flag: its parser infers the shape from
+        # the text, so output without an opening <think> is passed through
+        # untouched. TRT-LLM is told explicitly via the flag instead.
+        parser_input = raw_output
         parser_type = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
         parser = parser_type(tokenizer)
         reasoning_content, content = parser.extract_reasoning(parser_input, request)

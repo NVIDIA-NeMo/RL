@@ -42,22 +42,6 @@ def _tokens_for_response_text(
     return token_ids if text_token_end == len(token_ids) else token_ids[:text_token_end]
 
 
-def _ends_with_token_suffix(
-    token_ids: list[int], suffixes: tuple[tuple[int, ...], ...]
-) -> bool:
-    for suffix in suffixes:
-        suffix_len = len(suffix)
-        if suffix_len > len(token_ids):
-            continue
-        offset = len(token_ids) - suffix_len
-        for index, token_id in enumerate(suffix):
-            if token_ids[offset + index] != token_id:
-                break
-        else:
-            return True
-    return False
-
-
 def _build_reasoning_parser(
     name: str,
     chat_template_kwargs: dict[str, Any],
