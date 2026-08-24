@@ -90,6 +90,13 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     ``nemo_rl.data_plane.adapters.transfer_queue_env.configure_engine_env``.
     """
 
+    # The store reads this and configures its own transport from it -- it does
+    # not go through the MC_FORCE_MNNVL branch the transfer engine uses, which
+    # is why forcing that env var is inert here (and refused; see
+    # transfer_queue_env). "nvlink" additionally swaps mooncake's allocator to
+    # NvlinkTransport::allocatePinnedLocalMemory, so the segment lands in HBM
+    # rather than host RAM -- size it accordingly.
+    protocol: Literal["rdma", "nvlink"] = "rdma"
     global_segment_size: int = 68719476736  # 64 GiB per client process
     local_buffer_size: int = 4294967296  # 4 GiB per client process
     reuse_registered_buffers: bool = True

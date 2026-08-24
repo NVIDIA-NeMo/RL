@@ -159,14 +159,15 @@ _NVLINK_TRANSPORT_ENV = ("MC_FORCE_MNNVL", "MC_INTRANODE_NVLINK")
 def _reject_nvlink_transport_env() -> None:
     """Refuse to start when the launcher forces mooncake's NVLink transport.
 
-    No backend here can feed it. Register mode publishes torch-allocated
-    memory, and the fabric export needs an allocation made with
-    ``CU_MEM_HANDLE_TYPE_FABRIC`` -- the default caching allocator uses
-    ``cudaMalloc`` (no cuMem handle at all) and ``expandable_segments`` never
-    requests a FABRIC handle, so registration returns success having published
-    nothing and the reader fails with ``status -1`` much later, on another
-    node. ``mooncake_cpu`` never reaches the branch at all: the store brings up
-    its own transport pinned to ``protocol: rdma``.
+    No backend here can feed it *today*. Register mode publishes
+    torch-allocated memory, and both torch allocators were measured to fail:
+    with the default caching allocator mooncake logs ``not allocated by
+    cuMemCreate`` and returns success having published nothing, so the reader
+    fails with ``status -1`` much later and on another node; with
+    ``expandable_segments`` the read fails the same way, though no warning or
+    export failure is logged and the mechanism there is not established.
+    ``mooncake_cpu`` never reaches the branch at all: the store brings up its
+    own transport pinned to ``protocol: rdma``.
 
     Measured on GB300, 6n4g qwen3-30b: with ``MC_FORCE_MNNVL=1`` the run dies of
     a host OOM ~9 minutes in, twice out of two, while the identical run without
@@ -184,7 +185,8 @@ def _reject_nvlink_transport_env() -> None:
     raise RuntimeError(
         f"{', '.join(forced)} is set, which makes mooncake install its NVLink "
         "transport instead of RDMA. No data-plane backend can use it: register "
-        "mode registers torch memory, which is never fabric-exportable, and "
+        "mode registers torch memory, which mooncake's fabric export was measured "
+        "to reject, and "
         "mooncake_cpu's store pins its own transport to rdma. Setting it has "
         "been measured to end the run in a host OOM. Unset it. Reaching the "
         "NVLink path needs buffers allocated through mooncake's own allocator "

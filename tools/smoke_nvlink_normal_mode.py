@@ -13,19 +13,19 @@
 # limitations under the License.
 """Does NVLink IPC work in *normal* mode, where Mooncake owns the buffers?
 
-Register mode fails on the NVLink transport and the reason is structural, not a
-misconfiguration. ``NvlinkTransport::allocatePinnedLocalMemory`` builds its
-buffers with::
+Register mode fails on the NVLink transport with torch-allocated sources.
+``NvlinkTransport::allocatePinnedLocalMemory`` builds its own buffers with::
 
     prop.type                 = CU_MEM_ALLOCATION_TYPE_PINNED
     prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC
 
-so the allocation is fabric-exportable *by construction*. Register mode instead
-hands the transport whatever torch already allocated, and neither torch mode
-qualifies: the default caching allocator uses ``cudaMalloc`` (no cuMem handle at
-all, so ``cuMemRetainAllocationHandle`` fails and registration publishes
-nothing), while ``expandable_segments`` uses cuMem but never requests a FABRIC
-handle type.
+so they are fabric-exportable by construction. Register mode instead hands the
+transport whatever torch already allocated, and both torch modes failed --
+though only one failure has a mechanism we actually observed. With the default
+caching allocator mooncake logs ``not allocated by cuMemCreate`` and publishes
+nothing, and the reader reports ``not found!``. With ``expandable_segments``
+the reader still reports ``not found!``, but no warning and no export/import
+failure is logged, so why it fails is unknown.
 
 Normal mode goes through ``allocate_managed_buffer``, which calls that
 allocator, so it should be the supported path. This checks that directly

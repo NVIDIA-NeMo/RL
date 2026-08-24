@@ -398,7 +398,7 @@ On a GB300 node (RoCE, `mlx5_8`; `mlx5_17` present but with no active port):
 | real engine, GDR, mooncake defaults | FAIL, `ERR_CONTEXT` (-202) — the peermem route above |
 | real engine, GDR, DMA-BUF route | PASS — published base is a CUDA VA, every key returns `device=cuda` and byte-exact |
 
-### NVLink (MNNVL) is 40x RDMA, and register mode structurally cannot use it
+### NVLink (MNNVL) is 40x RDMA, and register mode cannot reach it as it stands
 
 Measured on GB300, `tools/nvlink_crossnode.sbatch` + `tools/smoke_nvlink_normal_mode.py`:
 
@@ -422,13 +422,27 @@ Four facts govern whether this is reachable, and three of them are traps:
    `protocol="nvlink"` only swaps the *memory allocator*, which is why an early
    run measured "nvlink" at RDMA speed. `nvlink_intra` is not compiled into the
    pinned wheel — setting `MC_INTRANODE_NVLINK` fails engine init outright.
-2. **The fabric export needs `CU_MEM_HANDLE_TYPE_FABRIC` memory.**
-   `NvlinkTransport::allocatePinnedLocalMemory` builds buffers with
-   `cuMemCreate` + that handle type. Register mode registers whatever torch
-   allocated, and neither torch mode qualifies: the default caching allocator
-   uses `cudaMalloc` (no cuMem handle), and `expandable_segments` uses cuMem but
-   never requests a FABRIC handle. **So register mode cannot use NVLink at all**
-   — this is structural, not a misconfiguration.
+2. **Register mode's sources are torch-allocated, and both torch modes failed.**
+   `NvlinkTransport::allocatePinnedLocalMemory` builds its own buffers with
+   `cuMemCreate` + `CU_MEM_HANDLE_TYPE_FABRIC`, so they are exportable by
+   construction. Register mode instead registers whatever torch allocated:
+
+   - **default caching allocator** — fails with a *proven* mechanism: mooncake
+     logs `Memory region ... is not allocated by cuMemCreate` and returns 0
+     having published nothing, so the reader hits `Requested address ... not
+     found!`.
+   - **`expandable_segments`** — also fails, mechanism **unverified**. The only
+     log line is the reader's `not found!`; there is no `cuMemCreate` warning
+     and no `cuMemExportToShareableHandle` / `cuMemImportFromShareableHandle` /
+     `cuMemAddressReserve` failure, so registration appears to have succeeded
+     and something later did not. A plausible reading is that torch's VMM
+     allocation never requests a FABRIC handle type, but that was inferred, not
+     observed, and has not been checked against the wheel's actual source.
+
+   So: not reachable with torch-allocated sources as they are today. That is
+   weaker than "impossible" — allocating register mode's sources through
+   mooncake's own allocator (see the `_prepare_source` note below) would sidestep
+   the question entirely, and has not been tried.
 3. **Registration fails silently.** `registerLocalMemory` calls
    `cuMemRetainAllocationHandle`, and when the memory did not come from
    `cuMemCreate` it logs a warning and returns **0** — success, having published
