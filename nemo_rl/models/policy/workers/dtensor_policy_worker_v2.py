@@ -373,13 +373,7 @@ class DTensorPolicyWorkerV2Impl(
             self.reference_model_state_dict = setup_reference_model_state(self.model)
 
         if defer_checkpoint_load:
-            self.checkpoint_manager.load_checkpoint(
-                model=self.model,
-                weights_path=weights_path,
-                optimizer=self.optimizer,
-                optimizer_path=optimizer_path,
-                scheduler=self.scheduler,
-            )
+            self.load_checkpoint(weights_path, optimizer_path)
 
         # Set instance attributes from runtime config (tuple unpacking)
         (

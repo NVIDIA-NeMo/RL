@@ -32,6 +32,10 @@ from tests.unit.test_utils import SimpleLossFn
 
 try:
     import nemo_rl.models.policy.workers.dtensor_policy_worker_v2 as worker_mod
+    from nemo_rl.models.automodel.config import (
+        ModelAndOptimizerState,
+        RuntimeConfig,
+    )
     from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
         DTensorPolicyWorkerV2Impl,
         _maybe_adapt_tensor_to_hf,
@@ -1025,21 +1029,21 @@ def _init_v2_worker_mocked(
         lambda cfg, get_processor=False: MagicMock(name="tokenizer"),
     )
 
-    # 13-tuple unpacked as runtime config at the end of __init__.
-    runtime_config = (
-        "model_class",
-        "model_config",
-        {},
-        False,
-        "attn_impl",
-        None,
-        False,
-        1.0,
-        False,
-        False,
-        False,
-        None,
-        False,
+    # Unpacked as runtime config at the end of __init__.
+    runtime_config = RuntimeConfig(
+        model_class="model_class",
+        model_config="model_config",
+        hf_config_overrides={},
+        allow_flash_attn_args=False,
+        attn_impl="attn_impl",
+        dtype=None,
+        enable_seq_packing=False,
+        max_grad_norm=1.0,
+        cpu_offload=False,
+        offload_optimizer_for_logprob=False,
+        is_generation_colocated=False,
+        sampling_params=None,
+        is_reward_model=False,
     )
     monkeypatch.setattr(
         worker_mod, "validate_and_prepare_config", lambda **kw: runtime_config
@@ -1064,18 +1068,18 @@ def _init_v2_worker_mocked(
         fake_init_checkpoint_manager,
     )
 
-    # 10-tuple unpacked as model_and_optimizer_state.
-    model_and_optimizer_state = (
-        MagicMock(name="model"),
-        MagicMock(name="optimizer"),
-        MagicMock(name="scheduler"),
-        False,
-        False,
-        False,
-        "model_class",
-        "model_config",
-        None,
-        False,
+    # Unpacked as model_and_optimizer_state.
+    model_and_optimizer_state = ModelAndOptimizerState(
+        model=MagicMock(name="model"),
+        optimizer=MagicMock(name="optimizer"),
+        scheduler=MagicMock(name="scheduler"),
+        is_hf_model=False,
+        is_moe_model=False,
+        is_reward_model=False,
+        model_class="model_class",
+        model_config="model_config",
+        peft_config=None,
+        autocast_enabled=False,
     )
     setup_mock = MagicMock(
         side_effect=lambda **kw: (
