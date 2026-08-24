@@ -107,6 +107,13 @@ RUN GITHUB_ARTIFACTORY=github.com \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
+# Rust toolchain for setuptools-rust extensions in SGLang.
+ENV PATH="/root/.cargo/bin:$PATH"
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal \
+    && rustc --version \
+    && cargo --version
+
 # Install uv and python
 ARG UV_VERSION=0.11.28
 ARG PYTHON_VERSION=3.13.14
