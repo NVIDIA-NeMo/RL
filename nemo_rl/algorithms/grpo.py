@@ -1739,10 +1739,9 @@ def dynamic_sampling(
         master_config.grpo.num_prompts_per_step
         * master_config.grpo.num_generations_per_prompt
     )
-    # Store the baseline, std and total_reward for the current unfiltered batch.
+    # Store the baseline and std for the current unfiltered batch.
     repeated_batch["baseline"] = baseline
     repeated_batch["std"] = std
-    total_rewards = repeated_batch["total_reward"]
     dynamic_sampling_metrics = {}
 
     # Dynamic sampling algorithm (used in DAPO algorithm)
@@ -1763,10 +1762,21 @@ def dynamic_sampling(
             filtered_repeated_batch["std"] = std[keep_prompt_indices]
             filtered_repeated_batch["baseline"] = baseline[keep_prompt_indices]
 
-            # Store filtered and total rewards to track them separately
-            filtered_rewards = filtered_repeated_batch["total_reward"]
-            filtered_repeated_batch["total_reward"] = total_rewards
-            filtered_repeated_batch["filtered_reward"] = filtered_rewards
+            # `select_indices` above already filtered `total_reward` to the
+            # kept prompts, correctly aligned row-for-row with every other
+            # key in `filtered_repeated_batch`. Expose the identical values
+            # under `filtered_reward` too, since callers read that name
+            # explicitly (e.g. grpo_train's post-filter `rewards` lookup).
+            # This used to instead overwrite `total_reward` with the full,
+            # unfiltered per-round reward tensor -- a different length than
+            # every other key here, which corrupts `total_reward` (but not
+            # `filtered_reward`, which was correctly the filtered tensor
+            # under the wrong name) the moment this batch is cached across
+            # dynamic-sampling rounds via `BatchedDataDict.from_batches`
+            # below, or sliced to `train_prompts_size` a few lines down.
+            filtered_repeated_batch["filtered_reward"] = filtered_repeated_batch[
+                "total_reward"
+            ]
 
             # Store the total_reward for the current filtered batch.
             # If none of the prompts in current batch have non-zero std, filtered_repeated_batch.size will be 0.
@@ -3036,6 +3046,13 @@ def grpo_train(
                 with timer.time("reward_calculation"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
+                    # This round's reward before dynamic-sampling filtering,
+                    # kept under its own name since `dynamic_sampling` below
+                    # reassigns `repeated_batch` (and `total_reward` on it)
+                    # to the filtered/cached batch, which has a different
+                    # row count once samples have been dropped or slices
+                    # accumulated across rounds.
+                    this_round_unfiltered_rewards = rewards
 
                     print("▶ Computing advantages...", flush=True)
                     # For DAPO with reward shaping, compute std on the raw
@@ -3461,7 +3478,7 @@ def grpo_train(
                     ].numpy()
                 if master_config.grpo.use_dynamic_sampling:
                     metrics["filtered_reward"] = rewards.numpy()
-                    metrics["reward"] = repeated_batch["total_reward"].numpy()
+                    metrics["reward"] = this_round_unfiltered_rewards.numpy()
 
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(gen_step_metrics)
@@ -3636,6 +3653,19 @@ def grpo_train(
                 log_data["content"] = flat_messages["content"]
                 log_data["rewards"] = rewards.tolist()
                 if master_config.grpo.use_dynamic_sampling:
+                    # Every other field logged here (content, token_ids, ...)
+                    # reflects the filtered-and-sliced batch, so `rewards`
+                    # must stay row-aligned to it; `filtered_rewards` is kept
+                    # as an explicit alias rather than being deduplicated
+                    # away, since other tooling may key on its presence. The
+                    # true pre-filter reward (`this_round_unfiltered_rewards`,
+                    # used for metrics["reward"] below) is intentionally NOT
+                    # used here: it reflects only the most recent generation
+                    # batch, not the (possibly multi-round) accumulated and
+                    # sliced batch this log entry describes, so it is not
+                    # row-aligned with `content` and using it here would
+                    # raise inside log_batched_dict_as_jsonl whenever the two
+                    # sizes differ.
                     log_data["filtered_rewards"] = rewards.tolist()
                     log_data["rewards"] = repeated_batch["total_reward"].tolist()
                 log_data["input_lengths"] = input_lengths.tolist()

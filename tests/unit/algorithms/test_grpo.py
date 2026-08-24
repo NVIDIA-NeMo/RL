@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
@@ -1957,6 +1958,179 @@ def test_dapo_dynamic_sampling_batch_caching(mock_grpo_components):
     )  # All samples from the single prompt with non-zero std
     assert is_batch_complete == True
     assert batch_cache is not None
+
+
+def test_dapo_dynamic_sampling_discard_slice_preserves_reward_alignment(
+    mock_grpo_components,
+):
+    """When a single round over-produces, total_reward must stay aligned
+    with the kept-and-sliced batch, not with the raw pre-filter batch.
+
+    `total_reward` used to be overwritten with the full, unfiltered
+    per-round reward tensor before the final `.slice(0, train_prompts_size)`
+    -- a different array than the one every other key in the batch reflects,
+    so the slice took an arbitrary prefix of the raw generation batch
+    (including dropped, zero-std samples) instead of the first
+    train_prompts_size *kept* samples.
+    """
+    batch_size = 6
+    message_logs = [
+        [
+            {"role": "user", "content": f"prompt_{i}"},
+            {"role": "assistant", "content": f"response_{i}"},
+        ]
+        for i in range(batch_size)
+    ]
+    repeated_batch = create_mock_batch(batch_size, ["math"] * batch_size, message_logs)
+    repeated_batch["total_reward"] = torch.tensor([10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
+    # Sample 0 is dropped (std == 0); samples 1-5 are kept.
+    std = torch.tensor([0.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    baseline = torch.zeros(batch_size)
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.use_dynamic_sampling = True
+    master_config.grpo.num_prompts_per_step = 1
+    master_config.grpo.num_generations_per_prompt = 4  # train_prompts_size = 4
+    master_config.grpo.dynamic_sampling_max_gen_batches = 5
+
+    result_batch, is_batch_complete, _, _ = dynamic_sampling(
+        repeated_batch,
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches=1,
+        master_config=master_config,
+        timer=Timer(),
+    )
+
+    # 5 kept >= 4 needed, so the first round already completes the batch;
+    # the extra kept sample (reward 60) is discarded by the final slice.
+    assert is_batch_complete is True
+    assert result_batch.size == 4
+    expected = torch.tensor([20.0, 30.0, 40.0, 50.0])
+    torch.testing.assert_close(result_batch["filtered_reward"], expected)
+    torch.testing.assert_close(result_batch["total_reward"], expected)
+    torch.testing.assert_close(
+        result_batch["total_reward"], result_batch["filtered_reward"]
+    )
+
+
+def test_dapo_dynamic_sampling_cache_preserves_reward_alignment(
+    mock_grpo_components,
+):
+    """Across cached rounds, total_reward must stay aligned with the
+    accumulated kept-and-sliced batch, not diverge in row count or order
+    from the rest of the batch.
+
+    `total_reward` used to be reset, on every round, to that round's full
+    unfiltered reward tensor. Once `BatchedDataDict.from_batches` concatenates
+    across rounds, that tensor's row count no longer matches every other key
+    in the same dict (which only accumulates the *kept* rows), so the final
+    slice reads the wrong reward for a sample under dynamic sampling's own
+    row-alignment guarantee.
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.use_dynamic_sampling = True
+    master_config.grpo.num_prompts_per_step = 1
+    master_config.grpo.num_generations_per_prompt = 6  # train_prompts_size = 6
+    master_config.grpo.dynamic_sampling_max_gen_batches = 5
+    timer = Timer()
+
+    def make_round(rewards: list[float], std: list[float]):
+        n = len(rewards)
+        message_logs = [
+            [
+                {"role": "user", "content": f"prompt_{i}"},
+                {"role": "assistant", "content": f"response_{i}"},
+            ]
+            for i in range(n)
+        ]
+        batch = create_mock_batch(n, ["math"] * n, message_logs)
+        batch["total_reward"] = torch.tensor(rewards)
+        return batch, torch.tensor(std), torch.zeros(n)
+
+    # Round 1: sample index 2 (reward 30) is dropped; 3 of 4 kept.
+    batch1, std1, baseline1 = make_round([10.0, 20.0, 30.0, 40.0], [1.0, 1.0, 0.0, 1.0])
+    result_batch, is_batch_complete, batch_cache, _ = dynamic_sampling(
+        batch1,
+        std1,
+        baseline1,
+        dynamic_sampling_num_gen_batches=1,
+        master_config=master_config,
+        timer=timer,
+    )
+    assert is_batch_complete is False  # 3 kept < 6 needed
+
+    # Round 2: none dropped, 4 of 4 kept. 3 + 4 = 7 >= 6, batch completes.
+    batch2, std2, baseline2 = make_round([50.0, 60.0, 70.0, 80.0], [1.0] * 4)
+    result_batch, is_batch_complete, batch_cache, _ = dynamic_sampling(
+        batch2,
+        std2,
+        baseline2,
+        dynamic_sampling_num_gen_batches=2,
+        master_config=master_config,
+        timer=timer,
+        batch_cache=batch_cache,
+    )
+
+    assert is_batch_complete is True
+    assert result_batch.size == 6
+    # First 3 kept from round 1, plus the first 3 kept from round 2; the
+    # last kept sample of round 2 (reward 80) is discarded by the slice.
+    expected = torch.tensor([10.0, 20.0, 40.0, 50.0, 60.0, 70.0])
+    torch.testing.assert_close(result_batch["filtered_reward"], expected)
+    torch.testing.assert_close(result_batch["total_reward"], expected)
+    torch.testing.assert_close(
+        result_batch["total_reward"], result_batch["filtered_reward"]
+    )
+
+
+def test_grpo_train_this_round_unfiltered_rewards_usage():
+    """`this_round_unfiltered_rewards` must be used for exactly one thing:
+    `metrics["reward"]`. Not for `log_data["rewards"]`.
+
+    Now that `dynamic_sampling` no longer overwrites `total_reward` on the
+    returned batch with the unfiltered per-round reward (see
+    test_dapo_dynamic_sampling_discard_slice_preserves_reward_alignment),
+    `repeated_batch["total_reward"]` after the call is the *filtered*
+    reward, row-aligned with the samples that end up training. Two things
+    downstream read it under `use_dynamic_sampling`, with opposite needs:
+
+    - `metrics["reward"]` is a diagnostic deliberately distinct from
+      `metrics["filtered_reward"]` (raw generation quality vs. reward of
+      the trained samples), so it must keep reading the preserved
+      pre-filter reward instead, or it would silently collapse to the
+      same value as `metrics["filtered_reward"]`.
+    - `log_data["rewards"]` is logged row-for-row against `content` and
+      `token_ids`, which reflect the filtered-and-sliced batch, not the
+      single most recent generation batch `this_round_unfiltered_rewards`
+      holds. It must keep reading the filtered `total_reward`, or it would
+      raise inside `log_batched_dict_as_jsonl` whenever the two sizes
+      differ (over-generation or a multi-round accumulation).
+
+    grpo_train builds both of these inline, so this test locks the two
+    literals in place via source inspection rather than invoking the
+    function, which would require standing up rollout, policy, and
+    generation actors.
+    """
+    source = inspect.getsource(grpo_train)
+    assert 'metrics["reward"] = this_round_unfiltered_rewards.numpy()' in source, (
+        "grpo_train no longer sources metrics['reward'] from the reward "
+        "captured before dynamic_sampling filtering; it would silently "
+        "become identical to metrics['filtered_reward']"
+    )
+    # The training-data JSONL's `rewards` field must stay row-aligned with
+    # `content`/`token_ids`, which reflect the filtered-and-sliced batch, not
+    # the single most recent generation batch `this_round_unfiltered_rewards`
+    # holds. Using the latter here would raise inside
+    # log_batched_dict_as_jsonl whenever the two sizes differ (over-generation
+    # or a multi-round accumulation), rather than merely being a less useful
+    # diagnostic like the metrics-dict case above.
+    assert 'log_data["rewards"] = repeated_batch["total_reward"].tolist()' in source, (
+        "grpo_train's training-data JSONL no longer sources log_data['rewards'] "
+        "from the filtered total_reward; if it now reads "
+        "this_round_unfiltered_rewards instead, it will crash whenever that "
+        "tensor's length differs from the logged content's"
+    )
 
 
 def test_dapo_cache_aligns_deduplicated_media_with_text_only_batch(
