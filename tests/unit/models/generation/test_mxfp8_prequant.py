@@ -316,6 +316,44 @@ def test_batched_expert_prequantization_uses_stream_local_scratch():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_batched_expert_prequantization_waits_when_consumer_stream_changes():
+    from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
+
+    def expert_name(expert_id):
+        return f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
+
+    params = [
+        (expert_name(i), torch.full((2, 64), i + 1, device="cuda")) for i in range(2)
+    ]
+
+    def delayed_quantize(tensor):
+        value = torch.empty_like(tensor)
+        torch.cuda._sleep(5_000_000)
+        value.copy_(tensor)
+        scale = torch.ones((*tensor.shape[:-1], 2), dtype=torch.uint8, device="cuda")
+        return value, scale
+
+    output = fp8_train_utils.iter_mxfp8_prequantized_params(
+        params,
+        {name for name, _tensor in params},
+        quantize_fn=delayed_quantize,
+        max_experts_per_batch=2,
+    )
+    producer_stream = torch.cuda.Stream()
+    consumer_stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(producer_stream):
+        next(output)
+        next(output)
+    with torch.cuda.stream(consumer_stream):
+        second_expert, _second_scale = next(output), next(output)
+        observed = second_expert[1].clone()
+    consumer_stream.synchronize()
+
+    torch.testing.assert_close(observed, params[1][1])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "is_gated,intermediate_size,hidden_size",
     [

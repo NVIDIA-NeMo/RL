@@ -197,6 +197,9 @@ def iter_mxfp8_prequantized_params(
             with torch.no_grad():
                 torch.stack(tensors, dim=0, out=stacked)
 
+            producer_stream = (
+                torch.cuda.current_stream(first.device) if first.is_cuda else None
+            )
             value, scale = quantize_fn(stacked.view(-1, stacked.shape[-1]))
             value = value.view_as(stacked)
             scale_columns = first.shape[-1] // MXFP8_BLOCK_SIZE
@@ -207,8 +210,18 @@ def iter_mxfp8_prequantized_params(
             )
             scale = scale.view(len(chunk), *scale_shape)
             for index, (_expert_id, name, _tensor) in enumerate(chunk):
-                yield name, value[index]
-                yield name + "_scale_from_checkpoint", scale[index]
+                for output_name, output_tensor in (
+                    (name, value[index]),
+                    (name + "_scale_from_checkpoint", scale[index]),
+                ):
+                    if producer_stream is not None:
+                        consumer_stream = torch.cuda.current_stream(
+                            output_tensor.device
+                        )
+                        if consumer_stream != producer_stream:
+                            consumer_stream.wait_stream(producer_stream)
+                        output_tensor.record_stream(consumer_stream)
+                    yield output_name, output_tensor
 
     def flush_pending() -> Iterator[tuple[str, torch.Tensor]]:
         while pending:
