@@ -646,46 +646,55 @@ class SingleControllerActor:
         if probe_task is not None:
             tasks.append(probe_task)
         try:
-            done, _ = await asyncio.wait(
-                set(tasks), return_when=asyncio.FIRST_COMPLETED
-            )
-            stop_after_rollout_checkpoint = False
-            if rollout_checkpoint_task is not None and rollout_checkpoint_task in done:
-                await rollout_checkpoint_task
-                if not self._rollout_checkpoint_stop_requested.is_set():
-                    raise RuntimeError(
-                        "rollout checkpoint pump exited without requesting stop"
-                    )
-                stop_after_rollout_checkpoint = True
-            if stop_after_rollout_checkpoint:
-                # FIRST_COMPLETED may return several tasks. Do not let the
-                # orderly pre-step checkpoint stop hide a rollout/train failure
-                # that completed in the same event-loop turn.
-                for task in done:
-                    if task is not rollout_checkpoint_task:
-                        await task
-            if (
-                not stop_after_rollout_checkpoint
-                and probe_task is not None
-                and probe_task in done
-            ):
-                # Loops forever like the watchdog, so finishing at all means it raised.
-                await probe_task
-            if rollout_telemetry_task is not None and rollout_telemetry_task in done:
-                # This pump has no normal return path. Awaiting it propagates the
-                # exception, including one concurrent with an orderly checkpoint stop.
-                await rollout_telemetry_task
-            if not stop_after_rollout_checkpoint and watchdog_task in done:
-                # The watchdog loops forever, so finishing at all means it raised --
-                # a stall or an unhealthy environment. Surface that ahead of the
-                # pumps, whose own symptom would just be "waiting".
-                await watchdog_task
-            if not stop_after_rollout_checkpoint and rollout_task in done:
-                # Propagate rollout failures immediately. A normally exhausted
-                # rollout pump leaves the train pump to drain committed groups.
-                await rollout_task
-            if not stop_after_rollout_checkpoint:
-                await train_task
+            # Keep supervising every task until training drains, or until the
+            # rollout-checkpoint pump requests its orderly pre-step stop. A
+            # single wait would stop watching the monitors as soon as rollout
+            # generation exhausts normally, so a watchdog failure during the
+            # remaining train drain could otherwise be discarded by teardown.
+            pending = set(tasks)
+            while train_task in pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                stop_after_rollout_checkpoint = False
+                if (
+                    rollout_checkpoint_task is not None
+                    and rollout_checkpoint_task in done
+                ):
+                    await rollout_checkpoint_task
+                    if not self._rollout_checkpoint_stop_requested.is_set():
+                        raise RuntimeError(
+                            "rollout checkpoint pump exited without requesting stop"
+                        )
+                    stop_after_rollout_checkpoint = True
+                if stop_after_rollout_checkpoint:
+                    # FIRST_COMPLETED may return several tasks. Do not let an
+                    # orderly checkpoint stop hide a rollout/train failure that
+                    # completed in the same event-loop turn.
+                    for task in done:
+                        if task is not rollout_checkpoint_task:
+                            await task
+                    break
+                if probe_task is not None and probe_task in done:
+                    # Loops forever like the watchdog, so finishing means it raised.
+                    await probe_task
+                if (
+                    rollout_telemetry_task is not None
+                    and rollout_telemetry_task in done
+                ):
+                    # This pump has no normal return path. Awaiting it propagates
+                    # a failure while the train pump is still draining.
+                    await rollout_telemetry_task
+                if watchdog_task in done:
+                    # Surface a stall or unhealthy environment ahead of pumps
+                    # whose own symptom would only be "waiting".
+                    await watchdog_task
+                if rollout_task in done:
+                    # Propagate rollout failures immediately. Normal exhaustion
+                    # leaves the train pump and monitors running through the drain.
+                    await rollout_task
+                if train_task in done:
+                    await train_task
         finally:
             for task in tasks:
                 task.cancel()
