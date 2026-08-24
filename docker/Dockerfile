@@ -73,6 +73,7 @@ apt-get install -y --no-install-recommends \
     less \
     vim \
     ccache \
+    protobuf-compiler \
 
 # Nsight
 apt install -y --no-install-recommends gnupg
