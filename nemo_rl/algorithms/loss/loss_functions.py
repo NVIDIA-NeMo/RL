@@ -252,7 +252,7 @@ class ClippedPGLossFn(LossFunction):
         self.ratio_clip_c = cfg.ratio_clip_c  # set to None to disable dual-clipping
         if self.ratio_clip_c is not None:
             assert self.ratio_clip_c > 1, (
-                f"ratio_clip_c must exceed 1, got {self.ratio_clip_c}."
+                f"ratio_clip_c must exceed 1 representing a lower bound of the ratios, got {self.ratio_clip_c}."
             )
         self.reference_policy_kl_penalty = (
             cfg.reference_policy_kl_penalty if not cfg.use_kl_in_reward else 0
