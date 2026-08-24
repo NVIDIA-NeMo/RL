@@ -303,6 +303,22 @@ class _AdvantageDataPlane:
         self.written_fields = fields
 
 
+def _grpo_stub(**overrides):
+    """The grpo config fields ``_advantage_stage`` reads, with real defaults.
+
+    Kept in one place: the stage reads a widening set of ``master_config.grpo``
+    knobs, and four tests were previously constructing that namespace by hand.
+    """
+    fields = {
+        "seq_logprob_error_threshold": None,
+        "reward_scaling": GRPOConfig.model_fields["reward_scaling"].default_factory(),
+        "advantage_clip_low": None,
+        "advantage_clip_high": None,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
 class _MaskRecordingAdvantageEstimator:
     def __init__(self) -> None:
         self.mask: torch.Tensor | None = None
@@ -345,7 +361,7 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
+        grpo=_grpo_stub(seq_logprob_error_threshold=2.0)
     )
     ctrl._step_log_dict = {
         "rewards": [],
@@ -411,7 +427,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+        grpo=_grpo_stub(seq_logprob_error_threshold=None)
     )
     ctrl._step_log_dict = {
         "rewards": [],
@@ -471,7 +487,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
+        grpo=_grpo_stub(seq_logprob_error_threshold=2.0)
     )
     ctrl._step_log_dict = {
         "rewards": [],
@@ -524,7 +540,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+        grpo=_grpo_stub(seq_logprob_error_threshold=None)
     )
     ctrl._step_log_dict = {
         "rewards": [],
@@ -981,3 +997,115 @@ def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> No
 
     assert ctrl._train_steps == 1
     assert trainer.keep_train_buffers_calls == [False, True]
+
+
+# ---------------------------------------------------------------------------
+# grpo.* knobs that every other driver applies and SC did not.
+# grpo.py:3321 / grpo.py:4883 / grpo_sync.py:915 clip advantages; grpo.py:3024
+# scales rewards. The SC advantage stage is the same point in the pipeline.
+# ---------------------------------------------------------------------------
+
+
+class _RewardRecordingAdvantageEstimator:
+    """Advantage == reward, broadcast, so the written column is readable."""
+
+    def __init__(self) -> None:
+        self.rewards: torch.Tensor | None = None
+
+    def compute_advantage(self, *, rewards, mask, **kwargs):
+        del kwargs
+        self.rewards = rewards.clone()
+        return rewards.unsqueeze(-1).expand_as(mask).clone()
+
+
+def _knob_ctrl(estimator, grpo_stub):
+    batch, seq = 2, 4
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(batch, seq, dtype=torch.long),
+            "total_reward": torch.tensor([-4.0, 6.0]),
+            "token_mask": torch.ones(batch, seq),
+            "sample_mask": torch.ones(batch),
+        },
+        batch_size=[batch],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._master_config = SimpleNamespace(grpo=grpo_stub)
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch)],
+        fields=list(data.keys()),
+    )
+    return ctrl, data_plane, meta
+
+
+def test_advantage_clip_bounds_are_applied_before_the_write() -> None:
+    estimator = _RewardRecordingAdvantageEstimator()
+    ctrl, data_plane, meta = _knob_ctrl(
+        estimator, _grpo_stub(advantage_clip_low=-1.0, advantage_clip_high=2.0)
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    written = data_plane.written_fields["advantages"]
+    assert written.min().item() == pytest.approx(-1.0)
+    assert written.max().item() == pytest.approx(2.0)
+
+
+def test_advantages_are_untouched_when_no_clip_bounds_are_set() -> None:
+    estimator = _RewardRecordingAdvantageEstimator()
+    ctrl, data_plane, meta = _knob_ctrl(estimator, _grpo_stub())
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    written = data_plane.written_fields["advantages"]
+    assert written.min().item() == pytest.approx(-4.0)
+    assert written.max().item() == pytest.approx(6.0)
+
+
+def test_only_the_configured_clip_bound_applies() -> None:
+    estimator = _RewardRecordingAdvantageEstimator()
+    ctrl, data_plane, meta = _knob_ctrl(estimator, _grpo_stub(advantage_clip_high=2.0))
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    written = data_plane.written_fields["advantages"]
+    assert written.max().item() == pytest.approx(2.0)
+    assert written.min().item() == pytest.approx(-4.0), "low bound was not set"
+
+
+def test_reward_scaling_reaches_the_estimator() -> None:
+    scaling = GRPOConfig.model_fields["reward_scaling"].default_factory()
+    scaling.enabled = True
+    scaling.source_min, scaling.source_max = -4.0, 6.0
+    scaling.target_min, scaling.target_max = 0.0, 1.0
+
+    estimator = _RewardRecordingAdvantageEstimator()
+    ctrl, _, meta = _knob_ctrl(estimator, _grpo_stub(reward_scaling=scaling))
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    torch.testing.assert_close(estimator.rewards, torch.tensor([0.0, 1.0]))
+
+
+def test_reward_scaling_disabled_leaves_rewards_alone() -> None:
+    estimator = _RewardRecordingAdvantageEstimator()
+    ctrl, _, meta = _knob_ctrl(estimator, _grpo_stub())
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    torch.testing.assert_close(estimator.rewards, torch.tensor([-4.0, 6.0]))

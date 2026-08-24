@@ -49,8 +49,10 @@ import torch
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
+    _clip_grpo_advantages,
     _write_latest_checkpoint_status,
     compute_and_apply_seq_logprob_error_masking,
+    scale_rewards,
 )
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -1705,6 +1707,14 @@ class SingleControllerActor:
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
 
+        # Before anything reads the rewards, matching grpo.py's ordering. A
+        # no-op unless grpo.reward_scaling.enabled, and it is the same helper,
+        # so the source-range clamp and the warning stay identical.
+        rewards = scale_rewards(
+            BatchedDataDict({"total_reward": rewards}),
+            self._master_config.grpo.reward_scaling,
+        )["total_reward"]
+
         seq_logprob_error_threshold = (
             self._master_config.grpo.seq_logprob_error_threshold
         )
@@ -1784,6 +1794,9 @@ class SingleControllerActor:
             )
         else:
             advantages = torch.zeros_like(mask)
+        # grpo_sync.py:915 does the same, immediately before its data-plane
+        # write. A no-op unless grpo.advantage_clip_low/high are set.
+        advantages = _clip_grpo_advantages(advantages, self._master_config.grpo)
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
         self._step_log_dict["masked_advantages"].append(
