@@ -696,7 +696,7 @@ class ClippedPGLossFn(LossFunction):
         # See: docs/guides/grpo.md#sampling-importance-ratio
         if self.sequence_level_importance_ratios:
             sample_importance_ratio = masked_mean(
-                actor_importance_weights,
+                actor_importance_weights.squeeze(-1),
                 sample_mask,
                 global_normalization_factor=global_valid_seqs,
             )

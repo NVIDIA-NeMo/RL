@@ -2013,6 +2013,33 @@ def test_clipped_pg_loss_gspo_batch_size_2():
     torch.testing.assert_close(actual_loss, expected_loss)
 
 
+def test_clipped_pg_loss_sequence_importance_ratio_averages_per_sample():
+    """Sequence-level importance-ratio metrics average one weight per sample."""
+    data, batch_size, seq_len, _ = _setup_clipped_pg_test_data(
+        batch_size=2, seq_len=3, device="cpu"
+    )
+    data["generation_logprobs"][:, 1] = -torch.log(torch.tensor([2.0, 4.0]))
+
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            use_importance_sampling_correction=True,
+            sequence_level_importance_ratios=True,
+            token_level_loss=False,
+        )
+    )
+    _, metrics = loss_fn(
+        next_token_logprobs=torch.zeros((batch_size, seq_len - 1)),
+        data=data,
+        global_valid_seqs=data["sample_mask"].sum(),
+        global_valid_toks=(
+            data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+        ).sum(),
+    )
+
+    assert metrics["sampling_importance_ratio"] == pytest.approx(3.0)
+
+
 def test_clipped_pg_loss_gspo_importance_sampling_correction():
     """Tests GSPO w/ importance sampling correction in ClippedPGLossFn."""
     if not torch.cuda.is_available():
