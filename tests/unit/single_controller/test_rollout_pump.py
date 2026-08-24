@@ -24,7 +24,10 @@ import pytest
 import ray
 import torch
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+    TQReplayBuffer,
+)
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSampler,
     WeightFifoSampler,
@@ -92,6 +95,96 @@ class _RecordingRolloutManager:
     ) -> None:
         del prompt, inflight_registry
         self._buffer.reserve(target_step=target_step)
+
+
+def test_token_capture_reserves_batch_atomically_with_dataloader_advance() -> None:
+    events: list[str] = []
+    barrier = DataPlaneCheckpointBarrier()
+
+    class _RecordingSampler(InOrderSampler):
+        async def wait_until_admissible(self, *, trainer_version_fn) -> None:
+            assert barrier._active_mutations == 0
+            events.append("wait")
+            await super().wait_until_admissible(trainer_version_fn=trainer_version_fn)
+
+        def commit_admission(self, *, trainer_version: int) -> int | None:
+            assert barrier._active_mutations == 1
+            events.append("commit")
+            return super().commit_admission(trainer_version=trainer_version)
+
+    class _CaptureManager:
+        def __init__(self) -> None:
+            self.stats = RolloutStats()
+
+        def reserve_prompt_group(
+            self, prompt: Any, *, target_step: int | None = None
+        ) -> str:
+            del target_step
+            events.append(f"reserve-{prompt['idx']}")
+            return f"group-{prompt['idx']}"
+
+        async def generate_for_finalization(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            recovery_group_id: str,
+            inflight_registry: dict[str, Any] | None = None,
+        ) -> Any:
+            del target_step, inflight_registry
+            events.append(f"dispatch-{prompt['idx']}-{recovery_group_id}")
+            return SimpleNamespace(group_id=recovery_group_id)
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(
+            max_num_epochs=1,
+            num_prompts_per_step=2,
+        ),
+        token_capture=SimpleNamespace(enabled=True),
+    )
+    ctrl._rollout_manager = _CaptureManager()
+    ctrl._finalizer_actors = [object()]
+    ctrl._finalize_with_actor = lambda request: asyncio.sleep(0)
+    ctrl._buffer = _RecordingBuffer()
+    ctrl._sampler = _RecordingSampler(ctrl._buffer, max_lookahead_versions=1)
+    ctrl._dataloader = [
+        BatchedDataDict(
+            {
+                "idx": [10, 11],
+                "message_log": [
+                    [{"role": "user", "content": "a"}],
+                    [{"role": "user", "content": "b"}],
+                ],
+            }
+        )
+    ]
+    ctrl._data_plane_checkpoint_barrier = barrier
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._buffer_capacity = asyncio.Semaphore(4)
+    ctrl._rollout_slots = asyncio.Semaphore(2)
+    ctrl._inflight_rollouts = 0
+    ctrl._inflight_by_group_id = {}
+    ctrl._dispatched_rollouts = set()
+    ctrl._trainer_version = 0
+    ctrl._current_epoch = 0
+
+    asyncio.run(ctrl._rollout_pump())
+
+    assert events == [
+        "wait",
+        "commit",
+        "reserve-10",
+        "reserve-11",
+        "dispatch-10-group-10",
+        "dispatch-11-group-11",
+        "wait",
+    ]
+    assert ctrl._buffer_capacity._value == 2
 
 
 @pytest.mark.parametrize(

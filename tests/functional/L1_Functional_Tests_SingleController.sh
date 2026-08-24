@@ -62,6 +62,17 @@ run_test uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_r
 # custodying token lineage and the finalizer publishing training rows.
 run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
 
+# Two-process token-capture recovery. The first run is killed after a durable
+# cut with a partially completed sibling group; the restart must reuse sealed
+# siblings and redispatch only the missing ones.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_tq_recovery.sh
+
+# Periodic snapshots are allowed while one streamed optimizer step is open.
+# Exercise both an early and a late cut: restart from the immutable step_1
+# trainer anchor, replay the rolled-back groups, and apply step 2 exactly once.
+run_test env SC_TQ_STREAMING_RECOVERY_CLAIMED_GROUPS=2 uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_streaming_recovery.sh
+run_test env SC_TQ_STREAMING_RECOVERY_CLAIMED_GROUPS=6 uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_streaming_recovery.sh
+
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
     coverage combine .coverage*

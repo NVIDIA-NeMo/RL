@@ -136,6 +136,17 @@ class CheckpointDispatchSampler(Protocol):
     ) -> None: ...
 
 
+@runtime_checkable
+class TwoPhaseAdmissionSampler(Protocol):
+    """Sampler that separates a blocking gate from its admission commit."""
+
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None: ...
+
+    def commit_admission(self, *, trainer_version: int) -> Optional[int]: ...
+
+
 class BaseSampler(abc.ABC):
     """Shared machinery for the built-in policies.
 
@@ -170,10 +181,19 @@ class BaseSampler(abc.ABC):
         self._dispatch_index = resume_from_trainer_version - 1
 
     # ── rollout-pump side ────────────────────────────────────────────────
-    @abc.abstractmethod
-    async def admit(
+    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
+        """Wait for and commit one prompt-batch admission."""
+        await self.wait_until_admissible(trainer_version_fn=trainer_version_fn)
+        return self.commit_admission(trainer_version=trainer_version_fn())
+
+    async def wait_until_admissible(
         self, *, trainer_version_fn: Callable[[], int]
-    ) -> Optional[int]: ...
+    ) -> None:
+        """Wait until one batch may be admitted; ungated by default."""
+
+    def commit_admission(self, *, trainer_version: int) -> Optional[int]:
+        """Commit one already-admissible batch; unstamped by default."""
+        return None
 
     # ── train-pump side ──────────────────────────────────────────────────
     @abc.abstractmethod
@@ -377,9 +397,20 @@ class _GatedSampler(BaseSampler):
             gate_window=self._gate_window,
         )
 
-    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None:
         while self._dispatch_index >= trainer_version_fn() + self._gate_window:
             await asyncio.sleep(_GATE_POLL_SECONDS)
+
+    def commit_admission(self, *, trainer_version: int) -> Optional[int]:
+        if self._dispatch_index >= trainer_version + self._gate_window:
+            raise RuntimeError(
+                "sampler admission was committed before its gate opened: "
+                f"dispatch_index={self._dispatch_index}, "
+                f"trainer_version={trainer_version}, "
+                f"gate_window={self._gate_window}"
+            )
         self._dispatch_index += 1
         return self._stamp()
 

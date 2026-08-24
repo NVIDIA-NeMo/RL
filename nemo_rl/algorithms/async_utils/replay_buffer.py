@@ -159,6 +159,12 @@ class DataPlaneCheckpointBarrier:
         self._checkpoint_active = False
         self._active_mutations = 0
         self._mutation_depth_by_task: dict[asyncio.Task[Any], int] = {}
+        self._mutation_version = 0
+
+    @property
+    def mutation_version(self) -> int:
+        """Return a monotonic marker for completed outer mutation sections."""
+        return self._mutation_version
 
     @asynccontextmanager
     async def mutation(self) -> AsyncIterator[None]:
@@ -187,6 +193,10 @@ class DataPlaneCheckpointBarrier:
             del self._mutation_depth_by_task[task]
             async with self._condition:
                 self._active_mutations -= 1
+                # Count completed mutation sections even when their body raised.
+                # A redundant periodic snapshot is safe; missing a mutation that
+                # partially changed TQ or controller metadata is not.
+                self._mutation_version += 1
                 if self._active_mutations == 0:
                     self._condition.notify_all()
 
@@ -1225,7 +1235,12 @@ class TQReplayBuffer:
 
         return len(drop_idxs)
 
-    def metadata_state_dict(self, *, saved_capacity: int) -> TQReplayMetadataState:
+    def metadata_state_dict(
+        self,
+        *,
+        saved_capacity: int,
+        additional_groups: Optional[list[TQReplayGroupMetadata]] = None,
+    ) -> TQReplayMetadataState:
         """Capture the controller index for ready groups without tensor payloads.
 
         The caller must hold the exclusive side of the shared data-plane
@@ -1237,7 +1252,10 @@ class TQReplayBuffer:
         across the complete publish/index or clear/remove transition. This
         includes future finalizer paths; canonical writes are not required to
         originate specifically from :meth:`commit`.
-        In-flight reservations are intentionally omitted.
+        In-flight reservations are intentionally omitted. ``additional_groups``
+        is used only by periodic snapshots to re-index canonical groups already
+        claimed by the current, uncheckpointed optimizer step. Their TQ rows are
+        still present, but normal sampler selection has removed their live slots.
         """
         groups: list[TQReplayGroupMetadata] = []
         for i, ready in enumerate(self.ready_list):
@@ -1254,6 +1272,27 @@ class TQReplayBuffer:
                     "group_id": self._group_ids[i],
                 }
             )
+        existing_group_ids = {group["group_id"] for group in groups}
+        existing_sample_ids = {
+            sample_id for group in groups for sample_id in group["meta"].sample_ids
+        }
+        for group in additional_groups or []:
+            group_id = group["group_id"]
+            if group_id in existing_group_ids:
+                raise ValueError(
+                    f"additional replay metadata duplicates group_id={group_id!r}"
+                )
+            duplicate_sample_ids = existing_sample_ids.intersection(
+                group["meta"].sample_ids
+            )
+            if duplicate_sample_ids:
+                raise ValueError(
+                    "additional replay metadata duplicates sample IDs: "
+                    f"{sorted(duplicate_sample_ids)!r}"
+                )
+            groups.append(group)
+            existing_group_ids.add(group_id)
+            existing_sample_ids.update(group["meta"].sample_ids)
         return {
             "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
             "storage": REPLAY_BUFFER_METADATA_STORAGE,

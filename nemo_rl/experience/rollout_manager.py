@@ -1315,6 +1315,29 @@ class RolloutManager:
         """
         self._weight_version = int(version)
 
+    def reserve_prompt_group(
+        self, input_sample: DatumSpec, *, target_step: Optional[int] = None
+    ) -> str:
+        """Reserve durable lineage before the dataloader advances past a batch.
+
+        The caller owns the SC data-plane mutation barrier, making dataloader
+        advancement and every reservation in the batch one checkpoint cut.
+        """
+        if self._recovery_ledger is None:
+            raise RuntimeError("prompt-group reservation requires token capture")
+        group = self._recovery_ledger.reserve_group(
+            prompt_id=str(input_sample["idx"]),
+            prompt_ref=PromptRef(
+                sample_id=str(input_sample["idx"]),
+                task_name=input_sample.get("task_name"),
+            ),
+            prompt_payload=input_sample,
+            expected_generations=self._num_generations_per_prompt,
+            target_step=target_step,
+            start_weight_version=self._weight_version,
+        )
+        return group.group_id
+
     async def run_rollout(
         self,
         input_sample: DatumSpec,
@@ -1498,6 +1521,7 @@ class RolloutManager:
         input_sample: DatumSpec,
         *,
         target_step: Optional[int] = None,
+        recovery_group_id: Optional[str] = None,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
     ) -> Optional["FinalizationRequest"]:
         """Run capture generation and return a metadata-only actor request.
@@ -1519,19 +1543,25 @@ class RolloutManager:
             raise RuntimeError(
                 "generate_for_finalization requires a rollout recovery ledger"
             )
-        async with self._recovery_mutation():
-            recovery_group = self._recovery_ledger.reserve_group(
-                prompt_id=str(input_sample["idx"]),
-                prompt_ref=PromptRef(
-                    sample_id=str(input_sample["idx"]),
-                    task_name=input_sample.get("task_name"),
-                ),
-                prompt_payload=input_sample,
-                expected_generations=self._num_generations_per_prompt,
-                target_step=target_step,
-                start_weight_version=self._weight_version,
-            )
-        recovery_group_id = recovery_group.group_id
+        if recovery_group_id is None:
+            async with self._recovery_mutation():
+                recovery_group_id = self.reserve_prompt_group(
+                    input_sample, target_step=target_step
+                )
+        else:
+            recovery_group = self._recovery_ledger.get_group(recovery_group_id)
+            if recovery_group.prompt_id != str(input_sample["idx"]):
+                raise ValueError(
+                    "reserved rollout group belongs to a different prompt: "
+                    f"group={recovery_group.prompt_id!r}, "
+                    f"input={str(input_sample['idx'])!r}"
+                )
+            if recovery_group.target_step != target_step:
+                raise ValueError(
+                    "reserved rollout group target step does not match dispatch: "
+                    f"group={recovery_group.target_step!r}, "
+                    f"dispatch={target_step!r}"
+                )
         return await self._run_finalization_with_retries(
             input_sample,
             recovery_group_id=recovery_group_id,

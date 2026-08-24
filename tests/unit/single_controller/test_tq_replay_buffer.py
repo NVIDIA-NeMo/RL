@@ -208,6 +208,21 @@ def _add_group(
 
 
 class TestDataPlaneCheckpointBarrier:
+    def test_mutation_version_advances_once_per_outer_section(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            assert barrier.mutation_version == 0
+            async with barrier.mutation():
+                async with barrier.mutation():
+                    assert barrier.mutation_version == 0
+            assert barrier.mutation_version == 1
+            with pytest.raises(RuntimeError, match="injected"):
+                async with barrier.mutation():
+                    raise RuntimeError("injected")
+            assert barrier.mutation_version == 2
+
+        asyncio.run(exercise())
+
     def test_mutations_run_concurrently_without_checkpoint(self):
         async def exercise() -> None:
             barrier = DataPlaneCheckpointBarrier()
@@ -1047,6 +1062,23 @@ class TestTQReplayBufferStateDict:
         ]
         assert state["manifest_digest"] == replay_manifest_digest(state["groups"])
         assert dp.get_calls == []
+
+    def test_metadata_state_dict_adds_training_claimed_groups(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+        live_meta = _add_group(buf, weight=1)
+        claimed = _make_group_entry("claimed", weight=2)
+
+        state = buf.metadata_state_dict(
+            saved_capacity=8,
+            additional_groups=[claimed],
+        )
+
+        assert [group["group_id"] for group in state["groups"]] == [
+            _group_id_of(live_meta),
+            "claimed",
+        ]
+        assert state["groups"][1] == claimed
+        assert state["manifest_digest"] == replay_manifest_digest(state["groups"])
 
     def test_native_tq_round_trip_restores_index_without_reputting_rows(self):
         dp = FakeDataPlaneClient()

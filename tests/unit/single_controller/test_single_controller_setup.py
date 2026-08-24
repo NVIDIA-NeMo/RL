@@ -358,6 +358,10 @@ class TestSetup:
                 "deferred_routes_without_capture",
                 "defer_routed_experts_to_policy requires",
             ),
+            (
+                "recovery_capacity",
+                "num_prompts_per_step.*min_groups_for_streaming_train - 1",
+            ),
         ],
     )
     def test_invalid_config_fails_before_setup_factories(
@@ -381,6 +385,16 @@ class TestSetup:
             mc.async_rl.max_buffered_rollouts = 3
         elif invalid_case == "deferred_routes_without_capture":
             mc.token_capture.defer_routed_experts_to_policy = True
+        elif invalid_case == "recovery_capacity":
+            # Four restored groups may leave one group below the streaming
+            # threshold while the producer atomically reserves the next full
+            # four-prompt batch. Capacity 4 cannot make progress; 4 + 2 - 1 can.
+            mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
+            mc.async_rl.min_groups_for_streaming_train = 2
+            mc.async_rl.max_buffered_rollouts = 4
+            mc.token_capture.enabled = True
+            mc.checkpointing["enabled"] = True
+            mc.data_plane["checkpointing_enabled"] = True
         else:  # pragma: no cover
             raise AssertionError(f"unknown test case {invalid_case}")
 
