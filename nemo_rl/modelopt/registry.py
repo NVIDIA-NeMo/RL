@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import shlex
 
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES, git_root
 
@@ -21,17 +22,17 @@ USE_SYSTEM_EXECUTABLE = os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == 
 MODELOPT_VLLM_EXECUTABLE = (
     PY_EXECUTABLES.SYSTEM
     if USE_SYSTEM_EXECUTABLE
-    else f"uv run --locked --extra modelopt --extra vllm --directory {git_root}"
+    else f"uv run --locked --extra modelopt --extra vllm --directory {shlex.quote(git_root)}"
 )
 MODELOPT_AUTOMODEL_EXECUTABLE = (
     PY_EXECUTABLES.SYSTEM
     if USE_SYSTEM_EXECUTABLE
-    else f"uv run --locked --extra modelopt --extra automodel --directory {git_root}"
+    else f"uv run --locked --extra modelopt --extra automodel --directory {shlex.quote(git_root)}"
 )
 MODELOPT_MCORE_EXECUTABLE = (
     PY_EXECUTABLES.SYSTEM
     if USE_SYSTEM_EXECUTABLE
-    else f"uv run --locked --extra modelopt --extra mcore --directory {git_root}"
+    else f"uv run --locked --extra modelopt --extra mcore --directory {shlex.quote(git_root)}"
 )
 
 MODELOPT_ACTOR_REGISTRY: dict[str, str] = {
