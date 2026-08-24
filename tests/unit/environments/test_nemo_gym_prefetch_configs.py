@@ -20,9 +20,15 @@ breaks the image build rather than the PR that drifts away from it. These tests
 run Gym's own ``model_validate`` on every standalone server block in those
 configs so the drift surfaces at PR time instead.
 
-Passing here does NOT mean the image build succeeds: ``prefetch_local_vllm_model``
-is skipped where vllm is absent, and the ``UV_LINK_MODE``/``r2e_gym.sh`` half of
-the prefetch is not covered at all.
+Passing here does NOT mean the image build succeeds. Two known gaps:
+
+* ``prefetch_local_vllm_model`` is skipped whenever vllm is absent, which in CI is
+  **always**: ``L0_Unit_Tests_Nemo_Gym.sh`` runs ``uv run --extra nemo_gym`` and vllm
+  is a separate extra, while Gym's ``local_vllm_model/app.py`` imports it at module
+  scope. ``vllm_serve_env_vars`` -- required only by ``LocalVLLMModelConfig`` -- is
+  therefore unguarded here. Tracked in
+  https://github.com/NVIDIA-NeMo/RL/issues/3806.
+* The ``UV_LINK_MODE``/``r2e_gym.sh`` half of the prefetch is not covered at all.
 """
 
 import glob
