@@ -13,10 +13,18 @@
 # limitations under the License.
 
 
+import re
+from collections.abc import Callable, Iterable, Iterator
+
 import torch
 
 MXFP8_BLOCK_SIZE = 32
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
+
+_EXPERT_WEIGHT_PATTERN = re.compile(
+    r"^(?P<prefix>.+\.experts)\.(?P<expert_id>\d+)\."
+    r"(?P<projection>gate_proj|up_proj|down_proj)\.weight$"
+)
 
 
 def _mxfp8_e4m3_quantize_torch(
@@ -93,6 +101,143 @@ def mxfp8_e4m3_quantize_for_refit(
     # pyrefly: ignore  # no-matching-overload
     x_scales = x_scales.masked_fill(x_scales == 0, 1)
     return x_q, x_scales
+
+
+def iter_mxfp8_prequantized_params(
+    params: Iterable[tuple[str, torch.Tensor]],
+    selected_names: set[str],
+    *,
+    quantize_fn: Callable[
+        [torch.Tensor], tuple[torch.Tensor, torch.Tensor]
+    ] = mxfp8_e4m3_quantize_for_refit,
+    scratch_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] | None = None,
+    max_experts_per_batch: int = 16,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Batch expert weights while preserving the existing refit wire entries.
+
+    Selected MoE experts with matching layer, projection, shape, dtype, and
+    device are quantized together in bounded chunks. Other selected weights use
+    the existing per-tensor path, and unselected weights pass through unchanged.
+
+    Args:
+        params: Exported Hugging Face parameter names and tensors.
+        selected_names: Parameter names selected for MXFP8 prequantization.
+        quantize_fn: MXFP8 quantization function.
+        scratch_cache: Reusable stacking buffers keyed by device and dtype.
+        max_experts_per_batch: Maximum number of experts per quantization call.
+
+    Yields:
+        Weight and scale entries accepted by the vLLM refit receiver.
+    """
+    if max_experts_per_batch <= 0:
+        raise ValueError("max_experts_per_batch must be positive")
+    if scratch_cache is None:
+        scratch_cache = {}
+
+    pending: dict[tuple[str, str], list[tuple[int, str, torch.Tensor]]] = {}
+    current_prefix: str | None = None
+
+    def quantize_one(name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+        if tensor.dtype == torch.float8_e4m3fn:
+            raise ValueError(
+                "MXFP8 prequantization requires BF16 trainer-exported weights; "
+                f"{name} is already stored as E4M3."
+            )
+        value, scale = quantize_fn(tensor)
+        return [(name, value), (name + "_scale_from_checkpoint", scale)]
+
+    def flush_group(
+        group_key: tuple[str, str],
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        group = pending.pop(group_key)
+        group.sort(key=lambda item: item[0])
+        while group:
+            chunk = group[:max_experts_per_batch]
+            del group[:max_experts_per_batch]
+            tensors = [tensor for _expert_id, _name, tensor in chunk]
+            batchable = len(chunk) > 1 and len({item[0] for item in chunk}) == len(
+                chunk
+            )
+            if batchable:
+                first = tensors[0]
+                batchable = all(
+                    tensor.shape == first.shape
+                    and tensor.dtype == first.dtype
+                    and tensor.device == first.device
+                    and tensor.layout is torch.strided
+                    for tensor in tensors
+                )
+            if not batchable:
+                for _expert_id, name, tensor in chunk:
+                    yield from quantize_one(name, tensor)
+                continue
+
+            first = tensors[0]
+            if first.dtype == torch.float8_e4m3fn:
+                raise ValueError(
+                    "MXFP8 prequantization requires BF16 trainer-exported weights."
+                )
+            required_numel = len(chunk) * first.numel()
+            cache_key = (first.device, first.dtype)
+            scratch = scratch_cache.get(cache_key)
+            if scratch is None or scratch.numel() < required_numel:
+                scratch = torch.empty(
+                    required_numel,
+                    dtype=first.dtype,
+                    device=first.device,
+                )
+                scratch_cache[cache_key] = scratch
+            stacked = scratch[:required_numel].view(len(chunk), *first.shape)
+            torch.stack(tensors, dim=0, out=stacked)
+
+            value, scale = quantize_fn(stacked.view(-1, stacked.shape[-1]))
+            value = value.view_as(stacked)
+            scale = scale.view(
+                len(chunk),
+                *first.shape[:-1],
+                first.shape[-1] // MXFP8_BLOCK_SIZE,
+            )
+            for index, (_expert_id, name, _tensor) in enumerate(chunk):
+                yield name, value[index]
+                yield name + "_scale_from_checkpoint", scale[index]
+
+    def flush_pending() -> Iterator[tuple[str, torch.Tensor]]:
+        while pending:
+            yield from flush_group(next(iter(pending)))
+
+    for name, tensor in params:
+        match = _EXPERT_WEIGHT_PATTERN.match(name) if name in selected_names else None
+        if match is None:
+            if pending:
+                yield from flush_pending()
+                current_prefix = None
+            if name in selected_names:
+                yield from quantize_one(name, tensor)
+            else:
+                yield name, tensor
+            continue
+
+        prefix = match.group("prefix")
+        projection = match.group("projection")
+        if current_prefix is not None and prefix != current_prefix:
+            yield from flush_pending()
+        elif projection == "down_proj" and any(
+            key[1] != "down_proj" for key in pending
+        ):
+            yield from flush_pending()
+        elif projection != "down_proj" and any(
+            key[1] == "down_proj" for key in pending
+        ):
+            yield from flush_pending()
+        current_prefix = prefix
+        group_key = (prefix, projection)
+        group = pending.setdefault(group_key, [])
+        group.append((int(match.group("expert_id")), name, tensor))
+        if len(group) == max_experts_per_batch:
+            yield from flush_group(group_key)
+
+    if pending:
+        yield from flush_pending()
 
 
 def get_vllm_qkv_scale_names(layer_idx: int) -> dict[str, str]:
