@@ -303,9 +303,7 @@ def test_megatron_policy_generation(
     config["megatron_cfg"]["pipeline_model_parallel_size"] = pipeline_parallel_size
     config["generation"]["top_p"] = top_p
     config["generation"]["top_k"] = top_k
-    config["generation"]["mcore_generation_config"]["logprobs_mode"] = (
-        logprobs_mode
-    )
+    config["generation"]["mcore_generation_config"]["logprobs_mode"] = logprobs_mode
     # config-level stop string, unioned with the per-sample stop strings below.
     config["generation"]["stop_strings"] = ["</s>"]
 
