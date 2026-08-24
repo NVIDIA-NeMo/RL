@@ -58,10 +58,12 @@ policy:
         num_nodes: 2
         gpus_per_node: 4
     vllm_cfg:
-      gpu_memory_utilization: 0.5
-      enforce_eager: true
+      gpu_memory_utilization: 0.8
+      enforce_eager: false
       reset_encoder_cache_after_weight_update: true
     vllm_kwargs:
+      compilation_config:
+        cudagraph_mode: FULL_AND_PIECEWISE
       limit_mm_per_prompt:
         image: 10
 data:
