@@ -130,3 +130,19 @@ command outputs are recorded in the local review snapshot handoff.
 
 No W&B run, SLURM job ID, throughput result, or speedup exists for this prepared
 screen yet.
+
+## 2026-08-23 first-array failure and recovery contract
+
+Product Linux gate `6476034` completed successfully, and all 13 scheduler
+test-only checks passed. Actual array `6476732` then failed all 13 tasks before
+training with the same Pyxis error: the `/home` checkout selected as
+`SLURM_SUBMIT_DIR` was not mounted because `ray.sub` uses
+`--no-container-mount-home`. No W&B or cadence evidence was created.
+
+The recovery contract stages one SHA256-bound source archive on Lustre and
+extracts one private source tree per array task to node-local `/raid/scratch`.
+The recovered runner explicitly mounts that source path, keeps all durable
+outputs on Lustre, and permits full arm submission only after an identical
+preflight-only startup canary terminates successfully. Recovery uses a new
+result root and W&B run generation; none of the failed array's manifests or
+ledgers may be overwritten.

@@ -15,7 +15,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "${arm}" && -n "${result_dir}" && -n "${expected_product_head}" ]]
-[[ "$(pwd -P)" == /home/* ]]
 [[ "${result_dir}" == /lustre/* ]]
 [[ "${RAY_TMPDIR:-}" == /tmp* ]]
 : "${WANDB_API_KEY:?WANDB_API_KEY is required}"
@@ -41,24 +40,11 @@ PY
     --arm "${arm}" --result-dir "${result_dir}" \
     --expected-product-head "${expected_product_head}"
 else
-  mkdir "${result_dir}"
-  python3 - "${identity}" "${arm}" "${expected_product_head}" "${WANDB_RUN_ID}" <<'PY'
-import json
-import os
-import sys
-
-path, arm, head, wandb_id = sys.argv[1:]
-payload = {
-    "schema_version": 1,
-    "arm": arm,
-    "product_head": head,
-    "wandb_run_id": wandb_id,
-    "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
-}
-with open(path, "x") as stream:
-    json.dump(payload, stream, indent=2, sort_keys=True)
-    stream.write("\n")
-PY
+  python3 -m research.qwen3_8b_draft_cadence_200step.launch init-identity \
+    --arm "${arm}" --result-dir "${result_dir}" \
+    --expected-product-head "${expected_product_head}" \
+    --wandb-run-id "${WANDB_RUN_ID}" \
+    --slurm-job-id "${SLURM_JOB_ID:-}"
 fi
 
 mapfile -t overrides < <(

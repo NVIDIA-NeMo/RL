@@ -119,6 +119,34 @@ def materialize_manifest(
     return path
 
 
+def initialize_run_identity(
+    *,
+    result_dir: Path,
+    arm: str,
+    product_head: str,
+    wandb_run_id: str,
+    slurm_job_id: str | None,
+) -> Path:
+    _arm(arm)
+    if len(product_head) != 40:
+        raise ValueError("product head must be a full SHA")
+    if not wandb_run_id:
+        raise ValueError("W&B run ID must not be empty")
+    result_dir.mkdir(exist_ok=True)
+    identity = result_dir / "run-identity.json"
+    payload = {
+        "schema_version": 1,
+        "arm": arm,
+        "product_head": product_head,
+        "wandb_run_id": wandb_run_id,
+        "slurm_job_id": slurm_job_id,
+    }
+    with identity.open("x") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    return identity
+
+
 def build_submission(
     arm: Arm,
     *,
@@ -179,7 +207,18 @@ def build_submission(
     return Submission(tuple(argv), environment, arm, remote_repo, expected_product_head)
 
 
+def validate_runtime_source_root(source_root: Path) -> None:
+    location = str(source_root)
+    if not source_root.is_absolute() or not location.startswith(
+        ("/home/", "/raid/scratch/")
+    ):
+        raise ValueError(
+            "source repository must live under /home or task-owned /raid/scratch"
+        )
+
+
 def validate_source(source_root: Path, expected_head: str) -> None:
+    validate_runtime_source_root(source_root)
     head = subprocess.run(
         ("git", "rev-parse", "HEAD"),
         cwd=source_root,
@@ -272,6 +311,12 @@ def main(argv: list[str] | None = None) -> None:
     adapt.add_argument("--arm", required=True)
     adapt.add_argument("--result-dir", type=Path, required=True)
     adapt.add_argument("--expected-product-head", required=True)
+    identity = subparsers.add_parser("init-identity")
+    identity.add_argument("--arm", required=True)
+    identity.add_argument("--result-dir", type=Path, required=True)
+    identity.add_argument("--expected-product-head", required=True)
+    identity.add_argument("--wandb-run-id", required=True)
+    identity.add_argument("--slurm-job-id")
     args = parser.parse_args(argv)
     arm = _arm(args.arm)
     if args.command == "overrides":
@@ -293,6 +338,14 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "adapt-native":
         adapt_native_outputs(
             args.result_dir, arm, product_head=args.expected_product_head
+        )
+    elif args.command == "init-identity":
+        initialize_run_identity(
+            result_dir=args.result_dir,
+            arm=arm.name,
+            product_head=args.expected_product_head,
+            wandb_run_id=args.wandb_run_id,
+            slurm_job_id=args.slurm_job_id,
         )
     else:
         validate_arm_receipts(args.result_dir, arm)

@@ -9,15 +9,55 @@ from unittest.mock import patch
 
 from research.qwen3_8b_draft_cadence_200step.launch import (
     build_submission,
+    initialize_run_identity,
     materialize_manifest,
     run_submission,
     validate_checkpoint_paths,
     validate_container,
+    validate_runtime_source_root,
 )
 from research.qwen3_8b_draft_cadence_200step.matrix import build_arms
 
 
 class LaunchContractTest(unittest.TestCase):
+    def test_run_identity_initializes_after_ray_created_its_log_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result_dir = Path(directory) / "dflash-adaptive"
+            (result_dir / "ray" / "123-logs").mkdir(parents=True)
+            identity = initialize_run_identity(
+                result_dir=result_dir,
+                arm="dflash-adaptive",
+                product_head="a" * 40,
+                wandb_run_id="q8c200-dflash-adaptive-recovery1",
+                slurm_job_id="123_6",
+            )
+            self.assertEqual(
+                json.loads(identity.read_text()),
+                {
+                    "schema_version": 1,
+                    "arm": "dflash-adaptive",
+                    "product_head": "a" * 40,
+                    "wandb_run_id": "q8c200-dflash-adaptive-recovery1",
+                    "slurm_job_id": "123_6",
+                },
+            )
+            with self.assertRaises(FileExistsError):
+                initialize_run_identity(
+                    result_dir=result_dir,
+                    arm="dflash-adaptive",
+                    product_head="a" * 40,
+                    wandb_run_id="q8c200-dflash-adaptive-recovery1",
+                    slurm_job_id="123_6",
+                )
+
+    def test_runtime_source_accepts_home_or_node_local_scratch_only(self) -> None:
+        validate_runtime_source_root(Path("/home/sna/RL-cadence"))
+        validate_runtime_source_root(Path("/raid/scratch/q8c200-123_4/source"))
+        with self.assertRaisesRegex(ValueError, "source repository"):
+            validate_runtime_source_root(Path("/lustre/results/source"))
+
     def test_manifest_is_exclusive_and_contains_all_literal_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

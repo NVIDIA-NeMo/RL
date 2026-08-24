@@ -88,3 +88,22 @@ python3 -m research.qwen3_8b_draft_cadence_200step.report \
 
 The report uses logged generation and E2E throughput instead of reconstructing
 throughput from averaged token counts and times.
+
+## Compute-visible source recovery
+
+The first actual 13-arm array, parent job `6476732`, failed before Python,
+Ray, W&B, or training. Every task inherited `/home/sna/RL-q8-cadence-d9f3a89ac`
+as the Slurm submit directory while `ray.sub` intentionally passed
+`--no-container-mount-home`; Pyxis therefore could not enter the requested
+container working directory. The failed result root and its exactly-once
+ledger are immutable and must not be reused.
+
+Recovery uses `staged_launch.py`: the exact signed recursive-clean checkout is
+archived and SHA256-bound on Lustre, then each array task extracts an isolated
+copy under
+`/raid/scratch/q8c200-${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}-r${SLURM_RESTART_COUNT:-0}/source`.
+That exact path is explicitly mounted into the nested Pyxis container. This
+also prevents the 13 concurrent MCore jobs from racing on generated helper
+artifacts in one shared checkout. A preflight-only task-0 canary using the same
+archive, renderer, mount, and `ray.sub` path is mandatory before the recovered
+`0-12` array is submitted.
