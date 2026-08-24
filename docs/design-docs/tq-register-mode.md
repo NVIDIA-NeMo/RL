@@ -398,6 +398,29 @@ On a GB300 node (RoCE, `mlx5_8`; `mlx5_17` present but with no active port):
 | real engine, GDR, mooncake defaults | FAIL, `ERR_CONTEXT` (-202) — the peermem route above |
 | real engine, GDR, DMA-BUF route | PASS — published base is a CUDA VA, every key returns `device=cuda` and byte-exact |
 
+### End to end, register mode's data plane costs ~30% less than the store's
+
+Same 6n4g GB300 shape, same qwen3-30b-a3b GRPO recipe, same five steps, both
+with `observability.enabled` so the per-step numbers come from the same counter:
+
+| | register mode (557752) | mooncake_cpu (552484) |
+|---|---|---|
+| total step time | 559.1s | 582.0s |
+| data plane, driver scope | **3.87s** | **5.62s** |
+| bytes moved | 1335.5 MB | 1355.5 MB |
+| share of step | 0.69% | 0.97% |
+
+Nearly identical volume, ~31% less time — the put side, where register mode
+publishes an address and the store copies into staging. Read the step-time
+column with care: register is 23s faster overall but only 1.75s of that is
+data plane, so the rest is generation and training variance rather than the
+backend.
+
+Driver scope means the SingleController's own client: the advantage-stage get
+and the post-train clear. Per-DP-rank `get_samples` and generation's
+`put_samples` run on separate clients in separate processes and are in neither
+column, so this understates both backends by the same construction.
+
 ### NVLink (MNNVL) is 40x RDMA, and register mode cannot reach it as it stands
 
 Measured on GB300, `tools/nvlink_crossnode.sbatch` + `tools/smoke_nvlink_normal_mode.py`:
@@ -448,7 +471,14 @@ Four facts govern whether this is reachable, and three of them are traps:
    `cuMemCreate` it logs a warning and returns **0** — success, having published
    nothing. The failure surfaces much later and on a different node as
    `Requested address … not found!` → `batch_transfer_sync_read … status -1`.
-4. **`MC_FORCE_MNNVL` replaces RDMA rather than joining it.** A peer outside the
+4. **The store rejects `protocol=nvlink` outright.** Setting
+   `data_plane.mooncake_cpu.protocol: nvlink` does reach mooncake — its log
+   flips to `auto discovery is disabled for protocol: nvlink` — and it then
+   refuses: `unsupported_protocol protocol=nvlink`, `Failed to initialize
+   transfer engine`, retried 20 times, ending in `Mooncake store setup failed
+   with error code: -1` before any segment is mounted. So the store cannot be
+   moved off RDMA by configuration at all.
+5. **`MC_FORCE_MNNVL` replaces RDMA rather than joining it.** A peer outside the
    NVLink clique gets no path at all, not a slower one. `ENABLE_MULTI_PROTOCOL`
    (comma-separated segments, per-buffer routing) is not compiled into the
    pinned wheel, so there is no adaptive rdma/nvlink fallback to lean on.

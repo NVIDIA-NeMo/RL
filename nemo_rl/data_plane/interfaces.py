@@ -96,6 +96,10 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     # transfer_queue_env). "nvlink" additionally swaps mooncake's allocator to
     # NvlinkTransport::allocatePinnedLocalMemory, so the segment lands in HBM
     # rather than host RAM -- size it accordingly.
+    # "nvlink" is REJECTED by the pinned wheel: the store's client_service
+    # answers `unsupported_protocol protocol=nvlink` and fails setup with -1
+    # (measured, job 558292). Kept only so the attempt is expressible and its
+    # outcome documented -- do not expect it to work without a newer mooncake.
     protocol: Literal["rdma", "nvlink"] = "rdma"
     global_segment_size: int = 68719476736  # 64 GiB per client process
     local_buffer_size: int = 4294967296  # 4 GiB per client process
