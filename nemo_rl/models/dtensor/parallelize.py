@@ -813,6 +813,46 @@ def clip_grad_by_total_norm_(
             g.mul_(clip_coeff)
 
 
+def _is_tp_duplicate(
+    grad: Union[torch.Tensor, DTensor],
+    tp_group: torch.distributed.ProcessGroup,
+) -> bool:
+    """Whether every rank of ``tp_group`` holds an identical copy of ``grad``.
+
+    Tensor parallelism only shards the parameters named in the parallel plan
+    (attention/MLP projections, embeddings). Everything else stays replicated:
+    norm weights, biases, router weights, and any module the plan does not
+    cover. Each TP rank therefore computes the very same gradient for those
+    parameters, and that gradient must contribute to the global norm exactly
+    once.
+
+    A plain ``torch.Tensor`` is replicated by definition. A ``DTensor`` is
+    replicated when its placement on the mesh dimension backed by ``tp_group``
+    is not a ``Shard``. The mesh dimension is located by comparing group ranks
+    rather than object identity so that mesh slices (``mesh["tp"]``) resolve
+    correctly.
+
+    Args:
+        grad: The gradient to classify.
+        tp_group: Tensor-parallel process group, or ``None`` when TP is unused.
+
+    Returns:
+        bool: True when the gradient is duplicated across ``tp_group``.
+    """
+    if tp_group is None or not isinstance(grad, DTensor):
+        return True
+
+    mesh = grad.device_mesh
+    tp_ranks = torch.distributed.get_process_group_ranks(tp_group)
+    for dim in range(mesh.ndim):
+        if torch.distributed.get_process_group_ranks(mesh.get_group(dim)) == tp_ranks:
+            return not isinstance(grad.placements[dim], Shard)
+
+    # The gradient does not live on the TP mesh at all, so it is replicated
+    # across the group.
+    return True
+
+
 def get_grad_norm(
     parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
     dp_cp_group: torch.distributed.ProcessGroup,
@@ -840,10 +880,17 @@ def get_grad_norm(
     if isinstance(parameters, (torch.Tensor, DTensor)):
         parameters = [parameters]
 
-    # Grads.
-    grads_for_norm = [
-        to_local_if_dtensor(p.grad.detach()) for p in parameters if p.grad is not None
-    ]
+    # Grads, split by whether the TP group holds duplicate copies of them.
+    grads_for_norm = []
+    tp_duplicate_grads = []
+    for p in parameters:
+        if p.grad is None:
+            continue
+        grad = p.grad.detach()
+        if _is_tp_duplicate(grad, tp_group):
+            tp_duplicate_grads.append(to_local_if_dtensor(grad))
+        else:
+            grads_for_norm.append(to_local_if_dtensor(grad))
 
     # Norm parameters.
     norm_type = float(norm_type)
@@ -851,6 +898,8 @@ def get_grad_norm(
 
     # Calculate norm.
     if norm_type == torch.inf:
+        # A max-reduction is idempotent, so duplicates need no special handling.
+        grads_for_norm = grads_for_norm + tp_duplicate_grads
         total_norm = max(grad.abs().max().item() for grad in grads_for_norm)
         total_norm_cuda = torch.tensor([float(total_norm)], dtype=dtype, device="cuda")
         # Take max across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
@@ -864,19 +913,32 @@ def get_grad_norm(
         total_norm = float(total_norm_cuda[0].item())
 
     else:
-        total_norm_cuda = torch.tensor(0.0, dtype=dtype, device="cuda")
-        for grad in grads_for_norm:
-            grad_norm = torch.linalg.vector_norm(grad, ord=norm_type, dtype=dtype)
-            total_norm_cuda += torch.pow(grad_norm, norm_type)
+
+        def _sum_of_powers(grads: list[torch.Tensor]) -> torch.Tensor:
+            acc = torch.tensor(0.0, dtype=dtype, device="cuda")
+            for grad in grads:
+                grad_norm = torch.linalg.vector_norm(grad, ord=norm_type, dtype=dtype)
+                acc += torch.pow(grad_norm, norm_type)
+            return acc
+
+        # [sharded-on-TP, duplicated-on-TP]. Both halves are sharded across DP by
+        # FSDP, so both are summed over dp_cp_group; only the sharded half may be
+        # summed over tp_group, otherwise every TP rank's identical copy of a
+        # replicated gradient is counted tp_size times and inflates the norm.
+        partial_norms = torch.stack(
+            [_sum_of_powers(grads_for_norm), _sum_of_powers(tp_duplicate_grads)]
+        )
 
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         torch.distributed.all_reduce(
-            total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group
+            partial_norms, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group
         )
 
+        sharded_norm = partial_norms[0].clone()
         torch.distributed.all_reduce(
-            total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            sharded_norm, op=torch.distributed.ReduceOp.SUM, group=tp_group
         )
+        total_norm_cuda = sharded_norm + partial_norms[1]
         total_norm = float(total_norm_cuda.item() ** (1.0 / norm_type))
 
     return total_norm
