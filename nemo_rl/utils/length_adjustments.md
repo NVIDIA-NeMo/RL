@@ -430,11 +430,13 @@ This uses per-row `profile_band` metadata with channel-specific `{a, b, f}` valu
 For an enabled channel, the multiplier is:
 
 ```text
-length <= a: multiplier = 1
-length > a:  multiplier = max(0, 1 - (length - a) / (b - a) * (1 - f))
+length <= a:     multiplier = 1
+a < length < b:  multiplier = 1 - (length - a) / (b - a) * (1 - f)
+length >= b:     multiplier = f
 ```
 
-So the multiplier is `f` at `b`, then the same slope continues past `b` until clamped at `0`.
+So the multiplier interpolates linearly from `1` at `a` down to `f` at `b`, then stays at `f` for
+all lengths past `b`.
 
 Profile-band multipliers are applied only to rollouts whose original environment reward is
 positive.

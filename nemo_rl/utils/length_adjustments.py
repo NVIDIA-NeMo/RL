@@ -770,8 +770,8 @@ def _band_multiplier(rl: int, ch: dict[str, Any] | None) -> float:
     Returns 1.0 if the channel block is missing or malformed (no-op).
     Otherwise:
         rl <= a    -> 1.0
-        rl == b    -> f
-        rl > a     -> same linear slope continues past b, floored at 0.0
+        a < rl < b -> linear interpolation from 1.0 down to f
+        rl >= b    -> f
     """
     if not ch:
         return 1.0
@@ -782,7 +782,9 @@ def _band_multiplier(rl: int, ch: dict[str, Any] | None) -> float:
         return 1.0
     if rl <= a:
         return 1.0
-    return max(0.0, 1.0 - (rl - a) / (b - a) * (1.0 - float(f)))
+    if rl >= b:
+        return float(f)
+    return 1.0 - (rl - a) / (b - a) * (1.0 - float(f))
 
 
 def _group_length_profile_gate_info(
