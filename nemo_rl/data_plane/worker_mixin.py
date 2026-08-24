@@ -28,7 +28,7 @@ TP=CP=PP=1) and inherit ``train`` / ``get_logprobs`` /
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 
 import torch
 
@@ -197,7 +197,10 @@ class TQWorkerMixin:
         """
         client = getattr(self, "_dp_client", None)
         snapshot = getattr(client, "snapshot", None)
-        return snapshot(reset_step_window=True) if callable(snapshot) else None
+        if not callable(snapshot):
+            return None
+        # cast: ``snapshot`` came off getattr, so it is untyped here.
+        return cast("dict[str, Any] | None", snapshot(reset_step_window=True))
 
     def _fetch(
         self,
