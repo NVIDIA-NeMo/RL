@@ -533,8 +533,9 @@ data_plane:
     offload_source_to_host: false    # true: put copies to host and registers there,
                                      # reads still land in HBM (one hop, no HBM held)
     rpc_port: 0                      # 0 = engine picks a free port
-  # observability:                    # NotRequired
-  #   enabled: false
+  observability:                      # per-op data-plane timing/volume
+    enabled: true                     # per-op timing/volume; cost is below measurement noise
+    verify_tensor_hash: false         # debug: per-row torch.hash_tensor wire-in vs wire-out (~2.4ms per 12MB batch)
 
 # Multi-Teacher On-Policy Distillation (MOPD); null = disabled (default). Mirrors
 # the field on the GRPO MasterConfig added for MOPD support.
