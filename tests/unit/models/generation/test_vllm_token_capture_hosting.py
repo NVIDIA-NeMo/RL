@@ -269,6 +269,10 @@ def test_request_capture_round_trip_stages_and_rides_coords():
     coords = content["ng_commit_coords"]
     assert coords["disposition"] == "staged"
     assert (coords["delta_len"], coords["cum_len"]) == (5, 5)
+    # Coords are token-free: hashes ride the wire, deltas stay in the sink.
+    assert "token_ids_delta" not in coords
+    assert coords["chain_hash"] == sink.records[0].chain_hash
+    assert coords["cumulative_hash"] == sink.records[0].cumulative_hash
     # Logprobs never transit worker -> gate; state map is drained.
     assert (
         "logprobs" not in content["choices"][0]
@@ -288,6 +292,7 @@ def test_request_capture_token_in_prev_len_chains():
             "prev_len": 3,
             "mode": "token_in",
             "required_prefix_token_ids": [10, 11, 12],
+            "parent_chain_hash": "1" * 64,
         },
         stream=False,
     )
@@ -317,6 +322,7 @@ def test_staging_chain_fetches_patches_and_begins_capture():
             "prev_len": 3,
             "mode": "token_in",
             "staging_chain": ["r0/c1", "r0/c2"],
+            "parent_chain_hash": "2" * 64,
         },
         stream=False,
     )

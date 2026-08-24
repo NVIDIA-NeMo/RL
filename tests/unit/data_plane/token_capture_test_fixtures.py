@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 from nemo_gym.token_id_capture.staging.digest import (
+    compute_chain_hash,
     compute_extras_digest,
     compute_staging_digest,
+    hash_token_ids,
 )
 from nemo_gym.token_id_capture.staging.rebuild import verify_and_linearize
 from nemo_gym.token_id_capture.staging.records import (
@@ -35,6 +37,8 @@ def _record(
     token_mask: list[float],
     logprobs: list[float],
     weight_version: int,
+    parent_chain_hash: str | None = None,
+    cumulative_prefix: list[int] | None = None,
 ) -> StagedCallRecord:
     token_mask = [f32(value) for value in token_mask]
     logprobs = [f32(value) for value in logprobs]
@@ -56,6 +60,8 @@ def _record(
         "generation_log_probs_delta": logprobs,
         "extras": None,
         "extras_digest": extras_digest,
+        "chain_hash": compute_chain_hash(parent_chain_hash, token_ids),
+        "cumulative_hash": hash_token_ids(list(cumulative_prefix or []) + token_ids),
     }
     return StagedCallRecord(
         **values,
@@ -124,6 +130,8 @@ def build_fixture_artifacts(
                 token_mask=[0.0, 1.0, 1.0],
                 logprobs=[0.0, -0.3, -0.4],
                 weight_version=5 if name == "mixed_weight_versions" else 4,
+                parent_chain_hash=root.chain_hash,
+                cumulative_prefix=root.token_ids_delta,
             )
         )
     receipt = RolloutReceipt(
