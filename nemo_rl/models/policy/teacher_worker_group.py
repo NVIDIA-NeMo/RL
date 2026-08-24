@@ -82,7 +82,14 @@ def create_teacher_configs_from_opd_config(
         seen_models.add(model_name)
 
         # defaults <- per-alias override, then validated/typed by the schema.
-        merged = {**default_cfg, **dict(overrides.get(alias, {}))}
+        raw_override = overrides.get(alias, {})
+        if isinstance(raw_override, TeacherResourceConfig):
+            # Config loading may pre-validate override blocks, which fills
+            # schema defaults for every field; keep only what the yaml
+            # actually set so a PARTIAL per-alias override doesn't clobber
+            # default_teacher_cfg (e.g. gpus_per_node reverting to 8).
+            raw_override = raw_override.model_dump(exclude_unset=True)
+        merged = {**default_cfg, **dict(raw_override)}
         res = TeacherResourceConfig(**merged)
 
         # Unknown top-level keys (extra="allow") fold into megatron_cfg_overrides;
