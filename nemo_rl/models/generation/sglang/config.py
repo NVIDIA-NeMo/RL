@@ -112,7 +112,7 @@ class SglangSpecificArgs(TypedDict):
     disable_cuda_graph_padding: NotRequired[bool]
     # Per-phase CUDA graph backend. "tc_piecewise" is the piecewise mode, which
     # crashed with "illegal memory access" on torch 2.10; recipes pass
-    # "breakable" for prefill to stay off it. Replaces the pre-v0.5.16
+    # "disabled" for prefill to stay off it. Replaces the pre-v0.5.16
     # `disable_piecewise_cuda_graph` boolean.
     cuda_graph_backend_decode: NotRequired[str]
     cuda_graph_backend_prefill: NotRequired[str]

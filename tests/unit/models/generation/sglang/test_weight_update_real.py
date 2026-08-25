@@ -92,7 +92,7 @@ def _make_sglang_cfg(tp_size, pad_token_id=PAD_TOKEN_ID):
             "dp_size": 1,
             "pp_size": 1,
             "ep_size": 1,
-            "cuda_graph_backend_prefill": "breakable",
+            "cuda_graph_backend_prefill": "disabled",
             "disable_cuda_graph": True,
             "mem_fraction_static": 0.3,
             "sglang_server_config": {

@@ -24,7 +24,7 @@ policy:
       skip_server_warmup: true
       # Piecewise CUDA graph currently crashes with "illegal memory access"
       # (likely torch 2.10 + sglang incompatibility). Keep disabled until upstream fix.
-      cuda_graph_backend_prefill: breakable
+      cuda_graph_backend_prefill: disabled
       disable_cuda_graph: false
       sglang_server_config:
         needs_offload: true
