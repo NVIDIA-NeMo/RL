@@ -40,7 +40,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
             gpus_per_node: 4  # inference GPUs; remainder go to training
     ```
 
-    Megatron generation is also supported, non-colocated only. It requires the Megatron trainer (`policy.megatron_cfg.enabled: true`) — refit transfers weights via Megatron's reshard collective — and NeMo-Gym rollouts additionally require `policy.generation.mcore_generation_config.expose_http_server: true`. The exemplar — a NeMo-Gym run with the OpenAI server exposed — lives at [examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml](../../examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml):
+    Megatron generation is also supported, non-colocated only. It requires the Megatron trainer (`policy.megatron_cfg.enabled: true`) and NeMo-Gym rollouts additionally require `policy.generation.mcore_generation_config.expose_http_server: true`. The exemplar — a NeMo-Gym run with the OpenAI server exposed — lives at [examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml](../../examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml):
 
     ```yaml
     policy:
@@ -187,6 +187,6 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
 - Generation backend: vLLM and Megatron generation are supported (Megatron non-colocated only — colocated Megatron generation raises at setup); SGLang and TRT-LLM have not been tested on SC.
-- Checkpointing and validation are not yet supported (setup raises if enabled).
+- Validation is not yet supported (setup raises if enabled); checkpointing is.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported.
