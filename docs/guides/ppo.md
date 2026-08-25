@@ -202,6 +202,22 @@ ppo:
 
 During warmup, generation and environment scoring still run normally — only policy weight updates are skipped.
 
+### Warm-Starting the Critic
+
+Warmup can be paid once, offline, instead of inside every PPO run: pretrain the value model separately and point a fresh PPO run at that checkpoint.
+
+```yaml
+ppo:
+  warm_start_value_checkpoint: /path/to/critic_pretrain_run/step_370
+  policy_training_start_step: 0  # the critic is already warm
+```
+
+`policy_training_start_step: 0` is the natural pairing, but keeping a short online warmup is equally valid: it calibrates the seeded critic on this run's own rollout distribution before the policy starts moving. A nonzero value is also what `async_ppo.warmup_generation_lead_steps` requires (`async_rl.sampler.warmup_lookahead_versions` on the SingleController path) — both must be null when it is 0.
+
+The path is a `step_<n>` directory holding a `value/` subtree — the layout a PPO or critic-pretraining run checkpoints — and the critic restores its weights, optimizer moments and LR-scheduler state from it. Nothing else is read: the policy starts from the base model, the dataloader from the beginning, and the step counter at 0.
+
+The warm start applies to a fresh run only: once the run has written a checkpoint of its own, that checkpoint wins. That is what lets the setting stay in the config across resumes — a resubmitted run restores its own critic instead of re-seeding from the pretrained one, with no config edit in between.
+
 ## Loss
 
 ### Policy Loss
@@ -238,6 +254,7 @@ ppo:
   max_num_steps: 100000
   ppo_epochs: 4
   policy_training_start_step: 0
+  warm_start_value_checkpoint: null
   val_period: 20
   val_at_start: true
   val_at_end: false
@@ -294,6 +311,7 @@ value_loss_fn:
 **PPO-specific parameters:**
 - **`ppo.ppo_epochs`**: Number of training updates per rollout batch
 - **`ppo.policy_training_start_step`**: Number of critic-only warmup steps before policy training begins
+- **`ppo.warm_start_value_checkpoint`**: Checkpoint step directory whose `value/` seeds the critic on a fresh run. See [Warm-Starting the Critic](#warm-starting-the-critic)
 - **`ppo.seq_logprob_error_threshold`**: Nullable sequence-level multiplicative probability-error threshold. PPO always logs sequence-level train/generation mismatch metrics; when this is set, sequences above the threshold are excluded from advantage and loss computation.
 - **`ppo.async_ppo`**: Enables replay-buffer-based asynchronous PPO. See [Asynchronous PPO](#asynchronous-ppo) for requirements and staleness controls.
 - **`ppo.adv_estimator.name`**: Set to `"gae"` for GAE advantage estimation (PPO default)

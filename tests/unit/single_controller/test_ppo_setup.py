@@ -570,6 +570,42 @@ class TestSetupBuildsTheCritic:
         patched_ppo_factories["policy"].offload_to_cpu.assert_not_called()
 
 
+class TestValueWarmStart:
+    def test_fresh_run_builds_the_critic_from_the_warm_start(
+        self, patched_ppo_factories, tmp_path
+    ):
+        seed = tmp_path / "critic_pretrain" / "step_370"
+        (seed / "value" / "weights").mkdir(parents=True)
+        (seed / "value" / "optimizer").mkdir()
+        mc = _ppo_master_config(
+            ppo=PPOConfig.model_construct(
+                max_num_steps=100,
+                warm_start_value_checkpoint=str(seed),
+                **_STEP_CONFIG,
+            )
+        )
+        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+
+        setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
+        assert value_kwargs["weights_path"] == seed / "value" / "weights"
+        assert value_kwargs["optimizer_path"] == seed / "value" / "optimizer"
+        # The policy is untouched by a warm start: pi_0 comes from the base model.
+        trainer_kwargs = patched_ppo_factories["_build_trainer"].call_args.kwargs
+        assert trainer_kwargs["weights_path"] is None
+
+    def test_unset_leaves_the_critic_cold(self, patched_ppo_factories, tmp_path):
+        mc = _ppo_master_config()
+        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+
+        setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
+        assert value_kwargs["weights_path"] is None
+        assert value_kwargs["optimizer_path"] is None
+
+
 def _cluster_config(mc: MasterConfig, *, colocated: bool, backend: str) -> MasterConfig:
     """Fill in the cluster / generation keys _build_clusters reads."""
     mc.cluster = {

@@ -789,10 +789,16 @@ def setup_single_controller(
     )
     save_state = _get_grpo_save_state(loaded_state)
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
-    value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
-        last_checkpoint_path,
-        model_component="value",
-    )
+    if is_ppo_run(master_config):
+        # Only a fresh run reads this; a resume ignores it and restores the critic
+        # from its own checkpoint, so the key can stay in the config.
+        warm_start = master_config.ppo.warm_start_value_checkpoint
+        if last_checkpoint_path is None and warm_start is not None:
+            print(f"🔥 Warm-starting the value model from {warm_start}")
+        value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
+            last_checkpoint_path or warm_start,
+            model_component="value",
+        )
 
     # ==========================
     # Setup Dataset & Environments

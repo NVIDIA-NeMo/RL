@@ -185,6 +185,10 @@ class PPOConfig(BaseModel, extra="allow"):
     # Value model trains from step 0; policy training is skipped for
     # total_steps < this value. Default 0 (train from start).
     policy_training_start_step: int = 0
+    # Step directory of a critic-pretrain run whose value/ seeds this run's critic.
+    # Only a fresh run reads it; a resume ignores it and restores the critic from
+    # its own checkpoint, so it can stay set.
+    warm_start_value_checkpoint: str | None = None
     # Nullable sequence-level multiplicative probability-error threshold.
     # None logs metrics without masking; values above the threshold are excluded.
     seq_logprob_error_threshold: float | None = None
@@ -705,8 +709,13 @@ def setup(
     worker_init_timing_metrics = {}
 
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    # Only a fresh run reads this; a resume ignores it and restores the critic from
+    # its own checkpoint, so the key can stay in the config.
+    warm_start = ppo_config.warm_start_value_checkpoint
+    if last_checkpoint_path is None and warm_start is not None:
+        print(f"🔥 Warm-starting the value model from {warm_start}")
     value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
-        last_checkpoint_path,
+        last_checkpoint_path or warm_start,
         model_component="value",
     )
 
