@@ -13,10 +13,12 @@ routers, shared experts, embeddings, normalization layers, and selected
 boundary layers remain in BF16. The policy backward pass currently uses TE's
 dequantized path.
 
-After every policy update, NeMo RL quantizes the updated routed-expert weights,
-packs them for transfer, and refits the colocated vLLM engines before the next
-rollout. This keeps the training and rollout paths on the same NVFP4 weight and
-activation-scaling contract.
+After every policy update, NeMo RL exports the updated BF16 weights to each
+colocated vLLM engine. The rollout workers quantize routed-expert weights while
+vLLM's native `reload_weights` API consumes the checkpoint-format stream before
+the next rollout. This keeps the training and rollout paths on the same NVFP4
+weight and activation-scaling contract without making training aware of the
+rollout representation.
 
 ## Performance and GPU Memory
 
@@ -63,14 +65,34 @@ show a lower end-to-end peak in this comparison. The current result therefore
 demonstrates lower rollout weight memory and greater KV-cache headroom, rather
 than lower peak memory for the full training process.
 
-\* Measured with routed-expert quantization on the Megatron training worker.
-Quantization has since moved to the vLLM worker (see "Weight refit" below);
-this row awaits re-measurement under that path.
+\* The original 17.93 s value was measured with routed-expert quantization on
+the Megatron training worker. After quantization moved to the vLLM worker,
+representative refits measured 17.6–18.7 s, consistent with the original row.
 
-The current performance result includes quantization and weight refit after
-each policy update. Refit is still a visible part of the step and remains an
-optimization target. Training-quality curves will be added after the ongoing
-long-run stability validation is complete.
+Profiling the vLLM-side path showed that native weight loading, rather than IPC
+transfer or NVFP4 arithmetic, dominates refit time:
+
+| Refit phase | Representative time | Share |
+|---|---:|---:|
+| vLLM load and layer processing | 13.13 s | 75% |
+| NVFP4 quantization | 3.80 s | 22% |
+| IPC wait and other work | 0.66 s | 4% |
+| Finalization after all layers load | approximately 0 s | approximately 0% |
+
+The load phase is Python-call-bound. Qwen3-30B-A3B emits 64,512 per-expert
+checkpoint names per refit across 42 quantized layers and 128 experts, and each
+name passes through vLLM's mapping, loader, and layerwise-reload bookkeeping.
+
+A research-only prototype coalesced those outputs into eight full fused-expert
+parameters per layer. In paired 90-step runs, the production per-expert path
+measured 18.42 s mean and median refit time; the prototype measured 6.31 s mean
+and 6.38 s median, a 2.92x improvement. Both runs completed successfully. The
+prototype is not part of this feature because complete fused-parameter loading
+depends on vLLM's internal expert layout and should be implemented upstream.
+
+Refit remains a visible part of the step and an optimization target.
+Training-quality curves will be added after the ongoing long-run stability
+validation is complete.
 
 ## Quick Start
 
@@ -132,10 +154,12 @@ It must cover the same boundary layers selected by
 ```mermaid
 flowchart LR
     A[TE per-token NVFP4 policy training] --> B[Megatron-Bridge HF weight export]
-    B --> D[Colocated weight refit]
-    D --> C[Quantize routed experts]
-    C --> E[vLLM per-token NVFP4 rollout]
-    E --> A
+    B --> C[BF16 IPC stream]
+    C --> D[vLLM native reload_weights]
+    D --> E[Quantize routed experts at load time]
+    E --> F[Restore kernel-format storage]
+    F --> G[vLLM per-token NVFP4 rollout]
+    G --> A
 ```
 
 ### Per-token NVFP4 policy training
@@ -160,14 +184,22 @@ names and reconstructs tensors across the training TP, PP, and EP topology,
 sending plain BF16 — identical to a BF16-only run. Training stays entirely
 unaware of NVFP4.
 
-Each vLLM engine receives the BF16 stream over the refit transport and
-quantizes routed-expert projections at load time, mirroring the fp8/mxfp8
-"real quant" rollout path: gate and up projections are quantized together
-under one shared per-expert global scale (vLLM's fused-MoE loader keeps only
-one gate/up scale per expert), and down projections are quantized
-independently. Ignored BF16 expert layers (`additional_ignore`) pass through
-untouched. vLLM's native loaders then select the TP and PP shards owned by the
-local rank as usual.
+Each vLLM engine receives the BF16 stream over CUDA IPC. NeMo RL converts each
+transport batch into owned checkpoint-format tensors and supplies one lazy
+iterator to vLLM's native `reload_weights` API. Routed-expert projections are
+quantized at load time, mirroring the fp8/mxfp8 "real quant" rollout path:
+gate and up projections are quantized together under one shared per-expert
+global scale (vLLM's fused-MoE loader keeps only one gate/up scale per expert),
+and down projections are quantized independently. Ignored BF16 expert layers
+(`additional_ignore`) pass through unchanged.
+
+The IPC allocation is acknowledged only after quantization and passthrough
+copies no longer depend on it. The final COMPLETE message is acknowledged only
+after `reload_weights` has consumed the entire stream, performed layerwise
+post-processing, and completed the final device fence. If preparation or load
+fails, the remaining IPC messages are drained and acknowledged so the sender
+cannot deadlock, and the rollout worker raises instead of serving stale
+weights.
 
 ### Per-token vLLM rollout
 
@@ -177,9 +209,10 @@ fused-MoE runtime, and rebuilds the affected kernels. Rollout activations are
 quantized dynamically for each token; no static activation calibration is
 required.
 
-The reload path preserves the parameter storage used by CUDA graphs and
-synchronizes the device before refit buffers are reused. A failed or incomplete
-refit stops the rollout instead of continuing with stale weights.
+The native reload path restores checkpoint-shaped parameters layer by layer,
+loads and processes them, then copies the resulting kernel-format tensors back
+into the storage used by CUDA graphs. A failed or incomplete refit stops the
+rollout instead of continuing with stale weights.
 
 ## Supported Configuration
 
@@ -205,8 +238,8 @@ yet supported by this path.
 
 ## Roadmap
 
-- Reduce refit latency and data movement, including quantization before the
-  expert-parallel gather.
+- Reduce refit latency, including an upstream vLLM full fused-parameter loader
+  and quantization before the expert-parallel gather.
 - Add native NVFP4 backward computation.
 - Complete longer stability and model-quality studies and publish the training
   curves.
