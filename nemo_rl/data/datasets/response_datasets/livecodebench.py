@@ -118,17 +118,27 @@ def _split_tests(
     return [tests[i] for i in train_idx], [tests[i] for i in val_idx]
 
 
+# Reference CODE_PROMPT (lasgroup/SDPO data/format/prompts.py), verbatim —
+# expert framing, all-tests emphasis, time-limit warning, and the code-block
+# instruction all shift absolute pass rates.
+_CODE_PROMPT_PREAMBLE = (
+    "You are a coding expert. You will be given a coding problem, and you "
+    "need to write a correct Python program that matches the specification "
+    "and passes all tests. The time limit is 1 second. You may start by "
+    "outlining your thought process. In the end, please provide the complete "
+    "code in a code block enclosed with ``` ```."
+)
+
+
 def _build_user_prompt(question: str, starter_code: str | None) -> str:
-    parts = [question.strip()]
+    parts = [_CODE_PROMPT_PREAMBLE, question.strip()]
+    # Kept beyond the reference prompt: our functional harness calls
+    # Solution().<method>, so LeetCode-style problems need the signature.
     if starter_code and starter_code.strip():
         parts.append(
             "Use the following starter code:\n\n"
             f"```python\n{starter_code.strip()}\n```"
         )
-    parts.append(
-        "Write your final solution as a single self-contained Python "
-        "code block."
-    )
     return "\n\n".join(parts)
 
 
@@ -182,6 +192,9 @@ class LiveCodeBenchDataset(RawDataset):
 
             metadata = {
                 "tests": tests_for_split,
+                # Gates the env's dense_train_rewards (reference: dense reward
+                # on train, sparse on the held-out split).
+                "split": "train" if split == "train" else "validation",
                 "starter_code": row.get("starter_code") or "",
                 "function_name": _infer_function_name(row.get("starter_code") or ""),
                 "platform": row.get("platform") or "",

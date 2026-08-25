@@ -46,7 +46,10 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     validate,
 )
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    GRPOAdvantageEstimator,
+)
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     SDPOHybridLossConfig,
@@ -1099,7 +1102,11 @@ def sdpo_train(
         adv_cfg.setdefault("normalize_rewards", True)
         if adv_cfg["name"] != "grpo":
             raise ValueError(f"SDPO+GRPO hybrid only supports adv_estimator name 'grpo', " f"got {adv_cfg['name']!r}.")
-        adv_estimator = GRPOAdvantageEstimator(adv_cfg, master_config.loss_fn)
+        # GRPOAdvantageEstimator reads the config by attribute since the main
+        # merge — wrap the raw sdpo.adv_estimator dict in the pydantic model.
+        adv_estimator = GRPOAdvantageEstimator(
+            AdvEstimatorConfig(**adv_cfg), master_config.loss_fn
+        )
         print(
             f"  ✓ SDPO+GRPO hybrid: grpo_weight={loss_fn.grpo_weight}, "
             f"adv_estimator=grpo (loo={adv_cfg['use_leave_one_out_baseline']}, "

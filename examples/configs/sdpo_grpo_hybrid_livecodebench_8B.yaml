@@ -27,12 +27,15 @@ sdpo:
   val_at_end: true
   max_val_samples: 131
   val_batch_size: 64
+  val_num_generations_per_prompt: 4  # paper Table 12 (Section 4): 4 validation rollouts per prompt
   seed: 42
   # SDPO-specific
   success_reward_threshold: 1.0      # all train tests must pass
   max_reprompt_len: 12288            # teacher prompt may include long error logs
   topk_logits_k: 20                  # paper Table 12 (Section 4 / LCBv6): K=20
-  topk_source: "student"             # paper §2.2: top-K indices from the STUDENT forward, teacher gathered at those indices ("teacher" = legacy teacher-selected top-k; needs DTensor v2)
+  teacher_regularization: "trust_region"  # paper §2.3/A.2 Eq.10: unregularized teacher diverges (Table 4; reproduced in run nttalvt9)
+  teacher_mix_coef: 0.01             # paper Table 4: alpha = 0.01 (weight of CURRENT policy in the lerp)
+  topk_source: "student"             # paper §2.2: top-K indices from the STUDENT forward, teacher gathered at those indices ("teacher" = legacy teacher-selected top-k; needs DTensor v2). Pair with tail_mode k_plus_one — at K=20 student-topk + legacy tail underperformed in the A/B
   remove_thinking_from_demo: true    # strip <think>...</think> from peer demos so {solution} slot stays content-only
   feedback_source: "combined"        # paper Table 2: peer-rollout demo + env feedback
   log_sample_every_n_steps: 1        # dump one fail + one pass per step (stdout + W&B Table)
@@ -51,8 +54,9 @@ loss_fn:
     success_reward_threshold: 1.0
     kl_type: "reverse"               # paper Table 12 (Section 4 / LCBv6): Reverse-KL
     mixed_kl_weight: 0.5             # unused when kl_type="reverse"
-    zero_outside_topk: true
-    reference_policy_kl_penalty: 0.0 # SDPO trust-region anchor disabled
+    zero_outside_topk: true          # ignored when tail_mode="k_plus_one" (the bucket replaces the tail correction)
+    tail_mode: "k_plus_one"          # paper A.3 / ref core_algos: log(1-sum p) remainder buckets on BOTH true-log-prob distributions
+    reference_policy_kl_penalty: 0.0 # student-side ref-KL off (not in paper Table 12); the teacher anchor is sdpo.teacher_regularization
     reference_policy_kl_type: "k3"
   grpo:
     reference_policy_kl_penalty: 0.01 # GRPO KL penalty to frozen-init reference. Non-zero anchors
@@ -256,8 +260,8 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
-    val_temperature: ${.temperature}
-    val_top_p: ${.top_p}
+    val_temperature: 0.6               # paper Table 12 (Section 4): validation at temp 0.6
+    val_top_p: 0.95                    # paper Table 12 (Section 4): validation top-p 0.95
     val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null

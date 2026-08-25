@@ -15,9 +15,13 @@
 """Environment that scores Python solutions against LiveCodeBench unit tests.
 
 Used by the SDPO LCBv6 recipe: each rollout produces Python code; this env
-runs each test as a subprocess with a timeout, computes a binary all-pass
-reward, and returns a textual feedback string (failed input / expected /
-actual, or runtime error) suitable for SDPO's env-feedback teacher.
+runs each test as a subprocess with a timeout, computes the reward (binary
+all-pass by default; fraction-of-tests-passed on the train split with
+dense_train_rewards, matching the reference harness), and returns a textual
+feedback string in the reference's LeetCode style — one runtime-error block,
+or the shortest wrong-answer blocks — suitable for SDPO's env-feedback
+teacher. Responses without a fenced code block are graded INCORRECT_FORMAT
+rather than executed.
 """
 
 from __future__ import annotations
@@ -51,10 +55,16 @@ class LiveCodeBenchEnvConfig(TypedDict):
     # entire aggregated feedback budget and pushing Output/Expected out of view.
     max_input_chars_per_test: NotRequired[int]
     max_input_lines_per_test: NotRequired[int]
+    # Reference behavior: reward = fraction of tests passed on the TRAIN split
+    # (metadata["split"] == "train"), all-or-nothing elsewhere. Default False
+    # keeps the legacy binary reward everywhere.
+    dense_train_rewards: NotRequired[bool]
 
 
 class LiveCodeBenchEnvMetadata(TypedDict):
     tests: list[dict[str, str]]
+    # "train" | "validation"; gates dense_train_rewards (absent -> sparse).
+    split: NotRequired[str]
     starter_code: NotRequired[str]
     function_name: NotRequired[str]
     platform: NotRequired[str]
@@ -65,15 +75,24 @@ class LiveCodeBenchEnvMetadata(TypedDict):
 _FENCE_RE = re.compile(r"```[a-zA-Z0-9_+\-]*[ \t]*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
-def extract_python_code(response: str) -> str:
-    """Pull a Python code block out of a model response.
+INCORRECT_FORMAT_FEEDBACK = (
+    "Incorrect Format: Put your code inside a ```python ... ``` block."
+)
 
-    Falls back to the whole response if no fenced block is found.
+
+def extract_python_code(response: str) -> str | None:
+    """Pull the LONGEST fenced code block out of a model response.
+
+    Mirrors the reference implementation (max(blocks, key=len)): a response
+    that ends with a short usage-example snippet is still graded on its main
+    solution block. Returns None when the response contains no fenced block —
+    the caller grades that as INCORRECT_FORMAT (reward 0 + explicit feedback)
+    instead of executing prose as Python.
     """
     matches = _FENCE_RE.findall(response)
-    if matches:
-        return matches[-1].strip()
-    return response.strip()
+    if not matches:
+        return None
+    return max(matches, key=len).strip()
 
 
 def _build_functional_harness(
@@ -244,10 +263,11 @@ def _run_one_test(
     test_index: int = 1,
     max_input_lines: int = 40,
     max_input_chars: int = 800,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str]:
     r"""Run a single test against the candidate code.
 
-    Returns (passed, feedback_block). When the test passes, feedback_block is "".
+    Returns (passed, kind, feedback_block) with kind in {"", "error",
+    "timeout", "wrong"}. When the test passes, kind and feedback_block are "".
     On failure, feedback_block is a paper F.3-style formatted block:
       - wrong answer  -> "Test Case N: Wrong Answer\nInput\n...\nOutput\n...\nExpected\n..."
       - runtime error -> "Runtime Error\n<ExcType>: <msg>\nLine N in <fn> (Solution.py)\nLast Executed Input\n..."
@@ -283,7 +303,7 @@ def _run_one_test(
                 cwd=tmp,
             )
         except subprocess.TimeoutExpired:
-            return False, _format_timeout(
+            return False, "timeout", _format_timeout(
                 test_index, test_input, timeout, max_input_lines, max_input_chars
             )
 
@@ -292,10 +312,10 @@ def _run_one_test(
 
     if testtype == "functional" and function_name:
         if "__LCB_PASS__" in stdout:
-            return True, ""
+            return True, "", ""
         if "__LCB_ERROR__" in stdout:
             tb = stdout.split("__LCB_ERROR__", 1)[-1].strip()
-            return False, _format_runtime_error(
+            return False, "error", _format_runtime_error(
                 tb or stderr, test_input, max_input_lines, max_input_chars
             )
         if "__LCB_FAIL__" in stdout:
@@ -305,25 +325,101 @@ def _run_one_test(
             expected_match = re.search(r"EXPECTED:\s*(.+)", details)
             actual_v = actual_match.group(1).strip() if actual_match else "<unknown>"
             expected_v = expected_match.group(1).strip() if expected_match else "<unknown>"
-            return False, _format_wrong_answer(
+            return False, "wrong", _format_wrong_answer(
                 test_index, test_input, actual_v, expected_v,
                 max_input_lines, max_input_chars,
             )
-        return False, _format_runtime_error(
+        return False, "error", _format_runtime_error(
             stderr or stdout, test_input, max_input_lines, max_input_chars
         )
 
     if proc.returncode != 0:
-        return False, _format_runtime_error(
+        return False, "error", _format_runtime_error(
             stderr, test_input, max_input_lines, max_input_chars
         )
 
     if _outputs_match(test_output, stdout):
-        return True, ""
-    return False, _format_wrong_answer(
+        return True, "", ""
+    return False, "wrong", _format_wrong_answer(
         test_index, test_input, stdout, test_output,
         max_input_lines, max_input_chars,
     )
+
+
+def grade_batch(
+    responses: list[str],
+    metadata: list[LiveCodeBenchEnvMetadata],
+    timeout: float,
+    max_feedback_chars: int,
+    max_failed_in_feedback: int,
+    max_input_lines: int = 40,
+    max_input_chars: int = 800,
+    dense_train_rewards: bool = False,
+) -> list[tuple[float, str]]:
+    """Grade a batch of responses; module-level so unit tests can call it directly."""
+    results: list[tuple[float, str]] = []
+    for response, meta in zip(responses, metadata):
+        code = extract_python_code(response)
+        if code is None:
+            # Reference behavior: no fenced block is a format failure —
+            # never execute prose as Python.
+            results.append((0.0, INCORRECT_FORMAT_FEEDBACK))
+            continue
+        tests = meta.get("tests", [])
+        if not tests:
+            results.append((0.0, "no tests available"))
+            continue
+
+        function_name = meta.get("function_name") or None
+        failures: list[tuple[str, str]] = []  # (kind, block)
+        for i, test in enumerate(tests):
+            passed, kind, fb = _run_one_test(
+                code, test, function_name, timeout, test_index=i + 1,
+                max_input_lines=max_input_lines,
+                max_input_chars=max_input_chars,
+            )
+            if not passed:
+                failures.append((kind, fb))
+
+        if not failures:
+            # All tests passed: emit a short human-readable note. Combined-mode
+            # SDPO teacher doesn't read env_feedback for successful rollouts.
+            feedback = f"All {len(tests)} tests passed."
+            reward = 1.0
+        else:
+            # Reference feedback selection: if any runtime error exists,
+            # show exactly ONE error block (errors before timeouts);
+            # otherwise show the shortest wrong-answer blocks first, up to
+            # max_failed_in_feedback. Concise, prioritized feedback is the
+            # teacher's input — long redundant dumps bury the signal.
+            error_block = next((fb for k, fb in failures if k == "error"), None)
+            timeout_block = next((fb for k, fb in failures if k == "timeout"), None)
+            if error_block is not None:
+                blocks = [error_block]
+            elif timeout_block is not None:
+                blocks = [timeout_block]
+            else:
+                blocks = sorted(
+                    (fb for _, fb in failures), key=len
+                )[:max_failed_in_feedback]
+            feedback = "\n\n".join(blocks)
+
+            # Dense train reward (reference compute_score: reward =
+            # fraction of tests passed at train; sparse all-or-nothing on
+            # the held-out split). The SDPO success gate is unaffected:
+            # reward hits success_reward_threshold=1.0 only when all tests
+            # pass in either mode.
+            is_train = meta.get("split", "") == "train"
+            if dense_train_rewards and is_train:
+                reward = (len(tests) - len(failures)) / len(tests)
+            else:
+                reward = 0.0
+
+        if len(feedback) > max_feedback_chars:
+            feedback = feedback[:max_feedback_chars] + "\n...[truncated]"
+
+        results.append((reward, feedback))
+    return results
 
 
 @ray.remote  # pragma: no cover
@@ -339,45 +435,18 @@ class LiveCodeBenchWorker:
         max_failed_in_feedback: int,
         max_input_lines: int = 40,
         max_input_chars: int = 800,
+        dense_train_rewards: bool = False,
     ) -> list[tuple[float, str]]:
-        results: list[tuple[float, str]] = []
-        for response, meta in zip(responses, metadata):
-            code = extract_python_code(response)
-            tests = meta.get("tests", [])
-            if not tests:
-                results.append((0.0, "no tests available"))
-                continue
-
-            function_name = meta.get("function_name") or None
-            failure_blocks: list[str] = []
-            num_failed = 0
-            for i, test in enumerate(tests):
-                passed, fb = _run_one_test(
-                    code, test, function_name, timeout, test_index=i + 1,
-                    max_input_lines=max_input_lines,
-                    max_input_chars=max_input_chars,
-                )
-                if not passed:
-                    num_failed += 1
-                    if len(failure_blocks) < max_failed_in_feedback:
-                        failure_blocks.append(fb)
-
-            if num_failed == 0:
-                # All tests passed: emit a short human-readable note. Combined-mode
-                # SDPO teacher doesn't read env_feedback for successful rollouts.
-                feedback = f"All {len(tests)} tests passed."
-                reward = 1.0
-            else:
-                # Paper F.3 format: concatenate failure blocks with blank-line
-                # separator, no per-batch summary header.
-                feedback = "\n\n".join(failure_blocks)
-                reward = 0.0
-
-            if len(feedback) > max_feedback_chars:
-                feedback = feedback[:max_feedback_chars] + "\n...[truncated]"
-
-            results.append((reward, feedback))
-        return results
+        return grade_batch(
+            responses,
+            metadata,
+            timeout,
+            max_feedback_chars,
+            max_failed_in_feedback,
+            max_input_lines,
+            max_input_chars,
+            dense_train_rewards,
+        )
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -389,7 +458,8 @@ class LiveCodeBenchEnvironment(EnvironmentInterface[LiveCodeBenchEnvMetadata]):
         self.num_workers = cfg["num_workers"]
         self.timeout = cfg.get("timeout_per_test_seconds", 6.0)
         self.max_feedback_chars = cfg.get("max_feedback_chars", 2000)
-        self.max_failed_in_feedback = cfg.get("max_failed_tests_in_feedback", 3)
+        self.max_failed_in_feedback = cfg.get("max_failed_tests_in_feedback", 2)
+        self.dense_train_rewards = cfg.get("dense_train_rewards", False)
         self.max_input_lines = cfg.get("max_input_lines_per_test", 40)
         self.max_input_chars = cfg.get("max_input_chars_per_test", 800)
         self.workers = [
@@ -426,6 +496,7 @@ class LiveCodeBenchEnvironment(EnvironmentInterface[LiveCodeBenchEnvMetadata]):
                 self.max_failed_in_feedback,
                 self.max_input_lines,
                 self.max_input_chars,
+                self.dense_train_rewards,
             )
             for i, (resp_chunk, meta_chunk) in enumerate(
                 zip(chunked_responses, chunked_metadata)

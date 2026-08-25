@@ -283,3 +283,27 @@ def test_hybrid_advantage_prompt_ids_grouping():
     # sample1 baseline=1.0 -> adv -1.0. group1 both baselines=1.0 -> adv 0.0.
     expected_col = torch.tensor([1.0, -1.0, 0.0, 0.0])
     assert torch.allclose(advantages[:, 0], expected_col), advantages[:, 0]
+
+
+def test_hybrid_adv_estimator_accepts_wrapped_dict_config():
+    """Regression for run x00dl9j4: sdpo_train passed a raw dict where
+    GRPOAdvantageEstimator reads attributes; the dict must be wrapped in
+    AdvEstimatorConfig."""
+    from nemo_rl.algorithms.advantage_estimator import (
+        AdvEstimatorConfig,
+        GRPOAdvantageEstimator,
+    )
+
+    adv_cfg = {"name": "grpo", "use_leave_one_out_baseline": True, "normalize_rewards": True}
+    est = GRPOAdvantageEstimator(AdvEstimatorConfig(**adv_cfg), None)
+    assert est.use_leave_one_out_baseline is True
+    assert est.normalize_rewards is True
+
+    import torch
+
+    prompt_ids = torch.tensor([[0], [0], [1], [1]])
+    rewards = torch.tensor([1.0, 0.0, 1.0, 1.0])
+    mask = torch.ones(4, 3)
+    adv = est.compute_advantage(prompt_ids=prompt_ids, rewards=rewards, mask=mask)
+    assert adv.shape == (4, 3)
+    assert torch.isfinite(adv).all()
