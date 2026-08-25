@@ -332,27 +332,28 @@ async def _run_env_eval_impl(
         prompts = []
         prompts_for_display = []
         for i, message_log in enumerate(batch["message_log"]):
-            content = [message["content"] for message in message_log]
-            fallback_content = "\n".join(content)
             vllm_content = (
                 vllm_content_rows[i] if vllm_content_rows is not None else None
             )
             multi_modal_data = (
                 multi_modal_rows[i] if multi_modal_rows is not None else None
             )
-            if vllm_content is not None or multi_modal_data:
-                prompt = vllm_content if vllm_content is not None else fallback_content
-                prompt_dict = {"prompt": prompt}
+            if vllm_content is not None:
+                prompt_dict = {"prompt": vllm_content}
                 if multi_modal_data:
                     prompt_dict["multi_modal_data"] = multi_modal_data
                 prompts.append(prompt_dict)
-                prompts_for_display.append(prompt)
+                prompts_for_display.append(vllm_content)
             else:
                 # Text-only fallback: use raw prompt strings (vLLM will tokenize them).
                 # Note: utils.py's format_prompt_for_vllm_generation uses pre-tokenized
                 # prompt_token_ids instead, since the training pipeline already has
                 # input_ids tensors. Both are valid vLLM inputs but may tokenize
-                # slightly differently.
+                # slightly differently. Only text-only rows have joinable
+                # string content; VLM rows carry a list of typed content parts.
+                fallback_content = "\n".join(
+                    message["content"] for message in message_log
+                )
                 prompts.append(fallback_content)
                 prompts_for_display.append(fallback_content)
 
