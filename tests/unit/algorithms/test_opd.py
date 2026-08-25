@@ -863,7 +863,7 @@ def _teacher_setup_config():
 
 
 def test_reserve_teacher_clusters_claims_each_topology_segment(monkeypatch):
-    """Every teacher placement group is claimed before planning the next one."""
+    """An explicit teacher segment is claimed before planning the next one."""
     from nemo_rl.algorithms import opd
 
     events = []
@@ -893,9 +893,12 @@ def test_reserve_teacher_clusters_claims_each_topology_segment(monkeypatch):
     monkeypatch.setattr(opd, "prepare_segment_topology", fake_prepare_segment_topology)
 
     topology = {f"node_{index}": ("nvlink_domain_0", index) for index in range(4)}
+    config = _teacher_setup_config()
+    config["on_policy_distillation"]["non_colocated_teachers"][
+        "default_teacher_cfg"
+    ]["segment_size"] = 2
     clusters = opd.reserve_teacher_clusters(
-        _teacher_setup_config(),
-        segment_size=16,
+        config,
         teacher_segment_topology=topology,
     )
 
@@ -920,7 +923,7 @@ def test_reserve_teacher_clusters_claims_each_topology_segment(monkeypatch):
 
 
 def test_reserve_teacher_clusters_claims_without_topology_constraints(monkeypatch):
-    """Teachers are claimed before Gym even when segment topology is disabled."""
+    """Available topology does not implicitly constrain teacher placement."""
     from nemo_rl.algorithms import opd
 
     events = []
@@ -944,7 +947,10 @@ def test_reserve_teacher_clusters_claims_without_topology_constraints(monkeypatc
     monkeypatch.setattr(opd, "RayVirtualCluster", FakeRayVirtualCluster)
     monkeypatch.setattr(opd, "prepare_segment_topology", fail_if_topology_is_prepared)
 
-    clusters = opd.reserve_teacher_clusters(_teacher_setup_config())
+    topology = {f"node_{index}": ("nvlink_domain_0", index) for index in range(4)}
+    clusters = opd.reserve_teacher_clusters(
+        _teacher_setup_config(), teacher_segment_topology=topology
+    )
 
     assert events == [
         ("create", "teacher_math"),
