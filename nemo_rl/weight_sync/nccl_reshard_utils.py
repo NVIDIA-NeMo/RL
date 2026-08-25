@@ -335,11 +335,12 @@ def build_mesh_info(
     rank_offset: int,
     tp_size: int = 1,
     ep_size: int = 1,
+    cp_size: int = 1,
     pp_size: int = 1,
-) -> tuple:
+) -> tuple[MeshInfo, dict[str, int]]:
     """Build a ``MeshInfo`` and *dim_map* from a parallelism config.
 
-    Dims are emitted in the order ``(tp, ep, dp, pp)``, size-1 dims are
+    Dims are emitted in the order ``(tp, cp, ep, dp, pp)``, size-1 dims are
     dropped, and the survivors are reversed into the row-major rank tensor
     (outer->inner).  So the *first* surviving dim in that order becomes the
     **innermost** (rightmost, fastest-varying) axis — consecutive global ranks
@@ -359,17 +360,34 @@ def build_mesh_info(
     EP — innermost; that case does not arise today.)
 
     Returns:
-        ``(MeshInfo, dim_map)`` where *dim_map* maps ``"tp"``/``"ep"``/``"dp"``/``"pp"``
-        to the corresponding mesh-tensor axis index.
+        ``(MeshInfo, dim_map)`` where *dim_map* maps parallelism dimensions to
+        their corresponding mesh-tensor axis indices.
     """
-    dp_size = num_gpus // (tp_size * ep_size * pp_size)
-    assert dp_size * tp_size * ep_size * pp_size == num_gpus, (
-        f"Cannot divide {num_gpus} GPUs into TP={tp_size} EP={ep_size} PP={pp_size} DP={dp_size}"
-    )
+    sizes = (tp_size, ep_size, cp_size, pp_size)
+    if num_gpus <= 0 or any(size <= 0 for size in sizes):
+        raise ValueError(
+            f"Cannot divide {num_gpus} GPUs into TP={tp_size} EP={ep_size} "
+            f"CP={cp_size} PP={pp_size}; all sizes must be positive."
+        )
+    parallel_size = tp_size * ep_size * cp_size * pp_size
+    if num_gpus % parallel_size != 0:
+        raise ValueError(
+            f"Cannot divide {num_gpus} GPUs into TP={tp_size} EP={ep_size} "
+            f"CP={cp_size} PP={pp_size}."
+        )
+    dp_size = num_gpus // parallel_size
 
-    dim_sizes = {"tp": tp_size, "ep": ep_size, "dp": dp_size, "pp": pp_size}
+    dim_sizes = {
+        "tp": tp_size,
+        "cp": cp_size,
+        "ep": ep_size,
+        "dp": dp_size,
+        "pp": pp_size,
+    }
     active_dims = [
-        (n, dim_sizes[n]) for n in ("tp", "ep", "dp", "pp") if dim_sizes[n] > 1
+        (name, dim_sizes[name])
+        for name in ("tp", "cp", "ep", "dp", "pp")
+        if dim_sizes[name] > 1
     ]
 
     if not active_dims:
@@ -736,6 +754,7 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
     if generation.get("backend") == "vllm":
         gen_tp = vllm_cfg.get("tensor_parallel_size", 1)
         gen_ep = vllm_cfg.get("expert_parallel_size", 1)
+        gen_cp = vllm_cfg.get("context_parallel_size", 1)
         gen_pp = vllm_cfg.get("pipeline_parallel_size", 1)
         if gen_ep != 1 and gen_ep != gen_tp:
             violations.append(
@@ -745,6 +764,11 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
         if gen_pp != 1:
             violations.append(
                 f"policy.generation.vllm_cfg.pipeline_parallel_size must be 1 (got {gen_pp})."
+            )
+        if gen_cp != 1:
+            violations.append(
+                "policy.generation.vllm_cfg.context_parallel_size must be 1 "
+                f"(got {gen_cp})."
             )
 
     if violations:
@@ -767,7 +791,8 @@ def build_nccl_reshard_refit_info(
     Args:
         state_dict_metadata: ``{hf_param_name: {"shape": list, "dtype": str}}``
             The input ``state_dict_metadata`` has a global view of the parameters
-        train_parallelism / gen_parallelism: ``{"tp_size", "ep_size", "pp_size"}``
+        train_parallelism / gen_parallelism:
+            ``{"tp_size", "ep_size", "cp_size", "pp_size"}``
         train_world_size / gen_world_size: number of GPUs per side
         layer_to_pp_stage: optional mapping from layer name to PP stage index.
             When provided (PP>1), per-stage meshes are built so each PP stage's
@@ -790,6 +815,12 @@ def build_nccl_reshard_refit_info(
     pp_size = train_parallelism.get("pp_size", 1)
     tp_size = train_parallelism.get("tp_size", 1)
     ep_size = train_parallelism.get("ep_size", 1)
+    cp_size = train_parallelism.get("cp_size", 1)
+    if train_world_size <= 0 or pp_size <= 0 or train_world_size % pp_size != 0:
+        raise ValueError(
+            f"Cannot divide train_world_size={train_world_size} into TP={tp_size} "
+            f"EP={ep_size} CP={cp_size} PP={pp_size}."
+        )
     use_per_stage = pp_size > 1
     if use_per_stage:
         assert layer_to_pp_stage is not None, (
@@ -805,6 +836,7 @@ def build_nccl_reshard_refit_info(
             rank_offset=rank_offset,
             tp_size=tp_size,
             ep_size=1,
+            cp_size=cp_size,
             pp_size=stage_pp,
         )
         expert_mesh, expert_dim_map = build_mesh_info(
@@ -812,6 +844,7 @@ def build_nccl_reshard_refit_info(
             rank_offset=rank_offset,
             tp_size=1,
             ep_size=ep_size,
+            cp_size=cp_size,
             pp_size=stage_pp,
         )
         return (non_expert_mesh, non_expert_dim_map), (expert_mesh, expert_dim_map)
@@ -834,6 +867,7 @@ def build_nccl_reshard_refit_info(
             rank_offset=rank_offset,
             tp_size=gen_tp,
             ep_size=1,
+            cp_size=1,
             pp_size=gen_pp,
         )
         if gen_ep > 1:
@@ -842,6 +876,7 @@ def build_nccl_reshard_refit_info(
                 rank_offset=rank_offset,
                 tp_size=1,
                 ep_size=gen_ep,
+                cp_size=1,
                 pp_size=gen_pp,
             )
         else:
@@ -941,5 +976,7 @@ def build_nccl_reshard_refit_info(
         "train_world_size": train_world_size,
         "gen_world_size": gen_world_size,
         "pp_size": pp_size,
+        "train_cp_size": cp_size,
+        "gen_cp_size": gen_parallelism.get("cp_size", 1),
         "gen_tp_size": gen_parallelism.get("tp_size", 1),
     }

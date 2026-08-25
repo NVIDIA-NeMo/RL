@@ -18,7 +18,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import torch
 import torch.distributed as dist
@@ -357,6 +357,695 @@ def _all_gather_tp_shards(local_weight: Tensor) -> list[Tensor]:
     gathered = [torch.empty_like(local_weight) for _ in range(tp_world_size)]
     dist.all_gather(gathered, local_weight.contiguous(), group=tp_group)
     return gathered
+
+
+@dataclass(frozen=True, slots=True)
+class DraftRefitTensorSpec:
+    name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    device_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class DraftRefitLane:
+    cp_rank: int
+    pp_ranks: tuple[int, ...]
+    owner_global_rank: int
+    manifest: tuple[DraftRefitTensorSpec, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _DraftRefitOwnerExport:
+    status: int
+    detail: str
+    manifest: tuple[DraftRefitTensorSpec, ...]
+    tensors: tuple[tuple[str, Tensor], ...]
+
+
+DraftRefitExporter = Callable[[], Iterable[tuple[str, Tensor]]]
+
+_DRAFT_REFIT_MAGIC = 0x44524654
+_DRAFT_REFIT_VERSION = 1
+_DRAFT_REFIT_MAX_TENSORS = 100_000
+_DRAFT_REFIT_MAX_NDIM = 16
+_DRAFT_REFIT_MAX_UTF8_BYTES = 1 << 20
+_DRAFT_REFIT_STATUS_OK = 0
+_DRAFT_REFIT_STATUS_EXPORTER_ERROR = 1
+_DRAFT_REFIT_STATUS_MANIFEST_INVALID = 2
+_DRAFT_REFIT_STATUS_WIRE_INVALID = 3
+_DRAFT_REFIT_DTYPE_TO_CODE = {
+    torch.bool: 0,
+    torch.uint8: 1,
+    torch.int8: 2,
+    torch.int16: 3,
+    torch.int32: 4,
+    torch.int64: 5,
+    torch.float16: 6,
+    torch.bfloat16: 7,
+    torch.float32: 8,
+    torch.float64: 9,
+    torch.complex64: 10,
+    torch.complex128: 11,
+}
+_DRAFT_REFIT_CODE_TO_DTYPE = {
+    code: dtype for dtype, code in _DRAFT_REFIT_DTYPE_TO_CODE.items()
+}
+_DRAFT_REFIT_DEVICE_TO_CODE = {"cpu": 0, "cuda": 1, "meta": 2}
+_DRAFT_REFIT_CODE_TO_DEVICE = {
+    code: device for device, code in _DRAFT_REFIT_DEVICE_TO_CODE.items()
+}
+
+
+def _draft_refit_error(
+    code: str,
+    detail: str,
+    *,
+    cp_rank: int,
+    pp_ranks: tuple[int, ...],
+) -> ValueError:
+    return ValueError(
+        f"[draft refit {code}] {detail}; cp_rank={cp_rank}, pp_ranks={pp_ranks}"
+    )
+
+
+def _bounded_utf8(value: str) -> bytes:
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= _DRAFT_REFIT_MAX_UTF8_BYTES:
+        return encoded
+    return (
+        encoded[:_DRAFT_REFIT_MAX_UTF8_BYTES]
+        .decode("utf-8", errors="ignore")
+        .encode("utf-8")
+    )
+
+
+def _materialize_draft_refit_export(
+    exporter: DraftRefitExporter,
+) -> _DraftRefitOwnerExport:
+    try:
+        materialized = list(exporter())
+    except Exception as error:
+        return _DraftRefitOwnerExport(
+            status=_DRAFT_REFIT_STATUS_EXPORTER_ERROR,
+            detail=f"exporter raised {type(error).__name__}: {error}",
+            manifest=(),
+            tensors=(),
+        )
+
+    if not materialized:
+        return _DraftRefitOwnerExport(
+            status=_DRAFT_REFIT_STATUS_MANIFEST_INVALID,
+            detail="exporter returned no tensors",
+            manifest=(),
+            tensors=(),
+        )
+    if len(materialized) > _DRAFT_REFIT_MAX_TENSORS:
+        return _DraftRefitOwnerExport(
+            status=_DRAFT_REFIT_STATUS_MANIFEST_INVALID,
+            detail=f"exporter returned more than {_DRAFT_REFIT_MAX_TENSORS} tensors",
+            manifest=(),
+            tensors=(),
+        )
+
+    names: set[str] = set()
+    manifest: list[DraftRefitTensorSpec] = []
+    validated_tensors: list[tuple[str, Tensor]] = []
+    total_name_bytes = 0
+    device_type: str | None = None
+    for index, item in enumerate(materialized):
+        if not isinstance(item, tuple) or len(item) != 2:
+            detail = f"export item {index} is not a (name, tensor) pair"
+            break
+        name, tensor = item
+        if not isinstance(name, str) or not name:
+            detail = f"export item {index} has an empty or non-string name"
+            break
+        if name in names:
+            detail = f"exporter returned duplicate tensor name: {name}"
+            break
+        if not isinstance(tensor, Tensor):
+            detail = f"exporter returned a non-tensor value for {name}"
+            break
+        if tensor.layout != torch.strided:
+            detail = f"exporter returned a non-strided tensor for {name}"
+            break
+        if tensor.dtype not in _DRAFT_REFIT_DTYPE_TO_CODE:
+            detail = f"exporter returned unsupported dtype {tensor.dtype} for {name}"
+            break
+        if tensor.device.type not in _DRAFT_REFIT_DEVICE_TO_CODE:
+            detail = (
+                f"exporter returned unsupported device {tensor.device.type} for {name}"
+            )
+            break
+        if tensor.ndim > _DRAFT_REFIT_MAX_NDIM:
+            detail = f"exporter returned rank-{tensor.ndim} tensor for {name}"
+            break
+        if device_type is not None and tensor.device.type != device_type:
+            detail = "exporter returned tensors on multiple device types"
+            break
+
+        try:
+            encoded_name = name.encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            detail = f"exporter returned a non-UTF-8 tensor name: {name!r}"
+            break
+        total_name_bytes += len(encoded_name)
+        if total_name_bytes > _DRAFT_REFIT_MAX_UTF8_BYTES:
+            detail = "exporter tensor names exceed the UTF-8 metadata limit"
+            break
+
+        device_type = tensor.device.type
+        names.add(name)
+        manifest.append(
+            DraftRefitTensorSpec(
+                name=name,
+                shape=tuple(tensor.shape),
+                dtype=tensor.dtype,
+                device_type=tensor.device.type,
+            )
+        )
+        validated_tensors.append((name, tensor))
+    else:
+        return _DraftRefitOwnerExport(
+            status=_DRAFT_REFIT_STATUS_OK,
+            detail="",
+            manifest=tuple(manifest),
+            tensors=tuple(validated_tensors),
+        )
+
+    return _DraftRefitOwnerExport(
+        status=_DRAFT_REFIT_STATUS_MANIFEST_INVALID,
+        detail=detail,
+        manifest=(),
+        tensors=(),
+    )
+
+
+def _collective_device(pp_group: dist.ProcessGroup) -> torch.device:
+    backend = str(dist.get_backend(pp_group)).lower()
+    if "nccl" in backend:
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def _wire_manifest(
+    manifest: tuple[DraftRefitTensorSpec, ...],
+) -> tuple[list[int], bytes]:
+    metadata: list[int] = []
+    encoded_names: list[bytes] = []
+    for spec in manifest:
+        encoded_name = spec.name.encode("utf-8")
+        encoded_names.append(encoded_name)
+        metadata.extend(
+            [
+                _DRAFT_REFIT_DTYPE_TO_CODE[spec.dtype],
+                _DRAFT_REFIT_DEVICE_TO_CODE[spec.device_type],
+                len(spec.shape),
+                len(encoded_name),
+                *spec.shape,
+            ]
+        )
+    return metadata, b"".join(encoded_names)
+
+
+def _wire_digest(metadata: list[int], utf8_bytes: bytes) -> int:
+    digest = 1_469_598_103_934_665_603
+    mask = (1 << 63) - 1
+    for value in metadata:
+        digest = ((digest ^ (int(value) & mask)) * 1_099_511_628_211) & mask
+    for value in utf8_bytes:
+        digest = ((digest ^ (int(value) & mask)) * 1_099_511_628_211) & mask
+    return digest
+
+
+def _decode_wire_manifest(
+    *,
+    tensor_count: int,
+    metadata: list[int],
+    utf8_bytes: bytes,
+) -> tuple[int, str, tuple[DraftRefitTensorSpec, ...]]:
+    manifest: list[DraftRefitTensorSpec] = []
+    names: set[str] = set()
+    metadata_offset = 0
+    name_offset = 0
+    try:
+        for _ in range(tensor_count):
+            if metadata_offset + 4 > len(metadata):
+                raise ValueError("truncated tensor metadata")
+            dtype_code, device_code, ndim, name_length = metadata[
+                metadata_offset : metadata_offset + 4
+            ]
+            metadata_offset += 4
+            if dtype_code not in _DRAFT_REFIT_CODE_TO_DTYPE:
+                raise ValueError(f"unsupported dtype code {dtype_code}")
+            if device_code not in _DRAFT_REFIT_CODE_TO_DEVICE:
+                raise ValueError(f"unsupported device code {device_code}")
+            if not 0 <= ndim <= _DRAFT_REFIT_MAX_NDIM:
+                raise ValueError(f"invalid tensor rank {ndim}")
+            if name_length <= 0 or name_offset + name_length > len(utf8_bytes):
+                raise ValueError("invalid UTF-8 tensor-name bounds")
+            if metadata_offset + ndim > len(metadata):
+                raise ValueError("truncated tensor shape")
+            shape = tuple(metadata[metadata_offset : metadata_offset + ndim])
+            metadata_offset += ndim
+            if any(dimension < 0 for dimension in shape):
+                raise ValueError("negative tensor dimension")
+
+            name = utf8_bytes[name_offset : name_offset + name_length].decode(
+                "utf-8", errors="strict"
+            )
+            name_offset += name_length
+            if not name or name in names:
+                raise ValueError("empty or duplicate tensor name")
+            names.add(name)
+            manifest.append(
+                DraftRefitTensorSpec(
+                    name=name,
+                    shape=shape,
+                    dtype=_DRAFT_REFIT_CODE_TO_DTYPE[dtype_code],
+                    device_type=_DRAFT_REFIT_CODE_TO_DEVICE[device_code],
+                )
+            )
+        if metadata_offset != len(metadata) or name_offset != len(utf8_bytes):
+            raise ValueError("trailing draft refit metadata")
+    except (UnicodeDecodeError, ValueError) as error:
+        return _DRAFT_REFIT_STATUS_WIRE_INVALID, str(error), ()
+    return _DRAFT_REFIT_STATUS_OK, "", tuple(manifest)
+
+
+def _reduce_lane_consensus(
+    values: list[int],
+    *,
+    pp_group: dist.ProcessGroup,
+    device: torch.device,
+) -> tuple[list[int], list[int]]:
+    local = torch.tensor(values, dtype=torch.int64, device=device)
+    minimum = local.clone()
+    maximum = local.clone()
+    dist.all_reduce(minimum, op=dist.ReduceOp.MIN, group=pp_group)
+    dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=pp_group)
+    return minimum.cpu().tolist(), maximum.cpu().tolist()
+
+
+def _raise_export_status(
+    status: int,
+    detail: str,
+    *,
+    cp_rank: int,
+    pp_ranks: tuple[int, ...],
+) -> None:
+    code = {
+        _DRAFT_REFIT_STATUS_EXPORTER_ERROR: "EXPORTER_ERROR",
+        _DRAFT_REFIT_STATUS_MANIFEST_INVALID: "MANIFEST_INVALID",
+        _DRAFT_REFIT_STATUS_WIRE_INVALID: "WIRE_INVALID",
+    }.get(status, "PROTOCOL_ERROR")
+    raise _draft_refit_error(
+        code,
+        detail,
+        cp_rank=cp_rank,
+        pp_ranks=pp_ranks,
+    )
+
+
+def _local_draft_refit_result(
+    *,
+    local_exporter: DraftRefitExporter | None,
+    metadata_only: bool,
+    cp_rank: int,
+    pp_ranks: tuple[int, ...],
+) -> list[tuple[str, Tensor]]:
+    if local_exporter is None:
+        raise _draft_refit_error(
+            "OWNER_COUNT",
+            "draft refit export must exist on exactly one PP rank; found 0",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+    owner_export = _materialize_draft_refit_export(local_exporter)
+    if owner_export.status != _DRAFT_REFIT_STATUS_OK:
+        _raise_export_status(
+            owner_export.status,
+            owner_export.detail,
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+    if metadata_only:
+        return [
+            (spec.name, torch.empty(spec.shape, dtype=spec.dtype, device="meta"))
+            for spec in owner_export.manifest
+        ]
+    if any(spec.device_type == "meta" for spec in owner_export.manifest):
+        raise _draft_refit_error(
+            "MANIFEST_INVALID",
+            "real draft refit export cannot contain meta tensors",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+    return list(owner_export.tensors)
+
+
+def _validate_lane_request(
+    *,
+    metadata_only: bool,
+    expected_pp_size: int,
+    cp_rank: int,
+    pp_ranks: tuple[int, ...],
+    pp_group: dist.ProcessGroup,
+    device: torch.device,
+) -> None:
+    if expected_pp_size <= 0:
+        status = 1
+    elif cp_rank < 0:
+        status = 2
+    elif len(pp_ranks) != expected_pp_size:
+        status = 3
+    else:
+        status = 0
+    request_minimum, request_maximum = _reduce_lane_consensus(
+        [status, int(metadata_only), expected_pp_size, cp_rank],
+        pp_group=pp_group,
+        device=device,
+    )
+    if request_minimum != request_maximum:
+        raise _draft_refit_error(
+            "LANE_CONFIG_MISMATCH",
+            f"PP lane requests differ: min={request_minimum}, max={request_maximum}",
+            cp_rank=request_minimum[3],
+            pp_ranks=pp_ranks,
+        )
+    if status == 1:
+        raise _draft_refit_error(
+            "INVALID_ARGUMENT",
+            "expected_pp_size must be positive",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+    if status == 2:
+        raise _draft_refit_error(
+            "INVALID_ARGUMENT",
+            "cp_rank must be non-negative",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+    if status == 3:
+        raise _draft_refit_error(
+            "TOPOLOGY_MISMATCH",
+            f"expected PP group size {expected_pp_size}, found {len(pp_ranks)}",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+
+
+def broadcast_draft_weights_from_pp_owner(
+    *,
+    local_exporter: DraftRefitExporter | None,
+    metadata_only: bool,
+    pp_group: dist.ProcessGroup | None = None,
+    expected_pp_size: int = 1,
+    cp_rank: int = 0,
+) -> list[tuple[str, Tensor]]:
+    """Broadcast one CP lane's ordered draft export in dtype-sized payloads."""
+    distributed = dist.is_available() and dist.is_initialized()
+    if pp_group is None or not distributed:
+        pp_ranks = (dist.get_rank(),) if distributed else (0,)
+        if expected_pp_size <= 0:
+            raise ValueError("expected_pp_size must be positive")
+        if cp_rank < 0:
+            raise ValueError("cp_rank must be non-negative")
+        if expected_pp_size != 1:
+            raise _draft_refit_error(
+                "TOPOLOGY_MISMATCH",
+                f"expected PP group size {expected_pp_size}, found 1",
+                cp_rank=cp_rank,
+                pp_ranks=pp_ranks,
+            )
+        return _local_draft_refit_result(
+            local_exporter=local_exporter,
+            metadata_only=metadata_only,
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+
+    pp_ranks = tuple(dist.get_process_group_ranks(pp_group))
+    device = _collective_device(pp_group)
+    _validate_lane_request(
+        metadata_only=metadata_only,
+        expected_pp_size=expected_pp_size,
+        cp_rank=cp_rank,
+        pp_ranks=pp_ranks,
+        pp_group=pp_group,
+        device=device,
+    )
+    if len(pp_ranks) == 1:
+        return _local_draft_refit_result(
+            local_exporter=local_exporter,
+            metadata_only=metadata_only,
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+
+    global_rank = dist.get_rank()
+    owner_state = torch.tensor(
+        [
+            int(local_exporter is not None),
+            global_rank if local_exporter is not None else 0,
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(owner_state, op=dist.ReduceOp.SUM, group=pp_group)
+    owner_count, owner_global_rank = owner_state.cpu().tolist()
+    if owner_count != 1:
+        raise _draft_refit_error(
+            "OWNER_COUNT",
+            f"draft refit export must exist on exactly one PP rank; found {owner_count}",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+
+    owner_export = (
+        _materialize_draft_refit_export(local_exporter)
+        if global_rank == owner_global_rank and local_exporter is not None
+        else None
+    )
+    if global_rank == owner_global_rank:
+        assert owner_export is not None
+        if owner_export.status == _DRAFT_REFIT_STATUS_OK:
+            metadata, utf8_bytes = _wire_manifest(owner_export.manifest)
+        else:
+            metadata = []
+            utf8_bytes = _bounded_utf8(owner_export.detail)
+        header_values = [
+            _DRAFT_REFIT_MAGIC,
+            _DRAFT_REFIT_VERSION,
+            owner_export.status,
+            owner_global_rank,
+            len(owner_export.manifest),
+            len(metadata),
+            len(utf8_bytes),
+            0,
+        ]
+    else:
+        metadata = []
+        utf8_bytes = b""
+        header_values = [0] * 8
+
+    header = torch.tensor(header_values, dtype=torch.int64, device=device)
+    dist.broadcast(header, src=owner_global_rank, group=pp_group)
+    received_header = header.cpu().tolist()
+    header_valid = (
+        len(received_header) == 8
+        and received_header[0] == _DRAFT_REFIT_MAGIC
+        and received_header[1] == _DRAFT_REFIT_VERSION
+        and received_header[2]
+        in {
+            _DRAFT_REFIT_STATUS_OK,
+            _DRAFT_REFIT_STATUS_EXPORTER_ERROR,
+            _DRAFT_REFIT_STATUS_MANIFEST_INVALID,
+        }
+        and received_header[3] == owner_global_rank
+        and 0 <= received_header[4] <= _DRAFT_REFIT_MAX_TENSORS
+        and 0
+        <= received_header[5]
+        <= _DRAFT_REFIT_MAX_TENSORS * (4 + _DRAFT_REFIT_MAX_NDIM)
+        and 0 <= received_header[6] <= _DRAFT_REFIT_MAX_UTF8_BYTES
+        and received_header[7] == 0
+    )
+    if not header_valid:
+        raise _draft_refit_error(
+            "PROTOCOL_ERROR",
+            "invalid draft refit header",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+
+    status = received_header[2]
+    tensor_count = received_header[4]
+    metadata_words = received_header[5]
+    utf8_length = received_header[6]
+    if status == _DRAFT_REFIT_STATUS_OK:
+        if tensor_count == 0 or utf8_length == 0:
+            raise _draft_refit_error(
+                "PROTOCOL_ERROR",
+                "valid draft refit export must contain named tensors",
+                cp_rank=cp_rank,
+                pp_ranks=pp_ranks,
+            )
+        minimum_metadata_words = tensor_count * 4
+        maximum_metadata_words = tensor_count * (4 + _DRAFT_REFIT_MAX_NDIM)
+        if not minimum_metadata_words <= metadata_words <= maximum_metadata_words:
+            raise _draft_refit_error(
+                "PROTOCOL_ERROR",
+                "draft refit metadata length is outside protocol bounds",
+                cp_rank=cp_rank,
+                pp_ranks=pp_ranks,
+            )
+    elif metadata_words != 0 or tensor_count != 0:
+        raise _draft_refit_error(
+            "PROTOCOL_ERROR",
+            "invalid draft refit export carried tensor metadata",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+
+    if metadata_words:
+        metadata_tensor = (
+            torch.tensor(metadata, dtype=torch.int64, device=device)
+            if global_rank == owner_global_rank
+            else torch.empty(metadata_words, dtype=torch.int64, device=device)
+        )
+        dist.broadcast(metadata_tensor, src=owner_global_rank, group=pp_group)
+        metadata = metadata_tensor.cpu().tolist()
+    if utf8_length:
+        utf8_tensor = (
+            torch.tensor(list(utf8_bytes), dtype=torch.uint8, device=device)
+            if global_rank == owner_global_rank
+            else torch.empty(utf8_length, dtype=torch.uint8, device=device)
+        )
+        dist.broadcast(utf8_tensor, src=owner_global_rank, group=pp_group)
+        utf8_bytes = bytes(utf8_tensor.cpu().tolist())
+
+    if status != _DRAFT_REFIT_STATUS_OK:
+        _raise_export_status(
+            status,
+            utf8_bytes.decode("utf-8", errors="replace"),
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+
+    decoded_status, decoded_detail, manifest = _decode_wire_manifest(
+        tensor_count=tensor_count,
+        metadata=metadata,
+        utf8_bytes=utf8_bytes,
+    )
+    digest = _wire_digest(metadata, utf8_bytes)
+    manifest_minimum, manifest_maximum = _reduce_lane_consensus(
+        [decoded_status, len(manifest), digest],
+        pp_group=pp_group,
+        device=device,
+    )
+    if manifest_minimum != manifest_maximum:
+        raise _draft_refit_error(
+            "MANIFEST_MISMATCH",
+            "draft refit manifest did not match across the PP lane",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+    if decoded_status != _DRAFT_REFIT_STATUS_OK:
+        _raise_export_status(
+            decoded_status,
+            decoded_detail,
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+
+    lane = DraftRefitLane(
+        cp_rank=cp_rank,
+        pp_ranks=pp_ranks,
+        owner_global_rank=owner_global_rank,
+        manifest=manifest,
+    )
+    if metadata_only:
+        return [
+            (spec.name, torch.empty(spec.shape, dtype=spec.dtype, device="meta"))
+            for spec in lane.manifest
+        ]
+    if any(spec.device_type == "meta" for spec in lane.manifest):
+        raise _draft_refit_error(
+            "MANIFEST_INVALID",
+            "real draft refit export cannot contain meta tensors",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+    expected_device_type = "cuda" if device.type == "cuda" else "cpu"
+    if any(spec.device_type != expected_device_type for spec in lane.manifest):
+        raise _draft_refit_error(
+            "MANIFEST_INVALID",
+            f"payload device must be {expected_device_type} for the PP backend",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+
+    tensors_by_name = dict(owner_export.tensors) if owner_export is not None else {}
+    specs_by_dtype: dict[torch.dtype, list[DraftRefitTensorSpec]] = {}
+    for spec in lane.manifest:
+        specs_by_dtype.setdefault(spec.dtype, []).append(spec)
+
+    buckets: list[tuple[list[DraftRefitTensorSpec], Tensor]] = []
+    payload_ready = 0
+    try:
+        for dtype_specs in specs_by_dtype.values():
+            if global_rank == lane.owner_global_rank:
+                bucket = torch.cat(
+                    [
+                        tensors_by_name[spec.name].contiguous().view(-1)
+                        for spec in dtype_specs
+                    ]
+                )
+            else:
+                bucket_device = (
+                    torch.device("cuda", torch.cuda.current_device())
+                    if dtype_specs[0].device_type == "cuda"
+                    else torch.device(dtype_specs[0].device_type)
+                )
+                bucket = torch.empty(
+                    sum(torch.Size(spec.shape).numel() for spec in dtype_specs),
+                    dtype=dtype_specs[0].dtype,
+                    device=bucket_device,
+                )
+            buckets.append((dtype_specs, bucket))
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        payload_ready = 1
+
+    readiness_minimum, readiness_maximum = _reduce_lane_consensus(
+        [payload_ready, len(buckets), digest],
+        pp_group=pp_group,
+        device=device,
+    )
+    if readiness_minimum[1:] != readiness_maximum[1:] or readiness_maximum[0]:
+        raise _draft_refit_error(
+            "PAYLOAD_INVALID",
+            "draft refit payload could not be materialized on every PP rank",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+
+    received_by_name: dict[str, Tensor] = {}
+    for dtype_specs, bucket in buckets:
+        dist.broadcast(bucket, src=lane.owner_global_rank, group=pp_group)
+        offset = 0
+        for spec in dtype_specs:
+            numel = 1
+            for dimension in spec.shape:
+                numel *= dimension
+            received_by_name[spec.name] = bucket.narrow(0, offset, numel).view(
+                spec.shape
+            )
+            offset += numel
+    if lane.manifest[0].device_type == "cuda":
+        torch.cuda.current_stream().synchronize()
+    return [(spec.name, received_by_name[spec.name]) for spec in lane.manifest]
 
 
 def _gather_tp_qkv_weight(

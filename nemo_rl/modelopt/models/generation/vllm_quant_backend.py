@@ -482,7 +482,14 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         model = self.model_runner.model
         reload_roots = self._get_modelopt_reload_roots()
 
-        def finalize() -> None:
+        def finalize(finalize_draft: bool) -> None:
+            # Match the base lifecycle's finalize(finalize_draft) signature.
+            # Real-quant refits do not support co-trained draft finalization;
+            # fail loudly rather than silently skipping it.
+            if finalize_draft:
+                raise RuntimeError(
+                    "ModelOpt real-quant refit does not support draft finalization"
+                )
             try:
                 with torch.device(self.device):
                     _require_complete_modelopt_layerwise_reload(model)
@@ -615,12 +622,19 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             for buf in attached:
                 del buf.weight_loader
 
-    def _load_weights(self, weights):
+    def _load_weights(self, weights, *, coverage=None):
         """Load pre-folded weights and activation-quantizer amax buffers.
 
         Weights arrive already folded from the Megatron side (weight_quantizer
         applied during export), so no fold_weight step is needed here.
+
+        ``coverage`` follows the base signature; the full delivered name set is
+        recorded here (real-quant deliberately filters some scale entries out
+        of the actual load, but they are still handled).
         """
+        if coverage is not None:
+            weights = list(weights)
+            coverage.record_loaded(tuple(name for name, _ in weights))
         if self._is_real_quant_model():
             weights = list(weights)
             source_storage_ptrs = {
