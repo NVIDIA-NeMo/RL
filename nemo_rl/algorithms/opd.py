@@ -60,8 +60,8 @@ class NonColocatedTeachersConfig(BaseModel, extra="allow"):
     enabled: bool = False
     # Deliberately UNTYPED blocks: both are partial by nature, and validating
     # them as TeacherResourceConfig here would fill schema defaults for every
-    # omitted field (e.g. gpus_per_node=8 on a 4-GPU/node cluster), clobbering
-    # the cluster-derived seed and the defaults<-override merge. Validation
+    # omitted field (e.g. gpus_per_node=8 on a 4-GPU/node cluster), which then
+    # clobber default_teacher_cfg in the defaults<-override merge. Validation
     # happens after the merge in create_teacher_configs_from_opd_config.
     default_teacher_cfg: dict[str, Any] = Field(default_factory=dict)
     teacher_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
