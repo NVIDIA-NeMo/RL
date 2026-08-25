@@ -28,7 +28,7 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
-from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
@@ -69,11 +69,12 @@ def _simple_tq_cfg() -> dict:
         "enabled": True,
         "impl": "transfer_queue",
         "backend": "simple",
-        "storage_capacity": 1024,
-        "num_storage_units": 1,
         "claim_meta_poll_interval_s": 0.5,
-        "global_segment_size": 8589934592,  # 8 GiB
-        "local_buffer_size": 1073741824,  # 1 GiB
+        "simple": {"storage_capacity": 1024, "num_storage_units": 1},
+        "mooncake_cpu": {
+            "global_segment_size": 8589934592,  # 8 GiB
+            "local_buffer_size": 1073741824,  # 1 GiB
+        },
     }
 
 
@@ -302,7 +303,7 @@ def test_train_pump_drives_mcore_training_step(
 
         master_config = MasterConfig.model_construct(
             policy={"train_global_batch_size": train_gbs},
-            # _sync_weights gates stale-abort on _should_use_nemo_gym(env); empty
+            # _sync_weights gates stale-abort on should_use_nemo_gym(env); empty
             # env -> native path (nemo_gym disabled).
             env={},
             grpo=GRPOConfig.model_construct(
@@ -326,6 +327,18 @@ def test_train_pump_drives_mcore_training_step(
                 "mlflow_enabled": False,
                 "monitor_gpus": False,
             },
+            # Actor __init__ builds a CheckpointManager + TimeoutChecker from
+            # this block; enabled=False keeps the run write-free.
+            checkpointing={
+                "enabled": False,
+                "checkpoint_dir": str(tmp_path / "checkpoints"),
+                "metric_name": None,
+                "higher_is_better": False,
+                "keep_top_k": None,
+                "save_period": 10_000,
+                "save_optimizer": False,
+                "checkpoint_must_save_by": None,
+            },
         )
 
         actor_args = SingleControllerActorArgs(
@@ -342,6 +355,8 @@ def test_train_pump_drives_mcore_training_step(
             rollout_manager=rollout_manager,
             tq_buffer=tq_buffer,
             partition_id=_PARTITION_ID,
+            save_state=_initial_grpo_save_state(),
+            last_checkpoint_path=None,
         )
         ctrl = _RecordingSingleControllerActor.remote(
             metric_log_handle=log,

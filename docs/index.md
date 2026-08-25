@@ -79,6 +79,13 @@ Learn how to evaluate your models using built-in evaluation datasets and custom 
 Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
 :::
 
+:::{grid-item-card} {octicon}`workflow` Managed Dynamo Generation
+:link: guides/dynamo-generation
+:link-type: doc
+
+Run a fixed Dynamo vLLM fleet with NCCL refit and W&B telemetry inside a Slurm Ray allocation.
+:::
+
 ::::
 
 ## Guides and Examples
@@ -308,14 +315,6 @@ guides/environments.md
 guides/eval.md
 guides/deepseek.md
 guides/models/index.md
-guides/models/nemotron/index.md
-guides/models/nemotron/nemotron-3-nano.md
-guides/models/nemotron/nemotron-3-nano-omni.md
-guides/models/nemotron/nemotron-3.5-lightning.md
-guides/models/nemotron/nemotron-3-super.md
-guides/models/nemotron/nemotron-3-ultra.md
-guides/models/qwen/index.md
-guides/models/qwen/qwen3-5.md
 model-quirks.md
 guides/async-grpo.md
 guides/single-controller.md
@@ -325,6 +324,7 @@ guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
 guides/refit.md
 guides/checkpoint-engine-refit.md
+guides/dynamo-generation.md
 guides/router-replay.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
@@ -359,6 +359,7 @@ design-docs/uv.md
 design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
+design-docs/dynamo-integration.md
 design-docs/sparse-delta-refit.md
 design-docs/checkpoint-engines.md
 design-docs/checkpointing.md
@@ -370,6 +371,7 @@ design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md
 design-docs/nccl-reshard-refit.md
+design-docs/media-token-validity-mask.md
 ```
 
 ```{toctree}

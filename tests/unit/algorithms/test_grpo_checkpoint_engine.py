@@ -47,6 +47,34 @@ def test_nixl_example_is_an_enabled_non_colocated_overlay():
     assert config.cluster["num_nodes"] == 2
 
 
+def test_reset_encoder_cache_flag_rejected_on_unsupported_refit_transports():
+    """The encoder-cache reset is honored only on collective/IPC and nccl_reshard."""
+    import pytest
+
+    from nemo_rl.models.generation.vllm.config import (
+        VllmConfig,
+        normalize_vllm_refit_config,
+    )
+
+    def _config(transport):
+        return cast(
+            VllmConfig,
+            {
+                "vllm_cfg": {"reset_encoder_cache_after_weight_update": True},
+                "refit_transport": transport,
+            },
+        )
+
+    # Supported transports pass through unchanged.
+    assert normalize_vllm_refit_config(_config(None)) is None
+    assert normalize_vllm_refit_config(_config("nccl_reshard")) is None
+
+    # Transports whose refit path never resets the encoder cache fail loudly.
+    for transport in ("nixl", "vllm_s3_sparse", "vllm_zmq_sparse"):
+        with pytest.raises(ValueError, match="reset_encoder_cache_after_weight_update"):
+            normalize_vllm_refit_config(_config(transport))
+
+
 def test_refit_policy_generation_uses_attached_checkpoint_engine_synchronizer():
     from nemo_rl.algorithms import grpo as grpo_mod
     from nemo_rl.models.generation.vllm import VllmGeneration
