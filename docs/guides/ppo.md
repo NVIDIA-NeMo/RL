@@ -175,10 +175,10 @@ The PPO training loop, [ppo_train](../../nemo_rl/algorithms/ppo.py), follows thi
 3. **Value inference**: the value model predicts per-token state values
 4. **Logprob computation**: the policy computes log probabilities for advantage estimation
 5. **Advantage estimation**: GAE computes advantages using value predictions and rewards
-6. **Value training**: the critic is updated first (critic-before-actor, following [veRL](https://arxiv.org/abs/2412.09613))
-7. **Policy training**: the actor is updated with the clipped surrogate objective
+6. **Value training**: the critic completes all of its updates first
+7. **Policy training**: the actor completes all of its updates with the clipped surrogate objective
 
-Steps 6–7 repeat `ppo_epochs` times per rollout before generating new responses.
+The critic stays resident for all `critic_ppo_epochs` updates, then the policy stays resident for all `ppo_epochs` updates. This avoids moving the colocated models between CPU and GPU after every epoch.
 
 ### Multiple Training Steps per Rollout
 
@@ -186,10 +186,13 @@ Unlike GRPO, which performs one training update per rollout, PPO can perform mul
 
 ```yaml
 ppo:
-  ppo_epochs: 4   # Train 4 times on each rollout batch
+  ppo_epochs: 4          # actor passes over each rollout batch
+  critic_ppo_epochs: 6  # critic passes; null uses ppo_epochs
 ```
 
-Each step trains both the critic and the actor on the same advantage estimates computed from the initial rollout.
+Each pass uses the same returns and advantage estimates computed from the initial
+rollout. `critic_ppo_epochs` must be greater than or equal to `ppo_epochs`, so the
+critic can be fit harder without adding actor updates.
 
 ### Critic Warmup
 
@@ -270,6 +273,7 @@ ppo:
   max_num_epochs: 100000
   max_num_steps: 100000
   ppo_epochs: 4
+  critic_ppo_epochs: null
   policy_training_start_step: 0
   warm_start_value_checkpoint: null
   val_period: 20
@@ -326,7 +330,8 @@ value_loss_fn:
 ```
 
 **PPO-specific parameters:**
-- **`ppo.ppo_epochs`**: Number of training updates per rollout batch
+- **`ppo.ppo_epochs`**: Number of actor training updates per rollout batch
+- **`ppo.critic_ppo_epochs`**: Number of critic training updates per rollout batch. `null` uses `ppo_epochs`; an explicit value must be greater than or equal to it.
 - **`ppo.policy_training_start_step`**: Number of critic-only warmup steps before policy training begins
 - **`ppo.warm_start_value_checkpoint`**: Checkpoint step directory whose `value/` seeds the critic on a fresh run. See [Warm-Starting the Critic](#warm-starting-the-critic)
 - **`ppo.seq_logprob_error_threshold`**: Nullable sequence-level multiplicative probability-error threshold. PPO always logs sequence-level train/generation mismatch metrics; when this is set, sequences above the threshold are excluded from advantage and loss computation.

@@ -293,6 +293,19 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="ppo_epochs must be at least 1"):
             validate_single_controller_config(mc)
 
+    def test_rejects_fewer_critic_epochs_than_actor_epochs(self):
+        mc = _ppo_master_config(
+            ppo=PPOConfig.model_construct(
+                max_num_steps=100,
+                ppo_epochs=2,
+                critic_ppo_epochs=1,
+                **_STEP_CONFIG,
+            )
+        )
+
+        with pytest.raises(ValueError, match="critic_ppo_epochs"):
+            validate_single_controller_config(mc)
+
     @pytest.mark.parametrize(
         "sampler_config",
         [WindowedSamplerConfig(), ReadyFirstSamplerConfig(), WeightFifoSamplerConfig()],
@@ -485,6 +498,22 @@ class TestMegatronTrainIters:
 
         assert mc.policy["megatron_cfg"]["train_iters"] == expected
         assert mc.value["megatron_cfg"]["train_iters"] == expected
+
+    def test_injects_distinct_policy_and_value_budgets(self):
+        mc = _ppo_master_config(
+            megatron_enabled=True,
+            ppo=PPOConfig.model_construct(
+                max_num_steps=7,
+                ppo_epochs=1,
+                critic_ppo_epochs=3,
+                **_STEP_CONFIG,
+            ),
+        )
+
+        sc_setup_mod._maybe_inject_megatron_train_iters(mc)
+
+        assert mc.policy["megatron_cfg"]["train_iters"] == 7
+        assert mc.value["megatron_cfg"]["train_iters"] == 21
 
     def test_skips_a_critic_on_a_non_megatron_backend(self):
         mc = _ppo_master_config(megatron_enabled=False, max_num_steps=7)

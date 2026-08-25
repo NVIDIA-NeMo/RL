@@ -8,7 +8,10 @@ ppo:
   max_rollout_turns: 1
   max_num_epochs: 100000
   max_num_steps: 100000
-  ppo_epochs: 4
+  ppo_epochs: 4  # actor passes over each rollout batch
+  # Critic passes over each rollout batch. null preserves the historical
+  # behavior by coupling this to ppo_epochs; an explicit value must be >= it.
+  critic_ppo_epochs: null
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
   warm_start_value_checkpoint: null  # step_<n> dir of a critic-pretrain run whose value/ seeds the critic
   val_period: 20

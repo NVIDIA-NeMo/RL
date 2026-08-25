@@ -645,6 +645,26 @@ def test_ppo_schema_rejects_unsupported_estimator_name():
         PPOConfig(adv_estimator={"name": "grpo"})
 
 
+def test_ppo_config_defaults_critic_epochs_to_actor_epochs():
+    config = PPOConfig(ppo_epochs=3)
+
+    assert config.critic_ppo_epochs is None
+    assert config.resolved_critic_ppo_epochs == 3
+
+
+def test_ppo_config_accepts_more_critic_epochs():
+    config = PPOConfig(ppo_epochs=1, critic_ppo_epochs=3)
+
+    assert config.resolved_critic_ppo_epochs == 3
+
+
+def test_ppo_config_rejects_fewer_critic_epochs_than_actor_epochs():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="critic_ppo_epochs"):
+        PPOConfig(ppo_epochs=2, critic_ppo_epochs=1)
+
+
 def test_create_advantage_estimator_rejects_unsupported_name():
     """The factory still guards names that skipped schema validation.
 
@@ -726,6 +746,7 @@ def _run_mock_ppo_train(
     max_num_steps: int,
     ppo_epochs: int,
     seq_logprob_error_threshold: float | None,
+    critic_ppo_epochs: int | None = None,
     policy_training_start_step: int = 0,
     warmup_generation_lead_steps: int | None = None,
     overlong_filtering: bool = False,
@@ -847,6 +868,9 @@ def _run_mock_ppo_train(
         "value_inference_finish"
     )
     value_model.finish_training.side_effect = lambda: events.append("value_finish")
+    value_model.prepare_for_training.side_effect = lambda: events.append(
+        "value_train_prep"
+    )
     value_model.get_values.return_value = {"values": torch.zeros(2, 3, 1)}
     value_model.train.side_effect = lambda *_args, **_kwargs: (
         events.append("value_train") or value_result
@@ -908,6 +932,7 @@ def _run_mock_ppo_train(
             overlong_filtering=overlong_filtering,
             policy_training_start_step=policy_training_start_step,
             ppo_epochs=ppo_epochs,
+            critic_ppo_epochs=critic_ppo_epochs,
             reward_scaling={"enabled": False},
             reward_shaping=RewardShapingConfig(enabled=False),
             seq_logprob_error_threshold=seq_logprob_error_threshold,
@@ -1045,7 +1070,11 @@ def test_ppo_train_noncolocated_refit_offload_lifecycle(monkeypatch):
     assert harness.refit.call_count == 2
     assert harness.policy.train.call_count == 4
     assert harness.value_model.train.call_count == 4
-    assert harness.policy.offload_to_cpu.call_count == 4
+    assert harness.value_model.prepare_for_training.call_count == 2
+    assert harness.policy.prepare_for_training.call_count == 2
+    # One offload after each rollout step; there is no longer an extra policy
+    # offload between PPO epochs.
+    assert harness.policy.offload_to_cpu.call_count == 2
     harness.policy_generation.prepare_for_generation.assert_not_called()
     assert harness.policy_generation.finish_generation.call_count == 2
 
@@ -1065,6 +1094,46 @@ def test_ppo_train_noncolocated_refit_offload_lifecycle(monkeypatch):
             "policy_offload",
             "rollout",
         ]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ppo_train_runs_extra_critic_epochs_without_extra_actor_updates(
+    monkeypatch, async_mode
+):
+    harness = _run_mock_ppo_train(
+        monkeypatch,
+        async_mode=async_mode,
+        max_num_steps=1,
+        ppo_epochs=2,
+        critic_ppo_epochs=3,
+        seq_logprob_error_threshold=None,
+    )
+
+    assert harness.value_model.train.call_count == 3
+    assert harness.policy.train.call_count == 2
+    assert harness.value_model.prepare_for_training.call_count == 1
+    assert harness.policy.prepare_for_training.call_count == 1
+    value_phase = harness.events[
+        harness.events.index("value_train_prep") : harness.events.index(
+            "policy_train_prep"
+        )
+    ]
+    assert value_phase == [
+        "value_train_prep",
+        "value_train",
+        "value_train",
+        "value_train",
+        "value_finish",
+    ]
+    policy_prep_index = harness.events.index("policy_train_prep")
+    policy_train_indices = [
+        index for index, event in enumerate(harness.events) if event == "policy_train"
+    ]
+    assert harness.events[policy_prep_index : policy_train_indices[-1] + 1] == [
+        "policy_train_prep",
+        "policy_train",
+        "policy_train",
+    ]
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
@@ -1947,13 +2016,27 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("async_enabled", "expected_train_iters"),
-    [(False, 3), (True, 30)],
+    (
+        "async_enabled",
+        "critic_ppo_epochs",
+        "expected_policy_train_iters",
+        "expected_value_train_iters",
+    ),
+    [
+        (False, None, 3, 3),
+        (False, 5, 3, 5),
+        (True, None, 30, 30),
+        (True, 5, 30, 50),
+    ],
 )
 def test_megatron_train_iters_matches_ppo_training_limit(
-    monkeypatch, async_enabled, expected_train_iters
+    monkeypatch,
+    async_enabled,
+    critic_ppo_epochs,
+    expected_policy_train_iters,
+    expected_value_train_iters,
 ):
-    """Async PPO cycles data until max_num_steps; sync PPO also honors epochs."""
+    """Each model's scheduler budget follows its own number of epochs."""
     from nemo_rl.algorithms.ppo import AsyncPPOConfig
 
     config = _make_noncolocated_setup_config()
@@ -1962,12 +2045,13 @@ def test_megatron_train_iters_matches_ppo_training_limit(
     config.ppo.max_num_steps = 10
     config.ppo.max_num_epochs = -1 if async_enabled else 1
     config.ppo.ppo_epochs = 3
+    config.ppo.critic_ppo_epochs = critic_ppo_epochs
     config.ppo.async_ppo = AsyncPPOConfig(enabled=async_enabled)
 
     _run_noncolocated_setup(monkeypatch, config)
 
-    assert config.policy["megatron_cfg"]["train_iters"] == expected_train_iters
-    assert config.value["megatron_cfg"]["train_iters"] == expected_train_iters
+    assert config.policy["megatron_cfg"]["train_iters"] == expected_policy_train_iters
+    assert config.value["megatron_cfg"]["train_iters"] == expected_value_train_iters
 
 
 def test_ppo_setup_rejects_a_warm_start_that_does_not_resolve(monkeypatch, tmp_path):

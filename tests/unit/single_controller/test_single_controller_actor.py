@@ -1109,6 +1109,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._trainer = _NoOpTrainer()
     ctrl._is_ppo = False
     ctrl._ppo_epochs = 1
+    ctrl._critic_ppo_epochs = 1
     ctrl._value = None
     ctrl._value_loss_fn = None
     ctrl._gen = SimpleNamespace(requires_kv_scale_sync=False)
@@ -1484,11 +1485,15 @@ def _ppo_train_pump_controller(
     policy_training_start_step: int = 0,
     value: _NoOpValue | None = None,
     ppo_epochs: int = 1,
+    critic_ppo_epochs: int | None = None,
 ) -> tuple[object, _NoOpValue]:
     ctrl = _train_pump_controller(sampler=sampler)
     value = _NoOpValue() if value is None else value
     ctrl._is_ppo = True
     ctrl._ppo_epochs = ppo_epochs
+    ctrl._critic_ppo_epochs = (
+        ppo_epochs if critic_ppo_epochs is None else critic_ppo_epochs
+    )
     ctrl._value = value
     ctrl._value_loss_fn = MagicMock(name="value_loss_fn")
     ctrl._master_config.grpo = None
@@ -1681,11 +1686,11 @@ def test_train_pump_trains_the_policy_once_warmup_is_over(monkeypatch, capsys) -
     assert capsys.readouterr().out.count("Critic warmup complete") == 1
 
 
-def test_train_pump_offloads_the_policy_between_ppo_epochs(monkeypatch) -> None:
-    """ppo_epochs repeats the whole train stage over the step's own batch.
+def test_train_pump_groups_ppo_epochs_by_model(monkeypatch) -> None:
+    """Each model stays resident for all of its PPO epochs.
 
-    The two models share the training GPUs, so every critic train runs with the
-    policy on CPU -- including the ones after the first epoch."""
+    The critic still finishes and leaves the shared training GPUs before the
+    policy is loaded, but the models no longer move between epochs."""
     meta = _single_group_meta()
     calls: list[str] = []
     ctrl, _ = _ppo_train_pump_controller(
@@ -1708,24 +1713,53 @@ def test_train_pump_offloads_the_policy_between_ppo_epochs(monkeypatch) -> None:
         "critic.finish_inference",
         "critic.prepare_for_training",
         "critic.train_from_meta",
-        "critic.finish_training",
-        "policy.prepare_for_training",
-        "policy.begin_train_step",
-        "policy.train_microbatches_from_meta",
-        "policy.finish_train_step",
-        "policy.offload_to_cpu",
-        "critic.prepare_for_training",
         "critic.train_from_meta",
         "critic.finish_training",
         "policy.prepare_for_training",
         "policy.begin_train_step",
         "policy.train_microbatches_from_meta",
-        # No offload after the last epoch: the refit needs the policy resident.
+        "policy.finish_train_step",
+        "policy.begin_train_step",
+        "policy.train_microbatches_from_meta",
         "policy.finish_train_step",
     ]
     # Still one RL step, so one refit and one version bump.
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
     assert ctrl._trainer_version == 1
+
+
+def test_train_pump_runs_all_critic_epochs_before_actor_epochs(monkeypatch) -> None:
+    """Independent critic epochs share one residency and do not update policy."""
+    meta = _single_group_meta()
+    calls: list[str] = []
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta),
+        value=_NoOpValue(calls=calls, prefix="critic."),
+        ppo_epochs=1,
+        critic_ppo_epochs=3,
+    )
+    ctrl._trainer = _EpochRecordingTrainer(calls)
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert calls == [
+        "policy.finish_inference",
+        "critic.prepare_for_inference",
+        "critic.get_values_from_meta",
+        "critic.finish_inference",
+        "critic.prepare_for_training",
+        "critic.train_from_meta",
+        "critic.train_from_meta",
+        "critic.train_from_meta",
+        "critic.finish_training",
+        "policy.prepare_for_training",
+        "policy.begin_train_step",
+        "policy.train_microbatches_from_meta",
+        "policy.finish_train_step",
+    ]
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
 
 
 def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:

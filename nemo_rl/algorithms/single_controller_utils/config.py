@@ -865,8 +865,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
-    if algo_cfg.ppo_epochs < 1:
-        raise ValueError("ppo.ppo_epochs must be at least 1")
+    # model_construct-based callers bypass PPOConfig's model validator, so
+    # resolve again at setup to keep invalid epoch relationships fail-fast.
+    assert master_config.ppo is not None
+    _ = master_config.ppo.resolved_critic_ppo_epochs
 
     # Without it the critic steps once per chunk and the policy once per step,
     # which is two effective learning rates from one config, and no error.

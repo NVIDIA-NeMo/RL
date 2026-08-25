@@ -57,7 +57,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
             gpus_per_node: 1  # inference GPUs; remainder go to training
     ```
 
-3. **One RL step = one training batch.** The batch a step trains on is the whole step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)). A GRPO step is also one optimizer step; a PPO step is `ppo.ppo_epochs` of them over that same batch.
+3. **One RL step = one training batch.** The batch a step trains on is the whole step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)). A GRPO step is also one optimizer step. A PPO step applies `ppo.ppo_epochs` actor updates and `ppo.critic_ppo_epochs` critic updates over that same batch; the exemplar defaults the critic count to `ppo.ppo_epochs`.
 
     ```python
     num_prompts_per_step * num_generations_per_prompt == policy.train_global_batch_size
