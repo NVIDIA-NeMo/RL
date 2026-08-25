@@ -329,6 +329,19 @@ def validate_and_set_config(
     weights_path,
     optimizer_path,
 ):
+    # inference_optimized layers hard-require SP with TP>1; fail here with the config key.
+    # This guards the training cfg; the inference cfg is guarded in
+    # merged_inference_megatron_cfg (the colocated build bypasses this function).
+    if (
+        config["megatron_cfg"].get("transformer_impl") == "inference_optimized"
+        and config["megatron_cfg"]["tensor_model_parallel_size"] > 1
+        and not config["megatron_cfg"]["sequence_parallel"]
+    ):
+        raise ValueError(
+            "transformer_impl=inference_optimized requires sequence parallelism "
+            "with TP>1: set policy.megatron_cfg.sequence_parallel=true."
+        )
+
     # Handle generation configuration
     is_generation_colocated = None
     sampling_params = None
@@ -1552,6 +1565,21 @@ def build_inference_model(
         inference_provider.transformer_impl = policy_cfg["megatron_cfg"][
             "transformer_impl"
         ]
+    # CUDA graph config needs to be set correctly before init.
+    if "cuda_graph_impl" in policy_cfg["megatron_cfg"]:
+        cuda_graph_impl = policy_cfg["megatron_cfg"]["cuda_graph_impl"]
+        if cuda_graph_impl not in ("none", "local"):
+            raise ValueError(
+                "Megatron generation supports only cuda_graph_impl 'none' or "
+                f"'local' for inference CUDA graphs, got '{cuda_graph_impl}'. "
+                "'transformer_engine' and 'full_iteration' are training-only "
+                "capture modes."
+            )
+        inference_provider.cuda_graph_impl = cuda_graph_impl
+    if "inference_cuda_graph_scope" in policy_cfg["megatron_cfg"]:
+        inference_provider.inference_cuda_graph_scope = InferenceCudaGraphScope[
+            policy_cfg["megatron_cfg"]["inference_cuda_graph_scope"]
+        ]
     # A custom (uneven) pipeline split is tuned for the training PP; reset to an even split
     # when inference uses a different PP (the reshard maps params across stages by name).
     if (
@@ -1727,6 +1755,34 @@ def setup_model_and_optimizer(
 
         mixed_precision_wrapper = MoEFloat16Module
         pre_wrap_hook.extend([freeze_moe_router])
+
+    freeze_config = policy_cfg["megatron_cfg"].get("freeze_config")
+    if freeze_config:
+
+        def apply_freeze(megatron_model):
+            # Run as a pre-wrap hook (before the DDP/FSDP wrap inside get_model) so
+            # frozen params are excluded before DDP allocates grad buffers and the
+            # optimizer is built; freezing after the wrap triggers a DDP grad-ready
+            # crash on the first backward. Delegate the choice of submodules to the
+            # model's own freeze() (e.g. freeze_vision_model / freeze_vision_projection /
+            # freeze_language_model for Qwen and Gemma VL providers) by passing
+            # freeze_config straight through.
+            if not isinstance(megatron_model, list):
+                megatron_model = [megatron_model]
+            for model_module in megatron_model:
+                # Handle both wrapped (Float16Module) and unwrapped models.
+                if isinstance(model_module, Float16Module):
+                    model_module = model_module.module
+                if hasattr(model_module, "freeze") and callable(model_module.freeze):
+                    try:
+                        model_module.freeze(**freeze_config)
+                    except TypeError as e:
+                        e.add_note(
+                            f"freeze_config keys must match {type(model_module).__name__}.freeze() parameters."
+                        )
+                        raise
+
+        pre_wrap_hook.extend([apply_freeze])
 
     if use_peft:
         peft_cfg = policy_cfg["megatron_cfg"].get("peft", {})

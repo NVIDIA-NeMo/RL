@@ -102,6 +102,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         processor: Optional[AutoProcessor] = None,
         worker_extension_cls_fqn: Optional[str] = None,
         skip_weight_load: bool = False,
+        reserved_http_server_port: Optional[int] = None,
     ):
         self.debug_payload_metrics = False
         if weights_path:
@@ -122,6 +123,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
+            )
+        if reserved_http_server_port is not None and not megatron_enable:
+            raise ValueError(
+                "reserved_http_server_port is only supported by the Megatron "
+                "worker (policy.megatron_cfg.enabled=true)."
             )
         if draft_enabled and not megatron_enable:
             raise ValueError(
@@ -266,6 +272,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         if skip_weight_load:
             worker_kwargs["skip_weight_load"] = True
+        if reserved_http_server_port is not None:
+            worker_kwargs["reserved_http_server_port"] = reserved_http_server_port
 
         if use_v2:
             # DTensor v2 workers reconstruct tokenizer/processor locally to avoid
@@ -401,7 +409,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return results
 
     def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+        nccl_peer: str = "nemo",
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
@@ -410,6 +424,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             port=port,
             world_size=world_size,
             train_world_size=train_world_size,
+            nccl_peer=nccl_peer,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
@@ -1105,12 +1120,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
 
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
     ) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_for_collective",
             kv_scales=kv_scales,
+            buffer_size_bytes=buffer_size_bytes,
+            num_buffers=num_buffers,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures

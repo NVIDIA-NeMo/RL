@@ -25,7 +25,7 @@ from nemo_rl.algorithms.metric_utils import (
 
 
 class TestPrintSetupTimingSummary:
-    """print_setup_timing_summary has three code paths with assertions."""
+    """print_setup_timing_summary's code paths and assertions."""
 
     @staticmethod
     def _common_setup(**overrides) -> SetupTimingMetrics:
@@ -37,8 +37,8 @@ class TestPrintSetupTimingSummary:
         base.update(overrides)
         return SetupTimingMetrics(**base)
 
-    def test_sc_gym_on_prints_reserve_load_split(self, capsys):
-        """SC + gym-on renders the '(reserve X.Xs + load Y.Ys)' suffix."""
+    def test_gym_on_prints_reserve_load_split(self, capsys):
+        """Gym-on (a reserved address) renders the '(reserve X.Xs + load Y.Ys)' suffix."""
         metrics = self._common_setup(
             generation_init_time_s=15.0,
             generation_init_reserve_time_s=3.0,
@@ -48,8 +48,8 @@ class TestPrintSetupTimingSummary:
         out = capsys.readouterr().out
         assert "Generation init: 15.0s (reserve 3.0s + load 12.0s)" in out
 
-    def test_sc_gym_off_prints_plain_generation_init(self, capsys):
-        """SC + gym-off renders only the top-level generation_init_time_s."""
+    def test_gym_off_prints_plain_generation_init(self, capsys):
+        """Gym-off renders only the top-level generation_init_time_s."""
         metrics = self._common_setup(generation_init_time_s=15.0)
         print_setup_timing_summary(metrics)
         out = capsys.readouterr().out
@@ -58,39 +58,11 @@ class TestPrintSetupTimingSummary:
         assert "reserve" not in out
         assert "load" not in out
 
-    def test_sc_gym_off_asserts_generation_init_time_populated(self):
-        """SC path with gen_init_time_key=None must have generation_init_time_s set."""
+    def test_asserts_generation_init_time_populated(self):
+        """Every driver must populate generation_init_time_s."""
         metrics = self._common_setup()
         with pytest.raises(AssertionError):
             print_setup_timing_summary(metrics)
-
-    def test_grpo_uses_backend_specific_key(self, capsys):
-        """grpo.py path reads the field named by gen_init_time_key."""
-        metrics = self._common_setup(vllm_init_time_s=15.0)
-        print_setup_timing_summary(metrics, gen_init_time_key="vllm_init_time_s")
-        out = capsys.readouterr().out
-        assert "Generation init: 15.0s" in out
-        assert "reserve" not in out
-
-    def test_grpo_asserts_generation_init_time_unset(self):
-        """grpo.py path forbids generation_init_time_s from being populated."""
-        metrics = self._common_setup(
-            generation_init_time_s=15.0,
-            vllm_init_time_s=15.0,
-        )
-        with pytest.raises(AssertionError):
-            print_setup_timing_summary(metrics, gen_init_time_key="vllm_init_time_s")
-
-    def test_reserve_load_split_takes_precedence_over_gen_key(self, capsys):
-        """If reserve_time_s is set, the SC+gym-on branch wins even if a key is passed."""
-        metrics = self._common_setup(
-            generation_init_time_s=15.0,
-            generation_init_reserve_time_s=3.0,
-            generation_init_load_time_s=12.0,
-        )
-        print_setup_timing_summary(metrics, gen_init_time_key="vllm_init_time_s")
-        out = capsys.readouterr().out
-        assert "Generation init: 15.0s (reserve 3.0s + load 12.0s)" in out
 
     def test_optional_nemo_gym_and_teacher_lines(self, capsys):
         """nemo_gym_init_time_s and teacher_init_time_s only print when populated."""
