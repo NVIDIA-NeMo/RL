@@ -106,6 +106,32 @@ def test_partial_override_does_not_clobber_defaults():
     assert cfg.megatron_cfg_overrides["some_megatron_knob"] is True
 
 
+def test_typed_override_blocks_round_trip_without_schema_fill():
+    """The override blocks are typed as partial models (all fields None); after
+    the ``model_dump(exclude_none=True)`` in ``_opd_cfg``, unset fields must not
+    reappear as schema defaults and clobber default_teacher_cfg in the merge."""
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    opd = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"general": "/ckpt/general"},
+        non_colocated_teachers={
+            "enabled": True,
+            "default_teacher_cfg": {"gpus_per_node": 4, "num_nodes": 2},
+            "teacher_overrides": {"general": {"micro_batch_size": 1}},
+        },
+    )
+    (cfg,) = create_teacher_configs_from_opd_config(
+        _opd_cfg({"on_policy_distillation": opd})
+    )
+    assert cfg.gpus_per_node == 4  # not the schema default 8
+    assert cfg.num_nodes == 2
+    assert cfg.micro_batch_size == 1
+
+
 def test_provider_override_allowlist_is_explicit_keys_only():
     """Only explicitly-set teacher override keys may reach the model provider;
     architecture keys inherited from the student config must be blocked, while

@@ -54,17 +54,36 @@ class TeacherResourceConfig(BaseModel, extra="allow"):
     megatron_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
+class TeacherResourceOverrides(BaseModel, extra="allow"):
+    """Partial ``TeacherResourceConfig``: every field defaults to ``None`` so
+    an omitted field never clobbers ``default_teacher_cfg`` in the
+    defaults<-override merge (these blocks reach the merge via
+    ``model_dump(exclude_none=True)`` in ``_opd_cfg``, which strips unset
+    fields). The merged result is validated as ``TeacherResourceConfig`` in
+    ``create_teacher_configs_from_opd_config``.
+    """
+
+    tensor_model_parallel_size: Optional[int] = None
+    pipeline_model_parallel_size: Optional[int] = None
+    context_parallel_size: Optional[int] = None
+    expert_model_parallel_size: Optional[int] = None
+    num_nodes: Optional[int] = None
+    gpus_per_node: Optional[int] = None
+    precision: Optional[str] = None
+    micro_batch_size: Optional[int] = None
+    megatron_cfg_overrides: Optional[dict[str, Any]] = None
+
+
 class NonColocatedTeachersConfig(BaseModel, extra="allow"):
     """Non-colocated (separate-GPU) teacher resourcing for on-policy distillation."""
 
     enabled: bool = False
-    # Deliberately UNTYPED blocks: both are partial by nature, and validating
-    # them as TeacherResourceConfig here would fill schema defaults for every
-    # omitted field (e.g. gpus_per_node=8 on a 4-GPU/node cluster), which then
-    # clobber default_teacher_cfg in the defaults<-override merge. Validation
-    # happens after the merge in create_teacher_configs_from_opd_config.
-    default_teacher_cfg: dict[str, Any] = Field(default_factory=dict)
-    teacher_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    default_teacher_cfg: TeacherResourceOverrides = Field(
+        default_factory=TeacherResourceOverrides
+    )
+    teacher_overrides: dict[str, TeacherResourceOverrides] = Field(
+        default_factory=dict
+    )
 
 
 class OnPolicyDistillationConfig(BaseModel, extra="allow"):

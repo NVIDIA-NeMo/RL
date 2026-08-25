@@ -312,8 +312,9 @@ def provider_override_allowed(megatron_cfg: Any, key: str) -> bool:
 
     Student configs carry no allowlist and every key applies (status quo).
     Teacher configs (built by TeacherWorkerGroup from a clone of the student's
-    config) carry ``_provider_override_allowlist`` = the keys explicitly set in
-    that teacher's ``teacher_overrides``: a teacher's model structure comes
+    config) carry ``_provider_override_allowlist`` = the keys explicitly set
+    for that teacher (``default_teacher_cfg`` merged with its
+    ``teacher_overrides``): a teacher's model structure comes
     from its own checkpoint, so inherited student keys must not reach its
     provider (a VLM student's tower keys crash a text teacher at load; its
     mtp_num_layers=0 crashes an MTP-bearing teacher at first forward).
