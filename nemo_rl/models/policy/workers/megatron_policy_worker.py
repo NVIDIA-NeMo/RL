@@ -2902,7 +2902,7 @@ class MegatronPolicyWorkerImpl(
             RefitAbortWatchdog,
         )
 
-        groups = [getattr(self, "pp_comm_group", None), self.model_update_group]
+        groups = [self.pp_comm_group, self.model_update_group]
         with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
             self._nccl_reshard_refit(
                 kv_scales=kv_scales, refit_timeout_s=refit_timeout_s

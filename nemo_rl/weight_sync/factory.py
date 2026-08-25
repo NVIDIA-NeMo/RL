@@ -55,6 +55,9 @@ def create_weight_synchronizer(
         train_cluster: RayVirtualCluster for training workers (required for non-colocated).
         inference_cluster: RayVirtualCluster for inference workers (required for non-colocated).
         refit_buffer_size_gb: Optional fixed buffer size for IPC weight staging.
+        refit_timeout_s: Deadline for one refit collective, after which each participating
+            worker aborts its own communicator so the controller can rebuild over the
+            survivors. None disarms it.
 
     Returns:
         A WeightSynchronizer instance appropriate for the deployment topology.
