@@ -10,9 +10,7 @@ grpo:
   max_num_epochs: 10
   max_num_steps: 10000
   use_leave_one_out_baseline: false
-  val_period: 10
   val_at_start: true
-  val_at_end: false
   max_val_samples: 128
   val_batch_size: 128
   skip_reference_policy_logprobs_calculation: true
@@ -116,8 +114,6 @@ policy:
       compilation_config:
         pass_config:
           fuse_allreduce_rms: false
-    colocated:
-      enabled: true
 
 data:
   max_input_seq_length: 2048

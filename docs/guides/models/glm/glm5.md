@@ -70,11 +70,11 @@ bare-metal setup details.
 - **GLM-5.2, non-colocated (131K capacity)**:
   [`grpo-glm5.2-72n8g-megatron-noncolocated.yaml`](../../../../examples/configs/recipes/llm/grpo-glm5.2-72n8g-megatron-noncolocated.yaml)
 
-  > [!NOTE]
-  > The 131K label describes training capacity, not current full-context GRPO
-  > validation. See
-  > [Long-Context Capacity and Validation](#long-context-capacity-and-validation)
-  > for details.
+> [!NOTE]
+> The 131K label describes training capacity, not current full-context GRPO
+> validation. See
+> [Long-Context Capacity and Validation](#long-context-capacity-and-validation)
+> for details.
 
 ### 3. Launch
 
