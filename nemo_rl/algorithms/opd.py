@@ -64,6 +64,7 @@ class TeacherResourceConfig(BaseModel, extra="allow"):
     expert_model_parallel_size: int = 1
     num_nodes: int = 1
     gpus_per_node: int = 8
+    segment_size: Optional[int] = Field(default=None, ge=1)
     precision: TeacherPrecision = "bfloat16"
     micro_batch_size: int = 4
     megatron_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
@@ -85,6 +86,7 @@ class TeacherResourceOverrideConfig(BaseModel, extra="allow"):
     expert_model_parallel_size: Optional[int] = None
     num_nodes: Optional[int] = None
     gpus_per_node: Optional[int] = None
+    segment_size: Optional[int] = Field(default=None, ge=1)
     precision: Optional[TeacherPrecision] = None
     micro_batch_size: Optional[int] = None
     megatron_cfg_overrides: Optional[dict[str, Any]] = None
@@ -409,7 +411,6 @@ def _validate_default_teacher_alias(opd_cfg: dict[str, Any]) -> None:
 def reserve_teacher_clusters(
     master_config: Any,
     *,
-    segment_size: Optional[int] = None,
     teacher_segment_topology: Optional[dict[str, tuple[str, int]]] = None,
 ) -> dict[str, RayVirtualCluster]:
     """Create and reserve topology-aware clusters for non-colocated teachers.
@@ -421,10 +422,9 @@ def reserve_teacher_clusters(
 
     Args:
         master_config: Full training configuration containing the OPD settings.
-        segment_size: NVLink-domain segment size from the cluster config. When
-            set, every teacher is constrained to one NVLink domain.
         teacher_segment_topology: Topology remaining after policy and inference
-            placement.
+            placement. It is consulted only when a teacher explicitly sets
+            ``segment_size`` in its resource config.
 
     Returns:
         A mapping from each deduplicated teacher alias to its reserved cluster.
@@ -458,18 +458,19 @@ def reserve_teacher_clusters(
             num_nodes = teacher_config.num_nodes
             gpus_per_node = teacher_config.gpus_per_node
 
-            # Pin each teacher within one NVLink domain (its whole node span is
-            # one segment) so its TP/PP/CP collectives stay on NVLink.
-            teacher_segment_size = None
+            # Teacher topology is explicitly opt-in. In particular, do not
+            # derive it from cluster.segment_size or from the teacher's node
+            # count: doing so can turn a valid small cluster segment into an
+            # impossible whole-teacher single-domain request.
+            teacher_segment_size = teacher_config.segment_size
             node_resource_constraints = None
-            if segment_size is not None:
-                teacher_segment_size = num_nodes
+            if teacher_segment_size is not None:
                 (
                     node_resource_constraints,
                     remaining_ids,
                     _,
                 ) = prepare_segment_topology(
-                    num_nodes,
+                    teacher_segment_size,
                     num_nodes,
                     topology=running_topology,
                     role=f"teacher:{alias}",

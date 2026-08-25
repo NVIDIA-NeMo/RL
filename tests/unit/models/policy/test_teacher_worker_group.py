@@ -28,6 +28,7 @@ def test_teacher_resource_config_defaults():
     assert res.pipeline_model_parallel_size == 1
     assert res.expert_tensor_parallel_size == 1
     assert res.gpus_per_node == 8
+    assert res.segment_size is None
     assert res.precision == "bfloat16"
 
 
@@ -101,6 +102,25 @@ def test_create_teacher_configs_homogeneous():
     )
     assert len(configs) == 2
     assert all(c.tensor_model_parallel_size == 4 for c in configs)
+
+
+def test_create_teacher_configs_resolves_explicit_segment_size():
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    config = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"math": "/ckpt/math"},
+        non_colocated_teachers={"default_teacher_cfg": {"segment_size": 2}},
+    )
+    resolved = create_teacher_configs_from_opd_config(
+        _opd_cfg({"on_policy_distillation": config})
+    )[0]
+
+    assert resolved.segment_size == 2
+    assert "segment_size" not in resolved.megatron_cfg_overrides
 
 
 def test_create_teacher_configs_sparse_override_preserves_default_resources():

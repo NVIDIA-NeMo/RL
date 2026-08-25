@@ -900,8 +900,8 @@ def setup(
 
     total_nodes = cluster_config["num_nodes"]
     segment_size = cluster_config.get("segment_size")
-    # Topology of nodes left over after policy/inference placement; non-colocated
-    # OPD teachers are placed within it so their collectives stay on NVLink.
+    # Topology of nodes left over after policy/inference placement. Explicit
+    # per-teacher segment constraints are planned within this remainder.
     teacher_segment_topology: Optional[dict[str, tuple[str, int]]] = None
     if rm_env_enabled:
         rm_resource = env_configs["reward_model"]["resources"]
@@ -1082,8 +1082,8 @@ def setup(
                     segment_size, train_nodes, topology=topology, role="training"
                 )
             )
-            # Teachers default to the nodes left after training; narrowed further
-            # below if a non-colocated inference cluster is also pinned.
+            # Make the nodes left after training available to explicit teacher
+            # segment constraints; narrow further below if inference is pinned.
             teacher_segment_topology = {
                 nid: topology[nid] for nid in remaining_node_ids
             }
@@ -1221,8 +1221,9 @@ def setup(
             flush=True,
         )
 
-    # Reserve topology-aware teacher placement groups before NeMo Gym starts
-    # opportunistically placing its GPU-backed services. Worker creation and
+    # Reserve teacher placement groups before NeMo Gym starts opportunistically
+    # placing its GPU-backed services. Topology constraints are applied only to
+    # teachers that explicitly configure a segment size. Worker creation and
     # model loading remain deferred until the policy is ready to avoid racing
     # Megatron-Bridge checkpoint conversion.
     teacher_clusters: dict[str, RayVirtualCluster] = {}
@@ -1231,7 +1232,6 @@ def setup(
         t0 = time.perf_counter()
         teacher_clusters = opd_module.reserve_teacher_clusters(
             master_config,
-            segment_size=segment_size,
             teacher_segment_topology=teacher_segment_topology,
         )
         teacher_reservation_time = time.perf_counter() - t0

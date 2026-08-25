@@ -63,6 +63,7 @@ class TeacherConfig:
     precision: TeacherPrecision
     micro_batch_size: int
     megatron_cfg_overrides: dict[str, Any]
+    segment_size: Optional[int] = None
 
 
 def create_teacher_configs_from_opd_config(
@@ -139,6 +140,7 @@ def create_teacher_configs_from_opd_config(
             precision=res.precision,
             micro_batch_size=res.micro_batch_size,
             megatron_cfg_overrides=all_overrides,
+            segment_size=res.segment_size,
         )
         if deduplicate and model_name in primary_config_by_model:
             primary = primary_config_by_model[model_name]
