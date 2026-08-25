@@ -533,36 +533,47 @@ echo "[recovery] job exited $EXIT_CODE, ${ELAPSED}s after the kill"
 # Handled before the generic exit-code check below, which would otherwise call it a
 # failure.
 if [[ "$FREEZE_VICTIM" == "true" ]]; then
-    if (( EXIT_CODE == 0 )); then
-        echo "[recovery] FAIL: the run exited 0, so the stalled collective did not end it."
-        echo "[recovery] Either the deadline (${REFIT_TIMEOUT_S}s) never fired, or the freeze did not"
-        echo "[recovery] land inside a refit. Check for 'watchdog armed' and 'deadline exceeded'"
-        echo "[recovery] in the log -- the watchdog reports both."
+    # A frozen rank now RECOVERS rather than ending the run, which reverses what this
+    # variant used to assert.
+    #
+    # It never becomes absent -- is_alive() is answered by the Ray actor and never touches
+    # the engine, so the probe can only ever see a dead process -- and the reconcile used
+    # to refuse for exactly that reason. But the ledger already knew: the frozen shard's
+    # own generations time out and drive it to SUSPECT before the refit aborts. The
+    # recovery now condemns that single suspect and rebuilds over the survivor.
+    #
+    # So the pass condition is completion, like the killed variants, plus evidence that it
+    # got there by attribution rather than by the shard dying.
+    if (( EXIT_CODE != 0 )); then
+        echo "[recovery] FAIL: the run exited $EXIT_CODE ${ELAPSED}s after the freeze."
+        echo "[recovery] A single suspect should have been condemned and the run continued."
+        grep -E "already suspect|identified as absent|RefitAborted|Traceback" "$RUN_LOG" | tail -20
         exit 1
     fi
     if ! grep -q "RefitAborted" "$RUN_LOG"; then
-        echo "[recovery] FAIL: the run died, but no RefitAborted appears in the log, so it"
-        echo "[recovery] did not die of the abort. Something else killed it."
-        grep -E "Error|Traceback|RayActorError" "$RUN_LOG" | tail -20
+        echo "[recovery] FAIL: the run completed, but no RefitAborted appears in the log, so"
+        echo "[recovery] the deadline never fired and this variant tested nothing."
+        grep -E "watchdog|deadline" "$RUN_LOG" | tail -20
         exit 1
     fi
-    if ! grep -q "no generation shard could be identified as absent" "$RUN_LOG"; then
-        echo "[recovery] FAIL: RefitAborted fired, but the run did not stop on the"
-        echo "[recovery] reconcile's refusal, so it died somewhere unintended."
-        grep -E "Error|Traceback|RuntimeError" "$RUN_LOG" | tail -20
+    if ! grep -q "condemning it as the silent participant" "$RUN_LOG"; then
+        echo "[recovery] FAIL: RefitAborted fired and the run survived, but no shard was"
+        echo "[recovery] condemned as the silent participant -- so it recovered by some"
+        echo "[recovery] other route and this variant is no longer testing attribution."
+        grep -E "already suspect|identified as absent|gen_fleet: shard" "$RUN_LOG" | tail -20
         exit 1
     fi
     # Never killed, so it must still be there -- stopped. If it is gone, something else
     # reaped it and this was the actor-death path after all.
     if [[ "$(awk '{print $3}' "/proc/$VICTIM/stat" 2>/dev/null || echo gone)" == "gone" ]]; then
         echo "[recovery] FAIL: the frozen victim disappeared; it was not the frozen-rank"
-        echo "[recovery] scenario that stopped the run, so the result does not mean what it says."
+        echo "[recovery] scenario that recovered, so the result does not mean what it says."
         exit 1
     fi
     echo "[recovery] abort observed:"; grep -m3 "RefitAborted" "$RUN_LOG"
-    echo "[recovery] refusal observed:"; grep -m1 "no generation shard could be identified as absent" "$RUN_LOG"
-    echo "[recovery] PASS: the deadline broke a stalled collective and the run stopped"
-    echo "[recovery] attributably ${ELAPSED}s after the freeze instead of wedging (refit_transport=$REFIT_TRANSPORT)"
+    echo "[recovery] attribution observed:"; grep -m1 "condemning it as the silent participant" "$RUN_LOG"
+    echo "[recovery] PASS: a frozen rank was attributed from the ledger and the run carried"
+    echo "[recovery] on, ${ELAPSED}s after the freeze (refit_transport=$REFIT_TRANSPORT)"
     exit 0
 fi
 

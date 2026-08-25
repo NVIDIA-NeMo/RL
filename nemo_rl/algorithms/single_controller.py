@@ -1599,15 +1599,47 @@ class SingleControllerActor:
                 "NCCL transports (collective, nccl_reshard) can recover this way."
             ) from failure
         if not rebuilt:
-            # Nothing was identified as absent, so there is no smaller membership to
-            # rebuild over. Retrying would either die on the aborted communicator or --
-            # worse -- rebuild over the full fleet and hang on the same silent rank,
-            # which is the wedge this whole path exists to remove. Fail attributably.
-            raise RuntimeError(
-                "refit failed and no generation shard could be identified as absent, so "
-                "the communicator cannot be safely rebuilt; the run cannot continue. A "
-                "rank that is alive but not participating would produce this."
-            ) from failure
+            # Nothing is absent, but that is not the same as nothing being known.
+            #
+            # The engine this is really about is wedged rather than dead: is_alive() is
+            # answered by the Ray actor and never touches the engine, so the probe can only
+            # ever see a dead PROCESS. A wedged one stays serving, is never absent, and
+            # takes the run down here -- while its own generations have been timing out and
+            # driving it to SUSPECT the whole time. The abort is independent evidence that
+            # something in the collective stopped participating; SUSPECT says which.
+            #
+            # Exactly one, or not at all. With several suspects there is no way to tell
+            # which broke the collective, and condemning the wrong one costs a healthy shard
+            # and leaves the real culprit in the rebuilt communicator -- the same hang, one
+            # shard smaller. With none there is nothing to go on. Both keep the raise.
+            suspects = self._gen_fleet.suspected_shards()
+            if len(suspects) == 1:
+                culprit = suspects[0]
+                print(
+                    f"  _sync_weights: no shard is absent, but shard {culprit} was already "
+                    "suspect; condemning it as the silent participant and retrying",
+                    flush=True,
+                )
+                self._gen_fleet.condemn_silent_participant(
+                    culprit,
+                    reason=(
+                        "did not participate in a refit that had to be aborted, while "
+                        "already suspect from failing generations"
+                    ),
+                )
+                rebuilt = await self._reconcile_refit_membership(force=True)
+
+            if not rebuilt:
+                # Either nothing was suspect, or too many were. Retrying would die on the
+                # aborted communicator or -- worse -- rebuild over the full fleet and hang
+                # on the same silent rank, which is the wedge this path exists to remove.
+                raise RuntimeError(
+                    "refit failed and no generation shard could be identified as absent, "
+                    "so the communicator cannot be safely rebuilt; the run cannot "
+                    "continue. A rank that is alive but not participating would produce "
+                    f"this. Shards already suspect: {suspects or 'none'} (exactly one is "
+                    "needed to attribute the failure)."
+                ) from failure
 
     def _promote_refit_shards(self) -> None:
         """Return shards holding current weights to the serving set.

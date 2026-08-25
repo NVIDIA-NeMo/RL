@@ -208,6 +208,29 @@ class GenerationFleetHealth:
             if self._shards[idx].state in _ABSENT_STATES
         ]
 
+    def suspected_shards(self) -> list[int]:
+        """Shards the ledger already doubted when the refit went wrong.
+
+        SUSPECT, or STALE having been SUSPECT immediately before an aborted refit marked
+        it partial. The second case is the common one at recovery time and would otherwise
+        be invisible: ``mark_weights_partial`` runs over every *serving* shard, and SUSPECT
+        is a serving state, so the suspicion is overwritten by STALE microseconds before
+        anyone asks. ``state_before_partial`` is what preserves it.
+
+        Not for routing -- ``serving_shards`` decides that. This exists for the one caller
+        that has independent evidence something in the collective stopped participating and
+        needs to know which shard the ledger was already unhappy with.
+        """
+        return [
+            idx
+            for idx in sorted(self._shards)
+            if self._shards[idx].state is ShardState.SUSPECT
+            or (
+                self._shards[idx].state is ShardState.STALE
+                and self._shards[idx].state_before_partial is ShardState.SUSPECT
+            )
+        ]
+
     def state_of(self, shard_idx: int) -> ShardState:
         return self._shards[shard_idx].state
 
@@ -304,6 +327,25 @@ class GenerationFleetHealth:
             shard.last_error = error
         shard.consecutive_probe_successes = 0
         shard.consecutive_probe_failures = self._policy.unhealthy_threshold
+        self._transition(shard, ShardState.DEAD)
+
+    def condemn_silent_participant(self, shard_idx: int, *, reason: str) -> None:
+        """Quarantine a shard that is alive but did not take part in a collective.
+
+        Distinct from :meth:`record_actor_death`, which means "Ray says the process is
+        gone". This one means "the process answers and still broke the refit", which is the
+        failure mode ``is_alive`` cannot see: it is answered by the Ray actor and never
+        touches the engine, so a wedged engine reads as healthy forever.
+
+        DEAD rather than STALE, because the point is to make it *absent*: STALE keeps it in
+        the refit, which is precisely what just hung. The caller owes an independent reason
+        to believe this shard is the culprit -- see the single-suspect rule in
+        ``_recover_from_failed_refit`` -- because this is a judgement, not an observation.
+        """
+        shard = self._shards[shard_idx]
+        if shard.state in _ABSENT_STATES:
+            return
+        shard.last_error = reason
         self._transition(shard, ShardState.DEAD)
 
     def report_failure(self, shard_idx: int, error: BaseException) -> None:
