@@ -23,7 +23,7 @@ from PIL import Image
 
 from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
-    VLLM_PROMPT_KEYS,
+    VLLM_MULTI_MODAL_DATA_KEY,
     PackedTensor,
 )
 
@@ -207,7 +207,7 @@ def collect_multimodal_payload_metrics(
                 value, seen_vllm_segments
             )
             totals["logical_segments"] += _typed_content_media_segment_count(value)
-        elif key in VLLM_PROMPT_KEYS:
+        elif key == VLLM_MULTI_MODAL_DATA_KEY:
             totals["physical_media_bytes"] += _value_nbytes(value, seen_vllm_leaves)
             totals["logical_media_bytes"] += _value_nbytes(value)
             totals["physical_segments"] += _value_segment_count(
