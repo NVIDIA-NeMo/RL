@@ -678,22 +678,39 @@ def test_load_weights_rejects_unnegotiated_mxfp8_payload(fp8_module, monkeypatch
         )
 
 
-def test_load_weights_rejects_prequantized_mxfp8_without_scale(fp8_module, monkeypatch):
+def test_load_weights_accepts_prequantized_mxfp8_split_across_batches(
+    fp8_module, monkeypatch
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
     fp8 = fp8_module
     fp8.global_fp8_config = types.SimpleNamespace(
         is_mx=True,
         refit_prequantize=True,
     )
-    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: True)
+    weight = torch.ones(2, 2, dtype=torch.float8_e4m3fn)
+    scale = torch.ones(2, 1, dtype=torch.uint8)
+    loaded = []
+    monkeypatch.setattr(
+        fp8, "_is_fp8_weight", lambda name, _model: name.endswith(".weight")
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "load_weights_maybe_cached",
+        lambda model, weights, *, cache_loader_routes: loaded.extend(weights),
+    )
+    model_runner = types.SimpleNamespace(
+        model=object(),
+        vllm_config=types.SimpleNamespace(additional_config={}),
+    )
 
-    with pytest.raises(ValueError, match="missing.*scale_from_checkpoint"):
-        fp8.load_weights(
-            [("model.weight", torch.ones(2, 2, dtype=torch.float8_e4m3fn))],
-            types.SimpleNamespace(
-                model=object(),
-                vllm_config=types.SimpleNamespace(additional_config={}),
-            ),
-        )
+    fp8.load_weights([("model.weight", weight)], model_runner)
+    fp8.load_weights([("model.weight_scale_from_checkpoint", scale)], model_runner)
+
+    assert loaded == [
+        ["model.weight", weight],
+        ("model.weight_scale_from_checkpoint", scale),
+    ]
 
 
 def test_load_weights_preserves_non_mx_blockwise_fp8_payload(fp8_module, monkeypatch):
