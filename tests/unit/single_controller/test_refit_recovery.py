@@ -527,3 +527,76 @@ class TestTheControllerStopsWaitingForASilentRank:
 
         assert seen, "the refit must run on a thread we control"
         assert all(t.daemon for t in seen), "and every one of them must be a daemon"
+
+
+class TestAWedgedButAliveEngineIsAttributed:
+    """The failure mode most likely to break a refit, and the one that used to end the run.
+
+    `is_alive()` is answered by the Ray actor and never touches the engine, so the
+    post-abort probe can only ever see a dead PROCESS. An engine that is wedged with its
+    actor healthy stays serving, is never absent, and the recovery refuses -- while that
+    same shard has been driven to SUSPECT by its own timing-out generations. The abort says
+    something stopped participating; SUSPECT says which.
+    """
+
+    def test_a_single_suspect_is_condemned_and_the_run_continues(self):
+        ctrl, monitor, sync = _make_controller(
+            RefitAborted("aborted"), dead_shards=(), shard_count=2
+        )
+        # Wedged, not dead: driven to SUSPECT by failing generations while its actor keeps
+        # answering. Nothing here makes it absent.
+        monitor.report_failure(1, TimeoutError("generation timed out"))
+
+        asyncio.run(ctrl._sync_weights())
+
+        assert monitor.state_of(1) is ShardState.DEAD, "the suspect must be condemned"
+        assert 1 in monitor.absent_shards(), "and thereby excluded from the rebuild"
+
+    def test_the_condemnation_says_why_it_was_not_an_actor_death(self):
+        ctrl, monitor, _ = _make_controller(
+            RefitAborted("aborted"), dead_shards=(), shard_count=2
+        )
+        monitor.report_failure(1, TimeoutError("generation timed out"))
+
+        asyncio.run(ctrl._sync_weights())
+
+        reason = monitor.snapshot()[1].last_error
+        assert "did not participate" in reason, (
+            "the ledger must not claim Ray reported the process gone"
+        )
+
+    def test_two_suspects_still_end_the_run(self):
+        """Condemning the wrong one costs a healthy shard AND leaves the culprit in."""
+        ctrl, monitor, _ = _make_controller(
+            RefitAborted("aborted"), dead_shards=(), shard_count=3
+        )
+        monitor.report_failure(1, TimeoutError("generation timed out"))
+        monitor.report_failure(2, TimeoutError("generation timed out"))
+
+        with pytest.raises(
+            RuntimeError, match="could not be safely rebuilt|identified as absent"
+        ):
+            asyncio.run(ctrl._sync_weights())
+
+        assert monitor.state_of(1) is not ShardState.DEAD
+        assert monitor.state_of(2) is not ShardState.DEAD
+
+    def test_no_suspect_still_ends_the_run(self):
+        """Nothing to go on; guessing would be worse than stopping."""
+        ctrl, monitor, _ = _make_controller(
+            RefitAborted("aborted"), dead_shards=(), shard_count=2
+        )
+
+        with pytest.raises(RuntimeError, match="identified as absent"):
+            asyncio.run(ctrl._sync_weights())
+
+    def test_the_message_names_the_suspects_it_found(self):
+        """'no shard was absent' alone gave the reader nothing to act on."""
+        ctrl, monitor, _ = _make_controller(
+            RefitAborted("aborted"), dead_shards=(), shard_count=3
+        )
+        monitor.report_failure(1, TimeoutError("t"))
+        monitor.report_failure(2, TimeoutError("t"))
+
+        with pytest.raises(RuntimeError, match=r"already suspect"):
+            asyncio.run(ctrl._sync_weights())
