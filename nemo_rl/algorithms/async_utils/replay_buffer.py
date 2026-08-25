@@ -977,13 +977,17 @@ class TQReplayBuffer:
         max_groups: int,
         expected_partition_id: str,
         expected_group_size: int,
+        groups_per_step: int,
+        drop_incomplete_targets_on_restore: bool,
     ) -> int:
         """Validate and re-put checkpointed groups into the buffer.
 
         The preflight runs entirely before any DataPlane write (legacy
         precedent: validate, then truncate):
           1. Validate the envelope and raise ValueError on malformed state.
-          2. Truncate to ``max_groups``, keeping the freshest groups, so the
+          2. Under ``drop_incomplete_targets_on_restore``, drop every group
+             stamped for a target step that is short of ``groups_per_step``.
+          3. Truncate to ``max_groups``, keeping the freshest groups, so the
              restored count can never exceed the buffer's capacity. Groups
              carrying a ``target_step`` are never truncated — an over-capacity
              in-order checkpoint raises instead (see Raises).
@@ -1002,6 +1006,13 @@ class TQReplayBuffer:
             expected_group_size: num_generations_per_prompt; every group must
                 hold exactly this many rows (a changed group size silently
                 breaks the group-relative baseline).
+            groups_per_step: num_prompts_per_step; the group count that makes a
+                target step whole. Read only when dropping incomplete targets.
+            drop_incomplete_targets_on_restore: Drop the restored groups of a
+                target step that is short of a full batch, so the rollout pump
+                dispatches that step from subsequent dataloader prompts instead
+                of gap-filling the hole. The original prompts are not
+                regenerated. Groups carrying no target_step are never dropped.
 
         Returns:
             Number of groups restored into the buffer.
@@ -1061,6 +1072,34 @@ class TQReplayBuffer:
                     )
                 seen_sample_ids.add(sid)
 
+        num_dropped_incomplete = 0
+        if drop_incomplete_targets_on_restore:
+            target_counts = Counter(
+                group["target_step"]
+                for group in groups
+                if group["target_step"] is not None
+            )
+            incomplete = {
+                target
+                for target, count in target_counts.items()
+                if count < groups_per_step
+            }
+            if incomplete:
+                kept = [
+                    group for group in groups if group["target_step"] not in incomplete
+                ]
+                num_dropped_incomplete = len(groups) - len(kept)
+                groups = kept
+                print(
+                    "Dropping partially restored target step(s) "
+                    + ", ".join(
+                        f"{target}={target_counts[target]}/{groups_per_step}"
+                        for target in sorted(incomplete)
+                    )
+                    + "; the rollout pump refills them from subsequent prompts",
+                    flush=True,
+                )
+
         if state["saved_capacity"] != max_groups:
             print(
                 "TQReplayBuffer capacity changed: "
@@ -1106,6 +1145,11 @@ class TQReplayBuffer:
             self._group_ids.append(group["group_id"])
 
         summary = f"📦 Restored {len(groups)} replay group(s) from checkpoint"
+        if num_dropped_incomplete:
+            summary += (
+                f"; dropped {num_dropped_incomplete} group(s) from incomplete "
+                "target step(s)"
+            )
         if num_truncated:
             summary += f"; truncated {num_truncated} group(s) over capacity"
         print(summary, flush=True)

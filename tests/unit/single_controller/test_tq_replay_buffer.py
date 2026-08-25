@@ -32,6 +32,8 @@ from nemo_rl.experience.interfaces import PromptGroupRecord
 
 # Each record yields _N_GENS training rows.
 _N_GENS = 2
+# Groups that make one target step whole (production: num_prompts_per_step).
+_GROUPS_PER_STEP = 2
 
 
 def _stub_record_to_train_batch(
@@ -573,6 +575,8 @@ def _load(
     max_groups: int = 8,
     expected_partition_id: str = "rollout_data",
     expected_group_size: int = _N_GENS,
+    groups_per_step: int = _GROUPS_PER_STEP,
+    drop_incomplete_targets_on_restore: bool = False,
 ) -> int:
     return _run(
         buf.load_state_dict(
@@ -580,6 +584,8 @@ def _load(
             max_groups=max_groups,
             expected_partition_id=expected_partition_id,
             expected_group_size=expected_group_size,
+            groups_per_step=groups_per_step,
+            drop_incomplete_targets_on_restore=drop_incomplete_targets_on_restore,
         )
     )
 
@@ -832,3 +838,66 @@ class TestTQReplayBufferLoadTruncation:
 
         assert _load(buf, state, max_groups=2) == 2
         assert buf.target_step_list == [1, 2]
+
+
+class TestTQReplayBufferLoadDropIncompleteTargets:
+    """``drop_incomplete_targets_on_restore`` discards partially restored steps."""
+
+    @staticmethod
+    def _partial_envelope() -> dict[str, Any]:
+        # Target 1 is whole (_GROUPS_PER_STEP groups); target 2 lost one to the
+        # in-flight cutoff at save time, so only one of its two groups is here.
+        return _make_envelope(
+            [
+                _make_group_entry("g0", weight=1, target_step=1),
+                _make_group_entry("g1", weight=1, target_step=1),
+                _make_group_entry("g2", weight=2, target_step=2),
+            ],
+            saved_capacity=8,
+        )
+
+    def test_incomplete_target_dropped_and_complete_target_kept(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+
+        restored = _load(
+            buf, self._partial_envelope(), drop_incomplete_targets_on_restore=True
+        )
+
+        assert restored == 2
+        assert buf.target_step_list == [1, 1]
+        put_sample_ids = [sid for c in dp.put_calls for sid in c["sample_ids"]]
+        assert "g2_g0" not in put_sample_ids
+
+    def test_incomplete_target_retained_by_default(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+
+        assert _load(buf, self._partial_envelope()) == 3
+        assert buf.target_step_list == [1, 1, 2]
+
+    def test_unstamped_groups_are_never_dropped(self):
+        # Only a stamped step can be short of a batch; under a sampler that
+        # stamps nothing the knob must leave the whole checkpoint alone.
+        state = _make_envelope(
+            [_make_group_entry(f"g{w}", weight=w) for w in (1, 2, 3)],
+            saved_capacity=8,
+        )
+        buf = _make_buffer(FakeDataPlaneClient())
+
+        assert _load(buf, state, drop_incomplete_targets_on_restore=True) == 3
+        assert buf.target_step_list == [None, None, None]
+
+    def test_dropping_runs_before_truncation(self):
+        # The drop is what brings this checkpoint back inside capacity, so it
+        # must happen first -- truncating a target-stamped envelope raises.
+        buf = _make_buffer(FakeDataPlaneClient())
+
+        restored = _load(
+            buf,
+            self._partial_envelope(),
+            max_groups=2,
+            drop_incomplete_targets_on_restore=True,
+        )
+
+        assert restored == 2
+        assert buf.target_step_list == [1, 1]

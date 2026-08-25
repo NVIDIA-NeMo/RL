@@ -21,6 +21,9 @@ async_rl:
   max_inflight_prompts: ${grpo.num_prompts_per_step}
   # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
   max_buffered_rollouts: 64
+  # in_order only. On resume, drop a target step's restored groups when it is
+  # short of a full batch instead of gap-filling it from subsequent prompts.
+  drop_incomplete_targets_on_restore: false
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
 
