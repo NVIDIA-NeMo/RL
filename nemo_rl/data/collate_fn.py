@@ -16,7 +16,7 @@ from typing import Any, Union
 import torch
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
-from nemo_rl.data.interfaces import DatumSpec, PreferenceDatumSpec
+from nemo_rl.data.interfaces import DatumSpec, OAPLDatumSpec, PreferenceDatumSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
@@ -212,6 +212,95 @@ def preference_collate_fn(
             "input_ids": cat_and_padded["token_ids"],
             "input_lengths": input_lengths,
             "sample_mask": batch["loss_multiplier"],
+        }
+    )
+    if add_loss_mask:
+        data["token_mask"] = cat_and_padded["token_loss_mask"]
+
+    return data
+
+
+def oapl_collate_fn(
+    data_batch: list[OAPLDatumSpec],
+    tokenizer: TokenizerType,
+    make_sequence_length_divisible_by: int,
+    add_loss_mask: bool,
+) -> BatchedDataDict[Any]:
+    """Collate function for OAPL training.
+
+    Unlike ``preference_collate_fn``, each datum is an independent (x, y)
+    trajectory: ``reward``, ``reference_policy_logprob``, and ``log_z`` are
+    precomputed offline, so no chosen/rejected interleaving is needed.
+
+    ``y`` may be a multi-turn agentic trajectory (assistant tool-call turns
+    interleaved with tool-result turns), so the token loss mask unmasks every
+    ``"assistant"`` role message rather than only the final message. Tool
+    (and user) turns stay masked out, so tool outputs never contribute to
+    log pi(y|x).
+
+    Args:
+        data_batch: List of data samples with message_log, reward, reference_policy_logprob, log_z, loss_multiplier, idx, and task_name fields.
+        tokenizer: Tokenizer for text processing
+        make_sequence_length_divisible_by: Make the sequence length divisible by this value
+        add_loss_mask: Whether to add a token_mask to the returned data
+    Returns:
+        BatchedDataDict with input_ids, input_lengths, token_mask (optional), sample_mask, reward, reference_policy_logprob, and log_z fields.
+    """
+    message_log = [datum_spec["message_log"] for datum_spec in data_batch]
+    length = torch.tensor([datum_spec["length"] for datum_spec in data_batch])
+    loss_multiplier = torch.tensor(
+        [datum_spec["loss_multiplier"] for datum_spec in data_batch]
+    )
+    reward = torch.tensor(
+        [datum_spec["reward"] for datum_spec in data_batch], dtype=torch.float32
+    )
+    reference_policy_logprob = torch.tensor(
+        [datum_spec["reference_policy_logprob"] for datum_spec in data_batch],
+        dtype=torch.float32,
+    )
+    log_z = torch.tensor(
+        [datum_spec["log_z"] for datum_spec in data_batch], dtype=torch.float32
+    )
+    idx = [datum_spec["idx"] for datum_spec in data_batch]
+    task_names = [datum_spec.get("task_name", None) for datum_spec in data_batch]
+
+    batch_max_length = torch.ones_like(length) * length.max()
+
+    batch: BatchedDataDict[Any] = BatchedDataDict(
+        message_log=message_log,
+        length=length,
+        loss_multiplier=loss_multiplier,
+        task_name=task_names,
+        idx=idx,
+        batch_max_length=batch_max_length,
+    )
+
+    if add_loss_mask:
+        # y may be a multi-turn agentic trajectory (e.g. assistant tool-call
+        # turns interleaved with tool-result turns), not a single final
+        # message, so unmask every assistant turn rather than only the last
+        # message. Non-assistant turns (user/tool) stay masked out, so tool
+        # outputs never contribute to log pi(y|x).
+        add_loss_mask_to_message_log(
+            batch["message_log"],
+            roles_to_train_on=["assistant"],
+            only_unmask_final=False,
+        )
+
+    cat_and_padded, input_lengths = batched_message_log_to_flat_message(
+        batch["message_log"],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+        make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+    )
+
+    data: BatchedDataDict[Any] = BatchedDataDict(
+        {
+            "input_ids": cat_and_padded["token_ids"],
+            "input_lengths": input_lengths,
+            "sample_mask": batch["loss_multiplier"],
+            "reward": reward,
+            "reference_policy_logprob": reference_policy_logprob,
+            "log_z": log_z,
         }
     )
     if add_loss_mask:
