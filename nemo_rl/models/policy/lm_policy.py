@@ -119,7 +119,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             if configured_extension_fqn is not None
             else worker_extension_cls_fqn
         )
-        if extension_fqn is not None and config.get("quant_cfg") is not None:
+        # Only the config-supplied FQN is mutually exclusive with quant_cfg: a config
+        # author cannot know which worker quant_cfg resolves to, so silently replacing
+        # it would be a footgun. The constructor argument is exempt because callers
+        # passing it already see the resolved class name and are expected to subclass
+        # it, which has always been supported alongside quantization.
+        if configured_extension_fqn is not None and config.get("quant_cfg") is not None:
             raise ValueError(
                 "worker_extension_cls_fqn and quant_cfg are mutually exclusive: "
                 "a custom policy worker cannot be combined with ModelOpt quantization"

@@ -176,6 +176,10 @@ def create_megatron_config(
     [
         ("tests.extensions.CustomPolicyWorker", None),
         (None, "tests.extensions.CustomPolicyWorker"),
+        (
+            "tests.extensions.CustomPolicyWorker",
+            "tests.extensions.CustomPolicyWorker",
+        ),
     ],
 )
 def test_policy_selects_worker_extension_from_config_or_constructor(
@@ -196,6 +200,28 @@ def test_policy_selects_worker_extension_from_config_or_constructor(
             config=config,
             tokenizer=create_mock_tokenizer(),
             worker_extension_cls_fqn=explicit_extension_fqn,
+        )
+
+    assert worker_builder.call_args.args[0] == "tests.extensions.CustomPolicyWorker"
+
+
+def test_policy_constructor_worker_extension_allows_quantization() -> None:
+    """The constructor argument may extend the quant-resolved worker; the config field may not."""
+    config = create_dtensor_config("test-model", tp=1)
+    config["quant_cfg"] = "NVFP4"
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
+        patch("nemo_rl.models.policy.lm_policy.get_default_hf_config"),
+        patch("nemo_rl.models.policy.lm_policy.FLOPTracker"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn="tests.extensions.CustomPolicyWorker",
         )
 
     assert worker_builder.call_args.args[0] == "tests.extensions.CustomPolicyWorker"
