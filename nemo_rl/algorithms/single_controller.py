@@ -410,6 +410,9 @@ class SingleControllerActor:
         Skipped with a warning when the checkpoint was written under a
         different sampler: restored groups carry the saving sampler's
         weight/target-step stamps, which another policy may never select.
+
+        A target step restored short of a full batch is gap-filled by the rollout
+        pump, unless async_rl.drop_incomplete_targets_on_restore drops it instead.
         """
         if self._last_checkpoint_path is None:
             return
@@ -442,6 +445,10 @@ class SingleControllerActor:
             max_groups=self._async_cfg.max_buffered_rollouts,
             expected_partition_id=self._partition_id,
             expected_group_size=self._algo_cfg.num_generations_per_prompt,
+            groups_per_step=self._algo_cfg.num_prompts_per_step,
+            drop_incomplete_targets_on_restore=(
+                self._async_cfg.drop_incomplete_targets_on_restore
+            ),
         )
         # Each buffered group holds one _buffer_capacity permit; the load
         # truncation guarantees restored <= capacity, so this never blocks.

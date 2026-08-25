@@ -712,3 +712,34 @@ class TestADropBudgetNeedsASamplerThatStamps:
             rollout_failure={"max_consecutive_dropped_prompts": 2},
         )
         validate_single_controller_config(cfg)
+
+
+class TestDropIncompleteTargetsOnRestore:
+    """The knob is in_order-only: nothing else stamps the target step it drops."""
+
+    def test_default_is_off(self):
+        assert AsyncRLConfig().drop_incomplete_targets_on_restore is False
+
+    @pytest.mark.parametrize(
+        "sampler",
+        [
+            {"name": "windowed"},
+            {"name": "weight_fifo"},
+            {"name": "ready_first"},
+            # Rejected even though a custom sampler may well stamp target steps:
+            # setup cannot know that it does without importing it.
+            {"name": "custom", "target": "some_module:SomeSampler"},
+        ],
+        ids=lambda sampler: sampler["name"],
+    )
+    def test_rejected_under_every_sampler_but_in_order(self, sampler):
+        cfg = _master_config(
+            sampler=sampler,
+            drop_incomplete_targets_on_restore=True,
+        )
+        with pytest.raises(NotImplementedError, match="sampler.name='in_order' only"):
+            validate_single_controller_config(cfg)
+
+    def test_accepted_under_in_order(self):
+        cfg = _master_config(drop_incomplete_targets_on_restore=True)
+        validate_single_controller_config(cfg)

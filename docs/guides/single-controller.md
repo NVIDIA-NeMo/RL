@@ -95,6 +95,7 @@ Field definitions:
 - `max_buffered_rollouts` — hard cap on unconsumed rollout groups buffered in the data plane. Validated at setup against the gated sampler's required capacity; a value too small deadlocks the rollout pump, so setup raises instead of silently blocking. Sized from the widest window the run ever uses, so `warmup_lookahead_versions` rather than `max_lookahead_versions` when it is set.
 - `min_groups_for_streaming_train` — minimum ready groups the trainer waits for before dispatching a batch. Set to `num_prompts_per_step` for sync/legacy semantics; lower for streaming. (PPO) Must equal `num_prompts_per_step` — the critic has no split train API, so one `train_from_meta` call is one optimizer step, and streaming a step across chunks would step the critic once per chunk.
 - `sampler.warmup_lookahead_versions` (PPO) — lookahead used while `ppo.policy_training_start_step` critic warmup is in progress, shrinking back to `max_lookahead_versions` afterwards. The SC equivalent of `ppo.async_ppo.warmup_generation_lead_steps`.
+- `drop_incomplete_targets_on_restore` — `in_order` only; setup raises under any other sampler. On resume a target step holding fewer than `num_prompts_per_step` groups is gap-filled by default: the rollout pump dispatches only the missing prompts and drops the rest of that dataloader batch. `true` discards the restored groups and dispatches the step whole instead. Neither regenerates the original prompts. The SC equivalent of `ppo.async_ppo.drop_incomplete_targets_on_restore`.
 
 ## Implementation Structure
 

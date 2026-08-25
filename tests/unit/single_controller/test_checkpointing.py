@@ -50,7 +50,11 @@ import torch
 import yaml
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSamplerConfig,
+    SamplerConfig,
+    WindowedSamplerConfig,
+)
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     GRPOSaveState,
@@ -272,6 +276,8 @@ class _FakeTQBuffer:
         max_groups: int,
         expected_partition_id: str,
         expected_group_size: int,
+        groups_per_step: int,
+        drop_incomplete_targets_on_restore: bool,
     ) -> int:
         self.load_calls.append(
             {
@@ -279,6 +285,10 @@ class _FakeTQBuffer:
                 "max_groups": max_groups,
                 "expected_partition_id": expected_partition_id,
                 "expected_group_size": expected_group_size,
+                "groups_per_step": groups_per_step,
+                "drop_incomplete_targets_on_restore": (
+                    drop_incomplete_targets_on_restore
+                ),
             }
         )
         return self.load_return
@@ -322,13 +332,19 @@ def _actor_master_config(
     ft_save_period: Optional[int] = None,
     num_prompts_per_step: int = 2,
     max_num_epochs: int = 1,
+    sampler: Optional[SamplerConfig] = None,
+    drop_incomplete_targets_on_restore: bool = False,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
     All fields are populated (init_tmp_checkpoint dumps the whole config to
     config.yaml); values satisfy validate_single_controller_config.
     """
-    sampler_cfg = WindowedSamplerConfig(max_staleness_versions=1)
+    sampler_cfg = (
+        sampler
+        if sampler is not None
+        else WindowedSamplerConfig(max_staleness_versions=1)
+    )
     return MasterConfig.model_construct(
         policy={
             # One optimizer.step per RL step: prompts * generations == gbs.
@@ -371,6 +387,7 @@ def _actor_master_config(
             min_groups_for_streaming_train=1,
             max_inflight_prompts=4,
             max_buffered_rollouts=4,
+            drop_incomplete_targets_on_restore=drop_incomplete_targets_on_restore,
         ),
     )
 
@@ -464,6 +481,17 @@ def _run_reserve_restore(mc: MasterConfig, actor_args: SingleControllerActorArgs
     async def _main():
         actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
         await actor._maybe_restore_replacement_reserve()
+        return actor
+
+    return asyncio.run(_main())
+
+
+def _run_buffer_restore(mc: MasterConfig, actor_args: SingleControllerActorArgs):
+    """Construct the actor and await only the replay-buffer restore."""
+
+    async def _main():
+        actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
+        await actor._maybe_restore_replay_buffer()
         return actor
 
     return asyncio.run(_main())
@@ -1301,6 +1329,8 @@ class TestReplayBufferPersistence:
                 "max_groups": 4,
                 "expected_partition_id": _PARTITION_ID,
                 "expected_group_size": 2,
+                "groups_per_step": 2,
+                "drop_incomplete_targets_on_restore": False,
             }
         ]
         # Each restored group holds one _buffer_capacity permit.
@@ -1308,6 +1338,34 @@ class TestReplayBufferPersistence:
         assert result["train_steps"] == 0
         # run()'s finally must tear the synchronizer down exactly once.
         assert actor._weight_synchronizer.shutdown_count == 1
+
+    def test_the_drop_flag_is_forwarded_to_the_buffer(self, tmp_path):
+        """The knob is in_order-only, so the restore must carry it, not default it."""
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        envelope = {"groups": ["g0"]}
+        torch.save(envelope, ckpt_dir / "replay_buffer.pt")
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=0,
+            sampler=InOrderSamplerConfig(max_lookahead_versions=1),
+            drop_incomplete_targets_on_restore=True,
+        )
+        save_state = _initial_grpo_save_state()
+        save_state.sampler_name = "in_order"
+        buffer = _FakeTQBuffer(load_return=1)
+
+        _run_buffer_restore(
+            mc,
+            _make_actor_args(
+                tq_buffer=buffer,
+                last_checkpoint_path=str(ckpt_dir),
+                save_state=save_state,
+            ),
+        )
+
+        assert len(buffer.load_calls) == 1
+        assert buffer.load_calls[0]["drop_incomplete_targets_on_restore"] is True
 
     def test_restored_permits_are_released_by_a_live_pump(self, tmp_path):
         # The restore takes one capacity permit per group; a running pump must
