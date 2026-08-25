@@ -1228,8 +1228,8 @@ def apply_te_precision_config(model_cfg: Any, config: PolicyConfig) -> None:
     ):
         raise ValueError(
             "generation.nvfp4_pertoken_rollout requires policy.precision="
-            "bfloat16 and megatron_cfg.fp4_cfg={enabled: true, fp4: e2m1, "
-            "fp4_recipe: nvfp4, fp4_param: false}"
+            "bfloat16 and megatron_cfg.fp4_cfg={enabled: true, fp4: e2m1} "
+            "with fp4_recipe=nvfp4 and fp4_param=false"
         )
     if fp8_on and fp4_on:
         raise ValueError(
@@ -1246,14 +1246,8 @@ def apply_te_precision_config(model_cfg: Any, config: PolicyConfig) -> None:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
 
     if fp4_cfg is not None and fp4_cfg.enabled:
-        required = {
-            "fp4": fp4_cfg.fp4,
-            "fp4_recipe": fp4_cfg.fp4_recipe,
-            "fp4_param": fp4_cfg.fp4_param,
-        }
-        missing = [name for name, value in required.items() if value is None]
-        if missing:
-            raise KeyError(f"Missing key in fp4_cfg: {missing[0]!r}")
+        if fp4_cfg.fp4 is None:
+            raise KeyError("Missing key in fp4_cfg: 'fp4'")
         model_cfg.fp4 = fp4_cfg.fp4
         model_cfg.fp4_recipe = fp4_cfg.fp4_recipe
         model_cfg.fp4_param = fp4_cfg.fp4_param

@@ -311,8 +311,8 @@ class Fp4Config(BaseModel, extra="forbid"):
 
     enabled: bool
     fp4: str | None = None
-    fp4_recipe: str | None = None
-    fp4_param: bool | None = None
+    fp4_recipe: str = "nvfp4"
+    fp4_param: bool = False
 
 
 # Type exists to be lax if not specified
