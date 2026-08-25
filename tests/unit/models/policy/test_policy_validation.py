@@ -131,6 +131,7 @@ def create_megatron_config(
         "logprob_batch_size": 1,
         "precision": "float32",
         "offload_optimizer_for_logprob": False,
+        "make_sequence_length_divisible_by": tp,
         "generation": {
             "backend": "hf",
             "temperature": 1.0,
@@ -446,3 +447,35 @@ def test_world_size_validation_megatron(
             )
         # For failing cases, worker group should not be created
         mock_ray_worker_group.assert_not_called()
+
+
+@pytest.mark.mcore
+@patch("nemo_rl.models.policy.lm_policy.RayQueue")
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_batch_invariant_te_native_pins_worker_cublaslt_workspace(
+    mock_ray_worker_group,
+    _mock_ray_queue,
+):
+    """The te_native backend pins cuBLASLt before actor CUDA imports."""
+    cluster = create_mock_cluster(world_size=2)
+    tokenizer = create_mock_tokenizer()
+    config = create_megatron_config("unused-model", tp=2)
+    config["megatron_cfg"].update(
+        {
+            "batch_invariant_mode": True,
+            "batch_invariant_backend": "te_native",
+            "env_vars": {"CUBLASLT_WORKSPACE_SIZE": "1048576"},
+        }
+    )
+
+    with patch(
+        "nemo_rl.models.policy.lm_policy.get_default_hf_config",
+        side_effect=ValueError("unused in this test"),
+    ):
+        Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+
+    assert mock_ray_worker_group.call_args.kwargs["env_vars"] == {
+        "CUBLASLT_WORKSPACE_SIZE": "0"
+    }
+    assert config["make_sequence_length_divisible_by"] == 64
+    assert config["dynamic_batching"]["sequence_length_round"] == 64

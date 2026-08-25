@@ -291,7 +291,14 @@ class MegatronGenerationMixin:
             ),
             logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
-            logprobs_mode="processed_logprobs",
+            # Sampling parameters control token selection, but batch-invariant
+            # generation reports raw model logprobs. Policy scoring mirrors this
+            # contract so parity is independent of temperature/top-k/top-p.
+            logprobs_mode=(
+                "raw_logprobs"
+                if self.cfg["megatron_cfg"].get("batch_invariant_mode")
+                else "processed_logprobs"
+            ),
             max_requests=max_requests,
         )
 

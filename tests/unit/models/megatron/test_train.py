@@ -143,6 +143,25 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert call_kwargs["fp32_output"] is False
 
+    def test_model_forward_can_gather_tensor_parallel_logits(self):
+        """The logprob path can request full-vocabulary logits at runtime."""
+        from nemo_rl.models.megatron.train import model_forward
+
+        mock_model = MagicMock(return_value=torch.randn(1, 3, 100))
+        mock_data_dict = MagicMock()
+        mock_data_dict.get_multimodal_dict.return_value = {}
+
+        model_forward(
+            model=mock_model,
+            data_dict=mock_data_dict,
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            position_ids=torch.tensor([[0, 1, 2]]),
+            attention_mask=torch.ones(1, 3),
+            gather_output=True,
+        )
+
+        assert mock_model.call_args.kwargs["runtime_gather_output"] is True
+
     def test_model_forward_clears_position_ids_for_multimodal(self):
         """Test model_forward sets position_ids to None for multimodal data."""
         from nemo_rl.models.megatron.train import model_forward
@@ -288,7 +307,10 @@ class TestForwardWithPostProcessingFn:
         )
 
         data_iterator = iter([processed_mb])
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"batch_invariant_mode": True},
+        }
         post_processor = LogprobsPostProcessor(cfg=cfg)
 
         with patch.object(post_processor, "__call__", return_value=MagicMock()):
@@ -299,6 +321,7 @@ class TestForwardWithPostProcessingFn:
             )
 
         mock_model_forward.assert_called_once()
+        assert mock_model_forward.call_args.kwargs["gather_output"] is True
 
     @patch("nemo_rl.models.megatron.train.model_forward")
     def test_forward_with_topk_post_processor(self, mock_model_forward):
@@ -1113,6 +1136,42 @@ class TestLossPostProcessor:
         assert isinstance(metrics, dict)
         assert len(metrics) == 1 and metrics["loss"] == 0.5
 
+    @patch("nemo_rl.models.megatron.train.wrap_loss_fn_with_input_preparation")
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_rank")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1
+    )
+    def test_batch_invariant_logprob_loss_uses_full_vocab_logits(
+        self,
+        mock_cp_size,
+        mock_cp_group,
+        mock_tp_rank,
+        mock_tp_group,
+        mock_wrap_loss,
+    ):
+        """Gathered logits must not be interpreted as a TP vocabulary shard."""
+        from nemo_rl.models.megatron.train import LossPostProcessor
+
+        mock_loss_fn = MagicMock()
+        mock_loss_fn.input_type = LossInputType.LOGPROB
+        mock_wrap_loss.return_value = (torch.tensor(0.5), {})
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"batch_invariant_mode": True},
+        }
+
+        wrapped_fn = LossPostProcessor(
+            loss_fn=mock_loss_fn, cfg=cfg, cp_normalize=False
+        )(data_dict=MagicMock())
+        wrapped_fn(torch.randn(1, 3, 8))
+
+        assert mock_wrap_loss.call_args.kwargs["vocab_parallel_rank"] is None
+        assert mock_wrap_loss.call_args.kwargs["vocab_parallel_group"] is None
+        mock_tp_rank.assert_not_called()
+        mock_tp_group.assert_not_called()
+
     @patch(
         "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
     )
@@ -1224,6 +1283,33 @@ class TestLogprobsPostProcessor:
         assert "logprobs" in result
         # Logprobs should be prepended with a 0
         assert result["logprobs"].shape[1] == 5
+
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_rank")
+    @patch("nemo_rl.models.megatron.train.from_parallel_logits_to_logprobs")
+    @patch("nemo_rl.models.megatron.train.get_next_token_logprobs_from_logits")
+    def test_batch_invariant_logprobs_use_full_vocab_path(
+        self, mock_full_vocab, mock_distributed, mock_tp_rank, mock_tp_group
+    ):
+        """Batch-invariant rescoring mirrors generation's full-vocab log_softmax."""
+        from nemo_rl.models.megatron.train import LogprobsPostProcessor
+
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"batch_invariant_mode": True},
+        }
+        processor = LogprobsPostProcessor(cfg=cfg)
+        input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+        data = MagicMock()
+        data.__getitem__ = MagicMock(return_value=input_ids)
+        mock_full_vocab.return_value = torch.randn(1, 4)
+
+        processor(data, input_ids, None)(torch.randn(1, 5, 16))
+
+        mock_full_vocab.assert_called_once()
+        mock_distributed.assert_not_called()
+        mock_tp_rank.assert_not_called()
+        mock_tp_group.assert_not_called()
 
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(

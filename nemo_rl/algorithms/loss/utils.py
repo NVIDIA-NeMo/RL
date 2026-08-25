@@ -51,8 +51,10 @@ def prepare_loss_input(
         logits: Logits from the model.
         data: Microbatch data. Will be updated if sampling_params is not None.
         loss_fn: Loss function.
-        vocab_parallel_rank: Vocab parallel rank.
-        vocab_parallel_group: Vocab parallel group.
+        vocab_parallel_rank: Vocab parallel rank. Leave unset with
+            vocab_parallel_group when logits contain the full vocabulary.
+        vocab_parallel_group: Vocab parallel group. Leave unset with
+            vocab_parallel_rank when logits contain the full vocabulary.
         context_parallel_group: Context parallel group.
         sampling_params: Sampling parameters.
         d2t: Draft to target token mapping.
@@ -304,11 +306,12 @@ def prepare_packed_loss_input(
             f"got {loss_fn.input_type}. Use SequencePackingLossWrapper with "
             f"prepare_loss_input for other types."
         )
-    assert vocab_parallel_group is not None, (
-        "prepare_packed_loss_input requires vocab_parallel_group (Megatron TP)."
+    assert (vocab_parallel_group is None) == (vocab_parallel_rank is None), (
+        "vocab_parallel_rank and vocab_parallel_group must either both be provided "
+        "or both be None for full-vocabulary logits."
     )
-    assert vocab_parallel_rank is not None, (
-        "vocab_parallel_rank must be provided with vocab_parallel_group."
+    resolved_vocab_parallel_rank = (
+        0 if vocab_parallel_rank is None else vocab_parallel_rank
     )
 
     input_ids = data["input_ids"]
@@ -345,8 +348,8 @@ def prepare_packed_loss_input(
         packed_rolled_targets,
         cu_seqlens_q_padded,
         unpacked_seqlen,
-        vocab_start_index=vocab_parallel_rank * logits.shape[-1],
-        vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+        vocab_start_index=resolved_vocab_parallel_rank * logits.shape[-1],
+        vocab_end_index=(resolved_vocab_parallel_rank + 1) * logits.shape[-1],
         group=vocab_parallel_group,
         inference_only=False,
         cp_group=context_parallel_group,
@@ -371,8 +374,9 @@ def prepare_packed_loss_input(
                     packed_rolled_targets,
                     cu_seqlens_q_padded,
                     unpacked_seqlen,
-                    vocab_start_index=vocab_parallel_rank * logits.shape[-1],
-                    vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+                    vocab_start_index=resolved_vocab_parallel_rank * logits.shape[-1],
+                    vocab_end_index=(resolved_vocab_parallel_rank + 1)
+                    * logits.shape[-1],
                     group=vocab_parallel_group,
                     inference_only=False,
                     cp_group=context_parallel_group,

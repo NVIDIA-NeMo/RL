@@ -1049,7 +1049,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     unpacked_seqlen: int,
     vocab_start_index: int,
     vocab_end_index: int,
-    group: torch.distributed.ProcessGroup,
+    group: Optional[torch.distributed.ProcessGroup],
     inference_only: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     chunk_size: Optional[int] = None,
@@ -1070,7 +1070,8 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         unpacked_seqlen (int): The length of the unpacked sequence tensor.
         vocab_start_index (int): Starting vocabulary index for this worker's partition.
         vocab_end_index (int): Ending vocabulary index for this worker's partition.
-        group (torch.distributed.ProcessGroup): Process group for distributed communication.
+        group (torch.distributed.ProcessGroup, optional): Tensor-parallel process
+            group. If None, logits already contain the full vocabulary.
         inference_only (bool, optional): If True, tensors won't be saved for backward pass. Defaults to False.
         cp_group (torch.distributed.ProcessGroup, optional): Context parallelism process group. Defaults to None.
         chunk_size (int, optional): Sequence dimension chunk size for computing the log probabilities.
@@ -1110,8 +1111,23 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         target = rolled_targets.unsqueeze(0)
         vocab_parallel_logits = vocab_parallel_logits.unsqueeze(0)
 
+    # Batch-invariant Megatron scoring gathers the full vocabulary before using
+    # the same canonical FP32 log_softmax as generation. Keeping this branch in
+    # the packed helper lets packed and unpacked callers share that contract.
+    if group is None:
+        logits = vocab_parallel_logits.to(torch.float32)
+        logits, _ = apply_top_k_top_p(
+            logits,
+            top_k=sampling_params.top_k if sampling_params is not None else None,
+            top_p=sampling_params.top_p if sampling_params is not None else 1.0,
+        )
+        probs = (
+            torch.nn.functional.log_softmax(logits, dim=-1)
+            .gather(dim=-1, index=target.unsqueeze(-1))
+            .squeeze(-1)
+        )
     # Apply distributed log probability computation
-    if need_top_k_or_top_p_filtering(sampling_params):
+    elif need_top_k_or_top_p_filtering(sampling_params):
         if chunk_size is not None:
             probs: torch.Tensor = ChunkedDistributedLogprobWithSampling.apply(  # type: ignore
                 vocab_parallel_logits,

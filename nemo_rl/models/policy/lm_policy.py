@@ -38,6 +38,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+from nemo_rl.models.megatron.batch_invariant import batch_invariant_token_multiple
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -142,6 +143,27 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "Disable policy.sequence_packing.enabled or policy.draft."
             )
         if megatron_enable:
+            if (
+                config["megatron_cfg"].get("batch_invariant_mode")
+                and not config["sequence_packing"]["enabled"]
+            ):
+                # Native TE kernels are invariant when eager policy scoring uses
+                # the same aligned token dimension as MCore generation buckets.
+                # Sequence packing aligns its total token count in megatron.data.
+                tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
+                config["make_sequence_length_divisible_by"] = (
+                    batch_invariant_token_multiple(
+                        config["make_sequence_length_divisible_by"], tp_size
+                    )
+                )
+                if config["dynamic_batching"]["enabled"]:
+                    config["dynamic_batching"]["sequence_length_round"] = (
+                        batch_invariant_token_multiple(
+                            config["dynamic_batching"]["sequence_length_round"],
+                            tp_size,
+                        )
+                    )
+
             worker_builder_cls_fqn = resolve_policy_worker_cls(
                 "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
                 config,
@@ -151,6 +173,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
             env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
+            if (
+                config["megatron_cfg"].get("batch_invariant_mode")
+                and config["megatron_cfg"].get("batch_invariant_backend") == "te_native"
+            ):
+                # te_native obtains invariance by disabling cuBLASLt split-K.
+                # This must be set in the actor runtime environment: importing
+                # the Megatron worker can initialize CUDA before __init__ calls
+                # enable_batch_invariant_mode().
+                env_vars["CUBLASLT_WORKSPACE_SIZE"] = "0"
 
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 raise RuntimeError(

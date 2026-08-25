@@ -378,6 +378,22 @@ class MegatronConfig(TypedDict):
     # Attention backend available values:
     # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/enums.py#L60
     attention_backend: NotRequired[str]
+    # Enable Megatron-Core's batch-invariant kernels for bitwise-identical
+    # Megatron generation and policy logprobs. This mode currently supports
+    # BF16 with matching training/generation TP, CP=1, and FlashAttention 3/4.
+    # NeMo-RL automatically aligns the scoring token dimension with MCore's
+    # batch-invariant inference buckets; no recipe-level padding override is needed.
+    # Sampling may use any supported temperature, top-k, or top-p settings;
+    # generation and training compare the corresponding raw model logprobs.
+    batch_invariant_mode: NotRequired[bool]
+    # Megatron-Core kernel backend used by batch_invariant_mode. "te_native"
+    # is the performant default; "triton" and "deepgemm" are legacy options.
+    batch_invariant_backend: NotRequired[Literal["deepgemm", "te_native", "triton"]]
+    # Cross-rank EP combine. "ordered" is portable; "multimem" uses NVLS.
+    batch_invariant_collective: NotRequired[Literal["multimem", "ordered"]]
+    # Pin the FlashAttention generation used by both training and inference.
+    # batch_invariant_mode requires version 3 or 4.
+    flash_attention_version: NotRequired[Literal[2, 3, 4] | None]
     moe_per_layer_logging: bool
     # Set to true to enable DeepEP for expert parallel communication
     # Must set moe_token_dispatcher_type to 'flex'

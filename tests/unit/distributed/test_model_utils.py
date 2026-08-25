@@ -42,6 +42,34 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 
 
+def test_packed_full_vocab_logprobs_use_canonical_log_softmax():
+    """Gathered packed logits use differentiable FP32 log_softmax without TP ops."""
+    logits = torch.randn(1, 6, 8, dtype=torch.bfloat16, requires_grad=True)
+    targets = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+
+    actual = from_parallel_logits_to_logprobs_packed_sequences(
+        logits,
+        targets,
+        cu_seqlens,
+        unpacked_seqlen=3,
+        vocab_start_index=0,
+        vocab_end_index=8,
+        group=None,
+    )
+    full_logprobs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+    expected = torch.stack(
+        (
+            torch.stack((full_logprobs[0, 0, 2], full_logprobs[0, 1, 3])),
+            torch.stack((full_logprobs[0, 3, 5], full_logprobs[0, 4, 6])),
+        )
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual.sum().backward()
+    assert logits.grad is not None
+
+
 @ray.remote(num_gpus=1)
 class ModelUtilsTestActor:
     def __init__(self, tp_size, cp_size, sharding):

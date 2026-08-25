@@ -1256,6 +1256,52 @@ class TestGetMicrobatchIterator:
 
     @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
+    @patch("nemo_rl.models.megatron.data._get_pack_sequence_parameters_for_megatron")
+    def test_batch_invariant_sequence_packing_aligns_only_total_tokens(
+        self, mock_get_params, mock_make_iterator, mock_get_and_validate_seqlen
+    ):
+        """Batch invariance aligns the packed M dimension, not every sequence."""
+        from nemo_rl.models.megatron.data import get_microbatch_iterator
+
+        mock_get_and_validate_seqlen.return_value = (1, 257)
+        mock_get_params.return_value = (2, 16, 513)
+        mock_data = MagicMock()
+        mock_data.make_microbatch_iterator_for_packable_sequences.return_value = iter(
+            []
+        )
+        mock_data.get_microbatch_iterator_for_packable_sequences_len.return_value = (
+            1,
+            513,
+        )
+
+        cfg = {
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": True},
+            "megatron_cfg": {
+                "batch_invariant_mode": True,
+                "tensor_model_parallel_size": 2,
+                "sequence_parallel": True,
+                "pipeline_model_parallel_size": 2,
+                "context_parallel_size": 1,
+            },
+            "make_sequence_length_divisible_by": 2,
+        }
+
+        *_, padded_seq_length = get_microbatch_iterator(
+            data=mock_data,
+            cfg=cfg,
+            mbs=1,
+            straggler_timer=MagicMock(),
+        )
+
+        call_kwargs = mock_make_iterator.call_args.kwargs
+        assert call_kwargs["pad_individual_seqs_to_multiple_of"] == 2
+        assert call_kwargs["pad_packed_seq_to_multiple_of"] == 64
+        assert call_kwargs["pad_full_seq_to"] == 576
+        assert padded_seq_length == 576
+
+    @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
+    @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
     def test_get_microbatch_iterator_regular(
         self, mock_make_iterator, mock_get_and_validate_seqlen
     ):

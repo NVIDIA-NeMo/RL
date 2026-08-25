@@ -251,6 +251,32 @@ def _assert_valid_generation_output(outputs, input_data, require_generation=True
     ), "logprobs[:, 0] should be the 0.0 placeholder"
 
 
+def _assert_exact_generation_logprobs(policy, outputs, prompt_lengths):
+    """Assert exact generation-vs-policy logprobs on generated tokens."""
+    fprop_data = BatchedDataDict(
+        {
+            "input_ids": outputs["output_ids"],
+            "input_lengths": outputs["unpadded_sequence_lengths"],
+        }
+    )
+    policy.prepare_for_lp_inference()
+    policy_logprobs = policy.get_logprobs(fprop_data)["logprobs"]
+
+    generated_mask = torch.zeros_like(outputs["logprobs"], dtype=torch.bool)
+    for row, (start, end) in enumerate(
+        zip(prompt_lengths, outputs["unpadded_sequence_lengths"])
+    ):
+        generated_mask[row, start:end] = True
+
+    generation = outputs["logprobs"].masked_select(generated_mask)
+    scoring = policy_logprobs.masked_select(generated_mask)
+    assert torch.equal(generation, scoring), (
+        f"generation and policy logprobs differ at "
+        f"{torch.count_nonzero(generation != scoring).item()}/{generation.numel()} "
+        f"generated tokens (max abs diff {(generation - scoring).abs().max().item()})"
+    )
+
+
 async def _generate_async(mg, tokenizer, test_input_data, greedy=False):
     """Drive ``generate_async`` over single-sample microbatches and reassemble in order."""
     collected = []
@@ -553,6 +579,80 @@ def test_megatron_generation_colocated(
     finally:
         if policy is not None:
             policy.shutdown()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.mcore
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize(
+    ("temperature", "top_k", "top_p"),
+    [
+        pytest.param(1.0, None, 1.0, id="unfiltered"),
+        pytest.param(0.7, 32, 1.0, id="temperature-top-k"),
+        pytest.param(1.3, None, 0.9, id="temperature-top-p"),
+    ],
+)
+def test_batch_invariant_generation_logprobs_are_exact(
+    test_input_data, tokenizer, temperature, top_k, top_p
+):
+    """Raw generation and policy logprobs are bitwise equal for TP=2 sampling."""
+    from megatron.core.transformer import attention as mcore_attention
+
+    if mcore_attention.HAVE_FA4:
+        flash_attention_version = 4
+    elif mcore_attention.HAVE_FA3:
+        flash_attention_version = 3
+    else:
+        pytest.skip("batch-invariant parity requires FlashAttention 3 or 4")
+
+    cluster = RayVirtualCluster(
+        bundle_ct_per_node_list=[2],
+        use_gpus=True,
+        max_colocated_worker_groups=2,
+        num_gpus_per_node=2,
+        name="megatron-batch-invariant-test-cluster",
+    )
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["colocated"]["enabled"] = True
+    config["generation"].update(
+        {
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+        }
+    )
+    config["megatron_cfg"].update(
+        {
+            "attention_backend": "flash",
+            "batch_invariant_mode": True,
+            "batch_invariant_backend": "te_native",
+            "batch_invariant_collective": "ordered",
+            "flash_attention_version": flash_attention_version,
+            "tensor_model_parallel_size": 2,
+            "sequence_parallel": True,
+            "use_fused_linear_logprobs": False,
+        }
+    )
+
+    policy = None
+    try:
+        policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+        generation = MegatronGeneration(
+            policy=policy, config=config, tokenizer=tokenizer
+        )
+        generation.prepare_for_generation()
+        outputs = generation.generate(test_input_data, greedy=False)
+        _assert_valid_generation_output(outputs, test_input_data)
+
+        generation.finish_generation(release_gpu=True)
+        _assert_exact_generation_logprobs(
+            policy, outputs, test_input_data["input_lengths"]
+        )
+    finally:
+        if policy is not None:
+            policy.shutdown()
+        cluster.shutdown()
         gc.collect()
         torch.cuda.empty_cache()
 
