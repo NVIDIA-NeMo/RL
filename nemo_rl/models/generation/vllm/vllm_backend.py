@@ -249,6 +249,14 @@ class VllmInternalWorkerExtension:
             rank_prefix, world_size - train_world_size
         )
 
+        # The other half of the pair printed on the train side.
+        print(
+            f"  refit: collective rendezvous [gen] addr={ip}:{port} "
+            f"rank={rank} world_size={world_size} "
+            f"train_world_size={train_world_size} prefix={rank_prefix}",
+            flush=True,
+        )
+
         # Rebuilding is the recovery path for a dead generation rank, so this runs more
         # than once per job. Without the release, each rebuild would strand the previous
         # NCCL communicator and its TCPStore for the life of the worker.
