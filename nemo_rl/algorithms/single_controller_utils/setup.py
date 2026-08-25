@@ -100,7 +100,10 @@ from nemo_rl.models.megatron.router_replay import (
 )
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointManager,
+    validate_warm_start_checkpoint,
+)
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
@@ -794,6 +797,7 @@ def setup_single_controller(
         # from its own checkpoint, so the key can stay in the config.
         warm_start = master_config.ppo.warm_start_value_checkpoint
         if last_checkpoint_path is None and warm_start is not None:
+            validate_warm_start_checkpoint(warm_start)
             print(f"🔥 Warm-starting the value model from {warm_start}")
         value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
             last_checkpoint_path or warm_start,

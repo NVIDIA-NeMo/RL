@@ -214,7 +214,15 @@ ppo:
 
 `policy_training_start_step: 0` is the natural pairing, but keeping a short online warmup is equally valid: it calibrates the seeded critic on this run's own rollout distribution before the policy starts moving. A nonzero value is also what `async_ppo.warmup_generation_lead_steps` requires (`async_rl.sampler.warmup_lookahead_versions` on the SingleController path) — both must be null when it is 0.
 
-The path is a `step_<n>` directory holding a `value/` subtree — the layout a PPO or critic-pretraining run checkpoints — and the critic restores its weights, optimizer moments and LR-scheduler state from it. Nothing else is read: the policy starts from the base model, the dataloader from the beginning, and the step counter at 0.
+The path is a `step_<n>` directory holding a `value/` subtree — the layout a PPO or critic-pretraining run checkpoints. The critic restores its weights from it, plus optimizer moments and LR-scheduler state whenever the seed carries them; a seed written with `save_optimizer: false` restores weights only and warns. Setup rejects a path with no `value/weights` subtree rather than letting the critic start cold behind the message above. Nothing else is read: the policy starts from the base model, the dataloader from the beginning, and the step counter at 0.
+
+**The seed and this run must agree on the value scheduler.** The seed is restored through the ordinary resume path, so Megatron checks its LR-scheduler state field by field against the one this run builds and raises on the first mismatch — `use_checkpoint_opt_param_scheduler` is off, so `OptimizerParamScheduler._check_and_set` asserts equality. Keep `value.megatron_cfg.scheduler` identical across the two runs, and give them the same scheduler-tick budget: `wd_incr_steps` is derived from `train_iters`, which PPO sets to `max_num_steps × ppo_epochs`, so a critic pretrained under a short budget and reused under a long one fails during critic init with
+
+```
+AssertionError: OptimizerParamScheduler: class input value <X> and checkpoint value <Y> for total number of weight decay iterations do not match
+```
+
+Carrying the seed's schedule over is deliberate — it is what lets the post-warmup LR continue instead of restarting. Set `value.megatron_cfg.scheduler.override_opt_param_scheduler: true` if you would rather this run's schedule win; the seeded LR is then discarded along with the mismatch.
 
 The warm start applies to a fresh run only: once the run has written a checkpoint of its own, that checkpoint wins. That is what lets the setting stay in the config across resumes — a resubmitted run restores its own critic instead of re-seeding from the pretrained one, with no config edit in between.
 

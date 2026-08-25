@@ -605,6 +605,31 @@ class TestValueWarmStart:
         assert value_kwargs["weights_path"] is None
         assert value_kwargs["optimizer_path"] is None
 
+    @pytest.mark.parametrize(
+        "warm_start",
+        ["", "{tmp}/typo"],
+        ids=["empty_string", "typo"],
+    )
+    def test_rejects_a_warm_start_that_does_not_resolve(
+        self, patched_ppo_factories, tmp_path, warm_start
+    ):
+        """get_resume_paths never stats the path, so an unresolvable one would
+        train a cold critic behind the line claiming a warm start. A Hydra
+        override written as `key=` with an unset variable arrives as ""."""
+        mc = _ppo_master_config(
+            ppo=PPOConfig.model_construct(
+                max_num_steps=100,
+                warm_start_value_checkpoint=warm_start.format(tmp=tmp_path),
+                **_STEP_CONFIG,
+            )
+        )
+        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+
+        with pytest.raises(ValueError, match="would silently start cold"):
+            setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        patched_ppo_factories["_build_value"].assert_not_called()
+
     def test_resume_ignores_the_warm_start(self, patched_ppo_factories, tmp_path):
         """Re-seeding a resumed run would discard the critic's own progress, so
         the run's checkpoint has to win over the key left in the config."""

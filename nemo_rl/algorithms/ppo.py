@@ -96,7 +96,11 @@ from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+    validate_warm_start_checkpoint,
+)
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
@@ -713,6 +717,7 @@ def setup(
     # its own checkpoint, so the key can stay in the config.
     warm_start = ppo_config.warm_start_value_checkpoint
     if last_checkpoint_path is None and warm_start is not None:
+        validate_warm_start_checkpoint(warm_start)
         print(f"🔥 Warm-starting the value model from {warm_start}")
     value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
         last_checkpoint_path or warm_start,
