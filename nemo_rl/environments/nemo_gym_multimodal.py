@@ -69,7 +69,10 @@ def _encode_single_image_source(source: str) -> str:
 
 def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
     """Replace local media paths in NeMo Gym examples with data URLs."""
-    image_targets_by_source: dict[str, list[dict]] = {}
+    local_image_sources: dict[str, None] = {}
+    pending_mutations: list[
+        tuple[dict, tuple[str, str, str], str, str, bool, Any, str]
+    ] = []
     for example in nemo_gym_examples:
         input_items = example.get("responses_create_params", {}).get("input", [])
         if not isinstance(input_items, list):
@@ -116,19 +119,24 @@ def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
                     raise ValueError(f"{part_type} requires a non-empty media URL")
                 if not url.startswith(("http://", "https://", "data:")):
                     if is_image:
-                        image_targets_by_source.setdefault(url, []).append(part)
+                        local_image_sources.setdefault(url, None)
                     else:
                         url = video_path_to_data_url(url)
 
-                for key in source_keys:
-                    if key != canonical_key:
-                        part.pop(key, None)
-                part["type"] = canonical_type
-                part[canonical_key] = url
-                if is_image and nested_detail is not None:
-                    part.setdefault("detail", nested_detail)
+                pending_mutations.append(
+                    (
+                        part,
+                        source_keys,
+                        canonical_type,
+                        canonical_key,
+                        is_image,
+                        nested_detail,
+                        url,
+                    )
+                )
 
-    sources = list(image_targets_by_source)
+    sources = list(local_image_sources)
+    encoded_by_source: dict[str, str] = {}
     if sources:
         with ThreadPoolExecutor(
             max_workers=_NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS
@@ -140,10 +148,24 @@ def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
                     strict=True,
                 )
             )
-        for source, targets in image_targets_by_source.items():
-            data_url = encoded_by_source[source]
-            for part in targets:
-                part["image_url"] = data_url
+
+    # Apply mutations only after every local source was encoded successfully.
+    for (
+        part,
+        source_keys,
+        canonical_type,
+        canonical_key,
+        is_image,
+        nested_detail,
+        url,
+    ) in pending_mutations:
+        for key in source_keys:
+            if key != canonical_key:
+                part.pop(key, None)
+        part["type"] = canonical_type
+        part[canonical_key] = encoded_by_source.get(url, url)
+        if is_image and nested_detail is not None:
+            part.setdefault("detail", nested_detail)
     return nemo_gym_examples
 
 
