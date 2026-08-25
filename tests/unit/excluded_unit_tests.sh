@@ -79,8 +79,6 @@ EXCLUDED_UNIT_TESTS=(
     ###########################################################################
 
     --ignore=unit/models/generation/test_vllm_large_model.py
-    --ignore=unit/models/generation/test_vllm_http_server_parity.py
-    --ignore=unit/models/generation/trtllm/test_trtllm_http_server_parity.py
 
     # test_vllm_generation.py — keep 3 key expensive tests + the replace_prefix_tokens integration test
     # Kept: test_vllm_policy_generation (basic generation correctness),

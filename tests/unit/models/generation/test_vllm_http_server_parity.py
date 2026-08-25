@@ -30,9 +30,6 @@ from typing import Any
 
 import pytest
 import requests
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
-from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
@@ -288,6 +285,14 @@ def _parse_with_vllm(
     enable_thinking: bool,
     reasoning_at_start: bool = False,
 ) -> dict[str, Any]:
+    # Keep optional vLLM imports out of module collection. The base unit-test
+    # phase imports this file before its vllm marker can be deselected.
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+    )
+    from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
+    from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
+
     request = ChatCompletionRequest(
         model=MODEL,
         messages=[{"role": "user", "content": "parser contract"}],
