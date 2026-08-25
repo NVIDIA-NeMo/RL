@@ -106,6 +106,10 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     generation = SimpleNamespace(
         cfg={"vllm_cfg": {"async_engine": True}},
         worker_group=SimpleNamespace(workers=workers, dp_size=dp_size),
+        # The rebuild bootstraps with the same peer protocol as the first build, so it
+        # asks the backend which one that is. A stand-in has to carry every hook the code
+        # under test reads, or it tests a shape the product never has.
+        get_collective_sender_spec=lambda: SimpleNamespace(nccl_peer="nemo"),
     )
     from nemo_rl.models.generation.vllm import vllm_generation
 
@@ -119,7 +123,12 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     )
     policy_calls = []
     policy = SimpleNamespace(
-        init_collective=lambda ip, port, world_size, *, train_world_size: (
+        init_collective=lambda ip,
+        port,
+        world_size,
+        *,
+        train_world_size,
+        nccl_peer=None: (
             policy_calls.append(
                 {
                     "ip": ip,

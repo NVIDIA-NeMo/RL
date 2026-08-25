@@ -202,11 +202,19 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             flush=True,
         )
 
+        # nccl_peer, exactly as init_communicator passes it. The receiver's bootstrap is
+        # not negotiable: "nemo" publishes a raw unique ID and warms up with a rank-0
+        # broadcast, "vllm" adds a pickled ID key and warms up with an all-reduce. Omitting
+        # it here silently rebuilt with the "nemo" default, and mismatched warmups on one
+        # communicator HANG rather than error -- the exact failure this path exists to
+        # remove, reappearing inside the recovery.
+        sender_spec = self._generation.get_collective_sender_spec()
         futures_train = self._policy.init_collective(
             ip,
             port,
             membership.world_size,
             train_world_size=membership.train_world_size,
+            nccl_peer=sender_spec.nccl_peer,
         )
         # Recorded before dispatching, so nothing downstream can fall back to the old
         # membership. Rebuilding the communicator is only half of it: the refit dispatch

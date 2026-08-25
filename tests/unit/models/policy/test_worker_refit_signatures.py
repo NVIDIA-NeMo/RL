@@ -370,3 +370,76 @@ def test_the_reshard_preconditions_are_checked_on_the_single_controller_path():
             )
             return
     raise AssertionError("setup_single_controller not found")
+
+
+def _sent_by_reshard_synchronizer(method: str, *, receiver: str) -> set[str]:
+    """Keywords NcclReshardWeightSynchronizer sends to ONE side of the refit.
+
+    Scoped by receiver on purpose. Both sides are called `nccl_reshard_refit`, and they do
+    not take the same arguments: kv_scales is read off the trainer and rides the misc
+    broadcast, so the generation side never sees it. Matching on the method name alone
+    compares the two sides against each other and reports a difference that is correct.
+    """
+    path = REPO_ROOT / "nemo_rl" / "weight_sync" / "nccl_reshard_weight_synchronizer.py"
+    tree = ast.parse(path.read_text())
+    for call in ast.walk(tree):
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == method
+            and isinstance(call.func.value, ast.Attribute)
+            and call.func.value.attr == receiver
+        ):
+            return {kw.arg for kw in call.keywords if kw.arg is not None}
+    raise AssertionError(
+        f"the reshard synchronizer no longer calls {receiver}.{method}"
+    )
+
+
+def test_the_generation_reshard_hook_accepts_what_the_synchronizer_sends():
+    """The second of the two generation refit hooks, and the one that was missed.
+
+    The rule was already written down on `update_weights_from_collective`: the synchronizer
+    calls these polymorphically, so a signature that omits the parameter does not fail at
+    import or type-check time -- it fails at the Ray boundary during the first refit. The
+    rule was stated, applied to the policy interface and to one generation hook, and not to
+    this one.
+    """
+    sent = _sent_by_reshard_synchronizer("nccl_reshard_refit", receiver="_generation")
+    accepted = _kwargs_of(
+        REPO_ROOT / "nemo_rl" / "models" / "generation" / "interfaces.py",
+        "nccl_reshard_refit",
+    )
+    missing = sent - accepted
+    assert not missing, (
+        f"NcclReshardWeightSynchronizer sends {sorted(missing)} to "
+        "generation.nccl_reshard_refit(), but GenerationInterface does not accept "
+        f"{'it' if len(missing) == 1 else 'them'}."
+    )
+
+
+def test_the_rebuild_bootstraps_with_the_same_peer_protocol_as_the_first_build():
+    """A rebuilt communicator must not silently fall back to the "nemo" default.
+
+    The receiver's bootstrap is not negotiable: "nemo" publishes a raw unique ID and warms
+    up with a rank-0 broadcast, "vllm" adds a pickled ID key and warms up with an
+    all-reduce. Mismatched warmups on one communicator HANG rather than error -- the exact
+    failure the rebuild exists to remove, reappearing inside the recovery.
+    """
+    path = REPO_ROOT / "nemo_rl" / "weight_sync" / "collective_weight_synchronizer.py"
+    tree = ast.parse(path.read_text())
+    calls = [
+        call
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "init_collective"
+        and isinstance(call.func.value, ast.Attribute)
+        and call.func.value.attr == "_policy"
+    ]
+    assert calls, "no policy.init_collective call found"
+    for call in calls:
+        assert "nccl_peer" in {kw.arg for kw in call.keywords}, (
+            "every policy.init_collective must pass nccl_peer; the rebuild omitted it and "
+            "silently bootstrapped with the wrong protocol."
+        )

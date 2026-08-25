@@ -494,8 +494,21 @@ class GenerationInterface(ABC):
         """Prepare per-layer param metadata for nccl_reshard-based refit."""
         raise NotImplementedError
 
-    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
-        """Receive weights from training workers via nccl_reshard."""
+    def nccl_reshard_refit(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
+        """Receive weights from training workers via nccl_reshard.
+
+        Takes the deadline for the same reason its sibling above does, and the reason is
+        worth repeating because this is the hook that was missed: the synchronizer calls
+        both polymorphically, so a backend whose signature omits the parameter does not
+        fail at import or type-check time -- it fails at the Ray boundary during the first
+        refit, a long way from the signature that caused it.
+
+        Args:
+            refit_timeout_s: Deadline for this collective, after which the worker aborts
+                its own communicator. None leaves the refit path unchanged.
+        """
         raise NotImplementedError
 
     def attach_fleet_health(self, monitor: Any, selector: Any) -> None:
