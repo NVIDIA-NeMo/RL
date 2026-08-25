@@ -169,12 +169,14 @@ class MegatronGenerationMixin:
 
             # Handle MTP as well.
             # TODO: this path only becomes testable once #3331 merges.
-            if (
-                getattr(lang_module, "mtp_process", False)
-                and hasattr(lang_module, "_setup_mtp_cuda_graphs")
-                and not hasattr(lang_module, "_mtp_cudagraph_manager")
-            ):
-                lang_module._setup_mtp_cuda_graphs()
+            if getattr(lang_module, "mtp_process", False):
+                if hasattr(lang_module, "_setup_mtp_cuda_graphs") and not hasattr(
+                    lang_module, "_mtp_cudagraph_manager"
+                ):
+                    lang_module._setup_mtp_cuda_graphs()
+                assert hasattr(lang_module, "_mtp_cudagraph_manager"), (
+                    f"cuda_graph_impl='{cuda_graph_impl}', but no MTP graph manager was created."
+                )
 
             assert any(
                 hasattr(module, "cudagraph_manager") for module in lang_module.modules()
