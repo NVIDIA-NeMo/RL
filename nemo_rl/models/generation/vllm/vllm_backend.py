@@ -93,8 +93,19 @@ def disable_draft_module_sharing() -> None:
     value into the dspark/dflash utils modules, so each module's global must
     be rebound individually.
 
+    A second, independent embed_tokens-sharing decision lives in
+    ``SpecDecodeBaseProposer._maybe_share_embeddings`` (used by the eagle3
+    proposer): it shares whenever ``self.model.has_own_embed_tokens`` is
+    falsy, a flag only ever set (to True) by ``process_eagle_weight`` when a
+    weight literally named "embed_tokens" is loaded -- which never happens
+    under ``load_format="dummy"``. This is not reachable through
+    ``_should_share`` at all, so it needs its own no-op patch; skipping it
+    entirely leaves each drafter holding the embed_tokens it built in
+    ``__init__``, matching the ``_should_share`` override above.
+
     Must run before engine creation (drafter load and CUDA-graph capture).
     """
+    from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
     from vllm.v1.worker.gpu.spec_decode.dflash import utils as dflash_utils
     from vllm.v1.worker.gpu.spec_decode.dspark import utils as dspark_utils
     from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
@@ -102,9 +113,13 @@ def disable_draft_module_sharing() -> None:
     def _never_share(*args: Any, **kwargs: Any) -> bool:
         return False
 
+    def _never_share_embeddings(self: Any, target_language_model: Any) -> None:
+        return None
+
     eagle_utils._should_share = _never_share
     dspark_utils._should_share = _never_share
     dflash_utils._should_share = _never_share
+    SpecDecodeBaseProposer._maybe_share_embeddings = _never_share_embeddings
 
 
 if os.environ.get(DRAFT_DISABLE_MODULE_SHARING_ENV) == "1":

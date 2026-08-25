@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+import inspect
 import math
 import os
 import sys
@@ -184,12 +185,30 @@ class RayWorkerBuilder:
             if hasattr(worker_class, "configure_worker"):
                 # Get complete worker configuration from the worker class.
                 # Returns (resources, env_vars, init_kwargs, runtime_env_overrides).
-                resources, env_vars, init_kwargs, runtime_env_overrides = (
-                    worker_class.configure_worker(
-                        num_gpus=num_gpus,
-                        bundle_indices=bundle_indices,
-                        num_gpus_per_node=num_gpus_per_node,
+                # config is the worker's first positional init arg (every
+                # RayWorkerBuilder(worker_cls, config, ...) call site puts it
+                # there); passed through -- only to implementations that
+                # declare a `config` parameter, for backward compatibility --
+                # so configure_worker can gate actor-creation-time runtime_env
+                # (e.g. env_vars) on config values BEFORE the actor exists. A
+                # plain os.environ mutation from inside the actor is invisible
+                # to any nested Ray actor the worker spawns (e.g. vLLM's
+                # per-TP-rank worker actors), since Ray actors do not inherit
+                # a parent actor's later os.environ mutations, only its
+                # runtime_env.
+                configure_worker_kwargs: dict[str, Any] = dict(
+                    num_gpus=num_gpus,
+                    bundle_indices=bundle_indices,
+                    num_gpus_per_node=num_gpus_per_node,
+                )
+                if "config" in inspect.signature(
+                    worker_class.configure_worker
+                ).parameters:
+                    configure_worker_kwargs["config"] = (
+                        self.init_args[0] if self.init_args else None
                     )
+                resources, env_vars, init_kwargs, runtime_env_overrides = (
+                    worker_class.configure_worker(**configure_worker_kwargs)
                 )
 
                 # Apply resource configuration
