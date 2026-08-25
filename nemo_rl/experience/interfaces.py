@@ -19,6 +19,23 @@ from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 
 NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
+# Unconsumed suffix of a gap-fill dataloader batch, carried in the async
+# collector's rollouts state so a checkpoint cannot strand yielded prompts.
+PENDING_PROMPTS_KEY = "pending_prompt_batch"
+# Frontier-aligned async checkpoint metadata (rollouts.pt). The frontier key
+# holds the checkpoint cut — the resume filter threshold — and the base is
+# the ordinal the saved dataloader snapshot resumes yielding from. Together
+# they let a resume regenerate every unaccounted prompt instead of skipping
+# it.
+FRONTIER_ORDINAL_KEY = "frontier_ordinal"
+RESUME_BASE_ORDINAL_KEY = "resume_base_ordinal"
+# Post-restore replay-buffer metadata: ordinals of the retained prompt groups,
+# reported after age/step filtering so the collector can regenerate the rest.
+RETAINED_TASK_INDICES_KEY = "retained_task_indices"
+# Ordinals already trained but at or above the checkpoint cut (rollouts.pt).
+# The resume folds them into the covered set so the re-yielded window drops
+# them instead of training them a second time.
+TRAINED_TASK_INDICES_KEY = "trained_task_indices"
 
 
 @dataclass

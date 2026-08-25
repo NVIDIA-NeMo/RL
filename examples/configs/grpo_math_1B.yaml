@@ -118,6 +118,10 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
+  # Async GRPO: restore replay-buffer state on resume. Set false to regenerate
+  # the buffered window fresh instead of reusing completed groups (which skew
+  # toward short rollouts at a save boundary).
+  load_replay_buffer: true
   model_save_format: "safetensors"
   save_consolidated: false
   save_optimizer: true
@@ -127,8 +131,9 @@ policy:
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
+    tokenizer_kwargs: null # extra kwargs forwarded to tokenizer loading, e.g., {fix_mistral_regex: false}
     use_fastokens: false # opt-in Rust-backed BPE tokenizer (~10x faster encode); requires the fastokens-b10 wheel. NRL_USE_FASTOKENS overrides at runtime.
-  hf_config_overrides: {} 
+  hf_config_overrides: {}
   train_global_batch_size: 512
   train_micro_batch_size: 4
   generation_batch_size: 32 # Only used when generating using HF backend
@@ -393,8 +398,11 @@ policy:
         shard_expert_weights: false
     mcore_generation_config:
       max_model_len: ${policy.max_total_sequence_length}  # Engine-side max sequence length.
-      cuda_graph_impl: "local"  # CUDA-graph implementation. Options: "none", "local", "transformer_engine", "full_iteration".
-      inference_cuda_graph_scope: "block"  # Inference CUDA-graph scope. Options: "none", "layer", "block".
+      # Generation CUDA graphs. MCore accepts only these pairings:
+      #   cuda_graph_impl "none"  -> omit inference_cuda_graph_scope
+      #   cuda_graph_impl "local" -> inference_cuda_graph_scope "layer" or "block"
+      cuda_graph_impl: "local"
+      inference_cuda_graph_scope: "block"
       buffer_size_gb: 10
       num_cuda_graphs: 4  # Number of CUDA graphs to pre-compile for different batch sizes
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)

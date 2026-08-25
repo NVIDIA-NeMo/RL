@@ -463,6 +463,7 @@ class TestCalculateSingleMetric:
         assert result["test/max"] == 42.0
         assert result["test/min"] == 42.0
         assert result["test/median"] == 42.0
+        assert result["test/histogram"] == [42.0]
         assert math.isnan(result["test/stddev"]), (
             "stddev should be nan for single value"
         )
@@ -476,6 +477,7 @@ class TestCalculateSingleMetric:
         assert result["test/min"] == 1.0
         assert result["test/median"] == 2.0
         assert abs(result["test/stddev"] - 1.0) < 1e-9  # stdev of [1,2,3] is 1.0
+        assert result["test/histogram"] == [1.0, 2.0, 3.0]
 
     def test_two_identical_values_returns_zero_stddev(self):
         """Test that stddev is 0 when all values are identical."""
@@ -2207,6 +2209,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
     manager._tokenizer = None
+    manager._effort_config = None
     manager._result_to_completion = lambda result: result["value"]
     manager._compute_rollout_metrics = lambda completions, agent: {
         "completion_count": len(completions),
