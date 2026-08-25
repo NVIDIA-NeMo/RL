@@ -22,8 +22,22 @@ import torch
 from megatron.bridge import AutoBridge
 from megatron.core.transformer import ModuleSpec
 
-from nemo_rl.models.megatron.config_keys import VLM_TOWER_OVERRIDE_KEYS
 from nemo_rl.models.policy import MegatronConfig
+
+
+def provider_override_allowed(megatron_cfg: MegatronConfig, key: str) -> bool:
+    """Whether a megatron_cfg key may be applied onto the model provider.
+
+    Student configs carry no allowlist and every key applies (status quo).
+    Teacher configs (built by TeacherWorkerGroup from a clone of the student's
+    config) carry ``_provider_override_allowlist`` = the keys explicitly set in
+    that teacher's ``teacher_overrides``: a teacher's model structure comes
+    from its own checkpoint, so inherited student keys must not reach its
+    provider (a VLM student's tower keys crash a text teacher at load; its
+    mtp_num_layers=0 crashes an MTP-bearing teacher at first forward).
+    """
+    allowlist = megatron_cfg.get("_provider_override_allowlist")
+    return allowlist is None or key in allowlist
 
 
 def iter_vlm_config_overrides(
@@ -34,7 +48,14 @@ def iter_vlm_config_overrides(
     Only keys present in the recipe are yielded, so omitting one keeps the
     provider's own default rather than silently forcing False.
     """
-    for key in VLM_TOWER_OVERRIDE_KEYS:
+    keys = (
+        "radio_force_cpe_eval_mode",
+        "freeze_vision_model",
+        "freeze_vision_projection",
+        "freeze_sound_encoder",
+        "freeze_sound_projection",
+    )
+    for key in keys:
         if key in megatron_config:
             yield key, megatron_config[key]
 
@@ -129,6 +150,8 @@ def import_model_from_hf_name(
 
     if megatron_config is not None:
         for key, value in iter_vlm_config_overrides(megatron_config):
+            if not provider_override_allowed(megatron_config, key):
+                continue
             # Match the import-time behaviour in megatron/setup.py: a key the
             # recipe set explicitly must not be dropped just because this
             # provider lacks the field, or a frozen tower silently trains.
