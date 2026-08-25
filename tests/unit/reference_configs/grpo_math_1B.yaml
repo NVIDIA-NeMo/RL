@@ -134,10 +134,6 @@ policy:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
     use_fastokens: false # opt-in Rust-backed BPE tokenizer (~10x faster encode); requires the fastokens-b10 wheel. NRL_USE_FASTOKENS overrides at runtime.
-  # If true, anchor the KL reference model to the base (model_name) weights even when
-  # resuming from a checkpoint; if false, the reference is captured from the resumed
-  # checkpoint weights (re-anchoring on every resume). DTensor v2 (automodel) path only.
-  ref_model_from_base_weights: false
   hf_config_overrides: {}
   train_global_batch_size: 512
   train_micro_batch_size: 4
