@@ -11,7 +11,7 @@ defaults: "grpo_math_1B.yaml"
 
 grpo:
   num_prompts_per_step: 32
-  num_generations_per_prompt: 8
+  num_generations_per_prompt: 6
   # The ELBO is a noisy estimate of the sequence likelihood, so dividing the
   # group advantage by its standard deviation amplifies estimator noise on
   # low-variance groups. GDPO follows Dr.GRPO in leaving advantages unnormalized.
@@ -33,8 +33,11 @@ loss_fn:
   # dLLMs score token i at position i; there is no next-token shift to undo.
   position_aligned_logprobs: true
   reference_policy_kl_penalty: 0.0
-  ratio_clip_min: 3.0e-4
-  ratio_clip_max: 4.0e-4
+  # GDPO trains with epsilon 0.5, i.e. clamp(ratio, 0.5, 1.5). That is far
+  # looser than a token-level GRPO clip because the ratio here is one
+  # length-normalized number per sequence, not one per token.
+  ratio_clip_min: 0.5
+  ratio_clip_max: 0.5
 
 policy:
   model_name: "GSAI-ML/LLaDA-8B-Instruct"
@@ -46,7 +49,7 @@ policy:
   # a rollout are only comparable when estimated at identical masks, and the
   # masks are drawn from a seeded generator over the microbatch's shape.
   logprob_batch_size: 1
-  max_total_sequence_length: 1024
+  max_total_sequence_length: 512
   precision: "bfloat16"
 
   dllm:
@@ -59,7 +62,7 @@ policy:
     # deterministic Gauss-Legendre rules of the SDMC scheme; "simpson" and "mc"
     # (double Monte Carlo) are kept for ablations. Each likelihood evaluation
     # costs len(quadrature points) * mc_samples forward passes.
-    quadrature: "gauss-2"
+    quadrature: "gauss-3"
     mc_samples: 1
     # Probability of masking each prompt token. 0.0 keeps the prompt intact,
     # matching the dLLM SFT objective.
@@ -80,6 +83,14 @@ policy:
     # Context parallelism shards the sequence, but the ELBO masks positions
     # across the whole sequence.
     context_parallel_size: 1
+    activation_checkpointing: true
+    # GDPO fine-tunes LoRA adapters (r=128, alpha=64) rather than full weights.
+    # This is what makes an 8B dLLM trainable at this batch size: the ELBO keeps
+    # `quadrature * mc_samples` forward activations alive for the backward pass.
+    lora_cfg:
+      enabled: true
+      dim: 128
+      alpha: 64
 
   # Both reorder or reuse tokens in ways that assume a causal factorization.
   sequence_packing:
@@ -87,12 +98,15 @@ policy:
   dynamic_batching:
     enabled: false
 
+  # official: max_grad_norm 0.2
+  max_grad_norm: 0.2
+
   optimizer:
     name: "torch.optim.AdamW"
     kwargs:
-      lr: 1.0e-6
-      weight_decay: 0.01
-      betas: [0.9, 0.999]
+      lr: 3.0e-7
+      weight_decay: 0.1
+      betas: [0.9, 0.99]
       eps: 1e-8
 
   generation:
@@ -101,7 +115,7 @@ policy:
     backend: "dllm"
     colocated:
       enabled: true
-    max_new_tokens: 512
+    max_new_tokens: 256
     temperature: 1.0
     top_p: 1.0
     top_k: null

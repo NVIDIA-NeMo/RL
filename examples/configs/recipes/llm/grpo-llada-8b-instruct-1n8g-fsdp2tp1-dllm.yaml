@@ -8,8 +8,6 @@ checkpointing:
 policy:
   tokenizer:
     name: GSAI-ML/LLaDA-8B-Instruct
-  dtensor_cfg:
-    activation_checkpointing: true
 logger:
   log_dir: logs/grpo-llada-8b-instruct-1n8g-fsdp2tp1-dllm
   wandb_enabled: true

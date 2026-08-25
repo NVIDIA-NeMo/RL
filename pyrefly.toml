@@ -129,6 +129,7 @@ project-includes = [
   "nemo_rl/data_plane/worker_mixin.py",
   "nemo_rl/distributed/__init__.py",
   "nemo_rl/distributed/collectives.py",
+  "nemo_rl/distributed/held_port.py",
   "nemo_rl/distributed/named_sharding.py",
   "nemo_rl/distributed/numa_utils.py",
   "nemo_rl/distributed/ray_actor_environment_registry.py",
