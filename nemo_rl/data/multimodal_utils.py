@@ -50,6 +50,8 @@ MEDIA_TAGS = {
     "video-audio": "<video-audio>",
 }
 MEDIA_TAGS_REVERSED = {v: k for k, v in MEDIA_TAGS.items()}
+CACHED_VIDEO_FRAME_MANIFEST_MAGIC = b"NEMO_RL_CACHED_VIDEO_FRAMES_V1\n"
+CACHED_VIDEO_FRAME_MANIFEST_MIME = "video/x-nemo-rl-cached-frames"
 
 DEFAULT_MEDIA_EXTENSIONS = {
     "image": ["png", "jpeg", "jpg", "img"],
