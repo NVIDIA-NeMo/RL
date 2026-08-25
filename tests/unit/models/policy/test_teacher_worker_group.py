@@ -110,7 +110,7 @@ def test_provider_override_allowlist_is_explicit_keys_only():
     """Only explicitly-set teacher override keys may reach the model provider;
     architecture keys inherited from the student config must be blocked, while
     student configs (no allowlist) keep the status-quo behavior."""
-    from nemo_rl.models.megatron.community_import import provider_override_allowed
+    from nemo_rl.models.policy import provider_override_allowed
     from nemo_rl.models.policy.teacher_worker_group import (
         create_teacher_configs_from_opd_config,
     )

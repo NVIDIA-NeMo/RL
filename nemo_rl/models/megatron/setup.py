@@ -229,10 +229,10 @@ from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
 )
 from nemo_rl.models.megatron.community_import import (
-    provider_override_allowed,
     import_model_from_hf_name,
     iter_vlm_config_overrides,
 )
+from nemo_rl.models.policy import provider_override_allowed
 from nemo_rl.models.megatron.config import (
     ColocatedReshardPlan,
     ModelAndOptimizerState,
