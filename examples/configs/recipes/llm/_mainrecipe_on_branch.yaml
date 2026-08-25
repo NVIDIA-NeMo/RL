@@ -1,0 +1,66 @@
+# Qwen3-30B-A3B SingleController + TransferQueue register mode, on GB200.
+#
+# Same algorithm and data as the 10n8g H100 SC recipe it inherits; two things
+# change:
+#
+#   1. GB200 NVL72 has 4 GPUs per node, so the 64+16-GPU H100 mesh is re-cut to
+#      6 nodes: train 4n x 4g = 16 GPUs (TP2 x PP2 x CP4, DP1, no expert
+#      parallel) and generation 2n x 4g = 8 GPUs (vLLM TP2 -> 4 engines). This
+#      geometry mirrors the tuned 30B-A3B MoE GB200 mesh in
+#      examples/nemo_gym/nemotron-3-ultra/nano_swe_teacher_qwen3mesh.yaml.
+#   2. data_plane.backend is register mode with GDR, which is what this recipe
+#      exists to exercise: no payload copy on put, one HBM-to-HBM hop on get.
+#
+# Launch: examples/nemo_gym/nemotron-3-ultra/qwen30b_sc_tq_register_gb200.sh
+defaults: ./grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml
+
+grpo:
+  # SC requires num_prompts_per_step x num_generations_per_prompt ==
+  # policy.train_global_batch_size; kept small so a step lands inside the
+  # partition's 4h ceiling on a cold cache.
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_num_steps: 5
+
+policy:
+  train_global_batch_size: 64
+  megatron_cfg:
+    # 16 train GPUs: TP2 x PP2 x CP4 = 16, DP1. Expert parallel is off — with
+    # DP1 there is no expert-data dimension left to shard over.
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 4
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 2
+        gpus_per_node: 4
+    vllm_cfg:
+      tensor_parallel_size: 2
+      expert_parallel_size: 1
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 6
+  # NVLink-domain segmentation is a Slurm-side concern here (sbatch --segment);
+  # the virtual cluster does not need to filter on it.
+  segment_size: null
+
+data_plane:
+  enabled: true
+  # Stock main, stock mooncake_cpu defaults (64GiB + 4GiB per client process,
+  # i.e. 272GiB pinned on a 4-GPU node). Testing whether that OOMs this node
+  # shape on main itself, independent of any local change.
+  backend: mooncake_cpu
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/_mainrecipe_on_branch
+
+logger:
+  log_dir: logs/_mainrecipe_on_branch
+  wandb:
+    name: _mainrecipe_on_branch

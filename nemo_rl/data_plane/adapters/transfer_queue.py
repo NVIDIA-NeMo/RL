@@ -43,12 +43,26 @@ import torch
 import transfer_queue as tq
 from tensordict import TensorDict
 
-# Importing registers register mode's client / manager / bootstrap provider with
-# TQ's factories, which is what makes backend="transfer_engine" resolvable. It
-# must happen in every process that builds a TQ storage manager — i.e. exactly
-# the processes that import this adapter. Safe to do here and nowhere earlier:
-# this module has already loaded transfer_queue above.
-import nemo_rl.data_plane.adapters.tq_register_mode  # noqa: F401
+
+def _register_transfer_engine_backend() -> None:
+    """Register register-mode's client / manager / bootstrap with TQ's factories.
+
+    Called rather than imported at module scope, so ``simple`` and
+    ``mooncake_cpu`` runs do not import register mode's module at all.
+
+    Note this does *not* avoid loading mooncake's native engine: importing
+    ``transfer_queue`` already does that, because its ``storage.clients``
+    package eagerly imports ``mooncake_client`` (see the note in
+    transfer_queue_env). Measured: mooncake is in ``sys.modules`` immediately
+    after importing this adapter either way. The gain here is only that one
+    module's worth of Python objects is not built for backends that cannot use
+    it -- not a memory fix.
+
+    Called from the backend branch that needs it, so the processes that resolve
+    ``backend="transfer_engine"`` still get the factories registered before they
+    build a storage manager.
+    """
+    import nemo_rl.data_plane.adapters.tq_register_mode  # noqa: F401
 from nemo_rl.data_plane.adapters.transfer_queue_env import (
     local_node_ip,
     rail_link_layers,
@@ -766,6 +780,13 @@ class TQDataPlaneClient(DataPlaneClient):
         # squeezes the trailing 1 back on get. Drop when upstream TQ
         # unifies the schema/data shapes for 1D fields.
         self._promote_1d = cfg["backend"] in KV_MANAGER_BACKENDS
+
+        # Both paths build a storage client, so both need register mode's
+        # factories -- the driver via _init_tq and every worker via
+        # _connect_existing. Gated on the backend so simple and mooncake_cpu
+        # runs never dlopen the engine.
+        if cfg["backend"] == "transfer_engine":
+            _register_transfer_engine_backend()
 
         if bootstrap:
             _init_tq(cfg)

@@ -98,7 +98,9 @@ which breaks `get` into `alloc` / `register` / `move` and reports
 distributions rather than means — the mean is misleading here, `get` spans
 2.8–78.9 ms in one run.
 
-The measured comparison lives in `docs/design-docs/tq-register-mode.md`
+The four-backend comparison, with per-step and per-call breakdowns, is in
+`docs/design-docs/data-plane-backend-comparison.md`. The register-mode-specific
+measurements live in `docs/design-docs/tq-register-mode.md`
 (section "End to end…"), with job IDs. Summary: register mode's data plane cost
 ~31% less than the store's for the same volume, and both were under 1% of step
 time.

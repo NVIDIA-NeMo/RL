@@ -374,6 +374,7 @@ design-docs/modelopt-real-quant-architecture.md
 design-docs/nccl-reshard-refit.md
 design-docs/media-token-validity-mask.md
 design-docs/tq-register-mode.md
+design-docs/data-plane-backend-comparison.md
 ```
 
 ```{toctree}

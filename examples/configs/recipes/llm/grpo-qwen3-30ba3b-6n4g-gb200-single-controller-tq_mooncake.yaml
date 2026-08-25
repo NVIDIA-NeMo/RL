@@ -13,14 +13,17 @@ data_plane:
   # of register mode's publish-an-address. Baseline for the comparison.
   backend: mooncake_cpu
   mooncake_cpu:
-    # Sized down from the 64GiB/4GiB defaults, which are per client *process*:
-    # 4 GPUs x 68 GiB = 272 GiB pinned per node. On these 920 GiB nodes, next to
-    # a 30B MoE's weight load, that is marginal rather than wrong -- measured 3
-    # setup OOMs in 6 attempts, always at task 0 with zero steps, across three
-    # different node sets. This run publishes ~500 MB per step, so 8 GiB per
-    # process is ample and removes the coin flip.
-    global_segment_size: 8589934592   # 8 GiB
-    local_buffer_size: 2147483648     # 2 GiB
+    # 272 GiB of pinned host memory (4 processes x 64+4 GiB, the per-process
+    # defaults) to move ~500 MB a step is indefensible on a 920 GiB node that
+    # also loads a 30B MoE. Sized to the payload instead.
+    #
+    # It also sidesteps a known issue: this branch OOMs at setup on the stock
+    # defaults where main does not (1 pass / 4 fails vs main 3/3). A 5-point
+    # bisect and seven refuted hypotheses did not name the cause, and each
+    # bisect point was a single run of a failure that is probabilistic, so the
+    # ladder is not trustworthy. Tracked, not fixed.
+    global_segment_size: 8589934592   # 8 GiB per client process
+    local_buffer_size: 2147483648     # 2 GiB per client process
 
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-6n4g-gb200-single-controller-tq_mooncake

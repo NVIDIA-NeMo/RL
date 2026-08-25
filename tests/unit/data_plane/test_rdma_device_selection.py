@@ -120,7 +120,7 @@ def test_env_override_wins_verbatim(fake_fabric, monkeypatch):
 def test_transport_config_is_rdma_and_carries_all_rails(fake_fabric):
     """The device list must reach mooncake, and the transport stays RDMA."""
     fake_fabric(_MIXED)
-    cfg = tq_adapter._mooncake_transport_config()
+    cfg = tq_adapter._mooncake_transport_config("rdma")
     assert cfg["protocol"] == "rdma"
     assert cfg["device_name"] == tq_adapter.rdma_devices()
 
@@ -128,7 +128,7 @@ def test_transport_config_is_rdma_and_carries_all_rails(fake_fabric):
 def test_raises_when_no_device_since_mooncake_is_rdma_only(fake_fabric):
     fake_fabric(_MIXED, uverbs=False)
     with pytest.raises(RuntimeError, match="requires RDMA"):
-        tq_adapter._mooncake_transport_config()
+        tq_adapter._mooncake_transport_config("rdma")
 
 
 # ── Peer-rail pairing ────────────────────────────────────────────────────────
