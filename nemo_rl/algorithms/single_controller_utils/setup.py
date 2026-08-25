@@ -39,7 +39,6 @@ from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _create_advantage_estimator,
     _get_grpo_save_state,
-    _should_use_nemo_gym,
 )
 from nemo_rl.algorithms.grpo import MasterConfig as GrpoMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
@@ -62,7 +61,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
 from nemo_rl.experience.rollout_manager import (
     RolloutManager,
     RolloutRetryPolicy,
@@ -312,12 +311,18 @@ def _build_trainer(
     return trainer, time.perf_counter() - t0
 
 
-def _spinup_gym(master_config: MasterConfig, base_urls: list[str]) -> tuple[Any, float]:
+def _spinup_gym(
+    master_config: MasterConfig,
+    base_urls: list[str],
+    tokenizer: PreTrainedTokenizerBase,
+) -> tuple[Any, float]:
     """Spin up the NeMo-Gym actor against the reserved vLLM URLs.
 
     Args:
         master_config: SC MasterConfig.
         base_urls: Reserved vLLM OpenAI server URLs.
+        tokenizer: Installed on the actor at spinup rather than passed per rollout
+            call. See NemoGym.set_tokenizer.
 
     Returns:
         A tuple of (NeMo-Gym actor, wall time spent in this call).
@@ -335,6 +340,7 @@ def _spinup_gym(master_config: MasterConfig, base_urls: list[str]) -> tuple[Any,
         env_configs=master_config.env,
         base_urls=base_urls,
         model_name=generation_config["model_name"],
+        tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
@@ -491,6 +497,7 @@ def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
         backoff_base_s=failure_config.backoff_base_s,
         max_backoff_s=failure_config.max_backoff_s,
         max_skipped_prompts=failure_config.max_skipped_prompts,
+        max_consecutive_dropped_prompts=failure_config.max_consecutive_dropped_prompts,
         max_gym_row_attempts=failure_config.nemo_gym.max_row_attempts,
     )
 
@@ -566,7 +573,7 @@ def setup_single_controller(
     # Setup Dataset & Environments
     # ==========================
     # TODO: add validate dataset wiring.
-    use_nemo_gym = _should_use_nemo_gym(cast(GrpoMasterConfig, master_config))
+    use_nemo_gym = should_use_nemo_gym(master_config)
     if use_nemo_gym and generation_config["backend"] != "vllm":
         raise NotImplementedError(
             "SC NeMo-Gym integration currently supports the vllm backend "
@@ -690,6 +697,7 @@ def setup_single_controller(
                 if generation_router is not None
                 else generation.dp_openai_server_base_urls
             ),
+            tokenizer=tokenizer,
         )
 
     if colocated:
