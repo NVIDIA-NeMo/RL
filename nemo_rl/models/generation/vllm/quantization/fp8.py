@@ -678,7 +678,10 @@ def get_quantized_weight_iterator(
                     f"Prequantized MXFP8 weight {k!r} is missing {scale_name!r}."
                 )
             # Prequantized MXFP8 sends the matching *_scale_from_checkpoint
-            # entry separately. Non-MXFP8 blockwise FP8 sends *_scale_inv.
+            # entry separately, and IPC buffer boundaries may place that scale
+            # in the next batch. The IPC manifest validates the complete set
+            # before post-load processing. Non-MXFP8 blockwise FP8 sends
+            # *_scale_inv.
             yield k, v
             continue
         is_mx = global_fp8_config.is_mx
