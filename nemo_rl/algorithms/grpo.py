@@ -1268,7 +1268,6 @@ def setup(
             cluster=None if colocated_inference else inference_cluster,
             policy=policy if colocated_inference else None,
             processor=processor,
-            weights_path=weights_path,
             skip_weight_load=not colocated_inference,
             reserved_http_server_port=reserved_http_server_port,
         )
@@ -1349,41 +1348,51 @@ def setup(
             setup_timing_metrics.generation_init_reserve_time_s = reserve_time
             print(f"  ✓ Reserved Megatron server URL: {reserved_url}", flush=True)
 
-            def init_megatron_stack():
-                """Init policy then generation; rank 0 holds the reserved port."""
-                p, policy_t = init_policy(
-                    reserved_http_server_port=reserved_http_server_port
-                    if colocated_inference
-                    else None
-                )
-                pg, gen_t = init_megatron_generation(
-                    p,
-                    reserved_http_server_port=None
-                    if colocated_inference
-                    else reserved_http_server_port,
-                )
-                return p, policy_t, pg, gen_t
-
             def init_nemo_gym():
                 """Spin up NeMo Gym servers against the reserved URL."""
                 return _spinup_nemo_gym([reserved_url], generation_config["model_name"])
 
-            init_tasks = {
-                "megatron": init_megatron_stack,
-                "nemo_gym": init_nemo_gym,
-            }
-            print(f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}", flush=True)
+            # Exactly one task adopts the reserved port: the policy when colocated
+            # (generation wraps it), else the dedicated generation policy.
+            policy_port, generation_port = (
+                (reserved_http_server_port, None)
+                if colocated_inference
+                else (None, reserved_http_server_port)
+            )
+
+            def init_megatron_generation_task(policy_future):
+                """Colocated generation waits; non-colocated inits in parallel."""
+                if colocated_inference:
+                    p, _ = policy_future.result()
+                    return init_megatron_generation(p)
+                return init_megatron_generation(
+                    reserved_http_server_port=generation_port
+                )
+
+            print("  ⚡ Init tasks: policy, megatron_generation, nemo_gym", flush=True)
+            init_tasks_t0 = time.perf_counter()
             try:
-                with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
-                    submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
-                    results = {k: f.result() for k, f in submitted.items()}
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    policy_future = executor.submit(
+                        init_policy, reserved_http_server_port=policy_port
+                    )
+                    generation_future = executor.submit(
+                        init_megatron_generation_task, policy_future
+                    )
+                    nemo_gym_future = executor.submit(init_nemo_gym)
+                    policy, policy_time = policy_future.result()
+                    policy_generation, megatron_gen_time = generation_future.result()
+                    nemo_gym_actor, nemo_gym_time = nemo_gym_future.result()
             finally:
                 ray.kill(port_holder)
 
-            policy, policy_time, policy_generation, megatron_gen_time = results[
-                "megatron"
-            ]
-            nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
+            if not colocated_inference:
+                setup_timing_metrics.parallel_wall_time_s = (
+                    time.perf_counter() - init_tasks_t0
+                )
+                setup_timing_metrics.parallel_init_enabled = 1.0
+            else:
+                setup_timing_metrics.parallel_init_enabled = 0.0
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.generation_init_time_s = (
                 reserve_time + megatron_gen_time
@@ -1392,13 +1401,20 @@ def setup(
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
         else:
-            # Initialize training first so checkpoint conversion completes before inference starts.
-            policy, policy_time = init_policy()
-            setup_timing_metrics.policy_init_time_s = policy_time
+            if not colocated_inference:
+                policy_generation, policy = initialize_generation_with_policy(
+                    init_megatron_generation,
+                    colocated_inference,
+                    setup_timing_metrics,
+                )
+            else:
+                # Colocated generation wraps the training policy.
+                policy, policy_time = init_policy()
+                setup_timing_metrics.policy_init_time_s = policy_time
 
-            # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
-            policy_generation, megatron_gen_time = init_megatron_generation(policy)
-            setup_timing_metrics.generation_init_time_s = megatron_gen_time
+                policy_generation, megatron_gen_time = init_megatron_generation(policy)
+                setup_timing_metrics.generation_init_time_s = megatron_gen_time
+                setup_timing_metrics.parallel_init_enabled = 0.0
 
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",

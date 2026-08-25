@@ -147,7 +147,6 @@ class MegatronGeneration(GenerationInterface):
         policy: Optional["Policy"] = None,
         name_prefix: str = "megatron_generation",
         processor: Optional[AutoProcessor] = None,
-        weights_path: Optional[str] = None,
         skip_weight_load: bool = False,
         reserved_http_server_port: Optional[int] = None,
     ):
@@ -162,7 +161,6 @@ class MegatronGeneration(GenerationInterface):
             policy: Existing training Policy to reuse for generation.
             name_prefix: Prefix for naming the worker group (non-colocated only).
             processor: Optional processor for VLMs (non-colocated only).
-            weights_path: Optional path to model weights (non-colocated only).
             skip_weight_load: Do not load the weights from the checkpoint; refit will do it.
             reserved_http_server_port: Driver-reserved OpenAI server port for non-colocated.
         """
@@ -214,7 +212,6 @@ class MegatronGeneration(GenerationInterface):
             processor=processor,
             init_optimizer=False,
             init_reference_model=False,
-            weights_path=weights_path,
             skip_weight_load=skip_weight_load,
             reserved_http_server_port=reserved_http_server_port,
         )

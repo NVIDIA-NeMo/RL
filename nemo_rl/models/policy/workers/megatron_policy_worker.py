@@ -497,16 +497,19 @@ class MegatronPolicyWorkerImpl(
         # worker) may set ``_model_import_post_wrap_hook`` and
         # layer-spec hooks on ``self`` before calling
         # super().__init__() to inject quantization hooks into HF->Megatron
-        # import.
-        handle_model_import(
-            config,
-            hf_model_name,
-            pretrained_path,
-            pt_checkpoint_exists,
-            model_post_wrap_hook=getattr(self, "_model_import_post_wrap_hook", None),
-            transformer_layer_spec=getattr(self, "_transformer_layer_spec", None),
-            mamba_stack_spec=getattr(self, "_mamba_stack_spec", None),
-        )
+        # import. Refit-fed inference-only policies (skip_weight_load) skip the import entirely.
+        if not skip_weight_load:
+            handle_model_import(
+                config,
+                hf_model_name,
+                pretrained_path,
+                pt_checkpoint_exists,
+                model_post_wrap_hook=getattr(
+                    self, "_model_import_post_wrap_hook", None
+                ),
+                transformer_layer_spec=getattr(self, "_transformer_layer_spec", None),
+                mamba_stack_spec=getattr(self, "_mamba_stack_spec", None),
+            )
         log_gpu_memory_diagnostics(
             label="after_hf_import", worker_type="MegatronPolicyWorker"
         )
@@ -524,6 +527,7 @@ class MegatronPolicyWorkerImpl(
             pretrained_path,
             weights_path,
             optimizer_path,
+            skip_weight_load=skip_weight_load,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
