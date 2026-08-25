@@ -152,6 +152,14 @@ run_test env KILL_DURING_REFIT=true FREEZE_VICTIM=true uv run --no-sync bash ./t
 # RefitAbortWatchdog.__exit__ an abort here escaped as an AttributeError and _sync_weights
 # missed it. And this is the path that splits the parent communicator into per-replica
 # children, which the parent's abort does not reach on its own.
+#
+# Unlike its packed-broadcast twin above, this one asserts a bounded ATTRIBUTABLE FAILURE,
+# not survival. The bulk abort goes through sync_stream_within, which orphans kernels on the
+# trainers' streams -- and aborting a communicator does not retire them, so the CUDA context
+# cannot be trusted afterwards and the run is expected to end. Jobs 6521181 and 6523731
+# measured both halves of that: the trainers wedge in init_nccl_communicator behind their own
+# half-aborted communicator, and killing the frozen victim first changes nothing, because the
+# orphaned work is local. See design_vllm_fault_tolerance.md section 8.5.7.
 run_test env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true FREEZE_VICTIM=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 
 # grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout

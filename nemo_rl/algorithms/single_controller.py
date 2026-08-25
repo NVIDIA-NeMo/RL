@@ -171,9 +171,6 @@ class SingleControllerActor:
         # meaningful value meaning "feature off", and it is also their default. Absence
         # therefore degrades to the documented off state rather than to a broken one.
         self._gen_fleet = getattr(actor_args, "fleet_monitor", None)
-        # Shards already evicted by _evict_absent_but_alive, so a fleet that stays
-        # absent across many steps is killed once rather than on every reconcile.
-        self._evicted_shards: set[int] = set()
         self._generation_router = getattr(actor_args, "generation_router", None)
         # Only with fleet health: without a ledger nothing ever reaches DEAD, so there
         # is nothing for a supervisor to restart.
@@ -1501,69 +1498,6 @@ class SingleControllerActor:
                     RuntimeError(f"router: {failures} failed request(s) to {url}"),
                 )
 
-    def _evict_absent_but_alive(self, absent: set[int]) -> None:
-        """Actually kill a shard the fleet has written off but whose process is still up.
-
-        THE FROZEN/KILLED ASYMMETRY, and the last thing keeping them apart. Until here,
-        condemning a shard changed bookkeeping and nothing else: the fleet said DEAD while
-        the process sat there holding its sockets open. That is exactly what a SIGKILLed
-        rank does not do, and the whole reason the killed variants of these tests have
-        always passed while the frozen ones have not.
-
-        Job 6521181 is the measurement. Both trainers' py-spy dumps sat in::
-
-            initialize (nccl/core/communicator.py:442)
-            init_nccl_communicator (stateless_process_group.py:202)
-            init_collective (base_policy_worker.py:91)
-
-        with two unnamed, frame-less threads apiece -- two abandoned ``ncclCommAbort``
-        calls from ``release_within``, still stuck in native code 25 minutes later. NCCL cannot
-        bootstrap a new communicator on a device while a previous one there is wedged
-        mid-abort, and that abort cannot finish while the frozen peer's sockets stay open
-        and idle. Bounding the abort moved the wall by one statement; nothing that leaves
-        the victim running can move it further.
-
-        So the shard is killed for real, which closes its sockets, lets every peer's
-        pending abort return, and puts the rebuild back on the path the killed variants
-        already prove works.
-
-        ``no_restart`` because Ray restarting the actor underneath us would readmit a shard
-        the fleet has just declared absent, and readmission is a deliberate decision made
-        elsewhere with a weight version attached -- not something to get by accident.
-
-        Best-effort and idempotent: a shard already gone raises, and that is the outcome
-        this wanted. The eviction must never be the reason a recovery fails.
-        """
-        if not absent or self._gen_fleet is None:
-            return
-        worker_group = self._gen.worker_group
-        leaders = worker_group.dp_leader_worker_indices
-        workers = worker_group.workers
-        for shard_idx in sorted(absent):
-            if shard_idx in self._evicted_shards or shard_idx >= len(leaders):
-                continue
-            # A shard spans every worker from its leader up to the next shard's leader.
-            start = leaders[shard_idx]
-            end = (
-                leaders[shard_idx + 1] if shard_idx + 1 < len(leaders) else len(workers)
-            )
-            for worker in workers[start:end]:
-                try:
-                    ray.kill(worker, no_restart=True)
-                except Exception as error:  # noqa: BLE001 - see docstring
-                    print(
-                        f"  refit: could not evict a worker of absent shard {shard_idx}: "
-                        f"{type(error).__name__}: {error}",
-                        flush=True,
-                    )
-            self._evicted_shards.add(shard_idx)
-            print(
-                f"  refit: evicted absent shard {shard_idx} "
-                f"(workers {start}..{end - 1}) so its peers' aborts can retire; a frozen "
-                "rank holds its sockets open and blocks the rebuild's NCCL bootstrap",
-                flush=True,
-            )
-
     async def _reconcile_refit_membership(self, force: bool = False) -> Optional[bool]:
         """Ask the weight transport to match the live fleet before the refit runs.
 
@@ -1586,8 +1520,6 @@ class SingleControllerActor:
         if self._gen_fleet is None:
             return False
         absent = self._gen_fleet.absent_shards()
-        # Before the rebuild, not after: the rebuild is what the survivors are blocked in.
-        self._evict_absent_but_alive(absent)
         # to_thread like every other call that reaches the workers: this can rebuild
         # communicators via blocking Ray calls, and running it on the loop would freeze
         # the watchdog, which is an asyncio task on that same loop.
