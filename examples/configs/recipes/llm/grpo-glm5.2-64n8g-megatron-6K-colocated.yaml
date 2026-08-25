@@ -39,6 +39,8 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 6144
+  # Keep every packed microbatch at one fixed length. With the legacy data path,
+  # unequal DP-rank lengths hang the MoE all-gather token dispatcher.
   make_sequence_length_divisible_by: 6144
   logprob_chunk_size: 1024
   offload_optimizer_for_logprob: true
@@ -135,7 +137,6 @@ logger:
   wandb:
     project: nemorl-glm52
     name: grpo-glm5.2-64n8g-megatron-6K-colocated
-    entity: nvidia
 
 cluster:
   gpus_per_node: 8

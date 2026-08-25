@@ -15,7 +15,7 @@ GEMMs in the three shared layers.
 > [!IMPORTANT]
 > **Status: Functionally Ready.** The GLM-5.1 and GLM-5.2 integrations support
 > Megatron training with vLLM generation. The GLM-5.2 reference configurations
-> include short- and long-context training paths. 
+> include short- and long-context training paths.
 
 ## Support Status
 
@@ -145,13 +145,14 @@ so Transformer Engine loads the pinned cuDNN version.
 
 ## Reference Training Curves
 
-Following curves show training run for GLM-5.2, 6K Sequence Length colocated using [this](../../../../examples/configs/recipes/llm/grpo-glm5.2-64n8g-megatron-6K-colocated.yaml) recipe. 
+The following curves show a colocated GLM-5.2 training run at a 6K sequence
+length using [this reference recipe](../../../../examples/configs/recipes/llm/grpo-glm5.2-64n8g-megatron-6K-colocated.yaml).
 
 ![GLM-5.2 GRPO training curves](../../../assets/glm5.2_grpo_curve.png)
 
 ## Known Limitations
 
-- Reference curves and long-run convergence results are not yet included.
+- Long-run convergence results are not yet included.
 - Full 131K end-to-end GRPO is not yet validated because of vLLM timeouts and
   resource constraints. The 131K Megatron Core SFT path has been tested.
 - The non-colocated configuration requires a large multi-node allocation.

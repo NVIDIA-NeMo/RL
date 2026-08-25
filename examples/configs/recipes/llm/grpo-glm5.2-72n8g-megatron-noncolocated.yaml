@@ -81,6 +81,9 @@ policy:
       tensor_parallel_size: 8
       expert_parallel_size: 64
       gpu_memory_utilization: 0.7
+      # Rollouts are capped at the 2K input plus 4K generated tokens; the 131K
+      # policy limit is reserved for training-side sequence packing.
+      max_model_len: 6144
       enforce_eager: true
     vllm_kwargs:
       max_num_batched_tokens: 4096

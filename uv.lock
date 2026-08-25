@@ -98,7 +98,7 @@ overrides = [
     { name = "decord2", marker = "sys_platform == 'never'" },
     { name = "deep-ep", marker = "platform_machine == 'aarch64'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" },
     { name = "deep-ep", marker = "platform_machine == 'x86_64'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=29d31c095796f3c8ece47ee9cdcc167051bbeed9" },
-    { name = "fastapi", extras = ["standard"], specifier = "<0.139.2" },
+    { name = "fastapi", extras = ["standard"], specifier = ">=0.133.0,<0.137.0" },
     { name = "langchain", specifier = ">=0.3.28" },
     { name = "langchain-core", specifier = ">=0.3.80" },
     { name = "langchain-core", specifier = ">=1.2.22" },
