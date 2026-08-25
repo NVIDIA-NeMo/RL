@@ -300,6 +300,10 @@ def get_tokenizer(
                     - "default": Uses the tokenizer's default template
                     - A custom jinja2 template string
                     If not specified, the tokenizer's default template will be used.
+                - tokenizer_kwargs: Extra keyword arguments forwarded to tokenizer
+                  loading, e.g. {"fix_mistral_regex": False}. When
+                  get_processor=True, these are passed through
+                  AutoProcessor.from_pretrained().
         get_processor: Whether to return a processor (via AutoProcessor) instead of a tokenizer.
 
     Returns:
@@ -359,15 +363,21 @@ def get_tokenizer(
     maybe_patch_fastokens(bool(tokenizer_config.get("use_fastokens")))
 
     processor = None
+    tokenizer_kwargs = dict(tokenizer_config.get("tokenizer_kwargs") or {})
 
     if get_processor:
         processor = AutoProcessor.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True, use_fast=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            use_fast=tokenizer_kwargs.pop("use_fast", True),
+            **tokenizer_kwargs,
         )
         tokenizer = processor.tokenizer
     else:
         tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            **tokenizer_kwargs,
         )
 
     if tokenizer.pad_token is None:

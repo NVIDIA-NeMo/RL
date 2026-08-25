@@ -301,17 +301,43 @@ def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
     assert moved == (["cpu"] if offload_optimizer else [])
 
 
-def test_megatron_offload_after_refit_finalizes_before_model_move(monkeypatch):
-    """Checkpoint CUDA IPC handles must be dropped before model storage is replaced."""
+@pytest.mark.parametrize(
+    "generation_backend, colocated, has_inference_model, expect_move_params",
+    [
+        # Plain training worker (no generation config): params always move.
+        (None, False, False, True),
+        # Shared-model colocated Megatron generation: params must stay resident —
+        # inference CUDA graphs replay with capture-time param pointers, and a
+        # CPU round-trip re-allocates their storage.
+        ("megatron", True, False, False),
+        # Colocated reshard (dedicated inference model): params still move; the
+        # graphs live on the dedicated, torch_memory_saver-managed model.
+        ("megatron", True, True, True),
+    ],
+)
+def test_megatron_offload_after_refit_finalizes_before_model_move(
+    monkeypatch, generation_backend, colocated, has_inference_model, expect_move_params
+):
+    """Checkpoint CUDA IPC handles must be dropped before model storage is replaced,
+    and shared-model colocated generation must keep its params resident."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     events = []
+    move_kwargs = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.model = _FakeTrainableModel()
+    worker.cfg = (
+        {"generation": {"backend": generation_backend}} if generation_backend else {}
+    )
+    worker.is_generation_colocated = colocated
+    worker.inference_model = object() if has_inference_model else None
+    worker._colocated_reshard_plan = None
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
-    worker.move_model = lambda model, device: events.append("move_model") or model
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append("move_model") or move_kwargs.append(kwargs) or model
+    )
     worker.offload_before_refit = lambda: events.append("offload_before_refit")
 
     class _AllocatorWakeup:
@@ -334,6 +360,7 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(monkeypatch):
 
     assert events[0] == "finalize_async_save"
     assert events.index("finalize_async_save") < events.index("move_model")
+    assert move_kwargs[0]["move_params"] is expect_move_params
 
 
 def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
