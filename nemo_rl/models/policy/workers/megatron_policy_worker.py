@@ -16,7 +16,6 @@ import gc
 import logging
 import os
 import re
-import functools
 import time
 import warnings
 from collections import OrderedDict, defaultdict
@@ -2855,16 +2854,26 @@ class MegatronPolicyWorkerImpl(
         Async purely so the blocking transfer does not occupy the loop. While it runs,
         this actor can still service the recovery's ``init_collective`` -- which is the
         whole reason the rebuild can happen at all when a generation rank goes silent.
+
+        THE DEVICE IS CARRIED ACROSS EXPLICITLY. CUDA's current device is thread-local, so
+        a fresh thread starts on device 0 rather than this worker's, and NCCL on the wrong
+        device fails with ``UnhandledCudaError`` -- job 6510914 died that way on its first
+        healthy refit, before any fault was injected. ``torch.cuda.current_stream()``
+        inside the transfer reads the same thread-local state, so setting the device also
+        puts the transfer back on the intended stream.
         """
         from nemo_rl.distributed.refit_watchdog import await_off_loop
 
-        return await await_off_loop(
-            functools.partial(
-                self._nccl_reshard_refit_guarded,
-                kv_scales=kv_scales,
-                refit_timeout_s=refit_timeout_s,
+        # Read on the loop thread, where it is correct, and applied on the worker thread.
+        device = torch.cuda.current_device()
+
+        def _on_this_workers_device():
+            torch.cuda.set_device(device)
+            return self._nccl_reshard_refit_guarded(
+                kv_scales=kv_scales, refit_timeout_s=refit_timeout_s
             )
-        )
+
+        return await await_off_loop(_on_this_workers_device)
 
     @torch.no_grad()
     def _nccl_reshard_refit_guarded(self, kv_scales=None, refit_timeout_s=None):
