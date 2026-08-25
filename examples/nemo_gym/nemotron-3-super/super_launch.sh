@@ -134,7 +134,7 @@ export LISTEN_PORT=6000
 export NGINX_PORT=6000
 export NEMO_SKILLS_SANDBOX_PORT=6000
 export SANDBOX_CONTAINER
-export SANDBOX_COMMAND="/start-with-nginx.sh"
+export SANDBOX_COMMAND="${SANDBOX_COMMAND:-/start-with-nginx.sh}"
 export SANDBOX_ENV_VARS="NEMO_SKILLS_SANDBOX_PORT=${NEMO_SKILLS_SANDBOX_PORT}"
 
 # ---- Build the run command ----
@@ -216,9 +216,9 @@ SBATCH_CMD=(
     --job-name="${WANDB_NAME}"
     --partition="${SLURM_PARTITION}"
     --time="${SLURM_TIME_LIMIT}"
-    --gres=gpu:8
+    --gres=gpu:"${GPUS_PER_NODE:-8}"
     --exclusive
-    --dependency=singleton
+    --dependency=singleton${SLURM_EXTRA_DEPENDENCY:+,${SLURM_EXTRA_DEPENDENCY}}
     ray.sub
 )
 

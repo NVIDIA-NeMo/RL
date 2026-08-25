@@ -19,8 +19,10 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollouts import (
+    _calculate_gdpo_reward_feature_metrics,
     _extract_mask_sample_flags,
     _postprocess_single_nemo_gym_group,
+    _record_gdpo_think_count_features,
     apply_reward_penalties,
     resolve_reward_penalty_config,
     should_mask_flagged_samples,
@@ -828,6 +830,123 @@ class TestPenalizeMultiEndThink:
 
 
 # =====================================================================
+# GDPO feature: think_count_delta
+# =====================================================================
+
+
+class TestGdpoThinkCountFeature:
+    CFG = {"token_ids": {"think_close": 13}}
+
+    def test_one_close_think_has_zero_delta(self):
+        result = _make_result(
+            message_log=[
+                _msg("user", [100, 12]),
+                _msg("assistant", [300, 13, 400]),
+            ]
+        )
+        _record_gdpo_think_count_features([result], self.CFG)
+        entry = result["full_result"]["gdpo_reward_features"]["think_count_delta"]
+        assert entry["reward"] == 0.0
+        assert entry["num_close_think_tags"] == 1
+
+    def test_missing_close_think_has_negative_delta(self):
+        result = _make_result(
+            message_log=[
+                _msg("user", [100, 12]),
+                _msg("assistant", [300, 400]),
+            ]
+        )
+        _record_gdpo_think_count_features([result], self.CFG)
+        entry = result["full_result"]["gdpo_reward_features"]["think_count_delta"]
+        assert entry["reward"] == -1.0
+        assert entry["num_close_think_tags"] == 0
+
+    def test_double_close_think_has_negative_delta(self):
+        result = _make_result(
+            message_log=[
+                _msg("user", [100, 12]),
+                _msg("assistant", [300, 13, 400, 13]),
+            ]
+        )
+        _record_gdpo_think_count_features([result], self.CFG)
+        entry = result["full_result"]["gdpo_reward_features"]["think_count_delta"]
+        assert entry["reward"] == -1.0
+        assert entry["num_close_think_tags"] == 2
+
+    def test_generation_str_fallback_counts_close_thinks(self):
+        result = _make_result(
+            output_items=[
+                _message_item("answer", generation_str="a </think> b </think>")
+            ],
+            message_log=[
+                _msg("user", [100, 12]),
+                _msg("assistant", [300, 400]),
+            ],
+        )
+        _record_gdpo_think_count_features([result], self.CFG)
+        entry = result["full_result"]["gdpo_reward_features"]["think_count_delta"]
+        assert entry["reward"] == -1.0
+        assert entry["num_close_think_tags"] == 2
+
+    def test_unconfigured_token_id_is_neutral_without_text(self):
+        # No think_close token id configured, no tokenizer, no generation
+        # text: counting is impossible, so the feature must stay neutral
+        # (count=1 -> delta=0) instead of guessing a token id.
+        result = _make_result(
+            message_log=[
+                _msg("user", [100, 12]),
+                _msg("assistant", [300, 13, 400, 13]),
+            ]
+        )
+        _record_gdpo_think_count_features([result], {})
+        entry = result["full_result"]["gdpo_reward_features"]["think_count_delta"]
+        assert entry["reward"] == 0.0
+        assert entry["count_source"] == "unavailable"
+
+    def test_unconfigured_token_id_uses_generation_str(self):
+        # Without a configured token id the generation string count is used
+        # alone (token ids of other tokenizers must not leak into the count).
+        result = _make_result(
+            output_items=[
+                _message_item("answer", generation_str="a </think> b")
+            ],
+            message_log=[
+                _msg("user", [100, 12]),
+                _msg("assistant", [300, 13, 400, 13]),
+            ],
+        )
+        _record_gdpo_think_count_features([result], {})
+        entry = result["full_result"]["gdpo_reward_features"]["think_count_delta"]
+        assert entry["reward"] == 0.0
+        assert entry["num_close_think_tags"] == 1
+
+    def test_generic_gdpo_feature_metrics(self):
+        r1 = _make_result()
+        r1["full_result"]["gdpo_reward_features"] = {
+            "length_adjusted_reward": {"reward": 1.0},
+            "think_count_delta": {"reward": 0.0},
+        }
+        r2 = _make_result()
+        r2["full_result"]["gdpo_reward_features"] = {
+            "length_adjusted_reward": {"reward": -0.5},
+            "think_count_delta": {"reward": -2.0},
+        }
+        r3 = _make_result()
+        r3["full_result"]["gdpo_reward_features"] = {
+            "length_adjusted_reward": {"reward": 0.5},
+        }
+
+        metrics = _calculate_gdpo_reward_feature_metrics([r1, r2, r3])
+
+        assert metrics["gdpo_length_adjusted_reward/min"] == -0.5
+        assert metrics["gdpo_length_adjusted_reward/max"] == 1.0
+        assert metrics["gdpo_length_adjusted_reward/mean"] == (1.0 - 0.5 + 0.5) / 3
+        assert metrics["gdpo_think_count_delta/min"] == -2.0
+        assert metrics["gdpo_think_count_delta/max"] == 0.0
+        assert metrics["gdpo_think_count_delta/mean"] == -1.0
+
+
+# =====================================================================
 # Cross-cutting: multiple penalties, config gating, batch behavior
 # =====================================================================
 
@@ -902,6 +1021,7 @@ if __name__ == "__main__":
         TestPenalizeEmptyFinalAnswer,
         TestPenalizeUnwantedTokens,
         TestPenalizeMultiEndThink,
+        TestGdpoThinkCountFeature,
         TestCrossCutting,
     ]
 
