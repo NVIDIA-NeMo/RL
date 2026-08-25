@@ -245,9 +245,11 @@ SBATCH_ARGS=(
     --gres=gpu:"${SBATCH_GPUS_PER_NODE}"
     --exclusive
     --dependency=singleton${SLURM_EXTRA_DEPENDENCY:+,${SLURM_EXTRA_DEPENDENCY}}
-    ${SLURM_COMMENT:+--comment=${SLURM_COMMENT}}
-    ray.sub
 )
+if [[ -n "${SLURM_COMMENT:-}" ]]; then
+    SBATCH_ARGS+=(--comment="${SLURM_COMMENT}")
+fi
+SBATCH_ARGS+=(ray.sub)
 
 if [[ "${DRY_RUN}" == true ]]; then
     echo "[dry-run] COMMAND:"
