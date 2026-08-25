@@ -605,6 +605,33 @@ class TestValueWarmStart:
         assert value_kwargs["weights_path"] is None
         assert value_kwargs["optimizer_path"] is None
 
+    def test_resume_ignores_the_warm_start(self, patched_ppo_factories, tmp_path):
+        """Re-seeding a resumed run would discard the critic's own progress, so
+        the run's checkpoint has to win over the key left in the config."""
+        seed = tmp_path / "critic_pretrain" / "step_370"
+        (seed / "value" / "weights").mkdir(parents=True)
+        (seed / "value" / "optimizer").mkdir()
+        step_5 = tmp_path / "run" / "step_5"
+        for component in ("policy", "value"):
+            (step_5 / component / "weights").mkdir(parents=True)
+            (step_5 / component / "optimizer").mkdir()
+        (step_5 / "training_info.json").write_text("{}")
+        mc = _ppo_master_config(
+            ppo=PPOConfig.model_construct(
+                max_num_steps=100,
+                warm_start_value_checkpoint=str(seed),
+                **_STEP_CONFIG,
+            )
+        )
+        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+
+        with patch.object(sc_setup_mod, "load_dataloader_state"):
+            setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
+        assert value_kwargs["weights_path"] == step_5 / "value" / "weights"
+        assert value_kwargs["optimizer_path"] == step_5 / "value" / "optimizer"
+
 
 def _cluster_config(mc: MasterConfig, *, colocated: bool, backend: str) -> MasterConfig:
     """Fill in the cluster / generation keys _build_clusters reads."""
