@@ -2271,9 +2271,7 @@ class SingleControllerActor:
 
                     # A generation engine that blocks training must stand down;
                     # sleep the engine to allow for the trainer to perform GPU work.
-                    # Safe because the select above assembles whole steps for
-                    # blocking engines (min == max), so nothing below waits on
-                    # rollouts the sleeping engine could not deliver.
+                    # Safe because the select above assembles whole steps for blocking engines.
                     # In-flight requests freeze, then continue on fresh weights.
                     # The post-step `_sync_weights` wake reopens the gate,
                     # except on save-bound steps, where the wake is deferred until after the save.
@@ -2411,9 +2409,7 @@ class SingleControllerActor:
                         and self._train_steps % ft_save_period == 0
                     )
                 )
-                # Latched (timer.last_saved): call once per step and reuse the bool.
-                # A second call would consume the latch, returning False and silently
-                # dropping both the save and the early-stop break below.
+                # Call once per step and reuse the bool.
                 should_save_by_timeout = self._timeout.check_save()
                 will_save_checkpoint = self._master_config.checkpointing[
                     "enabled"
