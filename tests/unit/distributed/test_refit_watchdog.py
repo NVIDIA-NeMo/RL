@@ -19,14 +19,12 @@ Testable without NCCL because the watchdog's contract is entirely about *when* i
 returns without raising) was verified separately on real hardware.
 """
 
-import sys
-import threading
 import asyncio
 import pickle
+import sys
+import threading
 import time
-
 from types import SimpleNamespace
-
 from unittest import mock
 
 import pytest

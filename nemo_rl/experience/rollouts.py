@@ -466,6 +466,38 @@ def _apply_effort_shaping(
     )
 
 
+def _effort_shaping_metrics(shaping: _EffortShapingMetrics) -> dict[str, float]:
+    """Build the rollout-metric entries for one group's effort-shaping lists.
+
+    Shared by the batched v1 path and the SingleController rollout manager so the
+    two cannot drift apart.
+
+    Args:
+        shaping: Per-sample tracking lists returned by ``_apply_effort_shaping``.
+
+    Returns:
+        Metric name to value. Empty only when shaping was disabled; callers
+        ``update`` an existing dict, so an absent key leaves the metric unreported
+        rather than reporting a zero.
+    """
+    metrics: dict[str, float] = {}
+    if shaping.length_rewards_low:
+        metrics["mean_length_reward_low"] = sum(shaping.length_rewards_low) / len(
+            shaping.length_rewards_low
+        )
+    if shaping.rewards_low:
+        metrics["mean_reward_low"] = sum(shaping.rewards_low) / len(shaping.rewards_low)
+    if shaping.low_lengths:
+        metrics["mean_length_low"] = sum(shaping.low_lengths) / len(shaping.low_lengths)
+        metrics["median_length_low"] = float(statistics.median(shaping.low_lengths))
+    if shaping.high_lengths:
+        metrics["mean_length_high"] = sum(shaping.high_lengths) / len(
+            shaping.high_lengths
+        )
+        metrics["median_length_high"] = float(statistics.median(shaping.high_lengths))
+    return metrics
+
+
 def generate_responses(
     policy_generation: GenerationInterface,
     generation_input_data: BatchedDataDict[GenerationDatumSpec],
@@ -2610,10 +2642,6 @@ def _postprocess_single_nemo_gym_group(
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
-    length_rewards_low = shaping.length_rewards_low
-    rewards_low = shaping.rewards_low
-    low_lengths = shaping.low_lengths
-    high_lengths = shaping.high_lengths
 
     resolved_reward_penalty_config = resolve_reward_penalty_config(
         reward_penalty_config, tokenizer, thinking_tags=thinking_tags
@@ -2793,18 +2821,7 @@ def _postprocess_single_nemo_gym_group(
     if mask_env_flagged_samples:
         final_batch["mask_sample"] = _extract_mask_sample_flags(results)
 
-    if length_rewards_low:
-        rollout_metrics["mean_length_reward_low"] = sum(length_rewards_low) / len(
-            length_rewards_low
-        )
-    if rewards_low:
-        rollout_metrics["mean_reward_low"] = sum(rewards_low) / len(rewards_low)
-    if low_lengths:
-        rollout_metrics["mean_length_low"] = sum(low_lengths) / len(low_lengths)
-        rollout_metrics["median_length_low"] = float(statistics.median(low_lengths))
-    if high_lengths:
-        rollout_metrics["mean_length_high"] = sum(high_lengths) / len(high_lengths)
-        rollout_metrics["median_length_high"] = float(statistics.median(high_lengths))
+    rollout_metrics.update(_effort_shaping_metrics(shaping))
 
     # Penalty metrics — map count keys to (config flag, metric name)
     _PENALTY_METRICS = {

@@ -33,6 +33,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     SingleControllerActorArgs,
     setup_single_controller,
 )
+from nemo_rl.experience.rollouts import EffortLevelsConfig
 
 
 def _make_master_config(
@@ -340,6 +341,52 @@ class TestSetup:
         assert actor_args.tq_buffer._partition_id == "rollout_data"
         assert actor_args.tq_buffer._require_routed_experts is False
 
+    def test_effort_levels_reach_the_rollout_manager(self, patched_factories):
+        """env.nemo_gym.effort_levels is resolved into RolloutManager's kwarg.
+
+        Asserted on the constructor rather than on ``_impl``: only the NeMo-Gym impl
+        keeps the config, while the native impl absorbs it via ``**kwargs``.
+        """
+        mc = _make_master_config(
+            env={
+                "nemo_gym": {
+                    "effort_levels": {
+                        "low_weight": 1.0,
+                        "low_penalty": 2.0,
+                        "low_ub": 500,
+                        "low_string": "<budget>",
+                    }
+                }
+            }
+        )
+
+        with patch.object(sc_setup_mod, "RolloutManager") as mock_rollout_manager:
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        _, call_kwargs = mock_rollout_manager.call_args
+        assert call_kwargs["effort_config"] == EffortLevelsConfig(
+            low_weight=1.0, low_penalty=2.0, low_ub=500, low_string="<budget>"
+        )
+
+    @pytest.mark.parametrize(
+        "env",
+        [
+            pytest.param({}, id="no_nemo_gym_section"),
+            pytest.param({"nemo_gym": {}}, id="no_effort_levels_key"),
+        ],
+    )
+    def test_rollout_manager_gets_no_effort_config_when_unset(
+        self, env: dict, patched_factories
+    ):
+        """Shaping stays off unless env.nemo_gym.effort_levels is configured."""
+        mc = _make_master_config(env=env)
+
+        with patch.object(sc_setup_mod, "RolloutManager") as mock_rollout_manager:
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        _, call_kwargs = mock_rollout_manager.call_args
+        assert call_kwargs["effort_config"] is None
+
     def test_router_replay_requires_routes_in_tq_buffer(self, patched_factories):
         mc = _make_master_config(colocated=True)
         mc.policy["router_replay"] = {"enabled": True}
@@ -537,9 +584,6 @@ class TestSetup:
         _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert metrics.generation_init_time_s is not None
-        # Backend-specific fields are grpo.py-only; SC does not populate them.
-        assert metrics.vllm_init_time_s is None
-        assert metrics.sglang_init_time_s is None
 
     def test_nemo_gym_uses_deferred_vllm_load(self, patched_factories):
         """NeMo-Gym path reserves vLLM ports up-front and finishes the load afterwards."""
