@@ -860,6 +860,45 @@ class TestDTensorParamsGenerator:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_prepare_refit_info_keeps_declared_buffer_native_dtype():
+    """prepare_refit_info must declare the same dtype dtensor_params_generator streams.
+
+    Mirrors NemotronH's fp32 ``e_score_correction_bias`` MoE routing buffers:
+    if the manifest declared bf16 while the sender streamed fp32 bytes, the
+    receiver would misinterpret the payload.
+    """
+
+    class Gate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(4, 4, dtype=torch.float32))
+            self.register_buffer(
+                "e_score_correction_bias", torch.zeros(4, dtype=torch.float32)
+            )
+
+    class Model(nn.Module):
+        _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+
+        def __init__(self):
+            super().__init__()
+            self.gate = Gate()
+
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.model = Model()
+    worker.dtype = torch.bfloat16
+
+    state_dict_info = DTensorPolicyWorkerV2Impl.prepare_refit_info(worker)
+
+    assert state_dict_info["gate.weight"][1] == torch.bfloat16, (
+        "Undeclared tensors should be declared in the policy compute dtype"
+    )
+    assert state_dict_info["gate.e_score_correction_bias"][1] == torch.float32, (
+        "Declared dtype-sensitive buffers must be declared in their native dtype"
+    )
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 class TestGetTrainContext:
     """Tests for the get_train_context context manager function."""
 
