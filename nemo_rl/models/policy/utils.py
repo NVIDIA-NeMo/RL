@@ -881,6 +881,7 @@ def init_process_group(
     """
     from torch.distributed.distributed_c10d import (
         Backend,
+        GroupName,
         PrefixStore,
         _get_default_group,
         _new_process_group_helper,
@@ -911,7 +912,7 @@ def init_process_group(
         # PrefixStore so multiple co-tenant groups don't trample each other's keys.
         store = PrefixStore(group_name or "", store)
 
-    group_name = group_name or ""
+    group_name = GroupName(group_name or "")
 
     # ``pg_options`` was renamed to ``backend_options`` in PyTorch 2.6:
     #   https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844

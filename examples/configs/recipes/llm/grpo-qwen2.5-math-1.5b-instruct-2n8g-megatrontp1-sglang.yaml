@@ -2,11 +2,18 @@ defaults: ../../grpo_math_1B_sglang.yaml
 grpo:
   max_num_steps: 450
 checkpointing:
-  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang
+  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang
 policy:
   model_name: Qwen/Qwen2.5-Math-1.5B-Instruct
   tokenizer:
     name: Qwen/Qwen2.5-Math-1.5B-Instruct
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    scheduler:
+      lr_warmup_iters: 50
+  dtensor_cfg:
+    enabled: false
   dynamic_batching:
     enabled: true
   sequence_packing:
@@ -15,18 +22,19 @@ policy:
   generation:
     max_new_tokens: 512
     sglang_cfg:
-      tp_size: 2
+      tp_size: 4
       sglang_server_config:
-        num_gpus: 8
+        num_gpus: 16
       sglang_router_config:
         use_distributed_post: true
 data:
   max_input_seq_length: 512
 logger:
-  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang
+  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang
+    name: grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang
 cluster:
   gpus_per_node: 8
+  num_nodes: 2

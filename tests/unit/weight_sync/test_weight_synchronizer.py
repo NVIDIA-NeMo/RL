@@ -297,7 +297,7 @@ class TestSGLangColocatedWeightSynchronizer:
         assert call_kwargs["buffer_size_bytes"] == 2 * (1024**3)
 
     @pytest.mark.parametrize("quantization", [None, {}])
-    def test_quantization_config_is_required(self, quantization, mock_ray):
+    def test_quantization_config_is_required(self, mock_ray, quantization):
         policy = _mock_policy()
         gen = _mock_sglang_generation()
         if quantization is None:

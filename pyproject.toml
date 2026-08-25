@@ -78,7 +78,7 @@ dependencies = [
   # crash at first gated-chunk backward with a RuntimeError pointing
   # at this exact pip install. Linux x86_64 only — mamba-ssm itself
   # is gated to that pair.
-  "tilelang; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "tilelang>=0.1.9,<0.1.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
   # Data-plane stack — promoted to base so worker venvs (built by
   # nemo_rl.utils.venvs.create_local_venv via bare `uv sync`, no extras)
   # automatically include them. Removes the need for a `[data-plane]`
@@ -120,6 +120,7 @@ fsdp = [
   "mamba-ssm",
   "causal-conv1d",
   "transformers>=5.5.0,<5.9.0",
+  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 automodel = [
   "nemo-automodel[moe]",
@@ -130,6 +131,7 @@ automodel = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   "transformers==5.5.0",
+  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",
@@ -140,6 +142,7 @@ automodel = [
 ]
 vllm = [
   "transformers==5.8.1",
+  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "cuda-python",
   "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
   # deep_ep also needs libibverbs-dev
@@ -165,13 +168,14 @@ sglang = [
   # re-materialized once, after the last bucket lands. No tagged release has
   # those endpoints, and re-running the finalize per bucket is not idempotent.
   "sglang",
-  "sglang-kernel==0.4.5",         # Direct dep for explicit version control; required by sglang-miles
-  "sglang-router",                # Used by nemo_rl.models.generation.sglang.sglang_router for multi-engine routing
+  "sglang-kernel==0.4.5",                                                       # Direct dep for explicit version control; required by sglang-miles
+  "sglang-router",                                                              # Used by nemo_rl.models.generation.sglang.sglang_router for multi-engine routing
   "kernels>=0.14.1,<0.15",
   "flashinfer-python==0.6.14",
   "flashinfer-cubin==0.6.14",
   "flashinfer-jit-cache==0.6.14",
   "transformers==5.12.1",
+  "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
@@ -191,6 +195,7 @@ mcore = [
   # pyproject changes propagate on bump without any mirror here.
   "megatron-bridge[te,ssm]",
   "transformers==5.8.1",
+  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
@@ -216,7 +221,11 @@ mcore = [
 # backend (_backend.py). The path source lets uv lock resolve the dep graph
 # without compiling (prepare_metadata_for_build_wheel returns static metadata).
 # The actual ~60-min wheel build is triggered by `uv sync --extra trtllm`.
-trtllm = ["tensorrt-llm==1.3.0rc21", "transformers==5.5.4"]
+trtllm = [
+  "tensorrt-llm==1.3.0rc21",
+  "transformers==5.5.4",
+  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
   "nvidia-resiliency-ext==0.6.0",
