@@ -1283,19 +1283,6 @@ def grpo_train_sync(
                     logger,
                 )
 
-            if (
-                master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("async_engine", False)
-            ):
-                for metric_name in metrics.keys():
-                    if metric_name.startswith("histogram/"):
-                        logger.log_histogram(
-                            metrics[metric_name],
-                            total_steps + 1,
-                            f"generation_metrics/{metric_name}",
-                        )
-
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")
             if "draft_loss" in metrics:
