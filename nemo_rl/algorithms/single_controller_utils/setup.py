@@ -799,8 +799,7 @@ def setup_single_controller(
 
     if use_nemo_gym:
         if megatron_backend:
-            # Megatron serves from rank 0 of the generation workers; pre-publish that address
-            # so Gym spinup can overlap the trainer + engine init.
+            # Megatron serves from rank 0 of the generation workers; pre-publish that address.
             t0 = time.perf_counter()
             (
                 megatron_reserved_url,
@@ -826,15 +825,11 @@ def setup_single_controller(
             defer_generation_model_load = True
             gym_base_urls = generation.dp_openai_server_base_urls
         # Before the Gym task is built, so Gym can be handed the router's single URL.
-        # These two statements are the only failable ones between the port holder's
-        # creation and the executor try/finally that reaps it, so they reap it on the
-        # way out; keep anything else that can raise out of that window.
+        # These two statements are the only failable ones related to the port holder's creation.
         try:
             generation_router = _maybe_start_generation_router(
                 gym_base_urls, master_config
             )
-            # The whole point of the router: Gym holds one NeMo-RL-owned URL and
-            # never has to fail over, which is the thing it cannot do.
             gym_spinup_base_urls = (
                 [ray.get(generation_router.base_url.remote())]
                 if generation_router is not None

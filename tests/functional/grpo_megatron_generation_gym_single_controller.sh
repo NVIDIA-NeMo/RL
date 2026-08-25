@@ -1,10 +1,7 @@
 #!/bin/bash
-# SingleController + NeMo-Gym + Megatron generation e2e smoke. Mirrors
-# grpo_async_gym_single_controller.sh with the generation backend swapped to
-# megatron (non-colocated): Gym rollouts go through the persistent Megatron
-# engine's OpenAI server, whose address is reserved up front so Gym spinup
-# overlaps engine init, and each post-step weight sync runs mcore's
-# reshard-capable transfer.
+# SingleController + NeMo-Gym + Megatron generation e2e smoke.
+# Mirrors grpo_async_gym_single_controller.sh
+# with the generation backend swapped to non-colocated Megatron Inference.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath $SCRIPT_DIR/../..)

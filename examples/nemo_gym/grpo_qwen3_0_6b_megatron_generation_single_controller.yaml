@@ -1,11 +1,8 @@
-# GRPO on the NeMo-Gym workplace-assistant environment via the SingleController
-# path, with training AND generation both on Megatron (non-colocated).
-# Gym rollouts go through the persistent Megatron engine's OpenAI-compatible
-# server: expose_http_server=true pre-publishes the server address so Gym
-# spinup overlaps trainer + engine init, and each post-step weight sync runs
-# mcore's reshard-capable transfer.
-# Smoke-test scale -- Qwen3-0.6B on one node with 2 GPUs (1 training + 1
-# generation); the CI-run variant of this setup is
+# GRPO on the NeMo-Gym workplace-assistant environment via the SingleController path,
+# using non-colocated Megatron Inference.
+# Gym rollouts go through the persistent Megatron engine's OpenAI-compatible server,
+# Smoke-test scale; Qwen3-0.6B on one node with 2 GPUs (1 training + 1 generation);
+# the CI-run variant of this setup is
 # tests/functional/grpo_megatron_generation_gym_single_controller.sh.
 defaults: "grpo_qwen3_30ba3b_instruct.yaml"
 
