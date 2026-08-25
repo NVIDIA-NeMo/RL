@@ -27,11 +27,8 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken
   checkpoint_must_save_by: 00:04:15:00
 policy:
-  model_name: /lustre/fsw/general_sa/shuangy/models/Qwen/Qwen3-30B-A3B-Base
-  tokenizer:
-    name: /lustre/fsw/general_sa/shuangy/models/Qwen/Qwen3-30B-A3B-Base
+  model_name: Qwen/Qwen3-30B-A3B-Base
   train_micro_batch_size: 1
-  logprob_batch_size: 1
   max_total_sequence_length: 22528
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: true
@@ -48,7 +45,6 @@ policy:
     sequence_parallel: true
     activation_checkpointing: true
     defer_fp32_logits: true
-    batch_invariant_mode: false
     moe_router_dtype: fp32
     fp4_cfg:
       enabled: true
@@ -70,7 +66,6 @@ policy:
     checkpoint:
       async_save: false
     env_vars:
-      NRL_MEGATRON_CHECKPOINT_DIR: /lustre/fsw/general_sa/shuangy/hf/megatron_ckpt_qwen3_30ba3b_nvfp4_pertoken
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False,garbage_collection_threshold:0.8
       NVTE_NVFP4_ROW_SCALED_ACTIVATION: '1'
       NVTE_NVFP4_DISABLE_RHT: '1'
@@ -81,8 +76,6 @@ policy:
     enabled: false
   dynamic_batching:
     enabled: true
-    train_mb_tokens: 22528
-    logprob_mb_tokens: 22528
   generation:
     max_new_tokens: 20480
     nvfp4_pertoken_rollout:
@@ -98,7 +91,6 @@ policy:
       moe_backend: auto
     vllm_cfg:
       gpu_memory_utilization: 0.5
-      precision: bfloat16
       env_vars:
         FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH: '1'
         TRTLLM_DISABLE_FP4_QUANT_FAST_MATH: '1'
@@ -120,8 +112,7 @@ logger:
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
-    entity: nv-welcome
-    project: qwen3-30b-nvfp4
+    project: nemo-rl
     name: grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken
 cluster:
   gpus_per_node: 4
