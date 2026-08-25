@@ -194,6 +194,11 @@ export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 # fails with "Repo id must be in the form 'repo_name' or 'namespace/repo_name'",
 # which says nothing about mounts. Check here instead.
 mount_checked_vars=(MODEL_PATH TRAIN_PATH VAL_PATH PERSISTENT_CACHE)
+# CHAT_TEMPLATE defaults to a file inside MODEL_PATH, which is already covered.
+# Point it at a template outside the checkpoint and it needs its own mount, or
+# vLLM and the tokenizer silently fall back and the run trains on the wrong
+# prompt shape. Check it only when it is not under MODEL_PATH.
+[[ "${CHAT_TEMPLATE}" != "${MODEL_PATH}"* ]] && mount_checked_vars+=(CHAT_TEMPLATE)
 # GYM_VENV_DIR defaults to a container-internal path, which needs no mount. It
 # only has to be checked when pointed at host storage -- worth doing, because
 # putting it on a shared filesystem is how Gym's skip_venv_if_present actually
@@ -226,6 +231,16 @@ echo " Model      : ${MODEL_PATH}"
 echo " Container  : ${CONTAINER}"
 echo "========================================"
 
+# Same-name submissions are always serialized. An explicit dependency can be
+# added for continuation chains so a successor runs only after its predecessor
+# succeeds, while still preventing accidental overlap with another submission
+# using the same experiment name.
+SLURM_DEPENDENCY="${SLURM_DEPENDENCY:-}"
+DEPENDENCY="singleton"
+if [[ -n "${SLURM_DEPENDENCY}" ]]; then
+    DEPENDENCY="singleton,${SLURM_DEPENDENCY}"
+fi
+
 SBATCH_ARGS=(
     sbatch
     --nodes="${SBATCH_NUM_NODES}"
@@ -235,7 +250,7 @@ SBATCH_ARGS=(
     --time="${SLURM_TIME_LIMIT}"
     --gres=gpu:"${SBATCH_GPUS_PER_NODE}"
     --exclusive
-    --dependency=singleton
+    --dependency="${DEPENDENCY}"
     ray.sub
 )
 
