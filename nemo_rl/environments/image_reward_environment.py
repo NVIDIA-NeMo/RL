@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Image-native reward environment for diffusion-GRPO.
+"""Image-native reward environment for flow-GRPO.
 
 Does NOT inherit :class:`nemo_rl.environments.interfaces.EnvironmentInterface`:
 the latter's ``step(message_log_batch, metadata)`` is token-centric and the
@@ -432,9 +432,7 @@ class GenRmOcrReward:
                 buf.getvalue()
             ).decode("utf-8")
             transcription = self._transcribe(data_url)
-            scores.append(
-                genrm_ocr_score(transcription, str(meta["ground_truth"]))
-            )
+            scores.append(genrm_ocr_score(transcription, str(meta["ground_truth"])))
         return {"genrm_ocr": torch.tensor(scores, dtype=torch.float32)}
 
 

@@ -39,7 +39,7 @@ run_test fast uv run --no-sync bash ./tests/functional/xtoken_off_policy_distill
 run_test fast uv run --no-sync bash ./tests/functional/dpo.sh
 run_test      uv run --no-sync bash ./tests/functional/prorlv2.sh
 run_test      uv run --no-sync bash ./tests/functional/rm.sh
-run_test      uv run --no-sync bash ./tests/functional/diffusion_grpo.sh
+run_test      uv run --no-sync bash ./tests/functional/flow_grpo.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

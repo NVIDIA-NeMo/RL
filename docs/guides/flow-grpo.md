@@ -1,10 +1,10 @@
-# Diffusion GRPO: RL for Image Diffusion Models
+# Flow-GRPO: RL for Image Diffusion Models
 
-This guide covers the diffusion-GRPO implementation in NeMo RL — an adaptation of [Flow-GRPO](https://arxiv.org/abs/2505.05470) that post-trains **image diffusion (flow-matching, text-to-image) models** such as [Qwen/Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) with online RL.
+This guide covers the Flow-GRPO implementation in NeMo RL — an adaptation of [Flow-GRPO](https://arxiv.org/abs/2505.05470) that post-trains **image diffusion (flow-matching, text-to-image) models** such as [Qwen/Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) with online RL.
 
-> **Scope note**: this is *image* diffusion (continuous flow-matching over latents), not diffusion *language* models (dLLMs). The `nemo_rl/models/diffusion/` package and `diffusion_grpo` algorithm refer exclusively to text-to-image generation.
+> **Scope note**: this is *image* diffusion (continuous flow-matching over latents), not diffusion *language* models (dLLMs). The `nemo_rl/models/diffusion/` package and `flow_grpo` algorithm refer exclusively to text-to-image generation.
 
-For foundational GRPO concepts (group-relative advantages, clipped policy gradients), see the [GRPO guide](grpo.md). Diffusion GRPO mirrors `nemo_rl.algorithms.grpo.grpo_train` in phase ordering but replaces token-level concepts (vLLM rollouts, token log-probs, token KL) with their continuous counterparts.
+For foundational GRPO concepts (group-relative advantages, clipped policy gradients), see the [GRPO guide](grpo.md). Flow-GRPO mirrors `nemo_rl.algorithms.grpo.grpo_train` in phase ordering but replaces token-level concepts (vLLM rollouts, token log-probs, token KL) with their continuous counterparts.
 
 ## How It Works
 
@@ -12,8 +12,8 @@ On-policy RL needs `log pi(action | state)`. A deterministic ODE sampler gives n
 
 1. **Rollout**: sample `num_generations_per_prompt` images per prompt with the SDE sampler, recording per-step transition log-probs. An optional **SDE window** (`policy.algo.sde_window_size` / `sde_window_range`) makes only a slice of the denoising steps stochastic — the Flow-GRPO "Fast" mode — so the loss only needs to recompute those steps.
 2. **Reward**: score decoded images with a pluggable reward environment (`nemo_rl/environments/image_reward_environment.py`).
-3. **Advantage**: group-relative advantage. The exemplar centers each group by its plain in-group mean (`grpo.use_leave_one_out_baseline: false`, matching the reference Flow-GRPO recipe); set it to `true` for the leave-one-out variant. `grpo.use_global_std: true` normalizes by the whole-batch reward std rather than per-group, because per-group std explodes on near-constant groups under sparse rewards.
-4. **Train**: recompute transition log-probs with grad and apply the clipped policy-gradient loss (`nemo_rl/algorithms/loss/diffusion_grpo.py`), with optional Gaussian KL against the reference policy (`loss_fn.beta > 0`; the reference is the base model with the LoRA adapter disabled).
+3. **Advantage**: group-relative advantage. The exemplar centers each group by its plain in-group mean (`flow_grpo.use_leave_one_out_baseline: false`, matching the reference Flow-GRPO recipe); set it to `true` for the leave-one-out variant. `flow_grpo.use_global_std: true` normalizes by the whole-batch reward std rather than per-group, because per-group std explodes on near-constant groups under sparse rewards.
+4. **Train**: recompute transition log-probs with grad and apply the clipped policy-gradient loss (`nemo_rl/algorithms/loss/flow_grpo.py`), with optional Gaussian KL against the reference policy (`loss_fn.beta > 0`; the reference is the base model with the LoRA adapter disabled).
 
 ## Components
 
@@ -21,14 +21,14 @@ On-policy RL needs `log pi(action | state)`. A deterministic ODE sampler gives n
 |---|---|
 | SDE step / log-prob kernel | `nemo_rl/models/diffusion/sde.py` |
 | Config schemas and protocols | `nemo_rl/models/diffusion/interfaces.py` |
-| Clipped policy-gradient loss | `nemo_rl/algorithms/loss/diffusion_grpo.py` |
+| Clipped policy-gradient loss | `nemo_rl/algorithms/loss/flow_grpo.py` |
 | Qwen-Image pipeline adapter | `nemo_rl/models/diffusion/pipeline.py` |
-| Ray worker (Automodel loading, LoRA, DP all-reduce) | `nemo_rl/models/diffusion/workers/diffusion_worker.py` |
-| Controller-side policy facade | `nemo_rl/models/diffusion/policy.py` |
-| Training loop | `nemo_rl/algorithms/diffusion_grpo.py` |
+| Ray worker (Automodel loading, LoRA, DP all-reduce) | `nemo_rl/models/diffusion/workers/flow_grpo_worker.py` |
+| Controller-side policy facade | `nemo_rl/models/diffusion/flow_grpo_policy.py` |
+| Training loop | `nemo_rl/algorithms/flow_grpo.py` |
 | Prompt dataset | `nemo_rl/data/datasets/text_to_image_prompt.py` |
 | Reward environment | `nemo_rl/environments/image_reward_environment.py` |
-| Entry point | `examples/run_diffusion_grpo.py` |
+| Entry point | `examples/run_flow_grpo.py` |
 
 The worker loads the Qwen-Image pipeline through the NeMo Automodel stack (`NeMoAutoDiffusionPipeline`); the transformer, scheduler, and VAE are diffusers components, while Automodel handles LoRA injection and checkpointing. Training itself is data-parallel: with `cluster.gpus_per_node: N`, rollout prompts scatter across N single-GPU workers and gradients all-reduce so every rank applies the identical update. `policy.seed` is required for DP so all ranks materialize bit-identical LoRA init; the training loop logs `train/dp_checksum_spread` (must stay 0) to guard gradient sync.
 
@@ -63,8 +63,8 @@ Co-locating the judge and training on one node means splitting the 8 GPUs (e.g. 
 Launch training (single node, LoRA):
 
 ```bash
-uv run --frozen --extra diffusion python examples/run_diffusion_grpo.py \
-    --config examples/configs/diffusion_grpo_qwen_image_ocr.yaml
+uv run --frozen --extra diffusion python examples/run_flow_grpo.py \
+    --config examples/configs/flow_grpo_qwen_image_ocr.yaml
 ```
 
 The exemplar's main hyperparameters:
@@ -86,8 +86,8 @@ Recipes ship as thin overrides of the exemplar:
 
 | Recipe | Reward | Steps | Config |
 |---|---|---|---|
-| Exemplar | `genrm_ocr` | 300 | `examples/configs/diffusion_grpo_qwen_image_ocr.yaml` |
-| Nightly (CI convergence gate) | `ocr` (PaddleOCR, CPU) | 60 | `examples/configs/recipes/diffusion/grpo-qwen-image-ocr-1n8g-dp8-lora.yaml` |
+| Exemplar | `genrm_ocr` | 300 | `examples/configs/flow_grpo_qwen_image_ocr.yaml` |
+| Nightly (CI convergence gate) | `ocr` (PaddleOCR, CPU) | 60 | `examples/configs/recipes/diffusion/flow_grpo-qwen-image-ocr-1n8g-dp8-lora.yaml` |
 
 The nightly recipe swaps in the CPU PaddleOCR reward so CI needs no served judge, and asserts a `val/reward_mean` gain plus healthy `train/mean_ratio` and `train/grad_norm` bounds.
 
@@ -96,15 +96,15 @@ The nightly recipe swaps in the CPU PaddleOCR reward so CI needs no served judge
 For a single-GPU sanity run (tiny random Qwen-Image, jpeg reward, no judge, no validation, 5 steps):
 
 ```bash
-bash tests/functional/diffusion_grpo.sh
+bash tests/functional/flow_grpo.sh
 ```
 
 ## Configuration
 
-All defaults live on the pydantic `BaseModel` schemas (`nemo_rl/models/diffusion/interfaces.py`, `nemo_rl/algorithms/diffusion_grpo.py`) and are documented in the exemplar YAML `examples/configs/diffusion_grpo_qwen_image_ocr.yaml`. Key blocks:
+All defaults live on the pydantic `BaseModel` schemas (`nemo_rl/models/diffusion/interfaces.py`, `nemo_rl/algorithms/flow_grpo.py`, `nemo_rl/algorithms/loss/flow_grpo.py`) and are documented in the exemplar YAML `examples/configs/flow_grpo_qwen_image_ocr.yaml`. Key blocks:
 
 ```yaml
-grpo:
+flow_grpo:
   num_prompts_per_step: 32        # x num_generations_per_prompt = samples/step
   num_generations_per_prompt: 16  # GRPO group size
   use_global_std: true            # whole-batch reward std normalization
@@ -117,7 +117,7 @@ loss_fn:
 policy:
   model_name: "Qwen/Qwen-Image"
   pipeline:
-    num_inference_steps: 10       # training rollout steps (val uses grpo.val_generation)
+    num_inference_steps: 10       # training rollout steps (val uses flow_grpo.val_generation)
   algo:
     noise_level: 1.2              # SDE noise scale
     sde_window_size: 2            # stochastic steps per rollout (Fast mode)
@@ -126,7 +126,7 @@ policy:
     enabled: true
 ```
 
-Validation always samples with the deterministic ODE (`grpo.val_generation.num_inference_steps`), keeps a fixed seed so `val/reward_mean` is comparable across steps, and saves up to `logger.num_val_samples_to_print` images per validation.
+Validation always samples with the deterministic ODE (`flow_grpo.val_generation.num_inference_steps`), keeps a fixed seed so `val/reward_mean` is comparable across steps, and saves up to `logger.num_val_samples_to_print` images per validation.
 
 ## Metrics to Watch
 

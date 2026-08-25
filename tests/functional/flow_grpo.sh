@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Functional test for diffusion-GRPO: a 1-GPU sanity run of `diffusion_grpo_train`.
+# Functional test for flow-GRPO: a 1-GPU sanity run of `flow_grpo_train`.
 #
 # Layers CLI overrides on the OCR exemplar config to train 5 steps of
 # `tiny-random/Qwen-Image` with the `jpeg_compressibility` reward (a real
@@ -8,10 +8,10 @@
 #
 # This script is wired into `tests/functional/L1_Functional_Tests_Other_2.sh`;
 # the CI-facing nightly recipe lives at
-# `tests/test_suites/diffusion/grpo-qwen-image-ocr-1n8g-dp8-lora.sh`.
+# `tests/test_suites/diffusion/flow_grpo-qwen-image-ocr-1n8g-dp8-lora.sh`.
 #
 # Usage:
-#   bash tests/functional/diffusion_grpo.sh
+#   bash tests/functional/flow_grpo.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -23,7 +23,7 @@ cd "$(dirname "$0")/../.."
 PY=${NRL_PYTHON:-uv run --frozen --extra diffusion python}
 export PATH="$HOME/.local/bin:$PATH"
 
-LOG_DIR="${LOG_DIR:-results/diffusion_grpo/$(date +%Y%m%d_%H%M%S)}"
+LOG_DIR="${LOG_DIR:-results/flow_grpo/$(date +%Y%m%d_%H%M%S)}"
 # Timestamped per run: a reused checkpoint dir would auto-resume at step 5
 # and the run would train 0 steps.
 CKPT_DIR="${CKPT_DIR:-$LOG_DIR/ckpts}"
@@ -47,8 +47,8 @@ EOF
 # Overrides shrink the OCR exemplar to the tiny 1-GPU setup: tiny-random
 # model, 128px/8-step pipeline, rank-4 LoRA on qkv, 1x4 rollout groups and
 # the CPU jpeg_compressibility reward with a single worker.
-$PY examples/run_diffusion_grpo.py \
-  --config examples/configs/diffusion_grpo_qwen_image_ocr.yaml \
+$PY examples/run_flow_grpo.py \
+  --config examples/configs/flow_grpo_qwen_image_ocr.yaml \
   policy.model_name="tiny-random/Qwen-Image" \
   policy.train_micro_batch_size=4 \
   policy.enable_gradient_checkpointing=false \
@@ -65,13 +65,13 @@ $PY examples/run_diffusion_grpo.py \
   policy.lora_cfg.rank=4 \
   policy.lora_cfg.alpha=8 \
   'policy.lora_cfg.target_modules=[*.attn.to_q,*.attn.to_k,*.attn.to_v]' \
-  grpo.num_prompts_per_step=1 \
-  grpo.num_generations_per_prompt=4 \
-  grpo.max_num_steps=5 \
-  grpo.ppo_epochs=4 \
-  grpo.ppo_mini_batch_size=4 \
-  grpo.val_period=0 \
-  grpo.val_at_start=false \
+  flow_grpo.num_prompts_per_step=1 \
+  flow_grpo.num_generations_per_prompt=4 \
+  flow_grpo.max_num_steps=5 \
+  flow_grpo.ppo_epochs=4 \
+  flow_grpo.ppo_mini_batch_size=4 \
+  flow_grpo.val_period=0 \
+  flow_grpo.val_at_start=false \
   loss_fn.ratio_clip_min=0.2 \
   loss_fn.ratio_clip_max=0.2 \
   'env.image_reward.plugins=[{name:jpeg_compressibility,weight:1.0}]' \

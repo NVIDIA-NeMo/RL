@@ -95,9 +95,9 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     ],
     "nemo_rl.environments.tools.retriever.RAGEnvironment": None,
     "nemo_rl.environments.nemo_gym.NemoGym": ["nemo_gym"],
-    # Diffusion-GRPO policy worker: nemo-automodel (pipeline loading, LoRA,
+    # Flow-GRPO policy worker: nemo-automodel (pipeline loading, LoRA,
     # checkpointing) + the diffusion extra (diffusers, OCR reward deps).
-    "nemo_rl.models.diffusion.workers.diffusion_worker.DiffusionPolicyWorker": [
+    "nemo_rl.models.diffusion.workers.flow_grpo_worker.FlowGRPOPolicyWorker": [
         "automodel",
         "diffusion",
     ],

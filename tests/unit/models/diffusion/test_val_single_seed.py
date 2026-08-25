@@ -15,9 +15,9 @@
 
 import torch
 
-from nemo_rl.models.diffusion.interfaces import DiffusionValGenerationCfg
-from nemo_rl.models.diffusion.policy import derive_rollout_seed
-from nemo_rl.models.diffusion.workers.diffusion_worker import (
+from nemo_rl.algorithms.flow_grpo import FlowGRPOValGenerationCfg
+from nemo_rl.models.diffusion.flow_grpo_policy import derive_rollout_seed
+from nemo_rl.models.diffusion.workers.flow_grpo_worker import (
     build_single_seed_latents_fn,
 )
 
@@ -50,6 +50,6 @@ def test_single_seed_latents_repeat_the_first_draw():
 
 
 def test_val_generation_cfg_single_seed_defaults_off():
-    cfg = DiffusionValGenerationCfg()
+    cfg = FlowGRPOValGenerationCfg()
     assert cfg.single_seed is False
     assert cfg.model_dump()["single_seed"] is False

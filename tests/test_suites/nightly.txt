@@ -202,7 +202,7 @@ tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-n
 #############
 
 # Qwen-Image flow-GRPO LoRA on the Flow-GRPO OCR task (PaddleOCR reward, single-node 8-GPU DP)
-tests/test_suites/diffusion/grpo-qwen-image-ocr-1n8g-dp8-lora.sh
+tests/test_suites/diffusion/flow_grpo-qwen-image-ocr-1n8g-dp8-lora.sh
 
 ########
 # DAPO #

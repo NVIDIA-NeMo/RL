@@ -1,5 +1,5 @@
-defaults: ../../diffusion_grpo_qwen_image_ocr.yaml
-grpo:
+defaults: ../../flow_grpo_qwen_image_ocr.yaml
+flow_grpo:
   max_num_steps: 60
   max_val_samples: 64  # the full 1018-prompt val set is too slow for nightly; pin to the first 64
 env:
@@ -10,8 +10,8 @@ env:
       - name: "ocr"
         weight: 1.0
 checkpointing:
-  checkpoint_dir: results/grpo-qwen-image-ocr-1n8g-dp8-lora
+  checkpoint_dir: results/flow_grpo-qwen-image-ocr-1n8g-dp8-lora
 logger:
-  log_dir: logs/grpo-qwen-image-ocr-1n8g-dp8-lora
+  log_dir: logs/flow_grpo-qwen-image-ocr-1n8g-dp8-lora
   wandb:
-    name: grpo-qwen-image-ocr-1n8g-dp8-lora
+    name: flow_grpo-qwen-image-ocr-1n8g-dp8-lora

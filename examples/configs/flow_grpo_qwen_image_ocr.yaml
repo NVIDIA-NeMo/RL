@@ -1,8 +1,8 @@
-# Diffusion-GRPO exemplar: Qwen-Image LoRA on the Flow-GRPO OCR task.
+# Flow-GRPO exemplar: Qwen-Image LoRA on the Flow-GRPO OCR task.
 # Hyperparameters mirror verl-omni examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_lora.sh.
 # Data: uv run python tools/export_ocr_prompts.py --out-dir examples/data/diffusion/ocr
 
-grpo:
+flow_grpo:
   num_prompts_per_step: 32  # x16 generations = 512 samples/step (verl-omni baseline)
   num_generations_per_prompt: 16
   max_num_steps: 300
@@ -27,8 +27,12 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "results/diffusion_grpo_qwen_image_ocr"
+  checkpoint_dir: "results/flow_grpo_qwen_image_ocr"
   save_period: 30
+  metric_name: null  # null keeps the most recent keep_top_k checkpoints; validation runs after the save, so a val:reward_mean ranking would score each checkpoint with the previous validation
+  higher_is_better: true
+  keep_top_k: 3
+  save_optimizer: true
 
 policy:
   model_name: "Qwen/Qwen-Image"
@@ -82,7 +86,7 @@ env:
   image_reward:
     plugins:
       # GenRM OCR reward (verl-omni parity — this is the reward that produces
-      # the convergence curve in docs/guides/diffusion-grpo.md). A Qwen3-VL-8B
+      # the convergence curve in docs/guides/flow-grpo.md). A Qwen3-VL-8B
       # judge behind an OpenAI-compatible endpoint (GENRM_BASE_URL env var)
       # transcribes each image; the transcription is scored by Levenshtein vs
       # the prompt's quoted target. See the guide for how to serve the judge.
@@ -105,7 +109,7 @@ cluster:
   num_nodes: 1
 
 logger:
-  log_dir: "logs/diffusion_grpo_qwen_image_ocr"
+  log_dir: "logs/flow_grpo_qwen_image_ocr"
   wandb_enabled: false
   tensorboard_enabled: true
   tensorboard: {}
@@ -114,8 +118,8 @@ logger:
   monitor_gpus: false
   num_val_samples_to_print: 8
   wandb:
-    project: "diffusion-grpo"
-    name: "diffusion-grpo-qwen-image-ocr"
+    project: "flow-grpo"
+    name: "flow-grpo-qwen-image-ocr"
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10

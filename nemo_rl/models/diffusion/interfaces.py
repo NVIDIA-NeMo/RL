@@ -14,7 +14,7 @@
 from typing import Any, Callable, NotRequired, Protocol, TypedDict
 
 import torch
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 
 class DiffusionPipelineCfg(BaseModel, extra="allow"):
@@ -77,7 +77,7 @@ class DiffusionPolicyConfig(BaseModel, extra="allow"):
     """Top-level configuration for the diffusion policy/worker.
 
     Defaults live on the fields (config-conventions v2); the exemplar YAMLs
-    under `examples/configs/diffusion_grpo_qwen_image*.yaml` document them.
+    under `examples/configs/flow_grpo_qwen_image*.yaml` document them.
     Workers materialize a `model_dump()` dict view internally and read it
     with plain key access.
     """
@@ -99,98 +99,11 @@ class DiffusionPolicyConfig(BaseModel, extra="allow"):
     lora_cfg: DiffusionLoraCfg = Field(default_factory=DiffusionLoraCfg)
 
 
-class DiffusionValGenerationCfg(BaseModel, extra="allow"):
-    """Validation-time generation overrides.
-
-    Validation always samples with the deterministic ODE (no SDE window, no
-    logprob collection).
-    """
-
-    num_inference_steps: int = 40
-    # Draw every validation sample's initial latent from a fresh generator
-    # holding the same seed (verl-omni val_kwargs.seed semantics: every val
-    # request is seeded identically), so val rewards are independent of batch
-    # position, batch size and DP worker layout. Default keeps the current
-    # behavior: one generator per rollout batch, per-worker seed offsets.
-    single_seed: bool = False
-
-
-class DiffusionGRPOAlgoConfig(BaseModel, extra="allow"):
-    """Top-level diffusion-GRPO training-loop config."""
-
-    num_prompts_per_step: int = 8
-    num_generations_per_prompt: int = 16
-    max_num_steps: int = 5000
-    # 0 disables periodic validation.
-    val_period: int = 50
-    seed: int = 42
-    ppo_epochs: int = 1
-    val_at_start: bool = False
-    val_at_end: bool = False
-    # 0 validates on the full val dataloader.
-    max_val_samples: int = 0
-    use_leave_one_out_baseline: bool = True
-    # Normalize advantages by the whole-batch reward std (verl-omni
-    # `global_std`) instead of per-group std, which explodes on
-    # near-constant groups under sparse rewards.
-    use_global_std: bool = True
-    # Actor-update mini-batch size in samples (verl-omni ppo_mini_batch_size
-    # semantics, which counts prompts and scales by rollout.n). None keeps a
-    # single optimizer update over the whole rollout batch. When set, each
-    # step slices the rollout batch in original order into
-    # (num_prompts_per_step * num_generations_per_prompt) / ppo_mini_batch_size
-    # sequential optimizer updates; updates after the first are intentionally
-    # off-policy, exactly as in verl-omni.
-    ppo_mini_batch_size: int | None = None
-    val_generation: DiffusionValGenerationCfg = Field(
-        default_factory=DiffusionValGenerationCfg
-    )
-
-    @model_validator(mode="after")
-    def _mini_batch_keeps_groups_whole(self) -> "DiffusionGRPOAlgoConfig":
-        mini = self.ppo_mini_batch_size
-        if mini is None:
-            return self
-        K = self.num_generations_per_prompt
-        total = self.num_prompts_per_step * K
-        if mini <= 0 or mini % K != 0:
-            raise ValueError(
-                f"grpo.ppo_mini_batch_size={mini} must be a positive multiple "
-                f"of num_generations_per_prompt={K} so contiguous slicing "
-                "never splits a GRPO group across mini-batches"
-            )
-        if total % mini != 0:
-            raise ValueError(
-                f"grpo.ppo_mini_batch_size={mini} must divide the rollout "
-                f"batch of {total} samples "
-                f"(num_prompts_per_step * num_generations_per_prompt)"
-            )
-        return self
-
-
-class DiffusionLossConfig(BaseModel, extra="allow"):
-    """Diffusion-GRPO loss knobs aligned with verl-omni `FlowGRPOLoss` config."""
-
-    ratio_clip_min: float = 0.2
-    ratio_clip_max: float = 0.2
-    # Advantages are clamped to ±adv_clip_max before the ratio computation
-    # (verl-omni FlowGRPOLoss semantics); None disables the clamp.
-    adv_clip_max: float | None = 5.0
-    beta: float = 0.0
-    # Default False keeps per-(sample, step) ratio elements, which is the
-    # verl-omni/Flow-GRPO formulation (verl-omni's log_prob is [B]: a mean
-    # over all non-batch dims, never a sum along T). True is an experimental
-    # sum-aggregation over T that inflates the log-ratio scale by
-    # ~window_size and is incompatible with 1e-4-scale ratio clips.
-    aggregate_logprobs_per_sample: bool = False
-
-
 class DiffusionDatumSpec(TypedDict):
     prompt: str
     negative_prompt: NotRequired[str]
     metadata: NotRequired[dict[str, Any]]
     idx: int
-    loss_multiplier: float
     task_name: NotRequired[str]
 
 
@@ -215,7 +128,6 @@ class DiffusionTrainDataSpec(TypedDict):
     generation_logprobs: torch.Tensor
     advantages: torch.Tensor
     timestep_mask: torch.Tensor
-    sample_mask: torch.Tensor
     prompt_embeds: torch.Tensor
     prompt_embeds_mask: torch.Tensor
     negative_prompt_embeds: torch.Tensor

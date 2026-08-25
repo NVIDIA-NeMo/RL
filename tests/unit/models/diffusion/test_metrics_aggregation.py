@@ -13,8 +13,8 @@
 # limitations under the License.
 import torch
 
-from nemo_rl.models.diffusion.policy import aggregate_worker_metrics
-from nemo_rl.models.diffusion.workers.diffusion_worker import accumulate_metrics
+from nemo_rl.models.diffusion.flow_grpo_policy import aggregate_worker_metrics
+from nemo_rl.models.diffusion.workers.flow_grpo_worker import accumulate_metrics
 
 
 def test_accumulate_metrics_min_max_and_weighted_mean():

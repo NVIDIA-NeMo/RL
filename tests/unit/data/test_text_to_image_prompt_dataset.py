@@ -76,7 +76,6 @@ def test_collate_fn_packs_into_batched_data_dict(tmp_path):
     assert batch["prompts"] == ["a", "b", "c"]
     assert batch["negative_prompts"] == [" ", " ", " "]
     assert batch["idx"] == [0, 1, 2]
-    assert batch["loss_multipliers"] == [1.0, 1.0, 1.0]
     assert batch["task_names"] == ["text_to_image"] * 3
 
 

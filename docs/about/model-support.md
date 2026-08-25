@@ -32,4 +32,4 @@ In addition, please refer to our [performance page](https://docs.nvidia.com/nemo
 
 ## Diffusion models via [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel) (experimental)
 
-- **Qwen-Image**: [Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) — Flow-GRPO text-to-image training (see the [Diffusion GRPO guide](../guides/diffusion-grpo.md))
+- **Qwen-Image**: [Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) — Flow-GRPO text-to-image training (see the [Flow-GRPO guide](../guides/flow-grpo.md))

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen-Image pipeline adapter for diffusion-GRPO.
+"""Qwen-Image pipeline adapter for flow-GRPO.
 
 Owns the per-step denoising math used by both rollout (``sample_trajectory``)
 and training-side log-prob recompute (``compute_transition_logprob``). Sharing
@@ -63,7 +63,7 @@ def apply_true_cfg(
 
 
 class QwenImagePipelineAdapter:
-    """Adapter wiring diffusers Qwen-Image components into diffusion-GRPO loops.
+    """Adapter wiring diffusers Qwen-Image components into flow-GRPO loops.
 
     The constructor takes already-loaded components rather than a model path so
     the worker (which manages FSDP/PEFT lifecycle) controls instantiation.

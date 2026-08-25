@@ -26,7 +26,7 @@ import torch
 
 pytest.importorskip("nemo_automodel")
 
-from nemo_rl.models.diffusion.workers.diffusion_worker import (
+from nemo_rl.models.diffusion.workers.flow_grpo_worker import (
     load_diffusion_pipeline,
 )
 
@@ -125,7 +125,7 @@ def _lora_cfg_dict(**overrides):
 
 
 def test_build_peft_config_maps_schema_fields():
-    from nemo_rl.models.diffusion.workers.diffusion_worker import build_peft_config
+    from nemo_rl.models.diffusion.workers.flow_grpo_worker import build_peft_config
 
     peft_cfg = build_peft_config(_lora_cfg_dict(rank=64, alpha=128))
     assert peft_cfg.dim == 64
@@ -143,7 +143,7 @@ def test_full_path_targets_inject_and_pass_fail_loud_check():
         apply_lora_to_linear_modules,
     )
 
-    from nemo_rl.models.diffusion.workers.diffusion_worker import (
+    from nemo_rl.models.diffusion.workers.flow_grpo_worker import (
         assert_lora_targets_hit,
         build_peft_config,
     )
@@ -158,7 +158,7 @@ def test_full_path_targets_inject_and_pass_fail_loud_check():
 def test_bare_suffix_targets_match_nothing_and_fail_loud():
     from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 
-    from nemo_rl.models.diffusion.workers.diffusion_worker import (
+    from nemo_rl.models.diffusion.workers.flow_grpo_worker import (
         assert_lora_targets_hit,
         build_peft_config,
     )
@@ -177,7 +177,7 @@ def test_bare_suffix_targets_match_nothing_and_fail_loud():
 def test_partially_missed_targets_fail_loud_and_name_offenders():
     from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 
-    from nemo_rl.models.diffusion.workers.diffusion_worker import (
+    from nemo_rl.models.diffusion.workers.flow_grpo_worker import (
         assert_lora_targets_hit,
         build_peft_config,
     )
@@ -197,7 +197,7 @@ def test_partially_missed_targets_fail_loud_and_name_offenders():
 def _lora_model_with_nonzero_delta() -> torch.nn.Module:
     from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 
-    from nemo_rl.models.diffusion.workers.diffusion_worker import build_peft_config
+    from nemo_rl.models.diffusion.workers.flow_grpo_worker import build_peft_config
 
     torch.manual_seed(0)
     model = _TinyTransformer()
@@ -210,7 +210,7 @@ def _lora_model_with_nonzero_delta() -> torch.nn.Module:
 
 
 def test_lora_scale_zero_matches_base_forward_bitwise():
-    from nemo_rl.models.diffusion.workers.diffusion_worker import lora_scale_zero
+    from nemo_rl.models.diffusion.workers.flow_grpo_worker import lora_scale_zero
 
     model = _lora_model_with_nonzero_delta()
     x = torch.randn(2, 4)
@@ -233,7 +233,7 @@ def test_lora_scale_zero_matches_base_forward_bitwise():
 def test_lora_scale_zero_restores_scales_on_exception():
     from nemo_automodel.components._peft.lora import LinearLoRA
 
-    from nemo_rl.models.diffusion.workers.diffusion_worker import lora_scale_zero
+    from nemo_rl.models.diffusion.workers.flow_grpo_worker import lora_scale_zero
 
     model = _lora_model_with_nonzero_delta()
     scales = [m.scale for m in model.modules() if isinstance(m, LinearLoRA)]
@@ -246,7 +246,7 @@ def test_lora_scale_zero_restores_scales_on_exception():
 def test_build_no_adapter_forward_zeroes_scales_and_matches_call_convention():
     from nemo_automodel.components._peft.lora import LinearLoRA
 
-    from nemo_rl.models.diffusion.workers.diffusion_worker import (
+    from nemo_rl.models.diffusion.workers.flow_grpo_worker import (
         build_no_adapter_forward,
     )
 
@@ -306,7 +306,7 @@ def single_process_group():
 def _lora_model_and_optimizer(seed: int):
     from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 
-    from nemo_rl.models.diffusion.workers.diffusion_worker import build_peft_config
+    from nemo_rl.models.diffusion.workers.flow_grpo_worker import build_peft_config
 
     torch.manual_seed(seed)
     model = _TinyTransformer()
@@ -319,7 +319,7 @@ def _lora_model_and_optimizer(seed: int):
 
 
 def test_checkpointer_lora_round_trip_and_layout(tmp_path, single_process_group):
-    from nemo_rl.models.diffusion.workers.diffusion_worker import build_checkpointer
+    from nemo_rl.models.diffusion.workers.flow_grpo_worker import build_checkpointer
 
     model, optimizer, peft_cfg = _lora_model_and_optimizer(seed=0)
     # One real step so LoRA weights and Adam moments are all nonzero.
@@ -339,7 +339,7 @@ def test_checkpointer_lora_round_trip_and_layout(tmp_path, single_process_group)
     ckpt.save_model(model, path, peft_config=peft_cfg)
     ckpt.save_optimizer(optimizer, model, path)
 
-    # Layout contract shared with the resume probe in algorithms/diffusion_grpo.
+    # Layout contract for FlowGRPOPolicyWorker.save_checkpoint / load_checkpoint.
     assert os.path.isfile(os.path.join(path, "model", "adapter_model.safetensors"))
     assert os.path.isfile(os.path.join(path, "model", "adapter_config.json"))
     assert os.path.isfile(os.path.join(path, "optim", ".metadata"))
@@ -370,7 +370,7 @@ def test_checkpointer_lora_round_trip_and_layout(tmp_path, single_process_group)
 def test_inlined_calculate_shift_matches_diffusers():
     qwenimage = pytest.importorskip("diffusers.pipelines.qwenimage.pipeline_qwenimage")
 
-    from nemo_rl.models.diffusion.workers.diffusion_worker import calculate_shift
+    from nemo_rl.models.diffusion.workers.flow_grpo_worker import calculate_shift
 
     for seq_len in (256, 1024, 4096, 64 * 64):
         assert calculate_shift(seq_len) == qwenimage.calculate_shift(seq_len)
@@ -379,13 +379,13 @@ def test_inlined_calculate_shift_matches_diffusers():
     )
 
 
-def test_diffusion_worker_registered_with_automodel_diffusion_env():
+def test_flow_grpo_worker_registered_with_automodel_diffusion_env():
     from nemo_rl.distributed.ray_actor_environment_registry import (
         ACTOR_ENVIRONMENT_REGISTRY,
     )
 
     exe = ACTOR_ENVIRONMENT_REGISTRY[
-        "nemo_rl.models.diffusion.workers.diffusion_worker.DiffusionPolicyWorker"
+        "nemo_rl.models.diffusion.workers.flow_grpo_worker.FlowGRPOPolicyWorker"
     ]
     assert "--extra automodel" in exe
     assert "--extra diffusion" in exe
@@ -402,7 +402,7 @@ def test_lora_schema_defaults_are_full_path_patterns():
 def test_exemplar_yaml_targets_are_full_path_patterns():
     yaml = pytest.importorskip("yaml")
 
-    with open("examples/configs/diffusion_grpo_qwen_image_ocr.yaml") as f:
+    with open("examples/configs/flow_grpo_qwen_image_ocr.yaml") as f:
         cfg = yaml.safe_load(f)
     targets = cfg["policy"]["lora_cfg"]["target_modules"]
     assert len(targets) == 12
