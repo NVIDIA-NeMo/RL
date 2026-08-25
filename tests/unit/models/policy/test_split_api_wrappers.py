@@ -207,6 +207,22 @@ class TestTQPolicySplitFanout:
         # _aggregate_train_results surfaces global_loss under "loss"
         assert out["loss"] == 1.0
 
+    def test_finish_surfaces_draft_grad_norm(self):
+        p, _ = _make_tq_policy()
+        with patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray:
+            mock_ray.get.return_value = [
+                {
+                    "global_loss": 1.0,
+                    "grad_norm": 0.5,
+                    "draft_grad_norm": 0.25,
+                    "all_mb_metrics": {"draft_loss": [0.1]},
+                    "is_replica_leader": True,
+                }
+            ]
+            out = p.finish_train_step()
+
+        assert out["draft_grad_norm"] == 0.25
+
     def test_abort_consumes_single_data_futures_with_ray_get(self):
         p, wg = _make_tq_policy()
         with patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray:
