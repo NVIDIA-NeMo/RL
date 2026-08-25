@@ -51,6 +51,20 @@ class AbstractPolicyWorker:
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
+        # Printed on both sides, like the reshard rendezvous below, and for the same
+        # reason. Job 6517523 showed the reshard bulk group is never reached on a rebuild
+        # after an abort -- so the failure is HERE, in the shared model_update_group, and a
+        # connect timeout names only the address. rank 0 is a trainer and is this store's
+        # master, so the absence of this line from a rebuild means the trainer never bound
+        # the port at all, which is a different bug from the two sides disagreeing.
+        print(
+            f"  refit: collective rendezvous [train] addr={ip}:{port} "
+            f"rank={self.rank} world_size={world_size} "
+            f"train_world_size={train_world_size} peer={nccl_peer} "
+            f"master={self.rank == 0}",
+            flush=True,
+        )
+
         # Rebuilding is the recovery path for a dead generation rank, so this runs more
         # than once per job. Without the release, each rebuild would strand the previous
         # NCCL communicator and its TCPStore for the life of the worker.
