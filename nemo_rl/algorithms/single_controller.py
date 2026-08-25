@@ -1023,6 +1023,11 @@ class SingleControllerActor:
                                     self._trainer.get_reference_policy_logprobs_from_meta,
                                     train_meta,
                                 )
+                    elif self._is_ppo:
+                        # prepare_for_lp_inference is skipped here, and it is the only
+                        # other call that parks the policy optimizer before the critic.
+                        with self._timer.time("value_inference_prep"):
+                            await asyncio.to_thread(self._trainer.offload_to_cpu)
 
                     # Value model forward
                     if self._is_ppo:

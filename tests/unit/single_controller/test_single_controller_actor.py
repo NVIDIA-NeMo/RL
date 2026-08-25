@@ -906,6 +906,9 @@ class _OrderRecordingTrainer(_NoOpTrainer):
     def prepare_for_training(self) -> None:
         self.calls.append("policy.prepare_for_training")
 
+    def offload_to_cpu(self) -> None:
+        self.calls.append("policy.offload_to_cpu")
+
 
 class _EpochRecordingTrainer(_OrderRecordingTrainer):
     """Also records the optimizer-step lifecycle, which the epoch loop repeats."""
@@ -921,9 +924,6 @@ class _EpochRecordingTrainer(_OrderRecordingTrainer):
     def finish_train_step(self) -> dict:
         self.calls.append("policy.finish_train_step")
         return {}
-
-    def offload_to_cpu(self) -> None:
-        self.calls.append("policy.offload_to_cpu")
 
 
 class _NoOpDataPlane:
@@ -1265,6 +1265,31 @@ def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> No
     assert trainer.keep_train_buffers_calls == [False, True]
 
 
+def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> None:
+    """The pre-critic offload is PPO-only: GRPO has no critic to make room for."""
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    calls: list[str] = []
+    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._trainer = _OrderRecordingTrainer(calls)
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._train_steps == 1
+    assert "policy.offload_to_cpu" not in calls
+
+
 # ── PPO ────────────────────────────────────────────────────────────────────
 
 
@@ -1380,6 +1405,49 @@ def test_train_pump_parks_the_policy_on_cpu_across_the_critic_stages(
     ]
 
 
+def test_train_pump_parks_the_policy_when_neither_logprob_is_needed(
+    monkeypatch,
+) -> None:
+    """No logprob means no prepare_for_lp_inference, so nothing else would park
+    the policy optimizer before the critic runs."""
+    meta = _single_group_meta()
+    calls: list[str] = []
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta),
+        value=_NoOpValue(calls=calls, prefix="critic."),
+    )
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._trainer = _OrderRecordingTrainer(calls)
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert "policy.prepare_for_lp_inference" not in calls
+    assert calls.index("policy.offload_to_cpu") < calls.index(
+        "critic.prepare_for_inference"
+    )
+
+
+def test_train_pump_does_not_double_offload_when_logprobs_run(monkeypatch) -> None:
+    """The logprob path already parks the optimizer, so the elif must not fire."""
+    meta = _single_group_meta()
+    calls: list[str] = []
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta),
+        value=_NoOpValue(calls=calls, prefix="critic."),
+    )
+    ctrl._policy_logprobs_required = True
+    ctrl._trainer = _OrderRecordingTrainer(calls)
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert "policy.offload_to_cpu" not in calls
+
+
 def test_train_pump_logs_critic_metrics(monkeypatch) -> None:
     meta = _single_group_meta()
     ctrl, _ = _ppo_train_pump_controller(sampler=_OneThenEmptySampler(meta))
@@ -1485,6 +1553,8 @@ def test_train_pump_offloads_the_policy_between_ppo_epochs(monkeypatch) -> None:
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert calls == [
+        # Neither logprob is required here, so the policy is parked up front.
+        "policy.offload_to_cpu",
         "policy.finish_inference",
         "critic.prepare_for_inference",
         "critic.get_values_from_meta",
