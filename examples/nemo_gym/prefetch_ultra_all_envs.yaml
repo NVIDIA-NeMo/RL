@@ -89,6 +89,8 @@ env:
           base_url: http://localhost:8000/v1
           api_key: dummy
           model: dummy-judge
+          return_token_id_information: false
+          uses_reasoning_parser: false
           spinup_server: false
     judge_model:
       responses_api_models:
@@ -97,6 +99,8 @@ env:
           base_url: http://localhost:8000/v1
           api_key: dummy
           model: dummy-judge
+          return_token_id_information: false
+          uses_reasoning_parser: false
           spinup_server: false
     # Thin client for the *_reasoning_off agent refs.
     policy_model_reasoning_off:
@@ -106,6 +110,8 @@ env:
           base_url: http://localhost:8000/v1
           api_key: dummy
           model: dummy-model
+          return_token_id_information: false
+          uses_reasoning_parser: false
           spinup_server: false
     # Standalone server defined only to bake the local_vllm_model venv (the runtime GPU judges
     # use this type). dry_run builds the venv without loading a model.
@@ -114,6 +120,9 @@ env:
         local_vllm_model:
           entrypoint: app.py
           model: dummy-model
+          return_token_id_information: false
+          uses_reasoning_parser: false
+          vllm_serve_env_vars: {}
           vllm_serve_kwargs:
             tensor_parallel_size: 1
             data_parallel_size: 1
