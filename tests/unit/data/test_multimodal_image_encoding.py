@@ -17,7 +17,7 @@ from collections import Counter
 import pytest
 from PIL import Image
 
-import nemo_rl.data.multimodal_utils as multimodal_utils
+import nemo_rl.environments.nemo_gym_multimodal as nemo_gym_multimodal
 from nemo_rl.data.multimodal_utils import (
     image_to_data_url,
     resolve_to_image,
@@ -106,7 +106,7 @@ def test_encode_images_deduplicates_sources_and_uses_a_bounded_thread_pool(
     first = _write_png(tmp_path, "first.png", (2, 3))
     second = _write_png(tmp_path, "second.png", (4, 5))
     expected = {
-        source: multimodal_utils._encode_single_image_source(source)
+        source: nemo_gym_multimodal._encode_single_image_source(source)
         for source in (first, second)
     }
     examples = [
@@ -119,31 +119,35 @@ def test_encode_images_deduplicates_sources_and_uses_a_bounded_thread_pool(
     ]
 
     resolve_calls = []
-    original_resolve = multimodal_utils.resolve_to_image
+    original_resolve = nemo_gym_multimodal.resolve_to_image
 
     def tracking_resolve(source):
         resolve_calls.append(source)
         return original_resolve(source)
 
     observed_max_workers = []
-    original_executor = multimodal_utils.ThreadPoolExecutor
+    original_executor = nemo_gym_multimodal.ThreadPoolExecutor
 
     def tracking_executor(*args, **kwargs):
         observed_max_workers.append(kwargs.get("max_workers"))
         return original_executor(*args, **kwargs)
 
-    monkeypatch.setattr(multimodal_utils, "resolve_to_image", tracking_resolve)
-    monkeypatch.setattr(multimodal_utils, "ThreadPoolExecutor", tracking_executor)
+    monkeypatch.setattr(nemo_gym_multimodal, "resolve_to_image", tracking_resolve)
+    monkeypatch.setattr(
+        nemo_gym_multimodal, "ThreadPoolExecutor", tracking_executor
+    )
 
-    encode_images_in_examples(examples)
+    normalize_media_in_examples(examples)
 
     assert Counter(resolve_calls) == Counter({first: 1, second: 1})
-    assert observed_max_workers == [multimodal_utils.NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS]
+    assert observed_max_workers == [
+        nemo_gym_multimodal._NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS
+    ]
     for example in examples:
         parts = example["responses_create_params"]["input"][0]["content"]
         assert parts[0]["image_url"] == expected[first]
-        assert parts[1]["image"] == expected[first]
-        assert parts[2]["url"] == expected[second]
+        assert parts[1]["image_url"] == expected[first]
+        assert parts[2]["image_url"] == expected[second]
 
 
 def test_encode_images_does_not_partially_mutate_on_error(tmp_path):
@@ -157,7 +161,7 @@ def test_encode_images_does_not_partially_mutate_on_error(tmp_path):
     ]
 
     with pytest.raises(FileNotFoundError):
-        encode_images_in_examples(examples)
+        normalize_media_in_examples(examples)
 
     parts = examples[0]["responses_create_params"]["input"][0]["content"]
     assert parts[0]["image_url"] == existing
@@ -166,15 +170,15 @@ def test_encode_images_does_not_partially_mutate_on_error(tmp_path):
 
 def test_encode_single_image_source_closes_image_on_success(monkeypatch):
     image = _CloseTrackingImage()
-    monkeypatch.setattr(multimodal_utils, "resolve_to_image", lambda _: image)
+    monkeypatch.setattr(nemo_gym_multimodal, "resolve_to_image", lambda _: image)
     monkeypatch.setattr(
-        multimodal_utils,
+        nemo_gym_multimodal,
         "image_to_data_url",
         lambda _: "data:image/png;base64,AA",
     )
 
     assert (
-        multimodal_utils._encode_single_image_source("image.png")
+        nemo_gym_multimodal._encode_single_image_source("image.png")
         == "data:image/png;base64,AA"
     )
     assert image.closed
@@ -182,15 +186,15 @@ def test_encode_single_image_source_closes_image_on_success(monkeypatch):
 
 def test_encode_single_image_source_closes_image_on_error(monkeypatch):
     image = _CloseTrackingImage()
-    monkeypatch.setattr(multimodal_utils, "resolve_to_image", lambda _: image)
+    monkeypatch.setattr(nemo_gym_multimodal, "resolve_to_image", lambda _: image)
 
     def fail_to_encode(_):
         raise RuntimeError("encoding failed")
 
-    monkeypatch.setattr(multimodal_utils, "image_to_data_url", fail_to_encode)
+    monkeypatch.setattr(nemo_gym_multimodal, "image_to_data_url", fail_to_encode)
 
     with pytest.raises(RuntimeError, match="encoding failed"):
-        multimodal_utils._encode_single_image_source("image.png")
+        nemo_gym_multimodal._encode_single_image_source("image.png")
     assert image.closed
 
 
