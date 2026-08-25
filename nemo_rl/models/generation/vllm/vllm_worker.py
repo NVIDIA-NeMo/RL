@@ -512,6 +512,7 @@ class BaseVllmGenerationWorker:
                 "Mistral3ForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
+                "Qwen4ExpForConditionalGeneration",
             )
         ):
             detected_arch = [
@@ -524,6 +525,7 @@ class BaseVllmGenerationWorker:
                     "Mistral3ForConditionalGeneration",
                     "Qwen3_5ForConditionalGeneration",
                     "Qwen3_5MoeForConditionalGeneration",
+                    "Qwen4ExpForConditionalGeneration",
                 )
             ]
             if self.cfg["vllm_cfg"]["skip_tokenizer_init"]:
