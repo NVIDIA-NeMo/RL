@@ -30,6 +30,40 @@ from torch.distributed.checkpoint.stateful import Stateful
 from transformers import AutoConfig, AutoTokenizer
 
 
+def save_tokenizer_on_rank0(tokenizer: Any, tokenizer_path: str) -> None:
+    """Save a tokenizer (or processor) to ``tokenizer_path`` from rank 0 only.
+
+    Unlike model/optimizer state, the tokenizer is *replicated* rather than
+    sharded: every rank holds an identical copy, and ``save_pretrained`` writes
+    to the same rank-independent filenames (``tokenizer_config.json``, ...).
+    Letting all ranks write means N-1 redundant writes racing on the same file.
+    ``save_pretrained`` is not atomic (it opens with ``O_TRUNC``, writes, and may
+    read files back), so concurrent writers can deadlock on the inode lock. On a
+    ``hard``-mounted NFS share this manifests as ranks stuck indefinitely in
+    uninterruptible disk sleep, hanging the whole job at checkpoint time.
+
+    This mirrors the rank-0 guard nemo_automodel applies to the same artifacts in
+    ``nemo_automodel.components.checkpoint.addons.ConsolidatedHFAddon.pre_save``.
+
+    Note this must NOT be applied to ``dcp.save``-based model/optimizer saves:
+    those are collective calls whose output is already rank-disjoint, so guarding
+    them would deadlock and drop every non-zero rank's shard.
+
+    Args:
+        tokenizer: The tokenizer or processor to save.
+        tokenizer_path: Directory to save the tokenizer into.
+    """
+    is_distributed = torch.distributed.is_initialized()
+    if not is_distributed or torch.distributed.get_rank() == 0:
+        print(f"Saving tokenizer (or processor) to {tokenizer_path}")
+        tokenizer.save_pretrained(tokenizer_path)
+    if is_distributed:
+        # Keep non-zero ranks from returning while rank 0 is still writing, so
+        # that the tokenizer directory is complete for any caller that reads it
+        # right after save_checkpoint() returns.
+        torch.distributed.barrier()
+
+
 ## modified from pytorch tutorial https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
 class ModelState(Stateful):
     """Helper class for tracking model state in distributed checkpointing.
@@ -171,8 +205,7 @@ def save_checkpoint(
             raise ValueError(
                 "tokenizer_path must be provided when saving tokenizer state"
             )
-        print(f"Saving tokenizer (or processor) to {tokenizer_path}")
-        tokenizer.save_pretrained(tokenizer_path)
+        save_tokenizer_on_rank0(tokenizer, tokenizer_path)
 
 
 def load_checkpoint(

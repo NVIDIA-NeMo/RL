@@ -1,0 +1,100 @@
+defaults: ../../../nemo_gym/grpo_nanov3.yaml
+grpo:
+  num_prompts_per_step: 4
+  val_num_generations_per_prompt: 1
+  val_period: 500
+  val_batch_size: null
+  seq_logprob_error_threshold: null
+  deduplicate_multimodal_data: true
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+policy:
+  model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  is_vlm: true
+  train_global_batch_size: 64
+  max_total_sequence_length: 24576
+  refit_buffer_size_gb: 1
+  sequence_packing:
+    enabled: false
+  tokenizer:
+    chat_template: default
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  megatron_cfg:
+    env_vars:
+      TORCH_CUDA_ARCH_LIST: '9.0'
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    mtp_num_layers: 0
+    mtp_use_repeated_layer: true
+    mtp_detach_heads: true
+    mtp_loss_scaling_factor: 0.0
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 4
+    context_parallel_size: 1
+    optimizer:
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    radio_force_cpe_eval_mode: true
+    clear_memory_caches_before_refit: true
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    scheduler:
+      lr_warmup_iters: 0
+  make_sequence_length_divisible_by: 32
+  generation:
+    bad_words: []
+    vllm_cfg:
+      reset_encoder_cache_after_weight_update: false
+      video:
+        sampling_style: nemotron_vl
+        num_frames: 32
+        temporal_patch_size: 2
+      logprobs_mode: raw_logprobs
+      gpu_memory_utilization: 0.6
+      enforce_eager: true
+      enable_prefix_caching: false
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        chat_template: null
+        chat_template_content_format: string
+        reasoning_parser: nemotron_v3
+    vllm_kwargs:
+      allowed_local_media_path: /path/to/video-data
+      mm_processor_cache_gb: 0
+      max_num_seqs: 1
+      limit_mm_per_prompt:
+        image: 32
+        video:
+          count: 1
+          num_frames: 32
+      max_num_batched_tokens: ${policy.max_total_sequence_length}
+      enable_chunked_prefill: false
+      disable_custom_all_reduce: true
+      attention_backend: FLASH_ATTN
+      attention_config:
+        use_trtllm_attention: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 14
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  num_workers: 0
+  default:
+    video_target_num_patches: 1024
+    video_maintain_aspect_ratio: true
+env:
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    skip_venv_if_present: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+cluster:
+  num_nodes: 16
