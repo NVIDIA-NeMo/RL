@@ -1829,6 +1829,36 @@ def test_clipped_pg_loss_entropy():
     )
 
 
+def test_clipped_pg_loss_skips_generation_diagnostics_when_unavailable():
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        sequence_level_importance_ratios=True,
+        token_level_loss=False,
+        position_aligned_logprobs=True,
+    )
+    loss_fn = ClippedPGLossFn(cfg, generation_logprobs_available=False)
+    data, _, _, _ = _setup_clipped_pg_test_data(seq_len=3, device="cpu")
+    data["advantages"] = torch.tensor([[0.0, 1.0, -1.0]])
+    data["prev_logprobs"] = torch.tensor([[0.0, -1.0, -1.0]])
+
+    _, metrics = loss_fn(
+        next_token_logprobs=torch.tensor([[0.0, -0.9, -1.1]]),
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(2.0),
+    )
+
+    for name in (
+        "token_mult_prob_error",
+        "gen_kl_error",
+        "policy_kl_error",
+        "js_divergence_error",
+        "sampling_importance_ratio",
+        "approx_entropy",
+    ):
+        assert metrics[name] == 0.0
+
+
 def test_clipped_pg_loss_gspo():
     """Tests GSPO path in ClippedPGLossFn."""
     if not torch.cuda.is_available():

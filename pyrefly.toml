@@ -172,6 +172,7 @@ project-includes = [
   "nemo_rl/models/generation/__init__.py",
   "nemo_rl/models/generation/constants.py",
   "nemo_rl/models/generation/dllm/__init__.py",
+  "nemo_rl/models/generation/dllm/dllm_generation.py",
   "nemo_rl/models/generation/dllm/denoise.py",
   "nemo_rl/models/generation/fleet_health.py",
   "nemo_rl/models/generation/dynamo/__init__.py",

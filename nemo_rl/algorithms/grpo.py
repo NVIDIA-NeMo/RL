@@ -131,6 +131,7 @@ from nemo_rl.models.megatron.router_replay import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.dllm import (
     dllm_config_from_policy,
+    make_dllm_mask_seeds,
     validate_dllm_policy,
 )
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -755,7 +756,9 @@ def setup(
         )
 
     loss_fn = ClippedPGLossFn(
-        loss_config, use_fused_linear_logprobs=use_fused_linear_logprobs
+        loss_config,
+        use_fused_linear_logprobs=use_fused_linear_logprobs,
+        generation_logprobs_available=dllm_config_from_policy(policy_config) is None,
     )
 
     # Validate force_on_policy_ratio
@@ -2281,19 +2284,13 @@ def _attach_dllm_mask_seed(
     measure mask noise rather than the policy update, and the importance ratio
     is meaningless.
 
-    The seed is derived from the batch contents rather than from a step counter
-    precisely because all three passes see this same batch: they each arrive at
-    the same seed without a counter having to be threaded to each of them, and
-    the value is reproducible across restarts.
+    Each row gets a stable seed derived from its contents and row index. Keeping
+    seeds per row makes the masks independent across samples and invariant to
+    how later policy passes split the batch into microbatches.
     """
     if dllm_config_from_policy(policy_config) is None:
         return
-    input_ids = target["input_ids"]
-    seed = int(input_ids.to(torch.int64).sum().item() % (2**31 - 1))
-    # Carried per sample so that microbatch slicing keeps it aligned with rows.
-    target["dllm_mask_seed"] = torch.full(
-        (input_ids.shape[0],), seed, dtype=torch.int64
-    )
+    target["dllm_mask_seed"] = make_dllm_mask_seeds(target["input_ids"])
 
 
 def _policy_dtype(policy_config: PolicyConfig) -> torch.dtype:
@@ -3450,7 +3447,7 @@ def grpo_train(
                     del extra_multimodal_data
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
-                if skip_prev_logprobs:
+                if skip_prev_logprobs or dllm_config_from_policy(master_config.policy):
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:
@@ -5053,7 +5050,7 @@ def async_grpo_train(
                         )
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
-                if skip_prev_logprobs:
+                if skip_prev_logprobs or dllm_config_from_policy(master_config.policy):
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:

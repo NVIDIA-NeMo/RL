@@ -89,21 +89,6 @@ def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -
                 f"masked positions, which {name} assumes away. Disable it."
             )
 
-    # Masks are drawn from a seeded generator over the microbatch's shape, so
-    # two passes over the same rollout only agree on masks if they use the same
-    # microbatch size. When they differ, the old and current ELBOs are taken at
-    # different masks and their ratio measures noise instead of the update --
-    # silently, since both passes still produce finite, plausible numbers.
-    logprob_bs = policy_cfg.get("logprob_batch_size")
-    train_bs = policy_cfg.get("train_micro_batch_size")
-    if logprob_bs is not None and train_bs is not None and logprob_bs != train_bs:
-        raise ValueError(
-            f"policy.logprob_batch_size ({logprob_bs}) must equal "
-            f"policy.train_micro_batch_size ({train_bs}) when "
-            "policy.dllm.enabled=true, so that the old, reference, and current "
-            "ELBOs of a rollout are estimated at identical masks."
-        )
-
     dtensor_cfg = policy_cfg.get("dtensor_cfg")
     if dtensor_cfg and dtensor_cfg.get("context_parallel_size", 1) > 1:
         raise ValueError(
@@ -129,6 +114,15 @@ def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -
                 "policy.dllm.enabled=true: the dllm generation backend has no "
                 "async engine, so rollouts would silently run synchronously. "
                 "Set grpo.async_grpo.enabled=false."
+            )
+        seq_error_threshold = getattr(grpo_cfg, "seq_logprob_error_threshold", None)
+        if seq_error_threshold is None and hasattr(grpo_cfg, "get"):
+            seq_error_threshold = grpo_cfg.get("seq_logprob_error_threshold")
+        if seq_error_threshold is not None:
+            raise ValueError(
+                "grpo.seq_logprob_error_threshold is not supported with "
+                "policy.dllm.enabled=true: denoising does not expose generation-time "
+                "log probabilities to compare with policy ELBOs. Set it to null."
             )
 
     dllm_cfg = dllm_config_from_policy(policy_cfg)
@@ -158,6 +152,14 @@ def _validate_dllm_generation(generation_cfg: Any, dllm_cfg: Any) -> None:
             "workers, so there is no separate inference cluster to place."
         )
 
+    if generation_cfg.get("stop_strings"):
+        raise ValueError(
+            "policy.generation.stop_strings is not supported with "
+            "policy.generation.backend='dllm': iterative denoising stops on token "
+            "ids, and cannot incrementally match decoded strings. Set it to null "
+            "and use stop_token_ids."
+        )
+
     max_new_tokens = generation_cfg.get("max_new_tokens")
     if max_new_tokens is not None and max_new_tokens % dllm_cfg.block_length != 0:
         raise ValueError(
@@ -173,7 +175,9 @@ def _validate_dllm_loss(loss_cfg: Any, dllm_cfg: Any) -> None:
     def _get(key: str, default: Any) -> Any:
         if hasattr(loss_cfg, key):
             return getattr(loss_cfg, key)
-        return loss_cfg.get(key, default)
+        if hasattr(loss_cfg, "get"):
+            return loss_cfg.get(key, default)
+        return default
 
     # The ELBO is a *sequence* likelihood: only its masked sum is meaningful, so
     # only a sequence-level ratio is well defined. A token-level ratio would
@@ -200,6 +204,18 @@ def _validate_dllm_loss(loss_cfg: Any, dllm_cfg: Any) -> None:
             "loss_fn.use_importance_sampling_correction=true is not supported "
             "with policy.dllm.enabled=true: denoising rollouts produce no "
             "per-token sampling log probabilities to correct against."
+        )
+    if _get("reference_policy_kl_penalty", 0.0) != 0:
+        raise ValueError(
+            "loss_fn.reference_policy_kl_penalty must be 0 with "
+            "policy.dllm.enabled=true: the existing KL estimator expects token "
+            "log probabilities, not per-position ELBO contributions."
+        )
+    if _get("use_kl_in_reward", False):
+        raise ValueError(
+            "loss_fn.use_kl_in_reward is not supported with "
+            "policy.dllm.enabled=true: reward KL requires token log probabilities, "
+            "not per-position ELBO contributions."
         )
     # The policy decides whether its log probabilities are position-aligned; the
     # loss decides whether to drop a column off every other per-token tensor to

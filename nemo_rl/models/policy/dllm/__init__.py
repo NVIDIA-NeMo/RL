@@ -27,6 +27,7 @@ from nemo_rl.models.policy.dllm.elbo import (
     SdmcElboEstimator,
     accumulate_elbo_logprobs,
     get_quadrature,
+    make_dllm_mask_seeds,
 )
 from nemo_rl.models.policy.dllm.setup import (
     dllm_config_from_policy,
@@ -41,5 +42,6 @@ __all__ = [
     "SdmcElboEstimator",
     "accumulate_elbo_logprobs",
     "get_quadrature",
+    "make_dllm_mask_seeds",
     "validate_dllm_policy",
 ]

@@ -15,6 +15,7 @@
 """Tests for dLLM policy config resolution and the setup-time guards."""
 
 import pytest
+from pydantic import ValidationError
 
 from nemo_rl.models.policy.dllm import (
     DllmConfig,
@@ -112,10 +113,21 @@ def test_token_level_loss_is_rejected():
         validate_dllm_policy(make_policy(), loss)
 
 
-def test_importance_sampling_correction_is_rejected():
-    """Denoising produces no per-token sampling logprobs to correct against."""
-    loss = dict(VALID_LOSS, use_importance_sampling_correction=True)
-    with pytest.raises(ValueError, match="use_importance_sampling_correction"):
+@pytest.mark.parametrize(
+    "setting,value,error",
+    [
+        (
+            "use_importance_sampling_correction",
+            True,
+            "use_importance_sampling_correction",
+        ),
+        ("reference_policy_kl_penalty", 0.1, "reference_policy_kl_penalty must be 0"),
+        ("use_kl_in_reward", True, "use_kl_in_reward is not supported"),
+    ],
+)
+def test_token_logprob_dependent_loss_options_are_rejected(setting, value, error):
+    loss = dict(VALID_LOSS, **{setting: value})
+    with pytest.raises(ValueError, match=error):
         validate_dllm_policy(make_policy(), loss)
 
 
@@ -129,23 +141,6 @@ def test_loss_config_may_be_an_object_not_a_mapping():
         position_aligned_logprobs = True
 
     validate_dllm_policy(make_policy(), LossObj())
-
-
-def test_mismatched_microbatch_sizes_are_rejected():
-    """Different microbatch shapes give the two passes different masks."""
-    policy = make_policy(logprob_batch_size=2, train_micro_batch_size=4)
-    with pytest.raises(ValueError, match="must equal"):
-        validate_dllm_policy(policy, VALID_LOSS)
-
-
-def test_matching_microbatch_sizes_are_allowed():
-    policy = make_policy(logprob_batch_size=4, train_micro_batch_size=4)
-    validate_dllm_policy(policy, VALID_LOSS)
-
-
-def test_microbatch_guard_does_not_apply_without_dllm():
-    policy = make_policy(dllm=False, logprob_batch_size=2, train_micro_batch_size=8)
-    validate_dllm_policy(policy, VALID_LOSS)
 
 
 def test_loss_must_not_shift_when_policy_is_position_aligned():
@@ -214,6 +209,12 @@ def test_max_new_tokens_must_be_a_multiple_of_the_block_length():
         validate_dllm_policy(policy, VALID_LOSS)
 
 
+def test_stop_strings_are_rejected():
+    policy = make_policy(generation=make_generation(stop_strings=["</answer>"]))
+    with pytest.raises(ValueError, match="stop_strings is not supported"):
+        validate_dllm_policy(policy, VALID_LOSS)
+
+
 def test_a_matching_custom_block_length_is_accepted():
     policy = make_policy(generation=make_generation(max_new_tokens=96))
     policy["dllm"]["block_length"] = 48
@@ -232,8 +233,9 @@ class _Async:
 
 
 class _Grpo:
-    def __init__(self, enabled):
+    def __init__(self, enabled, seq_logprob_error_threshold=None):
         self.async_grpo = _Async(enabled)
+        self.seq_logprob_error_threshold = seq_logprob_error_threshold
 
 
 def test_async_grpo_is_rejected_for_dllm():
@@ -249,6 +251,12 @@ def test_sync_grpo_is_accepted_for_dllm():
     )
 
 
+def test_seq_logprob_error_threshold_is_rejected_for_dllm():
+    policy = make_policy(generation=make_generation())
+    with pytest.raises(ValueError, match="seq_logprob_error_threshold"):
+        validate_dllm_policy(policy, VALID_LOSS, _Grpo(False, 1.05))
+
+
 def test_async_grpo_as_a_plain_mapping_is_also_rejected():
     policy = make_policy(generation=make_generation())
     with pytest.raises(ValueError, match="async_grpo.enabled is not supported"):
@@ -258,6 +266,24 @@ def test_async_grpo_as_a_plain_mapping_is_also_rejected():
 def test_an_omitted_grpo_config_skips_the_async_check():
     """Callers without a grpo section (SFT, eval) must still validate."""
     validate_dllm_policy(make_policy(generation=make_generation()), VALID_LOSS)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("quadrature", "gauss-99"),
+        ("mc_samples", 0),
+        ("p_mask_prompt", -0.1),
+        ("p_mask_prompt", 1.1),
+        ("block_length", 0),
+        ("diffusion_steps", 0),
+        ("cfg_scale", -0.1),
+        ("mask_id", -1),
+    ],
+)
+def test_invalid_dllm_config_values_are_rejected(field, value):
+    with pytest.raises(ValidationError):
+        DllmConfig(**{field: value})
 
 
 def test_async_grpo_is_ignored_when_dllm_is_disabled():

@@ -24,6 +24,7 @@ from nemo_rl.models.policy.dllm import (
     SdmcElboEstimator,
     accumulate_elbo_logprobs,
     get_quadrature,
+    make_dllm_mask_seeds,
     resolve_mask_id,
 )
 
@@ -154,6 +155,45 @@ def test_same_seed_gives_identical_masks():
 
     assert all(torch.equal(a, b) for a, b in zip(first, second))
     assert not all(torch.equal(a, c) for a, c in zip(first, third))
+
+
+def test_mask_seeds_are_stable_and_distinct_per_row():
+    input_ids, _ = make_batch(batch=3)
+    input_ids[1] = input_ids[0]
+
+    first = make_dllm_mask_seeds(input_ids)
+    second = make_dllm_mask_seeds(input_ids.clone())
+
+    torch.testing.assert_close(first, second)
+    assert first.dtype == torch.int64
+    assert first.unique().numel() == input_ids.shape[0]
+
+
+@pytest.mark.parametrize("quadrature", ["gauss-3", "mc"])
+def test_per_row_seeds_are_independent_and_microbatch_invariant(quadrature):
+    cfg = make_cfg(quadrature=quadrature, mc_samples=2)
+    estimator = SdmcElboEstimator(cfg, MASK_ID)
+    input_ids, completion_mask = make_batch(batch=3)
+    seeds = torch.tensor([11, 22, 33])
+
+    combined = list(estimator.mask_points(input_ids, completion_mask, seed=seeds))
+    per_row = [
+        list(
+            estimator.mask_points(
+                input_ids[row : row + 1],
+                completion_mask[row : row + 1],
+                seed=seeds[row : row + 1],
+            )
+        )
+        for row in range(input_ids.shape[0])
+    ]
+
+    for point_index, point in enumerate(combined):
+        for row in range(input_ids.shape[0]):
+            torch.testing.assert_close(
+                point.masked[row], per_row[row][point_index].masked[0]
+            )
+    assert not torch.equal(combined[0].masked[0], combined[0].masked[1])
 
 
 def test_at_least_one_position_masked_at_small_t():

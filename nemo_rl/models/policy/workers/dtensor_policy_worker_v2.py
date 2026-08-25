@@ -673,7 +673,7 @@ class DTensorPolicyWorkerV2Impl(
         # the seed travels with the batch rather than being drawn per call.
         seed = data_dict.get("dllm_mask_seed")
         if seed is not None:
-            seed = int(seed.flatten()[0].item())
+            seed = seed.to(clean_input_ids.device)
 
         def score_fn(
             masked_input_ids: torch.Tensor, target_ids: torch.Tensor
@@ -768,6 +768,13 @@ class DTensorPolicyWorkerV2Impl(
                 "autoregressive generation backend (vllm, sglang, trtllm)."
             )
 
+        batch_stop_strings = data.get("stop_strings", [])
+        if any(batch_stop_strings):
+            raise ValueError(
+                "Per-sample stop_strings are not supported by dLLM generation. "
+                "Use stop_token_ids instead."
+            )
+
         generation_cfg = self.cfg["generation"]
         assert generation_cfg is not None, (
             "policy.generation must be configured to generate."
@@ -798,6 +805,14 @@ class DTensorPolicyWorkerV2Impl(
             pad_id=pad_id,
         )
 
+        generator = torch.Generator(device=canvas.device)
+        seed = torch.randint(0, 2**31 - 1, (), dtype=torch.int64, device=canvas.device)
+        if self.tp_size > 1:
+            tp_group = self.tp_mesh.get_group()
+            leader = torch.distributed.get_global_rank(tp_group, 0)
+            torch.distributed.broadcast(seed, src=leader, group=tp_group)
+        generator.manual_seed(seed.item())
+
         def logits_fn(input_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
             logits = self.model(
                 input_ids=input_ids, attention_mask=mask.to(input_ids.dtype)
@@ -818,7 +833,7 @@ class DTensorPolicyWorkerV2Impl(
             top_k=None if greedy else generation_cfg["top_k"],
             top_p=1.0 if greedy else generation_cfg["top_p"],
             cfg_scale=self.dllm_cfg.cfg_scale,
-            generator=None,
+            generator=generator,
         )
 
         stop_token_ids = generation_cfg["stop_token_ids"] or [

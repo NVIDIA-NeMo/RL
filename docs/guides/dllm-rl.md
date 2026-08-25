@@ -124,6 +124,7 @@ sequence:
 
 ```yaml
 loss_fn:
+  reference_policy_kl_penalty: 0.0
   sequence_level_importance_ratios: true
   token_level_loss: false
   use_importance_sampling_correction: false
@@ -132,6 +133,14 @@ loss_fn:
 
 `position_aligned_logprobs` reflects that a dLLM scores token `i` at position `i`,
 with no autoregressive shift to undo. It must agree with `policy.dllm.shift_targets`.
+The current KL estimators require token log probabilities, so both policy KL and
+reward KL are unsupported for the sequence-level ELBO.
+
+Generation-time log probabilities are likewise unavailable for iterative
+denoising. Metrics that compare generation and policy log probabilities
+(`token_mult_prob_error`, generation/policy KL, JSD, sampling importance ratio,
+and approximate entropy) are logged as zero and sequence log-probability error
+masking must remain disabled.
 
 Advantages should be left **unnormalized**:
 
@@ -156,7 +165,9 @@ train against the wrong likelihood:
 | `megatron_cfg.enabled` | Only the DTensor backend implements the ELBO path. |
 | `router_replay` | Assumes one stable token-to-expert map per rollout; a dLLM re-routes every position on every denoising step. |
 | `dtensor_cfg.context_parallel_size > 1` | Shards the sequence, but the ELBO masks positions across the whole sequence. |
-| `logprob_batch_size != train_micro_batch_size` | Masks are drawn from a seeded generator over the microbatch shape, so differing sizes would compare ELBOs taken at different masks. |
+| Nonzero `reference_policy_kl_penalty`, `use_kl_in_reward` | Existing KL estimators require token log probabilities rather than per-position ELBO contributions. |
+| `grpo.seq_logprob_error_threshold` | Denoising does not expose generation-time token log probabilities to compare against policy ELBOs. |
+| `generation.stop_strings` | The denoiser fills a canvas rather than decoding incrementally; use `stop_token_ids`. |
 | Autoregressive generation backends | The ELBO path needs the in-worker denoiser. SGLang can serve LLaDA2.0 and SDAR for inference, but wiring that into RL rollouts is not implemented yet. |
 
 ## References

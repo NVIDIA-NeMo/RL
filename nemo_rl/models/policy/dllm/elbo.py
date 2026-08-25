@@ -88,6 +88,28 @@ _SIMPSON: tuple[tuple[float, ...], tuple[float, ...]] = (
 )
 
 
+def make_dllm_mask_seeds(input_ids: torch.Tensor) -> torch.Tensor:
+    """Build a stable, distinct mask seed for each row of a token batch.
+
+    The returned tensor can travel with a :class:`BatchedDataDict`, so slicing
+    into different microbatch sizes preserves each sample's RNG stream.
+
+    Args:
+        input_ids: Token ids with shape ``[batch, sequence]``.
+
+    Returns:
+        An int64 seed tensor with shape ``[batch]`` on the input device.
+    """
+    token_positions = torch.arange(
+        1, input_ids.shape[1] + 1, dtype=torch.int64, device=input_ids.device
+    )
+    content_hash = (input_ids.to(torch.int64) * token_positions).sum(dim=-1)
+    row_offsets = torch.arange(
+        input_ids.shape[0], dtype=torch.int64, device=input_ids.device
+    )
+    return torch.remainder(content_hash + row_offsets * 1_000_003, 2**31 - 1)
+
+
 def get_quadrature(rule: str) -> tuple[tuple[float, ...], tuple[float, ...]]:
     """Return ``(times, weights)`` on the unit interval for an integration rule.
 
@@ -130,14 +152,16 @@ class MaskPoint:
             contribute to the ELBO, shape ``[batch, seq_len]``.
         coefficient: The ``w_n / (t_n * draws)`` scale applied to this point's
             log probabilities when accumulating, where ``draws`` is the number of
-            mask samples averaged at this time.
-        time: The mask ratio ``t_n`` this point was drawn at, for logging.
+            mask samples averaged at this time. A ``[batch, 1]`` tensor for the
+            per-row times used by Monte Carlo quadrature, otherwise a float.
+        time: The mask ratio ``t_n`` this point was drawn at. A ``[batch]`` tensor
+            for Monte Carlo quadrature, otherwise a float.
     """
 
     input_ids: torch.Tensor
     masked: torch.Tensor
-    coefficient: float
-    time: float
+    coefficient: float | torch.Tensor
+    time: float | torch.Tensor
 
 
 class SdmcElboEstimator:
@@ -182,7 +206,7 @@ class SdmcElboEstimator:
         input_ids: torch.Tensor,
         completion_mask: torch.Tensor,
         *,
-        seed: Optional[int] = None,
+        seed: Optional[int | torch.Tensor] = None,
     ) -> Iterator[MaskPoint]:
         """Yields the masked views whose scores make up the ELBO.
 
@@ -192,19 +216,31 @@ class SdmcElboEstimator:
                 the completion and thus eligible for masking and scoring, shape
                 ``[batch, seq_len]``. Prompt and padding positions must be 0.
             seed: If given, masks are drawn from a generator seeded with this
-                value. The old-policy, reference-policy, and current-policy ELBOs
-                of a given rollout **must** share a seed -- otherwise their
-                difference is dominated by mask noise rather than by the policy
-                update, and the importance ratio becomes meaningless.
+                value. A ``[batch]`` tensor supplies an independent seed per row,
+                preserving each sample's masks across microbatching. The
+                old-policy, reference-policy, and current-policy ELBOs of a given
+                rollout **must** share seeds -- otherwise their difference is
+                dominated by mask noise rather than by the policy update.
 
         Yields:
             One :class:`MaskPoint` per (quadrature point, Monte Carlo draw).
         """
         completion_mask = completion_mask.bool()
-        generator: Optional[torch.Generator] = None
+        generators: Optional[list[torch.Generator]] = None
         if seed is not None:
-            generator = torch.Generator(device=input_ids.device)
-            generator.manual_seed(int(seed))
+            seeds = (
+                seed.reshape(-1).tolist() if isinstance(seed, torch.Tensor) else [seed]
+            )
+            if len(seeds) not in (1, input_ids.shape[0]):
+                raise ValueError(
+                    f"Expected one dLLM mask seed per batch row, got {len(seeds)} "
+                    f"seeds for batch size {input_ids.shape[0]}."
+                )
+            generators = []
+            for value in seeds:
+                generator = torch.Generator(device=input_ids.device)
+                generator.manual_seed(int(value))
+                generators.append(generator)
 
         # Each entry is (time, weight, draws): `draws` mask samples are averaged
         # at that time. Quadrature spends its budget on mc_samples draws per
@@ -215,28 +251,32 @@ class SdmcElboEstimator:
                 (t, w, self.cfg.mc_samples) for t, w in zip(self.times, self.weights)
             ]
         else:
-            num_draws = max(1, self.cfg.mc_samples)
-            sampled = torch.rand(
-                num_draws, generator=generator, device=input_ids.device
+            num_draws = self.cfg.mc_samples
+            sampled = self._rand(
+                (input_ids.shape[0], num_draws), input_ids.device, generators
             )
-            # Guard the 1/t singularity; the ELBO integrand is unbounded at t=0.
-            sampled = sampled.clamp_min(
-                1.0 / max(1, int(completion_mask.sum(-1).max().item()))
-            )
-            schedule = [(float(t), 1.0 / num_draws, 1) for t in sampled]
+            # Guard the 1/t singularity independently for each sequence.
+            min_time = completion_mask.sum(-1).clamp_min(1).reciprocal().float()
+            sampled = torch.maximum(sampled, min_time.unsqueeze(-1))
+            schedule = [
+                (sampled[:, draw], 1.0 / num_draws, 1) for draw in range(num_draws)
+            ]
 
         for time, weight, draws in schedule:
             for _ in range(draws):
-                masked = self._draw_mask(completion_mask, time, generator)
+                masked = self._draw_mask(completion_mask, time, generators)
                 noisy = torch.where(masked, self.mask_id, input_ids)
                 if self.cfg.p_mask_prompt > 0.0:
                     noisy, masked = self._mask_prompt(
-                        noisy, masked, completion_mask, input_ids, generator
+                        noisy, masked, completion_mask, input_ids, generators
                     )
+                coefficient = weight / (time * draws)
+                if isinstance(coefficient, torch.Tensor):
+                    coefficient = coefficient.unsqueeze(-1)
                 yield MaskPoint(
                     input_ids=noisy,
                     masked=masked,
-                    coefficient=weight / (time * draws),
+                    coefficient=coefficient,
                     time=time,
                 )
 
@@ -259,8 +299,8 @@ class SdmcElboEstimator:
     def _draw_mask(
         self,
         completion_mask: torch.Tensor,
-        time: float,
-        generator: Optional[torch.Generator],
+        time: float | torch.Tensor,
+        generators: Optional[list[torch.Generator]],
     ) -> torch.Tensor:
         """Masks a ``time`` fraction of each sequence's scorable positions.
 
@@ -288,9 +328,7 @@ class SdmcElboEstimator:
         # Rank scorable positions in a random order, then take the lowest
         # `num_masked` ranks. Non-scorable positions are pushed past every
         # scorable one so they can never be selected.
-        noise = torch.rand(
-            (batch, seq_len), generator=generator, device=completion_mask.device
-        )
+        noise = self._rand((batch, seq_len), completion_mask.device, generators)
         noise = noise.masked_fill(~completion_mask, float("inf"))
         ranks = noise.argsort(dim=-1).argsort(dim=-1)
         return ranks < num_masked.unsqueeze(-1)
@@ -301,7 +339,7 @@ class SdmcElboEstimator:
         masked: torch.Tensor,
         completion_mask: torch.Tensor,
         input_ids: torch.Tensor,
-        generator: Optional[torch.Generator],
+        generators: Optional[list[torch.Generator]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Additionally masks prompt tokens with probability ``p_mask_prompt``.
 
@@ -309,9 +347,31 @@ class SdmcElboEstimator:
         they are added to the model input without entering the returned mask.
         """
         is_prompt = ~completion_mask & (input_ids != self.mask_id)
-        draw = torch.rand(noisy.shape, generator=generator, device=noisy.device)
+        draw = self._rand(noisy.shape, noisy.device, generators)
         corrupt = is_prompt & (draw < self.cfg.p_mask_prompt)
         return torch.where(corrupt, self.mask_id, noisy), masked
+
+    @staticmethod
+    def _rand(
+        shape: torch.Size | tuple[int, ...],
+        device: torch.device,
+        generators: Optional[list[torch.Generator]],
+    ) -> torch.Tensor:
+        """Draw random values, optionally from one independent RNG per row."""
+        if generators is None or len(generators) == 1:
+            generator = generators[0] if generators else None
+            return torch.rand(shape, generator=generator, device=device)
+        if len(generators) != shape[0]:
+            raise ValueError(
+                f"Expected {shape[0]} row generators, got {len(generators)}."
+            )
+        return torch.cat(
+            [
+                torch.rand((1, *shape[1:]), generator=generator, device=device)
+                for generator in generators
+            ],
+            dim=0,
+        )
 
 
 def accumulate_elbo_logprobs(
@@ -319,7 +379,7 @@ def accumulate_elbo_logprobs(
     *,
     input_ids: torch.Tensor,
     completion_mask: torch.Tensor,
-    seed: Optional[int],
+    seed: Optional[int | torch.Tensor],
     score_fn: Any,
 ) -> torch.Tensor:
     """Runs the SDMC forwards and folds them into one per-position tensor.

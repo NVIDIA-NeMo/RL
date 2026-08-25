@@ -13,9 +13,14 @@
 # limitations under the License.
 """Configuration for masked diffusion language model (dLLM) policies."""
 
-from typing import Any, Optional
+from typing import Annotated, Any, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+_NonNegativeInt = Annotated[int, Field(ge=0)]
+_PositiveInt = Annotated[int, Field(ge=1)]
+_Probability = Annotated[float, Field(ge=0.0, le=1.0)]
+_NonNegativeFloat = Annotated[float, Field(ge=0.0)]
 
 
 class DllmConfig(BaseModel, extra="allow"):
@@ -36,7 +41,7 @@ class DllmConfig(BaseModel, extra="allow"):
     enabled: bool = False
     """Whether the policy is a masked diffusion LM."""
 
-    mask_id: Optional[int] = None
+    mask_id: Optional[_NonNegativeInt] = None
     """Token id of the ``[MASK]`` token.
 
     Model-specific, and a wrong value silently corrupts the likelihood rather
@@ -45,15 +50,17 @@ class DllmConfig(BaseModel, extra="allow"):
     only for a model that does not. :func:`resolve_mask_id` performs that
     lookup, and raises if neither source supplies one."""
 
-    quadrature: str = "gauss-2"
+    quadrature: Literal[
+        "gauss-1", "gauss-2", "gauss-3", "gauss-4", "gauss-5", "simpson", "mc"
+    ] = "gauss-2"
     """Integration rule over the mask ratio t. One of ``gauss-1`` .. ``gauss-5``
     (deterministic Gauss-Legendre, the SDMC scheme), ``simpson``, or ``mc``
     (double Monte Carlo -- the higher-variance baseline, kept for ablations)."""
 
-    mc_samples: int = 1
+    mc_samples: _PositiveInt = 1
     """Monte Carlo mask draws per quadrature point (``K`` in the paper)."""
 
-    p_mask_prompt: float = 0.0
+    p_mask_prompt: _Probability = 0.0
     """Probability of masking each prompt token, as a regularizer.
 
     Leave at 0.0 to reproduce GDPO: its SDMC estimator masks only completion
@@ -68,13 +75,13 @@ class DllmConfig(BaseModel, extra="allow"):
     position-aligned -- equivalent to dFactory's ``same_token_labels=true``,
     which is what the released LLaDA2.0 configs use."""
 
-    block_length: int = 32
+    block_length: _PositiveInt = 32
     """Block size for block-wise iterative denoising during generation."""
 
-    diffusion_steps: int = 64
+    diffusion_steps: _PositiveInt = 64
     """Total denoising steps per generated sequence."""
 
-    cfg_scale: float = 0.0
+    cfg_scale: _NonNegativeFloat = 0.0
     """Unsupervised classifier-free guidance scale. 0.0 disables guidance and
     halves the number of forward passes."""
 

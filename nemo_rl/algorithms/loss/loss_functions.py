@@ -233,13 +233,18 @@ class ClippedPGLossFn(LossFunction):
     input_type = LossInputType.LOGPROB
 
     def __init__(
-        self, cfg: ClippedPGLossConfig, use_fused_linear_logprobs: bool = False
+        self,
+        cfg: ClippedPGLossConfig,
+        *,
+        use_fused_linear_logprobs: bool = False,
+        generation_logprobs_available: bool = True,
     ):
         # When True, the model forward is patched to return precomputed next-token
         # logprobs (via chunked linear CE fusion) instead of full logits. This is
         # consumed by prepare_loss_input, which short-circuits the logits->logprobs
         # conversion. See nemo_rl/distributed/model_utils.py for the fused forward.
         self.use_fused_linear_logprobs = use_fused_linear_logprobs
+        self.generation_logprobs_available = generation_logprobs_available
         self.disable_ppo_ratio = cfg.disable_ppo_ratio
         self.ratio_clip_min = cfg.ratio_clip_min
         self.ratio_clip_max = cfg.ratio_clip_max
@@ -414,69 +419,68 @@ class ClippedPGLossFn(LossFunction):
         if self.force_on_policy_ratio:
             prev_logprobs = curr_logprobs.detach()
 
-        # token_mult_prob_error
-        # See more details and other metrics in docs/guides/grpo.md#metrics
-        lp_error = torch.abs(generation_logprobs - prev_logprobs)  # noqa: F841  (precommit ignore for now)
-        # average over all tokens in the microbatch
-        mult_prob_error = masked_mean(
-            torch.exp(lp_error * mask),
-            mask,
-            global_normalization_factor=global_valid_toks,
-        ).item()
+        if self.generation_logprobs_available:
+            # token_mult_prob_error
+            # See more details and other metrics in docs/guides/grpo.md#metrics
+            lp_error = torch.abs(generation_logprobs - prev_logprobs)
+            mult_prob_error = masked_mean(
+                torch.exp(lp_error * mask),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
 
-        # gen-kl: kl(P_gen || P_train)
-        # where log_ratio = prev_logprobs - generation_logprobs
-        gen_kl_error = calculate_kl(
-            logprobs=generation_logprobs,
-            logprobs_reference=prev_logprobs,
-            kl_type=self.reference_policy_kl_type,
-            input_clamp_value=None,
-            output_clamp_value=None,
-        )
-        gen_kl_error = masked_mean(
-            gen_kl_error,
-            mask,
-            global_normalization_factor=global_valid_toks,
-        ).item()
+            # gen-kl: kl(P_gen || P_train)
+            gen_kl_error = calculate_kl(
+                logprobs=generation_logprobs,
+                logprobs_reference=prev_logprobs,
+                kl_type=self.reference_policy_kl_type,
+                input_clamp_value=None,
+                output_clamp_value=None,
+            )
+            gen_kl_error = masked_mean(
+                gen_kl_error,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
 
-        # policy-kl: kl(P_train || P_gen)
-        # where log_ratio = generation_logprobs - prev_logprobs
-        policy_kl_error = calculate_kl(
-            logprobs=prev_logprobs,
-            logprobs_reference=generation_logprobs,
-            kl_type=self.reference_policy_kl_type,
-            input_clamp_value=None,
-            output_clamp_value=None,
-        )
-        policy_kl_error = masked_mean(
-            policy_kl_error,
-            mask,
-            global_normalization_factor=global_valid_toks,
-        ).item()
+            # policy-kl: kl(P_train || P_gen)
+            policy_kl_error = calculate_kl(
+                logprobs=prev_logprobs,
+                logprobs_reference=generation_logprobs,
+                kl_type=self.reference_policy_kl_type,
+                input_clamp_value=None,
+                output_clamp_value=None,
+            )
+            policy_kl_error = masked_mean(
+                policy_kl_error,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
 
-        # Jensen-Shannon divergence
-        # M = 0.5 * (P_train + P_gen)
-        # JSD = 0.5 * KL(P_train || M) + 0.5 * KL(P_gen || M)
-        log_mixture = torch.log(
-            0.5 * torch.exp(prev_logprobs) + 0.5 * torch.exp(generation_logprobs)
-        )
-        # KL(P_train || M)
-        kl_prev_to_mixture = (
-            torch.exp(prev_logprobs - log_mixture) - (prev_logprobs - log_mixture) - 1
-        )
-
-        # KL(P_gen || M)
-        kl_gen_to_mixture = (
-            torch.exp(generation_logprobs - log_mixture)
-            - (generation_logprobs - log_mixture)
-            - 1
-        )
-
-        js_divergence_error = masked_mean(
-            0.5 * kl_prev_to_mixture + 0.5 * kl_gen_to_mixture,
-            mask,
-            global_normalization_factor=global_valid_toks,
-        ).item()
+            # Jensen-Shannon divergence
+            log_mixture = torch.log(
+                0.5 * torch.exp(prev_logprobs) + 0.5 * torch.exp(generation_logprobs)
+            )
+            kl_prev_to_mixture = (
+                torch.exp(prev_logprobs - log_mixture)
+                - (prev_logprobs - log_mixture)
+                - 1
+            )
+            kl_gen_to_mixture = (
+                torch.exp(generation_logprobs - log_mixture)
+                - (generation_logprobs - log_mixture)
+                - 1
+            )
+            js_divergence_error = masked_mean(
+                0.5 * kl_prev_to_mixture + 0.5 * kl_gen_to_mixture,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+        else:
+            mult_prob_error = 0.0
+            gen_kl_error = 0.0
+            policy_kl_error = 0.0
+            js_divergence_error = 0.0
 
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:
@@ -578,7 +582,9 @@ class ClippedPGLossFn(LossFunction):
         # -------------------------------------------------------------
         _is_filter_metrics: dict = {}  # populated for icepop / seq-mask-tis
         # See: docs/guides/grpo.md#importance-sampling-correction
-        if self.sequence_level_importance_ratios:
+        if not self.generation_logprobs_available:
+            actor_importance_weights_expanded = torch.ones_like(prev_logprobs)
+        elif self.sequence_level_importance_ratios:
             # importance weight w_i = exp(Σ_t (log π_actor − log π_behaviour))
             seq_lp_diff = ((prev_logprobs - generation_logprobs) * mask).sum(dim=-1)
             actor_importance_weights = torch.exp(seq_lp_diff).detach()
@@ -707,7 +713,9 @@ class ClippedPGLossFn(LossFunction):
 
         # Metric: sampling importance ratio (mean over samples)
         # See: docs/guides/grpo.md#sampling-importance-ratio
-        if self.sequence_level_importance_ratios:
+        if not self.generation_logprobs_available:
+            sample_importance_ratio = torch.zeros((), device=mask.device)
+        elif self.sequence_level_importance_ratios:
             sample_importance_ratio = masked_mean(
                 actor_importance_weights.squeeze(-1),
                 sample_mask,
@@ -723,11 +731,14 @@ class ClippedPGLossFn(LossFunction):
         # Approximating entropy as E_{s ~ \pi_{gen}(s)}[-(\pi_{curr}/\pi_{gen})log(\pi_{curr}(s))]
         # See more details and other metrics in docs/guides/grpo.md#metrics
         with torch.no_grad():
-            seq_entropy_approx = -masked_mean(
-                torch.exp(curr_logprobs - generation_logprobs) * curr_logprobs,
-                mask,
-                global_normalization_factor=global_valid_toks,
-            )
+            if self.generation_logprobs_available:
+                seq_entropy_approx = -masked_mean(
+                    torch.exp(curr_logprobs - generation_logprobs) * curr_logprobs,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+            else:
+                seq_entropy_approx = torch.zeros((), device=mask.device)
 
         # -----------------------------------------------------------------
         # VAPO: positive-example NLL loss on correct samples (reward > 0)
