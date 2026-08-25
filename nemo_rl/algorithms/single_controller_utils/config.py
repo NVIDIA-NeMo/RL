@@ -553,6 +553,20 @@ class MasterConfig(BaseModel, extra="allow"):
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
 
+    @model_validator(mode="after")
+    def validate_algorithm_block(self) -> "MasterConfig":
+        # Both are Optional so a PPO run can omit `grpo`; without this the
+        # entrypoint dereferences the absent block before validation runs.
+        if self.grpo is not None and self.ppo is not None:
+            raise ValueError(
+                "Only one algorithm block can be set, either `grpo` or `ppo`."
+            )
+        if self.grpo is None and self.ppo is None:
+            raise ValueError(
+                "At least one algorithm block must be set, either `grpo` or `ppo`."
+            )
+        return self
+
 
 def is_ppo_run(master_config: MasterConfig) -> bool:
     """Whether this SingleController run trains a PPO critic alongside the policy.
@@ -568,8 +582,8 @@ def is_ppo_run(master_config: MasterConfig) -> bool:
 def algo_config(master_config: MasterConfig) -> GRPOConfig | PPOConfig:
     """The active algorithm block: ``ppo`` on a PPO run, else ``grpo``.
 
-    Exactly one of the two is set; _validate_algo_settings checks that, and it
-    always runs at setup.
+    Exactly one of the two is set; MasterConfig.validate_algorithm_block checks
+    that at construction.
     """
     if is_ppo_run(master_config):
         return master_config.ppo  # type: ignore
@@ -712,15 +726,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     one a GRPO run carries and would never build. Plus the reward shaping and
     filtering knobs SC reads on neither path.
     """
-    grpo = getattr(master_config, "grpo", None)
-    ppo = getattr(master_config, "ppo", None)
-    if grpo is not None and ppo is not None:
-        raise ValueError("Only one algorithm block can be set, either `grpo` or `ppo`.")
-    if grpo is None and ppo is None:
-        raise ValueError(
-            "At least one algorithm block must be set, either `grpo` or `ppo`."
-        )
-
     algo_cfg = algo_config(master_config)
 
     # SC reads none of these on either path, so an enabled one describes shaping
@@ -876,8 +881,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
-    # First: everything below reads the active algorithm block, which only exists
-    # once this has confirmed exactly one is set.
     _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl

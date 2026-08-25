@@ -138,7 +138,11 @@ class SingleControllerActorArgs:
 def _build_clusters(
     master_config: MasterConfig,
 ) -> tuple[RayVirtualCluster, RayVirtualCluster]:
-    """Allocate train + inference clusters; one shared cluster when colocated."""
+    """Allocate train + inference clusters; one shared cluster when colocated.
+
+    The colocated branch is unreachable on a real run -- validation rejects
+    colocated.enabled=true -- and is kept for when SC can support that mode.
+    """
     cluster_config = master_config.cluster
     generation_config = master_config.policy["generation"]
     colocated = generation_config["colocated"]["enabled"]

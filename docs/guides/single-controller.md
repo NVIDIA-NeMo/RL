@@ -25,7 +25,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       enabled: true
     ```
 
-2. **Enable vLLM async engine** and **disable colocated inference** (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine):
+2. **Enable vLLM async engine** and **disable colocated inference** (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine; setup rejects `colocated.enabled: true`):
 
     ```yaml
     policy:

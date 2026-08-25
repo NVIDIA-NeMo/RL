@@ -22,9 +22,12 @@ training cluster after the policy has stepped off it.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from omegaconf import OmegaConf
+from pydantic import ValidationError
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.advantage_estimator import (
@@ -155,6 +158,48 @@ def _ppo_master_config(**kwargs) -> MasterConfig:
     return _make_master_config(**kwargs)
 
 
+class TestAlgorithmBlockValidator:
+    """Exactly-one-block, enforced at construction so no reader sees a bad pair."""
+
+    @staticmethod
+    def _resolved(name: str) -> dict:
+        from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+
+        register_omegaconf_resolvers()
+        repo_root = Path(__file__).parents[3]
+        raw = load_config(repo_root / "examples/configs" / name)
+        resolved = OmegaConf.to_container(raw, resolve=True)
+        assert isinstance(resolved, dict)
+        return resolved
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "grpo_math_1B_megatron_single_controller.yaml",
+            "ppo_math_1B_megatron_single_controller.yaml",
+        ],
+        ids=["grpo", "ppo"],
+    )
+    def test_the_exemplars_still_validate(self, name):
+        MasterConfig(**self._resolved(name))
+
+    def test_rejects_a_config_with_no_algorithm_block(self):
+        resolved = self._resolved("grpo_math_1B_megatron_single_controller.yaml")
+        del resolved["grpo"]
+
+        with pytest.raises(ValidationError, match="At least one algorithm block"):
+            MasterConfig(**resolved)
+
+    def test_rejects_a_config_with_both_blocks(self):
+        resolved = self._resolved("ppo_math_1B_megatron_single_controller.yaml")
+        resolved["grpo"] = self._resolved(
+            "grpo_math_1B_megatron_single_controller.yaml"
+        )["grpo"]
+
+        with pytest.raises(ValidationError, match="Only one algorithm block"):
+            MasterConfig(**resolved)
+
+
 class TestIsPPORun:
     @pytest.mark.parametrize(
         ("make_config", "expected"),
@@ -187,22 +232,6 @@ class TestAlgoConfigSelection:
 class TestPPOValidation:
     def test_accepts_a_well_formed_ppo_config(self):
         validate_single_controller_config(_ppo_master_config())
-
-    def test_rejects_a_config_with_neither_block(self):
-        """Also caught at setup; algo_config only asserts the invariant."""
-        mc = _make_master_config()
-        mc.grpo = None
-
-        with pytest.raises(ValueError, match="At least one algorithm block"):
-            validate_single_controller_config(mc)
-
-    def test_rejects_a_config_with_both_blocks(self):
-        """Caught at setup rather than in algo_config, which runs on every access."""
-        mc = _ppo_master_config()
-        mc.grpo = GRPOConfig.model_construct(**_STEP_CONFIG)
-
-        with pytest.raises(ValueError, match="Only one algorithm block"):
-            validate_single_controller_config(mc)
 
     @pytest.mark.parametrize("missing", ["value", "value_loss_fn"])
     def test_rejects_ppo_without_its_critic_blocks(self, missing):
