@@ -176,21 +176,31 @@ def get_tokenizer(
                     - A custom jinja2 template string
                     If not specified, the tokenizer's default template will be used.
                 - chat_template_kwargs: Arguments passed to tokenizer.apply_chat_template()
+                - tokenizer_kwargs: Extra keyword arguments forwarded to
+                  NeMoAutoTokenizer.from_pretrained(), e.g.
+                  {"fix_mistral_regex": False}. When get_processor=True, these
+                  are passed through AutoProcessor.from_pretrained().
         get_processor: Whether to return a processor (via AutoProcessor) instead of a tokenizer.
 
     Returns:
         The configured tokenizer or processor instance.
     """
     processor = None
+    tokenizer_kwargs = dict(tokenizer_config.get("tokenizer_kwargs") or {})
 
     if get_processor:
         processor = AutoProcessor.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True, use_fast=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            use_fast=tokenizer_kwargs.pop("use_fast", True),
+            **tokenizer_kwargs,
         )
         tokenizer = processor.tokenizer
     else:
         tokenizer = NeMoAutoTokenizer.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            **tokenizer_kwargs,
         )
 
     if tokenizer.pad_token is None:
