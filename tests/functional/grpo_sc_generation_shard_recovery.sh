@@ -518,25 +518,69 @@ fi
 wait $TRAIN_PID && EXIT_CODE=0 || EXIT_CODE=$?
 echo "[recovery] job exited $EXIT_CODE, ${ELAPSED}s after the kill"
 
-# The frozen variant is the one case where a non-zero exit is the PASS. The victim stays
-# SUSPECT, the recovery then marks it STALE, and neither is absent -- so the reconcile
-# refuses to rebuild over a fleet that still contains a silent rank, which is the safe
-# answer. What is under test is that the refusal is REACHED, by way of the abort, and says
-# why: before the deadline existed this same scenario wedged forever (job 5898311).
-# Handled before the generic exit-code check below, which would otherwise call it a
-# failure.
+# The frozen variants, and the two transports do NOT agree here -- the expectation is split
+# because the outcomes genuinely differ, not because one of them is under-tested.
+#
+# A frozen rank never becomes absent: is_alive() is answered by the Ray actor and never
+# touches the engine, so the probe can only ever see a dead process. The ledger knows
+# anyway, because the frozen shard's own generations time out and drive it to SUSPECT
+# before the refit aborts, and the recovery condemns that single suspect.
+#
+# On the packed-broadcast transport that is enough, and the run carries on.
+#
+# On nccl_reshard it is not, and cannot be. The bulk transfer aborts by way of
+# sync_stream_within, which gives up on kernels already enqueued on the TRAINERS' streams
+# -- and aborting a communicator does not retire them. Its docstring has said so since it
+# was written: "In-flight kernels are orphaned and the caller's CUDA context should not be
+# trusted afterwards, so the RefitAborted raised here is expected to end the run."
+#
+# Jobs 6521181 and 6523731 measured the consequence. Both trainers' py-spy dumps sat in
+# init_nccl_communicator with the abandoned ncclCommAborts still in native code 25 minutes
+# on, and the rebuild could not bootstrap a new communicator on a device holding a
+# half-aborted one. Job 6523731 also proved it is not the peer's doing: the victim was
+# ray.killed before the rebuild and the trainers wedged identically. Nothing done to the
+# remote rank retires local GPU work.
+#
+# So on this transport the gain being pinned is the one the six bounds actually deliver --
+# the run ends attributably in seconds instead of wedging in NCCL for 33 minutes (job
+# 6258553) -- and asserting recovery here would assert a property the design explicitly
+# places out of scope.
+if [[ "$FREEZE_VICTIM" == "true" && "$REFIT_TRANSPORT" == "nccl_reshard" ]]; then
+    if (( EXIT_CODE == 0 )); then
+        echo "[recovery] FAIL: the run completed. On nccl_reshard an aborted bulk transfer"
+        echo "[recovery] orphans kernels on the trainers, so completing means the abort"
+        echo "[recovery] never fired and this variant tested nothing."
+        exit 1
+    fi
+    if ! grep -q "RefitAborted" "$RUN_LOG"; then
+        echo "[recovery] FAIL: the run failed without a RefitAborted, so it died of"
+        echo "[recovery] something other than the deadline this variant exists to exercise."
+        grep -E "watchdog|deadline|Traceback" "$RUN_LOG" | tail -20
+        exit 1
+    fi
+    # The whole point is bounded. Wedging for the full harness timeout is the failure this
+    # replaced, and it would otherwise reach the check above looking like a pass.
+    if (( ELAPSED > 900 )); then
+        echo "[recovery] FAIL: the run ended attributably but took ${ELAPSED}s. The bounds"
+        echo "[recovery] exist to make this fast; something is waiting that should not be."
+        exit 1
+    fi
+    if [[ "$(awk '{print $3}' "/proc/$VICTIM/stat" 2>/dev/null || echo gone)" == "gone" ]]; then
+        echo "[recovery] FAIL: the frozen victim disappeared; it was not the frozen-rank"
+        echo "[recovery] scenario that failed, so the result does not mean what it says."
+        exit 1
+    fi
+    echo "[recovery] abort observed:"; grep -m3 "RefitAborted" "$RUN_LOG"
+    echo "[recovery] PASS: a frozen rank on nccl_reshard ended the run attributably in"
+    echo "[recovery] ${ELAPSED}s rather than wedging in NCCL (recovery on this transport is"
+    echo "[recovery] out of scope -- see sync_stream_within)"
+    exit 0
+fi
+
+# The packed-broadcast frozen variant, where the condemned suspect IS recoverable: the
+# pass condition is completion, like the killed variants, plus evidence that it got there
+# by attribution rather than by the shard dying.
 if [[ "$FREEZE_VICTIM" == "true" ]]; then
-    # A frozen rank now RECOVERS rather than ending the run, which reverses what this
-    # variant used to assert.
-    #
-    # It never becomes absent -- is_alive() is answered by the Ray actor and never touches
-    # the engine, so the probe can only ever see a dead process -- and the reconcile used
-    # to refuse for exactly that reason. But the ledger already knew: the frozen shard's
-    # own generations time out and drive it to SUSPECT before the refit aborts. The
-    # recovery now condemns that single suspect and rebuilds over the survivor.
-    #
-    # So the pass condition is completion, like the killed variants, plus evidence that it
-    # got there by attribution rather than by the shard dying.
     if (( EXIT_CODE != 0 )); then
         echo "[recovery] FAIL: the run exited $EXIT_CODE ${ELAPSED}s after the freeze."
         echo "[recovery] A single suspect should have been condemned and the run continued."
