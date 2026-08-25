@@ -331,6 +331,7 @@ def _actor_master_config(
     checkpoint_must_save_by: Optional[str] = None,
     ft_save_period: Optional[int] = None,
     num_prompts_per_step: int = 2,
+    num_generations_per_prompt: int = 2,
     max_num_epochs: int = 1,
     sampler: Optional[SamplerConfig] = None,
     drop_incomplete_targets_on_restore: bool = False,
@@ -348,7 +349,9 @@ def _actor_master_config(
     return MasterConfig.model_construct(
         policy={
             # One optimizer.step per RL step: prompts * generations == gbs.
-            "train_global_batch_size": num_prompts_per_step * 2,
+            "train_global_batch_size": (
+                num_prompts_per_step * num_generations_per_prompt
+            ),
             "generation": {"colocated": {"enabled": False}},
         },
         loss_fn=ClippedPGLossConfig(),
@@ -358,7 +361,7 @@ def _actor_master_config(
             max_num_steps=max_num_steps,
             max_num_epochs=max_num_epochs,
             num_prompts_per_step=num_prompts_per_step,
-            num_generations_per_prompt=2,
+            num_generations_per_prompt=num_generations_per_prompt,
             seed=42,
         ),
         logger={
@@ -1345,9 +1348,11 @@ class TestReplayBufferPersistence:
         ckpt_dir.mkdir()
         envelope = {"groups": ["g0"]}
         torch.save(envelope, ckpt_dir / "replay_buffer.pt")
+        # Generations != prompts so a swap of the two group counts is visible.
         mc = _actor_master_config(
             tmp_path,
             max_num_steps=0,
+            num_generations_per_prompt=4,
             sampler=InOrderSamplerConfig(max_lookahead_versions=1),
             drop_incomplete_targets_on_restore=True,
         )
@@ -1366,6 +1371,8 @@ class TestReplayBufferPersistence:
 
         assert len(buffer.load_calls) == 1
         assert buffer.load_calls[0]["drop_incomplete_targets_on_restore"] is True
+        assert buffer.load_calls[0]["expected_group_size"] == 4
+        assert buffer.load_calls[0]["groups_per_step"] == 2
 
     def test_restored_permits_are_released_by_a_live_pump(self, tmp_path):
         # The restore takes one capacity permit per group; a running pump must
