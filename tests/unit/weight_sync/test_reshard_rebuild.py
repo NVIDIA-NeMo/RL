@@ -81,6 +81,10 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
         # default, which meant this fake could omit it and still pass -- the getattr was
         # covering for the fake rather than for a genuinely optional field.
         _refit_membership=None,
+        # Same principle: the rebuild asks which bootstrap protocol the receiver speaks,
+        # so a stand-in has to answer. Omitting it is how the reshard rebuild went on
+        # passing its tests while silently defaulting to "nemo".
+        get_collective_sender_spec=lambda: SimpleNamespace(nccl_peer="nemo"),
     )
     for name in (
         "rebuild_collective",

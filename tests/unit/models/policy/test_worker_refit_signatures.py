@@ -418,7 +418,13 @@ def test_the_generation_reshard_hook_accepts_what_the_synchronizer_sends():
     )
 
 
-def test_the_rebuild_bootstraps_with_the_same_peer_protocol_as_the_first_build():
+@pytest.mark.parametrize(
+    "synchronizer",
+    ["collective_weight_synchronizer.py", "nccl_reshard_weight_synchronizer.py"],
+)
+def test_the_rebuild_bootstraps_with_the_same_peer_protocol_as_the_first_build(
+    synchronizer,
+):
     """A rebuilt communicator must not silently fall back to the "nemo" default.
 
     The receiver's bootstrap is not negotiable: "nemo" publishes a raw unique ID and warms
@@ -426,7 +432,7 @@ def test_the_rebuild_bootstraps_with_the_same_peer_protocol_as_the_first_build()
     all-reduce. Mismatched warmups on one communicator HANG rather than error -- the exact
     failure the rebuild exists to remove, reappearing inside the recovery.
     """
-    path = REPO_ROOT / "nemo_rl" / "weight_sync" / "collective_weight_synchronizer.py"
+    path = REPO_ROOT / "nemo_rl" / "weight_sync" / synchronizer
     tree = ast.parse(path.read_text())
     calls = [
         call
