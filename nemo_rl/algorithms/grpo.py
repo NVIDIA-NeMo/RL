@@ -1334,8 +1334,7 @@ def setup(
             ]
             nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
             setup_timing_metrics.policy_init_time_s = policy_time
-            setup_timing_metrics.megatron_generation_init_time_s = megatron_gen_time
-            setup_timing_metrics.generation_init_time_s = (
+            setup_timing_metrics.megatron_generation_init_time_s = (
                 reserve_time + megatron_gen_time
             )
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time

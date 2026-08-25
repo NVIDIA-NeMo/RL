@@ -84,8 +84,7 @@ class TestPrintSetupTimingSummary:
     def test_grpo_reserve_renders_reserve_load_split(self, capsys):
         """grpo megatron+gym overlap decomposes exactly like the SC line."""
         metrics = self._common_setup(
-            megatron_generation_init_time_s=15.0,
-            generation_init_time_s=18.0,
+            megatron_generation_init_time_s=18.0,
             generation_init_reserve_time_s=3.0,
         )
         print_setup_timing_summary(
