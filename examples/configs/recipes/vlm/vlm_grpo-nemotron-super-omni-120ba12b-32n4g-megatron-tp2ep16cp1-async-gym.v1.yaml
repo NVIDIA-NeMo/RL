@@ -1,4 +1,6 @@
 defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+grpo:
+  deduplicate_multimodal_data: true
 policy:
   sequence_packing:
     logprob_mb_tokens: 32768
