@@ -743,6 +743,14 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "shaping. Disable them."
         )
 
+    if master_config.policy["generation"]["colocated"]["enabled"]:
+        raise ValueError(
+            "The SingleController path requires "
+            "policy.generation.colocated.enabled=false: SC drives rollout via "
+            "RolloutManager.generate_and_push, which is only supported on the "
+            "disaggregated async engine."
+        )
+
     async_config = master_config.async_rl
     # Capacity is sized from the peak window whatever the algorithm, so an inert
     # setting still costs buffer and fails setup naming the wrong cause.

@@ -117,7 +117,7 @@ def _make_master_config(
             "megatron_cfg": {"enabled": megatron_enabled},
             "generation": {
                 "backend": "vllm",
-                "colocated": {"enabled": True, "resources": {}},
+                "colocated": {"enabled": False, "resources": {}},
             },
         },
         checkpointing={
@@ -367,6 +367,17 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="must not be negative"):
             validate_single_controller_config(mc)
 
+    @pytest.mark.parametrize(
+        "make_config", [_ppo_master_config, _make_master_config], ids=["ppo", "grpo"]
+    )
+    def test_rejects_colocated_generation(self, make_config):
+        """SC never sleeps generation, so the engine would hold GPUs all step."""
+        mc = make_config()
+        mc.policy["generation"]["colocated"]["enabled"] = True
+
+        with pytest.raises(ValueError, match="colocated.enabled=false"):
+            validate_single_controller_config(mc)
+
     def test_grpo_is_free_to_use_any_sampler(self):
         mc = _make_master_config()
         mc.async_rl.sampler = WindowedSamplerConfig()
@@ -544,7 +555,11 @@ def _cluster_config(mc: MasterConfig, *, colocated: bool, backend: str) -> Maste
 
 
 class TestTrainClusterSizesForTheCritic:
-    """The critic shares the training GPUs, so it needs its own worker-group slot."""
+    """The critic shares the training GPUs, so it needs its own worker-group slot.
+
+    The colocated cases call _build_clusters directly, bypassing the validator that
+    rejects colocated.enabled=true; they pin its arithmetic, not a usable mode.
+    """
 
     @pytest.fixture
     def fake_cluster(self):
