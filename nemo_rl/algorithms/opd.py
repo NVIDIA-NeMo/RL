@@ -101,19 +101,6 @@ def _opd_cfg(master_config: Any) -> dict[str, Any]:
     return cfg
 
 
-def _cluster_gpus_per_node(master_config: Any) -> Optional[int]:
-    """Best-effort cluster.gpus_per_node from a MasterConfig object or dict."""
-    if isinstance(master_config, dict):
-        cluster = master_config.get("cluster")
-    else:
-        cluster = getattr(master_config, "cluster", None)
-    if cluster is None:
-        return None
-    if isinstance(cluster, dict):
-        return cluster.get("gpus_per_node")
-    return getattr(cluster, "gpus_per_node", None)
-
-
 def is_opd_enabled(master_config: Any) -> bool:
     """Whether on-policy distillation is enabled in the config."""
     return bool(_opd_cfg(master_config).get("enabled", False))
@@ -299,9 +286,7 @@ def reserve_teacher_clusters(
 
     opd_cfg = _opd_cfg(master_config)
     _validate_default_teacher_alias(opd_cfg)
-    teacher_configs = create_teacher_configs_from_opd_config(
-        opd_cfg, cluster_gpus_per_node=_cluster_gpus_per_node(master_config)
-    )
+    teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
 
     # Running topology of still-free nodes; each teacher consumes a segment and
     # passes the remainder to the next so teachers don't collide.
@@ -402,9 +387,7 @@ def create_teacher_worker_groups(
     teacher_model_by_agent_name = dict(opd_cfg.get("teacher_model_by_agent_name", {}))
     _validate_default_teacher_alias(opd_cfg)
 
-    teacher_configs = create_teacher_configs_from_opd_config(
-        opd_cfg, cluster_gpus_per_node=_cluster_gpus_per_node(master_config)
-    )
+    teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
     expected_aliases = {teacher_config.alias for teacher_config in teacher_configs}
     if set(teacher_clusters) != expected_aliases:
         raise ValueError(
