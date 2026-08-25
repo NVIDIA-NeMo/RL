@@ -2877,7 +2877,9 @@ class MegatronPolicyWorkerImpl(
 
         groups = [getattr(self, "pp_comm_group", None), self.model_update_group]
         with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
-            self._nccl_reshard_refit(kv_scales=kv_scales)
+            self._nccl_reshard_refit(
+                kv_scales=kv_scales, refit_timeout_s=refit_timeout_s
+            )
         if guard.fired:
             # The aborted transfer returned cleanly, so this is the only signal there is.
             raise RefitAborted(
@@ -2885,10 +2887,11 @@ class MegatronPolicyWorkerImpl(
                 "a generation rank most likely stopped participating"
             )
 
-    def _nccl_reshard_refit(self, kv_scales=None):
+    def _nccl_reshard_refit(self, kv_scales=None, refit_timeout_s=None):
         # hf_to_local_param_map is built once in prepare_nccl_reshard_refit_info;
         # weight values change but the name → spec mapping is stable across
         # refits.
+        from nemo_rl.distributed.refit_watchdog import sync_stream_within
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
         # spec.pre (grouped-MoE expert stacking) and spec.post enqueue on this
@@ -2937,14 +2940,18 @@ class MegatronPolicyWorkerImpl(
                 # memory returns to the caching allocator
                 del ctx, src_tensor
 
-        torch.cuda.synchronize()
+        sync_stream_within(
+            nccl_reshard_stream, refit_timeout_s, "the bulk parameter transfer"
+        )
         torch.cuda.empty_cache()
 
         import time
 
         misc_t0 = time.perf_counter()
         self._broadcast_misc_params_packed(kv_scales=kv_scales)
-        torch.cuda.synchronize()
+        sync_stream_within(
+            torch.cuda.current_stream(), refit_timeout_s, "the misc broadcast"
+        )
         if torch.distributed.get_rank() == 0:
             print(
                 f"[nccl_reshard_refit] misc broadcast (train side): "
