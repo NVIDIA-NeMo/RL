@@ -16,6 +16,7 @@ import gc
 import logging
 import os
 import re
+import functools
 import time
 import warnings
 from collections import OrderedDict, defaultdict
@@ -2848,8 +2849,25 @@ class MegatronPolicyWorkerImpl(
                     mapping[name] = LocalParamSpec(base=param_map.get(name))
         return HFToLocalParamMap(specs=mapping)
 
+    async def nccl_reshard_refit(self, kv_scales=None, refit_timeout_s=None):
+        """Run the refit off this actor's event loop; see _nccl_reshard_refit_guarded.
+
+        Async purely so the blocking transfer does not occupy the loop. While it runs,
+        this actor can still service the recovery's ``init_collective`` -- which is the
+        whole reason the rebuild can happen at all when a generation rank goes silent.
+        """
+        from nemo_rl.distributed.refit_watchdog import await_off_loop
+
+        return await await_off_loop(
+            functools.partial(
+                self._nccl_reshard_refit_guarded,
+                kv_scales=kv_scales,
+                refit_timeout_s=refit_timeout_s,
+            )
+        )
+
     @torch.no_grad()
-    def nccl_reshard_refit(self, kv_scales=None, refit_timeout_s=None):
+    def _nccl_reshard_refit_guarded(self, kv_scales=None, refit_timeout_s=None):
         """Transfer weights to generation workers via xferdtensor, under a deadline.
 
         Guarded exactly like the collective producer, and for the same reason: a
