@@ -38,8 +38,6 @@ if [[ $REFIT_COUNT -lt 2 ]]; then
     echo "[ERROR] Expected at least two quantized refits, found $REFIT_COUNT"
     exit 1
 fi
-assert_not_grep "rollout ignore patterns do not exclude" "$RUN_LOG" \
-    "Training-BF16 expert layers were not excluded from rollout quantization"
 
 MAX_RECORDED_STEP=$(jq -r 'if has("train/loss") then (."train/loss" | keys | map(tonumber) | max // 0) else 0 end' "$JSON_METRICS")
 if [[ $MAX_RECORDED_STEP -lt $MAX_STEPS ]]; then

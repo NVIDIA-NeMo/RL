@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
-import fnmatch
 import gc
 import logging
 import os
@@ -2172,7 +2171,6 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
-        self._warn_fp4_bf16_layer_rollout_ignore_mismatch()
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         # Collect tensor metadata for refit / hf side info.
@@ -2372,46 +2370,6 @@ class MegatronPolicyWorkerImpl(
             return None
         return parse_nvfp4_pertoken_rollout(cast(VllmConfig, generation_cfg))
 
-    def _warn_fp4_bf16_layer_rollout_ignore_mismatch(self) -> None:
-        """Warn if training-BF16 layers would be quantized for rollout."""
-        rollout_cfg = self._nvfp4_pertoken_rollout_cfg()
-        megatron_cfg = cast(dict[str, Any], self.cfg["megatron_cfg"])
-        raw_fp4_cfg = megatron_cfg.get("fp4_cfg")
-        fp4_cfg = (
-            Fp4Config.model_validate(raw_fp4_cfg) if raw_fp4_cfg is not None else None
-        )
-        if (
-            rollout_cfg is None
-            or fp4_cfg is None
-            or not fp4_cfg.enabled
-            or not megatron_cfg.get("first_last_layers_bf16")
-        ):
-            return
-        num_layers = self.megatron_bridge.transformer_config.num_layers
-        num_start = int(megatron_cfg.get("num_layers_at_start_in_bf16", 0))
-        num_end = int(megatron_cfg.get("num_layers_at_end_in_bf16", 0))
-        bf16_layers = list(range(num_start)) + list(
-            range(num_layers - num_end, num_layers)
-        )
-        ignore = rollout_cfg.resolved_ignore()
-        uncovered = [
-            layer_idx
-            for layer_idx in bf16_layers
-            if not any(
-                fnmatch.fnmatch(
-                    f"model.layers.{layer_idx}.mlp.experts.0.gate_proj", pattern
-                )
-                for pattern in ignore
-            )
-        ]
-        if uncovered:
-            warnings.warn(
-                "[nvfp4_pertoken] TE keeps layers "
-                f"{uncovered} in BF16 during training, but the rollout ignore "
-                "patterns do not exclude their experts. Extend "
-                "generation.nvfp4_pertoken_rollout.additional_ignore to cover them."
-            )
-
     def maybe_init_zmq(self) -> None:
         """Allow extra time for the first quantized refit and kernel autotune."""
         super().maybe_init_zmq()
@@ -2422,30 +2380,6 @@ class MegatronPolicyWorkerImpl(
             self.zmq_socket.setsockopt(zmq.RCVTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
 
     def _iter_params_with_optional_kv_scales(
-        self,
-        kv_scales: Optional[dict[str, float]] = None,
-        conversion_tasks=None,
-    ) -> Iterator[tuple[str, torch.Tensor]]:
-        """Yield HF parameters, quantizing expert weights for per-token rollout."""
-        base_iter = self._iter_params_with_optional_kv_scales_impl(
-            kv_scales=kv_scales,
-            conversion_tasks=conversion_tasks,
-        )
-        rollout_cfg = self._nvfp4_pertoken_rollout_cfg()
-        if rollout_cfg is None:
-            yield from base_iter
-            return
-        from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
-            iter_nvfp4_pertoken_weights,
-        )
-
-        yield from iter_nvfp4_pertoken_weights(
-            base_iter,
-            quant_patterns=rollout_cfg.quant_patterns,
-            ignore_patterns=rollout_cfg.resolved_ignore(),
-        )
-
-    def _iter_params_with_optional_kv_scales_impl(
         self,
         kv_scales: Optional[dict[str, float]] = None,
         conversion_tasks=None,
