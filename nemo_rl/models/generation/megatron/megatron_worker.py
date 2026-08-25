@@ -394,7 +394,7 @@ class MegatronGenerationMixin:
         )
 
         if "inference_cuda_graph_scope" in mcore_generation_config:
-            model_config.inference_cuda_graph_scope = InferenceCudaGraphScope[
+            engine_model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
                 mcore_generation_config["inference_cuda_graph_scope"]
             ]
 
@@ -601,8 +601,11 @@ class MegatronGenerationMixin:
         print(f"[Rank {self.rank}] finishing generation", flush=True)
         log_gpu_memory("finish_generation START")
 
-        inference_model, _ = self._inference_model_and_media_parts()
+        inference_model, media_model = self._inference_model_and_media_parts()
         lang_module = unwrap_model(inference_model)
+        graph_module = unwrap_model(
+            media_model if media_model is not None else inference_model
+        )
 
         if self.is_generation_colocated:
             if self._inference_engine_initialized and not self._inference_engine_asleep:
@@ -611,7 +614,8 @@ class MegatronGenerationMixin:
                 "cuda_graph_impl"
             ]
             if cuda_graph_impl != "none":
-                toggle_cuda_graphs(lang_module, set_to="none")
+                # Restore the same full model tree cached during worker setup.
+                toggle_cuda_graphs(graph_module, set_to="none")
                 # Need to turn off padding before training.
                 # Gains nightly MoE coverage once #2884 and #3570 merge.
                 set_decode_expert_padding(lang_module, set_to=False)
@@ -676,11 +680,14 @@ class MegatronGenerationMixin:
         if self.inference_model is not None:
             self._reshard_into_inference_model()
 
-        inference_model, _ = self._inference_model_and_media_parts()
+        inference_model, media_model = self._inference_model_and_media_parts()
         # `flash_decode` selects Megatron Inference's deprecated static-batching decode path,
         # which would cause an assertion error if taken.
         inference_model.config.flash_decode = False
         lang_module = unwrap_model(inference_model)
+        graph_module = unwrap_model(
+            media_model if media_model is not None else inference_model
+        )
         lang_module.eval()
 
         rotary_module = getattr(lang_module, "rotary_pos_emb", None)
@@ -691,7 +698,9 @@ class MegatronGenerationMixin:
 
         cuda_graph_impl = mcore_generation_config["cuda_graph_impl"]
         if cuda_graph_impl != "none":
-            toggle_cuda_graphs(lang_module, set_to=cuda_graph_impl)
+            # Use the same root object as _setup_colocated_cuda_graph_managers;
+            # CUDA-graph manager caches are keyed by model identity.
+            toggle_cuda_graphs(graph_module, set_to=cuda_graph_impl)
 
         # tags=["weights"] means we are inside refit_policy_generation between
         # suspend_for_refit and the weight transfer — the engine was intentionally
