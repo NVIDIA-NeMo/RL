@@ -443,6 +443,12 @@ class InOrderSampler(_GatedSampler):
     (the staleness window is not used for selection). ``evict`` is keyed on
     ``target_step`` — not the start weight — so a slot whose target step is still
     upcoming is never dropped early, and evict/select can't disagree.
+
+    warmup_lookahead_versions widens the gate while the PPO policy is frozen, so more
+    batches stay in flight during critic warmup. The driver retunes the window every
+    step and shrinks it back to max_lookahead_versions once the policy starts training,
+    so the widened lookahead does not turn into permanent extra staleness. Buffer
+    capacity is sized for the peak of the two.
     """
 
     def __init__(

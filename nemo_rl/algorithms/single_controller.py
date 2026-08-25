@@ -894,6 +894,12 @@ class SingleControllerActor:
             5. Train the policy model (GRPO) -- finish_train_step all_reduces the
                 accumulated gradients, rescales, and runs optimizer.step.
             6. Refit the model. Sync the new policy weights to generation.
+
+        PPO critic warmup (ppo.policy_training_start_step > 0) changes which of those
+        run. For the first N steps 3a still trains the critic every step, but 3b and 6
+        are skipped, so the policy is neither trained nor refit. The trainer version
+        still advances, and the sampler's lookahead is widened while the policy is
+        frozen.
         """
         policy_training_start_step = (
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
