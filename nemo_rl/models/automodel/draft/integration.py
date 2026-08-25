@@ -372,7 +372,11 @@ def build_eagle3_draft_model(
     draft_hf_config = load_draft_hf_config(
         model_name, algo="eagle3", target_num_hidden_layers=target_num_hidden_layers
     )
-    accepted_archs = ("Eagle3Speculator", "Qwen3Eagle3DraftModel")
+    # "Eagle3DraftModel" is the current speculators class name (e.g.
+    # RedHatAI/Qwen3-30B-A3B-Instruct-2507-speculator.eagle3);
+    # "Eagle3Speculator" is an older speculators naming that some earlier
+    # checkpoints still carry.
+    accepted_archs = ("Eagle3Speculator", "Eagle3DraftModel", "Qwen3Eagle3DraftModel")
     architectures = getattr(draft_hf_config, "architectures", None) or []
     if not any(arch in architectures for arch in accepted_archs):
         raise ValueError(
