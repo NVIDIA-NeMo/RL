@@ -37,6 +37,7 @@ exactly as before, down to not starting a thread.
 """
 
 import threading
+import time
 from collections.abc import Sequence
 from types import TracebackType
 from typing import Optional, Protocol, Union
@@ -81,6 +82,54 @@ def is_refit_abort(error: BaseException) -> bool:
     abort was named, and the run still wedged because the handler never matched.
     """
     return isinstance(error, RefitAborted) or REFIT_ABORTED_TOKEN in str(error)
+
+
+def sync_stream_within(stream, budget_s: Optional[float], what: str) -> None:
+    """Wait for ``stream``'s enqueued work, giving up after ``budget_s``.
+
+    WHY THIS EXISTS, and why the watchdog above is not enough. Aborting a communicator
+    does not retire work already enqueued on a CUDA stream. When a generation rank stops
+    receiving mid-refit the sends sit on the stream forever, and ``torch.cuda.synchronize``
+    -- which waits on the whole device -- never returns. The watchdog cannot help: the
+    abort fires, the kernels do not retire, the guarded block never exits, and
+    :attr:`RefitAbortWatchdog.fired` is never read. No exception-translation reaches a
+    hang.
+
+    Job 6485245 measured exactly that on 4xGB200: both policy workers parked in
+    ``synchronize`` 1801s after their own abort had logged, while the generation workers
+    had already unwound and gone idle.
+
+    So the wait is bounded here rather than trusted to end. The event is POLLED, not waited
+    on, so nothing can be left holding the GIL, and the happy path still finishes with the
+    same device-wide ``synchronize()`` -- behaviour is identical when nothing is wrong.
+
+    This does NOT recover the fleet. In-flight kernels are orphaned and the caller's CUDA
+    context should not be trusted afterwards, so the ``RefitAborted`` raised here is
+    expected to end the run -- attributably, in seconds, rather than after a 30-minute
+    stall. Recovering a frozen-but-alive rank on this transport stays out of scope.
+
+    ``budget_s`` of None or <= 0 keeps the original unbounded synchronize, so a run with no
+    refit deadline configured behaves exactly as before.
+    """
+    import torch
+
+    if budget_s is None or budget_s <= 0:
+        torch.cuda.synchronize()
+        return
+
+    event = torch.cuda.Event()
+    event.record(stream)
+    deadline = time.monotonic() + budget_s
+    while not event.query():
+        if time.monotonic() >= deadline:
+            raise RefitAborted(
+                f"refit: {what} did not retire within {budget_s}s. A peer most likely "
+                "stopped receiving; aborting the communicator does not retire work "
+                "already enqueued on the stream, so this gives up rather than blocking "
+                "in cudaDeviceSynchronize forever."
+            )
+        time.sleep(0.05)
+    torch.cuda.synchronize()
 
 
 class RefitAbortWatchdog:

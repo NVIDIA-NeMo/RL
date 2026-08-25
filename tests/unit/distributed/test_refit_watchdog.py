@@ -19,9 +19,12 @@ Testable without NCCL because the watchdog's contract is entirely about *when* i
 returns without raising) was verified separately on real hardware.
 """
 
+import sys
 import threading
 import pickle
 import time
+
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,6 +33,7 @@ from nemo_rl.distributed.refit_watchdog import (
     RefitAborted,
     RefitAbortWatchdog,
     is_refit_abort,
+    sync_stream_within,
 )
 
 
@@ -451,3 +455,73 @@ class TestBothTransportsCanBeHeldOpen:
             assert hold_at > guard_at, (
                 f"{method}: the hold must be INSIDE the RefitAbortWatchdog block"
             )
+
+
+class TestTheStreamWaitIsBounded:
+    """A CUDA sync that never returns is the one wedge the watchdog cannot break.
+
+    Aborting a communicator does not retire kernels already enqueued on a stream. Job
+    6485245: both policy workers parked in torch.cuda.synchronize() at
+    megatron_policy_worker.py:2940 for 1801s after their own abort had logged, while the
+    generation workers had already unwound and gone idle. The guarded block never exits,
+    so no exception translation and no `if guard.fired:` can ever run.
+    """
+
+    @staticmethod
+    def _fake_torch(monkeypatch, *, completes: bool):
+        """Stand in for torch.cuda, so this needs no GPU and no real stuck kernel."""
+        calls = {"synchronize": 0, "recorded": []}
+
+        class _Event:
+            def record(self, stream):
+                calls["recorded"].append(stream)
+
+            def query(self):
+                return completes
+
+        cuda = SimpleNamespace(
+            Event=_Event,
+            synchronize=lambda: calls.__setitem__(
+                "synchronize", calls["synchronize"] + 1
+            ),
+        )
+        monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
+        return calls
+
+    def test_work_that_never_retires_gives_up_instead_of_blocking(self, monkeypatch):
+        self._fake_torch(monkeypatch, completes=False)
+        started = time.monotonic()
+
+        with pytest.raises(RefitAborted, match="did not retire"):
+            sync_stream_within(object(), 0.3, "the bulk parameter transfer")
+
+        assert time.monotonic() - started < 5.0, "it must give up, not block"
+
+    def test_the_failure_names_what_was_waiting(self, monkeypatch):
+        """Two sites share this; the message has to say which one stalled."""
+        self._fake_torch(monkeypatch, completes=False)
+        with pytest.raises(RefitAborted, match="the misc broadcast"):
+            sync_stream_within(object(), 0.1, "the misc broadcast")
+
+    def test_it_is_recognised_as_an_abort_downstream(self, monkeypatch):
+        """It must reach the same handler as any other abort, incl. across vLLM's RPC."""
+        self._fake_torch(monkeypatch, completes=False)
+        with pytest.raises(RefitAborted) as caught:
+            sync_stream_within(object(), 0.1, "the bulk parameter transfer")
+        assert is_refit_abort(caught.value)
+        assert REFIT_ABORTED_TOKEN in str(caught.value)
+
+    def test_the_happy_path_still_ends_in_a_device_wide_synchronize(self, monkeypatch):
+        """Behaviour must be identical to before when nothing is wrong."""
+        calls = self._fake_torch(monkeypatch, completes=True)
+        sync_stream_within("a-stream", 30.0, "the bulk parameter transfer")
+        assert calls["synchronize"] == 1
+        assert calls["recorded"] == ["a-stream"]
+
+    @pytest.mark.parametrize("budget", [None, 0, -1.0])
+    def test_no_deadline_keeps_the_original_unbounded_wait(self, monkeypatch, budget):
+        """A run that configures no refit deadline behaves exactly as it did."""
+        calls = self._fake_torch(monkeypatch, completes=False)
+        sync_stream_within(object(), budget, "the bulk parameter transfer")
+        assert calls["synchronize"] == 1, "falls back to torch.cuda.synchronize()"
+        assert calls["recorded"] == [], "and records no event at all"
