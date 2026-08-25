@@ -32,6 +32,7 @@ from nemo_rl.algorithms.grpo import (
     AdvEstimatorConfig,
     AsyncGRPOConfig,
     GRPOConfig,
+    LegacyAsyncRLConfig,
     MasterConfig,
     RewardPenaltyConfig,
     RewardScalingConfig,
@@ -47,6 +48,7 @@ from nemo_rl.algorithms.grpo import (
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
     _validate_multimodal_dedup_capability,
+    _validate_generation_router_path,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
@@ -56,6 +58,7 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     setup,
     shutdown_environments,
+    shutdown_generation_router,
     validate,
 )
 from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
@@ -77,6 +80,7 @@ from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
+from nemo_rl.models.generation.generation_router import GenerationRouterConfig
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
@@ -113,6 +117,139 @@ def test_save_async_replay_buffer_checkpoint(tmp_path):
     replay_buffer.save_to_path.remote.assert_called_once_with(
         str(tmp_path / "replay_buffer.pt")
     )
+
+
+def test_legacy_generation_router_config_uses_shared_schema_without_mutation() -> None:
+    raw_async_rl = {
+        "generation_router": {
+            "enabled": True,
+            "backend_timeout_s": 321.0,
+        }
+    }
+    async_rl_config = LegacyAsyncRLConfig.model_validate(raw_async_rl)
+    master_config = MasterConfig.model_construct(async_rl=async_rl_config)
+
+    assert master_config.async_rl.generation_router == GenerationRouterConfig(
+        enabled=True, backend_timeout_s=321.0
+    )
+    assert raw_async_rl == {
+        "generation_router": {
+            "enabled": True,
+            "backend_timeout_s": 321.0,
+        }
+    }
+
+
+def test_legacy_generation_router_defaults_to_disabled_when_block_is_absent() -> None:
+    config = LegacyAsyncRLConfig().generation_router
+
+    assert config == GenerationRouterConfig(enabled=False)
+
+
+def test_legacy_generation_router_is_validated_at_config_parse_time() -> None:
+    with pytest.raises(ValueError, match="port_range_low"):
+        LegacyAsyncRLConfig.model_validate(
+            {
+                "generation_router": {
+                    "enabled": True,
+                    "port_range_low": 6099,
+                    "port_range_high": 6000,
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("enable_nemo_gym", "backend", "message"),
+    [
+        (False, "vllm", "requires the NeMo-Gym rollout path"),
+        (True, "trtllm", "requires policy.generation.backend='vllm'"),
+    ],
+)
+def test_enabled_generation_router_rejects_invalid_legacy_path(
+    enable_nemo_gym: bool, backend: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _validate_generation_router_path(
+            GenerationRouterConfig(enabled=True),
+            enable_nemo_gym=enable_nemo_gym,
+            generation_backend=backend,
+        )
+
+
+@pytest.mark.parametrize(
+    ("enable_nemo_gym", "backend", "message"),
+    [
+        (False, "vllm", "requires the NeMo-Gym rollout path"),
+        (True, "trtllm", "requires policy.generation.backend='vllm'"),
+    ],
+)
+def test_master_config_rejects_invalid_router_path_at_parse_time(
+    enable_nemo_gym: bool, backend: str, message: str
+) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    register_omegaconf_resolvers()
+    raw_config = OmegaConf.to_container(
+        load_config(repo_root / "examples/configs/grpo_math_1B.yaml"), resolve=True
+    )
+    raw_config["async_rl"] = {"generation_router": {"enabled": True}}
+    raw_config["env"]["should_use_nemo_gym"] = enable_nemo_gym
+    raw_config["policy"]["generation"]["backend"] = backend
+
+    with pytest.raises(ValueError, match=message):
+        MasterConfig.model_validate(raw_config)
+
+
+def test_optimized_recipe_enables_router_with_tail_safe_timeout() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    register_omegaconf_resolvers()
+    recipe = repo_root / (
+        "examples/configs/recipes/vlm/"
+        "vlm_grpo-nemotron-super-omni-120ba12b-32n4g-megatron-"
+        "tp2ep16cp1-async-gym.v1.yaml"
+    )
+    resolved = OmegaConf.to_container(load_config(recipe), resolve=True)
+    config = MasterConfig.model_validate(resolved)
+
+    assert config.async_rl.generation_router.enabled is True
+    assert config.async_rl.generation_router.backend_timeout_s == 1200.0
+    assert config.grpo.deduplicate_multimodal_data is True
+    assert config.grpo.debug_payload_metrics is False
+    assert config.policy["generation"]["vllm_kwargs"]["max_num_seqs"] == 64
+
+
+def test_disabled_generation_router_preserves_all_legacy_paths() -> None:
+    _validate_generation_router_path(
+        GenerationRouterConfig(enabled=False),
+        enable_nemo_gym=False,
+        generation_backend="megatron",
+    )
+
+
+def test_generation_router_handle_is_retained_until_explicit_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router_handle = MagicMock()
+    kill = MagicMock()
+    monkeypatch.setattr("nemo_rl.algorithms.grpo.ray.kill", kill)
+
+    # Merely holding the returned handle does not mutate or stop it; the launcher calls
+    # this only after environment teardown.
+    kill.assert_not_called()
+    shutdown_generation_router(router_handle)
+
+    kill.assert_called_once_with(router_handle)
+
+
+def test_generation_router_shutdown_is_noop_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kill = MagicMock()
+    monkeypatch.setattr("nemo_rl.algorithms.grpo.ray.kill", kill)
+
+    shutdown_generation_router(None)
+
+    kill.assert_not_called()
 
 
 @patch("nemo_rl.algorithms.grpo.ray")
@@ -2810,6 +2947,173 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         routed_experts_dtype="int16",
         use_fastokens=False,
     )
+
+
+def test_setup_routes_deferred_vllm_nemo_gym_through_single_url(
+    monkeypatch: pytest.MonkeyPatch, mock_grpo_components: dict[str, Any]
+) -> None:
+    """Guard the legacy deferred-vLLM wiring that previously passed raw URLs."""
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    class DummyLogger:
+        def log_hyperparams(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def log_metrics(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+    class DummyCheckpointer:
+        def get_latest_checkpoint_path(self) -> None:
+            return None
+
+        def load_training_info(self, _path: Any) -> None:
+            return None
+
+        def get_resume_paths(self, _path: Any) -> tuple[None, None]:
+            return None, None
+
+    class DummyLoader:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def __len__(self) -> int:
+            return 1
+
+    class DummyCluster:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+    class DummyPolicy:
+        def print_node_ip_and_gpu_id(self) -> None:
+            pass
+
+        def prepare_refit_info(self) -> dict[str, Any]:
+            return {}
+
+    vllm_load_and_start = MagicMock()
+    vllm_finish_generation = MagicMock()
+
+    class DummyDeferredVllmGeneration:
+        dp_openai_server_base_urls = [
+            "http://vllm-0.example/v1",
+            "http://vllm-1.example/v1",
+        ]
+        weight_synchronizer = None
+
+        def __init__(
+            self,
+            *,
+            cluster: Any,
+            config: Any,
+            defer_model_load: bool,
+        ) -> None:
+            assert defer_model_load is True
+
+        def load_and_start(self) -> None:
+            vllm_load_and_start()
+
+        def finish_generation(self) -> None:
+            vllm_finish_generation()
+
+        def prepare_refit_info(self, _state: dict[str, Any]) -> None:
+            pass
+
+    router_handle = MagicMock(name="generation_router_handle")
+    maybe_start_generation_router = MagicMock(
+        return_value=(["http://generation-router.example/v1"], router_handle)
+    )
+    nemo_gym_actor = object()
+    spinup_nemo_gym_actor = MagicMock(return_value=nemo_gym_actor)
+
+    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: DummyLogger())
+    monkeypatch.setattr(
+        grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
+    )
+    monkeypatch.setattr(
+        grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
+    )
+    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
+    monkeypatch.setattr(grpo_mod, "Policy", lambda *_args, **_kwargs: DummyPolicy())
+    monkeypatch.setattr(grpo_mod, "VllmGeneration", DummyDeferredVllmGeneration)
+    monkeypatch.setattr(grpo_mod, "normalize_vllm_refit_config", lambda _config: None)
+    monkeypatch.setattr(
+        grpo_mod, "configure_vllm_for_router_replay", lambda _config: None
+    )
+    monkeypatch.setattr(grpo_mod, "router_replay_enabled", lambda _config: False)
+    monkeypatch.setattr(
+        grpo_mod, "maybe_start_generation_router", maybe_start_generation_router
+    )
+    monkeypatch.setattr(grpo_mod, "spinup_nemo_gym_actor", spinup_nemo_gym_actor)
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy.update(
+        {
+            "model_name": "test-model",
+            "tokenizer": {"use_fastokens": False},
+            "dtensor_cfg": {"enabled": False},
+            "megatron_cfg": {
+                "enabled": False,
+                "pipeline_model_parallel_size": 1,
+            },
+            "generation": {
+                "backend": "vllm",
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
+                "val_temperature": 1.0,
+                "val_top_p": 1.0,
+                "val_top_k": None,
+                "vllm_cfg": {
+                    "async_engine": True,
+                    "expose_http_server": True,
+                    "precision": "bfloat16",
+                    "kv_cache_dtype": "auto",
+                },
+                "vllm_kwargs": {},
+                "colocated": {
+                    "enabled": True,
+                    "resources": {"gpus_per_node": None, "num_nodes": None},
+                },
+            },
+        }
+    )
+    master_config.env = {"should_use_nemo_gym": True}
+    router_config = GenerationRouterConfig(enabled=True, backend_timeout_s=1200.0)
+    master_config.async_rl = LegacyAsyncRLConfig(generation_router=router_config)
+    master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.cluster["gpus_per_node"] = 1
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 0
+
+    dataset = MagicMock()
+    dataset.__len__.return_value = 1
+    tokenizer = MagicMock()
+    result = grpo_mod.setup(master_config, tokenizer, dataset, None)
+
+    maybe_start_generation_router.assert_called_once_with(
+        backend_urls=[
+            "http://vllm-0.example/v1",
+            "http://vllm-1.example/v1",
+        ],
+        config=router_config,
+        health_managed=False,
+    )
+    spinup_nemo_gym_actor.assert_called_once_with(
+        env_configs=master_config.env,
+        base_urls=["http://generation-router.example/v1"],
+        model_name="test-model",
+        tokenizer=tokenizer,
+        enable_router_replay=False,
+        routed_experts_dtype="int16",
+        use_fastokens=False,
+    )
+    vllm_load_and_start.assert_called_once_with()
+    vllm_finish_generation.assert_called_once_with()
+    assert result[2] is nemo_gym_actor
+    assert result[-1] is router_handle
 
 
 def test_grpo_train_collects_generation_logger_and_seq_metrics(

@@ -37,6 +37,7 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     setup,
     shutdown_environments,
+    shutdown_generation_router,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
@@ -251,6 +252,7 @@ The validation set you pass in will directly be used for validation with no addi
             master_config,
             teacher_worker_groups,
             alias_to_group_alias,
+            generation_router,
         ) = setup(
             config,
             tokenizer,
@@ -351,6 +353,7 @@ The validation set you pass in will directly be used for validation with no addi
             )
     finally:
         shutdown_environments(task_to_env, val_task_to_env)
+        shutdown_generation_router(generation_router)
         try:
             policy_generation.shutdown()
         except Exception as error:

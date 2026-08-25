@@ -93,7 +93,7 @@ class PY_EXECUTABLES:
 #     [3000, 4000) Dynamo frontend/token-wrapper HTTP endpoints
 #     [4000, 4100) Dynamo worker system endpoints (node-local free-port selection)
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
-#   6000-6099    SingleController gen. router    (async_rl.generation_router.port_range_low/high;
+#   6000-6099    NeMo-Gym generation router      (async_rl.generation_router.port_range_low/high;
 #                                                 one fixed port per run — NeMo-Gym holds the
 #                                                 URL for the whole run and never re-resolves)
 #   7000-8999    vLLM engine rendezvous          (VLLM_PORT env var, 100-port spacing)

@@ -105,10 +105,11 @@ async_rl:
     max_restart_attempts_per_shard: 5
     min_healthy_shards: 1             # below this the run aborts
 
-  # NeMo-Gym-facing router in front of the generation fleet. Gym picks an endpoint by
-  # round-robin over a list fixed at process start and never fails over, so it is handed
-  # one NeMo-RL-owned URL instead and the routing decision moves next to generation_fleet_health.
-  # Only meaningful on the NeMo-Gym path; the native path calls generation over Ray.
+  # NeMo-Gym-facing router in front of the generation fleet. Gym deterministically
+  # hashes each session to one endpoint from a list fixed at process start and never
+  # fails over, so it is handed one NeMo-RL-owned URL instead and the routing decision
+  # moves next to generation_fleet_health. Only meaningful on the NeMo-Gym path; the
+  # native path calls generation over Ray.
   generation_router:
     enabled: false
     port_range_low: 6000              # distinct from Gym (5000-5999) and vLLM (7000-8999)

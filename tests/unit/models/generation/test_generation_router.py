@@ -14,10 +14,10 @@
 
 """The NeMo-RL-owned router that fronts the vLLM fleet for the NeMo-Gym path.
 
-Gym picks a policy endpoint by static round-robin over a list fixed at process start,
-never fails over, and retries a refused connection in an uncapped loop with no HTTP
-timeout. Handing it one NeMo-RL-owned URL moves the routing decision here, next to the
-fleet health that knows which shards are serving -- without changing Gym.
+Gym deterministically hashes each session to one policy endpoint from a list fixed at
+process start, never fails over, and retries a refused connection in an uncapped loop
+with no HTTP timeout. Handing it one NeMo-RL-owned URL moves the routing decision here,
+next to the fleet health that knows which shards are serving -- without changing Gym.
 
 Most of these run a real aiohttp server against real backends. A proxy is precisely the
 component that unit fakes flatter: header handling, streaming and status propagation only
@@ -25,11 +25,18 @@ misbehave over an actual socket.
 """
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import ClientSession, web
 
-from nemo_rl.models.generation.generation_router import GenerationRouterImpl
+from nemo_rl.models.generation import generation_router as router_module
+from nemo_rl.models.generation.generation_router import (
+    GenerationRouterConfig,
+    GenerationRouterImpl,
+    maybe_start_generation_router,
+)
 
 
 def _free_port() -> int:
@@ -118,6 +125,78 @@ class _Harness:
                 method, f"http://127.0.0.1:{self.port}{path}", data=body
             ) as response:
                 return response.status, await response.read(), dict(response.headers)
+
+
+class TestRouterStartup:
+    def test_disabled_returns_an_unmodified_copy_of_raw_urls(self) -> None:
+        raw_urls = ["http://a:1/v1", None, "http://b:2/v1"]
+
+        routed_urls, handle = maybe_start_generation_router(
+            backend_urls=raw_urls,
+            config=GenerationRouterConfig(enabled=False),
+            health_managed=False,
+        )
+
+        assert routed_urls == raw_urls
+        assert routed_urls is not raw_urls
+        assert raw_urls == ["http://a:1/v1", None, "http://b:2/v1"]
+        assert handle is None
+
+    def test_enabled_returns_one_router_url_and_retained_handle(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        raw_urls = ["http://a:1/v1", None, "http://b:2/v1"]
+        actor_handle = MagicMock()
+        base_url_ref = object()
+        actor_handle.base_url.remote.return_value = base_url_ref
+        actor_class = MagicMock()
+        actor_class.options.return_value.remote.return_value = actor_handle
+        monkeypatch.setattr(router_module, "GenerationRouterActor", actor_class)
+        monkeypatch.setattr(router_module, "_get_free_port_local", lambda *_: 6007)
+        monkeypatch.setattr(router_module, "_get_node_ip_local", lambda: "10.0.0.1")
+        monkeypatch.setattr(
+            router_module.ray,
+            "get_runtime_context",
+            lambda: SimpleNamespace(get_node_id=lambda: "a" * 56),
+        )
+        monkeypatch.setattr(
+            router_module.ray,
+            "get",
+            lambda value: "http://10.0.0.1:6007/v1" if value is base_url_ref else value,
+        )
+
+        config = GenerationRouterConfig(enabled=True)
+        config_before = config.model_dump()
+        routed_urls, handle = maybe_start_generation_router(
+            backend_urls=raw_urls,
+            config=config,
+            health_managed=False,
+        )
+
+        assert routed_urls == ["http://10.0.0.1:6007/v1"]
+        assert handle is actor_handle
+        assert raw_urls == ["http://a:1/v1", None, "http://b:2/v1"]
+        assert config.model_dump() == config_before
+        assert "generation_fleet_health.enabled=false" in capsys.readouterr().out
+        actor_class.options.return_value.remote.assert_called_once_with(
+            backend_urls=["http://a:1/v1", "http://b:2/v1"],
+            host="10.0.0.1",
+            port=6007,
+            backend_timeout_s=600.0,
+            connect_timeout_s=5.0,
+            no_healthy_backend_status=409,
+            health_managed=False,
+        )
+
+    def test_enabled_requires_an_http_backend(self) -> None:
+        with pytest.raises(ValueError, match="none were reported"):
+            maybe_start_generation_router(
+                backend_urls=[None],
+                config=GenerationRouterConfig(enabled=True),
+                health_managed=False,
+            )
 
 
 class TestEndpointSurface:
@@ -380,7 +459,7 @@ class TestBackendErrorHandling:
 
     def test_the_failing_backend_leaves_the_serving_set(self):
         """The reflex. Without it least-outstanding returns the corpse to inflight=0 and
-        picks it for every subsequent request -- worse than the round-robin replaced."""
+        picks it for every subsequent request -- worse than the sticky hash replaced."""
         wedged, healthy = _HangingBackend("wedged"), _Backend("healthy")
 
         async def _main():

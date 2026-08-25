@@ -100,6 +100,10 @@ from nemo_rl.experience.rollouts import (
     should_mask_flagged_samples,
 )
 from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
+from nemo_rl.models.generation.generation_router import (
+    GenerationRouterConfig,
+    maybe_start_generation_router,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
@@ -354,6 +358,38 @@ class GRPOLoggerConfig(LoggerConfig):
     num_val_samples_to_print: int  # number of val samples to print to stdout
 
 
+def _validate_generation_router_path(
+    config: GenerationRouterConfig,
+    *,
+    enable_nemo_gym: bool,
+    generation_backend: str,
+) -> None:
+    """Fail before cluster allocation when legacy routing cannot take effect."""
+    if not config.enabled:
+        return
+    if not enable_nemo_gym:
+        raise ValueError(
+            "async_rl.generation_router.enabled=true requires the NeMo-Gym rollout "
+            "path (env.should_use_nemo_gym=true); native rollouts do not use HTTP."
+        )
+    if generation_backend != "vllm":
+        raise ValueError(
+            "async_rl.generation_router.enabled=true on the legacy GRPO entrypoint "
+            "requires policy.generation.backend='vllm'; got "
+            f"{generation_backend!r}."
+        )
+
+
+class LegacyAsyncRLConfig(BaseModel, extra="allow"):
+    """Async-RL options consumed by the legacy GRPO entrypoint."""
+
+    # NeMo-Gym-facing HTTP router. Other async_rl keys remain accepted for config
+    # compatibility but are owned by the SingleController entrypoint.
+    generation_router: GenerationRouterConfig = Field(
+        default_factory=GenerationRouterConfig
+    )
+
+
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
@@ -366,6 +402,18 @@ class MasterConfig(BaseModel, extra="allow"):
     reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: Optional[DataPlaneConfig] = None
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
+    async_rl: LegacyAsyncRLConfig = Field(default_factory=LegacyAsyncRLConfig)
+
+    @model_validator(mode="after")
+    def _validate_legacy_generation_router_path(self) -> "MasterConfig":
+        """Reject router settings that the legacy entrypoint cannot consume."""
+        generation_config = self.policy.get("generation") or {}
+        _validate_generation_router_path(
+            self.async_rl.generation_router,
+            enable_nemo_gym=bool(self.env.get("should_use_nemo_gym")),
+            generation_backend=generation_config.get("backend", ""),
+        )
+        return self
 
 
 # ===============================================================================
@@ -431,6 +479,19 @@ def shutdown_environments(
                     print(f"Error stopping environment {task_name}: {kill_error}")
 
 
+def shutdown_generation_router(
+    generation_router: Optional["ray.actor.ActorHandle"],
+) -> None:
+    """Stop the NeMo-Gym router after environments have drained their HTTP work."""
+    if generation_router is None:
+        return
+    print("🛑 Shutting down generation router...")
+    try:
+        ray.kill(generation_router)
+    except Exception as shutdown_error:
+        print(f"Error stopping generation router: {shutdown_error}")
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -452,15 +513,17 @@ def setup(
     MasterConfig,
     dict[str, Any],
     dict[str, str],
+    Optional["ray.actor.ActorHandle"],
 ]:
     """Main entry point for running GRPO algorithm.
 
     Returns:
-        A 13-tuple, in order:
+        A 14-tuple, in order:
             policy, policy_generation, nemo_gym (the NeMo-Gym env actor, or None
             when not enabled), cluster, dataloader, val_dataloader, loss_fn,
             logger, checkpointer, grpo_save_state, master_config,
-            teacher_worker_groups, alias_to_group_alias.
+            teacher_worker_groups, alias_to_group_alias, generation_router. The
+            final handle is retained by the entrypoint until rollout teardown.
     """
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
@@ -475,6 +538,7 @@ def setup(
     logger_config = master_config.logger
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
+    generation_router_config = master_config.async_rl.generation_router
 
     checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
@@ -500,6 +564,12 @@ def setup(
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
+    enable_nemo_gym = should_use_nemo_gym(master_config)
+    _validate_generation_router_path(
+        generation_router_config,
+        enable_nemo_gym=enable_nemo_gym,
+        generation_backend=generation_config["backend"],
+    )
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -730,11 +800,11 @@ def setup(
 
     # NeMo Gym is initialized inside setup() (rather than by the caller) so its
     # spinup can overlap with vLLM model loading via deferred model load.
-    enable_nemo_gym = should_use_nemo_gym(master_config)
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
     nemo_gym_actor = None
+    generation_router = None
 
     def _spinup_nemo_gym(base_urls, model_name):
         """Spin up the NeMo Gym actor against the given generation server URLs."""
@@ -1364,6 +1434,14 @@ def setup(
                 f"{deferred_vllm.dp_openai_server_base_urls}",
                 flush=True,
             )
+            # Start before Gym is submitted so it receives one stable NeMo-RL URL.
+            # Legacy GRPO has no fleet-health pump; health-blind least-outstanding
+            # routing remains valid and the shared factory warns about no failover.
+            nemo_gym_base_urls, generation_router = maybe_start_generation_router(
+                backend_urls=deferred_vllm.dp_openai_server_base_urls,
+                config=generation_router_config,
+                health_managed=False,
+            )
 
             def init_vllm_deferred():
                 """Complete the deferred vLLM model load started above."""
@@ -1375,7 +1453,7 @@ def setup(
             def init_nemo_gym():
                 """Spin up NeMo Gym servers with the pre-assigned vLLM URLs."""
                 return _spinup_nemo_gym(
-                    deferred_vllm.dp_openai_server_base_urls,
+                    nemo_gym_base_urls,
                     generation_config["model_name"],
                 )
 
@@ -1688,6 +1766,7 @@ def setup(
         master_config,
         teacher_worker_groups,
         alias_to_group_alias,
+        generation_router,
     )
 
 

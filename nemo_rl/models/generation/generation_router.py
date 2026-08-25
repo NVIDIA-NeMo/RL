@@ -14,15 +14,15 @@
 
 """A NeMo-RL-owned HTTP router in front of the vLLM generation fleet.
 
-NeMo-Gym picks a policy endpoint by static round-robin over a list fixed at process
-start, with no health input and no failover. A dead vLLM endpoint therefore keeps
-receiving roughly 1/N of new rollouts for the rest of the run, and Gym retries a refused
-connection in an uncapped loop with no HTTP timeout.
+NeMo-Gym deterministically hashes each session to one policy endpoint from a list fixed
+at process start, with no health input and no failover. A dead vLLM endpoint therefore
+keeps receiving the sessions mapped to it for the rest of the run, and Gym retries a
+refused connection in an uncapped loop with no HTTP timeout.
 
 Rather than change Gym, hand it a single URL that NeMo-RL owns. Gym's
-``VLLMModelConfig.base_url`` accepts one string, so its round-robin becomes a no-op and
-the routing decision moves here, next to the fleet health that already knows which shards
-are serving.
+``VLLMModelConfig.base_url`` accepts one string, so deterministic session hashing has
+one possible target and the routing decision moves here, next to the fleet health that
+already knows which shards are serving.
 
 Two properties make this safe to put in Gym's critical path:
 
@@ -37,10 +37,11 @@ Deliberately *not* a redirect. Handing Gym a 307 would put its socket back on a 
 endpoint directly, so a backend dying mid-request would drop it into the same uncapped
 retry loop this exists to avoid.
 
-One thing this trades away: Gym's selection is *sticky* round-robin -- a session keeps its
-backend -- so per-request least-outstanding gives up prefix-cache affinity across the
-turns of a multi-turn rollout. That is a real cost, not purely a defect being fixed, and
-it is worth measuring before enabling this on a multi-turn workload.
+One thing this trades away: Gym's deterministic session hashing is *sticky* -- a
+session keeps its backend -- so per-request least-outstanding gives up prefix-cache
+affinity across the turns of a multi-turn rollout. That is a real cost, not purely a
+defect being fixed, and it is worth measuring before enabling this on a multi-turn
+workload.
 """
 
 from __future__ import annotations
@@ -50,6 +51,13 @@ import threading
 from typing import Any, Optional
 
 import ray
+from pydantic import BaseModel, PositiveFloat, PositiveInt, model_validator
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+from nemo_rl.distributed.virtual_cluster import (
+    _get_free_port_local,
+    _get_node_ip_local,
+)
 
 # Hop-by-hop headers are per-connection and must not be forwarded; passing Host through
 # would also make the backend see the router's address.
@@ -60,6 +68,60 @@ _SKIPPED_RESPONSE_HEADERS = frozenset(
 # Body chunk size for the streaming pass-through. Large enough that a long completion
 # does not cost thousands of iterations, small enough not to buffer a whole response.
 _STREAM_CHUNK_BYTES = 64 * 1024
+# HTTP statuses NeMo-Gym retries internally (nemo_gym/openai_utils.py). For the
+# rate-limit subset it raises its own retry ceiling on each attempt, so answering with
+# one of these is an unbounded loop rather than a bounded one.
+_GYM_RETRY_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 520})
+
+
+class GenerationRouterConfig(BaseModel, extra="allow"):
+    """NeMo-RL-owned HTTP router placed in front of vLLM for NeMo-Gym."""
+
+    # When true, NeMo-Gym receives the router's URL instead of the raw backend URLs.
+    enabled: bool = False
+    # Deliberately distinct from Gym (5000-5999) and vLLM (7000-8999).
+    port_range_low: PositiveInt = 6000
+    port_range_high: PositiveInt = 6099
+    # Router -> backend deadline, covering the whole generation.
+    backend_timeout_s: PositiveFloat = 600.0
+    # TCP handshake deadline, separate from the whole-generation deadline.
+    connect_timeout_s: PositiveFloat = 5.0
+    # Status returned when no shard is eligible.
+    no_healthy_backend_status: PositiveInt = 409
+
+    @model_validator(mode="after")
+    def _check_port_range(self) -> "GenerationRouterConfig":
+        if self.port_range_low >= self.port_range_high:
+            raise ValueError(
+                f"async_rl.generation_router.port_range_low ({self.port_range_low}) must be "
+                f"< port_range_high ({self.port_range_high}). Transposed, this surfaces "
+                "at setup as 'ValueError: empty range for randrange()' from deep inside "
+                "port allocation, far from the typo."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_connect_timeout_fits(self) -> "GenerationRouterConfig":
+        if self.connect_timeout_s > self.backend_timeout_s:
+            raise ValueError(
+                f"async_rl.generation_router.connect_timeout_s ({self.connect_timeout_s}) "
+                f"exceeds backend_timeout_s ({self.backend_timeout_s}), so the total "
+                "deadline would expire before the handshake one could ever fire."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_status_is_not_retried_by_gym(self) -> "GenerationRouterConfig":
+        if self.no_healthy_backend_status in _GYM_RETRY_STATUSES:
+            raise ValueError(
+                "async_rl.generation_router.no_healthy_backend_status="
+                f"{self.no_healthy_backend_status} is a status NeMo-Gym retries "
+                f"internally ({sorted(_GYM_RETRY_STATUSES)}). For the rate-limit codes "
+                "Gym raises its own retry ceiling on each attempt, so returning one "
+                "would make it retry forever -- exactly the hang the router exists to "
+                "prevent. Use a 4xx outside that set, e.g. 409."
+            )
+        return self
 
 
 class GenerationRouterImpl:
@@ -253,7 +315,7 @@ class GenerationRouterImpl:
             # have. The handshake is the opposite: a connect to a local vLLM either
             # completes in milliseconds or never will, so giving it the full budget just
             # means a black-holed SYN (node gone, no RST) parks the rollout for the
-            # whole 600s.
+            # whole configured backend deadline.
             timeout=ClientTimeout(
                 total=self._backend_timeout_s, sock_connect=self._connect_timeout_s
             ),
@@ -365,3 +427,75 @@ class GenerationRouterActor(GenerationRouterImpl):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.serve_in_background()
+
+
+def maybe_start_generation_router(
+    *,
+    backend_urls: list[Optional[str]],
+    config: GenerationRouterConfig,
+    health_managed: bool,
+) -> tuple[list[Optional[str]], Optional[ray.actor.ActorHandle[GenerationRouterImpl]]]:
+    """Optionally front generation backends with one stable NeMo-Gym URL.
+
+    Args:
+        backend_urls: Per-shard OpenAI server URLs reserved by generation.
+        config: Validated ``async_rl.generation_router`` configuration.
+        health_managed: Whether fleet health will push serving-set updates.
+
+    Returns:
+        A copy of the raw URLs and ``None`` when disabled; otherwise the router's
+        single URL and the actor handle that the caller must retain for the run.
+
+    Raises:
+        ValueError: If routing is enabled but generation exposes no HTTP backend.
+    """
+    raw_backend_urls = list(backend_urls)
+    if not config.enabled:
+        return raw_backend_urls, None
+
+    if not health_managed:
+        # This is a supported performance-only mode: least-outstanding routing and
+        # backend deadlines work, but no component can re-admit a quarantined shard.
+        print(
+            "⚠️  async_rl.generation_router.enabled=true with "
+            "generation_fleet_health.enabled=false: the router will never receive "
+            "a serving-set update, so it cannot route around a dead shard. "
+            "Least-outstanding routing and backend deadlines remain active, but "
+            "failover requires fleet health.",
+            flush=True,
+        )
+
+    active_backend_urls = [url for url in raw_backend_urls if url]
+    if not active_backend_urls:
+        raise ValueError(
+            "async_rl.generation_router.enabled=true requires generation backends "
+            "that expose OpenAI-compatible servers; none were reported. This needs "
+            "the vllm backend with async_engine and expose_http_server enabled."
+        )
+
+    # Reserve once and pass the port into the actor so a Ray restart rebinds the same
+    # address. NeMo-Gym keeps this URL for the full run and never re-resolves it.
+    port = _get_free_port_local(config.port_range_low, config.port_range_high)
+    router = GenerationRouterActor.options(  # type: ignore[attr-defined]
+        scheduling_strategy=NodeAffinitySchedulingStrategy(
+            node_id=ray.get_runtime_context().get_node_id(), soft=False
+        )
+    ).remote(
+        backend_urls=active_backend_urls,
+        host=_get_node_ip_local(),
+        port=port,
+        backend_timeout_s=config.backend_timeout_s,
+        connect_timeout_s=config.connect_timeout_s,
+        no_healthy_backend_status=config.no_healthy_backend_status,
+        # Without health pushes, reflexively dropping a backend would retire it
+        # permanently after one transient error.
+        health_managed=health_managed,
+    )
+    # Resolve now so setup fails before Gym starts if actor construction or binding
+    # failed. GenerationRouterImpl binds synchronously during actor initialization.
+    base_url = ray.get(router.base_url.remote())
+    print(
+        f"📡 Policy router fronting {len(active_backend_urls)} backend(s) at {base_url}",
+        flush=True,
+    )
+    return [base_url], router

@@ -29,7 +29,6 @@ from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
 import ray
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -57,8 +56,6 @@ from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
-    _get_free_port_local,
-    _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
@@ -74,8 +71,8 @@ from nemo_rl.models.generation.fleet_health import (
     HealthyShardSelector,
 )
 from nemo_rl.models.generation.generation_router import (
-    GenerationRouterActor,
     GenerationRouterImpl,
+    maybe_start_generation_router,
 )
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
@@ -121,8 +118,8 @@ class SingleControllerActorArgs:
     # probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
     # None unless async_rl.generation_router is enabled; the SingleController pushes the
-    # serving backend set to it. Parameterized with the Impl class because the decorated
-    # GenerationRouterActor name is an ActorClass instance, not a type.
+    # serving backend set to it. Parameterized with the implementation class because
+    # the decorated Ray actor name is an ActorClass instance, not a type.
     generation_router: Optional[ray.actor.ActorHandle[GenerationRouterImpl]] = None
 
 
@@ -429,65 +426,6 @@ def _shard_base_urls(generation: Any) -> Optional[list[Optional[str]]]:
     return urls
 
 
-def _maybe_start_generation_router(generation: Any, master_config: MasterConfig) -> Any:
-    """Start the NeMo-Gym-facing router, if enabled.
-
-    Returns:
-        The router actor handle, or None when the router is disabled.
-    """
-    router_config = master_config.async_rl.generation_router
-    if not router_config.enabled:
-        return None
-
-    if not master_config.async_rl.generation_fleet_health.enabled:
-        # Legitimate, but the operator should know what they are not getting: nothing
-        # ever calls set_serving_backends, so the router stays health-blind for the run.
-        # It still delivers the stable URL Gym never re-resolves, a backend deadline Gym
-        # sets nowhere, and least-outstanding balancing -- just no failover.
-        print(
-            "⚠️  async_rl.generation_router.enabled=true with generation_fleet_health.enabled=false: "
-            "the router will never receive a serving-set update, so it cannot route "
-            "around a dead shard. Enable async_rl.generation_fleet_health for failover.",
-            flush=True,
-        )
-
-    backend_urls = [url for url in (generation.dp_openai_server_base_urls or []) if url]
-    if not backend_urls:
-        raise ValueError(
-            "async_rl.generation_router.enabled=true requires generation backends that "
-            "expose OpenAI-compatible servers; none were reported. This needs the vllm "
-            "backend with async_engine and expose_http_server enabled."
-        )
-
-    # Reserved once and passed in, so Ray recreating a restarted actor rebinds the same
-    # address. NeMo-Gym holds this URL for the life of the run and never re-resolves it.
-    port = _get_free_port_local(
-        router_config.port_range_low, router_config.port_range_high
-    )
-    router = GenerationRouterActor.options(  # type: ignore[attr-defined]
-        scheduling_strategy=NodeAffinitySchedulingStrategy(
-            node_id=ray.get_runtime_context().get_node_id(), soft=False
-        )
-    ).remote(
-        backend_urls=backend_urls,
-        host=_get_node_ip_local(),
-        port=port,
-        backend_timeout_s=router_config.backend_timeout_s,
-        connect_timeout_s=router_config.connect_timeout_s,
-        no_healthy_backend_status=router_config.no_healthy_backend_status,
-        # Only a monitor-driven run ever pushes membership, and the router's reflex drop
-        # of a failing backend is only safe because a later push restores it. Without
-        # one, arming the reflex would retire backends permanently.
-        health_managed=master_config.async_rl.generation_fleet_health.enabled,
-    )
-    # Resolve the URL now so the driver fails here rather than inside Gym if the actor
-    # could not start. The router binds its socket inside __init__, so a port conflict
-    # fails actor construction and surfaces here with the port in the traceback.
-    base_url = ray.get(router.base_url.remote())
-    print(f"📡 Policy router fronting {len(backend_urls)} backend(s) at {base_url}")
-    return router
-
-
 def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
     """Translate ``async_rl.rollout_failure`` into the rollout layer's policy object."""
     failure_config = master_config.async_rl.rollout_failure
@@ -685,18 +623,18 @@ def setup_single_controller(
         )
         defer_generation_model_load = True
         # Before the Gym task is built, so Gym can be handed the router's single URL.
-        generation_router = _maybe_start_generation_router(generation, master_config)
+        nemo_gym_base_urls, generation_router = maybe_start_generation_router(
+            backend_urls=generation.dp_openai_server_base_urls,
+            config=master_config.async_rl.generation_router,
+            health_managed=master_config.async_rl.generation_fleet_health.enabled,
+        )
         # add nemo_gym spinup task
         build_tasks["nemo_gym"] = partial(
             _spinup_gym,
             master_config=master_config,
             # The whole point of the router: Gym holds one NeMo-RL-owned URL and
             # never has to fail over, which is the thing it cannot do.
-            base_urls=(
-                [ray.get(generation_router.base_url.remote())]
-                if generation_router is not None
-                else generation.dp_openai_server_base_urls
-            ),
+            base_urls=nemo_gym_base_urls,
             tokenizer=tokenizer,
         )
 

@@ -24,6 +24,7 @@ from nemo_rl.algorithms.grpo import (
     grpo_train,
     setup,
     shutdown_environments,
+    shutdown_generation_router,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
@@ -164,6 +165,7 @@ def main() -> None:
             master_config,
             teacher_worker_groups,
             alias_to_group_alias,
+            generation_router,
         ) = setup(
             config,
             tokenizer,
@@ -251,6 +253,7 @@ def main() -> None:
                 )
     finally:
         shutdown_environments(task_to_env, val_task_to_env)
+        shutdown_generation_router(generation_router)
         try:
             policy_generation.shutdown()
         except Exception as error:

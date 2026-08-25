@@ -125,6 +125,7 @@ def main() -> None:
             master_config,
             teacher_worker_groups,
             alias_to_group_alias,
+            _generation_router,
         ) = setup(config, tokenizer, dataset, val_dataset, processor=processor)
 
     rl_init_timer.record("total", time.perf_counter() - main_start)
