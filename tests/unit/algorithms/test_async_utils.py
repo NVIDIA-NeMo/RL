@@ -1185,6 +1185,7 @@ class TestAsyncTrajectoryCollector:
         master_config.grpo.async_grpo.max_generation_failures = max_generation_failures
         if replay_buffer is None:
             replay_buffer = mock.MagicMock()
+            replay_buffer.get_held_task_indices.remote.return_value = []
 
         return collector_cls(
             policy_generation=mock_generation,
@@ -1469,8 +1470,11 @@ class TestAsyncTrajectoryCollector:
         assert evicted["frontier_aligned"] is False
         assert evicted["base_ordinal"] is None
 
-    def test_get_checkpoint_state_omits_pending_on_frontier_snapshots(self):
+    def test_get_checkpoint_state_omits_pending_on_frontier_snapshots(
+        self, monkeypatch
+    ):
         """One call returns the cursor/pending pair; pending only on fallback."""
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda ref: ref)
         collector = self.create_local_collector(next_nemo_gym_task_index=4)
         collector._dataloader_snapshots.append((0, {"pos": 0}))
         collector._pending_batch = self.create_mock_batch(2)
@@ -1502,7 +1506,7 @@ class TestAsyncTrajectoryCollector:
         assert _stamped_task_indices(unstamped) == []
         assert _stamped_task_indices(no_rows) == []
 
-    def test_checkpoint_cut_lowered_by_outstanding_ordinals(self):
+    def test_checkpoint_cut_lowered_by_outstanding_ordinals(self, monkeypatch):
         """A target refilled past another target's in-flight groups must not
         strand them: 24 prompts in 8-batches, target 0 lost {3..7} to a
         tolerated failure and was refilled with {16..20}; training it moved
@@ -1510,6 +1514,7 @@ class TestAsyncTrajectoryCollector:
         The checkpoint must cut at 8 — not 21 — or those never-failed
         prompts sit below the resume base and are silently lost.
         """
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda ref: ref)
         collector = self.create_local_collector()
         collector._dataloader_snapshots.extend(
             [(0, {"pos": 0}), (8, {"pos": 1}), (16, {"pos": 2})]
@@ -1531,6 +1536,32 @@ class TestAsyncTrajectoryCollector:
         collector._outstanding_task_indices = set()
         idle = collector.get_checkpoint_state(21)
         assert idle["dataloader"]["frontier_ordinal"] == 21
+
+        # Buffered-but-untrained groups below the frontier lower the cut
+        # too: their only record is the buffer, which a
+        # load_replay_buffer=false resume discards. Here target 1's {8..12}
+        # completed (left the outstanding set) while {13..15} still run.
+        collector._outstanding_task_indices = {13, 14, 15}
+        collector.replay_buffer.get_held_task_indices.remote.return_value = [
+            8,
+            9,
+            10,
+            11,
+            12,
+        ]
+        partially_buffered = collector.get_checkpoint_state(21)
+        assert partially_buffered["dataloader"]["frontier_ordinal"] == 8
+        assert partially_buffered["dataloader"]["base_ordinal"] == 8
+
+        # Healthy buffer contents (at/above the frontier) change nothing.
+        collector._outstanding_task_indices = set()
+        collector.replay_buffer.get_held_task_indices.remote.return_value = [
+            21,
+            22,
+            23,
+        ]
+        healthy_buffered = collector.get_checkpoint_state(21)
+        assert healthy_buffered["dataloader"]["frontier_ordinal"] == 21
 
     def test_failure_interleaving_resume_regenerates_stranded_window(self):
         """Resume from a lowered cut regenerates exactly what was lost.
@@ -1556,6 +1587,29 @@ class TestAsyncTrajectoryCollector:
         )
 
         assert self._ordinals(stream) == [8, 9, 10, 13, 14, 15, 21, 22, 23]
+
+    def test_lowered_cut_resume_without_buffer_regenerates_buffered_window(self):
+        """load_replay_buffer=false on a cut-lowered checkpoint.
+
+        Cut = 8 (lowered to the buffered-untrained minimum), no retained set
+        (the buffer was discarded), covered = trained {16..20} only. The
+        whole [8, 16) window must regenerate — including {8..12}, whose
+        finished rollouts were thrown away with the buffer.
+        """
+        batches = [self.create_mock_batch(8) for _ in range(3)]
+        phase_a = self.create_local_collector()
+        self._run_loop_collecting(phase_a, self._FakeStatefulLoader(batches))
+
+        resumed = self.create_local_collector(
+            next_nemo_gym_task_index=8,
+            resume_frontier_ordinal=8,
+            resume_covered_task_indices=[16, 17, 18, 19, 20],
+        )
+        stream = self._run_loop_collecting(
+            resumed, self._FakeStatefulLoader(batches, start=1)
+        )
+
+        assert self._ordinals(stream) == list(range(8, 16)) + [21, 22, 23]
 
     def test_process_batch_tracks_dispatched_outstanding(self, monkeypatch):
         """Dispatch adds stamped group ordinals; a failed start removes them."""
@@ -1682,6 +1736,15 @@ class TestAsyncTrajectoryCollector:
             self._outer = outer
 
         @property
+        def get_held_task_indices(self):
+            class _HeldRemote:
+                @staticmethod
+                def remote():
+                    return []
+
+            return _HeldRemote
+
+        @property
         def add(self):
             outer = self._outer
 
@@ -1718,6 +1781,7 @@ class TestAsyncTrajectoryCollector:
         )
         collector.running = True
         collector._outstanding_task_indices = {5, 6}
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda ref: ref)
         monkeypatch.setattr(
             trajectory_collector_mod,
             "run_async_multi_turn_rollout_groups",

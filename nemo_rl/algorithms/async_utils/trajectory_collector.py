@@ -627,15 +627,18 @@ class AsyncTrajectoryCollector:
         be dead weight in every frontier checkpoint.
 
         The snapshot is taken at the conservative **cut** — the minimum of
-        the trained frontier and the lowest ordinal still out with a rollout
-        worker. Normally every outstanding ordinal is at or above the
-        frontier and the cut equals it; when a target is refilled from later
-        prompts (after a tolerated generation failure, or when gap-filling an
-        incomplete target restored from a checkpoint), training it can
-        advance past another target's in-flight groups, and cutting at the
-        frontier would strand those prompts. Cutting below the frontier
-        instead re-yields a window that includes already-trained prompts;
-        the driver persists those trained ordinals in the checkpoint
+        the trained frontier, the lowest ordinal still out with a rollout
+        worker, and the lowest ordinal held in the replay buffer (buffered-
+        but-untrained groups are covered only by the buffer, which a
+        ``load_replay_buffer=false`` resume discards). Normally everything
+        in flight or buffered sits at or above the frontier and the cut
+        equals it; when a target is refilled from later prompts (after a
+        tolerated generation failure, or when gap-filling an incomplete
+        target restored from a checkpoint), training it can advance past
+        another target's in-flight groups, and cutting at the frontier
+        would strand those prompts. Cutting below the frontier instead
+        re-yields a window that includes already-trained prompts; the
+        driver persists those trained ordinals in the checkpoint
         (``TRAINED_TASK_INDICES_KEY``) so the resume covers them like
         retained groups — nothing is skipped and nothing is re-trained.
 
@@ -647,18 +650,28 @@ class AsyncTrajectoryCollector:
         """
         with self._outstanding_lock:
             outstanding_min = min(self._outstanding_task_indices, default=None)
+        # Buffered-but-untrained groups are covered only by the replay
+        # buffer, and checkpointing.load_replay_buffer=false discards it on
+        # resume — so the cut must not sit above them either. Read AFTER the
+        # outstanding set: a group leaves that set only once its buffer add
+        # has succeeded, so between the two reads every dispatched group is
+        # visible to at least one of them.
+        held_task_indices = ray.get(self.replay_buffer.get_held_task_indices.remote())
+        buffered_min = min(held_task_indices, default=None)
         cut = frontier_ordinal
-        if outstanding_min is not None and outstanding_min < cut:
-            cut = outstanding_min
+        for candidate in (outstanding_min, buffered_min):
+            if candidate is not None and candidate < cut:
+                cut = candidate
+        if cut < frontier_ordinal:
             print(
                 f"⚠️ Checkpoint cut lowered from trained frontier "
                 f"{frontier_ordinal} to {cut}: ordinals below the frontier "
-                "are still in flight (a gap-filled target was refilled from "
-                "later prompts — after a tolerated generation failure, or "
-                "when resuming with an incomplete restored target). A resume "
-                "from this checkpoint regenerates the window instead of "
-                "skipping it; trained prompts above the cut are persisted in "
-                "rollouts.pt and stay covered."
+                "are still in flight or buffered-untrained (a gap-filled "
+                "target was refilled from later prompts — after a tolerated "
+                "generation failure, or when resuming with an incomplete "
+                "restored target). A resume from this checkpoint regenerates "
+                "the window instead of skipping it; trained prompts above "
+                "the cut are persisted in rollouts.pt and stay covered."
             )
         with self._pending_lock:
             dataloader_snapshot = self.get_checkpoint_dataloader_state(cut)
@@ -1410,13 +1423,12 @@ class AsyncTrajectoryCollector:
                 if status == "success":
                     buffered_group_indices.add(rollout_result.group_index)
                     if group_task_index is not None:
-                        # Buffered groups are checkpoint-covered when the
-                        # buffer is restored (load_replay_buffer=true, the
-                        # default): they no longer hold the checkpoint cut
-                        # down. With load_replay_buffer=false, a buffered
-                        # group below a lowered cut is lost on resume — a
-                        # known corner of that opt-out, documented in the
-                        # async-grpo guide.
+                        # Leaving the outstanding set only moves this
+                        # ordinal's checkpoint coverage from "in flight" to
+                        # "buffered": get_checkpoint_state also queries the
+                        # buffer's held ordinals when computing the cut, so
+                        # buffered-untrained groups stay protected even for
+                        # load_replay_buffer=false resumes.
                         with self._outstanding_lock:
                             self._outstanding_task_indices.discard(
                                 int(group_task_index)

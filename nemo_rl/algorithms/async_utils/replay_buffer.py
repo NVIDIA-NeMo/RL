@@ -327,6 +327,25 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         with self._lock:
             return len(self.trajectories)
 
+    def get_held_task_indices(self) -> list[int]:
+        """Ordinals of every prompt group currently held in the buffer.
+
+        Queried at checkpoint time: sampling removes trained groups, so
+        everything held here is buffered-but-untrained. Under target
+        interleaving with partial completion, some of these ordinals sit
+        below the trained frontier and the buffer is their only record — the
+        checkpoint cut must not sit above them, or a resume with
+        ``checkpointing.load_replay_buffer=false`` (which discards the
+        buffer) would never re-yield them.
+        """
+        with self._lock:
+            return sorted(
+                int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
+                for trajectory in self.trajectories
+                if isinstance(trajectory, dict)
+                and trajectory.get(NEMO_GYM_TASK_INDEX_KEY) is not None
+            )
+
     def clear(self) -> None:
         """Clear the buffer."""
         with self._lock:
