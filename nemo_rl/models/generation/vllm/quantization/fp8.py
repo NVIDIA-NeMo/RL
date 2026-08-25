@@ -501,7 +501,7 @@ def load_weights(weights, model_runner):
             # FP8 + scale entries would have nowhere to load. Pass the grouped
             # bf16 slab through instead; vLLM's fused expert mapping loads it
             # directly, same as a bf16 refit.
-            experts_module = _get_module_from_param_name(model, k)
+            experts_module = get_module_from_param_name(model, k)
             if (
                 isinstance(experts_module, RoutedExperts)
                 and experts_module.w13_weight.dtype == torch.float8_e4m3fn

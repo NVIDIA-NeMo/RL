@@ -328,8 +328,8 @@ no-build-isolation-package = [
   "fast-hadamard-transform",
   "deep_gemm",
   "deep_ep",
-  "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
-  "tensorrt-llm",             # custom PEP 517 backend calls build-custom-trtllm.sh; needs torch/CUDA from main venv
+  "nv-grouped-gemm",         # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
+  "tensorrt-llm",            # custom PEP 517 backend calls build-custom-trtllm.sh; needs torch/CUDA from main venv
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd

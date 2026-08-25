@@ -662,7 +662,7 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
     # Pass-through is also what a failed lookup produces, so pin that the
     # bf16 RoutedExperts was actually resolved.
     assert isinstance(
-        fp8._get_module_from_param_name(
+        fp8.get_module_from_param_name(
             model, f"{layers_prefix}.0.mlp.experts.gate_up_proj"
         ),
         fp8.RoutedExperts,

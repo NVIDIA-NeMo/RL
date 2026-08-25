@@ -588,7 +588,9 @@ def _patch_vllm_moe_routed_experts_capture(logger) -> None:
             "model_executor/layers/fused_moe/runner/moe_runner.py"
         )
     except RuntimeError:
-        logger.warning("Could not locate moe_runner.py for routed-experts capture patch.")
+        logger.warning(
+            "Could not locate moe_runner.py for routed-experts capture patch."
+        )
         return
 
     marker = "NeMo-RL patch (routed-experts capture for router replay)"

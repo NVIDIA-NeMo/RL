@@ -731,11 +731,9 @@ def test_main_worker_accepts_nvfp4_pertoken_over_framework_defaults():
     from nemo_rl.models.generation.vllm import vllm_worker
     from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
         DEFAULT_NVFP4_IGNORE,
-        build_nvfp4_pertoken_hf_quant_config,
-    )
-    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
         NVFP4_PER_TOKEN_METHOD,
         NvFp4PerTokenConfig,
+        build_nvfp4_pertoken_hf_quant_config,
     )
 
     llm_kwargs = {
@@ -785,8 +783,6 @@ def test_nvfp4_pertoken_rejects_conflicting_engine_kwargs(llm_kwargs):
     pytest.importorskip("vllm")
     from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
         DEFAULT_NVFP4_IGNORE,
-    )
-    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
         configure_nvfp4_pertoken_engine_kwargs,
     )
 
