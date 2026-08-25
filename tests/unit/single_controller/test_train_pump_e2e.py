@@ -199,6 +199,8 @@ class _RecordingLogger:
         metrics: dict[str, Any],
         step: int,
         prefix: str | None = "",
+        step_metric: str | None = None,
+        step_finished: bool = False,
     ) -> None:
         ray.get(
             self._log.record.remote(
