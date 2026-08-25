@@ -134,6 +134,18 @@ def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -
     vllm_kwargs["hf_overrides"] = merged_hf_overrides
 
 
+def _log_effective_quantization_ignore_patterns(
+    vllm_cfg: dict[str, Any], vllm_kwargs: dict[str, Any]
+) -> None:
+    if not vllm_cfg.get("quantization_ignore_patterns"):
+        return
+
+    effective_ignore = vllm_kwargs["hf_overrides"]["quantization_config"].get(
+        "ignore", []
+    )
+    print(f"NRL_MXFP8_EFFECTIVE_IGNORE={effective_ignore}")
+
+
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
     def __repr__(self) -> str:
@@ -596,11 +608,7 @@ class BaseVllmGenerationWorker:
             # Text-only runs additionally set generation.vllm_kwargs.language_model_only
             # in the recipe YAML to skip vLLM's multimodal preflight.
 
-        if self.cfg["vllm_cfg"].get("quantization_ignore_patterns"):
-            effective_ignore = vllm_kwargs["hf_overrides"]["quantization_config"].get(
-                "ignore", []
-            )
-            print(f"NRL_MXFP8_EFFECTIVE_IGNORE={effective_ignore}")
+        _log_effective_quantization_ignore_patterns(self.cfg["vllm_cfg"], vllm_kwargs)
 
         llm_kwargs = dict(
             model=self.model_name,

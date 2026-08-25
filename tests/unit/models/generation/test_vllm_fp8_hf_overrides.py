@@ -23,7 +23,35 @@ behavior so it cannot regress a third time.
 
 import pytest
 
-from nemo_rl.models.generation.vllm.vllm_worker import _merge_fp8_kwargs
+from nemo_rl.models.generation.vllm.vllm_worker import (
+    _log_effective_quantization_ignore_patterns,
+    _merge_fp8_kwargs,
+)
+
+
+def test_logs_effective_quantization_ignore_patterns(capsys) -> None:
+    vllm_cfg = {
+        "quantization_ignore_patterns": ["model.layers.*.self_attn.*"],
+    }
+    vllm_kwargs = {
+        "hf_overrides": {
+            "quantization_config": {
+                "ignore": ["model.layers.*.self_attn.*", "lm_head"],
+            }
+        }
+    }
+
+    _log_effective_quantization_ignore_patterns(vllm_cfg, vllm_kwargs)
+
+    assert capsys.readouterr().out == (
+        "NRL_MXFP8_EFFECTIVE_IGNORE=['model.layers.*.self_attn.*', 'lm_head']\n"
+    )
+
+
+def test_does_not_log_ignore_patterns_when_unconfigured(capsys) -> None:
+    _log_effective_quantization_ignore_patterns({}, {})
+
+    assert capsys.readouterr().out == ""
 
 
 def test_fp8_and_user_hf_overrides_coexist():
