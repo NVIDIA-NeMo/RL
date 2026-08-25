@@ -745,9 +745,6 @@ class TestSetup:
         _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert metrics.generation_init_time_s is not None
-        # Backend-specific fields are grpo.py-only; SC does not populate them.
-        assert metrics.vllm_init_time_s is None
-        assert metrics.sglang_init_time_s is None
 
     def test_nemo_gym_uses_deferred_vllm_load(self, patched_factories):
         """NeMo-Gym path reserves vLLM ports up-front and finishes the load afterwards."""

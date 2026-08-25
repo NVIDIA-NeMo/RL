@@ -1040,11 +1040,6 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
-    gen_init_time_key = (
-        "megatron_generation_init_time_s"
-        if backend == "megatron"
-        else f"{backend}_init_time_s"
-    )
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
     generation_config["_debug_payload_metrics"] = grpo_config.debug_payload_metrics
     remote_transport = None
@@ -1100,9 +1095,13 @@ def setup(
     # plane exists. Default is the plain Policy class — legacy behavior.
     _make_policy = policy_factory if policy_factory is not None else Policy
 
-    def init_policy():
+    def init_policy(reserved_http_server_port: Optional[int] = None):
         """Initialize policy training workers."""
         t0 = time.perf_counter()
+        extra_policy_kwargs = {}
+        if reserved_http_server_port is not None:
+            # Colocated Megatron generation serves HTTP from the training workers.
+            extra_policy_kwargs["reserved_http_server_port"] = reserved_http_server_port
         p = _make_policy(
             cluster=train_cluster,
             config=policy_config,
@@ -1112,6 +1111,7 @@ def setup(
             optimizer_path=optimizer_path,
             init_optimizer=True,
             init_reference_model=init_reference_model,
+            **extra_policy_kwargs,
         )
         # Keep custom policy_factory call signatures backward compatible.
         p.debug_payload_metrics = grpo_config.debug_payload_metrics
@@ -1139,25 +1139,21 @@ def setup(
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
-    def init_megatron_generation(policy=None):
+    def init_megatron_generation(
+        policy=None, reserved_http_server_port: Optional[int] = None
+    ):
         """Initialize Megatron generation."""
         t0 = time.perf_counter()
-        if colocated_inference:
-            mg = MegatronGeneration(
-                policy=policy,
-                config=policy_config,
-                tokenizer=tokenizer,
-                processor=processor,
-            )
-        else:
-            mg = MegatronGeneration(
-                cluster=inference_cluster,
-                config=policy_config,
-                tokenizer=tokenizer,
-                processor=processor,
-                weights_path=weights_path,
-                skip_weight_load=True,
-            )
+        mg = MegatronGeneration(
+            config=policy_config,
+            tokenizer=tokenizer,
+            cluster=None if colocated_inference else inference_cluster,
+            policy=policy if colocated_inference else None,
+            processor=processor,
+            weights_path=weights_path,
+            skip_weight_load=not colocated_inference,
+            reserved_http_server_port=reserved_http_server_port,
+        )
         return mg, time.perf_counter() - t0
 
     def initialize_generation_with_policy(
@@ -1195,7 +1191,7 @@ def setup(
             parallel_wall_time = time.perf_counter() - parallel_start_time
 
             # Store timing metrics
-            setattr(setup_timing_metrics, gen_init_time_key, generation_time)
+            setup_timing_metrics.generation_init_time_s = generation_time
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.parallel_wall_time_s = parallel_wall_time
             setup_timing_metrics.parallel_init_enabled = 1.0
@@ -1209,7 +1205,7 @@ def setup(
 
             # Initialize generation engine first (clean GPU memory), then policy
             policy_generation, generation_time = init_generation_fn()
-            setattr(setup_timing_metrics, gen_init_time_key, generation_time)
+            setup_timing_metrics.generation_init_time_s = generation_time
 
             policy, policy_time = init_policy()
             setup_timing_metrics.policy_init_time_s = policy_time
@@ -1219,21 +1215,78 @@ def setup(
 
     # Handle generation-specific setup
     if backend == "megatron":
-        # Initialize training first so checkpoint conversion completes before inference starts.
-        policy, policy_time = init_policy()
-        setup_timing_metrics.policy_init_time_s = policy_time
-
-        # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
-        policy_generation, megatron_gen_time = init_megatron_generation(policy)
-        setup_timing_metrics.megatron_generation_init_time_s = megatron_gen_time
-
         if enable_nemo_gym:
-            # The Megatron inference engine must be up before its server URLs exist.
-            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
-                policy_generation.dp_openai_server_base_urls,
-                generation_config["model_name"],
+            print(
+                "  ⚡ Reserving the Megatron server address for overlapped NeMo Gym init",
+                flush=True,
             )
+            reserve_t0 = time.perf_counter()
+            reserved_url, reserved_http_server_port, port_holder = (
+                MegatronGeneration.reserve_http_server_address(
+                    train_cluster if colocated_inference else inference_cluster,
+                    policy_config,
+                )
+            )
+            reserve_time = time.perf_counter() - reserve_t0
+            setup_timing_metrics.generation_init_reserve_time_s = reserve_time
+            print(f"  ✓ Reserved Megatron server URL: {reserved_url}", flush=True)
+
+            def init_megatron_stack():
+                """Init policy then generation; rank 0 holds the reserved port."""
+                p, policy_t = init_policy(
+                    reserved_http_server_port=reserved_http_server_port
+                    if colocated_inference
+                    else None
+                )
+                pg, gen_t = init_megatron_generation(
+                    p,
+                    reserved_http_server_port=None
+                    if colocated_inference
+                    else reserved_http_server_port,
+                )
+                return p, policy_t, pg, gen_t
+
+            def init_nemo_gym():
+                """Spin up NeMo Gym servers against the reserved URL."""
+                return _spinup_nemo_gym([reserved_url], generation_config["model_name"])
+
+            init_tasks = {
+                "megatron": init_megatron_stack,
+                "nemo_gym": init_nemo_gym,
+            }
+            print(f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}", flush=True)
+            try:
+                with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                    submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
+                    results = {k: f.result() for k, f in submitted.items()}
+            finally:
+                ray.kill(port_holder)
+
+            policy, policy_time, policy_generation, megatron_gen_time = results[
+                "megatron"
+            ]
+            nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
+            setup_timing_metrics.policy_init_time_s = policy_time
+            setup_timing_metrics.generation_init_time_s = (
+                reserve_time + megatron_gen_time
+            )
+            setup_timing_metrics.generation_init_load_time_s = megatron_gen_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
+
+            served_urls = policy_generation.dp_openai_server_base_urls
+            if served_urls != [reserved_url]:
+                raise RuntimeError(
+                    "Megatron server came up at a different address than the one "
+                    f"pre-published to NeMo Gym: reserved {reserved_url}, serving {served_urls}."
+                )
+        else:
+            # Initialize training first so checkpoint conversion completes before inference starts.
+            policy, policy_time = init_policy()
+            setup_timing_metrics.policy_init_time_s = policy_time
+
+            # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
+            policy_generation, megatron_gen_time = init_megatron_generation(policy)
+            setup_timing_metrics.generation_init_time_s = megatron_gen_time
 
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
@@ -1356,7 +1409,11 @@ def setup(
                 policy_generation, vllm_load_time = results["vllm"]
                 policy, policy_time = results["policy"]
             nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
-            setup_timing_metrics.vllm_init_time_s = vllm_reserve_time + vllm_load_time
+            setup_timing_metrics.generation_init_time_s = (
+                vllm_reserve_time + vllm_load_time
+            )
+            setup_timing_metrics.generation_init_reserve_time_s = vllm_reserve_time
+            setup_timing_metrics.generation_init_load_time_s = vllm_load_time
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
         else:
@@ -1445,8 +1502,25 @@ def setup(
             "https://github.com/NVIDIA-NeMo/RL/issues/3288."
         )
 
+    if backend == "megatron":
+        t0 = time.perf_counter()
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            train_cluster=train_cluster,
+            inference_cluster=None if colocated_inference else inference_cluster,
+        )
+        policy_generation.weight_synchronizer.init_communicator()
+        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
+        if not colocated_inference:
+            # Load the model weights now.
+            t0 = time.perf_counter()
+            policy_generation.weight_synchronizer.sync_weights()
+            setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
     # if it is not colocated inference, initialize collective communication for update weights
-    if (
+    elif (
         not colocated_inference
         and remote_transport is None
         and checkpoint_engine_config is None
@@ -1576,7 +1650,7 @@ def setup(
     )
 
     # Log worker initialization timing metrics to logger
-    print_setup_timing_summary(setup_timing_metrics, gen_init_time_key)
+    print_setup_timing_summary(setup_timing_metrics)
     logger.log_metrics(
         setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
     )

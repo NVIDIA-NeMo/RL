@@ -28,7 +28,6 @@ class MCoreGenerationSpecificArgs(TypedDict):
     async_engine: bool
     expose_http_server: bool
     parsers: list[str]
-
     buffer_size_gb: int
     block_size_tokens: int
     max_tokens: int
