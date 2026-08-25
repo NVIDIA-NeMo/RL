@@ -412,6 +412,10 @@ class ClippedPGLossFn(LossFunction):
             self.metric_normalizations = {
                 "loss": grad_normalizer,
                 "kl_penalty": grad_normalizer,
+                "token_mult_prob_error": MetricNormalizer.TOKENS,
+                "gen_kl_error": MetricNormalizer.TOKENS,
+                "policy_kl_error": MetricNormalizer.TOKENS,
+                "js_divergence_error": MetricNormalizer.TOKENS,
                 "num_valid_samples": MetricNormalizer.NONE,
                 "opd_topk_head_loss": MetricNormalizer.TOKENS,
                 "opd_topk_tail_loss": MetricNormalizer.TOKENS,
@@ -701,6 +705,10 @@ class ClippedPGLossFn(LossFunction):
                     "kl_penalty": (
                         kl.item() / self.reference_policy_kl_penalty if kl else 0
                     ),
+                    "token_mult_prob_error": mult_prob_error,
+                    "gen_kl_error": gen_kl_error,
+                    "policy_kl_error": policy_kl_error,
+                    "js_divergence_error": js_divergence_error,
                     "num_valid_samples": sample_mask.sum().item(),
                     **opd_topk_metrics,
                 },
