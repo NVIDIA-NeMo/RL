@@ -33,7 +33,8 @@ from nemo_rl.experience.interfaces import PromptGroupRecord
 # Each record yields _N_GENS training rows.
 _N_GENS = 2
 # Groups that make one target step whole (production: num_prompts_per_step).
-_GROUPS_PER_STEP = 2
+# Deliberately != _N_GENS so the two thresholds cannot be confused for each other.
+_GROUPS_PER_STEP = 3
 
 
 def _stub_record_to_train_batch(
@@ -846,12 +847,16 @@ class TestTQReplayBufferLoadDropIncompleteTargets:
     @staticmethod
     def _partial_envelope() -> dict[str, Any]:
         # Target 1 is whole (_GROUPS_PER_STEP groups); target 2 lost one to the
-        # in-flight cutoff at save time, so only one of its two groups is here.
+        # in-flight cutoff at save time, so two of its three groups are here.
+        # Two rather than one so that a threshold mutated to expected_group_size
+        # (== _N_GENS == 2) stops dropping it.
         return _make_envelope(
             [
                 _make_group_entry("g0", weight=1, target_step=1),
                 _make_group_entry("g1", weight=1, target_step=1),
-                _make_group_entry("g2", weight=2, target_step=2),
+                _make_group_entry("g2", weight=1, target_step=1),
+                _make_group_entry("g3", weight=2, target_step=2),
+                _make_group_entry("g4", weight=2, target_step=2),
             ],
             saved_capacity=8,
         )
@@ -864,16 +869,17 @@ class TestTQReplayBufferLoadDropIncompleteTargets:
             buf, self._partial_envelope(), drop_incomplete_targets_on_restore=True
         )
 
-        assert restored == 2
-        assert buf.target_step_list == [1, 1]
+        assert restored == 3
+        assert buf.target_step_list == [1, 1, 1]
         put_sample_ids = [sid for c in dp.put_calls for sid in c["sample_ids"]]
-        assert "g2_g0" not in put_sample_ids
+        assert "g3_g0" not in put_sample_ids
+        assert "g4_g0" not in put_sample_ids
 
     def test_incomplete_target_retained_by_default(self):
         buf = _make_buffer(FakeDataPlaneClient())
 
-        assert _load(buf, self._partial_envelope()) == 3
-        assert buf.target_step_list == [1, 1, 2]
+        assert _load(buf, self._partial_envelope()) == 5
+        assert buf.target_step_list == [1, 1, 1, 2, 2]
 
     def test_unstamped_groups_are_never_dropped(self):
         # Only a stamped step can be short of a batch; under a sampler that
@@ -895,9 +901,9 @@ class TestTQReplayBufferLoadDropIncompleteTargets:
         restored = _load(
             buf,
             self._partial_envelope(),
-            max_groups=2,
+            max_groups=3,
             drop_incomplete_targets_on_restore=True,
         )
 
-        assert restored == 2
-        assert buf.target_step_list == [1, 1]
+        assert restored == 3
+        assert buf.target_step_list == [1, 1, 1]

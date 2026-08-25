@@ -920,19 +920,16 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "loss_fn.force_on_policy_ratio=false so prev_logprobs are used"
             )
 
-    # in_order is the only sampler that stamps a target step, so nowhere else can
-    # a restored step be short of one. "custom" is rejected too: setup cannot tell
-    # whether it stamps without importing it.
+    # Only a stamped target step can be short of a batch. "custom" is left alone
+    # as in _validate_failure_settings: only its author knows whether it stamps.
     if (
         async_config.drop_incomplete_targets_on_restore
-        and async_config.sampler.name != "in_order"
+        and async_config.sampler.name not in ("in_order", "custom")
     ):
         raise NotImplementedError(
-            "async_rl.drop_incomplete_targets_on_restore is implemented for "
-            "async_rl.sampler.name='in_order' only, but this run uses "
-            f"{async_config.sampler.name!r}. Only in_order stamps the target step "
-            "this drops, so elsewhere the flag would silently change nothing about "
-            "the resume. Remove it, or switch to the in_order sampler."
+            f"async_rl.sampler.name={async_config.sampler.name!r} stamps no target "
+            "step, so async_rl.drop_incomplete_targets_on_restore would change "
+            "nothing about the resume. Remove it, or switch to the in_order sampler."
         )
 
     # Top-k retention keys off checkpointing.metric_name, but SC has no
