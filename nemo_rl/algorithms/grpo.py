@@ -158,23 +158,6 @@ from nemo_rl.weight_sync.factory import create_weight_synchronizer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-def _drop_bulky_wandb_metrics(metrics: dict) -> dict:
-    """Drop histogram/full-result keys before logging.
-
-    At GBS 512 the per-step metrics row exceeds W&B's ~10.38MB history-line
-    cap (hundreds of per-agent */histogram entries alone total >10MB), and
-    the W&B client silently drops the ENTIRE row — no train/* curves appear
-    at all (observed on run zfhm8dc1). Same mitigation as geshen's
-    nemo-rl-internal commit f5bafa107 ("disable all_results and histogram
-    wandb logs"): scalars are untouched.
-    """
-    return {
-        k: v
-        for k, v in metrics.items()
-        if "histogram" not in k and "full_result" not in k
-    }
-
-
 def _maybe_restore_async_replay_buffer_checkpoint(
     replay_buffer: Any,
     checkpoint_path: str,
@@ -3093,11 +3076,7 @@ def grpo_train(
                     metrics_logging_data["mean_gen_tokens_per_sample"] = (
                         rollout_metrics["mean_gen_tokens_per_sample"]
                     )
-                    logger.log_metrics(
-                        _drop_bulky_wandb_metrics(rollout_metrics),
-                        total_steps + 1,
-                        prefix="train",
-                    )
+                    logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config.grpo.reward_scaling
@@ -3477,9 +3456,7 @@ def grpo_train(
                         validation_timings, total_steps + 1, prefix="timing/validation"
                     )
                     logger.log_metrics(
-                        _drop_bulky_wandb_metrics(val_metrics),
-                        total_steps + 1,
-                        prefix="validation",
+                        val_metrics, total_steps + 1, prefix="validation"
                     )
                     if master_config.grpo.debug_payload_metrics:
                         validation_payload_metrics = drain_multimodal_payload_metrics()
@@ -3825,9 +3802,7 @@ def grpo_train(
 
             if refit_metrics:
                 logger.log_metrics(refit_metrics, total_steps + 1, prefix="refit")
-            logger.log_metrics(
-                _drop_bulky_wandb_metrics(metrics), total_steps + 1, prefix="train"
-            )
+            logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
@@ -5183,11 +5158,7 @@ def async_grpo_train(
                         logger.log_metrics(
                             validation_timings, step + 1, prefix="timing/validation"
                         )
-                        logger.log_metrics(
-                            _drop_bulky_wandb_metrics(val_metrics),
-                            step + 1,
-                            prefix="validation",
-                        )
+                        logger.log_metrics(val_metrics, step + 1, prefix="validation")
                         if master_config.grpo.debug_payload_metrics:
                             validation_payload_metrics = (
                                 drain_multimodal_payload_metrics()
@@ -5553,9 +5524,7 @@ def async_grpo_train(
             if refit_metrics:
                 logger.log_metrics(refit_metrics, step + 1, prefix="refit")
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
-            logger.log_metrics(
-                _drop_bulky_wandb_metrics(metrics), step + 1, prefix="train"
-            )
+            logger.log_metrics(metrics, step + 1, prefix="train")
             logger.log_metrics(efficiency_loggable, step + 1, prefix="")
             # step_finished=True here since this is the final log of our current step.
             logger.log_metrics(
