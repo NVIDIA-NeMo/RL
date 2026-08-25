@@ -32,7 +32,6 @@ os.environ["RAY_TMPDIR"] = _temp_dir  # Alternative env var
 os.environ["TMPDIR"] = _temp_dir  # System temp dir
 
 import nemo_rl.algorithms.async_utils.trajectory_collector as trajectory_collector_mod
-import nemo_rl.algorithms.grpo as grpo_mod
 from nemo_rl.algorithms.async_utils import (
     AsyncTrajectoryCollector,
     ReplayBuffer,
@@ -140,7 +139,7 @@ class TestReplayBufferImplCheckpointing:
         }
 
     def test_local_restore_prepares_current_step_for_gap_fill(self):
-        buffer = ReplayBufferImpl(max_size=10)
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
         state = self._state(
             trajectory_versions=[0, 1, 1, 2],
             target_weight_versions=[1, 2, 2, 3],
@@ -161,8 +160,40 @@ class TestReplayBufferImplCheckpointing:
         assert buffer.get_trajectories_needed(2, 2) == 0
         assert buffer.get_trajectories_needed(3, 2) == 1
 
+    @pytest.mark.parametrize(
+        ("drop_incomplete_targets_on_restore", "expected_targets", "expected_needed"),
+        [
+            (True, [2, 2], 2),
+            (False, [2, 2, 3], 1),
+        ],
+    )
+    def test_local_restore_can_drop_incomplete_frontier(
+        self,
+        drop_incomplete_targets_on_restore,
+        expected_targets,
+        expected_needed,
+    ):
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=drop_incomplete_targets_on_restore,
+        )
+        state = self._state(
+            trajectory_versions=[1, 1, 2],
+            target_weight_versions=[2, 2, 3],
+            last_target_weight_already_generated=3,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=2,
+        )
+
+        assert buffer.get_debug_info()["target_weight_versions"] == expected_targets
+        assert buffer.get_trajectories_needed(3, 2) == expected_needed
+
     def test_local_restore_empty_state_resets_generation_watermark(self):
-        buffer = ReplayBufferImpl(max_size=10)
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
         state = self._state(
             trajectory_versions=[],
             target_weight_versions=[],
@@ -180,7 +211,7 @@ class TestReplayBufferImplCheckpointing:
         assert buffer.get_trajectories_needed(5, 2) == 2
 
     def test_local_restore_removes_stale_trajectories(self):
-        buffer = ReplayBufferImpl(max_size=10)
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
         state = self._state(
             trajectory_versions=[0, 1, 4],
             target_weight_versions=[5, 5, 5],
@@ -199,8 +230,42 @@ class TestReplayBufferImplCheckpointing:
         assert not buffer.has_complete_batch(5, 2)
         assert buffer.get_trajectories_needed(5, 2) == 1
 
+    @pytest.mark.parametrize(
+        ("drop_incomplete_targets_on_restore", "expected_targets", "expected_needed"),
+        [
+            (True, [], 2),
+            (False, [5], 1),
+        ],
+    )
+    def test_local_restore_drops_target_made_incomplete_by_stale_filter(
+        self,
+        drop_incomplete_targets_on_restore,
+        expected_targets,
+        expected_needed,
+    ):
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=drop_incomplete_targets_on_restore,
+        )
+        state = self._state(
+            trajectory_versions=[4, 1],
+            target_weight_versions=[5, 5],
+            last_target_weight_already_generated=5,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=5,
+            max_age_steps=1,
+        )
+
+        assert buffer.get_debug_info()["target_weight_versions"] == expected_targets
+        assert buffer.size() == len(expected_targets)
+        assert buffer.get_trajectories_needed(5, 2) == expected_needed
+
     def test_local_restore_truncates_after_resume_cleanup(self):
-        buffer = ReplayBufferImpl(max_size=2)
+        buffer = ReplayBufferImpl(max_size=2, drop_incomplete_targets_on_restore=False)
         state = self._state(
             trajectory_versions=[0, 1, 2, 3],
             target_weight_versions=[1, 2, 3, 4],
@@ -218,7 +283,7 @@ class TestReplayBufferImplCheckpointing:
         assert buffer.get_debug_info()["target_weight_versions"] == [2, 3]
 
     def test_local_restore_without_current_step_rechecks_after_stale_removal(self):
-        buffer = ReplayBufferImpl(max_size=10)
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
         state = self._state(
             trajectory_versions=[0, 4, 4],
             target_weight_versions=[5, 5, 6],
@@ -235,7 +300,7 @@ class TestReplayBufferImplCheckpointing:
         assert buffer.get_last_target_weight_already_generated() == -1
 
     def test_local_sample_evicts_stale_restored_trajectories(self):
-        buffer = ReplayBufferImpl(max_size=10)
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
         assert (
             buffer.add(
                 {"batch": {"data": "stale"}, "rollout_metrics": {}},
@@ -264,7 +329,7 @@ class TestReplayBufferImplCheckpointing:
         assert buffer.size() == 0
 
     def test_local_debug_info_reports_starvation_diagnostics(self):
-        buffer = ReplayBufferImpl(max_size=10)
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
         assert (
             buffer.add(
                 {
@@ -318,7 +383,7 @@ class TestReplayBufferImplCheckpointing:
         assert diagnostics["num_trajectories_sampled"] == 2
 
     def test_local_load_state_dict_validates_checkpoint_shape(self):
-        buffer = ReplayBufferImpl(max_size=10)
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
 
         with pytest.raises(ValueError, match="Checkpoint missing required keys"):
             buffer.load_state_dict(
@@ -346,7 +411,7 @@ class TestReplayBufferImplCheckpointing:
             torch.tensor([[1.0, 2.0]]), dim_to_pack=0
         ).enable_deduplication()
         compact_media = PackedTensor.concat([compact_media_row] * 2)
-        source = ReplayBufferImpl(max_size=10)
+        source = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
         assert (
             source.add(
                 {
@@ -374,7 +439,9 @@ class TestReplayBufferImplCheckpointing:
 
         assert source.save_to_path(str(checkpoint_path)) == 2
 
-        restored = ReplayBufferImpl(max_size=10)
+        restored = ReplayBufferImpl(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
         metadata = restored.load_from_path(
             str(checkpoint_path),
             num_prompts_per_step=1,
@@ -407,7 +474,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_initialization(self):
         """Test ReplayBuffer initialization."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
         size = ray.get(buffer.size.remote())
         assert size == 0
 
@@ -421,7 +490,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_push_and_size(self):
         """Test pushing trajectories to buffer."""
-        buffer = ReplayBuffer.remote(max_size=3)
+        buffer = ReplayBuffer.remote(
+            max_size=3, drop_incomplete_targets_on_restore=False
+        )
 
         # Create mock trajectories
         trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
@@ -452,7 +523,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_max_size_limit(self):
         """Test that buffer respects max size limit."""
-        buffer = ReplayBuffer.remote(max_size=2)
+        buffer = ReplayBuffer.remote(
+            max_size=2, drop_incomplete_targets_on_restore=False
+        )
 
         # Fill buffer to capacity
         trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
@@ -483,7 +556,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_sampling_basic(self):
         """Test basic trajectory sampling."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         # Push trajectories with different weight versions
         trajectories = []
@@ -522,7 +597,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_sampling_insufficient_trajectories(self):
         """Test sampling when insufficient trajectories are available."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         # Push only one trajectory
         trajectory = {"batch": {"data": "test"}, "rollout_metrics": {"reward": 1.0}}
@@ -546,7 +623,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_watermark_advances_only_after_consumption(self):
         """Test buffering alone does not mark a target as consumed."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {}}
         trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {}}
@@ -584,7 +663,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_starvation_diagnostics_nemo_gym_turn_keys(self):
         """NeMo Gym uses turns_per_sample/* in rollout_metrics; diagnostics must read them."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
         t1 = {
             "batch": {"data": "a"},
             "rollout_metrics": {
@@ -620,7 +701,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_age_filtering(self):
         """Test that old trajectories are evicted."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         # Push trajectories with different ages
         old_trajectory = {"batch": {"data": "old"}, "rollout_metrics": {"reward": 1.0}}
@@ -657,7 +740,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_target_weight_matching(self):
         """Test that sampling only returns trajectories intended for current step."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         # Push trajectories intended for different target steps
         trajectory1 = {
@@ -693,7 +778,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_get_existing_target_weights(self):
         """Test getting existing target weight versions."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         # Initially empty
         existing_weights = ray.get(buffer.get_existing_target_weights.remote())
@@ -717,7 +804,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_clear(self):
         """Test clearing the buffer."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         # Push some trajectories
         trajectory = {"batch": {"data": "test"}, "rollout_metrics": {"reward": 1.0}}
@@ -745,7 +834,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_state_dict(self):
         """Test state_dict serialization for checkpointing."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
         trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
@@ -770,7 +861,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_load_state_dict(self):
         """Test load_state_dict restoration from checkpoint."""
-        buffer1 = ReplayBuffer.remote(max_size=10)
+        buffer1 = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
         trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
@@ -785,7 +878,9 @@ class TestReplayBuffer:
         state = ray.get(buffer1.state_dict.remote())
         ray.kill(buffer1)
 
-        buffer2 = ReplayBuffer.remote(max_size=10)
+        buffer2 = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
         assert ray.get(buffer2.size.remote()) == 0
 
         ray.get(buffer2.load_state_dict.remote(state))
@@ -800,7 +895,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_state_dict_round_trip_sampling(self):
         """Test save/restore preserves sampling behavior."""
-        buffer1 = ReplayBuffer.remote(max_size=10)
+        buffer1 = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         for i in range(3):
             trajectory = {
@@ -816,7 +913,9 @@ class TestReplayBuffer:
         state = ray.get(buffer1.state_dict.remote())
         ray.kill(buffer1)
 
-        buffer2 = ReplayBuffer.remote(max_size=10)
+        buffer2 = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
         ray.get(buffer2.load_state_dict.remote(state))
 
         sample_result = ray.get(
@@ -834,7 +933,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_load_state_dict_max_size_change(self):
         """Test load_state_dict truncates after resume cleanup."""
-        buffer1 = ReplayBuffer.remote(max_size=5)
+        buffer1 = ReplayBuffer.remote(
+            max_size=5, drop_incomplete_targets_on_restore=False
+        )
 
         for i in range(4):
             trajectory = {
@@ -850,7 +951,9 @@ class TestReplayBuffer:
         state = ray.get(buffer1.state_dict.remote())
         ray.kill(buffer1)
 
-        buffer2 = ReplayBuffer.remote(max_size=2)
+        buffer2 = ReplayBuffer.remote(
+            max_size=2, drop_incomplete_targets_on_restore=False
+        )
         ray.get(
             buffer2.load_state_dict.remote(
                 state,
@@ -868,7 +971,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_load_empty_state_resets_generation_watermark(self):
         """Test empty restore can generate from the current step."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         state = {
             "trajectories": [],
@@ -894,7 +999,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_restore_removes_stale_trajectories(self):
         """Test stale restored trajectories do not make a step look complete."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         state = {
             "trajectories": [
@@ -927,7 +1034,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_readiness_ignores_stale_trajectories(self):
         """Test readiness helpers match sample's age-window filtering."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         for version in [0, 1, 4]:
             ray.get(
@@ -959,7 +1068,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_load_state_dict_missing_keys(self):
         """Test load_state_dict raises for missing required keys."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         incomplete_state = {
             "trajectories": [],
@@ -973,7 +1084,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_load_state_dict_inconsistent_lengths(self):
         """Test load_state_dict raises for inconsistent parallel lists."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         bad_state = {
             "trajectories": [{"batch": {"data": "test"}}],
@@ -989,7 +1102,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_restore_for_training_step_gap_fill_accounting(self):
         """Test resume cleanup keeps incomplete future targets for gap filling."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         state = {
             "trajectories": [
@@ -1027,7 +1142,9 @@ class TestReplayBuffer:
         self,
     ):
         """Test fallback cleanup does not skip gaps after removing partial targets."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
 
         state = {
             "trajectories": [
@@ -1053,7 +1170,9 @@ class TestReplayBuffer:
 
     def test_replay_buffer_checkpoint_with_torch_save(self, tmp_path):
         """Actor-side compact replay checkpoint survives a config flag flip."""
-        buffer1 = ReplayBuffer.remote(max_size=10)
+        buffer1 = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
         pixel_row = PackedTensor(
             torch.tensor([[1.0, 2.0]]), dim_to_pack=0
         ).enable_deduplication()
@@ -1077,7 +1196,9 @@ class TestReplayBuffer:
 
         ray.kill(buffer1)
 
-        buffer2 = ReplayBuffer.remote(max_size=10)
+        buffer2 = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
         restore_metadata = ray.get(buffer2.load_from_path.remote(str(checkpoint_path)))
 
         assert restore_metadata == {
@@ -1102,11 +1223,11 @@ class TestReplayBuffer:
         ray.kill(buffer2)
 
     def test_resume_deadlock_precondition_detectable(self):
-        """Regression: restored buffer can expose the async-GRPO resume deadlock.
+        """Regression: restored buffer can expose an async resume deadlock.
 
         After PR #2651 introduced replay-buffer checkpointing, resuming from a
-        checkpoint where target N is complete but target N+1 is absent caused an
-        async-GRPO deadlock:
+        checkpoint where target N is complete but target N+1 is absent can
+        deadlock Async GRPO or Async PPO:
 
           1. Startup wait sees has_complete_batch(N) == True and breaks immediately.
           2. Training consumes all target-N trajectories and triggers a refit.
@@ -1124,7 +1245,9 @@ class TestReplayBuffer:
         max_age = 1
 
         # Build a pre-checkpoint buffer: 8 trajectories for target 30, none for 31.
-        buffer1 = ReplayBuffer.remote(max_size=20)
+        buffer1 = ReplayBuffer.remote(
+            max_size=20, drop_incomplete_targets_on_restore=False
+        )
         for _ in range(num_prompts):
             ray.get(
                 buffer1.add.remote(
@@ -1138,7 +1261,9 @@ class TestReplayBuffer:
         ray.kill(buffer1)
 
         # Restore at step 30, simulating a checkpoint resume.
-        buffer2 = ReplayBuffer.remote(max_size=20)
+        buffer2 = ReplayBuffer.remote(
+            max_size=20, drop_incomplete_targets_on_restore=False
+        )
         ray.get(
             buffer2.load_state_dict.remote(
                 state,
@@ -1215,7 +1340,6 @@ class TestAsyncTrajectoryCollector:
         collector.running = True
 
     def test_collection_loop_marks_data_exhausted_on_natural_completion(self):
-        """for...else path: iterator drains cleanly -> data_exhausted, not errored."""
         collector = self.create_local_collector()
         self._prime_collection_loop(collector)
         processed = []
@@ -1274,6 +1398,7 @@ class TestAsyncTrajectoryCollector:
         assert collector.data_exhausted is False
         status = collector.get_status()
         assert status["errored"] is True
+        assert status["error"] == "RuntimeError: collection blew up"
         assert status["data_exhausted"] is False
         assert status["running"] is False
 
@@ -2055,6 +2180,77 @@ class TestAsyncTrajectoryCollector:
             },
         )
 
+    def test_collector_selects_ppo_config(self):
+        """The shared collector derives PPO settings from its master config."""
+        from nemo_rl.algorithms.ppo import (
+            AsyncPPOConfig,
+            PPOConfig,
+        )
+        from nemo_rl.algorithms.ppo import (
+            MasterConfig as PPOMasterConfig,
+        )
+
+        async_config = AsyncPPOConfig(
+            max_trajectory_age_steps=3,
+            warmup_generation_lead_steps=5,
+        )
+        master_config = PPOMasterConfig.model_construct(
+            policy={"make_sequence_length_divisible_by": 1},
+            ppo=PPOConfig.model_construct(
+                num_prompts_per_step=2,
+                num_generations_per_prompt=4,
+                max_rollout_turns=1,
+                async_ppo=async_config,
+            ),
+        )
+        collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
+        collector = collector_cls(
+            policy_generation=MockGenerationInterface(),
+            tokenizer=mock.MagicMock(),
+            task_to_env={},
+            master_config=master_config,
+            replay_buffer=mock.MagicMock(),
+        )
+
+        assert collector.algorithm_config is master_config.ppo
+        assert collector.async_config is async_config
+        assert collector.async_config.max_trajectory_age_steps == 3
+
+        collector.set_generation_window(
+            weight_version=2,
+            generation_lead_steps=3,
+            max_trajectory_age_steps=5,
+        )
+        assert collector.current_weight_version == 2
+        assert collector._generation_lead_steps == 3
+        assert collector._max_trajectory_age_steps == 5
+        assert collector._calculate_target_weights(2) == [3, 4, 5]
+
+    def test_collector_grpo_window_remains_fixed(self):
+        collector = self.create_local_collector()
+
+        assert collector.current_weight_version == 0
+        assert collector._generation_lead_steps == 2
+        assert collector._max_trajectory_age_steps == 2
+        assert collector._calculate_target_weights(0) == [0, 1, 2]
+
+        collector.set_weight_version(5)
+
+        assert collector.current_weight_version == 5
+        assert collector._generation_lead_steps == 2
+        assert collector._max_trajectory_age_steps == 2
+        assert collector._calculate_target_weights(5) == [6, 7]
+
+    def test_collector_rejects_generation_lead_above_validity_age(self):
+        collector = self.create_local_collector()
+
+        with pytest.raises(ValueError, match="max_trajectory_age_steps"):
+            collector.set_generation_window(
+                weight_version=1,
+                generation_lead_steps=3,
+                max_trajectory_age_steps=2,
+            )
+
     def create_mock_batch(self, size: int = 2) -> BatchedDataDict[DatumSpec]:
         """Create a mock batch for testing."""
         message_logs = []
@@ -2076,7 +2272,9 @@ class TestAsyncTrajectoryCollector:
 
     def test_async_trajectory_collector_initialization(self):
         """Test AsyncTrajectoryCollector initialization."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
         mock_generation = MockGenerationInterface()
         mock_tokenizer = mock.MagicMock()
         mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
@@ -2102,7 +2300,9 @@ class TestAsyncTrajectoryCollector:
 
     def test_async_trajectory_collector_weight_version_updates(self):
         """Test weight version updates in trajectory collector."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
         mock_generation = MockGenerationInterface()
         mock_tokenizer = mock.MagicMock()
         mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
@@ -2129,7 +2329,9 @@ class TestAsyncTrajectoryCollector:
 
     def test_async_trajectory_collector_pause_resume(self):
         """Test pause and resume functionality."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
         mock_generation = MockGenerationInterface()
         mock_tokenizer = mock.MagicMock()
         mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
@@ -2155,7 +2357,9 @@ class TestAsyncTrajectoryCollector:
 
     def test_async_trajectory_collector_prepare_for_refit(self):
         """Test prepare for refit functionality."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
         mock_generation = MockGenerationInterface()
         mock_tokenizer = mock.MagicMock()
         mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
@@ -2203,9 +2407,39 @@ class TestAsyncTrajectoryCollector:
 
         collector.policy_generation.invalidate_kv_cache.assert_not_called()
 
+    def test_dynamo_cache_invalidation_failure_is_fatal_and_unblocks_waiters(self):
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {"backend": "dynamo"}
+        collector.master_config.grpo.async_grpo.recompute_kv_cache_after_weight_updates = True
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(
+            side_effect=RuntimeError("pause failed")
+        )
+        collector._refit_pause_cleared.clear()
+
+        with pytest.raises(RuntimeError, match="cache invalidation failed"):
+            collector.resume_after_refit()
+
+        assert collector._refit_pause_cleared.is_set()
+
+    def test_dynamo_prepare_for_refit_drains_pending_generations(self):
+        """Dynamo layerwise reload never overlaps an active generation."""
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {
+            "backend": "dynamo",
+            "dynamo_cfg": {},
+        }
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
+        collector.wait_for_pending_generations = mock.MagicMock()
+
+        collector.prepare_for_refit()
+
+        collector.wait_for_pending_generations.assert_called_once_with()
+
     def test_calculate_target_weights(self):
         """Test target weight calculation logic."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
         mock_generation = MockGenerationInterface()
         mock_tokenizer = mock.MagicMock()
         mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
@@ -2395,7 +2629,9 @@ class TestAsyncTrajectoryCollector:
         collector._get_next_target_for_generation = reserve_target
         collector._run_rollout_batch_worker = capture_batch
         monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
-        monkeypatch.setattr(grpo_mod, "_should_use_nemo_gym", lambda config: True)
+        monkeypatch.setattr(
+            trajectory_collector_mod, "should_use_nemo_gym", lambda config: True
+        )
         monkeypatch.setattr(
             trajectory_collector_mod._threading, "Thread", RecordingThread
         )
@@ -2458,7 +2694,9 @@ class TestAsyncTrajectoryCollector:
         collector._get_next_target_for_generation = reserve_target
         collector._run_rollout_batch_worker = capture_batch
         monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
-        monkeypatch.setattr(grpo_mod, "_should_use_nemo_gym", lambda config: False)
+        monkeypatch.setattr(
+            trajectory_collector_mod, "should_use_nemo_gym", lambda config: False
+        )
         monkeypatch.setattr(
             trajectory_collector_mod._threading, "Thread", RecordingThread
         )
@@ -2717,7 +2955,9 @@ class TestAsyncTrajectoryCollector:
 
     def test_dataloader_state_retrieval(self):
         """Test getting dataloader state for checkpointing."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
         mock_generation = MockGenerationInterface()
         mock_tokenizer = mock.MagicMock()
         mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
@@ -2964,7 +3204,9 @@ class TestAsyncUtilsIntegration:
 
     def test_buffer_and_collector_integration(self):
         """Test that buffer and collector work together correctly."""
-        buffer = ReplayBuffer.remote(max_size=10)
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
         mock_generation = MockGenerationInterface()
         mock_tokenizer = mock.MagicMock()
         mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
@@ -2998,7 +3240,9 @@ class TestAsyncUtilsIntegration:
 
     def test_concurrent_operations(self):
         """Test that concurrent operations don't cause race conditions."""
-        buffer = ReplayBuffer.remote(max_size=5)
+        buffer = ReplayBuffer.remote(
+            max_size=5, drop_incomplete_targets_on_restore=False
+        )
 
         # Push trajectories concurrently from multiple threads
         def push_trajectory(buffer, trajectory_id):
@@ -3043,11 +3287,15 @@ class TestAsyncUtilsIntegration:
         """Test error handling in async utilities."""
         # Test with invalid buffer size
         with pytest.raises(Exception):
-            buffer = ReplayBuffer.remote(max_size=-1)
+            buffer = ReplayBuffer.remote(
+                max_size=-1, drop_incomplete_targets_on_restore=False
+            )
             ray.get(buffer.size.remote())
 
         # Test buffer operations
-        buffer = ReplayBuffer.remote(max_size=1)
+        buffer = ReplayBuffer.remote(
+            max_size=1, drop_incomplete_targets_on_restore=False
+        )
 
         # Test sampling from empty buffer
         sample_result = ray.get(

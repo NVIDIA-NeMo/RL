@@ -42,13 +42,20 @@ class ReplayBufferImpl(ReplayBufferProtocol):
     """Replay buffer storing per-prompt groups.
 
     A single entry corresponds to 1 prompt repeated by
-    grpo.num_generations_per_prompt (required to compute per-prompt advantages).
+    the algorithm's ``num_generations_per_prompt`` setting.
     """
 
-    def __init__(self, max_size: int):
+    def __init__(
+        self,
+        max_size: int,
+        drop_incomplete_targets_on_restore: bool,
+    ) -> None:
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
+        # True discards partial restored rows. The dataloader is not rewound,
+        # so replacement rollouts come from subsequent prompts.
+        self._drop_incomplete_targets_on_restore = drop_incomplete_targets_on_restore
         self.trajectories = []  # List[dict[str, Any]]
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
         self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
@@ -488,6 +495,12 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 "last_target_weight_already_generated"
             ]
 
+            # Filter stale rows before checking target completeness. Otherwise a
+            # target can look complete, lose stale rows, and remain partially
+            # restored even when incomplete targets should be dropped.
+            if max_age_steps is not None and self.trajectories:
+                self._remove_stale_trajectories(max_age_steps)
+
             if current_training_step is not None and num_prompts_per_step is not None:
                 self._prepare_for_training_step(
                     current_step=current_training_step,
@@ -495,11 +508,6 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 )
             elif num_prompts_per_step is not None and self.trajectories:
                 self._remove_incomplete_target_steps(num_prompts_per_step)
-
-            if max_age_steps is not None and self.trajectories:
-                self._remove_stale_trajectories(max_age_steps)
-                if current_training_step is None and num_prompts_per_step is not None:
-                    self._remove_incomplete_target_steps(num_prompts_per_step)
 
             self._truncate_to_max_size(current_training_step)
 
@@ -560,11 +568,33 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             "   Complete targets: "
             f"{sorted(complete_targets) if complete_targets else 'none'}"
         )
-        for target in sorted(incomplete_targets):
+        if incomplete_targets and self._drop_incomplete_targets_on_restore:
             print(
-                f"   Incomplete target {target}: "
-                f"{target_counts[target]}/{num_prompts_per_step}"
+                "   Dropping incomplete restored targets; replacements will use "
+                "subsequent prompts: "
+                + ", ".join(
+                    f"{target}={target_counts[target]}/{num_prompts_per_step}"
+                    for target in sorted(incomplete_targets)
+                )
             )
+            indices_to_keep = [
+                i
+                for i, target in enumerate(self.target_weight_versions)
+                if target not in incomplete_targets
+            ]
+            self.trajectories = [self.trajectories[i] for i in indices_to_keep]
+            self.trajectory_versions = [
+                self.trajectory_versions[i] for i in indices_to_keep
+            ]
+            self.target_weight_versions = [
+                self.target_weight_versions[i] for i in indices_to_keep
+            ]
+        else:
+            for target in sorted(incomplete_targets):
+                print(
+                    f"   Incomplete target {target}: "
+                    f"{target_counts[target]}/{num_prompts_per_step}"
+                )
 
         # Let the collector ask each target from current_step onward how many
         # trajectories are still needed, so incomplete restored batches can be
@@ -1124,6 +1154,51 @@ class TQReplayBuffer:
     def count_for_target_step(self, target_step: int) -> int:
         """Return how many slots are stamped with ``target_step``."""
         return sum(1 for target in self.target_step_list if target == target_step)
+
+    def promote_ready_group(self, *, to_target_step: int) -> Optional[int]:
+        """Re-stamp a finished group from a later step so it lands in this one.
+
+        Fills a hole left by a dropped prompt with generation that is already done,
+        which is the point: the step closes immediately instead of waiting out a fresh
+        rollout. The step it was borrowed from is returned so the caller can repay it,
+        and the caller must -- an unrepaid loan is the same hole one step later, carried
+        forward until it reaches the last step, which has nobody to borrow from.
+
+        The furthest future step is preferred because it is due last and so has the most
+        slack to absorb the repayment. Only ready slots qualify: an unready one is a
+        reservation whose rollout is still running, so moving its stamp would hand this
+        step the same wait it is trying to avoid.
+
+        Promotion can only make a step fresher, never staler. Slots are appended in
+        dispatch order and the trainer version never decreases, so a group stamped for a
+        later step was generated at a weight version at least as new as the ones already
+        in this step.
+
+        Synchronous on purpose. ``remove`` deletes its indices before its own first
+        await, so as long as nothing here yields, the index picked below cannot be
+        shifted out from under the write by a selection running concurrently.
+
+        Args:
+            to_target_step: Training step to re-stamp the borrowed group onto -- the
+                step that lost a prompt. Must be at or ahead of the trainer version:
+                a group re-stamped onto a step already trained is never selectable
+                again and would only be evicted.
+
+        Returns:
+            The target step the group was taken from, or None when no later step has a
+            ready group to lend.
+        """
+        lender_idx: Optional[int] = None
+        lender_target: Optional[int] = None
+        for i, target in enumerate(self.target_step_list):
+            if target is None or target <= to_target_step or not self.ready_list[i]:
+                continue
+            if lender_target is None or target > lender_target:
+                lender_idx, lender_target = i, target
+        if lender_idx is None:
+            return None
+        self.target_step_list[lender_idx] = to_target_step
+        return lender_target
 
     def size(self) -> int:
         """Return the number of prompt-group entries currently held."""

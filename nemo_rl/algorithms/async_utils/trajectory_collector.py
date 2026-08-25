@@ -27,11 +27,27 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.grpo import MasterConfig
+from nemo_rl.algorithms.grpo import (
+    AsyncGRPOConfig,
+    GRPOConfig,
+)
+from nemo_rl.algorithms.grpo import (
+    MasterConfig as GRPOMasterConfig,
+)
 from nemo_rl.algorithms.opd import resolve_reference_aliases, teacher_seq_pad_multiple
+from nemo_rl.algorithms.ppo import (
+    AsyncPPOConfig,
+    PPOConfig,
+)
+from nemo_rl.algorithms.ppo import (
+    MasterConfig as PPOMasterConfig,
+)
+from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -99,7 +115,7 @@ class AsyncTrajectoryCollector:
         policy_generation: GenerationInterface,
         tokenizer: TokenizerType,
         task_to_env: dict[str, EnvironmentInterface],
-        master_config: MasterConfig,
+        master_config: GRPOMasterConfig | PPOMasterConfig,
         replay_buffer: Any,
         start_step: int = 0,
         teacher_worker_groups: Optional[dict[str, Any]] = None,
@@ -111,11 +127,39 @@ class AsyncTrajectoryCollector:
         ordinals_frontier_aligned: bool = True,
         resume_frontier_ordinal: Optional[int] = None,
         resume_covered_task_indices: Optional[list[int]] = None,
-    ):
+    ) -> None:
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
         self.task_to_env = task_to_env
         self.master_config = master_config
+        algorithm_config: GRPOConfig | PPOConfig
+        async_config: AsyncGRPOConfig | AsyncPPOConfig
+        if isinstance(master_config, GRPOMasterConfig):
+            algorithm_config = master_config.grpo
+            grpo_async_config = algorithm_config.async_grpo
+            assert grpo_async_config is not None
+            async_config = grpo_async_config
+            self._deduplicate_multimodal_data = (
+                algorithm_config.deduplicate_multimodal_data
+            )
+            self._debug_payload_metrics = algorithm_config.debug_payload_metrics
+            self._max_generation_failures = async_config.max_generation_failures
+        elif isinstance(master_config, PPOMasterConfig):
+            algorithm_config = master_config.ppo
+            async_config = algorithm_config.async_ppo
+            self._deduplicate_multimodal_data = False
+            self._debug_payload_metrics = False
+            self._max_generation_failures = 0
+        else:
+            raise TypeError(
+                "master_config must be a GRPO or PPO MasterConfig, got "
+                f"{type(master_config).__name__}"
+            )
+        self.algorithm_config = algorithm_config
+        self.async_config = async_config
+        self._num_prompts_per_step = int(algorithm_config.num_prompts_per_step)
+        self._num_generations_per_prompt = algorithm_config.num_generations_per_prompt
+        self._max_rollout_turns = algorithm_config.max_rollout_turns
         self.replay_buffer = replay_buffer
         self.teacher_worker_groups = teacher_worker_groups or {}
         self.alias_to_group_alias = alias_to_group_alias or {}
@@ -137,6 +181,8 @@ class AsyncTrajectoryCollector:
         self.running = False
         self.data_exhausted = False
         self.collection_failed = False
+        self.collection_error: Optional[str] = None
+        self._failure_lock: _threading.Lock = _threading.Lock()
 
         self._pg_lock: _threading.Lock = _threading.Lock()
 
@@ -149,8 +195,10 @@ class AsyncTrajectoryCollector:
 
         self.current_weight_version: int = start_step
         self.initial_weight_version: int = start_step
-        self.dataloader: StatefulDataLoader | None = None
+        self.dataloader: StatefulDataLoader | CyclingDataLoader | None = None
         self.collection_thread: _threading.Thread | None = None
+        self._generation_lead_steps = self.async_config.max_trajectory_age_steps
+        self._max_trajectory_age_steps = self.async_config.max_trajectory_age_steps
 
         # Track when generation limits cause collection to pause
         self._last_limit_warning_version: int | None = None
@@ -211,14 +259,9 @@ class AsyncTrajectoryCollector:
         # Timer for efficiency metrics
         self._efficiency_timer = ThreadSafeTimer(context={"worker": "collector"})
 
-        # Failure tracking for rollout batch workers. _failure_lock guards both
-        # _failure_count and _fatal_error_message.
-        self._failure_lock: _threading.Lock = _threading.Lock()
+        # Failure tracking for rollout batch workers.
         self._failure_count: int = 0
         self._fatal_error_message: str | None = None
-        self._max_generation_failures = (
-            self.master_config.grpo.async_grpo.max_generation_failures
-        )
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
@@ -230,31 +273,33 @@ class AsyncTrajectoryCollector:
 
         Example:
         generation_weight_version = 10
-        max_trajectory_age_steps = 4
+        generation_lead_steps = 4
+
+        Generation lead usually equals maximum trajectory age, but PPO critic
+        warmup can temporarily configure them independently.
 
         Returns:
             [11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 11, 12, 13, 14
         """
-        # Read async config strictly from grpo.async_grpo
-        max_trajectory_age = self.master_config.grpo.async_grpo.max_trajectory_age_steps
+        generation_lead = self._generation_lead_steps
         if generation_weight_version == self.initial_weight_version:
             return [
                 i
                 for i in range(
                     self.initial_weight_version,
-                    self.initial_weight_version + max_trajectory_age + 1,
+                    self.initial_weight_version + generation_lead + 1,
                 )
             ]
 
-        return [generation_weight_version + i for i in range(1, max_trajectory_age + 1)]
+        return [generation_weight_version + i for i in range(1, generation_lead + 1)]
 
     def _get_next_target_for_generation(
         self, generation_weight_version: int
     ) -> Optional[int]:
         """Get the next target weight that needs generation (if any)."""
         target_weights = self._calculate_target_weights(generation_weight_version)
-        num_prompts = int(self.master_config.grpo.num_prompts_per_step)
-        max_age_steps = int(self.master_config.grpo.async_grpo.max_trajectory_age_steps)
+        num_prompts = self._num_prompts_per_step
+        max_age_steps = self._max_trajectory_age_steps
         last_consumed_target = ray.get(
             self.replay_buffer.get_last_target_weight_already_generated.remote()
         )
@@ -297,20 +342,45 @@ class AsyncTrajectoryCollector:
         else:
             print(f"🔄 Updated weight version to {version}")
 
+    def set_generation_window(
+        self,
+        *,
+        weight_version: int,
+        generation_lead_steps: int,
+        max_trajectory_age_steps: int,
+    ) -> None:
+        """Update the PPO generation version, lead, and buffer-validity age."""
+        if generation_lead_steps < 1:
+            raise ValueError("generation_lead_steps must be at least 1")
+        if max_trajectory_age_steps < generation_lead_steps:
+            raise ValueError(
+                "max_trajectory_age_steps must be greater than or equal to "
+                "generation_lead_steps"
+            )
+
+        with self._generation_check_lock:
+            self.current_weight_version = weight_version
+            self._generation_lead_steps = generation_lead_steps
+            self._max_trajectory_age_steps = max_trajectory_age_steps
+
+        self._generation_limit_cleared.set()
+        print(
+            f"🔄 Updated generation window: version={weight_version}, "
+            f"lead={generation_lead_steps}, max_age={max_trajectory_age_steps}"
+        )
+
     def _should_pause_for_generation_limits(self) -> bool:
         """Check if collection should be paused due to generation limits."""
         try:
             target_weights = self._calculate_target_weights(self.current_weight_version)
-            num_prompts = int(self.master_config.grpo.num_prompts_per_step)
-            max_age_steps = int(
-                self.master_config.grpo.async_grpo.max_trajectory_age_steps
-            )
+            num_prompts = self._num_prompts_per_step
+            max_age_steps = self._max_trajectory_age_steps
             last_consumed_target = ray.get(
                 self.replay_buffer.get_last_target_weight_already_generated.remote()
             )
 
-            # Check if any target weight in our range needs generation
             with self._generation_check_lock:
+                # Check if any target weight in our range needs generation
                 for target_weight in target_weights:
                     if target_weight <= last_consumed_target:
                         continue
@@ -331,7 +401,9 @@ class AsyncTrajectoryCollector:
         except Exception:
             return False
 
-    def start_collection(self, dataloader: StatefulDataLoader) -> None:
+    def start_collection(
+        self, dataloader: StatefulDataLoader | CyclingDataLoader
+    ) -> None:
         """Start collecting trajectories from dataloader."""
         self.running = True
         self.dataloader = dataloader
@@ -352,12 +424,23 @@ class AsyncTrajectoryCollector:
         """Return a snapshot of the collector's internal state for driver-side diagnostics."""
         with self._threads_lock:
             inflight_workers = len(self._inflight_threads)
+        with self._failure_lock:
+            collection_failed = self.collection_failed
+            collection_error = self.collection_error
         return {
             "running": self.running,
             "data_exhausted": self.data_exhausted,
-            "errored": self.collection_failed,
+            "errored": collection_failed,
+            "error": collection_error,
             "inflight_workers": inflight_workers,
         }
+
+    def _mark_collection_failed(self, error: Exception) -> None:
+        """Record the first collection-loop failure."""
+        with self._failure_lock:
+            if not self.collection_failed:
+                self.collection_failed = True
+                self.collection_error = f"{type(error).__name__}: {error}"
 
     def _collection_loop(self):
         """Run the collection loop in background thread.
@@ -392,14 +475,9 @@ class AsyncTrajectoryCollector:
 
                     # Only log warning once per weight version
                     if self._last_limit_warning_version != self.current_weight_version:
-                        max_trajectory_age = (
-                            self.master_config.grpo.async_grpo.max_trajectory_age_steps
+                        target_weights = self._calculate_target_weights(
+                            self.current_weight_version
                         )
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
-
                         print(
                             f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
                             f"already exist in buffer. Waiting for weight update..."
@@ -456,7 +534,7 @@ class AsyncTrajectoryCollector:
             import traceback
 
             traceback.print_exc()
-            self.collection_failed = True
+            self._mark_collection_failed(e)
         finally:
             self.running = False
             if dataloader_exhausted:
@@ -702,12 +780,10 @@ class AsyncTrajectoryCollector:
         leftover: Optional[BatchedDataDict[DatumSpec]] = None
         try:
             generation_weight_version = self.current_weight_version
-            num_generations = self.master_config.grpo.num_generations_per_prompt
+            num_generations = self._num_generations_per_prompt
             num_prompts_in_batch = batch.size
-            num_prompts_per_step = int(self.master_config.grpo.num_prompts_per_step)
-            max_age_steps = int(
-                self.master_config.grpo.async_grpo.max_trajectory_age_steps
-            )
+            num_prompts_per_step = self._num_prompts_per_step
+            max_age_steps = self._max_trajectory_age_steps
 
             # Get the next target weight that needs generation
             target_weight = self._get_next_target_for_generation(
@@ -751,9 +827,7 @@ class AsyncTrajectoryCollector:
                 )
 
             # Generate all prompt groups needed for this target in one batched worker.
-            from nemo_rl.algorithms.grpo import _should_use_nemo_gym
-
-            use_nemo_gym = _should_use_nemo_gym(self.master_config)
+            use_nemo_gym = should_use_nemo_gym(self.master_config)
 
             if not self._refit_pause_cleared.is_set() and self.running:
                 with self._threads_lock:
@@ -769,20 +843,26 @@ class AsyncTrajectoryCollector:
             # Task indices are stamped at yield time in _collection_loop, so
             # slices and carried-over remainders keep their original ordinals.
             rollout_batch = batch.slice(0, num_prompts_to_generate)
+            # Task indices are stamped at yield time in _collection_loop (not
+            # here), so slices and carried-over remainders keep their original
+            # stream ordinals; capture this slice's ordinals for the
+            # outstanding set before dispatch.
             dispatched_task_indices = _stamped_task_indices(rollout_batch)
-            if use_nemo_gym and self.master_config.grpo.deduplicate_multimodal_data:
-                attach_initial_nemo_gym_image_payloads(rollout_batch, self.processor)
+            if use_nemo_gym and self._deduplicate_multimodal_data:
+                attach_initial_nemo_gym_image_payloads(
+                    rollout_batch,
+                    self.processor,
+                    env_config=self.master_config.env,
+                )
             repeated_batch = rollout_batch.repeat_interleave(
                 num_generations,
-                share_immutable_media=(
-                    self.master_config.grpo.deduplicate_multimodal_data
-                ),
+                share_immutable_media=self._deduplicate_multimodal_data,
             )
             print_multimodal_payload_metrics(
                 collect_multimodal_payload_metrics(
                     repeated_batch,
                     "prompt_repeat_async",
-                    enabled=self.master_config.grpo.debug_payload_metrics,
+                    enabled=self._debug_payload_metrics,
                 )
             )
 
@@ -890,19 +970,24 @@ class AsyncTrajectoryCollector:
                 "async_engine", False
             )
         elif backend == "megatron":
-            is_async_engine = generation_cfg.get("mcore_generation_config", {}).get(
-                "async_engine", False
-            )
+            is_async_engine = True
         elif backend == "trtllm":
             assert generation_cfg.get("trtllm_cfg", {}).get("async_engine", False), (
                 "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
                 "synchronous engine path (async_engine=false) is no longer supported."
             )
             is_async_engine = True
+        elif backend == "dynamo":
+            # Dynamo's native layerwise reload temporarily materializes model
+            # parameters while the NCCL update is in progress.  It is not safe
+            # to execute an already-issued vLLM request concurrently with that
+            # reload (in particular for NemotronH/Mamba parameters), even when
+            # the update route accepts allow_unpaused=True.  Stop new trajectory
+            # starts above and drain every active trajectory before refitting.
+            is_async_engine = False
         else:
             is_async_engine = False
-        async_grpo_config = self.master_config.grpo.async_grpo
-        in_flight_weight_updates = async_grpo_config.in_flight_weight_updates
+        in_flight_weight_updates = self.async_config.in_flight_weight_updates
 
         if is_async_engine and in_flight_weight_updates:
             # async engines support in-flight weight updates
@@ -931,8 +1016,7 @@ class AsyncTrajectoryCollector:
         # Invalidate&recompute vLLM caches after the weight updates (in-flight or not) if
         # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
         # Otherwise, keep using the stale KV caches (Magistral-style implementation).
-        async_cfg = self.master_config.grpo.async_grpo
-        if async_cfg.recompute_kv_cache_after_weight_updates:
+        if self.async_config.recompute_kv_cache_after_weight_updates:
             try:
                 print(
                     "🔄 Invalidating generation backend KV caches after weight update"
@@ -948,8 +1032,17 @@ class AsyncTrajectoryCollector:
                     )
             except Exception as e:
                 print(f"⚠️ Failed to invalidate generation backend KV caches: {e}")
-
-        self._refit_pause_cleared.set()
+                if (
+                    "generation" in self.master_config.policy
+                    and self.master_config.policy["generation"]["backend"] == "dynamo"
+                ):
+                    raise RuntimeError(
+                        "Managed Dynamo KV cache invalidation failed after refit"
+                    ) from e
+            finally:
+                self._refit_pause_cleared.set()
+        else:
+            self._refit_pause_cleared.set()
 
     def wait_for_pending_generations(self) -> None:
         """Wait for all in-flight generation threads to complete."""
@@ -1046,6 +1139,7 @@ class AsyncTrajectoryCollector:
         input_ids: torch.Tensor,
         agent_refs: list[dict[str, Any]],
         input_lengths: Optional[torch.Tensor] = None,
+        multimodal_data: Optional[dict[str, Any]] = None,
     ) -> tuple[torch.Tensor, float]:
         """Compute teacher logprobs for non-colocated teachers.
 
@@ -1055,6 +1149,8 @@ class AsyncTrajectoryCollector:
             input_ids: [B, S] tokenized input tensor
             agent_refs: list of B agent reference dicts
             input_lengths: [B] per-sample lengths (required for sequence packing)
+            multimodal_data: batch-level multimodal inputs, row-aligned with
+                ``input_ids`` and sliced per teacher
 
         Returns:
             ([B, S] teacher logprobs tensor, total_time_seconds)
@@ -1094,6 +1190,7 @@ class AsyncTrajectoryCollector:
             twg = self.teacher_worker_groups[group_key]
             sub_input_ids = input_ids[indices]
             sub_lengths = input_lengths[indices] if input_lengths is not None else None
+            row_indices = list(indices)
 
             # Pad batch to multiple of dp_size (required for DP sharding)
             dp_size = twg.sharding_annotations.get_axis_size("data_parallel")
@@ -1109,10 +1206,26 @@ class AsyncTrajectoryCollector:
                     sub_lengths = torch.cat(
                         [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
                     )
+                row_indices.extend([row_indices[-1]] * pad_count)
 
             sub_data = BatchedDataDict({"input_ids": sub_input_ids})
             if sub_lengths is not None:
                 sub_data["input_lengths"] = sub_lengths
+            if multimodal_data:
+                selected_multimodal = BatchedDataDict(multimodal_data).select_indices(
+                    row_indices
+                )
+                sub_data.update(
+                    {
+                        key: value
+                        for key, value in selected_multimodal.items()
+                        if value is not None
+                        and not (
+                            isinstance(value, PackedTensor)
+                            and not any(value.logical_segment_counts_by_row())
+                        )
+                    }
+                )
 
             # Serialize calls per teacher to prevent NCCL collective desync
             t_lock_start = time.time()
@@ -1194,10 +1307,8 @@ class AsyncTrajectoryCollector:
                 mask_env_flagged_samples=should_mask_flagged_samples(
                     self.master_config.env
                 ),
-                deduplicate_multimodal_data=(
-                    self.master_config.grpo.deduplicate_multimodal_data
-                ),
-                debug_payload_metrics=self.master_config.grpo.debug_payload_metrics,
+                deduplicate_multimodal_data=self._deduplicate_multimodal_data,
+                debug_payload_metrics=self._debug_payload_metrics,
             ):
                 task_index = rollout_result.task_index
                 if task_index is None:
@@ -1220,11 +1331,9 @@ class AsyncTrajectoryCollector:
             task_to_env=self.task_to_env,
             max_seq_len=self.master_config.policy["max_total_sequence_length"],
             num_generations=num_generations,
-            max_rollout_turns=self.master_config.grpo.max_rollout_turns,
+            max_rollout_turns=self._max_rollout_turns,
             greedy=False,
-            deduplicate_multimodal_data=(
-                self.master_config.grpo.deduplicate_multimodal_data
-            ),
+            deduplicate_multimodal_data=self._deduplicate_multimodal_data,
         ):
             yield rollout_result
 
@@ -1374,6 +1483,9 @@ class AsyncTrajectoryCollector:
                     flat_for_teacher["token_ids"],
                     agent_refs,
                     input_lengths=teacher_input_lengths,
+                    multimodal_data=flat_for_teacher.get_multimodal_dict(
+                        as_tensors=False
+                    ),
                 )
                 # Keep the tensor inside the batch so replay-buffer collation can
                 # pad variable-length prompt groups correctly.
@@ -1412,7 +1524,7 @@ class AsyncTrajectoryCollector:
                             target_weight_version,
                         ),
                         "replay_push",
-                        enabled=self.master_config.grpo.debug_payload_metrics,
+                        enabled=self._debug_payload_metrics,
                     )
                 )
                 status = await self.replay_buffer.add.remote(

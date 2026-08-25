@@ -186,6 +186,38 @@ def slice_sparse_projection_rows(
     ).coalesce()
 
 
+def slice_sparse_projection_cols(
+    sparse_matrix: torch.Tensor,
+    col_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Column-slice a sparse-COO projection ``[V_s, V_t]`` to ``[V_s, len(col_indices)]``.
+
+    ``col_indices`` must be sorted and unique -- ``select_teacher_topk_indices``
+    returns exactly that. Keeps COO entries whose column appears in
+    ``col_indices`` and remaps that column to its position in the list, so the
+    result equals what a dense ``matrix[:, col_indices]`` would give.
+
+    The row slicer above shifts by a constant because ranks own contiguous
+    slabs; columns here are an arbitrary sorted subset, hence the searchsorted.
+    """
+    indices = sparse_matrix.indices()
+    values = sparse_matrix.values()
+    cols = indices[1]
+    # Position each entry's column would take in ``col_indices``; entries whose
+    # column is absent land on a neighbour and are dropped by the equality test.
+    pos = torch.searchsorted(col_indices, cols).clamp(max=col_indices.numel() - 1)
+    mask = col_indices[pos] == cols
+    kept_indices = indices[:, mask].clone()
+    kept_indices[1] = pos[mask]
+    return torch.sparse_coo_tensor(
+        kept_indices,
+        values[mask],
+        (sparse_matrix.size(0), col_indices.numel()),
+        device=sparse_matrix.device,
+        dtype=sparse_matrix.dtype,
+    ).coalesce()
+
+
 # ---------------------------------------------------------------------------
 # TP/CP-aware loss primitives
 #
