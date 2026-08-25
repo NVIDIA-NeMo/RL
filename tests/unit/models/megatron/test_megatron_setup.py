@@ -1413,8 +1413,8 @@ class TestApplyPerformanceConfig:
         with pytest.raises(ValueError, match="requires a MoE model"):
             _apply_performance_config(model_cfg, config)
 
-    def test_fp4_configuration(self):
-        """Apply the validated Transformer Engine NVFP4 fields."""
+    def test_fp4_configuration_uses_nvfp4_parameter_defaults(self):
+        """Apply NVFP4 defaults without repeating them in the recipe."""
         from nemo_rl.models.megatron.setup import apply_te_precision_config
 
         model_cfg = SimpleNamespace(fp8=None)
@@ -1423,8 +1423,6 @@ class TestApplyPerformanceConfig:
                 "fp4_cfg": {
                     "enabled": True,
                     "fp4": "e2m1",
-                    "fp4_recipe": "nvfp4",
-                    "fp4_param": False,
                 }
             }
         }
@@ -1450,13 +1448,13 @@ class TestApplyPerformanceConfig:
                 },
             )
 
-    def test_fp4_requires_complete_nvfp4_fields(self):
+    def test_fp4_requires_format_when_enabled(self):
         from nemo_rl.models.megatron.setup import apply_te_precision_config
 
-        with pytest.raises(KeyError, match="fp4_cfg"):
+        with pytest.raises(KeyError, match="'fp4'"):
             apply_te_precision_config(
                 SimpleNamespace(),
-                {"megatron_cfg": {"fp4_cfg": {"enabled": True, "fp4": "e2m1"}}},
+                {"megatron_cfg": {"fp4_cfg": {"enabled": True}}},
             )
 
     def test_fp4_rejects_unknown_fields(self):
@@ -1504,8 +1502,6 @@ class TestApplyPerformanceConfig:
                 "fp4_cfg": {
                     "enabled": True,
                     "fp4": "e2m1",
-                    "fp4_recipe": "nvfp4",
-                    "fp4_param": False,
                 }
             },
         }
