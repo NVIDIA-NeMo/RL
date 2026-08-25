@@ -27,8 +27,8 @@ log p_θ(y | q) >= ELBO = E_{t ~ U[0,1]} (1/t) * E_{y_t} sum_{i masked} log p_θ
 Estimating that expectation by naive double Monte Carlo is high-variance. GDPO
 instead uses **Semi-deterministic Monte Carlo (SDMC)**: the integral over `t` is
 evaluated with a fixed Gauss-Legendre quadrature rule, and only the mask draw at
-each node stays stochastic. Two quadrature points with one mask draw each are
-usually enough.
+each node stays stochastic. Two or three quadrature points with one mask draw
+each are usually enough; the published recipe uses three.
 
 The estimator is implemented in
 {py:class}`SdmcElboEstimator <nemo_rl.models.policy.dllm.elbo.SdmcElboEstimator>`.
@@ -45,14 +45,14 @@ policy:
   model_name: "GSAI-ML/LLaDA-8B-Instruct"
   dllm:
     enabled: true
-    quadrature: "gauss-2"   # gauss-1..gauss-5, simpson, or mc
+    quadrature: "gauss-3"   # gauss-1..gauss-5, simpson, or mc
     mc_samples: 1           # mask draws per quadrature point
     block_length: 32        # denoising block width
     diffusion_steps: 128    # total denoising steps per rollout
     cfg_scale: 0.0          # unsupervised classifier-free guidance
   generation:
     backend: "dllm"
-    max_new_tokens: 512     # must be a multiple of block_length
+    max_new_tokens: 256     # must be a multiple of block_length
 ```
 
 A ready-to-edit exemplar lives at `examples/configs/dllm_grpo_llada_8b.yaml`, and a
@@ -68,7 +68,7 @@ uv run examples/run_grpo.py \
 
 Each likelihood evaluation costs `len(quadrature points) * mc_samples` forward
 passes, and GRPO evaluates the likelihood three times per step (current, previous,
-and reference policy). `gauss-2` with `mc_samples: 1` therefore doubles the forward
+and reference policy). `gauss-3` with `mc_samples: 1` therefore triples the forward
 cost relative to an autoregressive policy. Setting `cfg_scale > 0` doubles the cost
 of *generation* on top of that.
 
@@ -81,6 +81,14 @@ is inherited from the [d1](https://github.com/dllm-reasoning/d1) *diffu*-GRPO
 trainer that GDPO builds on. d1's one-shot estimator does use it, dividing the
 loss at each position by that position's masking probability. Corrupted prompt
 positions are never scored here.
+
+### Adapters
+
+The exemplar trains LoRA adapters (`policy.dtensor_cfg.lora_cfg`, r=128,
+alpha=64), as the published recipe does. This is not just a memory
+convenience: the ELBO keeps `quadrature * mc_samples` forward activations alive
+for the backward pass, so full fine-tuning an 8B dLLM needs considerably more
+room than the same model trained autoregressively.
 
 ### Mask token
 
