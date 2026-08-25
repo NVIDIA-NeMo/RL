@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import pytest
@@ -164,12 +165,19 @@ def test_packed_broadcast_single_large_tensor():
         )
 
     # Should still broadcast the tensor
-    assert mock_group.broadcast_count == 1
-    assert len(mock_group.broadcasted_tensors) == 1
+    assert mock_group.broadcast_count == 4
+    assert len(mock_group.broadcasted_tensors) == 4
+    assert mock_group.broadcasted_tensors[0].item() == 0
+    assert mock_group.broadcasted_tensors[1].tolist() == [
+        0,
+        large_tensor.numel() * large_tensor.element_size(),
+        1,
+    ]
+    assert mock_group.broadcasted_tensors[3].tolist() == [1, 0, 0]
 
     # Verify the size matches the large tensor
     expected_size = large_tensor.numel() * large_tensor.element_size()
-    assert mock_group.broadcasted_tensors[0].numel() == expected_size
+    assert mock_group.broadcasted_tensors[2].numel() == expected_size
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -199,6 +207,175 @@ def test_packed_broadcast_multiple_batches():
     assert mock_group.broadcast_count > 1
 
     # Total size should match sum of all tensors
-    total_broadcasted_size = sum(t.numel() for t in mock_group.broadcasted_tensors)
+    assert mock_group.broadcasted_tensors[0].item() == 0
+    assert mock_group.broadcasted_tensors[-1].tolist() == [1, 0, 0]
+    total_broadcasted_size = sum(
+        tensor.numel()
+        for tensor in mock_group.broadcasted_tensors
+        if tensor.dtype == torch.uint8
+    )
     expected_total_size = sum(t.numel() * t.element_size() for _, t in params)
     assert total_broadcasted_size == expected_total_size
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_preflight_failure_stops_before_payload():
+    producer_group = MockCommunicationGroup()
+    iterator_was_consumed = False
+
+    def params():
+        nonlocal iterator_was_consumed
+        iterator_was_consumed = True
+        yield "weight", torch.ones(1, device="cuda")
+
+    with pytest.raises(RuntimeError, match="injected producer preflight failure"):
+        packed_broadcast_producer(
+            iterator=params(),
+            group=producer_group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+            preflight_error=RuntimeError("injected producer preflight failure"),
+        )
+
+    assert not iterator_was_consumed
+    assert producer_group.broadcast_count == 1
+    assert producer_group.broadcasted_tensors[0].item() == 1
+
+    consumer_group = MockConsumerCommunicationGroup(producer_group.broadcasted_tensors)
+    with pytest.raises(RuntimeError, match="producer preflight failed"):
+        packed_broadcast_consumer(
+            iterator=iter([("weight", ((1,), torch.float32))]),
+            group=consumer_group,
+            src=0,
+            post_unpack_func=lambda _tensors: pytest.fail(
+                "consumer loaded payload after failed preflight"
+            ),
+        )
+    assert consumer_group.current_index == 1
+
+
+def test_packed_broadcast_midstream_failure_reaches_consumer(monkeypatch):
+    class ImmediateStream:
+        def synchronize(self):
+            return None
+
+    original_empty = torch.empty
+    original_tensor = torch.tensor
+
+    def force_cpu(factory):
+        def wrapped(*args, **kwargs):
+            device = kwargs.get("device")
+            if device is not None and torch.device(device).type == "cuda":
+                kwargs["device"] = "cpu"
+            return factory(*args, **kwargs)
+
+        return wrapped
+
+    monkeypatch.setattr(torch, "empty", force_cpu(original_empty))
+    monkeypatch.setattr(torch, "tensor", force_cpu(original_tensor))
+    monkeypatch.setattr(torch.cuda, "Stream", ImmediateStream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size", lambda: 1
+    )
+    monkeypatch.setattr("nemo_rl.utils.packed_tensor.get_num_buffers", lambda: 1)
+
+    def params():
+        yield "first.weight", torch.tensor([1.0])
+        raise RuntimeError("injected mid-stream producer failure")
+
+    producer_group = MockCommunicationGroup()
+    with pytest.raises(RuntimeError, match="injected mid-stream producer failure"):
+        packed_broadcast_producer(
+            iterator=params(),
+            group=producer_group,
+            src=0,
+            post_iter_func=lambda item: item[1],
+        )
+
+    loaded_names = []
+    consumer_group = MockConsumerCommunicationGroup(producer_group.broadcasted_tensors)
+    with pytest.raises(RuntimeError, match="producer failed during payload transfer"):
+        packed_broadcast_consumer(
+            iterator=iter(
+                [
+                    ("first.weight", ((1,), torch.float32)),
+                    ("second.weight", ((1,), torch.float32)),
+                ]
+            ),
+            group=consumer_group,
+            src=0,
+            post_unpack_func=lambda tensors: loaded_names.extend(
+                name for name, _ in tensors
+            ),
+        )
+
+    assert loaded_names == ["first.weight"]
+    assert consumer_group.current_index == len(producer_group.broadcasted_tensors)
+
+
+def test_packed_broadcast_consumer_drains_after_load_failure(monkeypatch):
+    class ImmediateStream:
+        def synchronize(self):
+            return None
+
+    original_empty = torch.empty
+    original_tensor = torch.tensor
+
+    def force_cpu(factory):
+        def wrapped(*args, **kwargs):
+            device = kwargs.get("device")
+            if device is not None and torch.device(device).type == "cuda":
+                kwargs["device"] = "cpu"
+            return factory(*args, **kwargs)
+
+        return wrapped
+
+    monkeypatch.setattr(torch, "empty", force_cpu(original_empty))
+    monkeypatch.setattr(torch, "tensor", force_cpu(original_tensor))
+    monkeypatch.setattr(torch.cuda, "Stream", ImmediateStream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size", lambda: 1
+    )
+    monkeypatch.setattr("nemo_rl.utils.packed_tensor.get_num_buffers", lambda: 1)
+
+    producer_group = MockCommunicationGroup()
+    packed_broadcast_producer(
+        iterator=iter(
+            [
+                ("first.weight", torch.tensor([1.0])),
+                ("second.weight", torch.tensor([2.0])),
+            ]
+        ),
+        group=producer_group,
+        src=0,
+        post_iter_func=lambda item: item[1],
+    )
+
+    callback_error = RuntimeError("injected consumer load failure")
+    callback_names = []
+
+    def fail_first_load(tensors):
+        callback_names.append([name for name, _ in tensors])
+        raise callback_error
+
+    consumer_group = MockConsumerCommunicationGroup(producer_group.broadcasted_tensors)
+    with pytest.raises(RuntimeError, match="injected consumer load failure") as error:
+        packed_broadcast_consumer(
+            iterator=iter(
+                [
+                    ("first.weight", ((1,), torch.float32)),
+                    ("second.weight", ((1,), torch.float32)),
+                ]
+            ),
+            group=consumer_group,
+            src=0,
+            post_unpack_func=fail_first_load,
+        )
+
+    assert error.value is callback_error
+    assert callback_names == [["first.weight"]]
+    assert consumer_group.current_index == len(producer_group.broadcasted_tensors)

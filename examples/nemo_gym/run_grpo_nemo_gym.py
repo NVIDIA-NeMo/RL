@@ -170,7 +170,7 @@ def main() -> None:
             "A generation config is required for GRPO"
         )
         has_refit_draft_weights = (
-            "draft" in config.policy and config.policy["draft"]["enabled"]
+            "draft" in config.policy and config.policy["draft"].enabled
         )
         trains_mtp = (
             "megatron_cfg" in config.policy

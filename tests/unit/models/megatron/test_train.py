@@ -31,6 +31,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.loss.draft import DraftLossStats
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 
 pytestmark = pytest.mark.mcore
@@ -662,6 +663,7 @@ class TestForwardWithPostProcessingFn:
         mock_get_cp_group.return_value = cp_group
         mock_roll_tensor.return_value = (shifted_embeds, None)
         mock_capture = MagicMock()
+        draft_sequence_layout = MagicMock()
         mock_capture.get_captured_states.return_value = SimpleNamespace(
             hidden_states=hidden_states,
             inputs_embeds=inputs_embeds,
@@ -678,6 +680,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            draft_sequence_layout=draft_sequence_layout,
         )
         post_processor = LogprobsPostProcessor(
             cfg={"sequence_packing": {"enabled": False}}
@@ -697,6 +700,9 @@ class TestForwardWithPostProcessingFn:
             shifts=-1,
             dims=0,
             cp_group=cp_group,
+        )
+        mock_capture.get_captured_states.assert_called_once_with(
+            sequence_layout=draft_sequence_layout
         )
         draft_model.assert_called_once_with(
             hidden_states=hidden_states,
@@ -1146,6 +1152,89 @@ class TestLossPostProcessor:
 
         # Loss should be scaled by num_microbatches / (cp_size * cp_size) = 4 / (2 * 2) = 1.0
         assert torch.isclose(loss, torch.tensor(1.0))
+
+    @pytest.mark.parametrize("cp_size", [1, 2, 4])
+    def test_packed_draft_gradient_correction_is_cp_invariant(
+        self, cp_size: int
+    ) -> None:
+        from nemo_rl.models.megatron.draft.step_state import DraftStepState
+        from nemo_rl.models.megatron.train import LossPostProcessor
+
+        raw_numerator = 12.0
+        draft_count = 4.0
+        policy_count = 32.0
+        num_microbatches = 3
+        owner_parameter = torch.nn.Parameter(torch.tensor(2.0))
+        mock_loss_fn = MagicMock()
+        mock_loss_fn.input_type = LossInputType.LOGIT
+        packed_wrapper = MagicMock(
+            side_effect=lambda *_args, **_kwargs: (
+                owner_parameter * raw_numerator,
+                {},
+            )
+        )
+        cfg = {"sequence_packing": {"enabled": True, "fuse_loss": False}}
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.train.get_context_parallel_world_size",
+                return_value=cp_size,
+            ),
+            patch("nemo_rl.models.megatron.train.get_context_parallel_group"),
+            patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group"),
+            patch(
+                "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            patch(
+                "nemo_rl.models.megatron.train.SequencePackingLossWrapper",
+                return_value=packed_wrapper,
+            ),
+        ):
+            post_processor = LossPostProcessor(
+                loss_fn=mock_loss_fn,
+                cfg=cfg,
+                num_microbatches=num_microbatches,
+                cp_normalize=True,
+            )
+            wrapped_loss = post_processor(
+                data_dict=MagicMock(), packed_seq_params=MagicMock()
+            )
+            local_loss, _ = wrapped_loss(torch.tensor(0.0))
+            mcore_scaled_loss = local_loss * cp_size / num_microbatches
+            mcore_scaled_loss.backward()
+
+        assert owner_parameter.grad is not None
+        zero_owner_grads = [torch.zeros_like(owner_parameter.grad)] * (cp_size - 1)
+        reduced_main_grad = sum(
+            [owner_parameter.grad, *zero_owner_grads],
+            start=torch.zeros_like(owner_parameter.grad),
+        ) / policy_count
+        assert reduced_main_grad.item() == pytest.approx(
+            raw_numerator / (cp_size * policy_count)
+        )
+
+        draft_parameter = torch.nn.Parameter(torch.tensor(1.0))
+        draft_parameter.grad_norm_group = "draft"
+        draft_parameter.main_grad = reduced_main_grad.clone()
+        state = DraftStepState()
+        stats = DraftLossStats(
+            numerators=torch.tensor([raw_numerator]),
+            counts=torch.tensor([draft_count]),
+            weights=torch.ones(1),
+        )
+        state.accumulate(state.metric_payload(stats))
+        state.set_global_counts(torch.tensor([draft_count]))
+
+        state.correct_main_grads(
+            [draft_parameter],
+            policy_normalization_count=torch.tensor(policy_count),
+            context_parallel_size=cp_size,
+        )
+
+        assert draft_parameter.main_grad.item() == pytest.approx(
+            raw_numerator / draft_count
+        )
 
     @patch(
         "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0

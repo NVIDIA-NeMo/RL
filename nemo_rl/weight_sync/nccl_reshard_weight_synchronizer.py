@@ -89,6 +89,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         return {
             "tp_size": megatron_cfg.get("tensor_model_parallel_size", 1),
             "ep_size": megatron_cfg.get("expert_model_parallel_size", 1),
+            "cp_size": megatron_cfg.get("context_parallel_size", 1),
             "pp_size": megatron_cfg.get("pipeline_model_parallel_size", 1),
         }
 
@@ -97,6 +98,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         return {
             "tp_size": vllm_cfg.get("tensor_parallel_size", 1),
             "ep_size": vllm_cfg.get("expert_parallel_size", 1),
+            "cp_size": 1,
             "pp_size": vllm_cfg.get("pipeline_parallel_size", 1),
         }
 
@@ -136,9 +138,25 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         return self._stale
 
     def init_communicator(self) -> None:
+        vllm_cfg = self._policy.cfg["generation"].get("vllm_cfg", {})
+        gen_cp_size = vllm_cfg.get("context_parallel_size", 1)
+        if gen_cp_size != 1:
+            raise ValueError(
+                "policy.generation.vllm_cfg.context_parallel_size must be 1 "
+                f"(got {gen_cp_size})."
+            )
+
         train_parallelism = self._train_parallelism()
         gen_parallelism = self._gen_parallelism()
         train_world_size = self._train_cluster.world_size()
+        pp_size = train_parallelism["pp_size"]
+        if pp_size <= 0 or train_world_size % pp_size != 0:
+            raise ValueError(
+                f"Cannot divide train_world_size={train_world_size} into "
+                f"TP={train_parallelism['tp_size']} "
+                f"EP={train_parallelism['ep_size']} "
+                f"CP={train_parallelism['cp_size']} PP={pp_size}."
+            )
         inference_world_size = self._inference_cluster.world_size()
         world_size = train_world_size + inference_world_size
 
@@ -158,7 +176,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         #    all train + gen ranks).  Separate NCCL communicator from
         #    model_update_group; the workers run the misc broadcast strictly
         #    after the bulk reshard (concurrent communicators can deadlock).
-        pp_size = train_parallelism["pp_size"]
         train_gpus_per_node = self._train_cluster.num_gpus_per_node
         train_ranks_per_stage = train_world_size // pp_size
         sub_world_size = train_ranks_per_stage + inference_world_size

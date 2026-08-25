@@ -109,6 +109,7 @@ from nemo_rl.models.generation.interfaces import (
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.policy.draft_sample_ids import stable_draft_sample_ids
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
@@ -2123,6 +2124,43 @@ def _preserve_router_replay_routed_experts(
         target["routed_experts"] = flat_messages["routed_experts"]
 
 
+def _attach_grpo_draft_sample_ids(
+    repeated_batch: BatchedDataDict,
+    *,
+    num_generations_per_prompt: int,
+) -> None:
+    """Stamp rollout rows with IDs stable under downstream batch reordering."""
+    if num_generations_per_prompt < 1:
+        raise ValueError("num_generations_per_prompt must be positive")
+    if repeated_batch.size % num_generations_per_prompt != 0:
+        raise ValueError("repeated GRPO batch does not contain complete prompt groups")
+
+    task_names = repeated_batch.get("task_name", [None] * repeated_batch.size)
+    row_keys = [
+        json.dumps(
+            [
+                task_names[row],
+                repeated_batch["idx"][row],
+                row % num_generations_per_prompt,
+            ],
+            separators=(",", ":"),
+        )
+        for row in range(repeated_batch.size)
+    ]
+    repeated_batch["draft_sample_ids"] = torch.tensor(
+        stable_draft_sample_ids(row_keys), dtype=torch.int64
+    )
+
+
+def _preserve_draft_sample_ids(
+    target: BatchedDataDict,
+    repeated_batch: BatchedDataDict,
+) -> None:
+    """Carry stable rollout identity into the policy training payload."""
+    if "draft_sample_ids" in repeated_batch:
+        target["draft_sample_ids"] = repeated_batch["draft_sample_ids"]
+
+
 def _policy_dtype(policy_config: PolicyConfig) -> torch.dtype:
     """Resolve the configured policy precision to its matching torch dtype."""
     return getattr(torch, policy_config["precision"])
@@ -2145,6 +2183,7 @@ def _build_async_grpo_train_data(
         }
     )
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
+    _preserve_draft_sample_ids(train_data, repeated_batch)
     # update multimodal data unconditionally
     extra_multimodal_data = flat_messages.get_multimodal_dict(
         as_tensors=False, pixel_dtype=_policy_dtype(policy_config)
@@ -2852,6 +2891,16 @@ def grpo_train(
                             ),
                         )
                     )
+                    draft_config = master_config.policy.get("draft")
+                    if (
+                        draft_config is not None
+                        and draft_config.enabled
+                        and draft_config.speculator_type in ("dflash", "dspark")
+                    ):
+                        _attach_grpo_draft_sample_ids(
+                            repeated_batch,
+                            num_generations_per_prompt=master_config.grpo.num_generations_per_prompt,
+                        )
                     print_multimodal_payload_metrics(
                         collect_multimodal_payload_metrics(
                             repeated_batch,
@@ -3172,6 +3221,7 @@ def grpo_train(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    _preserve_draft_sample_ids(train_data, repeated_batch)
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(

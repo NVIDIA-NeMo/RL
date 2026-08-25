@@ -66,6 +66,16 @@ def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
     check_nccl_reshard_refit_support(_valid_nccl_reshard_config())
 
 
+def test_check_nccl_reshard_refit_support_rejects_generation_context_parallelism() -> (
+    None
+):
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["context_parallel_size"] = 2
+
+    with pytest.raises(ValueError, match="context_parallel_size must be 1"):
+        check_nccl_reshard_refit_support(config)
+
+
 def test_check_nccl_reshard_refit_support_accepts_bf16_to_mxfp8() -> None:
     config = _valid_nccl_reshard_config()
     config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
@@ -171,25 +181,29 @@ def test_mesh_info_exposes_rank_grid():
 # build_mesh_info
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    "num_gpus,rank_offset,tp,ep,pp,exp_shape,exp_dim_map",
+    "num_gpus,rank_offset,tp,ep,cp,pp,exp_shape,exp_dim_map",
     [
         # TP4 + DP2 (non-expert mesh): emit (tp, dp) -> reversed (dp, tp).
-        (8, 0, 4, 1, 1, (2, 4), {"dp": 0, "tp": 1}),
+        (8, 0, 4, 1, 1, 1, (2, 4), {"dp": 0, "tp": 1}),
         # EP4 + DP2 (expert mesh).
-        (8, 0, 1, 4, 1, (2, 4), {"dp": 0, "ep": 1}),
+        (8, 0, 1, 4, 1, 1, (2, 4), {"dp": 0, "ep": 1}),
         # TP2 + EP4, DP1 (both >1, dp dropped): reversed (ep, tp).
-        (8, 0, 2, 4, 1, (4, 2), {"ep": 0, "tp": 1}),
+        (8, 0, 2, 4, 1, 1, (4, 2), {"ep": 0, "tp": 1}),
         # PP2 + DP2.
-        (4, 0, 1, 1, 2, (2, 2), {"pp": 0, "dp": 1}),
+        (4, 0, 1, 1, 1, 2, (2, 2), {"pp": 0, "dp": 1}),
         # TP8 only, 1-D mesh, with a rank offset (gen side starts after train).
-        (8, 8, 8, 1, 1, (8,), {"tp": 0}),
+        (8, 8, 8, 1, 1, 1, (8,), {"tp": 0}),
+        # CP is between DP/EP and TP in the row-major (PP, DP, EP, CP, TP) mesh.
+        (8, 0, 2, 1, 2, 1, (2, 2, 2), {"dp": 0, "cp": 1, "tp": 2}),
+        (8, 0, 1, 2, 2, 1, (2, 2, 2), {"dp": 0, "ep": 1, "cp": 2}),
+        (8, 0, 2, 1, 2, 2, (2, 2, 2), {"pp": 0, "cp": 1, "tp": 2}),
     ],
 )
 def test_build_mesh_info_shape_and_dim_map(
-    num_gpus, rank_offset, tp, ep, pp, exp_shape, exp_dim_map
+    num_gpus, rank_offset, tp, ep, cp, pp, exp_shape, exp_dim_map
 ):
     mesh, dim_map = build_mesh_info(
-        num_gpus, rank_offset, tp_size=tp, ep_size=ep, pp_size=pp
+        num_gpus, rank_offset, tp_size=tp, ep_size=ep, cp_size=cp, pp_size=pp
     )
     assert tuple(mesh.mesh.shape) == exp_shape
     assert dim_map == exp_dim_map
@@ -222,8 +236,8 @@ def test_build_mesh_info_rank_offset_disjoint_from_train():
 
 
 def test_build_mesh_info_indivisible_raises():
-    with pytest.raises(AssertionError):
-        build_mesh_info(8, 0, tp_size=3)  # 8 not divisible by 3
+    with pytest.raises(ValueError, match="TP=3.*EP=1.*CP=2.*PP=1"):
+        build_mesh_info(8, 0, tp_size=3, cp_size=2)  # 8 not divisible by 6
 
 
 # --------------------------------------------------------------------------
@@ -334,6 +348,19 @@ def test_get_placements_2d_mesh_shards_only_tp_axis():
     assert len(placements) == 2
     assert isinstance(placements[dm["dp"]], Replicate)
     assert isinstance(placements[dm["tp"]], Shard) and placements[dm["tp"]].dim == 0
+
+
+@pytest.mark.parametrize(
+    "dim_map",
+    [
+        {"dp": 0, "cp": 1, "tp": 2},
+        {"dp": 0, "ep": 1, "cp": 2},
+        {"pp": 0, "cp": 1, "tp": 2},
+    ],
+)
+def test_get_placements_replicates_context_parallel_axis(dim_map):
+    placements = get_placements("a.mlp.gate_proj.weight", dim_map, 2)
+    assert isinstance(placements[dim_map["cp"]], Replicate)
 
 
 def test_get_placements_expert_ep_shards_expert_dim0():
@@ -456,11 +483,15 @@ def test_build_refit_info_top_level_and_param_fields():
         "train_world_size",
         "gen_world_size",
         "pp_size",
+        "train_cp_size",
+        "gen_cp_size",
         "gen_tp_size",
     }
     assert info["train_world_size"] == 2
     assert info["gen_world_size"] == 4
     assert info["pp_size"] == 1
+    assert info["train_cp_size"] == 1
+    assert info["gen_cp_size"] == 1
     assert info["gen_tp_size"] == 4
 
     # Every param carries the canonical fields; no pp_stage when pp_size == 1.
@@ -527,6 +558,21 @@ def test_build_refit_info_sets_pp_stage_when_pp_gt_1():
             assert p["pp_stage"] == layer_to_pp_stage[layer]
 
 
+def test_build_refit_info_rejects_train_world_not_divisible_by_pp():
+    with pytest.raises(
+        ValueError,
+        match="train_world_size=14.*TP=1.*EP=1.*CP=2.*PP=3",
+    ):
+        build_nccl_reshard_refit_info(
+            _dense_metadata(),
+            train_parallelism={"tp_size": 1, "ep_size": 1, "cp_size": 2, "pp_size": 3},
+            gen_parallelism={"tp_size": 1, "ep_size": 1, "cp_size": 1, "pp_size": 1},
+            train_world_size=14,
+            gen_world_size=1,
+            layer_to_pp_stage={"model.layers.0": 0},
+        )
+
+
 def test_build_refit_info_groups_experts_and_tags_them():
     info = build_nccl_reshard_refit_info(
         _moe_metadata(num_experts=2),
@@ -546,6 +592,51 @@ def test_build_refit_info_groups_experts_and_tags_them():
         for layer in info["layer_names"]
         for p in info["per_layer_params"][layer]
     )
+
+
+def test_build_refit_info_replicates_train_context_parallelism():
+    info = build_nccl_reshard_refit_info(
+        {**_dense_metadata(), **_moe_metadata(num_experts=2)},
+        train_parallelism={"tp_size": 2, "ep_size": 2, "cp_size": 2, "pp_size": 1},
+        gen_parallelism={"tp_size": 2, "ep_size": 1, "cp_size": 1, "pp_size": 1},
+        train_world_size=8,
+        gen_world_size=2,
+    )
+
+    dense = _find(info, "model.layers.0.mlp.gate_proj.weight")
+    expert = _find(info, "model.layers.0.mlp.experts.gate_proj.weight")
+    assert tuple(dense["src_mesh_info"].mesh.shape) == (2, 2, 2)
+    assert tuple(expert["src_mesh_info"].mesh.shape) == (2, 2, 2)
+    assert isinstance(dense["src_placements"][1], Replicate)
+    assert isinstance(expert["src_placements"][2], Replicate)
+    assert info["train_cp_size"] == 2
+    assert info["gen_cp_size"] == 1
+
+
+def test_build_refit_info_tp2_pp2_cp2_stage_mesh_keeps_both_cp_replicas():
+    metadata = {
+        **_dense_metadata(),
+        "model.layers.1.mlp.gate_proj.weight": {
+            "shape": [64, 32],
+            "dtype": "torch.bfloat16",
+        },
+    }
+    info = build_nccl_reshard_refit_info(
+        metadata,
+        train_parallelism={"tp_size": 2, "ep_size": 1, "cp_size": 2, "pp_size": 2},
+        gen_parallelism={"tp_size": 2, "ep_size": 1, "cp_size": 1, "pp_size": 1},
+        train_world_size=8,
+        gen_world_size=2,
+        layer_to_pp_stage={"model.layers.0": 0, "model.layers.1": 1},
+    )
+
+    assert info["train_cp_size"] == 2
+    assert info["pp_size"] == 2
+    for layer_name in ("model.layers.0", "model.layers.1"):
+        parameter = info["per_layer_params"][layer_name][0]
+        assert tuple(parameter["src_mesh_info"].mesh.shape) == (2, 2)
+        assert parameter["src_mesh_info"].mesh.flatten().tolist() == [0, 1, 2, 3]
+        assert isinstance(parameter["src_placements"][0], Replicate)
 
 
 # --------------------------------------------------------------------------

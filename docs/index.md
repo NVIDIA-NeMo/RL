@@ -128,6 +128,13 @@ Create custom reward environments and integrate them with NeMo RL training pipel
 Configure offline and online Eagle3 draft-model workflows to accelerate rollout generation with vLLM.
 :::
 
+:::{grid-item-card} {octicon}`iterations` DFlash and DSpark Co-Training
+:link: guides/dflash-dspark-speculative-decoding
+:link-type: doc
+
+Train block-parallel DFlash and DSpark draft models with packed TP2 and context-parallel Megatron policies.
+:::
+
 :::{grid-item-card} {octicon}`unmute` Audio GRPO on AVQA
 :link: guides/grpo-audio
 :link-type: doc

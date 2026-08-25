@@ -478,16 +478,24 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             finalize_layerwise_reload,
             initialize_layerwise_reload,
         )
+        from vllm.model_executor.model_loader.utils import (
+            process_weights_after_loading,
+        )
 
         model = self.model_runner.model
         reload_roots = self._get_modelopt_reload_roots()
 
-        def finalize() -> None:
+        def finalize(finalize_draft: bool) -> None:
             try:
                 with torch.device(self.device):
                     _require_complete_modelopt_layerwise_reload(model)
                     for reload_root in reload_roots:
                         finalize_layerwise_reload(reload_root, self.model_config)
+                    if finalize_draft:
+                        self._maybe_process_draft_after_loading(
+                            process_weights_after_loading
+                        )
+                self._maybe_process_mtp_drafter_after_loading()
                 # Fence completion for both collective return and the IPC
                 # COMPLETE acknowledgment. Data-batch ACKs use the hook below.
                 torch.accelerator.synchronize()
@@ -615,12 +623,19 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             for buf in attached:
                 del buf.weight_loader
 
-    def _load_weights(self, weights):
+    def _load_weights(self, weights, *, coverage=None):
         """Load pre-folded weights and activation-quantizer amax buffers.
 
         Weights arrive already folded from the Megatron side (weight_quantizer
         applied during export), so no fold_weight step is needed here.
+
+        ``coverage`` follows the base signature; the full delivered name set is
+        recorded here (real-quant deliberately filters some scale entries out
+        of the actual load, but they are still handled).
         """
+        if coverage is not None:
+            weights = list(weights)
+            coverage.record_loaded(tuple(name for name, _ in weights))
         if self._is_real_quant_model():
             weights = list(weights)
             source_storage_ptrs = {

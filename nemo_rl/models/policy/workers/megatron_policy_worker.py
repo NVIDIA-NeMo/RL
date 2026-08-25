@@ -13,6 +13,7 @@
 # limitations under the License.
 import copy
 import gc
+import hashlib
 import logging
 import os
 import re
@@ -20,7 +21,7 @@ import time
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
+from typing import Any, Callable, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +73,23 @@ from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.megatron.draft.diagnostics import (
+    DraftUpdateProbe,
+    finalize_draft_update_probe,
+    format_draft_update_probe,
+    require_draft_update,
+    start_draft_update_probe,
+)
+from nemo_rl.models.megatron.draft.step_state import (
+    DRAFT_LOSS_METRIC_KEY,
+    DRAFT_STEP_PAYLOAD_KEY,
+    DraftStepPayload,
+    DraftStepState,
+)
+from nemo_rl.models.megatron.draft.training import (
+    DraftTrainingProvider,
+    resolve_draft_speculator,
+)
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -112,7 +130,10 @@ from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
-from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.packed_tensor import (
+    packed_broadcast_preflight_producer,
+    packed_broadcast_producer,
+)
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
@@ -122,6 +143,196 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def assert_refit_weight_manifest_rank_agreement(
+    ordered_manifest: Iterable[tuple[str, str, tuple[int, ...], str]],
+    *,
+    group: torch.distributed.ProcessGroup,
+) -> None:
+    """Fail synchronously when ranks disagree on refit names, order, or shape."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    manifest = tuple(ordered_manifest)
+    encoded = repr(manifest).encode("utf-8")
+    digest = hashlib.sha256(encoded).digest()
+    descriptor = [
+        len(manifest),
+        len(encoded),
+        *(
+            int.from_bytes(digest[offset : offset + 8], "big", signed=True)
+            for offset in range(0, len(digest), 8)
+        ),
+    ]
+    backend = str(torch.distributed.get_backend(group)).lower()
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if "nccl" in backend
+        else torch.device("cpu")
+    )
+    local_descriptor = torch.tensor(descriptor, dtype=torch.int64, device=device)
+    minimum = local_descriptor.clone()
+    maximum = local_descriptor.clone()
+    torch.distributed.all_reduce(
+        minimum, op=torch.distributed.ReduceOp.MIN, group=group
+    )
+    torch.distributed.all_reduce(
+        maximum, op=torch.distributed.ReduceOp.MAX, group=group
+    )
+    if not torch.equal(minimum, maximum):
+        raise ValueError("refit weight manifest differs across ranks")
+
+
+def _all_reduce_draft_normalization_counts(
+    counts: torch.Tensor,
+    *,
+    group: torch.distributed.ProcessGroup,
+) -> torch.Tensor:
+    """Place draft counts on the collective backend before reducing them."""
+    if torch.distributed.get_backend(group) == "nccl" and counts.device.type != "cuda":
+        counts = counts.to(device=torch.cuda.current_device())
+    torch.distributed.all_reduce(counts, group=group)
+    return counts
+
+
+def _validate_draft_training_setup(
+    *,
+    draft_provider: DraftTrainingProvider | None,
+    config: PolicyConfig,
+    model_cfg: Any,
+) -> None:
+    """Reject layouts that do not preserve block-draft plan/tensor semantics."""
+    if draft_provider is None or draft_provider.config.speculator_type not in (
+        "dflash",
+        "dspark",
+    ):
+        return
+    method = draft_provider.config.speculator_type
+    display_method = "DFlash" if method == "dflash" else "DSpark"
+
+    unsupported: list[str] = []
+    tensor_parallel_size = int(model_cfg.tensor_model_parallel_size)
+    pipeline_parallel_size = int(model_cfg.pipeline_model_parallel_size)
+    context_parallel_size = int(model_cfg.context_parallel_size)
+    sequence_parallel = bool(model_cfg.sequence_parallel)
+    sequence_packing_config = config.get("sequence_packing")
+    sequence_packing = bool(
+        sequence_packing_config is not None
+        and sequence_packing_config.get("enabled") is True
+    )
+    virtual_pipeline_size = getattr(
+        model_cfg,
+        "virtual_pipeline_model_parallel_size",
+        None,
+    )
+
+    if tensor_parallel_size != 2:
+        unsupported.append("tensor_model_parallel_size must be 2")
+    if pipeline_parallel_size != 1:
+        unsupported.append("pipeline_model_parallel_size must be 1")
+    if virtual_pipeline_size not in (None, 1):
+        unsupported.append("virtual_pipeline_model_parallel_size must be 1")
+    if context_parallel_size not in (1, 2, 4):
+        unsupported.append("context_parallel_size must be one of 1, 2, or 4")
+    if context_parallel_size > 1:
+        if not draft_provider.supports_context_parallel:
+            unsupported.append("provider does not support context parallel training")
+        if not sequence_packing:
+            unsupported.append(
+                "context_parallel_size > 1 requires sequence_packing.enabled=true"
+            )
+    if sequence_packing and not draft_provider.supports_sequence_packing:
+        unsupported.append("provider does not support sequence packing")
+    if sequence_parallel and not draft_provider.supports_target_sequence_parallel:
+        unsupported.append("provider does not support target sequence parallelism")
+    if sequence_parallel and not sequence_packing:
+        unsupported.append(
+            "sequence_parallel requires sequence_packing.enabled=true for draft training"
+        )
+    megatron_config = config.get("megatron_cfg")
+    if (
+        megatron_config is not None
+        and megatron_config.get("use_fused_linear_logprobs") is True
+    ):
+        unsupported.append("use_fused_linear_logprobs must be disabled")
+
+    invalid_taps = [
+        layer_id
+        for layer_id in getattr(
+            draft_provider.config,
+            "target_hidden_state_layer_ids",
+            (),
+        )
+        if layer_id >= model_cfg.num_layers
+    ]
+    if invalid_taps:
+        unsupported.append(
+            "target_hidden_state_layer_ids exceed the target model: "
+            + ", ".join(str(layer_id) for layer_id in invalid_taps)
+        )
+    generation_config = config.get("generation")
+    vllm_config = (
+        generation_config.get("vllm_kwargs") if generation_config is not None else None
+    )
+    speculative_config = (
+        vllm_config.get("speculative_config") if vllm_config is not None else None
+    )
+    if speculative_config is not None and speculative_config.get("method") != method:
+        unsupported.append(f"generation speculative method must be {method}")
+    mcore_generation_config = (
+        generation_config.get("mcore_generation_config")
+        if generation_config is not None
+        else None
+    )
+    # The runtime merges the training megatron config into the inference
+    # config, so an OMITTED override inherits the training PP/CP value when
+    # the Megatron generation backend is in use. Apply the same default here;
+    # otherwise CP>1 training with Megatron generation and no explicit
+    # override would silently run generation at CP>1 instead of failing this
+    # check. vLLM generation does not inherit megatron parallelism, so the
+    # default only applies to the megatron backend.
+    generation_backend = (
+        generation_config.get("backend") if generation_config is not None else None
+    )
+    inherits_megatron_parallelism = generation_backend == "megatron"
+    generation_pipeline_size = (
+        mcore_generation_config.get("pipeline_model_parallel_size")
+        if mcore_generation_config is not None
+        else None
+    )
+    if generation_pipeline_size is None and inherits_megatron_parallelism:
+        generation_pipeline_size = pipeline_parallel_size
+    if generation_pipeline_size is not None and int(generation_pipeline_size) != 1:
+        unsupported.append("generation pipeline_model_parallel_size must be 1")
+    generation_context_size = (
+        mcore_generation_config.get("context_parallel_size")
+        if mcore_generation_config is not None
+        else None
+    )
+    if generation_context_size is None and inherits_megatron_parallelism:
+        generation_context_size = context_parallel_size
+    if generation_context_size is not None and int(generation_context_size) != 1:
+        unsupported.append("generation context_parallel_size must be 1")
+    if unsupported:
+        raise ValueError(
+            f"{display_method} co-training setup is unsupported: "
+            + "; ".join(unsupported)
+        )
+
+
+def _validate_draft_training_entrypoint(
+    *,
+    draft_provider: DraftTrainingProvider | None,
+    context_parallel_size: int,
+    split_api: bool,
+) -> None:
+    """Fail before CP draft training can use globally normalized sync counts."""
+    if draft_provider is not None and context_parallel_size > 1 and not split_api:
+        raise ValueError(
+            "context-parallel draft co-training requires the split "
+            "begin/train_microbatch/finish API"
+        )
 
 
 def _should_use_router_replay(
@@ -256,13 +467,21 @@ def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
 
 
 @contextmanager
-def _meta_tensor_alloc_context():
+def _meta_tensor_alloc_context(
+    *,
+    # NOTE: currently unreachable at the sole caller (draft metadata is
+    # precomputed before entering this context, so no int64/uint8 protocol
+    # broadcast fires inside it); kept as a defensive hook for Bridge-driven
+    # export paths that do broadcast fixed-width protocol tensors.
+    control_broadcast_group: Optional[torch.distributed.ProcessGroup] = None,
+):
     """Skip real GPU work during metadata enumeration.
 
     Bridge's ``export_hf_weights`` does PP/TP/EP gathers to materialize
     full unsharded tensors, but the refit-info builders only need shape+dtype.
     Patch the allocators to redirect to ``meta`` and turn the collectives into
-    no-ops.  Subsequent shape-only ops on meta tensors propagate correctly,
+    no-ops. Fixed integer/byte protocol broadcasts may be explicitly preserved
+    on one group. Subsequent shape-only ops on meta tensors propagate correctly,
     while peak memory stays at zero extra GiB.
     """
     real_all_gather = torch.distributed.all_gather
@@ -280,6 +499,13 @@ def _meta_tensor_alloc_context():
         return None
 
     def _noop_broadcast(tensor, src, *a, **k):
+        if (
+            control_broadcast_group is not None
+            and k.get("group") is control_broadcast_group
+            and tensor.device.type != "meta"
+            and tensor.dtype in {torch.int64, torch.uint8}
+        ):
+            return real_broadcast(tensor, src, *a, **k)
         return None
 
     torch.distributed.all_gather = _noop_all_gather
@@ -518,6 +744,12 @@ class MegatronPolicyWorkerImpl(
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
         self.sampling_params = runtime_config.sampling_params
+        self.draft_provider = resolve_draft_speculator(config.get("draft"))
+        _validate_draft_training_setup(
+            draft_provider=self.draft_provider,
+            config=config,
+            model_cfg=runtime_config.model_cfg,
+        )
 
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
             "defer_fp32_logits", None
@@ -745,6 +977,14 @@ class MegatronPolicyWorkerImpl(
             return
         self.model.load_state_dict(extra_state, strict=False)
 
+    def _maybe_start_draft_update_probe(self) -> DraftUpdateProbe | None:
+        draft_cfg = self.cfg.get("draft")
+        if self.draft_model is None or not getattr(
+            draft_cfg, "update_probe_enabled", False
+        ):
+            return None
+        return start_draft_update_probe(self.draft_model)
+
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -765,6 +1005,11 @@ class MegatronPolicyWorkerImpl(
         assert check_dim_skip_keys is None, (
             "check_dim_skip_keys is only supported by the v2 DTensor worker; "
             "Megatron does not run cross-tokenizer distillation."
+        )
+        _validate_draft_training_entrypoint(
+            draft_provider=getattr(self, "draft_provider", None),
+            context_parallel_size=parallel_state.get_context_parallel_world_size(),
+            split_api=False,
         )
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
@@ -860,12 +1105,35 @@ class MegatronPolicyWorkerImpl(
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
 
+                draft_normalization_counts = None
+                draft_provider = getattr(self, "draft_provider", None)
+                if draft_provider is not None:
+                    draft_normalization_counts = draft_provider.normalization_counts(
+                        batch,
+                        optimizer_step=int(self.scheduler.num_steps),
+                    )
+                    if draft_normalization_counts is not None:
+                        # Unreachable with draft+CP>1 today (the entrypoint
+                        # validator rejects it), but reduce over DP x CP like
+                        # the deferred path so a future gate change cannot
+                        # silently shrink this denominator.
+                        draft_normalization_counts = (
+                            _all_reduce_draft_normalization_counts(
+                                draft_normalization_counts,
+                                group=parallel_state.get_data_parallel_group(
+                                    with_context_parallel=True
+                                ),
+                            )
+                        )
+
                 loss_post_processor = LossPostProcessor(
                     loss_fn=loss_fn,
                     cfg=self.cfg,
                     num_microbatches=num_microbatches,
                     sampling_params=self.sampling_params,
                     draft_model=self.draft_model,
+                    draft_provider=draft_provider,
+                    draft_normalization_counts=draft_normalization_counts,
                 )
 
                 rerun_state_machine = get_rerun_state_machine()
@@ -896,7 +1164,7 @@ class MegatronPolicyWorkerImpl(
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
                     # Forward pass.
-                    draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+                    draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
                     use_router_replay = _should_use_router_replay(
                         enabled=self._router_replay_enabled,
                         data=batch,
@@ -918,6 +1186,8 @@ class MegatronPolicyWorkerImpl(
                             sampling_params=self.sampling_params,
                             straggler_timer=self.mcore_state.straggler_timer,
                             draft_model=self.draft_model,
+                            draft_provider=getattr(self, "draft_provider", None),
+                            draft_optimizer_step=int(self.scheduler.num_steps),
                             enable_hidden_capture=draft_enabled,
                             use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
                                 "use_fused_linear_logprobs", False
@@ -939,9 +1209,16 @@ class MegatronPolicyWorkerImpl(
 
                 # Update parameters.
                 if not eval_mode:
+                    draft_update_probe = self._maybe_start_draft_update_probe()
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
+                    if draft_update_probe is not None:
+                        draft_update_result = finalize_draft_update_probe(
+                            self.draft_model, draft_update_probe
+                        )
+                        require_draft_update(draft_update_result)
+                        log.info(format_draft_update_probe(draft_update_result))
                     # Megatron-LM PR #4116 replaced the optimizer.mtp_grad_norm attribute
                     # with a per-group dict populated during gradient clipping. Value is
                     # None when clip_grad == 0 or this rank owns no MTP-tagged params
@@ -1187,9 +1464,10 @@ class MegatronPolicyWorkerImpl(
     #    ``forward_backward_func``, i.e. once per chunk). All three are nulled
     #    for the duration of the step and restored at finish/abort; see
     #    ``begin_train_step`` for what each one does.
-    # 3. Grad clip is bundled inside ``MegatronOptimizer.step()``; the 1/N
-    #    rescale via ``self.model.scale_gradients(1/N)`` must run before
-    #    ``optimizer.step()`` so the clip operates on the rescaled grad.
+    # 3. Grad clip is bundled inside ``MegatronOptimizer.step()``; the policy
+    #    1/N rescale and relative draft-denominator correction must run before
+    #    end-of-step finalization and ``optimizer.step()`` so clipping sees
+    #    normalized gradients.
     # 4. With ``calculate_per_token_loss=True`` + ``average_in_collective=
     #    False``, mcore's DDP sums (does not average) grads across DP, so
     #    no FSDP-style ``loss *= dp_size*cp_size`` cancellation is needed
@@ -1226,6 +1504,7 @@ class MegatronPolicyWorkerImpl(
             # streaming chunks the controller has fed into this optimizer step
             # so far.
             "num_chunks": 0,
+            "draft_step_state": DraftStepState(),
             # Saved across the step so we can restore at finish/abort.
             "saved_grad_sync_func": None,
             "saved_no_sync_func": None,
@@ -1471,6 +1750,8 @@ class MegatronPolicyWorkerImpl(
             num_microbatches=num_microbatches,
             sampling_params=self.sampling_params,
             draft_model=self.draft_model,
+            draft_provider=getattr(self, "draft_provider", None),
+            defer_draft_normalization=True,
         )
 
         # Placeholder N=1: loss returns un-normalized sums. ``backward``
@@ -1478,7 +1759,7 @@ class MegatronPolicyWorkerImpl(
         # hooks. The 1/N rescale happens once at finish.
         placeholder_n = torch.tensor(1.0, device="cuda")
 
-        draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+        draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
             data=data,
@@ -1508,6 +1789,8 @@ class MegatronPolicyWorkerImpl(
                     sampling_params=self.sampling_params,
                     straggler_timer=self.mcore_state.straggler_timer,
                     draft_model=self.draft_model,
+                    draft_provider=getattr(self, "draft_provider", None),
+                    draft_optimizer_step=int(self.scheduler.num_steps),
                     enable_hidden_capture=draft_enabled,
                     use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
                         "use_fused_linear_logprobs", False
@@ -1536,6 +1819,14 @@ class MegatronPolicyWorkerImpl(
         )
 
         for m in mb_metrics_collected:
+            draft_payload = m.get(DRAFT_STEP_PAYLOAD_KEY)
+            if draft_payload is not None:
+                if not isinstance(draft_payload, DraftStepPayload):
+                    raise TypeError(
+                        "draft step metric payload must be DraftStepPayload, "
+                        f"got {type(draft_payload).__name__}."
+                    )
+                state["draft_step_state"].accumulate(draft_payload)
             state["all_mb_metrics"].append(m)
             # ``loss`` key is the un-normalized per-mb scalar; collect for
             # the global_loss aggregation at finish.
@@ -1564,15 +1855,36 @@ class MegatronPolicyWorkerImpl(
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
-        # All-reduce accumulated mask sums across DP to recover true N.
-        to_reduce = torch.stack(
+        # Policy rows are replicated across CP, while draft windows are owned by
+        # exactly one CP rank. Reduce their denominators over the corresponding
+        # replica groups without multiplying either count.
+        draft_step_state: DraftStepState = state["draft_step_state"]
+        policy_counts = torch.stack(
             [state["local_valid_seqs"], state["local_valid_toks"]]
         ).to(torch.float64)
         torch.distributed.all_reduce(
-            to_reduce, group=parallel_state.get_data_parallel_group()
+            policy_counts,
+            group=parallel_state.get_data_parallel_group(),
         )
-        global_valid_seqs = to_reduce[0]
-        global_valid_toks = to_reduce[1]
+        global_valid_seqs = policy_counts[0]
+        global_valid_toks = policy_counts[1]
+        draft_counts = draft_step_state.counts_for_reduction(policy_counts)
+        if draft_step_state.active:
+            torch.distributed.all_reduce(
+                draft_counts,
+                group=parallel_state.get_data_parallel_group(
+                    with_context_parallel=True
+                ),
+            )
+        draft_step_state.set_global_counts(draft_counts)
+        draft_metric_numerator = draft_step_state.weighted_numerator_for_reduction(
+            policy_counts
+        )
+        if draft_step_state.active:
+            torch.distributed.all_reduce(
+                draft_metric_numerator,
+                group=parallel_state.get_context_parallel_group(),
+            )
 
         if state["loss_type"] == LossType.TOKEN_LEVEL:
             n_true = global_valid_toks
@@ -1586,6 +1898,12 @@ class MegatronPolicyWorkerImpl(
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
         self.model.scale_gradients(inv_n)
+        if draft_step_state.active:
+            draft_step_state.correct_main_grads(
+                self.model.parameters(),
+                policy_normalization_count=n_true,
+                context_parallel_size=parallel_state.get_context_parallel_world_size(),
+            )
 
         # End-of-step gradient finalization, exactly once per optimizer step.
         # ``begin_train_step`` nulled ``finalize_model_grads_func`` so mcore's
@@ -1639,7 +1957,19 @@ class MegatronPolicyWorkerImpl(
 
         # opt.step clips internally (clip_grad config); operates on the
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
+        draft_update_probe = self._maybe_start_draft_update_probe()
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+        if draft_update_probe is not None:
+            draft_update_result = finalize_draft_update_probe(
+                self.draft_model, draft_update_probe
+            )
+            require_draft_update(draft_update_result)
+            log.info(format_draft_update_probe(draft_update_result))
+
+        draft_grad_norm = None
+        if draft_step_state.active:
+            grad_norms_by_group = self.optimizer.grad_norms_by_group
+            draft_grad_norm = grad_norms_by_group.get("draft")
 
         pg_collection = get_pg_collection(self.model)
         update_successful = logical_and_across_model_parallel_group(
@@ -1650,6 +1980,9 @@ class MegatronPolicyWorkerImpl(
         )
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, mp_group=pg_collection.mp
+        )
+        draft_grad_norm = reduce_max_stat_across_model_parallel_group(
+            draft_grad_norm, mp_group=pg_collection.mp
         )
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
@@ -1736,6 +2069,12 @@ class MegatronPolicyWorkerImpl(
             )
 
         rescaled_metrics: list[dict[str, Any]] = []
+        normalized_draft_metric = (
+            draft_step_state.normalize_metric(draft_metric_numerator)
+            if draft_step_state.active
+            else None
+        )
+        emitted_draft_metric = False
         # curr_lr/curr_wd captured pre-scheduler.step above.
         global_valid_seqs_f = float(global_valid_seqs.item())
         global_valid_toks_f = float(global_valid_toks.item())
@@ -1743,7 +2082,17 @@ class MegatronPolicyWorkerImpl(
         for m in state["all_mb_metrics"]:
             out: dict[str, Any] = {}
             for k, v in m.items():
-                if "_min" in k or "_max" in k:
+                if k == DRAFT_STEP_PAYLOAD_KEY:
+                    continue
+                if k == DRAFT_LOSS_METRIC_KEY and draft_step_state.active:
+                    assert normalized_draft_metric is not None
+                    out[k] = (
+                        normalized_draft_metric
+                        if not emitted_draft_metric
+                        else torch.zeros_like(normalized_draft_metric)
+                    )
+                    emitted_draft_metric = True
+                elif "_min" in k or "_max" in k:
                     out[k] = v
                 else:
                     out[k] = _scale_metric(k, v)
@@ -1771,6 +2120,8 @@ class MegatronPolicyWorkerImpl(
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
         }
+        if draft_grad_norm is not None:
+            metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
 
         # MoE aux-loss metrics: same convention as sync train() — scale
         # by the total pipeline-microbatch count accumulated across all
@@ -2325,10 +2676,161 @@ class MegatronPolicyWorkerImpl(
             )
         return param_info
 
+    def _draft_refit_lane_kwargs(self) -> dict[str, object]:
+        """Return this worker's exact MCore pipeline lane coordinates."""
+        return {
+            "pp_group": parallel_state.get_pipeline_model_parallel_group(),
+            "expected_pp_size": parallel_state.get_pipeline_model_parallel_world_size(),
+            "cp_rank": parallel_state.get_context_parallel_rank(),
+        }
+
+    def _iter_draft_weights_for_refit(
+        self,
+        *,
+        metadata_only: bool,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield this CP/TP lane's draft weights from its last PP stage."""
+        draft_model = self.draft_model
+        draft_cfg = self.cfg.get("draft")
+        draft_enabled = draft_model is not None or bool(
+            getattr(draft_cfg, "enabled", False)
+        )
+        if not draft_enabled:
+            return
+
+        local_draft_exporter: (
+            Callable[[], Iterable[tuple[str, torch.Tensor]]] | None
+        ) = None
+        if draft_model is not None:
+            owner_draft_model = draft_model
+            draft_provider = getattr(self, "draft_provider", None)
+            if draft_provider is None:
+                raise RuntimeError("attached draft model has no training provider")
+
+            def export_local_draft_weights() -> list[tuple[str, torch.Tensor]]:
+                weights = draft_provider.export_weights(owner_draft_model)
+                if not weights:
+                    raise RuntimeError("attached draft model exported no weights")
+                log.info("draft_refit_manifest=draft_count=%d", len(weights))
+                if not metadata_only:
+                    return weights
+                return [
+                    (
+                        name,
+                        torch.empty(tensor.shape, dtype=tensor.dtype, device="meta"),
+                    )
+                    for name, tensor in weights
+                ]
+
+            local_draft_exporter = export_local_draft_weights
+
+        from nemo_rl.models.megatron.draft.utils import (
+            broadcast_draft_weights_from_pp_owner,
+        )
+
+        lane_kwargs = self._draft_refit_lane_kwargs()
+        draft_weights: list[tuple[str, torch.Tensor]] = []
+        local_error: Exception | None = None
+        try:
+            draft_weights = broadcast_draft_weights_from_pp_owner(
+                local_exporter=local_draft_exporter,
+                metadata_only=metadata_only,
+                pp_group=cast(
+                    torch.distributed.ProcessGroup,
+                    lane_kwargs["pp_group"],
+                ),
+                expected_pp_size=cast(int, lane_kwargs["expected_pp_size"]),
+                cp_rank=cast(int, lane_kwargs["cp_rank"]),
+            )
+        except Exception as error:
+            local_error = error
+
+        self._raise_draft_refit_failure_on_all_train_ranks(local_error)
+        for name, tensor in draft_weights:
+            yield f"draft.{name}", tensor
+
+    @staticmethod
+    def _raise_draft_refit_failure_on_all_train_ranks(
+        local_error: Exception | None,
+    ) -> None:
+        """Reach train-WORLD consensus before any rank leaves draft refit."""
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        device = torch.device("cuda", torch.cuda.current_device())
+        failing_rank = torch.tensor(
+            rank if local_error is not None else world_size,
+            dtype=torch.int64,
+            device=device,
+        )
+        torch.distributed.all_reduce(
+            failing_rank,
+            op=torch.distributed.ReduceOp.MIN,
+            group=torch.distributed.group.WORLD,
+        )
+        source_rank = int(failing_rank.item())
+        if source_rank == world_size:
+            return
+
+        message = (
+            f"{type(local_error).__name__}: {local_error}"
+            if rank == source_rank and local_error is not None
+            else ""
+        )
+        encoded = message.encode("utf-8")[:4096]
+        message_length = torch.tensor(
+            len(encoded),
+            dtype=torch.int64,
+            device=device,
+        )
+        torch.distributed.broadcast(
+            message_length,
+            src=source_rank,
+            group=torch.distributed.group.WORLD,
+        )
+        received_length = int(message_length.item())
+        message_tensor = (
+            torch.tensor(list(encoded), dtype=torch.uint8, device=device)
+            if rank == source_rank
+            else torch.empty(received_length, dtype=torch.uint8, device=device)
+        )
+        torch.distributed.broadcast(
+            message_tensor,
+            src=source_rank,
+            group=torch.distributed.group.WORLD,
+        )
+        received_message = bytes(message_tensor.cpu().tolist()).decode(
+            "utf-8",
+            errors="replace",
+        )
+        synchronized_error = RuntimeError(
+            f"Draft refit preflight failed on train rank {source_rank}: "
+            f"{received_message}"
+        )
+        if local_error is not None:
+            raise synchronized_error from local_error
+        raise synchronized_error
+
+    def _preflight_draft_weights_for_refit(
+        self,
+        *,
+        metadata_only: bool = False,
+    ) -> tuple[tuple[tuple[str, torch.Tensor], ...], Exception | None]:
+        """Materialize draft weights once so payload collectives cannot diverge."""
+        try:
+            return (
+                tuple(self._iter_draft_weights_for_refit(metadata_only=metadata_only)),
+                None,
+            )
+        except Exception as error:
+            return (), error
+
     def _iter_params_with_optional_kv_scales(
         self,
         kv_scales: Optional[dict[str, float]] = None,
         conversion_tasks=None,
+        *,
+        draft_metadata_only: bool = False,
+        draft_weights: tuple[tuple[str, torch.Tensor], ...] | None = None,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
@@ -2338,6 +2840,8 @@ class MegatronPolicyWorkerImpl(
         ``conversion_tasks`` (optional) overrides ``self.refit_conversion_tasks``
         — used by the nccl_reshard_refit misc-refit path to pass a filtered subset so
         Bridge only does TP/EP all-gather for those tasks instead of the full model.
+
+        ``draft_metadata_only`` returns meta draft tensors without moving payloads.
         """
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
             get_vllm_qkv_scale_names,
@@ -2357,14 +2861,12 @@ class MegatronPolicyWorkerImpl(
         for name, tensor in base_iter:
             yield name, tensor
 
-        if self.draft_model is not None:
-            from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
-
-            draft_weights = export_eagle_weights_to_hf(
-                self.draft_model,
+        if draft_weights is None:
+            yield from self._iter_draft_weights_for_refit(
+                metadata_only=draft_metadata_only
             )
-            for name, tensor in draft_weights:
-                yield f"draft.{name}", tensor
+        else:
+            yield from draft_weights
 
         # Check whether FP8 KV cache is enabled.
         use_fp8_kv_cache = False
@@ -2477,6 +2979,10 @@ class MegatronPolicyWorkerImpl(
         self, buffer_size_bytes: int = 0, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
+        draft_weights, preflight_error = self._preflight_draft_weights_for_refit()
+        if preflight_error is not None:
+            raise RuntimeError(str(preflight_error)) from preflight_error
+
         self.maybe_init_zmq()
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
@@ -2484,7 +2990,8 @@ class MegatronPolicyWorkerImpl(
         # Use the shared implementation to append optional KV scales.
         stream_weights_via_ipc_zmq_impl(
             params_generator=self._iter_params_with_optional_kv_scales(
-                kv_scales=kv_scales
+                kv_scales=kv_scales,
+                draft_weights=draft_weights,
             ),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
@@ -2501,14 +3008,19 @@ class MegatronPolicyWorkerImpl(
         num_buffers: Optional[int] = None,
     ) -> None:
         """Broadcast the weights for collective communication."""
+        draft_weights, preflight_error = self._preflight_draft_weights_for_refit()
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
-            iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
+            iterator=self._iter_params_with_optional_kv_scales(
+                kv_scales=kv_scales,
+                draft_weights=draft_weights,
+            ),
             group=self.model_update_group,
             src=0,
             post_iter_func=lambda x: x[1],
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
+            preflight_error=preflight_error,
         )
 
     def _build_layer_to_pp_stage(
@@ -2622,6 +3134,11 @@ class MegatronPolicyWorkerImpl(
         )
 
         self.refit_param_info_mcore = self._calculate_refit_param_info()
+        draft_metadata, draft_preflight_error = self._preflight_draft_weights_for_refit(
+            metadata_only=True
+        )
+        if draft_preflight_error is not None:
+            raise draft_preflight_error
 
         # Single pass over Bridge's stream: classify each param as major
         # (xferdtensor) or misc (packed_broadcast), preserve yield order so
@@ -2633,7 +3150,7 @@ class MegatronPolicyWorkerImpl(
         # goes to the misc packed_broadcast + vLLM load_weights path.
         state_dict_metadata = {}
         misc_meta = OrderedDict()
-        _xfer_bytes = _bcast_bytes = 0  # full-tensor payload routed to each path
+        payload_bytes = [0, 0]  # bulk and packed-broadcast bytes, respectively
 
         # Iterates all the params to construct the state_dict_metadata (xferdtensor path)
         # state_dict_metadata[hf_name] -> [shape, dtype]
@@ -2653,31 +3170,56 @@ class MegatronPolicyWorkerImpl(
         mtp_hf_layers_names = _collect_mtp_hf_layer_names(self.refit_conversion_tasks)
 
         layer_prefix = None
-        with _meta_tensor_alloc_context():
-            for name, tensor in self._iter_params_with_optional_kv_scales():
-                meta = {
-                    "shape": list(tensor.shape),
-                    "dtype": str(tensor.dtype),
-                }
-                _nbytes = tensor.numel() * tensor.element_size()
-                # Downsized whitelist: only FFN gate/up/down weights take the bulk
-                # nccl-reshard path; everything else -> misc (packed_broadcast).
-                if (
-                    is_nccl_reshard_param(name)
-                    and _extract_layer_name(name) not in mtp_hf_layers_names
-                ):
-                    state_dict_metadata[name] = meta
-                    _xfer_bytes += _nbytes
-                    if layer_prefix is not None:
-                        assert layer_prefix == _extract_layer_prefix(name), (
-                            f"layer_prefix mismatch: {layer_prefix} != {_extract_layer_prefix(name)}"
-                        )
-                    else:  # first param layer_prefix=None
-                        layer_prefix = _extract_layer_prefix(name)
-                else:
-                    misc_meta[name] = meta
-                    _bcast_bytes += _nbytes
+        ordered_manifest: list[tuple[str, str, tuple[int, ...], str]] = []
 
+        def record_metadata(name: str, tensor: torch.Tensor) -> None:
+            nonlocal layer_prefix
+            shape = tuple(tensor.shape)
+            dtype = str(tensor.dtype)
+            meta = {
+                "shape": list(shape),
+                "dtype": dtype,
+            }
+            num_bytes = tensor.numel() * tensor.element_size()
+            # Downsized whitelist: only FFN gate/up/down weights take the bulk
+            # nccl-reshard path; everything else -> misc (packed_broadcast).
+            if (
+                is_nccl_reshard_param(name)
+                and _extract_layer_name(name) not in mtp_hf_layers_names
+            ):
+                route = "bulk"
+                state_dict_metadata[name] = meta
+                payload_bytes[0] += num_bytes
+                if layer_prefix is not None:
+                    assert layer_prefix == _extract_layer_prefix(name), (
+                        f"layer_prefix mismatch: {layer_prefix} != {_extract_layer_prefix(name)}"
+                    )
+                else:  # first param layer_prefix=None
+                    layer_prefix = _extract_layer_prefix(name)
+            else:
+                route = "misc"
+                misc_meta[name] = meta
+                payload_bytes[1] += num_bytes
+            ordered_manifest.append((route, name, shape, dtype))
+
+        with _meta_tensor_alloc_context(
+            control_broadcast_group=parallel_state.get_pipeline_model_parallel_group()
+        ):
+            for name, tensor in self._iter_params_with_optional_kv_scales(
+                draft_metadata_only=True,
+                draft_weights=draft_metadata,
+            ):
+                record_metadata(name, tensor)
+
+        assert_refit_weight_manifest_rank_agreement(
+            ordered_manifest,
+            group=cast(
+                torch.distributed.ProcessGroup,
+                torch.distributed.group.WORLD,
+            ),
+        )
+
+        _xfer_bytes, _bcast_bytes = payload_bytes
         _gib = 1024**3
         _tot = _xfer_bytes + _bcast_bytes
         print(
@@ -2844,6 +3386,13 @@ class MegatronPolicyWorkerImpl(
         excludes ``.k_scale``/``.v_scale``/``.q_scale`` -> misc); the gen side finalizes
         them via ``_maybe_process_fp8_kv_cache``.  No out-of-band channel needed.
         """
+        draft_weights, preflight_error = self._preflight_draft_weights_for_refit()
+        packed_broadcast_preflight_producer(
+            self.model_update_group,
+            0,
+            preflight_error,
+        )
+
         # hf_to_local_param_map is built once in prepare_nccl_reshard_refit_info;
         # weight values change but the name → spec mapping is stable across
         # refits.
@@ -2901,7 +3450,10 @@ class MegatronPolicyWorkerImpl(
         import time
 
         misc_t0 = time.perf_counter()
-        self._broadcast_misc_params_packed(kv_scales=kv_scales)
+        self._broadcast_misc_params_packed(
+            kv_scales=kv_scales,
+            draft_weights=draft_weights,
+        )
         torch.cuda.synchronize()
         if torch.distributed.get_rank() == 0:
             print(
@@ -2910,7 +3462,12 @@ class MegatronPolicyWorkerImpl(
                 flush=True,
             )
 
-    def _broadcast_misc_params_packed(self, kv_scales=None) -> None:
+    def _broadcast_misc_params_packed(
+        self,
+        kv_scales=None,
+        *,
+        draft_weights: tuple[tuple[str, torch.Tensor], ...],
+    ) -> None:
         """Broadcast misc params via the existing packed_broadcast machinery."""
         misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {})
         if not misc_meta:
@@ -2919,6 +3476,7 @@ class MegatronPolicyWorkerImpl(
         misc_iter = self._iter_params_with_optional_kv_scales(
             kv_scales=kv_scales,
             conversion_tasks=self._misc_conversion_tasks,
+            draft_weights=draft_weights,
         )
 
         packed_broadcast_producer(
@@ -2926,6 +3484,7 @@ class MegatronPolicyWorkerImpl(
             group=self.model_update_group,
             src=0,
             post_iter_func=lambda x: x[1].contiguous(),
+            preflight_checked=True,
         )
 
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:

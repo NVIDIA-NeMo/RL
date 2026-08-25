@@ -314,11 +314,16 @@ policy:
     env_vars: null
 
   draft:
+    # Draft co-training speculator. Currently only eagle3 is supported.
+    speculator_type: eagle3
     enabled: false
     model_name: null
     loss_weight: 0.1
     num_layers: null
     aux_layer_indices: null
+    # Optional draft-only optimizer schedule. Set a mapping with `lr` and
+    # optional `min_lr`/`weight_decay` to enable it.
+    optimizer: null
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
   # for more details on dynamic batching and sequence packing.

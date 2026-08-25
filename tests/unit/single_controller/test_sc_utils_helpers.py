@@ -96,6 +96,16 @@ class TestAggregateStepMetrics:
         assert out["num_ranks"] == 4
         assert "grad_norm" not in out
 
+    def test_draft_grad_norm_tensor_is_preserved(self) -> None:
+        out = aggregate_step_metrics({"draft_grad_norm": torch.tensor([1.0, 3.0])})
+
+        assert out["draft_grad_norm"] == pytest.approx(2.0)
+
+    def test_draft_grad_norm_scalar_is_preserved(self) -> None:
+        out = aggregate_step_metrics({"draft_grad_norm": 0.25})
+
+        assert out["draft_grad_norm"] == pytest.approx(0.25)
+
     def test_mb_metric_reduction_rules(self) -> None:
         result = {
             "all_mb_metrics": {
@@ -110,6 +120,21 @@ class TestAggregateStepMetrics:
         assert out["probs_ratio_max"] == pytest.approx(0.9)
         assert out["lr"] == pytest.approx(0.2)
         assert out["some_sum_metric"] == pytest.approx(6.0)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    def test_cuda_draft_loss_is_reduced_without_numpy_conversion(self) -> None:
+        result = {
+            "all_mb_metrics": {
+                "draft_loss": [
+                    torch.tensor(1.25, device="cuda"),
+                    torch.tensor(2.75, device="cuda"),
+                ]
+            }
+        }
+
+        out = aggregate_step_metrics(result)
+
+        assert out["draft_loss"] == pytest.approx(4.0)
 
     def test_min_max_all_inf_falls_back_to_neg_one(self) -> None:
         result = {

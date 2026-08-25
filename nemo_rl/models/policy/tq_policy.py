@@ -67,6 +67,8 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
     if "moe_metrics" in results[0]:
         out["moe_metrics"] = results[0]["moe_metrics"]
+    if "draft_grad_norm" in results[0]:
+        out["draft_grad_norm"] = results[0]["draft_grad_norm"]
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
     for r in results:
         for k, v in r["all_mb_metrics"].items():
@@ -476,7 +478,9 @@ class TQPolicy(Policy):
     #   finish_train_step                   — all_reduce + opt.step + sched.step
     #   abort_train_step                    — drop accumulators, no opt.step
     #
-    # ``train_from_meta`` is unchanged and remains the sync entrypoint.
+    # ``train_from_meta`` remains the ordinary sync entrypoint. Packed CP
+    # DFlash/DSpark uses this split lifecycle because the draft objective owns
+    # disjoint CP-local windows and normalizes them once at step finish.
 
     def begin_train_step(
         self,
@@ -504,6 +508,7 @@ class TQPolicy(Policy):
         self,
         meta: KVBatchMeta,
         timer: Optional[Timer] = None,
+        train_fields: tuple[str, ...] = DP_TRAIN_FIELDS,
     ) -> None:
         """Dispatch one meta slice (DP-sharded) into an open train step.
 
@@ -518,13 +523,16 @@ class TQPolicy(Policy):
         ``.grad``. Returns nothing — per-microbatch metrics accumulate in
         the workers' open-step state and surface once via
         :meth:`finish_train_step`.
+
+        ``train_fields`` may omit columns the driver intentionally skipped,
+        such as ``prev_logprobs`` under force-on-policy training.
         """
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = replace(
             meta,
             fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                train_fields, enabled=self._router_replay_enabled
             ),
             task_name="train",
         )

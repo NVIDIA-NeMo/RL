@@ -58,6 +58,7 @@ from nemo_rl.models.megatron.data import ProcessedMicrobatch
 from nemo_rl.models.megatron.draft.hidden_capture import (
     get_capture_context,
 )
+from nemo_rl.models.megatron.draft.training import DraftSpeculator
 from nemo_rl.models.megatron.router_replay import (
     clear_router_replay,
     set_router_replay_backward,
@@ -227,6 +228,8 @@ def forward_with_post_processing_fn(
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
+    draft_provider: DraftSpeculator | None = None,
+    draft_optimizer_step: int = 0,
     enable_hidden_capture: Optional[bool] = False,
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
@@ -278,7 +281,13 @@ def forward_with_post_processing_fn(
         set_router_replay_forward(model, routed_experts_cp_sharded)
 
     # Insert hook to capture hidden states and embeddings for draft model training if draft_model is provided
-    capture_context, capture = get_capture_context(model, enable_hidden_capture)
+    capture_context, capture = get_capture_context(
+        model,
+        enable_hidden_capture,
+        aux_layer_indices=(
+            draft_provider.capture_layer_ids() if draft_provider is not None else None
+        ),
+    )
     try:
         with capture_context:
             output_tensor = model_forward(
@@ -309,20 +318,37 @@ def forward_with_post_processing_fn(
             clear_router_replay(model)
 
     if capture is not None:
-        from megatron.core.transformer.multi_token_prediction import roll_tensor
-
-        captured_states = capture.get_captured_states()
-        shifted_input_embeds = roll_tensor(
-            captured_states.inputs_embeds,
-            shifts=-1,
-            dims=0,
-            cp_group=get_context_parallel_group(),
-        )[0]
-        data_dict["student_logits"] = draft_model(
-            hidden_states=captured_states.hidden_states,
-            input_embeds=shifted_input_embeds,
-            attention_mask=attention_mask,
+        captured_states = capture.get_captured_states(
+            sequence_layout=processed_mb.draft_sequence_layout
         )
+        if draft_provider is None:
+            from megatron.core.transformer.multi_token_prediction import roll_tensor
+
+            shifted_input_embeds = roll_tensor(
+                captured_states.inputs_embeds,
+                shifts=-1,
+                dims=0,
+                cp_group=get_context_parallel_group(),
+            )[0]
+            data_dict["student_logits"] = draft_model(
+                hidden_states=captured_states.hidden_states,
+                input_embeds=shifted_input_embeds,
+                attention_mask=attention_mask,
+            )
+        else:
+            assert draft_model is not None
+            draft_provider.forward(
+                policy_model=model,
+                draft_model=draft_model,
+                captured_states=captured_states,
+                input_ids_cp_local=input_ids_cp_sharded,
+                attention_mask=attention_mask,
+                data=data_dict,
+                optimizer_step=draft_optimizer_step,
+                sequence_layout=processed_mb.draft_sequence_layout,
+                context_parallel_group=get_context_parallel_group(),
+                tensor_parallel_group=get_tensor_model_parallel_group(),
+            )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
     # Loss computation should use unscaled logits.
@@ -376,6 +402,8 @@ def megatron_forward_backward(
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
+    draft_provider: DraftSpeculator | None = None,
+    draft_optimizer_step: int = 0,
     enable_hidden_capture: Optional[bool] = False,
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
@@ -415,6 +443,8 @@ def megatron_forward_backward(
         sampling_params=sampling_params,
         straggler_timer=straggler_timer,
         draft_model=draft_model,
+        draft_provider=draft_provider,
+        draft_optimizer_step=draft_optimizer_step,
         enable_hidden_capture=enable_hidden_capture,
         use_fused_linear_logprobs=use_fused_linear_logprobs,
         use_router_replay=use_router_replay,
@@ -449,7 +479,10 @@ class LossPostProcessor:
         cp_normalize: bool = True,
         sampling_params: Optional[TrainingSamplingParams] = None,
         draft_model: Optional[MegatronModule] = None,
+        draft_provider: DraftSpeculator | None = None,
+        draft_normalization_counts: torch.Tensor | None = None,
         prepare_fn: Optional[Callable[..., Any]] = None,
+        defer_draft_normalization: bool = False,
     ):
         """Build a per-microbatch loss post-processor for the Megatron train loop.
 
@@ -466,6 +499,8 @@ class LossPostProcessor:
                 vocab_parallel_group, context_parallel_group)`` and return
                 ``(loss_input, data)``; value models pass one that right-shifts
                 and CP-all-gathers the scalar value-head output.
+            defer_draft_normalization: Return raw draft loss statistics for split
+                optimizer-step finalization instead of normalizing per microbatch.
         """
         self.loss_fn = loss_fn
         self.cfg = cfg
@@ -473,8 +508,16 @@ class LossPostProcessor:
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
         self.prepare_fn = prepare_fn
-        if draft_model is not None and draft_model.eagle_module is not None:
-            self.d2t = getattr(draft_model.eagle_module, "d2t", None)
+        self.defer_draft_normalization = defer_draft_normalization
+        self.draft_provider = draft_provider
+        self.draft_normalization_counts = draft_normalization_counts
+        eagle_module = (
+            getattr(draft_model, "eagle_module", None)
+            if draft_model is not None
+            else None
+        )
+        if eagle_module is not None:
+            self.d2t = getattr(eagle_module, "d2t", None)
         else:
             self.d2t = None
 
@@ -511,6 +554,7 @@ class LossPostProcessor:
                 d2t=self.d2t,
                 chunk_size=logprob_chunk_size,
             )
+        draft_prepare_fn = prepare_loss_input_wrapped
 
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
@@ -534,6 +578,7 @@ class LossPostProcessor:
             else:
                 wrapper_cls = SequencePackingLossWrapper
                 prepare_fn = prepare_loss_input_wrapped
+            draft_prepare_fn = prepare_fn
 
             loss_fn_wrapped = wrapper_cls(
                 loss_fn=self.loss_fn,
@@ -553,16 +598,20 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
-            if "student_logits" in data_dict:
-                loss_fn_wrapped = DraftLossWrapper(
-                    loss_fn=loss_fn_wrapped,
-                    prepare_fn=prepare_loss_input_wrapped,
-                    data_dict=data_dict,
-                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
-                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
-                    vocab_parallel_group=get_tensor_model_parallel_group(),
-                    context_parallel_group=get_context_parallel_group(),
-                )
+
+        if "student_logits" in data_dict or self.draft_provider is not None:
+            loss_fn_wrapped = DraftLossWrapper(
+                loss_fn=loss_fn_wrapped,
+                prepare_fn=draft_prepare_fn,
+                data_dict=data_dict,
+                loss_weight=float(self.cfg["draft"].loss_weight),
+                vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                vocab_parallel_group=get_tensor_model_parallel_group(),
+                context_parallel_group=get_context_parallel_group(),
+                defer_normalization=self.defer_draft_normalization,
+                draft_provider=self.draft_provider,
+                draft_normalization_counts=self.draft_normalization_counts,
+            )
 
         loss_fn_wrapped = partial(
             loss_fn_wrapped,
