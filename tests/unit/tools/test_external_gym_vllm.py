@@ -591,6 +591,13 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert (
         'COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"' in source
     )
+    assert "++env.nemo_gym.external_service_readiness" in source
+    assert "expected_backends:${replicas[${pool}]}" in source
+    assert "external_service_readiness_json" not in source
+    assert source.index('bash "${RAY_SUB}" &') < source.index(
+        "deadline=$((SECONDS + max_startup_timeout))"
+    )
+    assert source.count("check_startup_steps") == 3
     assert "genrm" not in source.lower()
     assert "nl2bash" not in source.lower()
     assert "safety" not in source.lower()

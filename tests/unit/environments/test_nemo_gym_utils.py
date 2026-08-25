@@ -212,6 +212,62 @@ def test_build_nemo_gym_config_uv_dirs(detected_uv_dirs, configured, expected):
     assert (global_config["uv_cache_dir"], global_config["uv_venv_dir"]) == expected
 
 
+def test_build_nemo_gym_config_moves_external_service_readiness_to_actor_field(
+    detected_uv_dirs,
+):
+    """Every entrypoint, SingleController included, builds its actor config here."""
+    cfg = build_nemo_gym_config(
+        _env_configs(
+            external_service_readiness={
+                "services": [
+                    {
+                        "name": "GENRM",
+                        "url": "http://10.0.0.1:9213/health",
+                        "expected_backends": 2,
+                    }
+                ],
+                "timeout_seconds": 10,
+                "poll_interval_seconds": 1,
+                "request_timeout_seconds": 2,
+            }
+        ),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+    )
+
+    readiness = cfg["external_service_readiness"]
+    assert isinstance(readiness, nemo_gym_mod.ExternalServiceReadinessConfig)
+    assert readiness.services[0].expected_backends == 2
+    assert "external_service_readiness" not in cfg["initial_global_config_dict"]
+
+
+def test_build_nemo_gym_config_rejects_invalid_external_service_readiness(
+    detected_uv_dirs,
+):
+    """A malformed gate fails on the driver, before any actor is created."""
+    service = {"name": "GENRM", "url": "http://10.0.0.1:9213/health"}
+    with pytest.raises(ValueError, match="must be unique"):
+        build_nemo_gym_config(
+            _env_configs(
+                external_service_readiness={
+                    "services": [
+                        {**service, "expected_backends": 1},
+                        {**service, "expected_backends": 2},
+                    ],
+                    "timeout_seconds": 10,
+                    "poll_interval_seconds": 1,
+                    "request_timeout_seconds": 2,
+                }
+            ),
+            base_urls=[],
+            model_name="test-model",
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
+
+
 def test_build_nemo_gym_config_moves_port_range_to_actor_fields(detected_uv_dirs):
     cfg = build_nemo_gym_config(
         _env_configs(port_range_low=6000, port_range_high=6999),
