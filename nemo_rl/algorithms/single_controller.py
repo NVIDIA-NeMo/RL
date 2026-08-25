@@ -1457,27 +1457,44 @@ class SingleControllerActor:
         )
 
     async def _drain_router_failures(self) -> None:
-        """Fold the router's observed backend failures into the fleet ledger.
+        """Fold the router's observed backend outcomes into the fleet ledger.
 
         The router is the only component that sees a *wedged* engine: it answers
         ``is_alive`` from a healthy worker process, so no probe can condemn it. The
         router holds no monitor reference by design -- membership flows one way -- so it
-        counts failures per backend URL and this drains them here, on the tick that
-        already talks to it.
+        counts per backend URL and this drains them here, on the tick that already talks
+        to it.
+
+        BOTH halves, and the successes first. ``consecutive_reported_failures`` is the only
+        counter that can condemn a wedged engine, and it is a *streak* -- but on the router
+        path nothing ever cleared it. ``report_success`` has exactly one caller, on the
+        native adapter, so a router run made the streak monotonic and every shard reached
+        ``unhealthy_threshold`` eventually, however healthy. Three unrelated blips days
+        apart, with thousands of successes between them, condemned a shard.
+
+        Successes first because they describe the same window: replaying failures onto a
+        streak that a success in that window should already have cleared is what made the
+        count monotonic in the first place. A genuinely wedged shard produces no successes,
+        so its condemnation timing is unchanged.
+
+        Deliberately not a reset on a clean *probe*: the reported streak is kept separate
+        from the probe streak precisely because a wedged engine still answers ``is_alive``.
         """
         if self._generation_router is None or self._gen_fleet is None:
             return
-        counts: dict[str, int] = await self._ray_get(
-            self._generation_router.drain_backend_failures.remote()
+        outcomes: dict[str, tuple[int, int]] = await self._ray_get(
+            self._generation_router.drain_backend_outcomes.remote()
         )
-        for url, count in counts.items():
+        for url, (successes, failures) in outcomes.items():
             shard_idx = self._gen_fleet.shard_for_base_url(url)
             if shard_idx is None:
                 continue
-            for _ in range(count):
+            if successes:
+                self._gen_fleet.report_success(shard_idx)
+            for _ in range(failures):
                 self._gen_fleet.report_failure(
                     shard_idx,
-                    RuntimeError(f"router: {count} failed request(s) to {url}"),
+                    RuntimeError(f"router: {failures} failed request(s) to {url}"),
                 )
 
     async def _reconcile_refit_membership(self, force: bool = False) -> Optional[bool]:

@@ -311,3 +311,135 @@ def test_the_reshard_refit_does_not_occupy_the_actors_event_loop():
             )
             return
     raise AssertionError("megatron_policy_worker.nccl_reshard_refit not found")
+
+
+def test_the_reshard_group_does_not_double_count_the_shard_offset():
+    """Both rank computations in vllm_backend must go through the same helper.
+
+    Under vLLM's external data parallelism each engine's torch world spans the whole
+    rollout, so get_rank() is ALREADY global and adding rank_prefix counts the shard offset
+    twice -- the higher shards then get NCCL ranks past the end of the group. init_collective
+    resolves this through resolve_rollout_rank; init_nccl_reshard_comm_group open-coded
+    `rank_prefix + get_rank()` and did not. Without external DP the two agree, which is why
+    it survived.
+    """
+    tree = ast.parse((GENERATION / "vllm" / "vllm_backend.py").read_text())
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "init_nccl_reshard_comm_group"
+        ):
+            called = {
+                c.func.id
+                for c in ast.walk(node)
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            }
+            assert "resolve_rollout_rank" in called, (
+                "init_nccl_reshard_comm_group must resolve its rank through "
+                "resolve_rollout_rank, like init_collective; adding rank_prefix to a "
+                "global get_rank() puts the higher shards past the end of the group."
+            )
+            return
+    raise AssertionError("init_nccl_reshard_comm_group not found")
+
+
+def test_the_reshard_preconditions_are_checked_on_the_single_controller_path():
+    """The guard had one caller, in grpo.setup, which SC does not go through.
+
+    run_grpo_single_controller calls setup_single_controller directly, so every
+    nccl_reshard precondition -- colocated.enabled, enable_eplb and the rest -- went
+    unenforced there and a bad config reached the first refit before anything noticed.
+    """
+    setup = (
+        REPO_ROOT / "nemo_rl" / "algorithms" / "single_controller_utils" / "setup.py"
+    )
+    tree = ast.parse(setup.read_text())
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "setup_single_controller"
+        ):
+            called = {
+                c.func.id
+                for c in ast.walk(node)
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            }
+            assert "check_nccl_reshard_refit_support" in called, (
+                "setup_single_controller must run the nccl_reshard precondition guard; "
+                "its only other caller is grpo.setup, which this path never reaches."
+            )
+            return
+    raise AssertionError("setup_single_controller not found")
+
+
+def _sent_by_reshard_synchronizer(method: str, *, receiver: str) -> set[str]:
+    """Keywords NcclReshardWeightSynchronizer sends to ONE side of the refit.
+
+    Scoped by receiver on purpose. Both sides are called `nccl_reshard_refit`, and they do
+    not take the same arguments: kv_scales is read off the trainer and rides the misc
+    broadcast, so the generation side never sees it. Matching on the method name alone
+    compares the two sides against each other and reports a difference that is correct.
+    """
+    path = REPO_ROOT / "nemo_rl" / "weight_sync" / "nccl_reshard_weight_synchronizer.py"
+    tree = ast.parse(path.read_text())
+    for call in ast.walk(tree):
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == method
+            and isinstance(call.func.value, ast.Attribute)
+            and call.func.value.attr == receiver
+        ):
+            return {kw.arg for kw in call.keywords if kw.arg is not None}
+    raise AssertionError(
+        f"the reshard synchronizer no longer calls {receiver}.{method}"
+    )
+
+
+def test_the_generation_reshard_hook_accepts_what_the_synchronizer_sends():
+    """The second of the two generation refit hooks, and the one that was missed.
+
+    The rule was already written down on `update_weights_from_collective`: the synchronizer
+    calls these polymorphically, so a signature that omits the parameter does not fail at
+    import or type-check time -- it fails at the Ray boundary during the first refit. The
+    rule was stated, applied to the policy interface and to one generation hook, and not to
+    this one.
+    """
+    sent = _sent_by_reshard_synchronizer("nccl_reshard_refit", receiver="_generation")
+    accepted = _kwargs_of(
+        REPO_ROOT / "nemo_rl" / "models" / "generation" / "interfaces.py",
+        "nccl_reshard_refit",
+    )
+    missing = sent - accepted
+    assert not missing, (
+        f"NcclReshardWeightSynchronizer sends {sorted(missing)} to "
+        "generation.nccl_reshard_refit(), but GenerationInterface does not accept "
+        f"{'it' if len(missing) == 1 else 'them'}."
+    )
+
+
+def test_the_rebuild_bootstraps_with_the_same_peer_protocol_as_the_first_build():
+    """A rebuilt communicator must not silently fall back to the "nemo" default.
+
+    The receiver's bootstrap is not negotiable: "nemo" publishes a raw unique ID and warms
+    up with a rank-0 broadcast, "vllm" adds a pickled ID key and warms up with an
+    all-reduce. Mismatched warmups on one communicator HANG rather than error -- the exact
+    failure the rebuild exists to remove, reappearing inside the recovery.
+    """
+    path = REPO_ROOT / "nemo_rl" / "weight_sync" / "collective_weight_synchronizer.py"
+    tree = ast.parse(path.read_text())
+    calls = [
+        call
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "init_collective"
+        and isinstance(call.func.value, ast.Attribute)
+        and call.func.value.attr == "_policy"
+    ]
+    assert calls, "no policy.init_collective call found"
+    for call in calls:
+        assert "nccl_peer" in {kw.arg for kw in call.keywords}, (
+            "every policy.init_collective must pass nccl_peer; the rebuild omitted it and "
+            "silently bootstrapped with the wrong protocol."
+        )
