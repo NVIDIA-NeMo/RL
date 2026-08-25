@@ -337,44 +337,96 @@ def test_rollout_config_rejects_partial_expert_ignore(nvfp4_module, pattern):
 # ------------------------------------------------------------- worker extension
 
 
-def test_prequantized_extension_uses_real_layerwise_reload_lifecycle(
-    nvfp4_module, monkeypatch
+def test_prequantized_extension_uses_native_ipc_reload(
+    nvfp4_module, monkeypatch, capsys
 ):
-    """The retained path must restore stable kernel storage after each refit."""
+    """IPC quantization feeds one checkpoint-format native vLLM reload."""
     M = nvfp4_module
-    from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.policy.utils import IPCProtocol, calculate_aligned_size
 
     _fake_scaled_fp4_quant(monkeypatch, M)
 
-    model = torch.nn.Linear(4, 4, bias=False)
-    record_metadata_for_reloading(model)
-    original_data_ptr = model.weight.data_ptr()
-    synchronized = []
+    name = "model.layers.0.mlp.experts.0.down_proj.weight"
+    source_weight = torch.randn(8, 32)
+    source_buffer = source_weight.view(torch.uint8)
+    used_bytes = calculate_aligned_size(source_weight.nbytes)
+    call_order = []
+
+    class FakeSocket:
+        def __init__(self):
+            self.payloads = iter(
+                [
+                    ("ipc-handle", [name], used_bytes),
+                    IPCProtocol.COMPLETE,
+                ]
+            )
+            self.sent = []
+
+        def recv_pyobj(self):
+            payload = next(self.payloads)
+            call_order.append(
+                "recv_complete" if payload == IPCProtocol.COMPLETE else "recv_data"
+            )
+            return payload
+
+        def send(self, payload):
+            self.sent.append(payload)
+            call_order.append(f"ack_{len(self.sent)}")
+
+    loaded = []
+    reload_kwargs = []
+
+    def reload_weights(**kwargs):
+        reload_kwargs.append(kwargs)
+        loaded.extend(kwargs["weights_iterator"])
+        call_order.append("reload_done")
+
     monkeypatch.setattr(
-        torch.accelerator, "synchronize", lambda: synchronized.append(True)
+        vllm_backend,
+        "rebuild_cuda_tensor_from_ipc",
+        lambda _handle, _device_index: source_buffer,
+    )
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        vllm_backend.torch.accelerator,
+        "synchronize",
+        lambda: call_order.append("final_sync"),
     )
 
     extension = M.NvFp4PerTokenWorkerExtension.__new__(M.NvFp4PerTokenWorkerExtension)
-    extension.device = torch.device("cpu")
-    extension.model_runner = types.SimpleNamespace(model=model)
-    extension.model_config = types.SimpleNamespace(dtype=torch.float32)
-    # The lifecycle's finish() hard-fails on a refit that quantized nothing, so
-    # stub the owning-module probe (this toy model has no expert layers) and
-    # process one synthetic expert weight before finalizing.
+    extension.device = torch.device("cuda:0")
+    extension.model_runner = types.SimpleNamespace(
+        model=object(), reload_weights=reload_weights
+    )
+    extension.state_dict_info = {name: (source_weight.shape, source_weight.dtype)}
+    extension.zmq_socket = FakeSocket()
+    extension.maybe_init_zmq = lambda: None
+    extension._synchronize_before_ipc_data_ack = lambda: call_order.append("data_sync")
     extension._quantizer = _quantizer_with_layer_quantized(M, True)
 
-    with extension._weight_update_lifecycle("ipc") as finalize:
-        assert model.weight.device.type == "meta"
-        extension._quantizer.process(
-            [("model.layers.0.mlp.experts.0.down_proj.weight", torch.randn(8, 32))]
-        )
-        finalize()
+    assert extension.update_weights_via_ipc_zmq() is True
 
-    assert model.weight.device.type == "cpu"
-    assert model.weight.data_ptr() == original_data_ptr
-    assert synchronized == [True]
+    assert len(reload_kwargs) == 1
+    assert reload_kwargs[0]["is_checkpoint_format"] is True
+    assert [key for key, _ in loaded] == [
+        f"{name_prefix}.{suffix}"
+        for name_prefix in [name.removesuffix(".weight")]
+        for suffix in ("weight", "weight_scale", "weight_scale_2", "input_scale")
+    ]
+    assert extension.zmq_socket.sent == [IPCProtocol.ACK.value.encode()] * 2
+    assert call_order == [
+        "recv_data",
+        "data_sync",
+        "ack_1",
+        "recv_complete",
+        "reload_done",
+        "final_sync",
+        "ack_2",
+    ]
     assert extension._weight_update_errors_are_fatal()
-    # The lifecycle must construct and reset a quantizer on entry, and finish()
-    # it (a no-op here — nothing was ever processed) before finalizing.
     assert extension._quantizer is not None
     assert not extension._quantizer._pending
+    printed = capsys.readouterr().out
+    assert "[nvfp4_pertoken] refit: quantized 1 expert weight groups" in printed
