@@ -43,13 +43,16 @@ def configure_generation_config(
     if config["stop_token_ids"] is None:
         config["stop_token_ids"] = [tokenizer.eos_token_id]
 
-    # vLLM setting shared by the standard and managed Dynamo backends.
-    if config["backend"] in ("vllm", "dynamo"):
+    # Managed Dynamo resolves this before launching its external vLLM workers.
+    if config["backend"] == "dynamo":
         vllm_backed_config = cast(VllmConfig, config)
         vllm_backed_config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
 
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
+        # Training defaults remain unresolved until the worker can inspect the model.
+        if is_eval:
+            config["vllm_cfg"]["load_format"] = "auto"
         if config.get("real_quant"):
             export_cpu_offload = config.get("real_quant_export_cpu_offload")
             if not isinstance(export_cpu_offload, bool):
@@ -67,7 +70,7 @@ def configure_generation_config(
                     "colocated CUDA-IPC refit with no explicit refit_transport"
                 )
 
-        # set load_format
+        # These startup paths require real checkpoint weights.
         if config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS:
             config["vllm_cfg"]["load_format"] = "auto"
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")

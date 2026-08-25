@@ -9,7 +9,8 @@ This document outlines special cases and model-specific behaviors that require c
 Gemma-3 models have a specific issue with vLLM dummy weight initialization due to a vLLM bug where [a `normalizer` buffer is created](https://github.com/vllm-project/vllm/blob/964472b9667508b1d4a7ed92068ff81740ae0036/vllm/model_executor/models/gemma3.py#L372) that is not present in the Hugging Face model. This causes the `normalizer` buffer to be set to dummy weights at initialization and then never updated with the correct values during model refit. As a workaround for this issue, we do not use dummy weight initialization for vLLM with Gemma-3 models and instead use the `load_format="auto"` setting to load the full weights at initialization.
 
 **Special Handling:**
-- We automatically use `load_format="auto"` for Gemma-3 models when initializing vLLM.
+- When `vllm_cfg.load_format` is unset, we automatically use `load_format="auto"` for Gemma-3 models when initializing vLLM.
+- During training, an explicit `vllm_cfg.load_format` takes precedence over this model heuristic. Only request `dummy` when refit updates every model parameter and buffer. Evaluation always loads checkpoint weights with `auto`.
 - This avoids issues with dummy weight initialization, where the dummy weights for this buffer would never get overwritten during refit.
 
 ### vLLM V1 runtime

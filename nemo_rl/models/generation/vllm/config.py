@@ -53,7 +53,8 @@ class VllmSpecificArgs(TypedDict):
     # Optional video contract. When present, NeMo RL registers its TorchCodec
     # loader and uses these exact sampling values on both sides of GRPO.
     video: NotRequired[VllmVideoConfig]
-    load_format: NotRequired[str]
+    # None/absent selects the model-aware training default; explicit values bypass that heuristic.
+    load_format: NotRequired[str | None]
     precision: NotRequired[str]
     # Whether vLLM returns logprobs before or after generation-time logit
     # processors. RL policy recomputation uses raw model logits, so recipes

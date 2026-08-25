@@ -41,10 +41,12 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
+    _resolve_load_format,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
+from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
@@ -504,6 +506,68 @@ def test_configure_generation_config_uses_real_startup_weights_without_draft_ref
     assert configured["vllm_cfg"]["load_format"] == "auto"
 
 
+@pytest.mark.parametrize(
+    ("configured_load_format", "is_eval", "expected_load_format"),
+    [
+        ("auto", False, "auto"),
+        ("dummy", False, "dummy"),
+        ("auto", True, "auto"),
+        ("dummy", True, "auto"),
+        (None, False, None),
+        (None, True, "auto"),
+    ],
+)
+def test_configure_generation_config_resolves_load_format_precedence(
+    configured_load_format: str | None,
+    is_eval: bool,
+    expected_load_format: str | None,
+) -> None:
+    vllm_config = deepcopy(basic_vllm_test_config)
+    if configured_load_format is None:
+        del vllm_config["vllm_cfg"]["load_format"]
+    else:
+        vllm_config["vllm_cfg"]["load_format"] = configured_load_format
+
+    configured = configure_generation_config(
+        vllm_config,
+        MagicMock(pad_token_id=0, eos_token_id=1),
+        is_eval=is_eval,
+    )
+
+    assert configured["vllm_cfg"].get("load_format") == expected_load_format
+
+
+@pytest.mark.parametrize(
+    ("configured_load_format", "model_requires_auto", "expected_load_format"),
+    [
+        ("auto", False, "auto"),
+        ("dummy", True, "dummy"),
+        (None, False, "dummy"),
+        (None, True, "auto"),
+    ],
+)
+def test_resolve_load_format_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_load_format: str | None,
+    model_requires_auto: bool,
+    expected_load_format: str,
+) -> None:
+    matches = MagicMock(return_value=model_requires_auto)
+    monkeypatch.setattr(ModelFlag, "matches", matches)
+
+    assert (
+        _resolve_load_format(
+            configured_load_format=configured_load_format,
+            model_name="model",
+        )
+        == expected_load_format
+    )
+    if configured_load_format is None:
+        matches.assert_called_once_with("model")
+    else:
+        matches.assert_not_called()
+
+
 @pytest.mark.parametrize("transport", ["vllm_s3_sparse", "vllm_zmq_sparse"])
 def test_configure_generation_config_uses_real_delta_baseline(transport: str):
     vllm_config = deepcopy(basic_vllm_test_config)
@@ -518,6 +582,7 @@ def test_configure_generation_config_uses_real_delta_baseline(transport: str):
 
 def test_configure_generation_config_keeps_dummy_startup_weights_for_nixl():
     vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_cfg"]["load_format"] = "dummy"
     vllm_config["refit_transport"] = "nixl"
 
     configured = configure_generation_config(
@@ -530,6 +595,7 @@ def test_configure_generation_config_keeps_dummy_startup_weights_for_nixl():
 def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refit():
     """Speculative training can keep dummy startup weights when draft refit is available."""
     vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_cfg"]["load_format"] = "dummy"
     vllm_config["vllm_kwargs"] = {
         "speculative_config": {
             "method": "eagle3",
@@ -648,6 +714,7 @@ def test_configure_generation_config_keeps_dummy_startup_weights_for_mtp(method)
     read the full base-model checkpoint).
     """
     vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_cfg"]["load_format"] = "dummy"
     vllm_config["vllm_kwargs"] = {
         "speculative_config": {
             "method": method,

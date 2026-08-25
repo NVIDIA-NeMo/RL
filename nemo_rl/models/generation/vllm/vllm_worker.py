@@ -88,6 +88,12 @@ def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     return enable_prefix_caching
 
 
+def _resolve_load_format(*, configured_load_format: str | None, model_name: str) -> str:
+    if configured_load_format is not None:
+        return configured_load_format
+    return "auto" if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(model_name) else "dummy"
+
+
 def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -> None:
     """Merge fp8 init kwargs into ``vllm_kwargs`` in place, preserving user overrides.
 
@@ -443,9 +449,10 @@ class BaseVllmGenerationWorker:
             os.environ["VLLM_DP_MASTER_IP"] = addr_list[leader_rank]
             os.environ["VLLM_DP_MASTER_PORT"] = str(port_list[leader_rank])
 
-        load_format = self.cfg["vllm_cfg"]["load_format"]
-        if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
-            load_format = "auto"
+        load_format = _resolve_load_format(
+            configured_load_format=self.cfg["vllm_cfg"].get("load_format"),
+            model_name=self.model_name,
+        )
 
         # MTP speculative decoding with load_format="dummy" gets its policy
         # weights via refit, but the MTP draft layer is not covered by refit, so
