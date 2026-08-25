@@ -38,6 +38,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _create_advantage_estimator,
+    _get_effort_config,
     _get_grpo_save_state,
 )
 from nemo_rl.algorithms.grpo import MasterConfig as GrpoMasterConfig
@@ -810,6 +811,7 @@ def setup_single_controller(
             env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
         ),
         retry_policy=_build_retry_policy(master_config),
+        effort_config=_get_effort_config(cast(GrpoMasterConfig, master_config)),
     )
 
     # Print setup timing metrics
