@@ -305,6 +305,16 @@ class VllmInternalWorkerExtension:
             previous.abort()
         self.pp_comm_groups = {}
         for stage in range(pp_size):
+            # The other half of the pair printed on the train side. A rendezvous that never
+            # comes up shows only a 300s connect timeout naming the address, which does not
+            # say whether the master never bound it or the two sides disagreed about
+            # world_size or rank. These two lines answer that directly.
+            print(
+                f"  refit: reshard rendezvous [gen] stage={stage} "
+                f"addr={pp_ips[stage]}:{pp_ports[stage]} "
+                f"rank={gen_rank_in_group} world_size={sub_world_size}",
+                flush=True,
+            )
             group = StatelessProcessGroup(
                 master_address=pp_ips[stage],
                 port=pp_ports[stage],

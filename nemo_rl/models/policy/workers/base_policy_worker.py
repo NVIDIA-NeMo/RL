@@ -90,6 +90,18 @@ class AbstractPolicyWorker:
         if self.pp_comm_group is not None:
             self.pp_comm_group.abort()
 
+        # Printed on both sides of this rendezvous, because a mismatch here is invisible
+        # otherwise: the party that got it wrong just waits, and the other reports a 300s
+        # connect timeout naming only the address. Jobs 6512153 and 6513879 both died that
+        # way after an ABORTED reshard refit -- the same rebuild works after a clean kill --
+        # and two rounds of reasoning about which side was at fault produced two wrong
+        # answers. Compare these lines against the gen side's before theorising.
+        print(
+            f"  refit: reshard rendezvous [train] stage={my_pp_stage} "
+            f"addr={pp_ips[my_pp_stage]}:{pp_ports[my_pp_stage]} "
+            f"rank={my_rank_in_group} world_size={sub_world_size}",
+            flush=True,
+        )
         self.pp_comm_group = StatelessProcessGroup(
             master_address=pp_ips[my_pp_stage],
             port=pp_ports[my_pp_stage],
