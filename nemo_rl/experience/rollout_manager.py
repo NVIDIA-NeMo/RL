@@ -1117,7 +1117,6 @@ class AsyncNemoGymRolloutImpl:
         rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
             "gen_tokens_per_sample/mean"
         ]
-
         return rollout_metrics
 
 
