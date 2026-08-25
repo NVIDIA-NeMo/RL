@@ -44,10 +44,10 @@ flowchart LR
 `te_precision_config_file` selects which modules use it. The provided precision
 recipe applies NVFP4 to MLP linears and keeps attention linears in BF16.
 
-`fp4_param=false` keeps persistent model parameters in BF16. NVFP4 is used for
-the selected forward computations, while the optimizer continues to update the
-BF16 model through FP32 master parameters. FP8 and FP4 cannot be enabled
-together.
+`fp4_param` defaults to `false`, which keeps persistent model parameters in
+BF16. NVFP4 is used for the selected forward computations, while the optimizer
+continues to update the BF16 model through FP32 master parameters. FP8 and FP4
+cannot be enabled together.
 
 During policy training, per-token activation scaling gives each token its own
 activation range. This reduces the effect of outlier tokens and matches the
@@ -125,8 +125,6 @@ policy:
     fp4_cfg:
       enabled: true
       fp4: e2m1
-      fp4_recipe: nvfp4
-      fp4_param: false
     first_last_layers_bf16: true
     num_layers_at_start_in_bf16: 2
     num_layers_at_end_in_bf16: 4
