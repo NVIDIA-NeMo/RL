@@ -18,9 +18,20 @@ Pausing a run to checkpoint and resuming it should train on the same prompt
 groups as never pausing at all. The matrix below is every combination that
 holds right now.
 
-Cases that do **not** hold live in ``test_checkpoint_no_data_loss_xfail.py``,
-each marked with the line that drops the data. When a fix lands, its case moves
-from that table into ``PASSING`` here.
+Two bars, and the difference matters:
+
+* ``PASSING`` -- the full bar. Every group the run still needs comes back.
+* ``NO_REGRESSION`` -- the weaker bar. Nothing that came back *before this
+  change* was lost. This holds for every ``windowed`` row, including ones that
+  still drop in-flight groups, which is what makes the xfail file honest.
+
+The other two files split the failures by which bar they miss:
+
+* ``test_checkpoint_regressions.py`` -- misses the weaker bar. Groups that used
+  to come back and no longer do. **Not** xfail; a step backwards should be loud.
+* ``test_checkpoint_no_data_loss_xfail.py`` -- clears the weaker bar, misses the
+  full one. Gaps that were here before. ``xfail(strict=True)``, so a fix turns
+  them into failures and the row gets moved into ``PASSING`` here.
 """
 
 from __future__ import annotations
@@ -31,6 +42,7 @@ import pytest
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
 from tests.unit.single_controller._checkpoint_scenarios import (
+    ALL_SCENARIOS,
     CAPACITY,
     PARTITION,
     ROLLOUTS_PER_GROUP,
@@ -41,6 +53,7 @@ from tests.unit.single_controller._checkpoint_scenarios import (
     _fresh_client,
     _new_buffer,
     assert_no_data_loss,
+    assert_no_regression,
     patch_converter,
     round_trip,
     sampler_config,
@@ -56,6 +69,11 @@ PASSING = [
     Case(S_STALE_ONLY, "windowed"),
 ]
 
+# The weaker bar -- "nothing that used to come back was lost" -- holds for every
+# windowed row, including the ones that still drop in-flight groups. Gated
+# samplers fail this and live in test_checkpoint_regressions.py.
+NO_REGRESSION = [Case(s, "windowed") for s in ALL_SCENARIOS]
+
 
 @pytest.fixture(autouse=True)
 def _converter(monkeypatch):
@@ -68,6 +86,11 @@ def test_restore_returns_every_group_the_run_still_needs(case, tmp_path):
     assert result.recovered == case.scenario.must_survive(), (
         "restore should return exactly the outstanding groups -- no more, no less"
     )
+
+
+@pytest.mark.parametrize("case", NO_REGRESSION, ids=lambda c: c.id)
+def test_restore_still_returns_what_it_used_to(case, tmp_path):
+    assert_no_regression(case.scenario, case.sampler, tmp_path)
 
 
 # ── properties that back the matrix up ──────────────────────────────────────

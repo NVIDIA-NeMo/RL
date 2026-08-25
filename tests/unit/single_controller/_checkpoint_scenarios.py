@@ -128,12 +128,36 @@ class Scenario:
         """Groups a restore has to return, or data is lost.
 
         Handed out, not trained, not deliberately evicted -- and below the
-        cursor, so the dataloader will never produce them again.
+        cursor, so the dataloader will never produce them again. This is the
+        bar the feature should eventually meet, not the bar it meets today.
         """
         return {
             _gid(g.gid)
             for g in self.groups
             if not g.evicted and g.gid not in self.trained and g.gid < self.cursor
+        }
+
+    def recoverable_before_this_pr(self) -> set[str]:
+        """What the pre-PR code would have brought back, for any sampler.
+
+        On the merge base the buffer was saved on every checkpoint with no
+        capability gate, and restored whenever the saved sampler name matched
+        the configured one -- which it always does on a same-sampler resume.
+        ``state_dict`` there saved the ready slots and said so outright:
+        *"Unready reservations are in-flight rollouts and are dropped, matching
+        legacy semantics."*
+
+        So the old behaviour is exactly: every committed group still held at
+        checkpoint time. Losing any of these is a step backwards, which is a
+        different and more serious thing than not yet closing a gap that was
+        always there.
+        """
+        return {
+            _gid(g.gid)
+            for g in self.groups
+            if not g.evicted
+            and g.gid not in self.trained
+            and g.done == ROLLOUTS_PER_GROUP
         }
 
 
@@ -238,9 +262,21 @@ async def _fill(buf: TQReplayBuffer, scenario: Scenario) -> None:
 
 @dataclass
 class RoundTrip:
-    """What a save/restore cycle returned."""
+    """What a save/restore cycle returned.
+
+    ``recovered`` is deliberately *presence*, not readiness: a group counts as
+    recovered if the restored buffer knows about it at all. That keeps the
+    assertions independent of how a future partial-group restore is built. A
+    group could come back already committed (its missing rollouts regenerated
+    before the save), or as a reserved slot waiting to be finished -- either
+    way the run has not lost the prompt, and either way these tests notice.
+    ``ready`` and ``pending`` are reported separately for diagnosis only;
+    nothing asserts on them.
+    """
 
     recovered: set[str]
+    ready: set[str]
+    pending: set[str]
     saved_sidecar: bool
     rows_before: set[str]
     rows_after: set[str]
@@ -280,8 +316,13 @@ async def _round_trip(
             expected_manifest_digest=sidecar["manifest_digest"],
         )
 
+    ready = {
+        gid for gid, is_ready in zip(buf_b._group_ids, buf_b.ready_list) if is_ready
+    }
     return RoundTrip(
         recovered=set(buf_b._group_ids),
+        ready=ready,
+        pending=set(buf_b._group_ids) - ready,
         saved_sidecar=sidecar is not None,
         rows_before=rows_before,
         rows_after=set(dp_b.list_sample_ids(PARTITION)),
@@ -296,15 +337,38 @@ def round_trip(scenario: Scenario, sampler_name: str, tmp_path: Path) -> RoundTr
 def assert_no_data_loss(
     scenario: Scenario, sampler_name: str, tmp_path: Path
 ) -> RoundTrip:
-    """Fail if the restore dropped any group the run still needs."""
+    """Fail if the restore dropped any group the run still needs.
+
+    The full bar: everything handed out and not yet trained comes back.
+    """
     result = round_trip(scenario, sampler_name, tmp_path)
-    expected = scenario.must_survive()
-    missing = sorted(expected - result.recovered)
+    missing = sorted(scenario.must_survive() - result.recovered)
     assert not missing, (
         f"{sampler_name}/{scenario.name}: restore dropped {missing}. "
         f"These groups were handed out by the dataloader, never trained, and sit "
         f"below the saved cursor ({scenario.cursor}), so nothing will produce them "
         f"again. recovered={sorted(result.recovered)}"
+    )
+    return result
+
+
+def assert_no_regression(
+    scenario: Scenario, sampler_name: str, tmp_path: Path
+) -> RoundTrip:
+    """Fail if this restore lost something the pre-PR code kept.
+
+    A weaker bar than :func:`assert_no_data_loss`, and a much sharper signal.
+    Not closing a gap that was always there is a missing feature. Dropping
+    groups the old code brought back is a step backwards, and one that no
+    config change can work around.
+    """
+    result = round_trip(scenario, sampler_name, tmp_path)
+    lost = sorted(scenario.recoverable_before_this_pr() - result.recovered)
+    assert not lost, (
+        f"{sampler_name}/{scenario.name}: {lost} came back before this change and "
+        f"do not now. These groups finished generating and committed, so the old "
+        f"save wrote them and the old restore returned them on a same-sampler "
+        f"resume. recovered={sorted(result.recovered)}"
     )
     return result
 
