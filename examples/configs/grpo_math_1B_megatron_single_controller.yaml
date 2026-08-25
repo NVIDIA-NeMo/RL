@@ -112,8 +112,8 @@ async_rl:
   # native path calls generation over Ray.
   generation_router:
     enabled: false
-    port_range_low: 6000              # distinct from Gym (5000-5999) and vLLM (7000-8999)
-    port_range_high: 6099
+    port_range_low: 1100              # head-only carve-out below Ray GCS (1200)
+    port_range_high: 1200
     backend_timeout_s: 600.0          # covers a whole generation; Gym sets none at all
     connect_timeout_s: 5.0            # a local handshake is ms-or-never
     no_healthy_backend_status: 409    # must stay outside Gym's retry set

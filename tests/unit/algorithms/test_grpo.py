@@ -144,6 +144,7 @@ def test_legacy_generation_router_defaults_to_disabled_when_block_is_absent() ->
     config = LegacyAsyncRLConfig().generation_router
 
     assert config == GenerationRouterConfig(enabled=False)
+    assert (config.port_range_low, config.port_range_high) == (1100, 1200)
 
 
 def test_legacy_generation_router_is_validated_at_config_parse_time() -> None:
@@ -212,6 +213,8 @@ def test_optimized_recipe_enables_router_with_tail_safe_timeout() -> None:
     config = MasterConfig.model_validate(resolved)
 
     assert config.async_rl.generation_router.enabled is True
+    assert config.async_rl.generation_router.port_range_low == 1100
+    assert config.async_rl.generation_router.port_range_high == 1200
     assert config.async_rl.generation_router.backend_timeout_s == 1200.0
     assert config.grpo.deduplicate_multimodal_data is True
     assert config.grpo.debug_payload_metrics is False

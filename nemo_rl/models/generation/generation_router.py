@@ -55,6 +55,8 @@ from pydantic import BaseModel, PositiveFloat, PositiveInt, model_validator
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
     _get_free_port_local,
     _get_node_ip_local,
 )
@@ -79,9 +81,11 @@ class GenerationRouterConfig(BaseModel, extra="allow"):
 
     # When true, NeMo-Gym receives the router's URL instead of the raw backend URLs.
     enabled: bool = False
-    # Deliberately distinct from Gym (5000-5999) and vLLM (7000-8999).
-    port_range_low: PositiveInt = 6000
-    port_range_high: PositiveInt = 6099
+    # Dedicated head-node range below Ray GCS (1200). In particular, do not use
+    # 6000-6999: ray.sub reserves that whole band for sandbox Nginx/uWSGI on every
+    # allocated node, including the Ray head where this actor is pinned.
+    port_range_low: PositiveInt = DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+    port_range_high: PositiveInt = DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
     # Router -> backend deadline, covering the whole generation.
     backend_timeout_s: PositiveFloat = 600.0
     # TCP handshake deadline, separate from the whole-generation deadline.

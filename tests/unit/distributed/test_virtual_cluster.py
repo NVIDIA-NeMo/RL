@@ -23,6 +23,8 @@ import ray
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
     DEFAULT_GENERATION_PORT_RANGE_LOW,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
     DEFAULT_MASTER_PORT_RANGE_HIGH,
@@ -637,10 +639,17 @@ class TestVllmPortAssignment:
 def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     # Lowest observed ephemeral floor on some GB200 nodes; stock Linux is 32768.
     EPHEMERAL_FLOOR = 9000
+    assert (
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+        < DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
+    )
+    # ray.sub assigns 1200 to the head-node GCS service.
+    assert DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH <= 1200
     assert DEFAULT_MASTER_PORT_RANGE_LOW < DEFAULT_MASTER_PORT_RANGE_HIGH
     assert DEFAULT_GENERATION_PORT_RANGE_LOW < DEFAULT_GENERATION_PORT_RANGE_HIGH
     assert DEFAULT_GYM_PORT_RANGE_LOW < DEFAULT_GYM_PORT_RANGE_HIGH
-    # Ordered, non-overlapping bands: master < generation < gym < vllm.
+    # Ordered, non-overlapping bands: router < master < generation < gym < vllm.
+    assert DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH < DEFAULT_MASTER_PORT_RANGE_LOW
     assert DEFAULT_MASTER_PORT_RANGE_HIGH < DEFAULT_GENERATION_PORT_RANGE_LOW
     assert DEFAULT_GENERATION_PORT_RANGE_HIGH < DEFAULT_GYM_PORT_RANGE_LOW
     assert DEFAULT_GYM_PORT_RANGE_HIGH < DEFAULT_VLLM_PORT_RANGE_LOW
@@ -667,4 +676,4 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     )
     assert DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH < EPHEMERAL_FLOOR
     # Avoid privileged ports (<1024).
-    assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
+    assert DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW > 1024

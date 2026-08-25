@@ -5,6 +5,8 @@ grpo:
 async_rl:
   generation_router:
     enabled: true
+    port_range_low: 1100
+    port_range_high: 1200
     # Above the observed 8-9 minute generation tail so a router timeout cannot
     # masquerade as a throughput improvement in the diagnostic A/B.
     backend_timeout_s: 1200.0

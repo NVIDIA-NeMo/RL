@@ -128,6 +128,11 @@ class _Harness:
 
 
 class TestRouterStartup:
+    def test_default_range_uses_the_dedicated_head_node_carveout(self) -> None:
+        config = GenerationRouterConfig()
+
+        assert (config.port_range_low, config.port_range_high) == (1100, 1200)
+
     def test_disabled_returns_an_unmodified_copy_of_raw_urls(self) -> None:
         raw_urls = ["http://a:1/v1", None, "http://b:2/v1"]
 
@@ -153,8 +158,9 @@ class TestRouterStartup:
         actor_handle.base_url.remote.return_value = base_url_ref
         actor_class = MagicMock()
         actor_class.options.return_value.remote.return_value = actor_handle
+        get_free_port = MagicMock(return_value=1107)
         monkeypatch.setattr(router_module, "GenerationRouterActor", actor_class)
-        monkeypatch.setattr(router_module, "_get_free_port_local", lambda *_: 6007)
+        monkeypatch.setattr(router_module, "_get_free_port_local", get_free_port)
         monkeypatch.setattr(router_module, "_get_node_ip_local", lambda: "10.0.0.1")
         monkeypatch.setattr(
             router_module.ray,
@@ -164,7 +170,7 @@ class TestRouterStartup:
         monkeypatch.setattr(
             router_module.ray,
             "get",
-            lambda value: "http://10.0.0.1:6007/v1" if value is base_url_ref else value,
+            lambda value: "http://10.0.0.1:1107/v1" if value is base_url_ref else value,
         )
 
         config = GenerationRouterConfig(enabled=True)
@@ -175,15 +181,16 @@ class TestRouterStartup:
             health_managed=False,
         )
 
-        assert routed_urls == ["http://10.0.0.1:6007/v1"]
+        assert routed_urls == ["http://10.0.0.1:1107/v1"]
         assert handle is actor_handle
         assert raw_urls == ["http://a:1/v1", None, "http://b:2/v1"]
         assert config.model_dump() == config_before
         assert "generation_fleet_health.enabled=false" in capsys.readouterr().out
+        get_free_port.assert_called_once_with(1100, 1200)
         actor_class.options.return_value.remote.assert_called_once_with(
             backend_urls=["http://a:1/v1", "http://b:2/v1"],
             host="10.0.0.1",
-            port=6007,
+            port=1107,
             backend_timeout_s=600.0,
             connect_timeout_s=5.0,
             no_healthy_backend_status=409,

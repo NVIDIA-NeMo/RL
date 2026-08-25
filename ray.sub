@@ -155,6 +155,7 @@ fi
 #
 # Port layout (all below ephemeral floor at 9000). Python port-range bounds
 # are half-open: [low, high).
+#   1100-1199    NeMo-Gym generation router (head only)
 #   1200-1201    Ray GCS + client server (head only)
 #   1301-1312    Ray management (node-mgr, obj-mgr, etc.; odd=worker, even=head)
 #   1313-1399    Dynamo etcd/NATS control plane (driver-local allocation)
