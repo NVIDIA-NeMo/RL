@@ -1,0 +1,128 @@
+defaults: ../../grpo_math_1B.yaml
+# Validated end-to-end W4A4 per-token NVFP4 recipe for Qwen3-30B-A3B-Base on
+# 8 nodes with 4 NVIDIA Blackwell GPUs per node. Policy training uses TE NVFP4;
+# colocated vLLM rollout quantizes updated BF16 expert weights during refit.
+grpo:
+  max_num_steps: 1500
+  val_at_start: true
+  use_dynamic_sampling: true
+  batch_multiplier: 3
+  dynamic_sampling_max_gen_batches: 20
+  use_leave_one_out_baseline: false
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    max_response_length: 20480
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken
+  checkpoint_must_save_by: 00:04:15:00
+policy:
+  model_name: /lustre/fsw/general_sa/shuangy/models/Qwen/Qwen3-30B-A3B-Base
+  tokenizer:
+    name: /lustre/fsw/general_sa/shuangy/models/Qwen/Qwen3-30B-A3B-Base
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 22528
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: true
+  make_sequence_length_divisible_by: 8
+  dtensor_cfg:
+    enabled: false
+  router_replay:
+    enabled: true
+  megatron_cfg:
+    enabled: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    activation_checkpointing: true
+    defer_fp32_logits: true
+    batch_invariant_mode: false
+    moe_router_dtype: fp32
+    fp4_cfg:
+      enabled: true
+      fp4: e2m1
+      fp4_recipe: nvfp4
+      fp4_param: false
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 2
+    num_layers_at_end_in_bf16: 4
+    te_precision_config_file: examples/configs/te_precision/attn_bf16_mlp_nvfp4.yaml
+    optimizer:
+      use_precision_aware_optimizer: false
+      lr: 1.0e-06
+      min_lr: 1.0e-07
+      weight_decay: 0.1
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-08
+    checkpoint:
+      async_save: false
+    env_vars:
+      NRL_MEGATRON_CHECKPOINT_DIR: /lustre/fsw/general_sa/shuangy/hf/megatron_ckpt_qwen3_30ba3b_nvfp4_pertoken
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False,garbage_collection_threshold:0.8
+      NVTE_NVFP4_ROW_SCALED_ACTIVATION: '1'
+      NVTE_NVFP4_DISABLE_RHT: '1'
+      NVTE_NVFP4_DISABLE_2D_QUANTIZATION: '1'
+      NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING: '1'
+      NVTE_BACKWARD_OVERRIDE: dequantized
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+    train_mb_tokens: 22528
+    logprob_mb_tokens: 22528
+  generation:
+    max_new_tokens: 20480
+    nvfp4_pertoken_rollout:
+      enabled: true
+      additional_ignore:
+      - '*.layers.0.mlp.experts*'
+      - '*.layers.1.mlp.experts*'
+      - '*.layers.44.mlp.experts*'
+      - '*.layers.45.mlp.experts*'
+      - '*.layers.46.mlp.experts*'
+      - '*.layers.47.mlp.experts*'
+    vllm_kwargs:
+      moe_backend: auto
+    vllm_cfg:
+      gpu_memory_utilization: 0.5
+      precision: bfloat16
+      env_vars:
+        FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH: '1'
+        TRTLLM_DISABLE_FP4_QUANT_FAST_MATH: '1'
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken
+  num_val_samples_to_print: 8
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    entity: nv-welcome
+    project: qwen3-30b-nvfp4
+    name: grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
