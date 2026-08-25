@@ -481,6 +481,10 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # Passed through to the Megatron model's freeze() method.
+    # Supported keys are model-specific, such as freeze_vision_model,
+    # freeze_vision_projection, and freeze_language_model.
+    freeze_config: NotRequired[dict[str, Any]]
 
 
 class DraftConfigDisabled(TypedDict):
@@ -505,6 +509,8 @@ class TokenizerConfig(TypedDict):
     chat_template: NotRequired[str | None]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]
+    # Arguments forwarded to tokenizer loading via get_tokenizer.
+    tokenizer_kwargs: NotRequired[dict[str, Any] | None]
     # Multimodal configs
     audio: NotRequired[dict[str, Any]]
     video: NotRequired[dict[str, Any]]

@@ -87,8 +87,15 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
+    FRONTIER_ORDINAL_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
+    PENDING_PROMPTS_KEY,
+    RESUME_BASE_ORDINAL_KEY,
+    RETAINED_TASK_INDICES_KEY,
+    TRAINED_TASK_INDICES_KEY,
 )
+from nemo_rl.experience.metric_utils import is_histogram_metric
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     attach_initial_nemo_gym_image_payloads,
@@ -149,6 +156,56 @@ from nemo_rl.weight_sync.factory import create_weight_synchronizer
 # Configuration
 # ===============================================================================
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def _maybe_restore_async_replay_buffer_checkpoint(
+    replay_buffer: Any,
+    checkpoint_path: str,
+    *,
+    load_replay_buffer: bool | None,
+    num_prompts_per_step: int,
+    current_training_step: int,
+    max_age_steps: int,
+) -> dict[str, Any] | None:
+    """Restore async replay state unless the config explicitly opts out.
+
+    With ``checkpointing.load_replay_buffer=false`` the buffer starts empty
+    and, on a frontier-aligned checkpoint, the whole buffered window is
+    regenerated fresh from the rewound dataloader — the empty-retained-set
+    case of the same resume path. This trades resume compute for an unbiased
+    step composition: retained groups are the ones whose longest rollout
+    happened to finish before the save, so reusing them skews the next steps
+    toward short-rollout prompts.
+
+    Returns:
+        The restore metadata from ``load_from_path``, or ``None`` when the
+        restore was skipped or no checkpoint file exists.
+    """
+    if load_replay_buffer is False:
+        print(
+            "📦 Skipping replay buffer restore (checkpointing.load_replay_buffer=false)"
+        )
+        return None
+
+    replay_buffer_path = os.path.join(checkpoint_path, "replay_buffer.pt")
+    if not os.path.exists(replay_buffer_path):
+        print(
+            f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
+            "Starting with an empty replay buffer."
+        )
+        return None
+
+    print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
+    restore_metadata = ray.get(
+        replay_buffer.load_from_path.remote(
+            replay_buffer_path,
+            num_prompts_per_step=num_prompts_per_step,
+            current_training_step=current_training_step,
+            max_age_steps=max_age_steps,
+        )
+    )
+    print("✅ Replay buffer restored from checkpoint")
+    return restore_metadata
 
 
 def _save_async_replay_buffer_checkpoint(
@@ -1101,11 +1158,6 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
-    gen_init_time_key = (
-        "megatron_generation_init_time_s"
-        if backend == "megatron"
-        else f"{backend}_init_time_s"
-    )
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
     generation_config["_debug_payload_metrics"] = grpo_config.debug_payload_metrics
     remote_transport = None
@@ -1161,9 +1213,13 @@ def setup(
     # plane exists. Default is the plain Policy class — legacy behavior.
     _make_policy = policy_factory if policy_factory is not None else Policy
 
-    def init_policy():
+    def init_policy(reserved_http_server_port: Optional[int] = None):
         """Initialize policy training workers."""
         t0 = time.perf_counter()
+        extra_policy_kwargs = {}
+        if reserved_http_server_port is not None:
+            # Colocated Megatron generation serves HTTP from the training workers.
+            extra_policy_kwargs["reserved_http_server_port"] = reserved_http_server_port
         p = _make_policy(
             cluster=train_cluster,
             config=policy_config,
@@ -1173,6 +1229,7 @@ def setup(
             optimizer_path=optimizer_path,
             init_optimizer=True,
             init_reference_model=init_reference_model,
+            **extra_policy_kwargs,
         )
         # Keep custom policy_factory call signatures backward compatible.
         p.debug_payload_metrics = grpo_config.debug_payload_metrics
@@ -1200,7 +1257,9 @@ def setup(
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
-    def init_megatron_generation(policy=None):
+    def init_megatron_generation(
+        policy=None, reserved_http_server_port: Optional[int] = None
+    ):
         """Initialize Megatron generation."""
         t0 = time.perf_counter()
         mg = MegatronGeneration(
@@ -1211,6 +1270,7 @@ def setup(
             processor=processor,
             weights_path=weights_path,
             skip_weight_load=not colocated_inference,
+            reserved_http_server_port=reserved_http_server_port,
         )
         return mg, time.perf_counter() - t0
 
@@ -1249,7 +1309,7 @@ def setup(
             parallel_wall_time = time.perf_counter() - parallel_start_time
 
             # Store timing metrics
-            setattr(setup_timing_metrics, gen_init_time_key, generation_time)
+            setup_timing_metrics.generation_init_time_s = generation_time
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.parallel_wall_time_s = parallel_wall_time
             setup_timing_metrics.parallel_init_enabled = 1.0
@@ -1263,7 +1323,7 @@ def setup(
 
             # Initialize generation engine first (clean GPU memory), then policy
             policy_generation, generation_time = init_generation_fn()
-            setattr(setup_timing_metrics, gen_init_time_key, generation_time)
+            setup_timing_metrics.generation_init_time_s = generation_time
 
             policy, policy_time = init_policy()
             setup_timing_metrics.policy_init_time_s = policy_time
@@ -1273,21 +1333,78 @@ def setup(
 
     # Handle generation-specific setup
     if backend == "megatron":
-        # Initialize training first so checkpoint conversion completes before inference starts.
-        policy, policy_time = init_policy()
-        setup_timing_metrics.policy_init_time_s = policy_time
-
-        # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
-        policy_generation, megatron_gen_time = init_megatron_generation(policy)
-        setup_timing_metrics.megatron_generation_init_time_s = megatron_gen_time
-
         if enable_nemo_gym:
-            # The Megatron inference engine must be up before its server URLs exist.
-            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
-                policy_generation.dp_openai_server_base_urls,
-                generation_config["model_name"],
+            print(
+                "  ⚡ Reserving the Megatron server address for overlapped NeMo Gym init",
+                flush=True,
             )
+            reserve_t0 = time.perf_counter()
+            reserved_url, reserved_http_server_port, port_holder = (
+                MegatronGeneration.reserve_http_server_address(
+                    train_cluster if colocated_inference else inference_cluster,
+                    policy_config,
+                )
+            )
+            reserve_time = time.perf_counter() - reserve_t0
+            setup_timing_metrics.generation_init_reserve_time_s = reserve_time
+            print(f"  ✓ Reserved Megatron server URL: {reserved_url}", flush=True)
+
+            def init_megatron_stack():
+                """Init policy then generation; rank 0 holds the reserved port."""
+                p, policy_t = init_policy(
+                    reserved_http_server_port=reserved_http_server_port
+                    if colocated_inference
+                    else None
+                )
+                pg, gen_t = init_megatron_generation(
+                    p,
+                    reserved_http_server_port=None
+                    if colocated_inference
+                    else reserved_http_server_port,
+                )
+                return p, policy_t, pg, gen_t
+
+            def init_nemo_gym():
+                """Spin up NeMo Gym servers against the reserved URL."""
+                return _spinup_nemo_gym([reserved_url], generation_config["model_name"])
+
+            init_tasks = {
+                "megatron": init_megatron_stack,
+                "nemo_gym": init_nemo_gym,
+            }
+            print(f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}", flush=True)
+            try:
+                with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                    submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
+                    results = {k: f.result() for k, f in submitted.items()}
+            finally:
+                ray.kill(port_holder)
+
+            policy, policy_time, policy_generation, megatron_gen_time = results[
+                "megatron"
+            ]
+            nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
+            setup_timing_metrics.policy_init_time_s = policy_time
+            setup_timing_metrics.generation_init_time_s = (
+                reserve_time + megatron_gen_time
+            )
+            setup_timing_metrics.generation_init_load_time_s = megatron_gen_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
+
+            served_urls = policy_generation.dp_openai_server_base_urls
+            if served_urls != [reserved_url]:
+                raise RuntimeError(
+                    "Megatron server came up at a different address than the one "
+                    f"pre-published to NeMo Gym: reserved {reserved_url}, serving {served_urls}."
+                )
+        else:
+            # Initialize training first so checkpoint conversion completes before inference starts.
+            policy, policy_time = init_policy()
+            setup_timing_metrics.policy_init_time_s = policy_time
+
+            # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
+            policy_generation, megatron_gen_time = init_megatron_generation(policy)
+            setup_timing_metrics.generation_init_time_s = megatron_gen_time
 
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
@@ -1410,7 +1527,11 @@ def setup(
                 policy_generation, vllm_load_time = results["vllm"]
                 policy, policy_time = results["policy"]
             nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
-            setup_timing_metrics.vllm_init_time_s = vllm_reserve_time + vllm_load_time
+            setup_timing_metrics.generation_init_time_s = (
+                vllm_reserve_time + vllm_load_time
+            )
+            setup_timing_metrics.generation_init_reserve_time_s = vllm_reserve_time
+            setup_timing_metrics.generation_init_load_time_s = vllm_load_time
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
         else:
@@ -1546,7 +1667,7 @@ def setup(
             # Load the model weights now.
             t0 = time.perf_counter()
             policy_generation.weight_synchronizer.sync_weights()
-            setup_timing_metrics.generation_init_load_time_s = time.perf_counter() - t0
+            setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
     # if it is not colocated inference, initialize collective communication for update weights
     elif (
         not colocated_inference
@@ -1664,7 +1785,7 @@ def setup(
     )
 
     # Log worker initialization timing metrics to logger
-    print_setup_timing_summary(setup_timing_metrics, gen_init_time_key)
+    print_setup_timing_summary(setup_timing_metrics)
     logger.log_metrics(
         setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
     )
@@ -3686,20 +3807,6 @@ def grpo_train(
                     logger,
                 )
 
-            # Plot ISL/OSL/ISL+OSL histograms to wandb
-            if (
-                master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("async_engine", False)
-            ):
-                for metric_name in metrics.keys():
-                    if metric_name.startswith("histogram/"):
-                        logger.log_histogram(
-                            metrics[metric_name],
-                            total_steps + 1,
-                            f"generation_metrics/{metric_name}",
-                        )
-
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
@@ -4036,6 +4143,7 @@ def aggregate_rollout_metrics(
     """Aggregate rollout metrics from multiple trajectory groups.
 
     Different metric types are aggregated according to their semantics:
+    - Histogram observations: flattened into one step-level distribution
     - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
     - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
     - "total_turns": summed
@@ -4050,7 +4158,9 @@ def aggregate_rollout_metrics(
     """
     aggregated = {}
     for k, v in per_group_metrics.items():
-        if not isinstance(v[0], (int, float)):
+        if is_histogram_metric(k):
+            aggregated[k] = [observation for group in v for observation in group]
+        elif not isinstance(v[0], (int, float)):
             aggregated[k] = v
         elif k.endswith("/min") or (k.startswith("min_") and not k.endswith("_rate")):
             aggregated[k] = min(v)
@@ -4235,26 +4345,17 @@ def async_grpo_train(
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    replay_buffer_restore_metadata: dict[str, int] | None = None
+    replay_buffer_restore_metadata: dict[str, Any] | None = None
     rollouts_state = None
     if last_checkpoint_path is not None:
-        replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
-        if os.path.exists(replay_buffer_path):
-            print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
-            replay_buffer_restore_metadata = ray.get(
-                replay_buffer.load_from_path.remote(
-                    replay_buffer_path,
-                    num_prompts_per_step=num_prompts_per_step,
-                    current_training_step=step,
-                    max_age_steps=max_trajectory_age_steps,
-                )
-            )
-            print("✅ Replay buffer restored from checkpoint")
-        else:
-            print(
-                f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
-                "Starting with an empty replay buffer."
-            )
+        replay_buffer_restore_metadata = _maybe_restore_async_replay_buffer_checkpoint(
+            replay_buffer,
+            last_checkpoint_path,
+            load_replay_buffer=master_config.checkpointing.get("load_replay_buffer"),
+            num_prompts_per_step=num_prompts_per_step,
+            current_training_step=step,
+            max_age_steps=max_trajectory_age_steps,
+        )
 
         rollouts_path = os.path.join(last_checkpoint_path, "rollouts.pt")
         if os.path.exists(rollouts_path):
@@ -4266,6 +4367,72 @@ def async_grpo_train(
         int(
             (replay_buffer_restore_metadata or {}).get(NEXT_NEMO_GYM_TASK_INDEX_KEY, 0)
         ),
+    )
+
+    # Frontier-aligned resume: the checkpoint saved the dataloader state at
+    # the trained frontier rather than the live cursor, so the collector
+    # re-yields the covered window and regenerates every prompt that is
+    # neither trained nor retained in the restored buffer. Legacy checkpoints
+    # (no frontier metadata) keep today's behavior.
+    frontier_ordinal = (rollouts_state or {}).get(FRONTIER_ORDINAL_KEY)
+    resume_base_ordinal = (rollouts_state or {}).get(RESUME_BASE_ORDINAL_KEY)
+    frontier_restore = frontier_ordinal is not None and resume_base_ordinal is not None
+    if frontier_restore:
+        retained_task_indices = list(
+            (replay_buffer_restore_metadata or {}).get(RETAINED_TASK_INDICES_KEY, [])
+        )
+        # Ordinals trained at/above the cut, covered like retained groups so
+        # the re-yielded window regenerates only what was lost.
+        trained_task_indices = [
+            int(ordinal)
+            for ordinal in (rollouts_state or {}).get(TRAINED_TASK_INDICES_KEY, [])
+        ]
+        covered_task_indices = sorted(
+            set(retained_task_indices) | set(trained_task_indices)
+        )
+        collector_start_kwargs: dict[str, Any] = {
+            "next_nemo_gym_task_index": int(resume_base_ordinal),
+            "resume_frontier_ordinal": int(frontier_ordinal),
+            "resume_covered_task_indices": covered_task_indices,
+            # The rewound dataloader re-yields any carried-over remainder.
+            "pending_batch": None,
+            "ordinals_frontier_aligned": True,
+        }
+        print(
+            "📦 Frontier-aligned resume: dataloader rewound to ordinal "
+            f"{resume_base_ordinal}, trained frontier {frontier_ordinal}, "
+            f"{len(retained_task_indices)} retained prompt groups, "
+            f"{len(trained_task_indices)} trained above the cut"
+        )
+    else:
+        collector_start_kwargs = {
+            "next_nemo_gym_task_index": next_nemo_gym_task_index,
+            "pending_batch": (rollouts_state or {}).get(PENDING_PROMPTS_KEY),
+            # Ordinal == stream position only holds for runs that have used
+            # frontier-aligned checkpoints from the start; a legacy resume
+            # keeps live-cursor checkpoints.
+            "ordinals_frontier_aligned": last_checkpoint_path is None,
+        }
+        if last_checkpoint_path is not None:
+            print(
+                "⚠️ Legacy checkpoint resume: frontier-aligned checkpointing "
+                "is disabled for this run and every checkpoint descended from "
+                "it. Checkpoints will save the live dataloader cursor, so a "
+                "resume may skip prompts that were in flight at the save."
+            )
+
+    # High-water mark of trained group ordinals, exclusive — the checkpoint
+    # frontier. consumed_samples cannot serve here: tolerated generation
+    # failures leave stream holes it never sees, so it lags the true stream
+    # position.
+    trained_frontier_ordinal = (
+        int(frontier_ordinal) if frontier_ordinal is not None else consumed_samples
+    )
+    # Trained ordinals at/above the last checkpoint cut, persisted so a
+    # resume covers them instead of re-training them. Pruned at each save;
+    # the cut never decreases, so pruning is safe.
+    recent_trained_task_indices: set[int] = (
+        set(trained_task_indices) if frontier_restore else set()
     )
 
     _tc_py_exec = get_actor_python_env(
@@ -4303,8 +4470,8 @@ def async_grpo_train(
         teacher_worker_groups=teacher_worker_groups,
         alias_to_group_alias=alias_to_group_alias,
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
-        next_nemo_gym_task_index=next_nemo_gym_task_index,
         processor=processor,
+        **collector_start_kwargs,
     )
 
     print(
@@ -4622,6 +4789,24 @@ def async_grpo_train(
                     # Extract trajectories and metadata from sample result
                     trajectories = sample_result["trajectories"]
                     avg_trajectory_age = sample_result["avg_trajectory_age"]
+
+                    # Advance the trained frontier from the sampled groups'
+                    # own stream ordinals.
+                    sampled_ordinals = [
+                        trajectory.get(NEMO_GYM_TASK_INDEX_KEY)
+                        for trajectory in trajectories
+                        if isinstance(trajectory, dict)
+                    ]
+                    if sampled_ordinals and all(
+                        ordinal is not None for ordinal in sampled_ordinals
+                    ):
+                        trained_frontier_ordinal = max(
+                            trained_frontier_ordinal,
+                            max(int(ordinal) for ordinal in sampled_ordinals) + 1,
+                        )
+                        recent_trained_task_indices.update(
+                            int(ordinal) for ordinal in sampled_ordinals
+                        )
 
                     print(
                         f"✅ Sampled {len(trajectories)} trajectory groups from buffer (avg age: {avg_trajectory_age:.2f} steps)"
@@ -5204,21 +5389,47 @@ def async_grpo_train(
                             ),
                             checkpointing_cfg=master_config.checkpointing,
                         )
-                        # Get dataloader state from trajectory collector
-                        actual_dataloader_state = ray.get(
-                            trajectory_collector.get_dataloader_state.remote()
+                        # Save the dataloader state at the checkpoint cut
+                        # rather than the live cursor; a resume re-yields the
+                        # covered window and regenerates what the restored
+                        # buffer does not account for. One actor call returns
+                        # the snapshot and rollout state as a consistent pair
+                        # (separate reads would race the collection loop).
+                        collector_checkpoint = ray.get(
+                            trajectory_collector.get_checkpoint_state.remote(
+                                trained_frontier_ordinal
+                            )
                         )
+                        dataloader_snapshot = collector_checkpoint["dataloader"]
+                        rollouts_state = collector_checkpoint["rollouts"]
                         torch.save(
-                            actual_dataloader_state,
+                            dataloader_snapshot["dataloader_state"],
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
                         _save_async_replay_buffer_checkpoint(
                             replay_buffer,
                             checkpoint_path,
                         )
-                        rollouts_state = ray.get(
-                            trajectory_collector.get_rollouts_state.remote()
-                        )
+                        if dataloader_snapshot["frontier_aligned"]:
+                            # Persist the (possibly lowered) cut as the
+                            # resume filter threshold, not the trained
+                            # frontier.
+                            cut_ordinal = int(dataloader_snapshot["frontier_ordinal"])
+                            rollouts_state[FRONTIER_ORDINAL_KEY] = cut_ordinal
+                            rollouts_state[RESUME_BASE_ORDINAL_KEY] = (
+                                dataloader_snapshot["base_ordinal"]
+                            )
+                            # Ordinals trained at/above the cut: the resume
+                            # must not regenerate these. Prune below the cut
+                            # (it never decreases).
+                            recent_trained_task_indices = {
+                                ordinal
+                                for ordinal in recent_trained_task_indices
+                                if ordinal >= cut_ordinal
+                            }
+                            rollouts_state[TRAINED_TASK_INDICES_KEY] = sorted(
+                                recent_trained_task_indices
+                            )
                         torch.save(
                             rollouts_state,
                             os.path.join(checkpoint_path, "rollouts.pt"),
@@ -5305,20 +5516,6 @@ def async_grpo_train(
                     ],
                     logger,
                 )
-
-            # Plot ISL/OSL/ISL+OSL histograms to wandb
-            if (
-                master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("async_engine", False)
-            ):
-                for metric_name in metrics.keys():
-                    if metric_name.startswith("histogram/"):
-                        logger.log_histogram(
-                            metrics[metric_name],
-                            step + 1,
-                            f"generation_metrics/{metric_name}",
-                        )
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")
