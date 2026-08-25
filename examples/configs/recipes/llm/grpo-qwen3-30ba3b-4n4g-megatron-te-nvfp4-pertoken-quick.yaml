@@ -27,8 +27,6 @@ policy:
     fp4_cfg:
       enabled: true
       fp4: e2m1
-      fp4_recipe: nvfp4
-      fp4_param: false
     first_last_layers_bf16: true
     num_layers_at_start_in_bf16: 2
     num_layers_at_end_in_bf16: 4
