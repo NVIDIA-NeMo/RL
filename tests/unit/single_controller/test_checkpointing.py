@@ -905,6 +905,9 @@ class TestPPOWarmupCheckpoint:
     def test_warmup_step_skips_the_top_k_metric(self, actor):
         """No policy metrics exist yet, so the checkpoint just is not a candidate."""
         actor._master_config.checkpointing["metric_name"] = "train:loss"
+        # Seed it so the delattr in the warmup branch is observable; the bare
+        # namespace never had the attribute, so the assertion would be vacuous.
+        setattr(actor._save_state, "train:loss", 1.23)
 
         with pytest.warns(UserWarning, match="not available during PPO critic warmup"):
             asyncio.run(actor._save_checkpoint({}, is_policy_training_step=False))

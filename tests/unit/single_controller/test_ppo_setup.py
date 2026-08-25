@@ -351,6 +351,22 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="PPO critic-warmup knob"):
             validate_single_controller_config(mc)
 
+    def test_rejects_warmup_lookahead_without_critic_warmup_on_a_ppo_run(self):
+        """With policy_training_start_step=0 there is no window to widen."""
+        mc = _ppo_master_config()
+        mc.async_rl.sampler.warmup_lookahead_versions = 2
+
+        with pytest.raises(ValueError, match="no frozen-policy window to widen"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_negative_reference_policy_kl_penalty(self):
+        """ClippedPGLossConfig has no ge= constraint, so the guard is reachable."""
+        mc = _ppo_master_config()
+        mc.loss_fn.reference_policy_kl_penalty = -0.1
+
+        with pytest.raises(ValueError, match="must not be negative"):
+            validate_single_controller_config(mc)
+
     def test_grpo_is_free_to_use_any_sampler(self):
         mc = _make_master_config()
         mc.async_rl.sampler = WindowedSamplerConfig()

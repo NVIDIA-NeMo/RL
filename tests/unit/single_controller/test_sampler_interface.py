@@ -262,6 +262,33 @@ class TestWarmupLookaheadWindow:
 
         assert sampler.required_buffer_capacity(groups_per_step=4) == 16
 
+    def test_retuning_the_gate_reopens_admission(self):
+        """The live window is what admit gates on, so widening it admits more."""
+        s = InOrderSampler(
+            FakeBuffer(), max_lookahead_versions=1, warmup_lookahead_versions=3
+        )
+
+        # dispatch_index starts at -1; window 1 admits the live batch and one
+        # lookahead batch against a trainer parked at 0, then blocks.
+        assert _run(s.admit(trainer_version_fn=lambda: 0)) == 0
+        assert _run(s.admit(trainer_version_fn=lambda: 0)) == 1
+        with pytest.raises(asyncio.TimeoutError):
+            _run(asyncio.wait_for(s.admit(trainer_version_fn=lambda: 0), timeout=0.05))
+
+        s.set_gate_window(3)
+
+        assert _run(s.admit(trainer_version_fn=lambda: 0)) == 2
+        assert _run(s.admit(trainer_version_fn=lambda: 0)) == 3
+        with pytest.raises(asyncio.TimeoutError):
+            _run(asyncio.wait_for(s.admit(trainer_version_fn=lambda: 0), timeout=0.05))
+
+        # ...and shrinking it back closes the gate again: at dispatch_index 3 a
+        # trainer on version 2 is inside the warmup window but outside the steady one.
+        s.set_gate_window(1)
+
+        with pytest.raises(asyncio.TimeoutError):
+            _run(asyncio.wait_for(s.admit(trainer_version_fn=lambda: 2), timeout=0.05))
+
     def test_set_gate_window_rejects_a_negative_window(self):
         sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
 
