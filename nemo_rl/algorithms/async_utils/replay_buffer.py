@@ -337,13 +337,10 @@ class ReplayBufferImpl(ReplayBufferProtocol):
     def get_held_task_indices(self) -> list[int]:
         """Ordinals of every prompt group currently held in the buffer.
 
-        Queried at checkpoint time: sampling removes trained groups, so
-        everything held here is buffered-but-untrained. Under target
-        interleaving with partial completion, some of these ordinals sit
-        below the trained frontier and the buffer is their only record — the
-        checkpoint cut must not sit above them, or a resume with
-        ``checkpointing.load_replay_buffer=false`` (which discards the
-        buffer) would never re-yield them.
+        All held groups are untrained (sampling removes trained ones). The
+        checkpoint cut must not exceed any of these ordinals: with
+        ``checkpointing.load_replay_buffer=false`` the buffer is discarded on
+        resume, and ordinals below the cut are never re-yielded.
         """
         with self._lock:
             return sorted(

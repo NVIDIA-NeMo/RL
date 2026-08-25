@@ -4317,9 +4317,8 @@ def async_grpo_train(
         retained_task_indices = list(
             (replay_buffer_restore_metadata or {}).get(RETAINED_TASK_INDICES_KEY, [])
         )
-        # Ordinals trained at/above the cut (present when target interleaving
-        # lowered the cut): covered like retained groups, so the re-yielded
-        # window regenerates only what was genuinely lost — no re-training.
+        # Ordinals trained at/above the cut, covered like retained groups so
+        # the re-yielded window regenerates only what was lost.
         trained_task_indices = [
             int(ordinal)
             for ordinal in (rollouts_state or {}).get(TRAINED_TASK_INDICES_KEY, [])
@@ -4358,21 +4357,16 @@ def async_grpo_train(
                 "resume may skip prompts that were in flight at the save."
             )
 
-    # High-water mark of trained group ordinals, exclusive: the checkpoint
-    # frontier. consumed_samples counts prompts per step, but tolerated
-    # generation failures (max_generation_failures > 0) leave holes in the
-    # stream that the counter never sees, so it lags the true stream position
-    # — a frontier derived from it would re-train the lag window and treat
-    # dropped prompts as covered on resume. The trained rows' own ordinals
-    # have no such drift.
+    # High-water mark of trained group ordinals, exclusive — the checkpoint
+    # frontier. consumed_samples cannot serve here: tolerated generation
+    # failures leave stream holes it never sees, so it lags the true stream
+    # position.
     trained_frontier_ordinal = (
         int(frontier_ordinal) if frontier_ordinal is not None else consumed_samples
     )
-    # Trained ordinals at/above the last checkpoint cut. When interleaving
-    # lowers a future cut below the frontier, these are persisted so a resume
-    # covers them instead of re-training them. Seeded from the restored
-    # checkpoint (those prompts stay covered until the cut passes them) and
-    # pruned at each save — the cut is non-decreasing, so pruning is safe.
+    # Trained ordinals at/above the last checkpoint cut, persisted so a
+    # resume covers them instead of re-training them. Pruned at each save;
+    # the cut never decreases, so pruning is safe.
     recent_trained_task_indices: set[int] = (
         set(trained_task_indices) if frontier_restore else set()
     )
@@ -4733,8 +4727,7 @@ def async_grpo_train(
                     avg_trajectory_age = sample_result["avg_trajectory_age"]
 
                     # Advance the trained frontier from the sampled groups'
-                    # own stream ordinals (see the tracker's definition for
-                    # why consumed_samples cannot serve as the frontier).
+                    # own stream ordinals.
                     sampled_ordinals = [
                         trajectory.get(NEMO_GYM_TASK_INDEX_KEY)
                         for trajectory in trajectories
@@ -5332,16 +5325,12 @@ def async_grpo_train(
                             ),
                             checkpointing_cfg=master_config.checkpointing,
                         )
-                        # Save the dataloader state aligned with the trained
-                        # frontier rather than the live cursor, which has
-                        # already advanced past prompts that are still in
-                        # flight or buffered. A resume re-yields the covered
-                        # window and regenerates whatever the restored buffer
-                        # does not retain, so no prompt is skipped. Falls back
-                        # to the live cursor for runs whose ordinals are not
-                        # frontier-aligned. One actor call returns the
-                        # snapshot and the rollout state as a consistent
-                        # pair — separate reads would race the collection loop.
+                        # Save the dataloader state at the checkpoint cut
+                        # rather than the live cursor; a resume re-yields the
+                        # covered window and regenerates what the restored
+                        # buffer does not account for. One actor call returns
+                        # the snapshot and rollout state as a consistent pair
+                        # (separate reads would race the collection loop).
                         collector_checkpoint = ray.get(
                             trajectory_collector.get_checkpoint_state.remote(
                                 trained_frontier_ordinal
@@ -5358,21 +5347,17 @@ def async_grpo_train(
                             checkpoint_path,
                         )
                         if dataloader_snapshot["frontier_aligned"]:
-                            # The collector may lower the cut below the
-                            # trained frontier when prompts below it are
-                            # still in flight (target interleaving); the
-                            # persisted threshold must be the cut, or the
-                            # resume filter would drop the re-yielded window
-                            # as already-trained.
+                            # Persist the (possibly lowered) cut as the
+                            # resume filter threshold, not the trained
+                            # frontier.
                             cut_ordinal = int(dataloader_snapshot["frontier_ordinal"])
                             rollouts_state[FRONTIER_ORDINAL_KEY] = cut_ordinal
                             rollouts_state[RESUME_BASE_ORDINAL_KEY] = (
                                 dataloader_snapshot["base_ordinal"]
                             )
-                            # Trained ordinals the re-yielded window must NOT
-                            # regenerate: everything trained at/above the cut.
-                            # Prune below the cut — the cut never decreases,
-                            # so those ordinals can never be re-yielded.
+                            # Ordinals trained at/above the cut: the resume
+                            # must not regenerate these. Prune below the cut
+                            # (it never decreases).
                             recent_trained_task_indices = {
                                 ordinal
                                 for ordinal in recent_trained_task_indices

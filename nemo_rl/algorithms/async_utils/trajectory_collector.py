@@ -217,23 +217,20 @@ class AsyncTrajectoryCollector:
         self._generating_targets: set[int] = set()
         self._next_nemo_gym_task_index = next_nemo_gym_task_index
 
-        # Unconsumed suffix of the last gap-fill batch. Prompts land here
-        # instead of being discarded, are consumed before the next dataloader
-        # pull, and ride get_rollouts_state() so a checkpoint cannot strand
-        # them. Written by the collection thread, read at checkpoint time from
-        # the actor thread, hence the lock.
+        # Unconsumed suffix of the last gap-fill batch, consumed before the
+        # next dataloader pull and serialized into fallback checkpoints.
+        # Written by the collection thread, read at checkpoint time from the
+        # actor thread, hence the lock.
         self._pending_lock: _threading.Lock = _threading.Lock()
         self._pending_batch: Optional[BatchedDataDict[DatumSpec]] = pending_batch
 
-        # Frontier-aligned checkpointing. Every yielded prompt is stamped with
-        # a monotonic ordinal equal to its global position in the dataloader
-        # stream, and a small ring of pre-pull dataloader snapshots keyed by
-        # that ordinal lets checkpoints save a dataloader state aligned with
-        # the trained frontier instead of the (further advanced) live cursor.
-        # On a frontier restore, rows whose ordinals were already trained
-        # (< resume_frontier_ordinal) or retained in the restored buffer are
-        # dropped at yield, so the existing gap-fill path regenerates exactly
-        # the prompts a legacy resume would have skipped.
+        # Frontier-aligned checkpointing. Every yielded prompt is stamped
+        # with a monotonic ordinal equal to its position in the dataloader
+        # stream; this ring of pre-pull dataloader snapshots, keyed by that
+        # ordinal, is what checkpoints save instead of the live cursor. On a
+        # frontier restore, re-yielded rows that are already covered (below
+        # the cut, or in resume_covered_task_indices) are dropped at yield
+        # and the gap-fill path regenerates the rest.
         self._snapshot_lock: _threading.Lock = _threading.Lock()
         self._dataloader_snapshots: deque[tuple[int, dict]] = deque(maxlen=512)
         # False when ordinals cannot be trusted to equal the trained-prompt
@@ -247,12 +244,9 @@ class AsyncTrajectoryCollector:
         )
 
         # Group ordinals dispatched to a rollout worker and not yet buffered.
-        # The checkpoint cut is min(outstanding, trained frontier): after a
-        # tolerated generation failure, a target refilled from later prompts
-        # can train ordinals PAST another target's still-running groups, so
-        # prompts below the trained frontier may still be in flight — saving
-        # the frontier itself would strand them (never re-yielded on resume,
-        # never in the buffer).
+        # Target interleaving can leave ordinals below the trained frontier
+        # in flight; the checkpoint cut must not sit above the minimum of
+        # this set (see get_checkpoint_state).
         self._outstanding_lock: _threading.Lock = _threading.Lock()
         self._outstanding_task_indices: set[int] = set()
 
@@ -591,10 +585,9 @@ class AsyncTrajectoryCollector:
         """Drop re-yielded rows a frontier restore already accounts for.
 
         After a frontier-aligned restore the dataloader re-yields the window
-        between the trained frontier and the old cursor. Rows already trained
-        (ordinal below the frontier) or retained in the restored buffer are
-        dropped; what remains is exactly the set a legacy resume would have
-        skipped, and the normal gap-fill path regenerates it.
+        between the cut and the old cursor. Rows already covered (ordinal
+        below the cut, or in the covered set) are dropped; the normal
+        gap-fill path regenerates the rest.
 
         Returns:
             The (possibly row-filtered) batch, or ``None`` when every row was
@@ -646,11 +639,10 @@ class AsyncTrajectoryCollector:
     def get_checkpoint_dataloader_state(self, frontier_ordinal: int) -> dict[str, Any]:
         """Return the dataloader state a checkpoint should persist.
 
-        Prefers the snapshot taken just before the batch containing
-        ``frontier_ordinal`` was pulled, so a resume re-yields (and
-        regenerates) everything past the trained frontier instead of skipping
-        it. Falls back to the live cursor when ordinals are not
-        frontier-aligned or the snapshot ring no longer covers the frontier.
+        Returns the newest ring snapshot at or below ``frontier_ordinal``, so
+        a resume re-yields everything past it. Falls back to the live cursor
+        when ordinals are not frontier-aligned or the snapshot ring no longer
+        covers the frontier.
 
         Args:
             frontier_ordinal: The trained-prompt count (consumed_samples).
@@ -691,13 +683,10 @@ class AsyncTrajectoryCollector:
     def get_checkpoint_state(self, frontier_ordinal: int) -> dict[str, Any]:
         """Return the dataloader snapshot and rollout state as one consistent pair.
 
-        Reading them in separate actor calls lets the collection loop consume
-        the pending remainder and pull the next batch in between, so a
-        fallback (live-cursor) checkpoint could pair a cursor already past
-        batch K+1 with a pending suffix of batch K+1 — duplicating those
-        prompts on resume. Holding the pending lock across both reads keeps
-        the pair consistent: the loop cannot take or store the pending batch
-        while it is held.
+        Both are read while holding the pending lock so the collection loop
+        cannot consume or replace the pending batch in between; a torn pair
+        (cursor newer than its pending suffix) would duplicate prompts on a
+        fallback resume.
 
         The pending remainder is only included on fallback snapshots. On a
         frontier-aligned snapshot the rewound dataloader re-yields it (the
@@ -728,12 +717,10 @@ class AsyncTrajectoryCollector:
         """
         with self._outstanding_lock:
             outstanding_min = min(self._outstanding_task_indices, default=None)
-        # Buffered-but-untrained groups are covered only by the replay
-        # buffer, and checkpointing.load_replay_buffer=false discards it on
-        # resume — so the cut must not sit above them either. Read AFTER the
-        # outstanding set: a group leaves that set only once its buffer add
-        # has succeeded, so between the two reads every dispatched group is
-        # visible to at least one of them.
+        # The cut is also bounded by buffered-untrained ordinals: their only
+        # record is the buffer, which load_replay_buffer=false discards on
+        # resume. Read after the outstanding set — an ordinal leaves it only
+        # once its buffer add succeeded, so no group is missed by both reads.
         held_task_indices = ray.get(self.replay_buffer.get_held_task_indices.remote())
         buffered_min = min(held_task_indices, default=None)
         cut = frontier_ordinal
@@ -843,10 +830,8 @@ class AsyncTrajectoryCollector:
             # Task indices are stamped at yield time in _collection_loop, so
             # slices and carried-over remainders keep their original ordinals.
             rollout_batch = batch.slice(0, num_prompts_to_generate)
-            # Task indices are stamped at yield time in _collection_loop (not
-            # here), so slices and carried-over remainders keep their original
-            # stream ordinals; capture this slice's ordinals for the
-            # outstanding set before dispatch.
+            # Rows are stamped at yield time, so this slice carries its
+            # original stream ordinals; record them for the outstanding set.
             dispatched_task_indices = _stamped_task_indices(rollout_batch)
             if use_nemo_gym and self._deduplicate_multimodal_data:
                 attach_initial_nemo_gym_image_payloads(
@@ -1403,10 +1388,8 @@ class AsyncTrajectoryCollector:
                 )
         finally:
             if dispatched_task_indices:
-                # Anything still outstanding here was neither buffered nor
-                # re-queued — a tolerated failure's permanent loss. It must
-                # stop holding the checkpoint cut down, or one failed batch
-                # would pin every later checkpoint's base forever.
+                # This worker's unbuffered ordinals are a permanent loss and
+                # must not keep holding the checkpoint cut down.
                 with self._outstanding_lock:
                     self._outstanding_task_indices.difference_update(
                         dispatched_task_indices
@@ -1535,12 +1518,8 @@ class AsyncTrajectoryCollector:
                 if status == "success":
                     buffered_group_indices.add(rollout_result.group_index)
                     if group_task_index is not None:
-                        # Leaving the outstanding set only moves this
-                        # ordinal's checkpoint coverage from "in flight" to
-                        # "buffered": get_checkpoint_state also queries the
-                        # buffer's held ordinals when computing the cut, so
-                        # buffered-untrained groups stay protected even for
-                        # load_replay_buffer=false resumes.
+                        # The cut now covers this ordinal via the buffer's
+                        # held-ordinal report instead of the outstanding set.
                         with self._outstanding_lock:
                             self._outstanding_task_indices.discard(
                                 int(group_task_index)
