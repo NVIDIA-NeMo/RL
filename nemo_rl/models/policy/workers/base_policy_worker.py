@@ -49,14 +49,13 @@ class AbstractPolicyWorker:
             train_world_size: Number of training workers (used in inference cluster)
             nccl_peer: NCCL initialization protocol used by the inference workers
         """
+        from nemo_rl.distributed.refit_watchdog import RELEASE_GRACE_S, release_within
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         # Printed on both sides, like the reshard rendezvous below, and for the same
-        # reason. Job 6517523 showed the reshard bulk group is never reached on a rebuild
-        # after an abort -- so the failure is HERE, in the shared model_update_group, and a
-        # connect timeout names only the address. rank 0 is a trainer and is this store's
-        # master, so the absence of this line from a rebuild means the trainer never bound
-        # the port at all, which is a different bug from the two sides disagreeing.
+        # reason: a connect timeout names only the address, so without this there is no
+        # way to tell a trainer that never bound the port from two sides that disagree
+        # about which port to use. rank 0 is a trainer and is this store's master.
         print(
             f"  refit: collective rendezvous [train] addr={ip}:{port} "
             f"rank={self.rank} world_size={world_size} "
@@ -65,15 +64,26 @@ class AbstractPolicyWorker:
             flush=True,
         )
 
+        # BIND BEFORE RELEASING, and never the other way round. rank 0 is this store's
+        # master, so every other rank is already counting down a 300s connect timeout
+        # against this port; anything slow that runs first is spent from that budget.
+        # Releasing first cost job 6518381 the whole run -- see release_within.
+        old_group, self.model_update_group = (
+            self.model_update_group,
+            StatelessProcessGroup(
+                master_address=ip, port=port, rank=self.rank, world_size=world_size
+            ),
+        )
         # Rebuilding is the recovery path for a dead generation rank, so this runs more
         # than once per job. Without the release, each rebuild would strand the previous
-        # NCCL communicator and its TCPStore for the life of the worker.
-        if self.model_update_group is not None:
-            self.model_update_group.abort()
-
-        self.model_update_group = StatelessProcessGroup(
-            master_address=ip, port=port, rank=self.rank, world_size=world_size
-        )
+        # NCCL communicator and its TCPStore for the life of the worker. Bounded, because
+        # the peer this is releasing may be frozen rather than dead.
+        if old_group is not None:
+            release_within(
+                old_group.abort,
+                RELEASE_GRACE_S,
+                "the previous refit communicator",
+            )
         device = torch.cuda.current_device()
         # Release unused cached allocator blocks before NCCL communicator
         # initialization so transport buffers have sufficient device-memory headroom.
@@ -95,14 +105,14 @@ class AbstractPolicyWorker:
         stage's group (``pp_ips[my_pp_stage]`` / ``pp_ports[my_pp_stage]``).
         Non-PP is simply ``pp_size == 1`` that contains all the train ranks.
         """
+        from nemo_rl.distributed.refit_watchdog import RELEASE_GRACE_S, release_within
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         # Released for the same reason init_collective releases model_update_group:
         # _build re-runs both communicator families on every reconcile, so without this
         # each recovery strands a NCCL communicator and a bound TCPStore per PP stage for
-        # the life of the worker.
-        if self.pp_comm_group is not None:
-            self.pp_comm_group.abort()
+        # the life of the worker. Deferred past the rendezvous and bounded, same as there.
+        stale_group, self.pp_comm_group = self.pp_comm_group, None
 
         # Printed on both sides of this rendezvous, because a mismatch here is invisible
         # otherwise: the party that got it wrong just waits, and the other reports a 300s
@@ -127,6 +137,13 @@ class AbstractPolicyWorker:
         torch.cuda.empty_cache()
         self.pp_comm_group.init_nccl_communicator(device=device)
         self.my_pp_stage = my_pp_stage
+
+        if stale_group is not None:
+            release_within(
+                stale_group.abort,
+                RELEASE_GRACE_S,
+                "the previous reshard bulk communicator",
+            )
 
     def prepare_nccl_reshard_refit_info(
         self,

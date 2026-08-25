@@ -242,6 +242,7 @@ class VllmInternalWorkerExtension:
         train_world_size: int,
     ) -> None:
         """Initialize the collective communication."""
+        from nemo_rl.distributed.refit_watchdog import RELEASE_GRACE_S, release_within
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         # Place vLLM ranks after all training ranks so all training workers can join
@@ -257,15 +258,24 @@ class VllmInternalWorkerExtension:
             flush=True,
         )
 
+        # Connect before releasing, for the reason the train side binds before releasing:
+        # the rendezvous has a 300s budget and the release may never return at all.
+        old_group, self.model_update_group = (
+            self.model_update_group,
+            StatelessProcessGroup(
+                master_address=ip, port=port, rank=rank, world_size=world_size
+            ),
+        )
         # Rebuilding is the recovery path for a dead generation rank, so this runs more
         # than once per job. Without the release, each rebuild would strand the previous
-        # NCCL communicator and its TCPStore for the life of the worker.
-        if self.model_update_group is not None:
-            self.model_update_group.abort()
-
-        self.model_update_group = StatelessProcessGroup(
-            master_address=ip, port=port, rank=rank, world_size=world_size
-        )
+        # NCCL communicator and its TCPStore for the life of the worker. Bounded, because
+        # the peer this is releasing may be frozen rather than dead.
+        if old_group is not None:
+            release_within(
+                old_group.abort,
+                RELEASE_GRACE_S,
+                "the previous refit communicator",
+            )
         # Free cached torch-allocator blocks so NCCL's P2P transport buffers
         # (raw cudaMalloc at comm init) have headroom; otherwise comm_init OOMs
         # on memory-tight shapes (mirror the train side).
@@ -288,6 +298,7 @@ class VllmInternalWorkerExtension:
         ranks (each in only their own stage) unblock deterministically.
         Non-PP is simply ``pp_size == 1`` that contains all the gen ranks.
         """
+        from nemo_rl.distributed.refit_watchdog import RELEASE_GRACE_S, release_within
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         # Through the same helper init_collective uses, and for the same reason: under
@@ -308,9 +319,11 @@ class VllmInternalWorkerExtension:
         torch.cuda.empty_cache()
         # Aborted before the dict is dropped, not just dereferenced: garbage collecting
         # the handle does not release the NCCL communicator or unbind the TCPStore, so
-        # a reshard run would strand one of each per PP stage per recovery.
-        for previous in (self.pp_comm_groups or {}).values():
-            previous.abort()
+        # a reshard run would strand one of each per PP stage per recovery. Deferred past
+        # the rendezvous below and bounded, for the reason init_collective binds before it
+        # releases: these are the split children's parents, and on a frozen peer their
+        # abort is the call that never returns.
+        stale_groups = list((self.pp_comm_groups or {}).values())
         self.pp_comm_groups = {}
         for stage in range(pp_size):
             # The other half of the pair printed on the train side. A rendezvous that never
@@ -331,6 +344,11 @@ class VllmInternalWorkerExtension:
             )
             group.init_nccl_communicator(device=self.device)
             self.pp_comm_groups[stage] = group
+
+        for previous in stale_groups:
+            release_within(
+                previous.abort, RELEASE_GRACE_S, "a previous reshard bulk communicator"
+            )
 
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""

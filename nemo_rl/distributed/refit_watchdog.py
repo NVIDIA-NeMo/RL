@@ -173,6 +173,54 @@ def sync_stream_within(stream, budget_s: Optional[float], what: str) -> None:
     torch.cuda.synchronize()
 
 
+RELEASE_GRACE_S = 30.0
+
+
+def release_within(release, budget_s: float, what: str) -> None:
+    """Run a teardown that may never return, without letting it wedge the caller.
+
+    THE SIXTH UNBOUNDED WAIT, and the one that only the reshard transport reaches.
+    ``StatelessProcessGroup.abort()`` calls ``abort_xferdtensor_python_subcommunicators``
+    before the parent, and those split children exist ONLY on the Python reshard path --
+    on the packed-broadcast path that call finds no cache entry and returns immediately.
+    ``ncclCommAbort`` joins the communicator's proxy thread, and a proxy thread blocked
+    reading from a SIGSTOPped peer never returns: the socket is open and idle, so nothing
+    errors and nothing times out. SIGKILL closes it and the proxy errors out at once,
+    which is why the killed variants never see this.
+
+    Job 6518381 measured the consequence. On the rebuild, train rank 0 -- the rendezvous
+    store's master -- entered ``init_collective``, printed its line, and never bound the
+    port, because the only statement between the two is the old group's release. The
+    surviving generation rank then spent 600s (300s, an 89s backoff, 300s again) failing
+    to connect to a store that was never created, and the run died at 700s having
+    condemned the right shard and planned the right membership.
+
+    Bounded, on a DAEMON thread, and deliberately not joined. ``asyncio.to_thread`` and a
+    bare ``ThreadPoolExecutor`` both use non-daemon threads that the interpreter joins at
+    exit, which would move the wedge to shutdown rather than remove it. Nothing downstream
+    reads a result: the release exists to stop resources accumulating across rebuilds, so
+    a release that never finishes costs one stuck thread, while waiting on it costs the run.
+    """
+    finished = threading.Event()
+
+    def _release() -> None:
+        try:
+            release()
+        except Exception:  # noqa: BLE001 - a failed release must not mask the rebuild
+            pass
+        finally:
+            finished.set()
+
+    threading.Thread(target=_release, name="refit-release", daemon=True).start()
+    if not finished.wait(budget_s):
+        print(
+            f"  refit: {what} did not release within {budget_s}s; continuing without it. "
+            "A peer that is frozen rather than dead leaves ncclCommAbort joining a proxy "
+            "thread that never returns, so this is abandoned rather than waited on.",
+            flush=True,
+        )
+
+
 class RefitAbortWatchdog:
     """Abort the given group(s) if the guarded block outlives ``timeout_s``.
 
