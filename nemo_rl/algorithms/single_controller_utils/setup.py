@@ -1465,8 +1465,7 @@ def setup_single_controller(
 
     if use_nemo_gym:
         if megatron_backend:
-            # Megatron serves from rank 0 of the generation workers; pre-publish that address
-            # so Gym spinup can overlap the trainer + engine init.
+            # Megatron serves from rank 0 of the generation workers; pre-publish that address.
             t0 = time.perf_counter()
             (
                 megatron_reserved_url,

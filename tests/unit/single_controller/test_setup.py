@@ -1421,20 +1421,52 @@ class TestSetup:
         mc.policy["generation"]["top_k"] = None
         return mc
 
-    @pytest.mark.parametrize("served_matches_reserved", [True, False])
-    def test_megatron_gym_setup(self, patched_factories, served_matches_reserved):
-        """The megatron setup path, end to end at the unit level."""
-        mc = self._make_gym_megatron_config()
+    @pytest.mark.parametrize(
+        ("scenario", "error_match"),
+        [
+            ("gym", None),
+            ("gym_served_mismatch", "different address"),
+            ("native", None),
+        ],
+        ids=["gym", "gym_served_mismatch", "native"],
+    )
+    def test_megatron_setup(
+        self, patched_factories, scenario: str, error_match: str | None
+    ):
+        """Non-colocated Megatron generation setup, gym and native legs.
+
+        gym: reserve rank-0's URL, spin Gym up on it, build trainer + engine
+        (weight load skipped, reserved port adopted), cross-check the served
+        address, reap the port holder.
+        gym_served_mismatch: the served-vs-reserved cross-check fires after the
+        builds when the engine comes up on a different address.
+        native: expose_http_server=false and no Gym, so nothing reserves a URL,
+        no port holder is created, and the cross-check is skipped.
+        """
+        gym = scenario != "native"
+        if gym:
+            mc = self._make_gym_megatron_config()
+            patched_factories["setup_response_data"].return_value = (
+                list(range(8)),
+                None,
+            )
+        else:
+            mc = _make_master_config(
+                colocated=False, backend="megatron", megatron_enabled=True
+            )
         mc.async_rl.recompute_kv_cache_after_weight_updates = True
-        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
         tokenizer = MagicMock(pad_token_id=0)
         reserved_url = "http://10.0.0.1:5555/v1"
-        served_url = reserved_url if served_matches_reserved else "http://10.0.0.9:7/v1"
+        served_url = (
+            "http://10.0.0.9:7/v1"
+            if scenario == "gym_served_mismatch"
+            else reserved_url
+        )
         port_holder = MagicMock(name="port_holder")
         fake_gym_actor = MagicMock(name="nemo_gym_actor")
 
         with (
-            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=gym),
             patch.object(
                 sc_setup_mod, "spinup_nemo_gym_actor", return_value=fake_gym_actor
             ) as mock_spinup,
@@ -1448,78 +1480,40 @@ class TestSetup:
                 port_holder,
             )
             # Wire the real check through the class mock so the
-            # served-vs-reserved legs below exercise the genuine logic.
+            # served-vs-reserved legs exercise the genuine logic.
             mock_megatron.verify_served_address = (
                 MegatronGeneration.verify_served_address
             )
             mock_megatron.return_value.dp_openai_server_base_urls = [served_url]
-            if served_matches_reserved:
+            if error_match is None:
                 actor_args, metrics = setup_single_controller(mc, tokenizer)
             else:
-                with pytest.raises(RuntimeError, match="different address"):
+                with pytest.raises(RuntimeError, match=error_match):
                     setup_single_controller(mc, tokenizer)
 
-        # Construction: trainer first, generation from the dedicated cluster
-        # (asserted in both cases — the URL check fires after the builds).
         inference_cluster = patched_factories["_build_clusters"].return_value[1]
+        # The megatron path never uses the generic generation factory and applies
+        # its config overrides before any build (_build_generation normally sets
+        # model_name; the kv-cache mode comes from the async_rl flag).
         patched_factories["_build_generation"].assert_not_called()
-        patched_factories["_build_trainer"].assert_called_once()
-        mock_megatron.reserve_http_server_address.assert_called_once_with(
-            inference_cluster,
-            mc.policy,
-        )
-        mock_megatron.assert_called_once_with(
-            config=mc.policy,
-            tokenizer=tokenizer,
-            cluster=inference_cluster,
-            processor=None,
-            weights_path=None,
-            skip_weight_load=True,
-            reserved_http_server_port=5555,
-        )
-        _, spinup_kwargs = mock_spinup.call_args
-        assert spinup_kwargs["base_urls"] == [reserved_url]
-        mock_ray.kill.assert_called_once_with(port_holder)
-        # Config overrides applied before any build.
-        # The megatron path skips _build_generation, which normally sets this.
         assert mc.policy["generation"]["model_name"] == "test-model"
         mcore_cfg = mc.policy["generation"]["mcore_generation_config"]
         assert mcore_cfg["kv_cache_management_mode"] == "recompute"
         assert mc.async_rl.recompute_kv_cache_after_weight_updates is False
-        if served_matches_reserved:
-            assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
-            assert actor_args.gen_handle is mock_megatron.return_value
-            assert actor_args.trainer_handle is patched_factories["fake_policy"]
-            assert metrics.nemo_gym_init_time_s is not None
-            assert metrics.generation_init_reserve_time_s is not None
-            assert metrics.generation_init_time_s is not None
-            assert metrics.policy_init_time_s is not None
-            _, factory_kwargs = patched_factories[
-                "create_weight_synchronizer"
-            ].call_args
-            assert factory_kwargs["generation_backend"] == "megatron"
-            assert factory_kwargs["colocated"] is False
-            assert factory_kwargs["inference_cluster"] is inference_cluster
+        # Reservation + holder lifecycle exist on the gym legs only.
+        if gym:
+            mock_megatron.reserve_http_server_address.assert_called_once_with(
+                inference_cluster,
+                mc.policy,
+            )
+            mock_ray.kill.assert_called_once_with(port_holder)
+        else:
+            mock_megatron.reserve_http_server_address.assert_not_called()
+            mock_ray.kill.assert_not_called()
 
-    def test_megatron_non_gym_setup(self, patched_factories):
-        """Non-colocated Megatron generation with NeMo Gym off."""
-        mc = _make_master_config(
-            colocated=False, backend="megatron", megatron_enabled=True
-        )
-        tokenizer = MagicMock(pad_token_id=0)
-
-        with (
-            patch.object(sc_setup_mod, "spinup_nemo_gym_actor") as mock_spinup,
-            patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
-            patch.object(sc_setup_mod, "ray") as mock_ray,
-        ):
-            actor_args, metrics = setup_single_controller(mc, tokenizer)
-
-        inference_cluster = patched_factories["_build_clusters"].return_value[1]
-        mock_megatron.reserve_http_server_address.assert_not_called()
-        mock_ray.kill.assert_not_called()
-        mock_spinup.assert_not_called()
-        patched_factories["_build_generation"].assert_not_called()
+        # Construction: trainer first, generation from the dedicated cluster,
+        # with the weight load skipped and the reserved port adopted (gym) or
+        # absent (native).
         patched_factories["_build_trainer"].assert_called_once()
         mock_megatron.assert_called_once_with(
             config=mc.policy,
@@ -1528,18 +1522,33 @@ class TestSetup:
             processor=None,
             weights_path=None,
             skip_weight_load=True,
-            reserved_http_server_port=None,
+            reserved_http_server_port=5555 if gym else None,
         )
-        assert mc.policy["generation"]["model_name"] == "test-model"
+        if gym:
+            # Gym spins up on the reserved URL, before the served-address
+            # cross-check — so the mismatch leg sees it too.
+            _, spinup_kwargs = mock_spinup.call_args
+            assert spinup_kwargs["base_urls"] == [reserved_url]
+        else:
+            mock_spinup.assert_not_called()
+        if scenario == "gym_served_mismatch":
+            return  # raised at the cross-check; no actor_args/metrics exist
+
         assert actor_args.gen_handle is mock_megatron.return_value
         assert actor_args.trainer_handle is patched_factories["fake_policy"]
         assert metrics.generation_init_time_s is not None
         assert metrics.policy_init_time_s is not None
-        assert metrics.generation_init_reserve_time_s is None
         _, factory_kwargs = patched_factories["create_weight_synchronizer"].call_args
         assert factory_kwargs["generation_backend"] == "megatron"
         assert factory_kwargs["colocated"] is False
         assert factory_kwargs["inference_cluster"] is inference_cluster
+        if gym:
+            assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
+            assert metrics.nemo_gym_init_time_s is not None
+            assert metrics.generation_init_reserve_time_s is not None
+        else:
+            # Reserve/load split is populated on the gym-on path only.
+            assert metrics.generation_init_reserve_time_s is None
 
 
 class TestNativeTQRecoverySetup:
