@@ -804,7 +804,6 @@ def setup(
     def initialize_generation_with_policy(
         init_generation_fn,
         generation_name: str,
-        init_time_key: str,
         worker_init_timing_metrics: dict,
     ):
         """Generic function to initialize a generation engine (vLLM or SGLang) along with policy.
@@ -812,7 +811,6 @@ def setup(
         Args:
             init_generation_fn: Function that initializes the generation engine (init_vllm or init_sglang)
             generation_name: Name of the generation engine ("vLLM" or "SGLang")
-            init_time_key: Key name for storing initialization time in metrics ("vllm_init_time_s" or "sglang_init_time_s")
             worker_init_timing_metrics: Dictionary to store timing metrics
 
         Returns:
@@ -823,7 +821,7 @@ def setup(
 
         # Policy and value initialize serially because they share training GPUs.
         policy_generation, generation_time = init_generation_fn()
-        worker_init_timing_metrics[init_time_key] = generation_time
+        worker_init_timing_metrics["generation_init_time_s"] = generation_time
 
         policy, policy_time = init_policy()
         # Block until the policy worker's __init__ completes and offload to
@@ -881,7 +879,6 @@ def setup(
         policy_generation, policy, value_model = initialize_generation_with_policy(
             init_generation_fn=init_vllm,
             generation_name="vLLM",
-            init_time_key="vllm_init_time_s",
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
 
@@ -900,7 +897,6 @@ def setup(
         policy_generation, policy, value_model = initialize_generation_with_policy(
             init_generation_fn=init_sglang,
             generation_name="SGLang",
-            init_time_key="sglang_init_time_s",
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
 
@@ -952,12 +948,12 @@ def setup(
     if worker_init_timing_metrics:
         print("\n▶ Worker Initialization Timing:")
 
-        vllm_time = worker_init_timing_metrics.get("vllm_init_time_s", 0)
+        gen_time = worker_init_timing_metrics.get("generation_init_time_s", 0)
         policy_time = worker_init_timing_metrics.get("policy_init_time_s", 0)
         total_setup = worker_init_timing_metrics.get("total_setup_time_s", 0)
 
-        if vllm_time:
-            print(f"  vLLM init: {vllm_time:.1f}s")
+        if gen_time:
+            print(f"  Generation init: {gen_time:.1f}s")
 
         if policy_time:
             print(f"  Policy init: {policy_time:.1f}s")
