@@ -118,6 +118,10 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
+  # Async GRPO: restore replay-buffer state on resume. Set false to regenerate
+  # the buffered window fresh instead of reusing completed groups (which skew
+  # toward short rollouts at a save boundary).
+  load_replay_buffer: true
   model_save_format: "safetensors"
   save_consolidated: false
   save_optimizer: true
@@ -127,8 +131,9 @@ policy:
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
+    tokenizer_kwargs: null # extra kwargs forwarded to tokenizer loading, e.g., {fix_mistral_regex: false}
     use_fastokens: false # opt-in Rust-backed BPE tokenizer (~10x faster encode); requires the fastokens-b10 wheel. NRL_USE_FASTOKENS overrides at runtime.
-  hf_config_overrides: {} 
+  hf_config_overrides: {}
   train_global_batch_size: 512
   train_micro_batch_size: 4
   generation_batch_size: 32 # Only used when generating using HF backend
@@ -535,11 +540,19 @@ data_plane:
   enabled: false
   impl: transfer_queue
   backend: "simple"                  # TQ storage backend ('simple' or 'mooncake_cpu')
-  storage_capacity: 1000000          # max samples retained per partition
-  num_storage_units: 2               # storage shards
   claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
-  global_segment_size: 549755813888  # 512 GiB — used when backend == "mooncake_cpu"
-  local_buffer_size:   68719476736   # 64 GiB  — used when backend == "mooncake_cpu"
+  # Backend-specific blocks: only the one named by `backend` is read, and an
+  # absent block means that backend's defaults (see SimpleStorageConfig /
+  # MooncakeCpuConfig in nemo_rl/data_plane/interfaces.py).
+  simple:
+    storage_capacity: 1000000        # max samples retained per partition
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
+  mooncake_cpu:
+    # Per client process — see MooncakeCpuConfig before raising these.
+    global_segment_size: 68719476736 # 64 GiB/process
+    local_buffer_size:    4294967296 # 4 GiB/process
+    reuse_registered_buffers: true   # reuse RDMA-registered buffers
+    staging_buffer_size:   268435456 # 256 MiB/pool slot; bigger transfers bypass the pool
   # observability:                    # NotRequired
   #   enabled: false
 

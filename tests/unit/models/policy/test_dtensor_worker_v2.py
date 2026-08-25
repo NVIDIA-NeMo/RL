@@ -31,6 +31,11 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
 
 try:
+    import nemo_rl.models.policy.workers.dtensor_policy_worker_v2 as worker_mod
+    from nemo_rl.models.automodel.config import (
+        ModelAndOptimizerState,
+        RuntimeConfig,
+    )
     from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
         DTensorPolicyWorkerV2Impl,
         _maybe_adapt_tensor_to_hf,
@@ -1003,3 +1008,164 @@ class TestGetTrainContext:
             sequence_dim,
         ], "sequence_dim should be replicated for each buffer"
         assert len(call_kwargs["cp_seq_dims"]) == 3
+
+
+def _init_v2_worker_mocked(
+    monkeypatch, *, init_reference_model, weights_path, optimizer_path
+):
+    """Run DTensorPolicyWorkerV2Impl.__init__ with all heavy deps mocked.
+
+    Returns (worker, call_log, setup_mock, load_checkpoint_mock).
+    """
+    call_log = []
+
+    monkeypatch.setattr(worker_mod, "apply_transformer_engine_patch", lambda: None)
+    monkeypatch.setattr(worker_mod.ray, "get_gpu_ids", lambda: [0])
+    monkeypatch.setattr(
+        "nemo_rl.distributed.numa_utils.bind_to_gpu_numa", lambda gpu_id: None
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.automodel.setup.get_tokenizer",
+        lambda cfg, get_processor=False: MagicMock(name="tokenizer"),
+    )
+
+    # Unpacked as runtime config at the end of __init__.
+    runtime_config = RuntimeConfig(
+        model_class="model_class",
+        model_config="model_config",
+        hf_config_overrides={},
+        allow_flash_attn_args=False,
+        attn_impl="attn_impl",
+        dtype=None,
+        enable_seq_packing=False,
+        max_grad_norm=1.0,
+        cpu_offload=False,
+        offload_optimizer_for_logprob=False,
+        is_generation_colocated=False,
+        sampling_params=None,
+        is_reward_model=False,
+    )
+    monkeypatch.setattr(
+        worker_mod, "validate_and_prepare_config", lambda **kw: runtime_config
+    )
+    monkeypatch.setattr(worker_mod, "setup_distributed", lambda **kw: MagicMock())
+    monkeypatch.setattr(worker_mod.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(
+        worker_mod, "maybe_preinit_nixl_checkpoint_engine", lambda cfg: None
+    )
+
+    load_checkpoint_mock = MagicMock(
+        side_effect=lambda **kw: call_log.append("load_checkpoint")
+    )
+
+    def fake_init_checkpoint_manager(self, config_updates=None, checkpoint_root=None):
+        self.checkpoint_manager = MagicMock()
+        self.checkpoint_manager.load_checkpoint = load_checkpoint_mock
+
+    monkeypatch.setattr(
+        DTensorPolicyWorkerV2Impl,
+        "_init_checkpoint_manager",
+        fake_init_checkpoint_manager,
+    )
+
+    # Unpacked as model_and_optimizer_state.
+    model_and_optimizer_state = ModelAndOptimizerState(
+        model=MagicMock(name="model"),
+        optimizer=MagicMock(name="optimizer"),
+        scheduler=MagicMock(name="scheduler"),
+        is_hf_model=False,
+        is_moe_model=False,
+        is_reward_model=False,
+        model_class="model_class",
+        model_config="model_config",
+        peft_config=None,
+        autocast_enabled=False,
+    )
+    setup_mock = MagicMock(
+        side_effect=lambda **kw: (
+            call_log.append("setup_model_and_optimizer"),
+            model_and_optimizer_state,
+        )[1]
+    )
+    monkeypatch.setattr(worker_mod, "setup_model_and_optimizer", setup_mock)
+
+    ref_state = {"ref": "state"}
+    monkeypatch.setattr(
+        worker_mod,
+        "setup_reference_model_state",
+        lambda model: (call_log.append("setup_reference_model_state"), ref_state)[1],
+    )
+
+    config = {
+        "model_name": "base-model",
+        "tokenizer": {},
+        "dtensor_cfg": {},
+        "generation": {},
+    }
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    DTensorPolicyWorkerV2Impl.__init__(
+        worker,
+        config,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
+        init_optimizer=True,
+        init_reference_model=init_reference_model,
+    )
+    return worker, call_log, setup_mock, load_checkpoint_mock
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_resume_with_reference_model_defers_checkpoint_load(monkeypatch):
+    """On resume with a KL reference, the reference must be captured from base
+    weights (checkpoint load deferred until after the capture)."""
+    worker, call_log, setup_mock, load_mock = _init_v2_worker_mocked(
+        monkeypatch,
+        init_reference_model=True,
+        weights_path="/ckpt/weights",
+        optimizer_path="/ckpt/optim",
+    )
+    # (a) base weights used for setup: checkpoint paths not passed through.
+    assert setup_mock.call_args.kwargs["weights_path"] is None
+    assert setup_mock.call_args.kwargs["optimizer_path"] is None
+    # (b) reference captured BEFORE the checkpoint load.
+    assert call_log == [
+        "setup_model_and_optimizer",
+        "setup_reference_model_state",
+        "load_checkpoint",
+    ]
+    assert worker.reference_model_state_dict == {"ref": "state"}
+    # (c) checkpoint still loaded, with the original paths.
+    assert load_mock.call_args.kwargs["weights_path"] == "/ckpt/weights"
+    assert load_mock.call_args.kwargs["optimizer_path"] == "/ckpt/optim"
+    assert load_mock.call_args.kwargs["model"] is worker.model
+    assert load_mock.call_args.kwargs["optimizer"] is worker.optimizer
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_resume_without_reference_model_passes_paths_through(monkeypatch):
+    worker, call_log, setup_mock, load_mock = _init_v2_worker_mocked(
+        monkeypatch,
+        init_reference_model=False,
+        weights_path="/ckpt/weights",
+        optimizer_path="/ckpt/optim",
+    )
+    assert setup_mock.call_args.kwargs["weights_path"] == "/ckpt/weights"
+    assert setup_mock.call_args.kwargs["optimizer_path"] == "/ckpt/optim"
+    load_mock.assert_not_called()
+    assert worker.reference_model_state_dict is None
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_fresh_run_with_reference_model_does_not_defer(monkeypatch):
+    worker, call_log, setup_mock, load_mock = _init_v2_worker_mocked(
+        monkeypatch,
+        init_reference_model=True,
+        weights_path=None,
+        optimizer_path=None,
+    )
+    assert setup_mock.call_args.kwargs["weights_path"] is None
+    load_mock.assert_not_called()
+    assert worker.reference_model_state_dict == {"ref": "state"}
