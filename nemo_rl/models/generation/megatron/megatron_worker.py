@@ -286,6 +286,7 @@ class MegatronGenerationMixin:
         inference_model, media_model = self._inference_model_and_media_parts(
             inference_wrapper_cls
         )
+        engine_model = media_model if media_model is not None else self._gen_model()
         pg_collection = get_attr_wrapped_model(self._gen_model(), "pg_collection")
         model_config = inference_model.config
 
@@ -385,7 +386,7 @@ class MegatronGenerationMixin:
             logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
             logprobs_mode=mcore_generation_config.get(
-                "logprobs_mode", "raw_logprobs"
+                "logprobs_mode", "processed_logprobs"
             ),
             max_requests=max_requests,
             image_preprocessing_config=image_preprocessing_config,
@@ -398,11 +399,11 @@ class MegatronGenerationMixin:
             ]
 
         self.inference_context = DynamicInferenceContext(
-            model_config, inference_config
+            engine_model.config, inference_config
         )
         if media_model is None:
             self.inference_wrapped_model = GPTInferenceWrapper(
-                inference_model, self.inference_context
+                engine_model, self.inference_context
             )
         else:
             if inference_wrapper_cls is None:
@@ -410,7 +411,7 @@ class MegatronGenerationMixin:
                     "Multimodal inference requires megatron_inference_wrapper."
                 )
             self.inference_wrapped_model = inference_wrapper_cls(
-                media_model, self.inference_context
+                engine_model, self.inference_context
             )
         text_generation_controller = TextGenerationController(
             inference_wrapped_model=self.inference_wrapped_model,
@@ -600,7 +601,8 @@ class MegatronGenerationMixin:
         print(f"[Rank {self.rank}] finishing generation", flush=True)
         log_gpu_memory("finish_generation START")
 
-        lang_module = unwrap_model(self._gen_model())
+        inference_model, _ = self._inference_model_and_media_parts()
+        lang_module = unwrap_model(inference_model)
 
         if self.is_generation_colocated:
             if self._inference_engine_initialized and not self._inference_engine_asleep:
@@ -657,10 +659,6 @@ class MegatronGenerationMixin:
         if self._colocated_reshard_plan is not None:
             self._build_colocated_inference_model(self.cfg)
 
-        gen_model = self._gen_model()
-        # `flash_decode` selects Megatron Inference's deprecated static-batching decode path,
-        # which would cause an assertion error if taken.
-        gen_model.config.flash_decode = False
         if self.is_generation_colocated and self.inference_model is None:
             self.model = self.move_model(
                 self.model, "cuda", move_params=True, move_grads=False
@@ -673,13 +671,16 @@ class MegatronGenerationMixin:
                 and self._forward_pre_hook_enabled()
             ):
                 self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
-            gen_model = self.model
 
         # Colocated reshard (hosts without a dedicated inference model skip it).
         if self.inference_model is not None:
             self._reshard_into_inference_model()
 
-        lang_module = unwrap_model(gen_model)
+        inference_model, _ = self._inference_model_and_media_parts()
+        # `flash_decode` selects Megatron Inference's deprecated static-batching decode path,
+        # which would cause an assertion error if taken.
+        inference_model.config.flash_decode = False
+        lang_module = unwrap_model(inference_model)
         lang_module.eval()
 
         rotary_module = getattr(lang_module, "rotary_pos_emb", None)
