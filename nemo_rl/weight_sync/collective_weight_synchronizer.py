@@ -144,10 +144,17 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             try:
                 ray.get(futures_train)
             except BaseException:
-                # Every train rank must be out of the old refit before the caller can
-                # rebuild over the survivors; see _settle_before_propagating.
+                # Every rank must be out of the old refit before the caller can rebuild
+                # over the survivors; see _settle_before_propagating. BOTH sides: the
+                # rebuild dispatches init_collective to the generation ranks too, and
+                # ray.get(futures_train) raising leaves futures_inference running. Settling
+                # only the train half is the same half-applied fix as the widened
+                # signatures in design_vllm_fault_tolerance.md section 8.5.5.
                 _settle_before_propagating(
                     futures_train, self._settle_budget_s(), "train"
+                )
+                _settle_before_propagating(
+                    futures_inference, self._settle_budget_s(), "generation"
                 )
                 raise
             results = ray.get(futures_inference)
