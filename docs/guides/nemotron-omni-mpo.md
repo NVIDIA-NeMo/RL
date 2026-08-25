@@ -1,33 +1,21 @@
 # Nemotron Omni MPO
 
-This path ports offline image MPO to the canonical `NemotronOmniModel`
-from NeMo-RL PR #3290 (which supersedes #3227) and Megatron-Bridge PR #4885.
-Development is based on the rewritten
-`aroshanghias/nemotron-omni-main-migration` head. It deliberately does not
-restore the legacy `LLaVAModel` collapse/expand flow.
+Mixed Preference Optimization (MPO) combines preference, supervised
+fine-tuning, and binary-classification losses for offline preference data.
+Nemotron Omni MPO uses `NemotronOmniModel` with NeMo-RL's Megatron data
+pipeline and supports single-image MMPR chosen/rejected pairs.
 
 ## Container
 
-PR #3290 does not name a published, immutable production image for this
-workflow. Its migration document uses an Ali-owned placeholder image for an
-intermediate launch example and lists the old `nvcr.io/nvidia/nemo:25.04`
-environment only for the legacy vLLM 0.7 baseline. Neither is the target MPO
-container.
-
-Build the release image from the checked-out #3290-based source so the
+Build the release image from the checked-out source so the
 NeMo-RL, Megatron-Bridge, Megatron-LM, TransformerEngine, and vLLM pins stay
 consistent:
 
 ```bash
 docker buildx build --build-context nemo-rl=. \
   --target release -f docker/Dockerfile \
-  --tag nemorl-omni-mpo:pr3290 --load .
+  --tag nemorl-omni-mpo:latest --load .
 ```
-
-At this revision, `docker/Dockerfile` defaults to
-`nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04`; use the
-repository build rather than treating that base image as a complete NeMo-RL
-runtime.
 
 For Slurm/Pyxis, publish that image to the registry available to the cluster
 and use it as `--container-image`. The same source can be used directly for
@@ -36,17 +24,8 @@ reproducible qualification path.
 
 MPO is offline preference training. It computes policy and reference
 log-probabilities with Megatron and does not start a vLLM generation worker.
-The vLLM compatibility work in #3290 therefore does not block the first
-MPO run.
 
 ## Data and launch
-
-PR #3290 adds maintained Nano image-GRPO references for Clevr
-(`vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml`) and
-MMPR
-(`vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml`).
-They are architecture references, not MPO recipes. This migration adds the
-offline MPO recipe below.
 
 The recipe accepts the existing MMPR meta-recipe JSON. Override its placeholder
 path at launch:
@@ -76,14 +55,12 @@ MPO_MAX_SAMPLES=64 MPO_MAX_NUM_STEPS=2 \
 MPO_TRAIN_GLOBAL_BATCH_SIZE=8 scripts/vlm_mpo.sh
 ```
 
-The launcher explicitly enables online W&B logging. It defaults to entity
-`joc`, project `nemotron-omni-main-migration`, and a unique run name; override
-these with `WANDB_ENTITY`, `WANDB_PROJECT`, and `WANDB_NAME`. It forwards
-`WANDB_API_KEY` or read-only mounts the submit host's `$HOME/.netrc`. The
-container driver defaults to `WANDB_PIN_VERSION=0.28.1`, which supports current
-`wandb_v1_...` tokens. Legacy 36-character keys can explicitly select
-`WANDB_PIN_VERSION=0.21.1`. Set it to another semantic version, or to an empty
-string to use the container SDK unchanged.
+The launcher enables online W&B logging and defaults to project `vlm-mpo`.
+Override the destination with `WANDB_ENTITY`, `WANDB_PROJECT`, and
+`WANDB_NAME`. It forwards `WANDB_API_KEY` or read-only mounts the submit host's
+`$HOME/.netrc`. The container driver defaults to `WANDB_PIN_VERSION=0.28.1`;
+set it to another semantic version, or to an empty string to use the container
+SDK unchanged.
 
 The data processor emits normal processor-expanded image tensors and tokens.
 NeMo-RL's Megatron data pipeline keeps each chosen/rejected pair in one
@@ -91,30 +68,58 @@ microbatch and packs its expanded token rows into a full THD sequence.
 `NemotronOmniModel` inserts media embeddings into that full sequence and then
 selects the context-parallel slice.
 
-Image training currently requires sequence packing. The unpacked path produces
-a dense decoder mask that is not accepted by the pinned Megatron-Bridge media
-insertion implementation, so NeMo-RL rejects that combination early. Follow
-[NeMo-RL #3525](https://github.com/NVIDIA-NeMo/RL/issues/3525) and
-[Megatron-Bridge #5181](https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/5181)
-for no-pack enablement.
+The pinned Megatron-Bridge distinguishes NeMo-RL's dense 4D causal mask from
+the 2D media-token validity mask, so unpacked image batches are supported by
+the integration. Packed training remains the recommended path for useful Super
+context lengths because unpacked batches have substantially higher memory use.
 
-## Support and qualification status
+## MPO configuration
 
-This change provides packed single-image MPO recipes for Nemotron Omni Nano and
-Super. Nano has completed an end-to-end parity run on an earlier revision.
-Super and the corrected chained-resume path have smoke coverage but still
-require final-head convergence, resume, throughput, and memory qualification
-before they should be treated as production-qualified.
+The algorithm-specific settings live under `mpo`:
 
-## Qualification order
+- `reference_policy_kl_penalty`: scales policy/reference log-ratios.
+- `preference_loss_weight`: weights the pairwise preference term.
+- `sft_loss_weight`: weights chosen-response negative log-likelihood.
+- `bco_loss_weight`: weights the binary-classification objective.
+- `preference_average_log_probs`, `sft_average_log_probs`, and
+  `quality_average_log_probs`: select sum or token-average normalization for
+  the three terms.
+- `reward_shift`: initial BCO reward centering value.
+- `reward_shift_momentum`: exponential-moving-average momentum for driver-side
+  reward-shift updates. The updated value is checkpointed.
+- `max_num_steps`: final training and scheduler horizon.
+- `stop_after_step`: optional segment boundary for time-limited jobs. Keep
+  `max_num_steps` unchanged across resumed segments.
 
-1. Run a short Nano single-image MMPR smoke test with CP=1 and MTP disabled.
-2. Compare loss components, pair accuracy, chosen/rejected rewards, and the
-   checkpointed BCO `reward_shift` against the legacy implementation.
-3. Resume from a checkpoint and verify the first resumed shift update.
-4. Qualify CP>1 separately with a valid parallel topology and
-   `make_sequence_length_divisible_by` divisible by `2 * CP * TP` when
-   sequence parallelism is enabled.
-5. Repeat the parity and chained-resume checks on the packed Super recipes.
-6. Defer multi-image, video/audio, and MTP qualification until the
-   single-image baselines are stable.
+Packed MPO additionally requires:
+
+- `policy.sequence_packing.fuse_loss=true`
+- `policy.sequence_packing.pair_grouping_key=pair_index`
+- a Megatron policy backend
+
+`max_sequences_per_bin=1` bounds each bin to one chosen/rejected pair. When it
+is enabled, `policy.train_global_batch_size` must be divisible by the
+data-parallel degree.
+
+## Chained jobs
+
+Use `scripts/vlm_mpo_chain.sh` when the scheduler wall-clock limit is shorter
+than the intended run. `CHAIN_STEP_TARGETS` contains cumulative, strictly
+increasing boundaries, while `MPO_MAX_NUM_STEPS` remains the final horizon:
+
+```bash
+CHAIN_SEGMENTS=2 CHAIN_STEP_TARGETS=50,100 MPO_MAX_NUM_STEPS=100 \
+CONTAINER=<registry-image> SBATCH_ACCOUNT=<account> \
+MPO_MODEL_NAME=/path/to/model MPO_DATA_PATH=/path/to/mmpr/meta.json \
+scripts/vlm_mpo_chain.sh
+```
+
+All segments use one checkpoint directory and one W&B run ID. Each dependent
+segment restores model, optimizer, scheduler, dataloader, and MPO reward-shift
+state before continuing.
+
+## Current scope
+
+The provided recipe targets single-image MMPR data with Nemotron Omni Nano.
+Packed and unpacked image batches are supported. Multi-image, video/audio
+preference data, and MTP training require separate qualification.

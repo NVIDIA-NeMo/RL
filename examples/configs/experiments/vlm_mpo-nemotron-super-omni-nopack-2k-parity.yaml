@@ -1,12 +1,8 @@
-# Matched Super MPO control based on legacy W&B run fpieeug0:
-#   nvidia/vlm-mpo-dev-mmpr/super-NOPACK-2k-100step
-#
-# The 2K context is intentional: it is the longest legacy Super no-packing
-# control that completed on 4 nodes. Packing changes only in the sibling config.
+# Super 2K unpacked control. Packing changes only in the sibling config.
 defaults: vlm_mpo-nemotron-omni-nopack-legacy-parity.yaml
 
 policy:
-  model_name: /lustre/fsw/portfolios/llmservice/users/smohsenitahe/checkpoints/super_sft_16k
+  model_name: REPLACE_WITH_NEMOTRON_SUPER_OMNI_MODEL
   tokenizer:
     name: ${policy.model_name}
   max_total_sequence_length: 2048
@@ -18,10 +14,8 @@ policy:
     # Initial Super parity excludes the checkpoint's auxiliary MTP head.
     mtp_num_layers: 0
     mtp_loss_scaling_factor: 0.0
+    # Match the legacy no-pack run's unfused logprob path.
+    use_fused_linear_logprobs: false
 
 data:
   max_input_seq_length: 2048
-
-logger:
-  wandb:
-    name: super-main-nopack-2k-cp1-100step

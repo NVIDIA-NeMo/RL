@@ -18,15 +18,16 @@ from typing import Any, cast
 import pytest
 from omegaconf import OmegaConf
 
+from nemo_rl.algorithms.dpo import _validate_stop_after_step
 from nemo_rl.algorithms.loss import MPOLossConfig, MPOLossFn
 from nemo_rl.algorithms.mpo import (
     MasterConfig,
     MPOConfig,
     MPOSaveState,
-    _configure_pair_safe_packing,
     _update_reward_shift,
-    _validate_stop_after_step,
+    _validate_pair_safe_packing,
 )
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig, SequencePackingConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
@@ -86,7 +87,7 @@ def test_reward_shift_update_ignores_empty_optimizer_step():
 def test_mpo_stop_after_step_does_not_change_final_step_limit():
     config = MPOConfig(max_num_steps=100, stop_after_step=50)
 
-    _validate_stop_after_step(config)
+    _validate_stop_after_step(config, "mpo")
 
     assert config.max_num_steps == 100
     assert config.stop_after_step == 50
@@ -94,45 +95,89 @@ def test_mpo_stop_after_step_does_not_change_final_step_limit():
     for invalid_boundary in (0, 101):
         with pytest.raises(ValueError, match="between 1 and mpo.max_num_steps"):
             _validate_stop_after_step(
-                MPOConfig(max_num_steps=100, stop_after_step=invalid_boundary)
+                MPOConfig(max_num_steps=100, stop_after_step=invalid_boundary),
+                "mpo",
             )
 
 
-def test_mpo_configures_pair_safe_sequence_packing():
-    policy_config = cast(
+def _packed_policy_config() -> PolicyConfig:
+    return cast(
         PolicyConfig,
         {
+            "train_global_batch_size": 4,
             "dynamic_batching": {"enabled": False},
             "sequence_packing": {
                 "enabled": True,
                 "algorithm": "modified_first_fit_decreasing",
+                "fuse_loss": True,
+                "pair_grouping_key": "pair_index",
+                "max_sequences_per_bin": 1,
+            },
+            "megatron_cfg": {
+                "enabled": True,
+                "tensor_model_parallel_size": 2,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": 1,
             },
         },
     )
 
-    _configure_pair_safe_packing(policy_config)
 
-    sequence_packing = cast(SequencePackingConfig, policy_config["sequence_packing"])
-    assert sequence_packing["enabled"] is True
-    assert sequence_packing["fuse_loss"] is True
-    assert sequence_packing["pair_grouping_key"] == "pair_index"
-    assert sequence_packing["max_sequences_per_bin"] == 1
+def _cluster_config() -> ClusterConfig:
+    return {"num_nodes": 1, "gpus_per_node": 4}
+
+
+def test_mpo_validates_pair_safe_sequence_packing():
+    _validate_pair_safe_packing(_packed_policy_config(), _cluster_config())
 
 
 def test_mpo_rejects_non_pair_grouping_key():
-    policy_config = cast(
-        PolicyConfig,
-        {
-            "dynamic_batching": {"enabled": False},
-            "sequence_packing": {
-                "enabled": True,
-                "pair_grouping_key": "task_name",
-            },
-        },
-    )
+    policy_config = _packed_policy_config()
+    sequence_packing = cast(dict[str, Any], policy_config["sequence_packing"])
+    sequence_packing["pair_grouping_key"] = "task_name"
 
     with pytest.raises(ValueError, match="pair_grouping_key='pair_index'"):
-        _configure_pair_safe_packing(policy_config)
+        _validate_pair_safe_packing(policy_config, _cluster_config())
+
+
+def test_mpo_rejects_non_fused_or_dtensor_packed_loss():
+    policy_config = _packed_policy_config()
+    sequence_packing = cast(dict[str, Any], policy_config["sequence_packing"])
+    sequence_packing["fuse_loss"] = False
+    with pytest.raises(ValueError, match="fuse_loss=True"):
+        _validate_pair_safe_packing(policy_config, _cluster_config())
+
+    policy_config = _packed_policy_config()
+    megatron_config = cast(dict[str, Any], policy_config["megatron_cfg"])
+    megatron_config["enabled"] = False
+    with pytest.raises(ValueError, match="requires the Megatron backend"):
+        _validate_pair_safe_packing(policy_config, _cluster_config())
+
+
+def test_mpo_rejects_pair_batch_not_divisible_by_dp():
+    policy_config = _packed_policy_config()
+    policy_config["train_global_batch_size"] = 3
+
+    with pytest.raises(
+        ValueError,
+        match=r"train_global_batch_size=3, DP=2.*1 nodes x 4 GPUs",
+    ):
+        _validate_pair_safe_packing(policy_config, _cluster_config())
+
+
+def test_vlm_mpo_exemplar_validates_without_dpo_config():
+    root = Path(__file__).parents[3]
+    register_omegaconf_resolvers()
+    config = load_config(root / "examples/configs/vlm_mpo.yaml")
+    master_config = MasterConfig.model_validate(
+        OmegaConf.to_container(config, resolve=True)
+    )
+
+    train_config = master_config.data["train"]
+    assert isinstance(train_config, dict)
+    assert train_config["dataset_name"] == "MMPRPreference"
+    assert master_config.data["validation"] is None
+    assert "dpo" not in (master_config.model_extra or {})
 
 
 def test_nemotron_omni_mpo_recipe_validates():
@@ -168,9 +213,8 @@ def test_nemotron_omni_mpo_recipe_validates():
     assert isinstance(train_config, dict)
     assert train_config["dataset_name"] == "MMPRPreference"
     assert "max_samples" in train_config
-    assert master_config.logger["wandb_enabled"]
-    assert master_config.logger["wandb"]["entity"] == "joc"
-    assert master_config.logger["wandb"]["project"] == "nemotron-omni-main-migration"
+    assert master_config.data["validation"] is None
+    assert not master_config.logger["wandb_enabled"]
 
 
 def test_nemotron_omni_nopack_parity_config_matches_legacy_run():
@@ -205,10 +249,12 @@ def test_nemotron_omni_nopack_parity_config_matches_legacy_run():
     assert megatron_config["optimizer"]["lr"] == 8.0e-7
     assert megatron_config["optimizer"]["optimizer_cpu_offload"] is True
     train_config = cast(dict[str, Any], master_config.data["train"])
+    assert train_config["data_path"] == "REPLACE_WITH_MMPR_METADATA_PATH"
     assert train_config["split_validation_size"] == 2000
     assert train_config["legacy_validation_split"] is True
     assert master_config.data["num_workers"] == 0
     assert master_config.cluster["num_nodes"] == 4
+    assert not master_config.logger["wandb_enabled"]
 
 
 @pytest.mark.parametrize(
@@ -239,7 +285,9 @@ def test_nemotron_super_omni_mpo_parity_configs(
     )
 
     assert master_config.mpo.max_num_steps == 100
-    assert master_config.policy["model_name"].endswith("/super_sft_16k")
+    assert (
+        master_config.policy["model_name"] == "REPLACE_WITH_NEMOTRON_SUPER_OMNI_MODEL"
+    )
     assert master_config.policy["train_global_batch_size"] == 256
     assert master_config.policy["max_total_sequence_length"] == sequence_length
     assert master_config.data["max_input_seq_length"] == sequence_length
@@ -256,6 +304,7 @@ def test_nemotron_super_omni_mpo_parity_configs(
     assert megatron_config["expert_model_parallel_size"] == 32
     assert megatron_config["context_parallel_size"] == context_parallel_size
     assert megatron_config["mtp_num_layers"] == 0
+    assert megatron_config["use_fused_linear_logprobs"] is False
 
     packing = cast(SequencePackingConfig, master_config.policy["sequence_packing"])
     assert packing["enabled"] is packing_enabled

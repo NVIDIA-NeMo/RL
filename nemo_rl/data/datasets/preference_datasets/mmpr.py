@@ -176,11 +176,17 @@ class MMPRPreferenceDataset(RawDataset):
                         )
                         # Preserve the legacy MPO data contract used for the
                         # parity baseline with the reasoning checkpoint.
+                        chosen_had_reasoning = "<think>" in str(record[chosen_key])
+                        if not chosen_had_reasoning:
+                            record["system"] = ""
+                        else:
+                            # Keep a stable Dataset schema without rendering an
+                            # empty system turn for reasoning rows.
+                            record.setdefault("system", None)
                         for response_key in (chosen_key, rejected_key):
                             response = str(record[response_key])
                             if "<think>" not in response:
                                 record[response_key] = "<think></think>\n\n" + response
-                        record.setdefault("system", "")
                         images = record["image"]
                         if isinstance(images, str):
                             images = [images]

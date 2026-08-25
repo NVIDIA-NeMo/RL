@@ -12,7 +12,3 @@ policy:
     fuse_loss: true
     pair_grouping_key: pair_index
     max_sequences_per_bin: 1
-
-logger:
-  wandb:
-    name: nano-main-packed-legacy-parity-100step

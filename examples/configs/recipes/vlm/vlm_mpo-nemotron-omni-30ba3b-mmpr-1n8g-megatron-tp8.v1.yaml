@@ -1,57 +1,22 @@
-defaults: ../../dpo.yaml
+defaults: ../../vlm_mpo.yaml
 mpo:
-  max_num_epochs: 1
   max_num_steps: 7000
   val_period: 100
   val_batches: 32
   val_global_batch_size: 32
-  val_micro_batch_size: 1
   val_at_start: false
   val_at_end: true
-  seed: 42
-  reference_policy_kl_penalty: 0.05
-  preference_average_log_probs: false
   sft_average_log_probs: true
-  quality_average_log_probs: false
   preference_loss_weight: 0.8
-  sft_loss_weight: 0.0
   bco_loss_weight: 0.2
-  reward_shift_momentum: 0.99
-  reward_shift: 0.0
 policy:
-  model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
-  tokenizer:
-    name: ${policy.model_name}
-    fix_mistral_regex: true
   train_global_batch_size: 256
-  train_micro_batch_size: 1
-  max_total_sequence_length: 8192
   logprob_chunk_size: 128
-  dtensor_cfg:
-    enabled: false
-  sequence_packing:
-    enabled: true
-    train_mb_tokens: 16384
-    logprob_mb_tokens: 16384
-    algorithm: modified_first_fit_decreasing
-    fuse_loss: true
-    pair_grouping_key: pair_index
-    max_sequences_per_bin: 1
-  make_sequence_length_divisible_by: 8
   megatron_cfg:
-    enabled: true
-    env_vars:
-      TORCH_CUDA_ARCH_LIST: '9.0'
-    tensor_model_parallel_size: 8
-    expert_model_parallel_size: 8
     activation_checkpointing: true
     empty_unused_memory_level: 2
-    freeze_audio_encoder: true
-    freeze_audio_projector: true
     bias_activation_fusion: false
     defer_fp32_logits: true
-    mtp_num_layers: 0
-    mtp_loss_scaling_factor: 0.0
     optimizer:
       lr: 8.0e-07
       min_lr: 2.0e-09
@@ -62,28 +27,8 @@ policy:
     distributed_data_parallel_config:
       overlap_grad_reduce: false
       overlap_param_gather: false
-data:
-  train:
-    dataset_name: MMPRPreference
-    data_path: REPLACE_WITH_MMPR_METADATA_PATH
-    split_validation_size: 0.01
-    seed: 42
-    max_samples: null
-    cache_dir: null
-  validation: null
-  default:
-    prompt_file: null
-    system_prompt_file: null
 checkpointing:
   checkpoint_dir: results/vlm_mpo_nemotron_omni_mmpr_megatron
   keep_top_k: 4
   save_period: 100
   checkpoint_must_save_by: 00:03:45:00
-logger:
-  wandb_enabled: true
-  wandb:
-    entity: joc
-    project: nemotron-omni-main-migration
-    name: nemotron-omni-mmpr-mpo-megatron
-cluster:
-  gpus_per_node: 8

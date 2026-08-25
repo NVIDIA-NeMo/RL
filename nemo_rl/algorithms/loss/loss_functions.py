@@ -1234,9 +1234,6 @@ class MPOLossFn(PreferenceLossFn):
             "bco_reward_count": MetricNormalizer.NONE,
         }
 
-    def set_reward_shift(self, value: float) -> None:
-        self.reward_shift = float(value)
-
     def update_reward_shift(self, reward_sum: float, reward_count: float) -> float:
         """Apply one EMA update from globally aggregated BCO rewards."""
         if reward_count <= 0:

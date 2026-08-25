@@ -65,22 +65,27 @@ def _initial_dpo_save_state() -> DPOSaveState:
 
 def _get_dpo_save_state(
     loaded_state: Optional[dict[str, Any]],
-) -> DPOSaveState:
+    save_state_cls: type = DPOSaveState,
+    initial_save_state_fn: Callable[[], Any] = _initial_dpo_save_state,
+) -> Any:
     if loaded_state is None:
-        return _initial_dpo_save_state()
+        return initial_save_state_fn()
 
     # Start from current defaults so partial/legacy checkpoints remain loadable.
-    known_fields = {field.name for field in fields(DPOSaveState)}
-    state_values = vars(_initial_dpo_save_state()).copy()
+    known_fields = {field.name for field in fields(save_state_cls)}
+    state_values = vars(initial_save_state_fn()).copy()
     state_values.update(
         {key: value for key, value in loaded_state.items() if key in known_fields}
     )
-    return DPOSaveState(**state_values)
+    return save_state_cls(**state_values)
 
 
 class DPOConfig(BaseModel, extra="allow"):
     max_num_epochs: int = 1
     max_num_steps: int = 150
+    # Optional boundary for time-sliced jobs. Unlike max_num_steps, this does
+    # not change the final scheduler horizon.
+    stop_after_step: int | None = None
     val_period: int = 25
     val_batches: int = 8
     val_global_batch_size: int = 8
@@ -125,6 +130,17 @@ class DPOValMetrics:
     global_valid_toks: float
 
 
+def _validate_stop_after_step(config: DPOConfig, config_name: str = "dpo") -> None:
+    if config.stop_after_step is None:
+        return
+    if not 0 < config.stop_after_step <= config.max_num_steps:
+        raise ValueError(
+            f"{config_name}.stop_after_step must be between 1 and "
+            f"{config_name}.max_num_steps; got {config.stop_after_step} "
+            f"and {config.max_num_steps}."
+        )
+
+
 # =======================================================
 # Setup & Initialization
 # =======================================================
@@ -139,6 +155,7 @@ def setup(
     initial_save_state_fn: Callable[[], Any] = _initial_dpo_save_state,
     allow_sequence_packing: bool = False,
     cluster_name: str = "dpo_cluster",
+    algorithm_config_name: str = "dpo",
 ) -> tuple[
     Policy,
     RayVirtualCluster,
@@ -164,6 +181,7 @@ def setup(
     logger_config = master_config.logger
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
+    _validate_stop_after_step(dpo_config, algorithm_config_name)
 
     checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
@@ -204,18 +222,11 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    if loaded_state is not None:
-        # Filter to only known save-state fields; checkpoints may carry
-        # extra keys (e.g. validation metrics from previous runs).
-        known_fields = {f.name for f in fields(save_state_cls)}
-        if "total_valid_tokens" in known_fields:
-            # Backcompat: checkpoints saved before total_valid_tokens was added.
-            loaded_state.setdefault("total_valid_tokens", 0)
-        dpo_save_state = save_state_cls(
-            **{k: v for k, v in loaded_state.items() if k in known_fields}
-        )
-    else:
-        dpo_save_state = initial_save_state_fn()
+    dpo_save_state = _get_dpo_save_state(
+        loaded_state,
+        save_state_cls=save_state_cls,
+        initial_save_state_fn=initial_save_state_fn,
+    )
 
     # ==========================
     #           Data
@@ -598,7 +609,7 @@ def dpo_train(
     val_at_start = dpo_config.val_at_start
     val_at_end = dpo_config.val_at_end
     max_num_epochs = dpo_config.max_num_epochs
-    stop_after_step = getattr(dpo_config, "stop_after_step", None)
+    stop_after_step = dpo_config.stop_after_step
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:

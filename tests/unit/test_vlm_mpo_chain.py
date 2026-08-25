@@ -35,3 +35,47 @@ def test_vlm_mpo_chain_requires_targets_for_multiple_segments():
         "CHAIN_STEP_TARGETS is required when CHAIN_SEGMENTS is greater than 1"
         in result.stderr
     )
+
+
+def test_vlm_mpo_launcher_overrides_declared_stop_key(tmp_path):
+    repo_root = Path(__file__).resolve().parents[2]
+    fake_repo = tmp_path / "repo"
+    fake_bin = tmp_path / "bin"
+    fake_repo.mkdir()
+    fake_bin.mkdir()
+    (fake_repo / "config.yaml").write_text("{}\n")
+    (fake_repo / "ray.sub").write_text("#!/usr/bin/env bash\n")
+    fake_sbatch = fake_bin / "sbatch"
+    fake_sbatch.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$COMMAND\"\n"
+        "printf 'Submitted batch job 123\\n'\n"
+    )
+    fake_sbatch.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "HOME": str(tmp_path),
+            "NEMORL": str(fake_repo),
+            "CONFIG_PATH": "config.yaml",
+            "CONTAINER": "test-container.sqsh",
+            "SBATCH_ACCOUNT": "test-account",
+            "MPO_DATA_PATH": "test-data.json",
+            "MPO_MAX_NUM_STEPS": "5",
+            "MPO_STOP_AFTER_STEP": "3",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(repo_root / "scripts" / "vlm_mpo.sh")],
+        capture_output=True,
+        check=False,
+        env=env,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "mpo.stop_after_step=3" in result.stdout
+    assert "+mpo.stop_after_step" not in result.stdout

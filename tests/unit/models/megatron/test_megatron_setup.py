@@ -4149,7 +4149,6 @@ class TestForceSyncModelFromOptimizerFp32:
         TestForceSyncOptimizerFp32FromModel._patch_hdo_class(
             monkeypatch, _HybridDeviceOptimizer
         )
-        model_param = torch.zeros(2)
         model_chunk = MagicMock()
         plain_opt = SimpleNamespace(
             optimizer=object(),
@@ -4158,5 +4157,4 @@ class TestForceSyncModelFromOptimizerFp32:
 
         setup_mod._force_sync_model_from_optimizer_fp32(plain_opt)
 
-        torch.testing.assert_close(model_param, torch.zeros(2))
         model_chunk.start_param_sync.assert_not_called()
