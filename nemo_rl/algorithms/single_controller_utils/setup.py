@@ -563,7 +563,7 @@ def _clamp_max_num_steps(
     """Clamp max_num_steps to max_num_epochs * len(dataloader)."""
     algo_cfg = algo_config(master_config)
     max_num_epochs = algo_cfg.max_num_epochs
-    if max_num_epochs is None or max_num_epochs <= 0:
+    if max_num_epochs is None:
         return
     algo_cfg.max_num_steps = min(
         algo_cfg.max_num_steps,

@@ -408,6 +408,19 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="colocated.enabled=false"):
             validate_single_controller_config(mc)
 
+    @pytest.mark.parametrize(
+        "make_config", [_ppo_master_config, _make_master_config], ids=["ppo", "grpo"]
+    )
+    @pytest.mark.parametrize("epochs", [-1, 0], ids=["negative", "zero"])
+    def test_rejects_a_non_positive_max_num_epochs(self, make_config, epochs):
+        """docs/guides/ppo.md tells async-PPO users to set -1; carried onto SC it
+        makes the rollout pump's epoch gate unsatisfiable and the run exits 0."""
+        mc = make_config()
+        algo_config(mc).max_num_epochs = epochs
+
+        with pytest.raises(ValueError, match="trains zero steps"):
+            validate_single_controller_config(mc)
+
     def test_grpo_is_free_to_use_any_sampler(self):
         mc = _make_master_config()
         mc.async_rl.sampler = WindowedSamplerConfig()

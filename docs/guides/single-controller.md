@@ -160,6 +160,8 @@ The [legacy async GRPO](./async-grpo.md) (`grpo.async_grpo.enabled: true` under 
 
 SC reads its async knobs from `async_rl:` and **requires `grpo.async_grpo: null`** (or `ppo.async_ppo: null` on a PPO run) — `run_grpo_single_controller.py` raises if a legacy block is still present, so null it out when porting rather than leaving it in place.
 
+Do not carry `max_num_epochs: -1` across either. [ppo.md](./ppo.md#asynchronous-ppo) requires that value for legacy async PPO, but SC has no `-1` convention: the rollout pump gates on `_current_epoch < max_num_epochs`, so any non-positive value trains zero steps and exits successfully. Setup rejects it — set a positive `max_num_epochs` and bound the run with `max_num_steps`.
+
 | Legacy `grpo.async_grpo.*` / `ppo.async_ppo.*` | SC equivalent `async_rl.*` |
 | -------------------------- | -------------------------- |
 | `enabled: true` | Implicit — SC is always async; use `sampler.max_lookahead_versions: 0` for sync semantics, `>= 1` for async |
