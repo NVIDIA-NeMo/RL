@@ -282,8 +282,19 @@ class VllmInternalWorkerExtension:
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
-        local_rank = torch.distributed.get_rank()
-        gen_rank_in_group = train_ranks_per_stage + rank_prefix + local_rank
+        # Through the same helper init_collective uses, and for the same reason: under
+        # vLLM's external data parallelism each engine's torch world spans the whole
+        # rollout, so get_rank() is ALREADY global and adding rank_prefix on top counts
+        # the shard offset twice. The higher shards then get NCCL ranks past the end of
+        # the group. Without external DP the two forms agree, which is why this survived:
+        # each engine's world is tp x pp, get_rank() indexes within the shard, and the
+        # prefix is exactly what is missing.
+        #
+        # The group is one PP stage: train_ranks_per_stage trainers followed by every gen
+        # rank, so the rollout span is sub_world_size - train_ranks_per_stage.
+        gen_rank_in_group = train_ranks_per_stage + resolve_rollout_rank(
+            rank_prefix, sub_world_size - train_ranks_per_stage
+        )
 
         # Free cached blocks so NCCL P2P buffers have headroom (see init_collective).
         torch.cuda.empty_cache()

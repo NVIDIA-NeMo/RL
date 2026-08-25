@@ -311,3 +311,62 @@ def test_the_reshard_refit_does_not_occupy_the_actors_event_loop():
             )
             return
     raise AssertionError("megatron_policy_worker.nccl_reshard_refit not found")
+
+
+def test_the_reshard_group_does_not_double_count_the_shard_offset():
+    """Both rank computations in vllm_backend must go through the same helper.
+
+    Under vLLM's external data parallelism each engine's torch world spans the whole
+    rollout, so get_rank() is ALREADY global and adding rank_prefix counts the shard offset
+    twice -- the higher shards then get NCCL ranks past the end of the group. init_collective
+    resolves this through resolve_rollout_rank; init_nccl_reshard_comm_group open-coded
+    `rank_prefix + get_rank()` and did not. Without external DP the two agree, which is why
+    it survived.
+    """
+    tree = ast.parse((GENERATION / "vllm" / "vllm_backend.py").read_text())
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "init_nccl_reshard_comm_group"
+        ):
+            called = {
+                c.func.id
+                for c in ast.walk(node)
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            }
+            assert "resolve_rollout_rank" in called, (
+                "init_nccl_reshard_comm_group must resolve its rank through "
+                "resolve_rollout_rank, like init_collective; adding rank_prefix to a "
+                "global get_rank() puts the higher shards past the end of the group."
+            )
+            return
+    raise AssertionError("init_nccl_reshard_comm_group not found")
+
+
+def test_the_reshard_preconditions_are_checked_on_the_single_controller_path():
+    """The guard had one caller, in grpo.setup, which SC does not go through.
+
+    run_grpo_single_controller calls setup_single_controller directly, so every
+    nccl_reshard precondition -- colocated.enabled, enable_eplb and the rest -- went
+    unenforced there and a bad config reached the first refit before anything noticed.
+    """
+    setup = (
+        REPO_ROOT / "nemo_rl" / "algorithms" / "single_controller_utils" / "setup.py"
+    )
+    tree = ast.parse(setup.read_text())
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "setup_single_controller"
+        ):
+            called = {
+                c.func.id
+                for c in ast.walk(node)
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            }
+            assert "check_nccl_reshard_refit_support" in called, (
+                "setup_single_controller must run the nccl_reshard precondition guard; "
+                "its only other caller is grpo.setup, which this path never reaches."
+            )
+            return
+    raise AssertionError("setup_single_controller not found")
