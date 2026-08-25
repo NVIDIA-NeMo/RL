@@ -12,7 +12,7 @@ top-k selection and the next three reuse it. GLM-5.1 computes the indexer in
 each DSA layer. Reuse avoids repeating the indexer's projection and scoring
 GEMMs in the three shared layers.
 
-> [IMPORTANT]
+> [!IMPORTANT]
 > **Status: Functionally Ready.** The GLM-5.1 and GLM-5.2 integrations support
 > Megatron training with vLLM generation. The GLM-5.2 reference configurations
 > include short- and long-context training paths. 
