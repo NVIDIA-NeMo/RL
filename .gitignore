@@ -49,8 +49,3 @@ code_snapshots*/
 
 # Claude Code review memory (local only)
 .claude/review-memory/
-submit_vlm_*.sh
-examples/configs/recipes/vlm/joint-*.yaml
-examples/configs/recipes/vlm/vision-diag*.yaml
-examples/configs/recipes/vlm/mopd-nemotron-super-omni-*.yaml
-examples/configs/recipes/vlm/prefetch-joint-*.yaml

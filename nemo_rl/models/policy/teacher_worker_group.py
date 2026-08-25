@@ -83,13 +83,7 @@ def create_teacher_configs_from_opd_config(
         # defaults <- per-alias override, then schema-validated. Partial blocks
         # are honored as written; set gpus_per_node in default_teacher_cfg to
         # match the cluster (the schema default is 8).
-        raw_override = overrides.get(alias, {})
-        if isinstance(raw_override, TeacherResourceConfig):
-            # Defensive: if a loader pre-validated the block, keep only what
-            # the yaml actually set so a PARTIAL override doesn't clobber
-            # defaults with schema-filled fields.
-            raw_override = raw_override.model_dump(exclude_unset=True)
-        merged = {**default_cfg, **dict(raw_override)}
+        merged = {**default_cfg, **dict(overrides.get(alias, {}))}
         res = TeacherResourceConfig(**merged)
 
         # Unknown top-level keys (extra="allow") fold into megatron_cfg_overrides;
