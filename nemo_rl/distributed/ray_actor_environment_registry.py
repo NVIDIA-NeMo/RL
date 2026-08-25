@@ -60,9 +60,9 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": PY_EXECUTABLES.VLLM,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.nemo_gym.NemoGym": PY_EXECUTABLES.NEMO_GYM,
-    # Diffusion-GRPO policy worker: nemo-automodel (pipeline loading, LoRA,
+    # Flow-GRPO policy worker: nemo-automodel (pipeline loading, LoRA,
     # checkpointing) + the diffusion extra (diffusers, OCR reward deps).
-    "nemo_rl.models.diffusion.workers.diffusion_worker.DiffusionPolicyWorker": PY_EXECUTABLES.AUTOMODEL_DIFFUSION,
+    "nemo_rl.models.diffusion.workers.flow_grpo_worker.FlowGRPOPolicyWorker": PY_EXECUTABLES.AUTOMODEL_DIFFUSION,
     "nemo_rl.environments.image_reward_environment._RewardWorker": PY_EXECUTABLES.SYSTEM,
 }
 

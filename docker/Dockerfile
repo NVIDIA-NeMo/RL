@@ -230,7 +230,7 @@ fi
 uv sync --link-mode symlink --frozen --extra mcore --no-install-project
 uv sync --link-mode symlink --frozen --extra automodel --no-install-project
 uv sync --link-mode symlink --frozen --extra modelopt --no-install-project
-# Combined env for the diffusion-GRPO policy worker (PY_EXECUTABLES.AUTOMODEL_DIFFUSION)
+# Combined env for the flow-GRPO policy worker (PY_EXECUTABLES.AUTOMODEL_DIFFUSION)
 uv sync --link-mode symlink --frozen --extra automodel --extra diffusion --no-install-project
 uv sync --link-mode symlink --frozen --all-groups --no-install-project
 

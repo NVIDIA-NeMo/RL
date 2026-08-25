@@ -73,7 +73,7 @@ vlm_<algo>-<model>-<nodes>n<gpus>g-<strategy>[-modifiers][.vN].(yaml|sh)
 ### Diffusion Pattern
 
 Image-diffusion recipes follow the LLM pattern (e.g.
-`grpo-qwen-image-ocr-1n8g-dp8-lora`), with the task name appended to the
+`flow_grpo-qwen-image-ocr-1n8g-dp8-lora`), with the task name appended to the
 model segment as in the VLM recipes.
 
 ### Directory Placement

@@ -13,9 +13,9 @@
 # limitations under the License.
 import torch
 
-from nemo_rl.models.diffusion.policy import DiffusionPolicy
+from nemo_rl.models.diffusion.flow_grpo_policy import FlowGRPOPolicy
 
-merge = DiffusionPolicy._merge_trajectories
+merge = FlowGRPOPolicy._merge_trajectories
 
 
 def test_merge_single_shard_is_identity():

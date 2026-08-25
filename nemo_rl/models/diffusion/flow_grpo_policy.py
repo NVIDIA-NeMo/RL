@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Controller-side ``DiffusionPolicy`` facade.
+"""Controller-side ``FlowGRPOPolicy`` facade.
 
 Owns one :class:`nemo_rl.distributed.worker_groups.RayWorkerGroup` of
-:class:`nemo_rl.models.diffusion.workers.diffusion_worker.DiffusionPolicyWorker`
+:class:`nemo_rl.models.diffusion.workers.flow_grpo_worker.FlowGRPOPolicyWorker`
 actors. With N workers (``cluster.gpus_per_node = N``) the policy runs
 data-parallel: rollout prompts are scattered across workers (each worker gets
 a distinct seed), trajectories are gathered/concatenated on the controller,
@@ -84,7 +84,7 @@ def aggregate_worker_metrics(
     return out
 
 
-class DiffusionPolicy:
+class FlowGRPOPolicy:
     """Controller-side facade around a Ray pool of diffusion workers."""
 
     def __init__(
@@ -92,12 +92,12 @@ class DiffusionPolicy:
         cluster: RayVirtualCluster,
         config: DiffusionPolicyConfig,
         *,
-        name_prefix: str = "diffusion_policy",
+        name_prefix: str = "flow_grpo_policy",
     ) -> None:
         self.cluster = cluster
         self.config = config
         builder = RayWorkerBuilder(
-            "nemo_rl.models.diffusion.workers.diffusion_worker.DiffusionPolicyWorker",
+            "nemo_rl.models.diffusion.workers.flow_grpo_worker.FlowGRPOPolicyWorker",
             config,
         )
         self.worker_group = RayWorkerGroup(
@@ -171,7 +171,7 @@ class DiffusionPolicy:
             # batch) run on worker 0 alone.
             if n > 1:
                 print(
-                    f"[DiffusionPolicy] rollout of {len(prompts)} prompts does "
+                    f"[FlowGRPOPolicy] rollout of {len(prompts)} prompts does "
                     f"not split across {n} workers; running on worker 0 only",
                     flush=True,
                 )
@@ -185,7 +185,7 @@ class DiffusionPolicy:
             )
             return ray.get(future)
         # generation_overrides is a full model_dump() of
-        # DiffusionValGenerationCfg (or None on the training path).
+        # FlowGRPOValGenerationCfg (or None on the training path).
         single_seed = generation_overrides is not None and bool(
             generation_overrides["single_seed"]
         )
@@ -208,7 +208,7 @@ class DiffusionPolicy:
     def train(
         self,
         data: BatchedDataDict[DiffusionTrainDataSpec],
-        # model_dump() dict view of DiffusionLossConfig.
+        # model_dump() dict view of FlowGRPOLossConfig.
         loss_cfg: dict[str, Any],
     ) -> dict[str, float]:
         n = self.num_workers
@@ -245,8 +245,8 @@ class DiffusionPolicy:
     def prepare_for_training(self) -> None:
         self._call_all("prepare_for_training")
 
-    def save_checkpoint(self, path: str) -> None:
-        self._call_all("save_checkpoint", path=path)
+    def save_checkpoint(self, path: str, *, save_optimizer: bool = True) -> None:
+        self._call_all("save_checkpoint", path=path, save_optimizer=save_optimizer)
 
     def load_checkpoint(self, path: str) -> None:
         self._call_all("load_checkpoint", path=path)

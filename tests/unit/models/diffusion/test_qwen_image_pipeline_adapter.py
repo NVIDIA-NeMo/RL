@@ -152,7 +152,6 @@ def test_sample_then_recompute_matches_in_fp32():
         "generation_logprobs": sampling_logprobs_stacked,
         "advantages": torch.zeros(B, T),
         "timestep_mask": torch.ones(B, T),
-        "sample_mask": torch.ones(B),
     }
     curr_lp, _, _, _ = adapter.compute_transition_logprob(data)  # type: ignore[arg-type]
 
@@ -201,7 +200,6 @@ def test_recompute_parity_holds_under_cfg():
         "generation_logprobs": sampling_logprobs_stacked,
         "advantages": torch.zeros(B, T),
         "timestep_mask": torch.ones(B, T),
-        "sample_mask": torch.ones(B),
     }
     curr_lp, _, _, _ = adapter.compute_transition_logprob(data)  # type: ignore[arg-type]
 
@@ -278,7 +276,6 @@ def test_parity_bf16_within_loose_tolerance(dtype: torch.dtype):
         "generation_logprobs": sampling_logprobs_stacked,
         "advantages": torch.zeros(B, T),
         "timestep_mask": torch.ones(B, T),
-        "sample_mask": torch.ones(B),
     }
     curr_lp, _, _, _ = adapter.compute_transition_logprob(data)  # type: ignore[arg-type]
     tol = 1e-4 if dtype == torch.float32 else 1e-2

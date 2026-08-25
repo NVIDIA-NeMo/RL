@@ -169,7 +169,7 @@ tests/test_suites/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-contr
 #############
 
 # Qwen-Image flow-GRPO LoRA on the Flow-GRPO OCR task (PaddleOCR reward, single-node 8-GPU DP)
-tests/test_suites/diffusion/grpo-qwen-image-ocr-1n8g-dp8-lora.sh
+tests/test_suites/diffusion/flow_grpo-qwen-image-ocr-1n8g-dp8-lora.sh
 
 ########
 # DAPO #

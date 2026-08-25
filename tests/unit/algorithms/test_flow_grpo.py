@@ -11,64 +11,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for diffusion-GRPO resume helpers."""
+"""Tests for the flow-GRPO training loop."""
 
+import json
 import os
-
-from nemo_rl.algorithms.diffusion_grpo import _latest_checkpoint
-
-
-def _make_ckpt(root, name: str, complete: bool = True) -> str:
-    """Mimic the Automodel Checkpointer layout: model/ + optim/.metadata last."""
-    path = os.path.join(root, name)
-    os.makedirs(os.path.join(path, "model"))
-    if complete:
-        os.makedirs(os.path.join(path, "optim"))
-        with open(os.path.join(path, "optim", ".metadata"), "wb"):
-            pass
-    return path
-
-
-def test_latest_checkpoint_missing_dir_returns_none(tmp_path):
-    assert _latest_checkpoint(str(tmp_path / "does_not_exist")) is None
-
-
-def test_latest_checkpoint_picks_highest_complete_step(tmp_path):
-    _make_ckpt(tmp_path, "step_1")
-    expected = _make_ckpt(tmp_path, "step_10")
-    # Incomplete checkpoint (no optim/.metadata yet) must be skipped even
-    # though its step number is the highest.
-    _make_ckpt(tmp_path, "step_30", complete=False)
-    _make_ckpt(tmp_path, "not_a_checkpoint")
-    assert _latest_checkpoint(str(tmp_path)) == (expected, 10)
-
-
-def test_latest_checkpoint_all_incomplete_returns_none(tmp_path):
-    _make_ckpt(tmp_path, "step_5", complete=False)
-    assert _latest_checkpoint(str(tmp_path)) is None
 
 
 def test_master_config_rejects_kl_with_full_param():
     import pytest
     from omegaconf import OmegaConf
 
-    from nemo_rl.algorithms.diffusion_grpo import DiffusionMasterConfig
+    from nemo_rl.algorithms.flow_grpo import MasterConfig
     from nemo_rl.utils.config import load_config
 
     cfg = OmegaConf.to_container(
-        load_config("examples/configs/diffusion_grpo_qwen_image_ocr.yaml"),
+        load_config("examples/configs/flow_grpo_qwen_image_ocr.yaml"),
         resolve=True,
     )
     cfg["loss_fn"]["beta"] = 0.04
     cfg["policy"]["lora_cfg"]["enabled"] = False
     with pytest.raises(Exception, match="beta"):
-        DiffusionMasterConfig.model_validate(cfg)
+        MasterConfig.model_validate(cfg)
 
 
 def test_run_validation_passes_generation_overrides():
     import torch
 
-    from nemo_rl.algorithms.diffusion_grpo import _run_validation
+    from nemo_rl.algorithms.flow_grpo import _run_validation
 
     seen = []
 
@@ -123,7 +92,7 @@ def test_run_validation_passes_generation_overrides():
 def test_build_train_data_slices_to_window_columns():
     import torch
 
-    from nemo_rl.algorithms.diffusion_grpo import _build_train_data
+    from nemo_rl.algorithms.flow_grpo import _build_train_data
 
     B, T, w = 2, 8, 3
     mask = torch.zeros(B, T)
@@ -145,9 +114,7 @@ def test_build_train_data_slices_to_window_columns():
         "metadata": [{}, {}],
         "images": torch.zeros(B, 3, 4, 4),
     }
-    out = _build_train_data(
-        traj, torch.tensor([1.0, -1.0]), loss_multiplier=torch.ones(B)
-    )
+    out = _build_train_data(traj, torch.tensor([1.0, -1.0]))
     assert out["timesteps"].shape == (B, w)
     assert out["latents"].shape == (B, w + 1, 4)
     assert torch.all(out["timestep_mask"] == 1)
@@ -158,7 +125,7 @@ def test_build_train_data_slices_to_window_columns():
 
 
 def _mini_batch_algo_cfg(**overrides):
-    from nemo_rl.models.diffusion.interfaces import DiffusionGRPOAlgoConfig
+    from nemo_rl.algorithms.flow_grpo import FlowGRPOAlgoConfig
 
     cfg = {
         "num_prompts_per_step": 4,
@@ -170,7 +137,7 @@ def _mini_batch_algo_cfg(**overrides):
         "val_at_end": False,
     }
     cfg.update(overrides)
-    return DiffusionGRPOAlgoConfig.model_validate(cfg)
+    return FlowGRPOAlgoConfig.model_validate(cfg)
 
 
 def test_ppo_mini_batch_size_must_keep_groups_whole():
@@ -193,7 +160,7 @@ def test_ppo_mini_batch_size_valid_values_accepted():
 
 
 class _RecordingPolicy:
-    """Fake DiffusionPolicy capturing each train() call's sample ids."""
+    """Fake FlowGRPOPolicy capturing each train() call's sample ids."""
 
     num_workers = 1
 
@@ -235,18 +202,38 @@ class _RecordingPolicy:
         # Distinct loss per call so the cross-mini mean is observable.
         return {"loss": float(len(self.train_calls)), "mean_ratio": 1.0}
 
-    def save_checkpoint(self, path):
+    def save_checkpoint(self, path, *, save_optimizer=True):
         raise AssertionError("checkpointing is disabled in this test")
 
 
-def _run_one_train_step(algo_cfg):
+def _master_config(algo_cfg, checkpoint_dir=None):
+    """Exemplar config with the algo block swapped for the test's `algo_cfg`."""
+    from omegaconf import OmegaConf
+
+    from nemo_rl.algorithms.flow_grpo import MasterConfig
+    from nemo_rl.utils.config import load_config
+
+    cfg = OmegaConf.to_container(
+        load_config("examples/configs/flow_grpo_qwen_image_ocr.yaml"),
+        resolve=True,
+    )
+    cfg["checkpointing"]["enabled"] = checkpoint_dir is not None
+    if checkpoint_dir is not None:
+        cfg["checkpointing"]["checkpoint_dir"] = str(checkpoint_dir)
+    master = MasterConfig.model_validate(cfg)
+    master.flow_grpo = algo_cfg
+    return master
+
+
+def _run_one_train_step(algo_cfg, checkpoint_dir=None, policy=None):
     import torch
 
-    from nemo_rl.algorithms.diffusion_grpo import diffusion_grpo_train
-    from nemo_rl.models.diffusion.interfaces import DiffusionLossConfig
+    from nemo_rl.algorithms.flow_grpo import flow_grpo_train
+    from nemo_rl.utils.checkpoint import CheckpointManager
 
     K = algo_cfg.num_generations_per_prompt
-    policy = _RecordingPolicy(K)
+    policy = policy if policy is not None else _RecordingPolicy(K)
+    master = _master_config(algo_cfg, checkpoint_dir)
 
     class FakeEnv:
         def score_images(self, images, prompts, metadata):
@@ -259,7 +246,7 @@ def _run_one_train_step(algo_cfg):
         def log_metrics(self, metrics, step):
             logged.append(metrics)
 
-    diffusion_grpo_train(
+    flow_grpo_train(
         policy,
         FakeEnv(),
         [
@@ -270,12 +257,34 @@ def _run_one_train_step(algo_cfg):
             }
         ],
         None,
-        algo_cfg=algo_cfg,
-        loss_cfg=DiffusionLossConfig(),
+        master_config=master,
         logger=FakeLogger(),
-        checkpoint_dir=None,
+        checkpointer=CheckpointManager(master.checkpointing),
     )
     return policy, logged
+
+
+def test_resume_reads_step_from_training_info(tmp_path):
+    """A complete step_N/ resumes at N and loads from its policy/ subdir."""
+    step_dir = tmp_path / "step_5"
+    step_dir.mkdir(parents=True)
+    (step_dir / "training_info.json").write_text(json.dumps({"step": 5}))
+
+    class ResumingPolicy(_RecordingPolicy):
+        def __init__(self, K):
+            super().__init__(K)
+            self.loaded_from = None
+
+        def load_checkpoint(self, path):
+            self.loaded_from = path
+
+    policy = ResumingPolicy(4)
+    # max_num_steps == the resumed step, so the loop body never runs.
+    algo_cfg = _mini_batch_algo_cfg(max_num_steps=5)
+    _run_one_train_step(algo_cfg, checkpoint_dir=tmp_path, policy=policy)
+
+    assert policy.loaded_from == os.path.join(str(step_dir), "policy")
+    assert policy.train_calls == []
 
 
 def test_mini_batches_preserve_order_and_groups():
@@ -309,7 +318,7 @@ def test_mini_batches_repeat_across_ppo_epochs():
 def test_global_std_tames_constant_group_amplification():
     import torch
 
-    from nemo_rl.algorithms.diffusion_grpo import _compute_advantages
+    from nemo_rl.algorithms.flow_grpo import _compute_advantages
 
     # Group a is all-constant (common under OCR rewards); group b carries a
     # tiny signal.

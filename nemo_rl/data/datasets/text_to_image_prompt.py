@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Plain text-to-image prompt dataset for diffusion-GRPO training.
+"""Plain text-to-image prompt dataset for flow-GRPO training.
 
 Supports two formats:
 
@@ -20,7 +20,7 @@ Supports two formats:
   ``negative_prompt`` (optional), and ``metadata`` (optional dict).
 
 The collate function produces a ``BatchedDataDict[DiffusionDatumSpec]`` that
-the diffusion-GRPO trainer feeds into ``DiffusionPolicy.sample_trajectory``.
+the flow-GRPO trainer feeds into ``FlowGRPOPolicy.sample_trajectory``.
 """
 
 import json
@@ -91,7 +91,6 @@ class TextToImagePromptDataset(Dataset):
             "negative_prompt": rec.get("negative_prompt", self.negative_prompt_default),
             "metadata": rec.get("metadata", {}),
             "idx": idx,
-            "loss_multiplier": 1.0,
             "task_name": self.task_name,
         }
         return datum
@@ -107,7 +106,6 @@ def text_to_image_collate_fn(
             "negative_prompts": [item.get("negative_prompt", " ") for item in batch],
             "metadata": [item.get("metadata", {}) for item in batch],
             "idx": [item["idx"] for item in batch],
-            "loss_multipliers": [item["loss_multiplier"] for item in batch],
             "task_names": [item.get("task_name", "text_to_image") for item in batch],
         }
     )

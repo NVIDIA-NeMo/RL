@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Diffusion-GRPO loss.
+"""Flow-GRPO loss.
 
 This module intentionally does NOT implement
 :class:`nemo_rl.algorithms.loss.interfaces.LossFunction`. The Protocol's
@@ -20,7 +20,7 @@ This module intentionally does NOT implement
 sequence semantics; mapping diffusion timestep semantics onto them would either
 distort the abstractions or require renaming the args at every call site. The
 diffusion training loop calls this loss directly from
-:class:`nemo_rl.models.diffusion.workers.diffusion_worker.DiffusionPolicyWorker`,
+:class:`nemo_rl.models.diffusion.workers.flow_grpo_worker.FlowGRPOPolicyWorker`,
 so Protocol conformance is not needed.
 
 The formula mirrors verl-omni
@@ -32,13 +32,30 @@ https://github.com/yifan123/flow_grpo/blob/main/scripts/train_sd3_fast.py#L885.
 from typing import Any
 
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.algorithms.utils import masked_mean
-from nemo_rl.models.diffusion.interfaces import DiffusionLossConfig
 
 
-class DiffusionGRPOLossFn:
-    """Clipped policy-gradient loss for diffusion GRPO with optional Gaussian KL.
+class FlowGRPOLossConfig(BaseModel, extra="allow"):
+    """Flow-GRPO loss knobs aligned with verl-omni `FlowGRPOLoss` config."""
+
+    ratio_clip_min: float = 0.2
+    ratio_clip_max: float = 0.2
+    # Advantages are clamped to ±adv_clip_max before the ratio computation
+    # (verl-omni FlowGRPOLoss semantics); None disables the clamp.
+    adv_clip_max: float | None = 5.0
+    beta: float = 0.0
+    # Default False keeps per-(sample, step) ratio elements, which is the
+    # verl-omni/Flow-GRPO formulation (verl-omni's log_prob is [B]: a mean
+    # over all non-batch dims, never a sum along T). True is an experimental
+    # sum-aggregation over T that inflates the log-ratio scale by
+    # ~window_size and is incompatible with 1e-4-scale ratio clips.
+    aggregate_logprobs_per_sample: bool = False
+
+
+class FlowGRPOLossFn:
+    """Clipped policy-gradient loss for flow-GRPO with optional Gaussian KL.
 
     Inputs are all shaped ``[B, T]`` (batch times generations-per-prompt times
     inference steps). The mean tensors used by the KL term are shaped
@@ -48,10 +65,10 @@ class DiffusionGRPOLossFn:
     computation, to match verl-omni's FlowGRPOLoss behaviour.
     """
 
-    def __init__(self, cfg: DiffusionLossConfig | dict[str, Any]):
+    def __init__(self, cfg: FlowGRPOLossConfig | dict[str, Any]):
         # Normalize through the schema so both validated dicts (from the
         # entrypoint's model_dump) and partial dicts get schema defaults.
-        self.cfg = DiffusionLossConfig.model_validate(cfg).model_dump()
+        self.cfg = FlowGRPOLossConfig.model_validate(cfg).model_dump()
 
     def __call__(
         self,
@@ -59,7 +76,6 @@ class DiffusionGRPOLossFn:
         generation_logprob: torch.Tensor,
         advantages: torch.Tensor,
         timestep_mask: torch.Tensor,
-        sample_mask: torch.Tensor,
         *,
         current_mean: torch.Tensor | None = None,
         reference_mean: torch.Tensor | None = None,
@@ -79,7 +95,6 @@ class DiffusionGRPOLossFn:
             device=device, dtype=curr_logprob.dtype
         )
         timestep_mask = timestep_mask.to(device=device)
-        sample_mask = sample_mask.to(device=device)
         if aggregate_per_sample:
             # Experimental sum-aggregation, NOT verl-omni semantics: verl-omni
             # keeps log_prob at [B] by averaging over all non-batch dims and
@@ -116,17 +131,14 @@ class DiffusionGRPOLossFn:
                     advantages = advantages[:, 0]
                 advantages = advantages.unsqueeze(-1).expand_as(curr_logprob)
                 timestep_mask = torch.ones_like(curr_logprob)
-                sample_mask = sample_mask.unsqueeze(-1).expand_as(curr_logprob)
         log_ratio = curr_logprob - generation_logprob
         ratio = log_ratio.exp()
         unclipped = -advantages * ratio
         clipped = -advantages * ratio.clamp(1.0 - ratio_clip_min, 1.0 + ratio_clip_max)
         pg = torch.maximum(unclipped, clipped)
 
-        if aggregate_per_sample:
-            mask = timestep_mask.float() * sample_mask.float()
-        else:
-            mask = timestep_mask.float() * sample_mask.float().unsqueeze(-1)
+        # Both branches above leave timestep_mask shaped exactly like `pg`.
+        mask = timestep_mask.float()
         policy_loss = masked_mean(pg, mask)
 
         with torch.no_grad():

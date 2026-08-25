@@ -16,7 +16,7 @@
 Mirrors the *shape* of
 :class:`nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorkerImpl`
 but does not inherit from it — the parent's API targets a HF causal-LM
-``forward``. Methods exposed to ``DiffusionPolicy``:
+``forward``. Methods exposed to ``FlowGRPOPolicy``:
 
 ``sample_trajectory``, ``compute_transition_logprob``, ``train_step``,
 ``save_checkpoint``, ``shutdown``.
@@ -249,7 +249,7 @@ def accumulate_metrics(
 
 
 @ray.remote
-class DiffusionPolicyWorker:  # pragma: no cover
+class FlowGRPOPolicyWorker:  # pragma: no cover
     """Ray actor owning one Qwen-Image pipeline + LoRA optimizer."""
 
     # Populated by the _load_pipeline/_build_optimizer/_build_adapter helpers
@@ -323,7 +323,7 @@ class DiffusionPolicyWorker:  # pragma: no cover
 
         if not torch.cuda.is_available():
             raise RuntimeError(
-                "DiffusionPolicyWorker requires CUDA, but torch.cuda.is_available() "
+                "FlowGRPOPolicyWorker requires CUDA, but torch.cuda.is_available() "
                 "is False (e.g. a cu13 torch wheel on a CUDA-12 driver). Refusing "
                 "to fall back to CPU training silently."
             )
@@ -598,7 +598,7 @@ class DiffusionPolicyWorker:  # pragma: no cover
                     prompts, negative_prompts, metadata, K=K, seed=seed
                 )
         train_steps = int(self.config["pipeline"]["num_inference_steps"])
-        # generation_overrides is a full model_dump() of DiffusionValGenerationCfg.
+        # generation_overrides is a full model_dump() of FlowGRPOValGenerationCfg.
         val_steps = int(generation_overrides["num_inference_steps"])
         saved_algo = self.adapter.algo_cfg
         saved_prepare = self.adapter._prepare_initial_latents_fn
@@ -662,11 +662,11 @@ class DiffusionPolicyWorker:  # pragma: no cover
     def train_step(self, data, loss_cfg):
         import torch
 
-        from nemo_rl.algorithms.loss.diffusion_grpo import DiffusionGRPOLossFn
+        from nemo_rl.algorithms.loss.flow_grpo import FlowGRPOLossFn
 
         self.transformer.train()
         if self._loss_fn is None:
-            self._loss_fn = DiffusionGRPOLossFn(loss_cfg)
+            self._loss_fn = FlowGRPOLossFn(loss_cfg)
         use_reference = float(loss_cfg["beta"]) > 0
 
         # Gradient accumulation over sample-dimension chunks so the
@@ -691,7 +691,6 @@ class DiffusionPolicyWorker:  # pragma: no cover
                 generation_logprob=chunk["generation_logprobs"],
                 advantages=chunk["advantages"],
                 timestep_mask=chunk["timestep_mask"],
-                sample_mask=chunk["sample_mask"],
                 current_mean=recompute["current_mean"],
                 reference_mean=recompute["reference_mean"],
                 std_dev=recompute["std_dev"],
@@ -709,9 +708,7 @@ class DiffusionPolicyWorker:  # pragma: no cover
                     # loses ~0.3-0.4%/step on the small LoRA grads that the
                     # 1e-4 ratio clip already shrinks.
                     g32 = p.grad.float()
-                    torch.distributed.all_reduce(
-                        g32, op=torch.distributed.ReduceOp.AVG
-                    )
+                    torch.distributed.all_reduce(g32, op=torch.distributed.ReduceOp.AVG)
                     p.grad = g32.to(p.grad.dtype)
         grad_norm = torch.nn.utils.clip_grad_norm_(
             (p for p in self.transformer.parameters() if p.requires_grad),
@@ -745,15 +742,14 @@ class DiffusionPolicyWorker:  # pragma: no cover
             )
         return self._checkpointer
 
-    def save_checkpoint(self, path: str) -> None:
-        """Write model + optimizer state under `path` via the Automodel Checkpointer.
+    def save_checkpoint(self, path: str, *, save_optimizer: bool = True) -> None:
+        """Write model (and optionally optimizer) state under `path`.
 
         Layout: ``path/model/`` (LoRA: rank-0-written adapter_model.safetensors
         + HF-peft-compatible adapter_config.json; full-param: sharded
-        safetensors) and ``path/optim/`` (torch DCP; its ``.metadata`` is
-        written last and doubles as the resume completeness marker). Every DP
-        rank must call in: DCP saves are collectives and the Checkpointer
-        synchronizes ranks internally.
+        safetensors) and ``path/optim/`` (torch DCP). Every DP rank must call
+        in: DCP saves are collectives and the Checkpointer synchronizes ranks
+        internally.
         """
         ckpt = self._get_checkpointer()
         ckpt.save_model(
@@ -761,18 +757,22 @@ class DiffusionPolicyWorker:  # pragma: no cover
             path,
             peft_config=getattr(self._pipe, "_peft_config", None),
         )
-        ckpt.save_optimizer(self.optimizer, self.transformer, path)
+        if save_optimizer:
+            ckpt.save_optimizer(self.optimizer, self.transformer, path)
 
     def load_checkpoint(self, path: str) -> bool:
-        """Restore weights + optimizer saved by :meth:`save_checkpoint`.
+        """Restore weights (and optimizer state, when present) from `path`.
 
         LoRA restores only the adapter weights (the frozen base keeps coming
         from the HF snapshot). All DP ranks participate, matching the
-        invariant that ranks hold identical weights and optimizer state.
+        invariant that ranks hold identical weights and optimizer state. A
+        checkpoint saved with ``save_optimizer=False`` has no ``optim/``, so
+        the optimizer restarts from its freshly initialized state.
         """
         ckpt = self._get_checkpointer()
         ckpt.load_model(self.transformer, os.path.join(path, "model"))
-        ckpt.load_optimizer(self.optimizer, self.transformer, path)
+        if os.path.isdir(os.path.join(path, "optim")):
+            ckpt.load_optimizer(self.optimizer, self.transformer, path)
         return True
 
     def prepare_for_generation(self) -> None:

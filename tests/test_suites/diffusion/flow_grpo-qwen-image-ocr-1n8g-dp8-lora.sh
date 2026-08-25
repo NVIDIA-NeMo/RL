@@ -20,9 +20,9 @@ if [[ ! -f examples/data/diffusion/ocr/train_prompts.jsonl ]]; then
   uv run python tools/export_ocr_prompts.py --out-dir examples/data/diffusion/ocr
 fi
 
-uv run --extra diffusion examples/run_diffusion_grpo.py \
+uv run --extra diffusion examples/run_flow_grpo.py \
     --config $CONFIG_PATH \
-    grpo.max_num_steps=$MAX_STEPS \
+    flow_grpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
@@ -36,7 +36,7 @@ uv run --extra diffusion examples/run_diffusion_grpo.py \
 # Convert tensorboard logs to json
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Diffusion-GRPO logs 0-based steps, so the last step key is MAX_STEPS - 1.
+# Flow-GRPO logs 0-based steps, so the last step key is MAX_STEPS - 1.
 LAST_STEP=$((MAX_STEPS - 1))
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $LAST_STEP ]]; then
     # Nightly uses the CPU PaddleOCR (ocr) reward, not the exemplar's genrm_ocr

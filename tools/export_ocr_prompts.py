@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Export the Flow-GRPO OCR dataset as diffusion-GRPO prompt jsonl files.
+"""Export the Flow-GRPO OCR dataset as flow-GRPO prompt jsonl files.
 
 Source: https://github.com/yifan123/flow_grpo/tree/main/dataset/ocr
 (19,653 train / 1,018 val prompts; the upstream txt files lack a trailing

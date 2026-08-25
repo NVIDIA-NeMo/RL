@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Diffusion-GRPO training loop.
+"""Flow-GRPO training loop.
 
 Mirrors :func:`nemo_rl.algorithms.grpo.grpo_train` in phase ordering
 (cluster→policy→env→dataset→loop[rollout→reward→advantage→train→validate→checkpoint])
@@ -27,12 +27,12 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from typing import Any, Iterable
 
 import torch
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
+from nemo_rl.algorithms.loss.flow_grpo import FlowGRPOLossConfig
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
@@ -40,19 +40,87 @@ from nemo_rl.environments.image_reward_environment import (
     ImageRewardEnvConfig,
     ImageRewardEnvironment,
 )
+from nemo_rl.models.diffusion.flow_grpo_policy import (
+    FlowGRPOPolicy,
+    aggregate_worker_metrics,
+)
 from nemo_rl.models.diffusion.interfaces import (
-    DiffusionGRPOAlgoConfig,
-    DiffusionLossConfig,
     DiffusionPolicyConfig,
     DiffusionTrainDataSpec,
     DiffusionTrajectorySpec,
 )
-from nemo_rl.models.diffusion.policy import (
-    DiffusionPolicy,
-    aggregate_worker_metrics,
-)
+from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.timer import Timer
+
+
+class FlowGRPOValGenerationCfg(BaseModel, extra="allow"):
+    """Validation-time generation overrides.
+
+    Validation always samples with the deterministic ODE (no SDE window, no
+    logprob collection).
+    """
+
+    num_inference_steps: int = 40
+    # Draw every validation sample's initial latent from a fresh generator
+    # holding the same seed (verl-omni val_kwargs.seed semantics: every val
+    # request is seeded identically), so val rewards are independent of batch
+    # position, batch size and DP worker layout. Default keeps the current
+    # behavior: one generator per rollout batch, per-worker seed offsets.
+    single_seed: bool = False
+
+
+class FlowGRPOAlgoConfig(BaseModel, extra="allow"):
+    """Top-level flow-GRPO training-loop config."""
+
+    num_prompts_per_step: int = 8
+    num_generations_per_prompt: int = 16
+    max_num_steps: int = 5000
+    # 0 disables periodic validation.
+    val_period: int = 50
+    seed: int = 42
+    ppo_epochs: int = 1
+    val_at_start: bool = False
+    val_at_end: bool = False
+    # 0 validates on the full val dataloader.
+    max_val_samples: int = 0
+    use_leave_one_out_baseline: bool = True
+    # Normalize advantages by the whole-batch reward std (verl-omni
+    # `global_std`) instead of per-group std, which explodes on
+    # near-constant groups under sparse rewards.
+    use_global_std: bool = True
+    # Actor-update mini-batch size in samples (verl-omni ppo_mini_batch_size
+    # semantics, which counts prompts and scales by rollout.n). None keeps a
+    # single optimizer update over the whole rollout batch. When set, each
+    # step slices the rollout batch in original order into
+    # (num_prompts_per_step * num_generations_per_prompt) / ppo_mini_batch_size
+    # sequential optimizer updates; updates after the first are intentionally
+    # off-policy, exactly as in verl-omni.
+    ppo_mini_batch_size: int | None = None
+    val_generation: FlowGRPOValGenerationCfg = Field(
+        default_factory=FlowGRPOValGenerationCfg
+    )
+
+    @model_validator(mode="after")
+    def _mini_batch_keeps_groups_whole(self) -> "FlowGRPOAlgoConfig":
+        mini = self.ppo_mini_batch_size
+        if mini is None:
+            return self
+        K = self.num_generations_per_prompt
+        total = self.num_prompts_per_step * K
+        if mini <= 0 or mini % K != 0:
+            raise ValueError(
+                f"flow_grpo.ppo_mini_batch_size={mini} must be a positive multiple "
+                f"of num_generations_per_prompt={K} so contiguous slicing "
+                "never splits a GRPO group across mini-batches"
+            )
+        if total % mini != 0:
+            raise ValueError(
+                f"flow_grpo.ppo_mini_batch_size={mini} must divide the rollout "
+                f"batch of {total} samples "
+                f"(num_prompts_per_step * num_generations_per_prompt)"
+            )
+        return self
 
 
 class DiffusionDataSplitConfig(BaseModel, extra="allow"):
@@ -70,26 +138,20 @@ class DiffusionEnvConfig(BaseModel, extra="allow"):
     image_reward: ImageRewardEnvConfig
 
 
-class DiffusionCheckpointingConfig(BaseModel, extra="allow"):
-    enabled: bool = True
-    checkpoint_dir: str = "results/diffusion_grpo"
-    save_period: int = 100
-
-
-class DiffusionMasterConfig(BaseModel, extra="allow"):
-    """Schema for `examples/configs/diffusion_grpo_qwen_image*.yaml`."""
+class MasterConfig(BaseModel, extra="allow"):
+    """Schema for `examples/configs/flow_grpo_qwen_image*.yaml`."""
 
     policy: DiffusionPolicyConfig
-    loss_fn: DiffusionLossConfig
-    grpo: DiffusionGRPOAlgoConfig
+    loss_fn: FlowGRPOLossConfig
+    flow_grpo: FlowGRPOAlgoConfig
     data: DiffusionDataConfig
     env: DiffusionEnvConfig
     logger: LoggerConfig
     cluster: ClusterConfig
-    checkpointing: DiffusionCheckpointingConfig
+    checkpointing: CheckpointingConfig
 
     @model_validator(mode="after")
-    def _kl_requires_lora(self) -> "DiffusionMasterConfig":
+    def _kl_requires_lora(self) -> "MasterConfig":
         if self.loss_fn.beta > 0 and not self.policy.lora_cfg.enabled:
             raise ValueError(
                 "loss_fn.beta > 0 (Gaussian KL vs the reference policy) requires "
@@ -99,7 +161,7 @@ class DiffusionMasterConfig(BaseModel, extra="allow"):
         return self
 
     @model_validator(mode="after")
-    def _per_element_logprob_pairing(self) -> "DiffusionMasterConfig":
+    def _per_element_logprob_pairing(self) -> "MasterConfig":
         if (
             self.policy.per_element_logprob
             != self.loss_fn.aggregate_logprobs_per_sample
@@ -158,8 +220,6 @@ def _compute_advantages(
 def _build_train_data(
     traj: DiffusionTrajectorySpec,
     advantages_per_sample: torch.Tensor,
-    *,
-    loss_multiplier: torch.Tensor,
 ) -> BatchedDataDict[DiffusionTrainDataSpec]:
     T = traj["timesteps"].shape[-1]
     # Keep only the columns inside the SDE window so the training-side
@@ -193,7 +253,6 @@ def _build_train_data(
         "generation_logprobs": traj["generation_logprobs"],
         "advantages": advantages,
         "timestep_mask": traj["timestep_mask"],
-        "sample_mask": loss_multiplier,
         "prompt_embeds": traj["prompt_embeds"],
         "prompt_embeds_mask": traj["prompt_embeds_mask"],
         "negative_prompt_embeds": traj["negative_prompt_embeds"],
@@ -202,50 +261,27 @@ def _build_train_data(
     return BatchedDataDict(data)
 
 
-def _latest_checkpoint(checkpoint_dir: str) -> tuple[str, int] | None:
-    """Newest complete ``step_N`` subdirectory of `checkpoint_dir`, or None.
-
-    A checkpoint counts as complete once ``optim/.metadata`` exists — the
-    Automodel Checkpointer's optimizer save is the last collective in
-    :meth:`DiffusionPolicyWorker.save_checkpoint`, and torch DCP writes the
-    ``.metadata`` file at the end of that save.
-    """
-    if not os.path.isdir(checkpoint_dir):
-        return None
-    best: tuple[str, int] | None = None
-    for name in os.listdir(checkpoint_dir):
-        m = re.fullmatch(r"step_(\d+)", name)
-        if m is None:
-            continue
-        path = os.path.join(checkpoint_dir, name)
-        if not os.path.exists(os.path.join(path, "optim", ".metadata")):
-            continue
-        step = int(m.group(1))
-        if best is None or step > best[1]:
-            best = (path, step)
-    return best
-
-
-def diffusion_grpo_train(
-    policy: DiffusionPolicy,
+def flow_grpo_train(
+    policy: FlowGRPOPolicy,
     env: ImageRewardEnvironment,
     train_dataloader: Iterable[BatchedDataDict[Any]],
     val_dataloader: Iterable[BatchedDataDict[Any]] | None,
     *,
-    algo_cfg: DiffusionGRPOAlgoConfig,
-    loss_cfg: DiffusionLossConfig,
+    master_config: MasterConfig,
     logger: Logger,
-    checkpoint_dir: str | None,
-    save_period: int = 0,
+    checkpointer: CheckpointManager,
     val_image_dir: str | None = None,
     num_val_images_to_save: int = 0,
 ) -> None:
     timer = Timer()
+    algo_cfg = master_config.flow_grpo
     K = algo_cfg.num_generations_per_prompt
     max_steps = algo_cfg.max_num_steps
     seed_base = algo_cfg.seed
+    checkpointing_enabled = master_config.checkpointing["enabled"]
+    save_period = checkpointer.save_period
     # The loss config crosses the Ray boundary into train_step as a dict.
-    loss_cfg_dict = loss_cfg.model_dump()
+    loss_cfg_dict = master_config.loss_fn.model_dump()
 
     def run_validation(step: int) -> None:
         _run_validation(
@@ -262,13 +298,14 @@ def diffusion_grpo_train(
         )
 
     start_step = 0
-    if checkpoint_dir is not None:
-        latest = _latest_checkpoint(checkpoint_dir)
-        if latest is not None:
-            ckpt_path, start_step = latest
-            policy.load_checkpoint(ckpt_path)
+    if checkpointing_enabled:
+        last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+        training_info = checkpointer.load_training_info(last_checkpoint_path)
+        if training_info is not None:
+            start_step = training_info["step"]
+            policy.load_checkpoint(os.path.join(last_checkpoint_path, "policy"))
             print(
-                f"[diffusion_grpo] resuming from {ckpt_path} "
+                f"[flow_grpo] resuming from {last_checkpoint_path} "
                 f"(start_step={start_step}); note: the dataloader position "
                 "is not restored, prompt order restarts from the beginning",
                 flush=True,
@@ -319,18 +356,8 @@ def diffusion_grpo_train(
                 f"metadata length {len(traj['metadata'])} != rollout batch "
                 f"{rewards.shape[0]}"
             )
-            loss_mult = torch.tensor(
-                [m.get("loss_multiplier", 1.0) for m in traj["metadata"]],
-                dtype=torch.float32,
-            )
-        else:
-            loss_mult = torch.ones(rewards.shape[0])
 
-        train_data = _build_train_data(
-            traj,
-            advantages_per_sample,
-            loss_multiplier=loss_mult,
-        )
+        train_data = _build_train_data(traj, advantages_per_sample)
 
         ppo_epochs = algo_cfg.ppo_epochs
         total_samples = int(train_data["generation_logprobs"].shape[0])
@@ -400,19 +427,25 @@ def diffusion_grpo_train(
         avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else loss_val
         spread = metrics.get("train/dp_checksum_spread")
         print(
-            f"[diffusion_grpo] step={step} "
+            f"[flow_grpo] step={step} "
             f"train/loss_last={loss_val} train/loss_avg={avg_loss} "
             f"train/mean_ratio={ratio_val} train/reward_mean={rew_val}"
             + (f" train/dp_checksum_spread={spread}" if spread is not None else ""),
             flush=True,
         )
 
-        if (
-            checkpoint_dir is not None
-            and save_period > 0
-            and (step + 1) % save_period == 0
-        ):
-            policy.save_checkpoint(os.path.join(checkpoint_dir, f"step_{step + 1}"))
+        if checkpointing_enabled and save_period > 0 and (step + 1) % save_period == 0:
+            # tmp_step_N -> step_N rename is what makes a checkpoint count as
+            # complete; a run killed mid-save leaves tmp_step_N, which
+            # get_latest_checkpoint_path() ignores.
+            tmp_path = checkpointer.init_tmp_checkpoint(
+                step + 1, {"step": step + 1, **metrics}, master_config
+            )
+            policy.save_checkpoint(
+                os.path.join(tmp_path, "policy"),
+                save_optimizer=checkpointer.save_optimizer,
+            )
+            checkpointer.finalize_checkpoint(tmp_path)
 
         if val_dataloader is not None:
             val_period = algo_cfg.val_period
@@ -424,7 +457,7 @@ def diffusion_grpo_train(
 
 
 def _run_validation(
-    policy: DiffusionPolicy,
+    policy: FlowGRPOPolicy,
     env: ImageRewardEnvironment,
     val_dataloader: Iterable[BatchedDataDict[Any]] | None,
     *,

@@ -218,7 +218,7 @@ def test_flow_match_scheduler_contract():
     T = 8
     scheduler = FlowMatchEulerDiscreteScheduler(use_dynamic_shifting=True)
     sigmas = np.linspace(1.0, 1 / T, T)
-    # Same call shape as DiffusionPolicyWorker._load_pipeline.
+    # Same call shape as FlowGRPOPolicyWorker._load_pipeline.
     scheduler.set_timesteps(T, device="cpu", sigmas=sigmas.tolist(), mu=0.8)
 
     assert scheduler.timesteps.ndim == 1

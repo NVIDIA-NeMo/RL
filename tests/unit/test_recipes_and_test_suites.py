@@ -49,6 +49,7 @@ ALGO_MAPPING_TO_BASE_YAML = {
     "ppo": "examples/configs/ppo_math_1B_megatron.yaml",
     "mopd": "examples/configs/grpo_math_1B.yaml",
     "gdpo": "examples/configs/gdpo_math_1B.yaml",
+    "flow_grpo": "examples/configs/flow_grpo_qwen_image_ocr.yaml",
 }
 
 # Configuration keys that are allowed to be added to base configs during testing
