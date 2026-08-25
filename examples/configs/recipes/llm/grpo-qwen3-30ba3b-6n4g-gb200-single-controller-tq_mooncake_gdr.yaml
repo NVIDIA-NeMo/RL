@@ -1,16 +1,12 @@
-# SingleController + TransferQueue: the mooncake_cpu store, as the register-mode baseline.
+# SingleController + TransferQueue: the mooncake_cpu store with GDR.
 #
 # Overlay on the register-mode GDR recipe, which owns the mesh, the GRPO
-# sizing and the cluster shape. Only the data plane differs -- and the log
-# and run names, which must not collide: four backends writing one log_dir
-# and one wandb name is how an A/B silently becomes one run overwriting
-# another.
+# sizing and the cluster shape. This is the fourth cell of the backend
+# comparison: store vs register mode, crossed with host staging vs GDR.
 defaults: ./grpo-qwen3-30ba3b-6n4g-gb200-single-controller-tq_register.yaml
 
 data_plane:
   enabled: true
-  # The store stages through its own buffers and copies at put -- the opposite
-  # of register mode's publish-an-address. Baseline for the comparison.
   backend: mooncake_cpu
   mooncake_cpu:
     # Sized down from the 64GiB/4GiB defaults, which are per client *process*:
@@ -21,11 +17,15 @@ data_plane:
     # process is ample and removes the coin flip.
     global_segment_size: 8589934592   # 8 GiB
     local_buffer_size: 2147483648     # 2 GiB
+    # Staging buffers in GPU memory rather than host, so a read lands in HBM.
+    # The store still copies at put -- that is the axis register mode changes,
+    # and holding it fixed here is what isolates the two effects.
+    use_gdr: true
 
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-30ba3b-6n4g-gb200-single-controller-tq_mooncake
+  checkpoint_dir: results/grpo-qwen3-30ba3b-6n4g-gb200-single-controller-tq_mooncake_gdr
 
 logger:
-  log_dir: logs/grpo-qwen3-30ba3b-6n4g-gb200-single-controller-tq_mooncake
+  log_dir: logs/grpo-qwen3-30ba3b-6n4g-gb200-single-controller-tq_mooncake_gdr
   wandb:
-    name: grpo-qwen3-30ba3b-6n4g-gb200-single-controller-tq_mooncake
+    name: grpo-qwen3-30ba3b-6n4g-gb200-single-controller-tq_mooncake_gdr

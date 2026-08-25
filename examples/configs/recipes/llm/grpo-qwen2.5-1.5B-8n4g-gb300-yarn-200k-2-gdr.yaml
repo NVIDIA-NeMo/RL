@@ -1,0 +1,15 @@
+# 200k data-plane cell: the store, GDR staging.
+defaults: ./grpo-qwen2.5-1.5B-8n4g-gb300-yarn-200k.yaml
+
+data_plane:
+  enabled: true
+  backend: mooncake_cpu
+  mooncake_cpu:
+    use_gdr: true
+  observability:
+    enabled: true
+
+logger:
+  log_dir: logs/grpo-qwen2.5-1.5B-8n4g-gb300-yarn-200k-2-gdr
+  wandb:
+    name: grpo-qwen2.5-1.5B-8n4g-gb300-yarn-200k-2-gdr

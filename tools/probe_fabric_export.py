@@ -121,22 +121,10 @@ def probe_pointer(cuda, label: str, ptr: int, nbytes: int) -> None:
     )
     print(f"  export(FABRIC)              -> {_rc(rc_fab)}")
 
-    # Contrast: same allocation, a handle type torch might plausibly have asked
-    # for. Distinguishes "no exportable handle at all" from "wrong type".
-    fd = ctypes.c_int(0)
-    rc_fd = cuda.cuMemExportToShareableHandle(
-        ctypes.byref(fd), handle, ctypes.c_int(_CU_MEM_HANDLE_TYPE_POSIX_FD),
-        ctypes.c_ulonglong(0),
-    )
-    print(f"  export(POSIX_FD)            -> {_rc(rc_fd)}")
-
-    if rc_fab == 0:
-        print("    => fabric-exportable. This memory COULD serve register mode.")
-    elif rc_fd == 0:
-        print("    => exportable, but not as FABRIC: the allocation did not")
-        print("       request CU_MEM_HANDLE_TYPE_FABRIC. Confirms the inference.")
-    else:
-        print("    => not exportable under either handle type.")
+    # Every allocation probed here now terminates in one of two states, so the
+    # POSIX_FD contrast and its branches were unreachable -- and one of them
+    # printed "Confirms the inference" for an inference this tool disproved.
+    print("    => fabric-exportable." if rc_fab == 0 else "    => NOT fabric-exportable.")
 
 
 def mooncake_style_alloc(cuda, nbytes: int):

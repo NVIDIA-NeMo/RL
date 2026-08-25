@@ -206,7 +206,15 @@ def _tensor_bytes(v: torch.Tensor) -> int:
     if type(buf) is not torch.Tensor:
         return v.nbytes
     offsets = getattr(v, "_offsets", None)
-    if offsets is not None and buf.shape[0] != int(offsets[-1]):
+    # Host-side offsets only: reading offsets[-1] from device memory is a
+    # blocking sync, and this is on the measured path of every put and get.
+    # A device-resident narrow therefore takes the buffer size, which the
+    # docstring's caveat already covers -- nothing here builds one.
+    if (
+        offsets is not None
+        and offsets.device.type == "cpu"
+        and buf.shape[0] != int(offsets[-1])
+    ):
         return v.nbytes
     return buf.nbytes
 
@@ -1580,13 +1588,17 @@ class MetricsDataPlaneClient(DataPlaneClient):
         except Exception:
             self._emit(op, partition_id, n_keys, n_bytes, t0, "error")
             raise
+        # Stop the clock here: everything below is this wrapper's own work, and
+        # billing it to the op inflates wall_ms, the latency percentiles and the
+        # bytes-vs-ms regression with the cost of measuring.
+        t_done = monotonic()
         # If the call returns a TensorDict, the read-side bytes are more
         # informative than the input estimate.
         if isinstance(out, TensorDict):
             n_bytes = _td_bytes(out)
         elif isinstance(out, KVBatchMeta) and not n_keys:
             n_keys = len(out.sample_ids)
-        self._emit(op, partition_id, n_keys, n_bytes, t0, "ok")
+        self._emit(op, partition_id, n_keys, n_bytes, t0, "ok", t_end=t_done)
         return out
 
     def _emit(
@@ -1597,8 +1609,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         n_bytes: int,
         t0: float,
         status: EventStatus,
+        t_end: float | None = None,
     ) -> None:
-        wall_ms = (monotonic() - t0) * 1000.0
+        # t_end lets the caller stop the clock before its own bookkeeping;
+        # the error paths pass none and are timed to the raise.
+        wall_ms = ((t_end if t_end is not None else monotonic()) - t0) * 1000.0
         self._last_inner_ms = wall_ms
         on_event = self._on_event
         if on_event is not None:
@@ -1778,3 +1793,75 @@ class MetricsDataPlaneClient(DataPlaneClient):
             "",
             lambda: self._inner.close(),
         )
+
+
+def log_data_plane_step(
+    source: Any,
+    logger: Any,
+    step: int,
+    total_step_time: float,
+) -> None:
+    """Log this step's data-plane cost. No-op unless observability is enabled.
+
+    ``source`` is whatever owns the client and the worker fan-out -- the policy
+    in the synchronous loop, the trainer handle in the single-controller loop.
+
+    Prefers the cluster view (the driver's counters plus every worker rank's,
+    summed) and falls back to the driver's alone when the fan-out reaches only
+    one process. Reported one way or the other, never both, so there is a
+    single answer to "what did the data plane cost" rather than two that
+    disagree by roughly the DP degree. The prefix names the scope, because the
+    driver issues about one op of each kind per step while the bulk traffic is
+    the workers' per-DP-rank ``get_samples`` -- about a sixth of the total, per
+    ``TQPolicy.collect_data_plane_snapshots``.
+
+    Even the cluster view omits the rollout actor, which builds its own client
+    and is not on the worker group, so ``kv_first_write`` is in neither.
+
+    The previous reading lives on ``source``, alongside the client whose
+    counters it differences, rather than in module state: two trainers in one
+    process would otherwise interleave one ``prev`` and produce negative
+    deltas.
+
+    Lives here rather than in either training loop because it was written twice
+    and the copies drifted -- one gained ``flush=True``, and the other grew a
+    docstring asserting the fan-out hook had no implementation when it did.
+    """
+    client = getattr(source, "dp_client", None)
+    if not isinstance(client, MetricsDataPlaneClient):
+        return  # observability disabled -> plain adapter
+
+    collect = getattr(source, "collect_data_plane_snapshots", None)
+    collect_started = monotonic()
+    snapshots = collect() if callable(collect) else []
+    if len(snapshots) > 1:
+        merged = merge_snapshots(snapshots)
+        # The fan-out is part of what observability costs, and the larger part:
+        # omitting it reported a twentieth of the real bill.
+        collect_ms = (monotonic() - collect_started) * 1e3
+        prev = getattr(source, "_prev_cluster_snapshot", {})
+        metrics = cluster_step_metrics(
+            merged, prev, total_step_time, collect_ms=collect_ms
+        )
+        source._prev_cluster_snapshot = merged
+        scope = "cluster"
+    else:
+        # Single process, or the fan-out could not reach the workers.
+        metrics = client.get_step_metrics(total_step_time)
+        scope = "driver"
+
+    logger.log_metrics(headline_series(metrics), step, prefix=f"data_plane/{scope}")
+    try:
+        columns, rows = breakdown_table(metrics)
+    except Exception as exc:  # noqa: BLE001 - a panel must never fail a step
+        logging.getLogger(__name__).warning("data-plane breakdown failed: %s", exc)
+    else:
+        if rows:
+            logger.log_table(columns, rows, step, f"data_plane/{scope}/breakdown")
+    # flush: the Ray driver's stdout is buffered, so an unflushed line can be
+    # lost when a run ends badly -- which is when it is most wanted.
+    print(
+        f"  • data plane ({scope}): {metrics['step/wall_ms']:.0f}ms, "
+        f"{metrics['step/comm_volume_mb']:.1f} MB moved",
+        flush=True,
+    )

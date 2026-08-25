@@ -164,12 +164,14 @@ def _reject_nvlink_transport_env() -> None:
     with the default caching allocator mooncake logs ``not allocated by
     cuMemCreate`` and returns success having published nothing, so the reader
     fails with ``status -1`` much later and on another node; with
-    ``expandable_segments`` the memory *is* fabric-exportable, but mooncake
-    publishes the extent ``cuMemGetAddressRange`` reports -- for a VMM
-    suballocation that is the physical chunk (20 MiB of a 64 MiB tensor,
-    measured), so any read past it fails the reader's containment check.
-    ``mooncake_cpu`` never reaches the branch at all: the store brings up its
-    own transport pinned to ``protocol: rdma``.
+    ``expandable_segments`` the memory *is* fabric-exportable and it still
+    fails, in at least two ways: mooncake publishes the extent
+    ``cuMemGetAddressRange`` reports, which for a VMM suballocation is the
+    physical chunk (20 MiB of a 64 MiB tensor, measured), and a payload small
+    enough to avoid that entirely still fails with nothing logged.
+    ``mooncake_cpu`` never reaches the branch at all: the store installs from
+    its own protocol string, and the only NVLink value it would accept is
+    rejected by this wheel.
 
     Measured on GB300, 6n4g qwen3-30b: with ``MC_FORCE_MNNVL=1`` the run dies of
     a host OOM ~9 minutes in, twice out of two, while the identical run without
@@ -187,8 +189,8 @@ def _reject_nvlink_transport_env() -> None:
     raise RuntimeError(
         f"{', '.join(forced)} is set, which makes mooncake install its NVLink "
         "transport instead of RDMA. No data-plane backend can use it: register "
-        "mode registers torch memory, which mooncake's fabric export was measured "
-        "to reject, and "
+        "mode registers torch memory, which was measured to fail over this "
+        "transport in at least two ways, and "
         "mooncake_cpu's store pins its own transport to rdma. Setting it has "
         "been measured to end the run in a host OOM. Unset it. Reaching the "
         "NVLink path needs buffers allocated through mooncake's own allocator "

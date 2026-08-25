@@ -104,21 +104,24 @@ def rdma_devices() -> str:
     return ",".join(ib or roce)
 
 
-def _mooncake_transport_config(protocol: str = "rdma") -> dict:
-    """Transport settings the store brings up for itself.
+def _mooncake_transport_config(protocol: str) -> dict:
+    """Transport settings for a mooncake-engine backend.
 
     The store configures its own transport from this ``protocol`` -- it never
     reaches the ``MC_FORCE_MNNVL`` branch the transfer engine uses, which is why
-    forcing that variable does nothing here. So this string, not the
-    environment, is the only way to move the store off RDMA.
+    forcing that variable does nothing here. Note this does not make the store
+    steerable: ``nvlink`` is rejected outright by the pinned wheel
+    (``unsupported_protocol``, setup fails -1), so RDMA is its only option
+    today.
 
     Runs on the driver only, so it assumes homogeneous nodes: the device it
     finds is broadcast to every client.
     """
     if protocol == "nvlink":
-        # No device filter: NVLink needs no HCA, and naming one would pin the
-        # store to a rail it is not going to use. Experimental -- nothing has
-        # yet shown the store can serve reads over this transport.
+        # No device filter: NVLink needs no HCA. Measured to fail before any
+        # segment mounts -- the store answers `unsupported_protocol
+        # protocol=nvlink` and setup returns -1 (job 558292). Kept so the
+        # attempt stays expressible and its outcome documented.
         return {"protocol": "nvlink", "device_name": ""}
 
     # mooncake_cpu exists for the zero-copy RDMA MooncakeStore path (TQ v0.1.8),
@@ -566,10 +569,12 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     "rpc_port": int(te_cfg.rpc_port),
                     "use_gdr": bool(te_cfg.use_gdr),
                     "offload_source_to_host": bool(te_cfg.offload_source_to_host),
-                    # Not mooncake_cpu's protocol knob: register mode registers
-                    # torch memory, which the NVLink fabric export can never
-                    # accept, so RDMA is the only transport it can run.
-                    **_mooncake_transport_config(),
+                    # Not mooncake_cpu's protocol knob: register mode has no
+                    # protocol of its own, and NVLink is unreachable for it
+                    # today (see docs/design-docs/tq-register-mode.md), so RDMA
+                    # is the only transport it runs. Stated explicitly rather
+                    # than inherited from a default argument.
+                    **_mooncake_transport_config("rdma"),
                 },
             },
         }

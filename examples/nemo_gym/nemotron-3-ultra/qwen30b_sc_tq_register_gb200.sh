@@ -52,7 +52,10 @@ SLURM_PARTITION="${SLURM_PARTITION:-batch}"
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-nemotron_sw_pre}"
 
 # --- container + caches ------------------------------------------------------
-export CONTAINER="${CONTAINER:-/scratch/fsw/portfolios/nemotron/users/zhiyul/enroot-images/nvcr.io+nvidian+nemo-rl+nightly-gym.2026-08-17.squashfs}"
+# Required, matching ray.sub and docs/cluster.md. A date-stamped squashfs
+# under one user's scratch is unreadable to anyone else, and the failure
+# surfaces as an enroot error deep in srun rather than as "set CONTAINER".
+: "${CONTAINER:?set CONTAINER to a squashfs path or an nvcr.io ref (see docs/cluster.md)}"
 # HF_HOME normally comes from the secrets file; this is only the fallback.
 export HF_HOME="${HF_HOME:-/lustre/fsw/portfolios/nemotron/users/zhiyul/hf_cache}"
 export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/scratch/fsw/portfolios/nemotron/users/zhiyul/persistent_cache}"

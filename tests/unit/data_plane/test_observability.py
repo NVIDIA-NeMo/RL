@@ -30,6 +30,7 @@ from tensordict import NonTensorData, NonTensorStack, TensorDict
 
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.observability import (
+    log_data_plane_step,
     _QUANTILES,
     MetricsDataPlaneClient,
     _estimate_encoded_bytes,
@@ -1427,12 +1428,34 @@ def test_data_plane_is_logged_before_the_step_is_committed():
         for line in source[source.index("def grpo_train_sync") :].splitlines()
         if not line.lstrip().startswith("#")
     )
-    dp_call = body.index("_log_data_plane_metrics(policy, logger")
+    dp_call = body.index("log_data_plane_step(policy, logger")
     commit = body.index("step_finished=True")
     assert dp_call < commit, (
-        "_log_data_plane_metrics must run before the step_finished=True log; "
+        "log_data_plane_step must run before the step_finished=True log; "
         "wandb drops anything logged against an already-committed step"
     )
+
+
+def test_both_training_loops_log_the_data_plane_through_one_helper():
+    """Two copies of this logic drifted once already, in ways that mattered.
+
+    The single-controller copy asserted in its docstring that the worker
+    fan-out hook had no implementation -- while ``TQPolicy`` implemented it in
+    the same branch -- so that loop reported the driver's counters alone,
+    roughly a sixth of a step's traffic, and its published numbers carried the
+    wrong scope. One helper is what stops the two answers diverging again.
+    """
+    import pathlib
+
+    import nemo_rl
+
+    root = pathlib.Path(nemo_rl.__file__).parent / "algorithms"
+    for name in ("grpo_sync.py", "single_controller.py"):
+        source = (root / name).read_text()
+        assert "log_data_plane_step(" in source, f"{name} no longer logs the data plane"
+        assert "def _log_data_plane_metrics" not in source, (
+            f"{name} grew a private copy of the shared helper again"
+        )
 
 
 def test_per_op_volume_is_charted_and_sums_to_comm_volume():
@@ -1533,3 +1556,110 @@ def test_a_believable_mismatch_rate_is_not_second_guessed(caplog):
         _hash_deltas(hv, {})
 
     assert "more likely a bug" not in caplog.text
+
+
+def test_sizing_a_jagged_field_never_reads_device_offsets():
+    """Sizing must not sync the device: it runs on every put and every get.
+
+    ``int(offsets[-1])`` is a blocking D2H copy when the offsets live on the
+    payload's device -- free for a host backend, a real stall for a GDR one.
+    That difference would otherwise land in a backend comparison looking like
+    the transport's cost rather than the measurement's.
+    """
+    from nemo_rl.data_plane.observability import _tensor_bytes
+
+    class _TrapOffsets:
+        """Indexing this at all means a device sync would have happened."""
+
+        device = torch.device("cuda")
+
+        def __getitem__(self, idx):  # pragma: no cover - must not be reached
+            raise AssertionError("sizing read device-resident offsets")
+
+    values = torch.arange(12, dtype=torch.float32)
+
+    class _FakeNested:
+        _values = values
+        _offsets = _TrapOffsets()
+        nbytes = 999  # distinct from the buffer, so we can tell them apart
+
+    assert _tensor_bytes(_FakeNested()) == values.nbytes
+
+
+def test_sizing_still_uses_offsets_when_they_are_on_the_host():
+    """The narrow-detection path is intact for host-resident offsets."""
+    from nemo_rl.data_plane.observability import _tensor_bytes
+
+    values = torch.arange(12, dtype=torch.float32)
+
+    class _HostNarrowed:
+        _values = values
+        _offsets = torch.tensor([0, 4])  # describes 4 elements, buffer holds 12
+        nbytes = 999
+
+    assert _tensor_bytes(_HostNarrowed()) == 999
+
+
+class _RecordingLogger:
+    """Minimal Logger surface: records instead of asserting on wandb."""
+
+    def __init__(self):
+        self.metrics: list[tuple[dict, int, str]] = []
+        self.tables: list[str] = []
+
+    def log_metrics(self, metrics, step, prefix=""):
+        self.metrics.append((metrics, step, prefix))
+
+    def log_table(self, columns, rows, step, name):
+        self.tables.append(name)
+
+
+def test_log_data_plane_step_runs_and_reports_driver_scope():
+    """Actually call it. An import-only check cannot catch a NameError inside
+    the body -- which is exactly how a `time.perf_counter()` in a module that
+    imports only `monotonic` reached a six-node run and killed it after one
+    step."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    now = monotonic()
+    client._emit("get", "p", 4, 1_000_000, now - 5 / 1e3, "ok")
+
+    class _Source:
+        dp_client = client  # no collect_data_plane_snapshots -> driver scope
+
+    logger = _RecordingLogger()
+    log_data_plane_step(_Source(), logger, step=3, total_step_time=10.0)
+
+    assert logger.metrics, "nothing was logged"
+    _, step, prefix = logger.metrics[0]
+    assert step == 3
+    assert prefix == "data_plane/driver"
+
+
+def test_log_data_plane_step_prefers_the_cluster_view_when_the_fanout_works():
+    """With more than one snapshot the scope must switch, because the driver
+    alone sees roughly a sixth of a step's traffic."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    now = monotonic()
+    client._emit("get", "p", 4, 1_000_000, now - 5 / 1e3, "ok")
+    snap = client.snapshot()
+
+    class _Source:
+        dp_client = client
+
+        def collect_data_plane_snapshots(self):
+            return [snap, snap]
+
+    logger = _RecordingLogger()
+    log_data_plane_step(_Source(), logger, step=1, total_step_time=10.0)
+    assert logger.metrics[0][2] == "data_plane/cluster"
+
+
+def test_log_data_plane_step_is_a_noop_without_observability():
+    """A plain adapter must cost one isinstance and log nothing."""
+
+    class _Source:
+        dp_client = NoOpDataPlaneClient()
+
+    logger = _RecordingLogger()
+    log_data_plane_step(_Source(), logger, step=1, total_step_time=10.0)
+    assert not logger.metrics and not logger.tables

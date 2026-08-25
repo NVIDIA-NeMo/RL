@@ -1,0 +1,28 @@
+# Qwen2.5-1.5B at 200k tokens on GB300, as a data-plane stress vehicle.
+#
+# The 6n4g qwen3-30b recipes move ~100 MB of data plane per step against ~100s
+# of compute, so the transport is under 1% either way and the four backends are
+# hard to separate. Payload scales with sequence length: 196608 tokens is 48x
+# the 4096 those recipes run, which is the regime where the choice of transport
+# can actually show up.
+#
+# Adapted from grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.yaml: same model, yarn
+# scaling and CP degree, re-cut for 4-GPU nodes (32 GPUs = 8 nodes here rather
+# than 4), and 196608 rather than 262144 so the rope factor stays a clean
+# multiple of the base context.
+defaults: ./grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.yaml
+
+policy:
+  max_total_sequence_length: 196608
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
+
+grpo:
+  max_num_steps: 3
+
+logger:
+  log_dir: logs/grpo-qwen2.5-1.5B-8n4g-gb300-yarn-200k
+  wandb:
+    name: grpo-qwen2.5-1.5B-8n4g-gb300-yarn-200k

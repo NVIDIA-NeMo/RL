@@ -438,7 +438,7 @@ Cross-node costs nothing in steady state; the whole difference is first touch
 paid once per peer. Both nodes reported `CliqueId 3406`, `ClusterUUID
 cecca9d5-…`.
 
-Four facts govern whether this is reachable, and three of them are traps:
+Six facts govern whether this is reachable, and most of them are traps:
 
 1. **The transport is chosen by env var at install time, not by `protocol`.**
    `transfer_engine_impl.cpp`: `MC_INTRANODE_NVLINK` → `nvlink_intra`; else
@@ -534,9 +534,34 @@ artifact.
 Consequence: adopting NVLink means moving sources into engine-allocated buffers
 (`allocate_managed_buffer`, which appears nowhere in the shipped code today),
 i.e. reintroducing the put-side copy register mode exists to avoid. It is a
-choice between the two, not a combination. At current payloads the data plane is
-0.12% of step time, so the case rests on headroom at larger scale rather than
-on today's throughput.
+choice between the two, not a combination. At current payloads the data plane is under 1% of step time either way
+(0.69% driver-scope measured; ~0.12% as an upper bound summed from per-call
+logs), so the case rests on headroom at larger scale rather than on today's
+throughput.
+
+### TODO: what would actually unblock NVLink
+
+Not a version bump. The checkout at `dc549aec` (2026-08-15) is newer than the
+pinned wheel (`0.3.11.post1`) and still has both known blockers: `registerLocalMemory`
+still publishes `cuMemGetAddressRange`'s extent, and `client_service.cpp` still
+has no `protocol == "nvlink"` case (0 occurrences; only `nvlink_intra`). The
+nvlink transport's recent history is CUDA path discovery, batch error
+propagation and per-device streams — nothing aimed at either.
+
+Two compile-time options, both `OFF` by default in
+`mooncake-common/common.cmake`, are the cheaper ask:
+
+- **`-DUSE_INTRA_NVLINK=ON`** — gives the store the one NVLink protocol it
+  already accepts. `IntraNodeNvlinkTransport` uses `cudaDeviceEnablePeerAccess`
+  + `cudaMemcpyBatchAsync` rather than fabric handle export, so it sidesteps the
+  extent bug entirely and is a genuinely different code path from the one that
+  fails. Intra-node only, so it covers the same-node slice, not the rack.
+- **`-DENABLE_MULTI_PROTOCOL=ON`** — restores `"rdma,nvlink"` segments and
+  per-buffer routing, i.e. adaptive rather than all-or-nothing.
+
+Untested either way — this is a lead, not a plan. Reporting the extent bug upstream is worth doing on its own merits, but note
+it would not be sufficient: the sub-chunk test shows a second, unexplained
+failure underneath it.
 
 ## Effort estimate (original, pre-implementation)
 

@@ -1,0 +1,26 @@
+# SingleController + TransferQueue: register mode over CPU RDMA.
+#
+# Overlay on the register-mode GDR recipe, which owns the mesh, the GRPO
+# sizing and the cluster shape. Only the data plane differs -- and the log
+# and run names, which must not collide: four backends writing one log_dir
+# and one wandb name is how an A/B silently becomes one run overwriting
+# another.
+defaults: ./grpo-qwen3-30ba3b-6n4g-gb200-single-controller-tq_register.yaml
+
+data_plane:
+  enabled: true
+  backend: transfer_engine
+  transfer_engine:
+    # Host-resident sources: put registers the tensor after a D2H copy and the
+    # one-sided read pulls host -> consumer. The GDR base keeps the payload in
+    # HBM end to end. Same publish-an-address design; only where the bytes live
+    # differs, which is what makes the two comparable.
+    use_gdr: false
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-6n4g-gb200-single-controller-tq_register_cpu
+
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-6n4g-gb200-single-controller-tq_register_cpu
+  wandb:
+    name: grpo-qwen3-30ba3b-6n4g-gb200-single-controller-tq_register_cpu

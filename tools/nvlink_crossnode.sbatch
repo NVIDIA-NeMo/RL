@@ -31,7 +31,7 @@
 #SBATCH --job-name=nvlink-crossnode
 set -uo pipefail
 
-CONTAINER_IMAGE="${CONTAINER_IMAGE:-/scratch/fsw/portfolios/nemotron/users/zhiyul/enroot-images/nvcr.io+nvidian+nemo-rl+nightly-gym.2026-08-17.squashfs}"
+: "${CONTAINER_IMAGE:?set CONTAINER_IMAGE to a squashfs path or an nvcr.io ref}"
 MOUNTS="${MOUNTS:-/scratch:/scratch,/lustre:/lustre}"
 WORKDIR="${WORKDIR:-$(pwd)}"
 MB="${MB:-512}"

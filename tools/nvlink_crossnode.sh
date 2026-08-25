@@ -1,7 +1,8 @@
 #!/bin/bash
 # Cross-node NVLink: does MNNVL fabric actually span nodes in one NVL72 domain?
 #
-# The same-node result (104 GB/s at 512MB) only proves NVLink within a chassis.
+# The same-node result (765 GB/s warm at 512MB) only proves NVLink within a
+# chassis.
 # MNNVL is supposed to reach the whole domain, and that difference decides
 # whether this covers ~13% of our traffic or all of it. One task per node,
 # rendezvous over the shared filesystem.
