@@ -69,6 +69,18 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
         self._stale = True
+        # The absent set this synchronizer's current communicator was built with, so a
+        # membership that has not changed can skip the rebuild. None means "never rebuilt",
+        # i.e. still the full-fleet group from setup.
+        #
+        # Without this, reconcile_communicator rebuilt on EVERY call once a shard was gone,
+        # because absent_shards() never empties again -- nothing in production calls
+        # mark_restarting or mark_loaded. _sync_weights reconciles twice per step, so a run
+        # that lost a shard at step 10 and trains to 10,000 paid ~20,000 full rebuilds: a
+        # fresh port, a fresh TCPStore and a fresh NCCL bootstrap across every train and
+        # inference rank each time, plus a plan regeneration on nccl_reshard. The steady
+        # state this feature exists to produce was the expensive one.
+        self._built_with_absent: Optional[frozenset[int]] = None
 
     def sync_weights(
         self,
@@ -137,7 +149,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         )
         ray.get(futures_train + futures_inference)
 
-    def reconcile_communicator(self, absent_shards: Sequence[int]) -> bool:
+    def reconcile_communicator(
+        self, absent_shards: Sequence[int], force: bool = False
+    ) -> bool:
         """Rebuild the refit communicator over the surviving generation shards.
 
         ``model_update_group`` spans every train and inference rank and was built once,
@@ -161,6 +175,13 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         normal run instead of only after a failure.
         """
         if not absent_shards:
+            return False
+
+        # Unchanged membership over a live communicator: nothing to do. `force` is how the
+        # recovery path says the communicator is gone rather than merely unchanged -- after
+        # an abort it must be rebuilt even though the absent set is identical, and skipping
+        # it there would fail the recovery with "no shard could be identified as absent".
+        if not force and self._built_with_absent == frozenset(absent_shards):
             return False
 
         dp_size = self._generation.worker_group.dp_size
@@ -195,6 +216,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._generation.set_refit_membership(membership)
         futures_inference = self._generation.rebuild_collective(membership, ip, port)
         ray.get(futures_train + futures_inference)
+        # Recorded only after the rebuild has actually happened, so a rebuild that
+        # raises leaves the cache describing the communicator we still have.
+        self._built_with_absent = frozenset(absent_shards)
         return True
 
     def shutdown(self) -> None:

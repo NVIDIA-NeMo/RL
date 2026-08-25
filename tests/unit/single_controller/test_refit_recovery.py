@@ -62,6 +62,7 @@ class _Synchronizer:
         self._rebuild_succeeds = rebuild_succeeds
         self.sync_calls = 0
         self.reconciled_with: list[list[int]] = []
+        self.forced: list[bool] = []
         # State of the fleet at the moment the retry ran, which is the only place the
         # dead shard's exclusion can actually be observed.
         self.absent_at_retry: list[int] | None = None
@@ -78,8 +79,11 @@ class _Synchronizer:
         if self._monitor is not None:
             self.absent_at_retry = self._monitor.absent_shards()
 
-    def reconcile_communicator(self, absent):
+    def reconcile_communicator(self, absent, force=False):
+        # `force` is how the recovery path says the communicator is gone rather than
+        # merely unchanged; the real synchronizers skip an unchanged absent set.
         self.reconciled_with.append(sorted(absent))
+        self.forced.append(force)
         return bool(absent) and self._rebuild_succeeds
 
 
@@ -310,6 +314,43 @@ class TestWhenRecoveryIsNotPossible:
             asyncio.run(ctrl._sync_weights())
         assert sync.sync_calls == 1
         assert sync.reconciled_with == []
+
+
+class TestTheRecoveryForcesTheRebuild:
+    """The pre-refit reconciles may skip; the recovery's may not.
+
+    The synchronizers skip a rebuild when the absent set matches what they last built
+    with -- that is what stops a lost shard costing two full rebuilds on every subsequent
+    step. After an abort the absent set is identical and the communicator is *gone*, so
+    the recovery has to override the skip or it retries over a communicator that no longer
+    exists and fails with "no generation shard could be identified as absent".
+    """
+
+    def test_the_recovery_reconcile_is_forced(self):
+        ctrl, _, sync = _make_controller(RefitAborted("aborted"))
+
+        asyncio.run(ctrl._sync_weights())
+
+        assert any(sync.forced), (
+            "the recovery must force its rebuild; skipping it there retries over an "
+            "aborted communicator"
+        )
+
+    def test_the_pre_refit_reconciles_are_not_forced(self):
+        """They run every step, and forcing them would reinstate the cost this removes."""
+        ctrl, _, sync = _make_controller(None)
+        sync._failure = None
+
+        def _clean(*, kv_scales=None):
+            del kv_scales
+            sync.sync_calls += 1
+
+        sync.sync_weights = _clean
+        asyncio.run(ctrl._sync_weights())
+
+        assert sync.forced and not any(sync.forced), (
+            "a healthy step must never force a rebuild"
+        )
 
 
 class TestTheHappyPathIsUntouched:
