@@ -449,3 +449,76 @@ class TestAnUnchangedMembershipIsNotRebuiltAgain:
 
         assert sync.reconcile_communicator([]) is False
         assert sync.reconcile_communicator([], force=True) is False
+
+
+class TestStragglersAreWaitedForBeforeARebuild:
+    """A communicator rebuild is a collective, so it needs every rank out of the old one.
+
+    ray.get raises on the FIRST future that fails and leaves the rest running. Job 6512153
+    measured what that costs on the reshard kill variant: rank 0 gave up on its own
+    deadline, the controller went into the recovery, and the rebuild began two log lines
+    BEFORE rank 1's watchdog fired. The surviving generation worker then spent 300s twice
+    failing to reach a store that never came up, and the run died at 690s.
+    """
+
+    @staticmethod
+    def _futures(monkeypatch, *, pending):
+        """Records what ray.wait was asked to wait for."""
+        waited = {}
+
+        def _fake_wait(futures, *, num_returns, timeout):
+            waited["futures"] = list(futures)
+            waited["num_returns"] = num_returns
+            waited["timeout"] = timeout
+            return ([], list(futures)) if pending else (list(futures), [])
+
+        monkeypatch.setattr("ray.wait", _fake_wait)
+        return waited
+
+    def test_every_train_rank_is_waited_for(self, monkeypatch):
+        from nemo_rl.weight_sync import nccl_reshard_weight_synchronizer as mod
+
+        waited = self._futures(monkeypatch, pending=False)
+        mod._settle_before_propagating(["a", "b", "c"], 90.0, "train")
+
+        assert waited["futures"] == ["a", "b", "c"]
+        assert waited["num_returns"] == 3, "all of them, not just the first"
+        assert waited["timeout"] == 90.0
+
+    def test_it_is_bounded_rather_than_blocking_the_recovery(self, monkeypatch):
+        """A caller stuck here is a worse wedge than the one being recovered from."""
+        from nemo_rl.weight_sync import nccl_reshard_weight_synchronizer as mod
+
+        self._futures(monkeypatch, pending=True)
+        mod._settle_before_propagating(["a"], 0.1, "train")  # must return, not hang
+
+    def test_a_stragglers_error_does_not_replace_the_caller_s(self, monkeypatch):
+        """They are unwinding from the same failure the caller already holds."""
+        from nemo_rl.weight_sync import nccl_reshard_weight_synchronizer as mod
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("straggler blew up while unwinding")
+
+        monkeypatch.setattr("ray.wait", _boom)
+        mod._settle_before_propagating(["a"], 1.0, "train")  # must not raise
+
+    def test_nothing_to_wait_for_is_a_no_op(self, monkeypatch):
+        from nemo_rl.weight_sync import nccl_reshard_weight_synchronizer as mod
+
+        def _never(*_args, **_kwargs):
+            raise AssertionError("ray.wait must not be called with no futures")
+
+        monkeypatch.setattr("ray.wait", _never)
+        mod._settle_before_propagating([], 1.0, "train")
+
+    def test_the_budget_outlasts_the_deadline_the_ranks_were_armed_with(self):
+        """A straggler gives up when its own watchdog fires; wait past that."""
+        sync = _collective()
+        sync._refit_timeout_s = 60.0
+        assert sync._settle_budget_s() > 60.0
+
+    def test_an_unconfigured_deadline_still_bounds_the_wait(self):
+        """Nothing bounds the ranks, so this must not wait forever either."""
+        sync = _collective()
+        sync._refit_timeout_s = None
+        assert 0 < sync._settle_budget_s() < 600

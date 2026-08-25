@@ -443,3 +443,34 @@ def test_the_rebuild_bootstraps_with_the_same_peer_protocol_as_the_first_build()
             "every policy.init_collective must pass nccl_peer; the rebuild omitted it and "
             "silently bootstrapped with the wrong protocol."
         )
+
+
+@pytest.mark.parametrize(
+    "synchronizer",
+    ["collective_weight_synchronizer.py", "nccl_reshard_weight_synchronizer.py"],
+)
+def test_a_failed_refit_waits_for_stragglers_before_it_propagates(synchronizer):
+    """The caller rebuilds on this failure, and a rebuild needs every rank out first.
+
+    ray.get raises on the first future that fails and leaves the rest running. Job 6512153:
+    the rebuild began two log lines before the second trainer's watchdog had even fired,
+    and the rendezvous it built was one nobody could join.
+    """
+    path = REPO_ROOT / "nemo_rl" / "weight_sync" / synchronizer
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "sync_weights"
+        ):
+            called = {
+                c.func.id
+                for c in ast.walk(node)
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            }
+            assert "_settle_before_propagating" in called, (
+                f"{synchronizer}::sync_weights must let every train rank unwind before "
+                "the failure reaches the caller; otherwise the rebuild races them."
+            )
+            return
+    raise AssertionError(f"{synchronizer}::sync_weights not found")
