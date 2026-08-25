@@ -1102,11 +1102,6 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
-    gen_init_time_key = (
-        "megatron_generation_init_time_s"
-        if backend == "megatron"
-        else f"{backend}_init_time_s"
-    )
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
     generation_config["_debug_payload_metrics"] = grpo_config.debug_payload_metrics
     remote_transport = None
@@ -1258,7 +1253,7 @@ def setup(
             parallel_wall_time = time.perf_counter() - parallel_start_time
 
             # Store timing metrics
-            setattr(setup_timing_metrics, gen_init_time_key, generation_time)
+            setup_timing_metrics.generation_init_time_s = generation_time
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.parallel_wall_time_s = parallel_wall_time
             setup_timing_metrics.parallel_init_enabled = 1.0
@@ -1272,7 +1267,7 @@ def setup(
 
             # Initialize generation engine first (clean GPU memory), then policy
             policy_generation, generation_time = init_generation_fn()
-            setattr(setup_timing_metrics, gen_init_time_key, generation_time)
+            setup_timing_metrics.generation_init_time_s = generation_time
 
             policy, policy_time = init_policy()
             setup_timing_metrics.policy_init_time_s = policy_time
@@ -1334,9 +1329,10 @@ def setup(
             ]
             nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
             setup_timing_metrics.policy_init_time_s = policy_time
-            setup_timing_metrics.megatron_generation_init_time_s = (
+            setup_timing_metrics.generation_init_time_s = (
                 reserve_time + megatron_gen_time
             )
+            setup_timing_metrics.generation_init_load_time_s = megatron_gen_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
             served_urls = policy_generation.dp_openai_server_base_urls
@@ -1352,7 +1348,7 @@ def setup(
 
             # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
             policy_generation, megatron_gen_time = init_megatron_generation(policy)
-            setup_timing_metrics.megatron_generation_init_time_s = megatron_gen_time
+            setup_timing_metrics.generation_init_time_s = megatron_gen_time
 
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
@@ -1475,7 +1471,11 @@ def setup(
                 policy_generation, vllm_load_time = results["vllm"]
                 policy, policy_time = results["policy"]
             nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
-            setup_timing_metrics.vllm_init_time_s = vllm_reserve_time + vllm_load_time
+            setup_timing_metrics.generation_init_time_s = (
+                vllm_reserve_time + vllm_load_time
+            )
+            setup_timing_metrics.generation_init_reserve_time_s = vllm_reserve_time
+            setup_timing_metrics.generation_init_load_time_s = vllm_load_time
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
         else:
@@ -1611,7 +1611,7 @@ def setup(
             # Load the model weights now.
             t0 = time.perf_counter()
             policy_generation.weight_synchronizer.sync_weights()
-            setup_timing_metrics.generation_init_load_time_s = time.perf_counter() - t0
+            setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
     # if it is not colocated inference, initialize collective communication for update weights
     elif (
         not colocated_inference
@@ -1729,7 +1729,7 @@ def setup(
     )
 
     # Log worker initialization timing metrics to logger
-    print_setup_timing_summary(setup_timing_metrics, gen_init_time_key)
+    print_setup_timing_summary(setup_timing_metrics)
     logger.log_metrics(
         setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
     )
