@@ -21,7 +21,7 @@ import torch
 from megatron.bridge import AutoBridge
 from megatron.core.transformer import ModuleSpec
 
-from nemo_rl.models.policy import MegatronConfig, provider_override_allowed
+from nemo_rl.models.policy import MegatronConfig
 
 
 def iter_vlm_config_overrides(
@@ -133,6 +133,11 @@ def import_model_from_hf_name(
     model_provider = bridge.to_megatron_provider(load_weights=True)
 
     if megatron_config is not None:
+        # Function-scope import: containers may carry an older installed
+        # nemo_rl in isolated worker venvs; resolving at call time (after the
+        # launcher's PYTHONPATH is in effect) avoids stale-module imports.
+        from nemo_rl.models.policy import provider_override_allowed
+
         for key, value in iter_vlm_config_overrides(megatron_config):
             if not provider_override_allowed(megatron_config, key):
                 continue

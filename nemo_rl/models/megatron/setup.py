@@ -232,7 +232,6 @@ from nemo_rl.models.megatron.community_import import (
     import_model_from_hf_name,
     iter_vlm_config_overrides,
 )
-from nemo_rl.models.policy import provider_override_allowed
 from nemo_rl.models.megatron.config import (
     ColocatedReshardPlan,
     ModelAndOptimizerState,
@@ -696,6 +695,8 @@ def setup_model_config(
     # serialized defaults. Apply explicit recipe controls before model
     # construction so RADIO positional encoding and frozen towers are stable
     # and consistent between logprob and training passes.
+    from nemo_rl.models.policy import provider_override_allowed
+
     for vlm_key, vlm_value in iter_vlm_config_overrides(config["megatron_cfg"]):
         if not provider_override_allowed(config["megatron_cfg"], vlm_key):
             continue
@@ -1028,6 +1029,8 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Multi-Token Prediction settings onto the mcore model config."""
+    from nemo_rl.models.policy import provider_override_allowed
+
     megatron_cfg = config["megatron_cfg"]
 
     def _allowed(key: str) -> bool:
