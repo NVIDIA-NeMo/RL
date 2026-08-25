@@ -73,6 +73,11 @@ class FP8State:
     seen_params: set = field(default_factory=lambda: set())
     fp8_param_names: set = field(default_factory=lambda: set())
     vllm_patches: list = field(default_factory=lambda: [])
+    # Full refit manifest names from prepare_refit_info. load_weights receives
+    # transfer batches split by buffer size, so a weight and its
+    # *_scale_from_checkpoint entry may arrive in different batches; presence
+    # must be validated against the full manifest, not the current batch.
+    refit_manifest_names: set | None = None
 
 
 # Global FP8 config that can be accessed by patched vLLM functions
@@ -110,6 +115,10 @@ def install_fp8_config(config: dict[str, Any] | None) -> None:
         return
     global global_fp8_config
     global_fp8_config = FP8Config(**config)
+
+
+def set_refit_manifest_names(names: set[str] | None) -> None:
+    fp8_state.refit_manifest_names = names
 
 
 def _patch_ray_executor_v2_worker(ray_executor_v2: Any, fp8_config: FP8Config) -> None:
@@ -529,8 +538,16 @@ def load_weights(weights, model_runner):
                     "MXFP8 E4M3 refit weights require refit_prequantize=true; "
                     "other FP8 trainer scale layouts are not compatible."
                 )
+            # Transfer batches split by buffer size, so the matching scale may
+            # arrive in an earlier or later batch; validate against the full
+            # refit manifest when available, not just the current batch.
             scale_name = k + "_scale_from_checkpoint"
-            if global_fp8_config.is_mx and scale_name not in weight_names:
+            manifest = fp8_state.refit_manifest_names
+            if (
+                global_fp8_config.is_mx
+                and scale_name not in weight_names
+                and (manifest is None or scale_name not in manifest)
+            ):
                 raise ValueError(
                     f"Prequantized MXFP8 weight {k!r} is missing {scale_name!r}."
                 )

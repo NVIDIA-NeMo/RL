@@ -480,6 +480,7 @@ class VllmInternalWorkerExtension:
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         fp8.install_fp8_config(serialized_fp8_config)
+        fp8.set_refit_manifest_names(set(state_dict_info))
         if not (
             fp8.global_fp8_config is not None
             and fp8.global_fp8_config.is_mx
