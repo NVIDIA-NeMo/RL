@@ -87,10 +87,12 @@ $PY examples/run_flow_grpo.py \
   checkpointing.save_period=5 \
   2>&1 | tee "$LOG_DIR/run.log"
 
-# The overrides train 5 steps with save_period=5, so step_5 must exist with
-# the Automodel Checkpointer layout: model/ (LoRA adapter) + optim/.metadata
-# (DCP optimizer state; written last = completeness marker).
-CHECKPOINT_DIR="$CKPT_DIR/step_5"
+# The overrides train 5 steps with save_period=5, so step_5 must exist. The
+# CheckpointManager writes the policy under step_N/policy/, and the Automodel
+# Checkpointer lays it out as model/ (LoRA adapter) + optim/ (DCP optimizer
+# state). A step_N/ that exists at all is already complete: the manager only
+# renames tmp_step_N to step_N once the save returned.
+CHECKPOINT_DIR="$CKPT_DIR/step_5/policy"
 if [[ ! -e "$CHECKPOINT_DIR/model/adapter_model.safetensors" ]] || \
    [[ ! -e "$CHECKPOINT_DIR/optim/.metadata" ]]; then
   echo "FAILED: $CHECKPOINT_DIR is missing the LoRA adapter or DCP optimizer metadata" >&2
