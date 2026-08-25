@@ -441,14 +441,13 @@ def test_genrm_ocr_sampling_params_configurable(monkeypatch):
     assert payload["max_tokens"] == 64
 
 
-def test_genrm_ocr_default_model_matches_verl_omni(monkeypatch):
-    import os
-
+def test_genrm_ocr_requires_model(monkeypatch):
+    """`model` has no default: the judge is named in the config, not in code."""
     from nemo_rl.environments.image_reward_environment import GenRmOcrReward
 
     monkeypatch.setenv("GENRM_BASE_URL", "http://h:1/v1")
-    plugin = GenRmOcrReward()
-    assert plugin._model == os.path.expanduser("~/models/tiny-random/qwen3-vl")
+    with pytest.raises(ValidationError, match="model"):
+        GenRmOcrReward()
 
 
 def test_genrm_ocr_requires_base_url(monkeypatch):
@@ -456,14 +455,14 @@ def test_genrm_ocr_requires_base_url(monkeypatch):
 
     monkeypatch.delenv("GENRM_BASE_URL", raising=False)
     with pytest.raises(ValueError, match="GENRM_BASE_URL"):
-        GenRmOcrReward()
+        GenRmOcrReward(model="m")
 
 
 def test_genrm_ocr_rejects_size_mismatch(monkeypatch):
     from nemo_rl.environments.image_reward_environment import GenRmOcrReward
 
     monkeypatch.setenv("GENRM_BASE_URL", "http://h:1/v1")
-    plugin = GenRmOcrReward()
+    plugin = GenRmOcrReward(model="m")
     with pytest.raises(ValueError, match="metadata len"):
         plugin.score(torch.rand(2, 3, 4, 4), ["a", "b"], [{}])
 
@@ -479,7 +478,7 @@ def test_genrm_ocr_http_failure_propagates(monkeypatch):
         raise requests.exceptions.ConnectionError("GRM router down")
 
     monkeypatch.setattr(requests, "post", fail_post)
-    plugin = GenRmOcrReward()
+    plugin = GenRmOcrReward(model="m")
     # No retry (mirrors verl-omni genrm_ocr): the failure surfaces loudly.
     with pytest.raises(requests.exceptions.ConnectionError):
         plugin.score(torch.rand(1, 3, 4, 4), ["p"], [{"ground_truth": "x"}])
@@ -498,7 +497,7 @@ def test_genrm_ocr_malformed_response_raises(monkeypatch):
             {"error": "model overloaded"}
         ),
     )
-    plugin = GenRmOcrReward()
+    plugin = GenRmOcrReward(model="m")
     with pytest.raises(KeyError):
         plugin.score(torch.rand(1, 3, 4, 4), ["p"], [{"ground_truth": "x"}])
 

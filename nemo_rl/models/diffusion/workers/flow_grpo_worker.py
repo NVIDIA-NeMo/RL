@@ -129,8 +129,10 @@ def build_peft_config(lora_cfg: dict[str, Any]) -> Any:
     full-path wildcard patterns ('*.attn.to_q'): Automodel's ModuleMatcher
     anchors each pattern to the whole module FQN, so peft-style bare suffixes
     ('to_q') silently match nothing. `lora_dtype` stays None so the loader
-    pins LoRA weights to bf16 alongside the base weights (Automodel diffusion
-    convention; AdamW's fp32 moments carry optimizer precision).
+    pins LoRA weights to bf16 alongside the base weights, the Automodel
+    diffusion convention. Note that torch's AdamW builds its moments with
+    `zeros_like(p)`, so they follow the parameter dtype: bf16 weights get bf16
+    moments, with no fp32 master copy.
     """
     from nemo_automodel.components._peft.lora import PeftConfig
 
