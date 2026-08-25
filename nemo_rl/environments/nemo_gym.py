@@ -250,9 +250,7 @@ class NemoGymConfig(TypedDict):
     # Optional startup gate for externally served Gym dependencies. The actor
     # starts local Gym services first, then waits for every target before it
     # exposes its rollout collection helper to the training driver.
-    external_service_readiness: NotRequired[
-        ExternalServiceReadinessConfig | None
-    ]
+    external_service_readiness: NotRequired[ExternalServiceReadinessConfig | None]
     # Multimodal fields (populated by `setup_nemo_gym_config` when VLM is enabled).
     tokenizer_config: NotRequired[
         Optional[TokenizerConfig]
@@ -307,8 +305,7 @@ def _probe_external_service(
         or isinstance(total_backends, bool)
     ):
         return (
-            "health response must contain integer healthy_backends and "
-            "total_backends"
+            "health response must contain integer healthy_backends and total_backends"
         )
     if (
         status != "ok"
@@ -358,9 +355,7 @@ def _wait_for_external_services(
         if problems != previous_problems:
             print(
                 "Waiting for external NeMo-Gym services: "
-                + "; ".join(
-                    f"{name}: {problem}" for name, problem in problems.items()
-                )
+                + "; ".join(f"{name}: {problem}" for name, problem in problems.items())
             )
             previous_problems = problems
 
@@ -781,9 +776,7 @@ Depending on your data shape, you may want to change these values."""
         )
 
         try:
-            _wait_for_external_services(
-                self.cfg.get("external_service_readiness")
-            )
+            _wait_for_external_services(self.cfg.get("external_service_readiness"))
         except TimeoutError:
             # RunHelper.start() has already spawned local Gym services. Do not
             # leave them behind when an external dependency misses its deadline.
