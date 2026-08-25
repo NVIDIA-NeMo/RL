@@ -1,12 +1,10 @@
 defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
-
-# Config-only performance variant. Preserve the parent's 64-GPU learner and
-# 64-GPU rollout pools while mapping them to 32 four-GPU nodes.
 policy:
   sequence_packing:
     logprob_mb_tokens: 32768
   megatron_cfg:
-    activation_checkpointing: false
+    recompute_granularity: full
+    tensor_model_parallel_size: 2
     context_parallel_size: 1
   generation:
     vllm_kwargs:
@@ -17,7 +15,6 @@ policy:
       resources:
         gpus_per_node: 4
         num_nodes: 16
-
 cluster:
   gpus_per_node: 4
   num_nodes: 32
