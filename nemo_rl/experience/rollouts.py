@@ -476,9 +476,9 @@ def _effort_shaping_metrics(shaping: _EffortShapingMetrics) -> dict[str, float]:
         shaping: Per-sample tracking lists returned by ``_apply_effort_shaping``.
 
     Returns:
-        Metric name to value. Empty when shaping was disabled or when no prompt in
-        the group matched ``low_string`` -- callers ``update`` an existing dict, so
-        an absent key leaves the metric unreported rather than reporting a zero.
+        Metric name to value. Empty only when shaping was disabled; callers
+        ``update`` an existing dict, so an absent key leaves the metric unreported
+        rather than reporting a zero.
     """
     metrics: dict[str, float] = {}
     if shaping.length_rewards_low:
