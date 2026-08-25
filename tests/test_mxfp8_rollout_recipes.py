@@ -299,7 +299,7 @@ def test_mxfp8_functional_test_uses_ignore_patterns() -> None:
 
     assert "quantization_ignored_layer_kws" not in script_text
     assert "quantization_ignore_patterns=[model.layers.*.self_attn.*]" in script_text
-    assert "model\\.layers\\.\\*\\.self_attn\\.\\*" in script_text
+    assert "assert_grep 'NRL_MXFP8_EFFECTIVE_IGNORE=.*self_attn'" in script_text
 
 
 def test_qwen3_235b_scripts_append_distributed_timeout_override() -> None:

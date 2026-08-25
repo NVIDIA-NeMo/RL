@@ -596,6 +596,12 @@ class BaseVllmGenerationWorker:
             # Text-only runs additionally set generation.vllm_kwargs.language_model_only
             # in the recipe YAML to skip vLLM's multimodal preflight.
 
+        if self.cfg["vllm_cfg"].get("quantization_ignore_patterns"):
+            effective_ignore = vllm_kwargs["hf_overrides"]["quantization_config"].get(
+                "ignore", []
+            )
+            print(f"NRL_MXFP8_EFFECTIVE_IGNORE={effective_ignore}")
+
         llm_kwargs = dict(
             model=self.model_name,
             served_model_name=self.model_name,

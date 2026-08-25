@@ -64,6 +64,6 @@ uv run tests/check_metrics.py "$JSON_METRICS" \
     'max(data["train/token_mult_prob_error"]) < 2.0'
 
 assert_grep 'quantization=modelopt_mxfp8|quant_algo.*MXFP8' "$RUN_LOG"
-assert_grep 'model\.layers\.\*\.self_attn\.\*' "$RUN_LOG"
+assert_grep 'NRL_MXFP8_EFFECTIVE_IGNORE=.*self_attn' "$RUN_LOG"
 
 echo "[PASS] GB200 dense Qwen GRPO vLLM MXFP8 rollout functional test"
