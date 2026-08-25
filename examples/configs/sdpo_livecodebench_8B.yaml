@@ -279,10 +279,15 @@ env:
   livecodebench:
     num_workers: 16
     timeout_per_test_seconds: 6.0
-    max_feedback_chars: 12000          # was 4000 — give 5+ full failure blocks room (each with Input/Output/Expected visible)
-    max_failed_tests_in_feedback: 5    # was 3 — broader failure exposure
-    max_input_chars_per_test: 800      # NEW — caps each test's input dump so big atcoder JSON arrays don't crowd out Output/Expected
-    max_input_lines_per_test: 40       # NEW — line cap for vertical inputs (was hardcoded 8)
+    # Feedback shape matched to the reference harness (lasgroup/SDPO
+    # format_test_feedback): one error block XOR <=2 shortest wrong-answers,
+    # 2000-char total cap, 250-char/8-line inputs. Concise, prioritized
+    # feedback is what the SDPO teacher conditions on.
+    max_feedback_chars: 2000
+    max_failed_tests_in_feedback: 2
+    max_input_chars_per_test: 250
+    max_input_lines_per_test: 8
+    dense_train_rewards: true          # reference compute_score: train reward = fraction of tests passed; validation stays all-or-nothing
 
 logger:
   log_dir: "logs/sdpo_lcbv6_8b"

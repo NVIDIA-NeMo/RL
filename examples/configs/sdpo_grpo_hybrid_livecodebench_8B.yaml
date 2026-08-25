@@ -47,7 +47,7 @@ sdpo:
     normalize_rewards: true
 
 loss_fn:
-  grpo_weight: 0.3                   # λ ∈ [0,1]; 0 = pure SDPO, 1 = pure GRPO. Kept a minority
+  grpo_weight: 0.0                   # λ ∈ [0,1]; 0 = pure SDPO, 1 = pure GRPO. Kept a minority
                                      # signal so SDPO stays the low-variance stabilizer (paper §4.5).
                                      # For 8B, consider 0.0 (pure SDPO) — see header caveat.
   sdpo:
@@ -280,7 +280,7 @@ policy:
       tensor_parallel_size: 2
       pipeline_parallel_size: 1
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.5
+      gpu_memory_utilization: 0.35   # colocated vLLM keeps this reserved during training; 0.5 OOM'd the flash-attn backward at step 1 (job 20626) — 0.35 is what all successful pure-SDPO LCB runs used
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: False
       use_deep_gemm: False
@@ -316,10 +316,14 @@ env:
   livecodebench:
     num_workers: 16
     timeout_per_test_seconds: 6.0
-    max_feedback_chars: 12000          # give 5+ full failure blocks room (each with Input/Output/Expected visible)
-    max_failed_tests_in_feedback: 5    # broader failure exposure
-    max_input_chars_per_test: 800      # caps each test's input dump so big atcoder JSON arrays don't crowd out Output/Expected
-    max_input_lines_per_test: 40       # line cap for vertical inputs
+    # Feedback shape matched to the reference harness (lasgroup/SDPO
+    # format_test_feedback): one error block XOR <=2 shortest wrong-answers,
+    # 2000-char total cap, 250-char/8-line inputs.
+    max_feedback_chars: 2000
+    max_failed_tests_in_feedback: 2
+    max_input_chars_per_test: 250
+    max_input_lines_per_test: 8
+    dense_train_rewards: true          # reference: train reward = fraction of tests passed — REQUIRED for the GRPO leg to see partial credit like the paper's baselines; validation stays all-or-nothing
 
 logger:
   log_dir: "logs/sdpo_grpo_hybrid_lcbv6_8b"
