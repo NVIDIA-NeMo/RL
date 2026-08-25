@@ -43,7 +43,9 @@ policy:
   model_name: "GSAI-ML/LLaDA-8B-Instruct"
   tokenizer:
     name: ${policy.model_name}
-  train_global_batch_size: 256
+  # One rollout step produces 32 * 6 = 192 sequences. NeMo RL requires the
+  # training data size to be a multiple of the global batch size.
+  train_global_batch_size: 192
   train_micro_batch_size: 1
   # Must equal train_micro_batch_size: the old, reference, and current ELBOs of
   # a rollout are only comparable when estimated at identical masks, and the

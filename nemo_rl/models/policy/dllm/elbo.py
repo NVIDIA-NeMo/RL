@@ -322,7 +322,9 @@ class SdmcElboEstimator:
         scorable = completion_mask.sum(-1)
         # At least one masked position, so a point never contributes a
         # degenerate zero (which the 1/t weight would turn into a NaN).
-        num_masked = (scorable.float() * time).round().long().clamp(min=1)
+        # The GDPO reference uses ``int(t * completion_length)`` (floor for
+        # positive values) for its exact-k mask draw.
+        num_masked = (scorable.float() * time).floor().long().clamp(min=1)
         num_masked = torch.minimum(num_masked, scorable)
 
         # Rank scorable positions in a random order, then take the lowest
