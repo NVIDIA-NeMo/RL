@@ -20,7 +20,7 @@ RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 JOB_NAME="${JOB_NAME:-nemotron-omni-mpo-${RUN_ID}}"
 DATA_PATH="${MPO_DATA_PATH:-${DATA_PATH:-}}"
 : "${DATA_PATH:?Set MPO_DATA_PATH or DATA_PATH}"
-: "${CONTAINER:?Set CONTAINER to the #3290-based release image}"
+: "${CONTAINER:?Set CONTAINER to a compatible NeMo RL release image}"
 : "${SBATCH_ACCOUNT:?Set SBATCH_ACCOUNT}"
 
 MODEL_NAME="${MPO_MODEL_NAME:-nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16}"
@@ -30,8 +30,8 @@ RESULTS_ROOT="${RESULTS_ROOT:-${NEMORL}/results}"
 RESULTS_NAME="${RESULTS_NAME:-${JOB_NAME}}"
 RESULTS_DIR="${RESULTS_ROOT}/${RESULTS_NAME}"
 RUNNER="${RUNNER:-uv run --no-sync}"
-WANDB_ENTITY="${WANDB_ENTITY:-joc}"
-WANDB_PROJECT="${WANDB_PROJECT:-nemotron-omni-main-migration}"
+WANDB_ENTITY="${WANDB_ENTITY:-}"
+WANDB_PROJECT="${WANDB_PROJECT:-vlm-mpo}"
 WANDB_NAME="${WANDB_NAME:-${JOB_NAME}}"
 WANDB_RUN_ID="${WANDB_RUN_ID:-}"
 WANDB_RESUME="${WANDB_RESUME:-allow}"
@@ -44,6 +44,9 @@ MPO_TRAIN_GLOBAL_BATCH_SIZE="${MPO_TRAIN_GLOBAL_BATCH_SIZE:-}"
 MPO_CHECKPOINT_MUST_SAVE_BY="${MPO_CHECKPOINT_MUST_SAVE_BY:-}"
 
 OPTIONAL_OVERRIDES=""
+if [[ -n "${WANDB_ENTITY}" ]]; then
+  OPTIONAL_OVERRIDES+=" +logger.wandb.entity='${WANDB_ENTITY}'"
+fi
 if [[ -n "${MPO_MAX_NUM_STEPS}" ]]; then
   [[ "${MPO_MAX_NUM_STEPS}" =~ ^[1-9][0-9]*$ ]] || {
     echo "MPO_MAX_NUM_STEPS must be a positive integer" >&2
@@ -56,7 +59,7 @@ if [[ -n "${MPO_STOP_AFTER_STEP}" ]]; then
     echo "MPO_STOP_AFTER_STEP must be a positive integer" >&2
     exit 2
   }
-  OPTIONAL_OVERRIDES+=" +mpo.stop_after_step=${MPO_STOP_AFTER_STEP}"
+  OPTIONAL_OVERRIDES+=" mpo.stop_after_step=${MPO_STOP_AFTER_STEP}"
 fi
 if [[ -n "${MPO_MAX_SAMPLES}" ]]; then
   [[ "${MPO_MAX_SAMPLES}" =~ ^[1-9][0-9]*$ ]] || {
@@ -150,7 +153,6 @@ policy.tokenizer.name='${MODEL_NAME}' \
 data.train.data_path='${DATA_PATH}' \
 checkpointing.checkpoint_dir='${RESULTS_DIR}' \
 logger.wandb_enabled=true \
-logger.wandb.entity='${WANDB_ENTITY}' \
 logger.wandb.project='${WANDB_PROJECT}' \
 logger.wandb.name='${WANDB_NAME}'${OPTIONAL_OVERRIDES}"
 

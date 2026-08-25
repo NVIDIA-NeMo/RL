@@ -99,6 +99,36 @@ def test_mpo_loss_is_invariant_to_pair_row_order():
         assert reordered_metrics[key] == pytest.approx(interleaved_metrics[key])
 
 
+def test_mpo_loss_matches_closed_form_components():
+    """Pin every weighted MPO term to an independently derived value."""
+    logsigmoid = torch.nn.functional.logsigmoid
+    logprobs, data = _mpo_batch()
+    beta = 0.5
+    loss_fn = MPOLossFn(_loss_config(reference_policy_kl_penalty=beta))
+
+    loss, metrics = _call_loss(loss_fn, logprobs, data)
+
+    # Pair-aligned sequence log-ratios from _mpo_batch.
+    chosen = torch.tensor([-1.0, -2.0])
+    rejected = torch.tensor([-3.0, -4.0])
+    pairs, shift = 2.0, 1.0
+
+    expected_preference = (-logsigmoid(beta * (chosen - rejected))).sum() / pairs
+    expected_sft = torch.tensor([1.0, 2.0]).sum() / pairs
+    expected_bco = (-logsigmoid(beta * chosen - shift)).sum() / pairs + (
+        -logsigmoid(-(beta * rejected - shift))
+    ).sum() / pairs
+    expected_total = expected_preference + 0.25 * expected_sft + 0.5 * expected_bco
+
+    torch.testing.assert_close(loss, expected_total)
+    assert metrics["preference_loss"] == pytest.approx(expected_preference.item())
+    assert metrics["sft_loss"] == pytest.approx(expected_sft.item())
+    assert metrics["bco_loss"] == pytest.approx(expected_bco.item())
+    assert metrics["accuracy"] == pytest.approx(1.0)
+    assert metrics["rewards_chosen_mean"] == pytest.approx(-1.5)
+    assert metrics["rewards_rejected_mean"] == pytest.approx(-3.5)
+
+
 def test_mpo_loss_does_not_mutate_reward_shift_on_worker_call():
     logprobs, data = _mpo_batch()
     loss_fn = MPOLossFn(_loss_config())

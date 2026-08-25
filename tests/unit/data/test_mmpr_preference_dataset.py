@@ -144,6 +144,7 @@ def test_mmpr_preference_dataset_normalizes_responses_independently(tmp_path):
             "image": "example.png",
             "chosen": "Chosen",
             "rejected": "<think>rejected reasoning</think>\n\nRejected",
+            "system": "This legacy value is intentionally blanked.",
         },
     ]
     annotation_path.write_text(
@@ -172,8 +173,10 @@ def test_mmpr_preference_dataset_normalizes_responses_independently(tmp_path):
 
     assert rows[0]["chosen"] == "<think>chosen reasoning</think>\n\nChosen"
     assert rows[0]["rejected"] == "<think></think>\n\nRejected"
+    assert rows[0]["system"] is None
     assert rows[1]["chosen"] == "<think></think>\n\nChosen"
     assert rows[1]["rejected"] == "<think>rejected reasoning</think>\n\nRejected"
+    assert rows[1]["system"] == ""
 
 
 def test_format_mmpr_preference_dataset_preserves_no_placeholder_rows():

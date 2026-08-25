@@ -11,7 +11,7 @@ CHAIN_ID="${CHAIN_ID:-$(date +%Y%m%d-%H%M%S)}"
 CHAIN_NAME="${CHAIN_NAME:-nemotron-omni-mpo-chain-${CHAIN_ID}}"
 RESULTS_NAME="${RESULTS_NAME:-${CHAIN_NAME}}"
 WANDB_NAME="${WANDB_NAME:-${CHAIN_NAME}}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-$(python -c 'import secrets; print("mpo" + secrets.token_hex(3))')}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-mpo$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')}"
 RESULTS_ROOT="${RESULTS_ROOT:-${NEMORL}/results}"
 final_max_steps="${MPO_MAX_NUM_STEPS:-}"
 

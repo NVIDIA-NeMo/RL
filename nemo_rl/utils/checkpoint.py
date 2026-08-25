@@ -78,6 +78,9 @@ def _load_megatron_sharded_metadata_keys(iteration_dir: Path) -> set[str]:
 
 def _is_megatron_optimizer_key(key: str) -> bool:
     """Return whether a flattened Megatron checkpoint key belongs to the optimizer."""
+    # ChainedOptimizer prefixes every sharded key when a model has multiple
+    # sub-optimizers (for example, dense and expert parameters in MoE models).
+    key = re.sub(r"^chained_\d+\.", "", key)
     return key == "optimizer" or key.startswith(("optimizer.", "optimizer/"))
 
 

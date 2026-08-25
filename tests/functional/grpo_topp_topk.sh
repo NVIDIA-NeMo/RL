@@ -18,8 +18,6 @@ rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
-# Training recomputes top-k/top-p-filtered logprobs, so request the matching
-# processed distribution instead of vLLM's raw-logprobs engine default.
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo.py \
     policy.model_name=Qwen/Qwen3-0.6B \
@@ -30,7 +28,6 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.generation.temperature=0.8 \
     policy.generation.top_p=0.9 \
     policy.generation.top_k=50 \
-    policy.generation.vllm_cfg.logprobs_mode=processed_logprobs \
     cluster.gpus_per_node=2 \
     grpo.max_num_steps=2 \
     logger.tensorboard_enabled=true \

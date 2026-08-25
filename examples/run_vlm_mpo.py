@@ -47,9 +47,7 @@ def main() -> None:
         args.config = os.path.join(
             os.path.dirname(__file__),
             "configs",
-            "recipes",
-            "vlm",
-            "vlm_mpo-nemotron-omni-30ba3b-mmpr-1n8g-megatron-tp8.v1.yaml",
+            "vlm_mpo.yaml",
         )
 
     config = load_config(args.config)

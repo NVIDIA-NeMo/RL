@@ -1,8 +1,5 @@
-# New-main qualification against legacy W&B run vnosv1bs:
-#   nvidia/vlm-mpo-dev-mmpr/super-PACK-rev2d-cp2-100step
-#
-# Super no-packing OOMs at useful context lengths, so this is a packed-only
-# qualification. Every packed item remains one chosen/rejected MPO pair.
+# Super 16K CP2 packed qualification. Every packed item remains one
+# chosen/rejected MPO pair.
 defaults: vlm_mpo-nemotron-super-omni-nopack-2k-parity.yaml
 
 policy:
@@ -22,10 +19,6 @@ policy:
 
 data:
   max_input_seq_length: 16384
-
-logger:
-  wandb:
-    name: super-main-packed-16k-cp2-100step
 
 checkpointing:
   # Stop before the four-hour partition limit so the dependent segment can

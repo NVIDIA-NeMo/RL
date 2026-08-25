@@ -1,12 +1,5 @@
-# Trend-parity migration comparison against W&B run 6emw424v:
-#   nvidia/vlm-mpo-dev-mmpr/nano-NOPACK-rev2d-cp1-100step
-#
-# Training and data settings mirror that run. The intentional model delta is
-# the V3 public checkpoint required to exercise the canonical NemotronOmniModel;
-# the legacy V2 checkpoint routes through NemotronVLModel instead.
-#
-# The current MBridge pin does not support unpacked image batches. Retain this
-# control for requalification after NVIDIA-NeMo/RL#3525 is resolved.
+# Unpacked 100-step control for comparing a Nemotron Omni MPO recipe with its
+# pair-atomic packed sibling.
 defaults: ../recipes/vlm/vlm_mpo-nemotron-omni-30ba3b-mmpr-1n8g-megatron-tp8.v1.yaml
 
 mpo:
@@ -112,7 +105,7 @@ data:
   num_workers: 0
   train:
     dataset_name: MMPRPreference
-    data_path: /lustre/fs1/portfolios/coreai/users/aroshanghias/data/mmpr_public/processed/MMPR-v1.2/meta_public.json
+    data_path: REPLACE_WITH_MMPR_METADATA_PATH
     split_validation_size: 2000
     legacy_validation_split: true
     seed: 42
@@ -128,21 +121,6 @@ checkpointing:
   save_period: 100
   checkpoint_must_save_by: 00:03:45:00
   save_optimizer: true
-
-logger:
-  wandb_enabled: true
-  tensorboard_enabled: false
-  mlflow_enabled: false
-  swanlab_enabled: false
-  monitor_gpus: true
-  num_val_samples_to_print: 0
-  wandb:
-    entity: nvidia
-    project: vlm-mpo-dev-mmpr
-    name: nano-main-nopack-legacy-parity-100step
-  gpu_monitoring:
-    collection_interval: 10
-    flush_interval: 10
 
 cluster:
   num_nodes: 4

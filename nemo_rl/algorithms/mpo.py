@@ -35,7 +35,7 @@ from nemo_rl.algorithms.loss import MPOLossConfig, MPOLossFn
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
@@ -46,12 +46,9 @@ class MPOConfig(DPOConfig):
     quality_average_log_probs: bool = False
     reward_shift_momentum: float = 0.99
     reward_shift: float = 0.0
-    # Optional launcher-only boundary for a time-sliced job. Unlike
-    # max_num_steps, this must not change Megatron's scheduler horizon.
-    stop_after_step: int | None = None
 
 
-class MasterConfig(BaseModel, extra="ignore"):
+class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     data: DataConfig
     mpo: MPOConfig
@@ -90,35 +87,52 @@ def _initial_mpo_save_state(config: MPOConfig) -> MPOSaveState:
     )
 
 
-def _configure_pair_safe_packing(policy_config: PolicyConfig) -> None:
+def _validate_pair_safe_packing(
+    policy_config: PolicyConfig, cluster_config: ClusterConfig
+) -> None:
     if policy_config["dynamic_batching"]["enabled"]:
         raise ValueError("Dynamic batching is not supported with MPO.")
     if not policy_config["sequence_packing"]["enabled"]:
         return
 
     packing_config = cast(dict[str, Any], policy_config["sequence_packing"])
-    packing_config["fuse_loss"] = True
-    configured_grouping = packing_config.get("pair_grouping_key")
-    if configured_grouping not in (None, "pair_index"):
+    raw_megatron_config = policy_config["megatron_cfg"]
+    if not raw_megatron_config["enabled"]:
         raise ValueError(
-            "MPO requires policy.sequence_packing.pair_grouping_key='pair_index'; "
-            f"got {configured_grouping!r}."
+            "MPO with sequence packing requires the Megatron backend; the fused "
+            "packed-loss path is not implemented for DTensor."
         )
-    packing_config["pair_grouping_key"] = "pair_index"
-    # This grouping is applied before NeMo-RL's Megatron data path packs each
-    # microbatch into full THD input. Keeping one atomic pair per microbatch
-    # both preserves chosen/rejected alignment and bounds vision-encoder memory.
-    packing_config.setdefault("max_sequences_per_bin", 1)
+    megatron_config = cast(MegatronConfig, raw_megatron_config)
 
+    for key, required in (("pair_grouping_key", "pair_index"), ("fuse_loss", True)):
+        if packing_config.get(key) != required:
+            raise ValueError(
+                f"MPO requires policy.sequence_packing.{key}={required!r}; "
+                f"got {packing_config.get(key)!r}."
+            )
 
-def _validate_stop_after_step(config: MPOConfig) -> None:
-    if config.stop_after_step is None:
-        return
-    if not 0 < config.stop_after_step <= config.max_num_steps:
-        raise ValueError(
-            "mpo.stop_after_step must be between 1 and mpo.max_num_steps; "
-            f"got {config.stop_after_step} and {config.max_num_steps}."
+    # With one pair per bin, each DP rank must receive the same integer number
+    # of pairs. Validate the user-facing batch setting before the packer emits
+    # a derived min_bin_count/bin_count_multiple error at the first step.
+    if packing_config.get("max_sequences_per_bin") == 1:
+        world_size = cluster_config["num_nodes"] * cluster_config["gpus_per_node"]
+        model_parallel_size = (
+            megatron_config["tensor_model_parallel_size"]
+            * megatron_config["pipeline_model_parallel_size"]
+            * megatron_config["context_parallel_size"]
         )
+        if world_size % model_parallel_size == 0:
+            dp_size = world_size // model_parallel_size
+            train_gbs = policy_config["train_global_batch_size"]
+            if train_gbs % dp_size != 0:
+                raise ValueError(
+                    "policy.train_global_batch_size must be divisible by the data "
+                    "parallel degree when "
+                    "policy.sequence_packing.max_sequences_per_bin=1; "
+                    f"got train_global_batch_size={train_gbs}, DP={dp_size} from "
+                    f"{cluster_config['num_nodes']} nodes x "
+                    f"{cluster_config['gpus_per_node']} GPUs."
+                )
 
 
 def _make_loss_fn(
@@ -184,8 +198,7 @@ def setup(
     MasterConfig,
 ]:
     """Set up MPO without reintroducing the legacy Omni collapse/expand path."""
-    _validate_stop_after_step(master_config.mpo)
-    _configure_pair_safe_packing(master_config.policy)
+    _validate_pair_safe_packing(master_config.policy, master_config.cluster)
     result = setup_preference_training(
         master_config,  # type: ignore[arg-type]
         tokenizer,
@@ -196,6 +209,7 @@ def setup(
         initial_save_state_fn=lambda: _initial_mpo_save_state(master_config.mpo),
         allow_sequence_packing=True,
         cluster_name="mpo_cluster",
+        algorithm_config_name="mpo",
     )
     return result  # type: ignore[return-value]
 

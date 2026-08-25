@@ -498,6 +498,11 @@ def test_get_resume_paths_warns_when_megatron_optimizer_missing(
         "_load_megatron_common_state_dict",
         MagicMock(return_value={"args": {}}),
     )
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_megatron_sharded_metadata_keys",
+        MagicMock(return_value=set()),
+    )
 
     with pytest.warns(UserWarning, match="Optimizer state not found"):
         weights_path, optimizer_path = CheckpointManager.get_resume_paths(
@@ -570,7 +575,12 @@ def test_get_resume_paths_torch_dist_megatron_optimizer(
         "_load_megatron_common_state_dict",
         MagicMock(return_value={"args": {}}),
     )
-    load_sharded_keys = MagicMock(return_value={"optimizer.state.exp_avg"})
+    load_sharded_keys = MagicMock(
+        return_value={
+            "chained_1.optimizer.distributed.dp_group_idx_5.gbuf_idx_0."
+            "dtype_(torch.bfloat16, torch.bfloat16)"
+        }
+    )
     monkeypatch.setattr(
         checkpoint_module,
         "_load_megatron_sharded_metadata_keys",
