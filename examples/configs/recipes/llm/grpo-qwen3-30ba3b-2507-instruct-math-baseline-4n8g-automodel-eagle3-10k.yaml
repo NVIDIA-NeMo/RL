@@ -1,0 +1,89 @@
+defaults: grpo-qwen3-8b-math-baseline-4n8g-automodel.yaml
+# Qwen3-30B-A3B-Instruct-2507 GRPO math baseline with EAGLE3 draft
+# co-training (DTensor v2 backend), 4 nodes x 8 GPUs, 10240-token context
+# (2048 prompt + 8192 response). MoE sibling of the Qwen3-8B baseline
+# (EP32/TP1 policy training, vLLM TP=4 generation, no thinking chat
+# template) with the RedHatAI/Qwen3-30B-A3B-Instruct-2507-speculator.eagle3
+# drafter (dense 1-layer llama-family) co-trained alongside it via the
+# speculators-style TTT unrolling (teacher-forced multi-step forward over
+# the rollout, distilling the policy's own logits mapped into the reduced
+# draft vocabulary) and refit into vLLM (draft.* weight stream) for
+# speculative-decoding generation. Draft architecture fields (aux layer
+# ids, draft_vocab_size, d2t/t2d maps, norm_before_residual, layer family)
+# come from the draft checkpoint's config.json; only training options are
+# set here.
+#
+# Context is trimmed to 10240 (from this repo's usual 20480): eagle3 draft
+# co-training OOMs at 20480 on this 30B EP32 layout even after chunking the
+# drafter's lm_head/KL (chunk-size reductions only shrank the failing
+# allocation, never freed enough headroom -- the base memory budget itself
+# is too tight at 20480).
+#
+# Also switches checkpointing to synchronous dcp.save: DTensorPolicyWorkerV2
+# defaults to is_async=true (dcp.async_save), which spawns a fresh per-rank
+# background process + Gloo process group on every checkpoint save; that
+# rendezvous has failed repeatedly on this 4-node/32-rank layout
+# (RuntimeError: Connection closed by peer / 30-min timeout), always at the
+# first save_period boundary.
+#
+# This is the first recipe pairing draft co-training with EP-sharded (EP32)
+# policy training in this repo -- treat as unvalidated until it completes a
+# smoke run.
+grpo:
+  val_period: 10
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-2507-instruct-math-baseline-4n8g-automodel-eagle3-10k
+  save_period: 15
+  keep_top_k: 5
+  is_async: false
+policy:
+  model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
+  max_total_sequence_length: 10240
+  tokenizer:
+    # Instruct-2507 is a non-thinking checkpoint (no <think> toggle in its
+    # chat template, unlike the base Qwen3-30B-A3B); drop the inherited
+    # enable_thinking kwarg.
+    chat_template_kwargs: null
+  hf_config_overrides:
+    # Disable the MoE load-balancing aux loss for RL: Automodel otherwise
+    # injects router gradients that conflict with the policy objective and
+    # degrade accuracy. Keep as 0.0, not 0: Hugging Face strict config
+    # validation declares router_aux_loss_coef as float and rejects YAML's
+    # integer 0.
+    router_aux_loss_coef: 0.0
+  dtensor_cfg:
+    tensor_parallel_size: 1
+    expert_parallel_size: 32
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        experts: gmm
+        dispatcher: deepep
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+  draft:
+    enabled: true
+    model_name: RedHatAI/Qwen3-30B-A3B-Instruct-2507-speculator.eagle3
+    algo: "eagle3"
+    loss_weight: 1.0
+    eagle3:
+      # Draft param-group lr; must far exceed the policy RL lr so the draft
+      # tracks policy drift.
+      learning_rate: 1.0e-04
+      ttt_steps: 3
+      ttt_step_loss_decay: 1.0
+      train_embed_and_head: true
+  generation:
+    max_new_tokens: 8192
+    vllm_cfg:
+      tensor_parallel_size: 4
+    vllm_kwargs:
+      speculative_config:
+        method: "eagle3"
+        model: ${policy.draft.model_name}
+        # One proposal per TTT step the drafter is trained to unroll
+        # (checkpoint config.json: proposal_methods[0].speculative_tokens=3).
+        num_speculative_tokens: 3
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-2507-instruct-math-baseline-4n8g-automodel-eagle3-10k
