@@ -258,7 +258,9 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         self._generation.prepare_nccl_reshard_refit_info(wire_refit_info)
         self._built_membership = membership
 
-    def reconcile_communicator(self, absent_shards: Sequence[int]) -> bool:
+    def reconcile_communicator(
+        self, absent_shards: Sequence[int], force: bool = False
+    ) -> bool:
         """Rebuild both communicator families and regenerate the refit plan.
 
         This transport is harder to recover than the plain broadcast, and the difference
@@ -295,7 +297,18 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 total_gen_workers=len(self._generation.worker_group.workers),
                 train_world_size=membership.train_world_size,
             )
-        if membership.shard_prefixes == self._built_membership.shard_prefixes:
+        # `force` is how the recovery path says the communicator is GONE rather than
+        # merely unchanged: after an abort the membership is identical and the
+        # communicator is dead, so skipping would retry over nothing.
+        #
+        # It only overrides the skip when something IS absent. Forcing a rebuild with
+        # an empty absent set would produce a communicator that still contains the
+        # rank that just went silent, and the retry would hang on it exactly as the
+        # first attempt did. That case -- a frozen-but-alive rank, which never becomes
+        # absent -- must fall through to False so the caller reports "no generation
+        # shard could be identified as absent" and stops.
+        unchanged = membership.shard_prefixes == self._built_membership.shard_prefixes
+        if unchanged and not (force and absent_shards):
             return False
         print(
             f"  refit: rebuilding nccl_reshard communicators over shards "

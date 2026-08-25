@@ -239,6 +239,8 @@ class TestRebuildDispatch:
         sync, _, policy_calls = _rebuildable(dp_size=4)
 
         sync.reconcile_communicator([3])
+        # A different absent set, so this rebuilds without needing force. What is under
+        # test is that each rebuild that DOES happen takes a fresh port.
         sync.reconcile_communicator([2, 3])
 
         assert policy_calls[0]["port"] != policy_calls[1]["port"]
@@ -400,7 +402,10 @@ class TestControllerCallSite:
         _condemn(monitor, 1)
         calls = []
         synchronizer = SimpleNamespace(
-            reconcile_communicator=lambda absent: calls.append(list(absent)) or False
+            reconcile_communicator=lambda absent, force=False: calls.append(
+                list(absent)
+            )
+            or False
         )
         ctrl = self._controller(monitor, synchronizer)
 
@@ -432,3 +437,78 @@ class TestControllerCallSite:
 
         assert [w.idx for w in workers if w.calls] == [0, 1, 3]
         assert policy_calls[0]["world_size"] == 8 + 3
+
+
+class TestAnUnchangedMembershipIsNotRebuiltAgain:
+    """A dead shard used to cost two full rebuilds on every subsequent step, forever.
+
+    ``absent_shards()`` never empties again -- nothing in production calls
+    ``mark_restarting`` or ``mark_loaded`` -- and ``_sync_weights`` reconciles twice per
+    step. So a run that lost a shard at step 10 and trained to 10,000 paid ~20,000
+    rebuilds, each a fresh port, a fresh TCPStore and a fresh NCCL bootstrap across every
+    train and inference rank. The steady state this feature exists to produce was the
+    expensive one, and three comments claimed the opposite.
+    """
+
+    def test_the_second_call_with_the_same_absent_set_is_skipped(self, monkeypatch):
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, workers, _ = _rebuildable(dead_shards=(2,))
+
+        assert sync.reconcile_communicator([2]) is True
+        calls_after_first = sum(len(w.calls) for w in workers)
+
+        assert sync.reconcile_communicator([2]) is False, "membership did not change"
+        assert sum(len(w.calls) for w in workers) == calls_after_first, (
+            "the skip must be a real skip -- no worker may be touched again"
+        )
+
+    def test_a_changed_membership_still_rebuilds(self, monkeypatch):
+        """The skip must not swallow a second loss."""
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        # Only 2 is unreachable: the first rebuild still dispatches to 3, which is only
+        # lost by the time of the second.
+        sync, _, _ = _rebuildable(dead_shards=(2,))
+
+        assert sync.reconcile_communicator([2]) is True
+        assert sync.reconcile_communicator([2, 3]) is True, "a new loss must rebuild"
+
+    def test_order_does_not_defeat_the_comparison(self, monkeypatch):
+        """absent_shards() returns a sequence; the same set in another order is the same."""
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, _, _ = _rebuildable(dead_shards=(2, 3))
+
+        assert sync.reconcile_communicator([2, 3]) is True
+        assert sync.reconcile_communicator([3, 2]) is False
+
+    def test_force_rebuilds_over_an_unchanged_membership(self, monkeypatch):
+        """The recovery path's case, and the one that breaks if the skip has no override.
+
+        After an abort the communicator is gone while the absent set is identical. Skipping
+        there would make the retry run over a communicator that no longer exists, and the
+        recovery would fail with "no generation shard could be identified as absent".
+        """
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, workers, _ = _rebuildable(dead_shards=(2,))
+
+        assert sync.reconcile_communicator([2]) is True
+        calls_after_first = sum(len(w.calls) for w in workers)
+
+        assert sync.reconcile_communicator([2], force=True) is True
+        assert sum(len(w.calls) for w in workers) > calls_after_first, (
+            "force must actually rebuild, not just return True"
+        )
+
+    def test_force_with_nothing_absent_does_not_rebuild(self, monkeypatch):
+        """The frozen-rank case, and the one where forcing would recreate the hang.
+
+        A rank that is alive but not participating never becomes absent. Forcing a rebuild
+        there would produce a communicator that still contains it, and the retry would hang
+        exactly as the first attempt did. Falling through to False is what lets the caller
+        report "no generation shard could be identified as absent" and stop.
+        """
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, workers, _ = _rebuildable(dead_shards=(2,))
+
+        assert sync.reconcile_communicator([]) is False
+        assert sync.reconcile_communicator([], force=True) is False
+        assert not any(w.calls for w in workers), "no rebuild may have been dispatched"

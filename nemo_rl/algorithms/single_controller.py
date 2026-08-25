@@ -1480,7 +1480,7 @@ class SingleControllerActor:
                     RuntimeError(f"router: {count} failed request(s) to {url}"),
                 )
 
-    async def _reconcile_refit_membership(self) -> Optional[bool]:
+    async def _reconcile_refit_membership(self, force: bool = False) -> Optional[bool]:
         """Ask the weight transport to match the live fleet before the refit runs.
 
         A no-op without fleet health: with no monitor there is no notion of a shard being
@@ -1492,6 +1492,12 @@ class SingleControllerActor:
         abort the old communicator is gone, so "nothing to reconcile" means there is
         nothing to retry with either -- but "this transport has no membership" is a
         different refusal and deserves a different message.
+
+        ``force`` says the communicator is gone rather than merely unchanged. The
+        synchronizers skip a rebuild when the absent set matches what they last built with,
+        which is what stops a lost shard costing two full rebuilds on every subsequent step
+        -- but after an abort the membership is identical and the communicator is dead, so
+        the recovery path has to override that or it retries over nothing.
         """
         if self._gen_fleet is None:
             return False
@@ -1500,7 +1506,7 @@ class SingleControllerActor:
         # communicators via blocking Ray calls, and running it on the loop would freeze
         # the watchdog, which is an asyncio task on that same loop.
         rebuilt = await asyncio.to_thread(
-            self._weight_synchronizer.reconcile_communicator, absent
+            self._weight_synchronizer.reconcile_communicator, absent, force
         )
         # Log unconditionally, not just on a rebuild.
         #
@@ -1511,7 +1517,8 @@ class SingleControllerActor:
         # reconcile_communicator wrongly returned False. The absent set is the whole
         # difference and it was not being printed.
         print(
-            f"  _sync_weights: refit membership absent={sorted(absent)} rebuilt={rebuilt}",
+            f"  _sync_weights: refit membership absent={sorted(absent)} "
+            f"rebuilt={rebuilt}{' (forced)' if force else ''}",
             flush=True,
         )
         return rebuilt
@@ -1581,7 +1588,7 @@ class SingleControllerActor:
                 self._gen_fleet.mark_weights_partial(shard_idx)
 
         # 3. Rebuild without the dead.
-        rebuilt = await self._reconcile_refit_membership()
+        rebuilt = await self._reconcile_refit_membership(force=True)
         if rebuilt is None:
             # This transport owns no NCCL world -- IPC, HTTP, checkpoint-engine. There is
             # nothing to rebuild, and saying "no shard was absent" here would be a wrong
@@ -1907,7 +1914,9 @@ class SingleControllerActor:
         # idle here and every rank is synchronized, which is required because the
         # operations that change membership are themselves collectives. Doing it every
         # time is also idempotent, so a missed or reordered health update converges on
-        # the next step instead of needing replay.
+        # the next step instead of needing replay. Cheap rather than free: the
+        # synchronizer skips the rebuild when the absent set matches what it last built
+        # with, so the steady state after a loss is a set comparison, not a rebuild.
         await self._reconcile_refit_membership()
 
         t0 = time.monotonic()
@@ -1928,8 +1937,9 @@ class SingleControllerActor:
         #
         # The reconcile above runs before calibration and two to_thread hops; a death
         # recorded in that gap would otherwise be ignored until the NEXT step, by which
-        # time this broadcast is already hanging on the missing rank. Idempotent, so the
-        # common case is a no-op.
+        # time this broadcast is already hanging on the missing rank. Idempotent, and a
+        # set comparison in the common case -- it used to be a full rebuild on every call
+        # once a shard was gone, because absent_shards() never empties again.
         await self._reconcile_refit_membership()
 
         try:

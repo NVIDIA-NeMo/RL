@@ -146,7 +146,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             train_world_size=train_world_size,
         )
 
-    def reconcile_communicator(self, absent_shards: Sequence[int]) -> bool:
+    def reconcile_communicator(
+        self, absent_shards: Sequence[int], force: bool = False
+    ) -> bool:
         """Rebuild the refit communicator over the surviving generation shards.
 
         ``model_update_group`` spans every train and inference rank and was built once,
@@ -189,7 +191,18 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
                 total_gen_workers=len(self._generation.worker_group.workers),
                 train_world_size=membership.train_world_size,
             )
-        if membership.shard_prefixes == self._built_membership.shard_prefixes:
+        # `force` is how the recovery path says the communicator is GONE rather than
+        # merely unchanged: after an abort the membership is identical and the
+        # communicator is dead, so skipping would retry over nothing.
+        #
+        # It only overrides the skip when something IS absent. Forcing a rebuild with
+        # an empty absent set would produce a communicator that still contains the
+        # rank that just went silent, and the retry would hang on it exactly as the
+        # first attempt did. That case -- a frozen-but-alive rank, which never becomes
+        # absent -- must fall through to False so the caller reports "no generation
+        # shard could be identified as absent" and stops.
+        unchanged = membership.shard_prefixes == self._built_membership.shard_prefixes
+        if unchanged and not (force and absent_shards):
             return False
 
         # A fresh port every time: the rendezvous store for the previous world may still

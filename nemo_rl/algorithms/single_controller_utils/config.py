@@ -279,8 +279,13 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # nothing dispatches on this value, so accepting "round_robin" would silently give
     # the caller least_outstanding anyway.
     selection: Literal["least_outstanding"] = "least_outstanding"
-    # What to do once a shard is quarantined. Recovery modes arrive with the
-    # communicator rebuild.
+    # What to do once a shard is quarantined, for the case that cannot be recovered from.
+    #
+    # "Recovery modes arrive with the communicator rebuild" used to sit here as a forward
+    # reference. The rebuild has since landed, and recovery is not selected through this
+    # field at all: the reconcile rebuilds over the survivors whenever a shard becomes
+    # absent, whatever this says. A Literal of one for the same reason as selection above
+    # -- nothing dispatches on the value, so a second option would be a lie.
     on_dead_shard: Literal["fail_fast"] = "fail_fast"
     # Attempts to bring a shard back before retiring it permanently, counted across the
     # whole run rather than per incident.

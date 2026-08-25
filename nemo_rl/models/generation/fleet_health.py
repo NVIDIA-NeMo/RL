@@ -165,9 +165,15 @@ class GenerationFleetHealth:
             )
             for idx in range(shard_count)
         }
-        # Bumped whenever the serving set changes. The weight-sync path compares this
-        # against the epoch its communicator was built with, so reconciliation is an
-        # integer comparison in the common case.
+        # Bumped whenever the serving set changes. Published as a metric, and nothing
+        # else reads it.
+        #
+        # This used to claim the weight-sync path compared it against the epoch its
+        # communicator was built with. It never did -- the comparison described here did
+        # not exist anywhere, and reconcile_communicator rebuilt on every call once a shard
+        # was gone. That skip is now real, but it compares absent SETS on the synchronizer
+        # rather than an epoch from here, because the synchronizer is what knows which
+        # membership its current communicator was built with.
         self._membership_epoch: int = 0
         self._last_serving: frozenset[int] = frozenset(self._shards)
 
