@@ -365,13 +365,6 @@ class _BlockingDPClient(_FakeDPClient):
         super().save_checkpoint(checkpoint_dir, metadata=metadata)
 
 
-class _FakeGeneration:
-    """Continuous-serving stand-in; the pump asks it before every train step."""
-
-    def blocks_training(self) -> bool:
-        return False
-
-
 class _BlockingGeneration:
     """Colocated stand-in: blocks training, and its wake carries the update."""
 
@@ -414,6 +407,12 @@ class _FakeGeneration:
 
     def drain_latest_logger_metrics(self) -> dict[str, Any]:
         return {}
+
+    def blocks_training(self) -> bool:
+        return False
+
+    def wake_carries_weight_updates(self) -> bool:
+        return False
 
 
 class _EventRecordingSynchronizer(_FakeWeightSynchronizer):
