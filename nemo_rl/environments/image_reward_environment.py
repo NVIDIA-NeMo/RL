@@ -338,11 +338,12 @@ def genrm_ocr_score(text: str, ground_truth: str) -> float:
 class GenRmOcrOptions(BaseModel, extra="allow"):
     """Extra keys of a `genrm_ocr` plugins entry.
 
-    Defaults mirror verl-omni genrm_ocr.py (`DEFAULT_GRM_MODEL_PATH` and
-    `DEFAULT_SAMPLING_PARAMS`).
+    `model` is required: the judge served behind `GENRM_BASE_URL` differs per
+    deployment, so the exemplar YAML is the single place it is named. The
+    sampling defaults mirror verl-omni genrm_ocr.py `DEFAULT_SAMPLING_PARAMS`.
     """
 
-    model: str = "~/models/tiny-random/qwen3-vl"
+    model: str
     temperature: float = 0.7
     top_p: float = 0.8
     max_tokens: int = 4096
