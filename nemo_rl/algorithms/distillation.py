@@ -26,12 +26,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.grpo import (
-    _should_use_async_rollouts,
-    _should_use_nemo_gym,
-    aggregate_rollout_metrics,
-    refit_policy_generation,
-)
+from nemo_rl.algorithms.grpo import aggregate_rollout_metrics, refit_policy_generation
 from nemo_rl.algorithms.loss import (
     DistillationLossConfig,
     DistillationLossDataDict,
@@ -59,6 +54,7 @@ from nemo_rl.environments.nemo_gym import (
     NemoGymConfig,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    should_use_nemo_gym,
 )
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
@@ -67,6 +63,7 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
+    should_use_async_rollouts,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
@@ -337,7 +334,7 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
-    enable_nemo_gym = bool(env_configs) and _should_use_nemo_gym(master_config)
+    enable_nemo_gym = bool(env_configs) and should_use_nemo_gym(master_config)
     nemo_gym_actor: Optional[EnvironmentInterface] = None
     if enable_nemo_gym:
         nemo_gym_num_nodes = env_configs.get("nemo_gym", {}).get("num_gpu_nodes", 0)
@@ -707,7 +704,7 @@ def distillation_train(
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert student_generation is not None  # for mypy type check
-    use_nemo_gym = _should_use_nemo_gym(master_config)
+    use_nemo_gym = should_use_nemo_gym(master_config)
     if use_nemo_gym:
         print("▶ Using NeMo-Gym rollouts for distillation", flush=True)
 
@@ -827,7 +824,7 @@ def distillation_train(
                         del nemo_gym_rollout_result
 
                     # Use async rollouts if vLLM async engine is enabled
-                    elif _should_use_async_rollouts(master_config):
+                    elif should_use_async_rollouts(master_config.policy["generation"]):
                         (
                             repeated_batch,
                             rollout_metrics,
@@ -1196,7 +1193,7 @@ def validate(
         )
         return {}, {}
 
-    use_nemo_gym = _should_use_nemo_gym(master_config)
+    use_nemo_gym = should_use_nemo_gym(master_config)
 
     timer = Timer()
     with timer.time("total_validation_time"):
@@ -1239,7 +1236,7 @@ def validate(
                 for key, value in gen_metrics.items():
                     validation_rollout_metrics.setdefault(key, []).append(value)
             # Use async rollouts if vLLM async engine is enabled
-            elif _should_use_async_rollouts(master_config):
+            elif should_use_async_rollouts(master_config.policy["generation"]):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
                     val_batch,

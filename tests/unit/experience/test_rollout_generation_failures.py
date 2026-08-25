@@ -177,6 +177,7 @@ def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
     )
     manager._stats = RolloutStats()
     manager._skipped_prompts = 0
+    manager._consecutive_infra_drops = 0
     return manager
 
 

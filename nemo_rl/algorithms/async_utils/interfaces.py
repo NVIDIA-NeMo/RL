@@ -47,7 +47,8 @@ class ReplayBufferProtocol(Protocol):  # pragma: no cover
         loses its last chance to be used for its intended training step.
 
         Returns:
-            Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
+            Dictionary with ``trajectories`` and ``avg_trajectory_age``, or
+            None if insufficient data.
         """
         ...
 
