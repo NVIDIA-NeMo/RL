@@ -19,6 +19,11 @@ import statistics
 from collections.abc import Sequence
 
 
+def is_histogram_metric(name: str) -> bool:
+    """Return whether a metric key represents raw histogram observations."""
+    return name.startswith("histogram/") or name.endswith("/histogram")
+
+
 def calculate_single_metric(
     values: Sequence[float | int], batch_size: int, key_name: str
 ) -> dict:
@@ -30,19 +35,17 @@ def calculate_single_metric(
         key_name: Prefix for the returned metric keys (e.g. "total_reward").
 
     Returns:
-        Dict mapping "{key_name}/{stat}" to its value for stat in mean, max, min, median, stddev (nan for a single value), and histogram (a wandb.Histogram).
+        Dict mapping "{key_name}/{stat}" to its value for stat in mean, max, min,
+        median, stddev (nan for a single value), and histogram. Histogram values
+        remain backend-agnostic raw observations until the logger serializes them.
     """
-    # Deferred: wandb is optional, and importing it at module scope would
-    # pull it in for every importer of nemo_rl.algorithms.grpo.
-    from wandb import Histogram
-
     return {
         f"{key_name}/mean": sum(values) / batch_size,
         f"{key_name}/max": max(values),
         f"{key_name}/min": min(values),
         f"{key_name}/median": statistics.median(values),
         f"{key_name}/stddev": statistics.stdev(values) if len(values) > 1 else math.nan,
-        f"{key_name}/histogram": Histogram(values),
+        f"{key_name}/histogram": list(values),
     }
 
 
