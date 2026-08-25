@@ -16,6 +16,7 @@ import asyncio
 import copy
 import gc
 import logging
+import math
 import threading
 import time
 import uuid
@@ -60,6 +61,34 @@ LOGGER = logging.getLogger(__name__)
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
+
+
+def _replace_non_finite(obj: Any) -> Any:
+    """Replace NaN/Inf floats with 0.0 and warn once per response."""
+    replacement_count = 0
+
+    def replace(value: Any) -> Any:
+        nonlocal replacement_count
+
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                replacement_count += 1
+                return 0.0
+            return value
+        if isinstance(value, dict):
+            return {key: replace(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [replace(item) for item in value]
+        return value
+
+    sanitized = replace(obj)
+    if replacement_count:
+        LOGGER.warning(
+            "Replaced %d non-finite float values in the vLLM chat completion "
+            "response with 0.0; this may indicate numerical instability.",
+            replacement_count,
+        )
+    return sanitized
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -804,8 +833,8 @@ class VllmAsyncGenerationWorkerImpl(
 
             elif isinstance(generator, ChatCompletionResponse):
                 return JSONResponse(
-                    content=model_dump_chat_response_with_dynamic_message_fields(
-                        generator
+                    content=_replace_non_finite(
+                        model_dump_chat_response_with_dynamic_message_fields(generator)
                     )
                 )
 
