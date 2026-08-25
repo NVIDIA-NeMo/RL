@@ -1382,3 +1382,22 @@ def test_sequence_packing_microbatch_boundaries(pad_to_multiple_of):
     assert torch.all(
         reconstructed["sequence_lengths"] == batch_data["sequence_lengths"]
     )
+
+
+def test_multimodal_sharing_tolerates_dict_valued_type_key():
+    """Tool/JSON-schema payloads can have a parameter literally named "type"
+    whose value is a dict; the media-sharing walk must not crash on it."""
+    from nemo_rl.distributed.batched_data_dict import _prepare_multimodal_sharing
+
+    tool_schema_row = {
+        "role": "assistant",
+        "tool_schema": {
+            "parameters": {
+                # a parameter named "type": its schema definition is a dict
+                "type": {"type": "string", "enum": ["observation", "question"]},
+                "content": {"type": "string"},
+            }
+        },
+    }
+    shared = _prepare_multimodal_sharing(tool_schema_row)
+    assert isinstance(shared, dict)
