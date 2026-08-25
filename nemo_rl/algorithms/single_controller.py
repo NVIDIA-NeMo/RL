@@ -38,8 +38,8 @@ import asyncio
 import contextlib
 import logging
 import math
-import threading
 import os
+import threading
 import time
 from collections import deque
 from collections.abc import Iterator

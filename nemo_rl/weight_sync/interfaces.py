@@ -122,7 +122,9 @@ class WeightSynchronizer(ABC):
         """
         pass
 
-    def reconcile_communicator(self, absent_shards: Sequence[int]) -> Optional[bool]:
+    def reconcile_communicator(
+        self, absent_shards: Sequence[int], force: bool = False
+    ) -> Optional[bool]:
         """Bring the transport's communicator in line with the live generation fleet.
 
         Called immediately before every refit, rather than in response to a death event.
@@ -136,6 +138,11 @@ class WeightSynchronizer(ABC):
                 (see ``GenerationFleetHealth.absent_shards``). Note this is not the
                 complement of the serving set: a shard withheld from traffic may still be
                 alive and able to refit.
+            force: rebuild even when the membership is unchanged. Implementations
+                skip a rebuild whose absent set matches what they last built with,
+                which is what stops a lost shard costing a rebuild on every
+                subsequent step. The recovery path sets this because after an abort
+                the membership is identical and the communicator is *gone*.
 
         Returns:
             True if the communicator was rebuilt, False if nothing needed rebuilding,
