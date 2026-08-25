@@ -141,3 +141,65 @@ def test_chunked_kl_matches_unchunked_reference(monkeypatch):
     with torch.no_grad():
         eval_out = m._kl_div_per_position(logits_ref.detach(), targets)
     assert torch.allclose(eval_out, reference, atol=1e-6)
+
+
+def _run_ttt_forward_backward(model):
+    torch.manual_seed(0)
+    total = 16
+    input_ids = torch.randint(0, 100, (1, total))
+    loss_mask = torch.zeros(1, total, dtype=torch.bool)
+    loss_mask[:, 4:] = True
+    terms = model(
+        fused_hidden_states=torch.randn(1, total, 3 * 32),
+        input_ids=input_ids,
+        document_ids=torch.zeros(1, total, dtype=torch.long),
+        loss_mask=loss_mask,
+        teacher_logits=torch.randn(1, total, 40),
+        ttt_steps=2,
+    )
+    loss = sum(num / den for num, den in zip(terms.loss_nums, terms.loss_dens))
+    loss.backward()
+    return terms
+
+
+def test_chunked_lm_head_matches_unchunked_reference(monkeypatch):
+    """The TTT forward's per-chunk lm_head must reproduce the single-chunk
+    (effectively unchunked) result exactly: loss/accuracy terms and
+    gradients, independent of chunk size. Chunking lm_head avoids
+    materializing the full [1, T, draft_vocab] logits tensor per TTT step
+    (~2.4 GiB at 20k tokens / 64000 draft vocab), but must be a pure
+    regrouping of the same per-position computation.
+    """
+    from nemo_rl.models.automodel.draft import eagle3_qwen3 as m
+
+    model = _tiny_eagle3_model()
+    model.requires_grad_(True)
+    model.set_embedding_head_trainable(True)
+
+    monkeypatch.setattr(m, "_KL_CHUNK_TOKENS", 1024)  # total=16 tokens: one chunk
+    reference = _run_ttt_forward_backward(model)
+    reference_grads = {
+        name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None
+    }
+
+    model.zero_grad(set_to_none=True)
+    monkeypatch.setattr(m, "_KL_CHUNK_TOKENS", 3)  # force multi-chunk path
+    chunked = _run_ttt_forward_backward(model)
+    chunked_grads = {
+        name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None
+    }
+
+    for field in (
+        "loss_nums",
+        "loss_dens",
+        "full_acc_nums",
+        "full_acc_dens",
+        "cond_acc_nums",
+        "cond_acc_dens",
+    ):
+        for ref_val, chunked_val in zip(getattr(reference, field), getattr(chunked, field)):
+            assert torch.allclose(chunked_val, ref_val, atol=1e-5), field
+
+    assert reference_grads.keys() == chunked_grads.keys()
+    for name in reference_grads:
+        assert torch.allclose(chunked_grads[name], reference_grads[name], atol=1e-5), name

@@ -187,7 +187,7 @@ class Eagle3ForwardTerms:
     cond_acc_dens: list[torch.Tensor]
 
 
-_KL_CHUNK_TOKENS = 2048
+_KL_CHUNK_TOKENS = 512
 
 
 def _kl_div_per_position_chunk(
@@ -228,27 +228,6 @@ def _kl_div_per_position(logits: torch.Tensor, targets: torch.Tensor) -> torch.T
             piece = _kl_div_per_position_chunk(logit_chunk, target_chunk)
         pieces.append(piece)
     return torch.cat(pieces, dim=1)
-
-
-def _align_for_step(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    loss_mask: torch.Tensor,
-    prev_correct: torch.Tensor,
-    ttt_step: int,
-):
-    """Trim logits/targets/masks so step-k logits line up with their labels.
-
-    Step-k logits at position t predict the token at t + 1 + k, so the
-    targets (and loss mask) shift left by k while the last k logit positions
-    have no labels. Mirrors the speculators ``align_for_step``.
-    """
-    if ttt_step > 0:
-        logits = logits[:, :-ttt_step]
-        prev_correct = prev_correct[:, :-ttt_step]
-    targets = targets[:, ttt_step:]
-    loss_mask = loss_mask[:, ttt_step:]
-    return logits, targets, loss_mask, prev_correct
 
 
 class Qwen3Eagle3DraftModel(Qwen3PreTrainedModel):
@@ -425,7 +404,7 @@ class Qwen3Eagle3DraftModel(Qwen3PreTrainedModel):
             document_ids, total_seq_len, dtype, device
         )
 
-        hidden_states = self.fc(fused_hidden_states)
+        hidden_states = self.fc(fused_hidden_states.to(dtype))
 
         original_input_ids = input_ids.detach().clone()
         targets = teacher_logits.detach()
@@ -460,34 +439,70 @@ class Qwen3Eagle3DraftModel(Qwen3PreTrainedModel):
                     position_embeddings=position_embeddings,
                 )
 
-            logits = self.lm_head(self.norm(hidden_states))
-
-            s_logits, s_targets, s_mask, s_prev = _align_for_step(
-                logits, targets, loss_mask, prev_correct, ttt_step
+            # Step-k logits at position t predict the token at t + 1 + k, so
+            # targets/loss_mask shift left by k while the last k positions
+            # have no label (mirrors the speculators align_for_step).
+            #
+            # Chunked along the sequence: self.lm_head(self.norm(...)) is
+            # per-position (RMSNorm has no cross-position stats, the Linear
+            # is pointwise), so slicing hidden_states before norm+lm_head is
+            # identical to slicing the resulting logits afterward, but never
+            # materializes the full [1, T, draft_vocab] logits tensor -- at
+            # 20k-token sequences with a 64000 draft vocab that tensor alone
+            # is ~2.4 GiB per TTT step, which OOMs at this model's memory
+            # budget. The alignment slices above (trim the last ttt_step
+            # positions off logits, shift targets/loss_mask right by
+            # ttt_step, trim prev_correct the same way as logits) are
+            # applied to hidden_states/targets/loss_mask/prev_correct up
+            # front instead, so every per-chunk tensor below already has
+            # matching length.
+            effective_len = total_seq_len - ttt_step
+            hidden_for_logits = (
+                hidden_states[:, :effective_len] if ttt_step > 0 else hidden_states
             )
-            elementwise = _kl_div_per_position(s_logits, s_targets)
-            mask_f = s_mask.to(elementwise.dtype)
-            loss_num = (elementwise * mask_f).sum(dim=1)
-            loss_den = mask_f.sum(dim=1).detach() + _LOSS_REDUCTION_EPS
-            terms.loss_nums.append(loss_num.sum())
-            terms.loss_dens.append(loss_den.sum())
+            targets_for_step = targets[:, ttt_step:]
+            mask_for_step = loss_mask[:, ttt_step:]
+            prev_for_step = (
+                prev_correct[:, :effective_len] if ttt_step > 0 else prev_correct
+            )
 
-            with torch.no_grad():
-                pred_ids = torch.argmax(s_logits, dim=-1)
-                target_ids = torch.argmax(s_targets, dim=-1)
-                correct = pred_ids == target_ids
-                cond_total = s_prev.sum().float()
-                # s_prev is a view of prev_correct, so the in-place AND
-                # persists into the next step (speculators semantics).
-                correct = torch.logical_and(s_prev, correct, out=s_prev)
-                masked_correct = torch.masked_select(correct, s_mask)
-                correct_sum = masked_correct.float().sum()
-                terms.full_acc_nums.append(correct_sum)
-                terms.full_acc_dens.append(
-                    torch.tensor(float(masked_correct.numel()), device=device)
-                )
-                terms.cond_acc_nums.append(correct_sum.clone())
-                terms.cond_acc_dens.append(cond_total)
+            loss_num = hidden_for_logits.new_zeros(())
+            loss_den = hidden_for_logits.new_zeros(())
+            correct_sum = hidden_for_logits.new_zeros(())
+            correct_count = hidden_for_logits.new_zeros(())
+            cond_total = hidden_for_logits.new_zeros(())
+            for start in range(0, effective_len, _KL_CHUNK_TOKENS):
+                end = start + _KL_CHUNK_TOKENS
+                h_chunk = hidden_for_logits[:, start:end]
+                t_chunk = targets_for_step[:, start:end]
+                m_chunk = mask_for_step[:, start:end]
+                # A view into prev_correct's storage: the in-place AND below
+                # must persist into the next step (speculators semantics),
+                # same as the pre-chunking s_prev view did.
+                p_chunk = prev_for_step[:, start:end]
+
+                logits_chunk = self.lm_head(self.norm(h_chunk))
+                elementwise = _kl_div_per_position_chunk(logits_chunk, t_chunk)
+                mask_f = m_chunk.to(elementwise.dtype)
+                loss_num = loss_num + (elementwise * mask_f).sum()
+                loss_den = loss_den + mask_f.sum().detach()
+
+                with torch.no_grad():
+                    pred_ids = torch.argmax(logits_chunk, dim=-1)
+                    target_ids = torch.argmax(t_chunk, dim=-1)
+                    correct = pred_ids == target_ids
+                    cond_total = cond_total + p_chunk.sum().float()
+                    correct = torch.logical_and(p_chunk, correct, out=p_chunk)
+                    masked_correct = torch.masked_select(correct, m_chunk)
+                    correct_sum = correct_sum + masked_correct.float().sum()
+                    correct_count = correct_count + masked_correct.numel()
+
+            terms.loss_nums.append(loss_num)
+            terms.loss_dens.append(loss_den + _LOSS_REDUCTION_EPS)
+            terms.full_acc_nums.append(correct_sum)
+            terms.full_acc_dens.append(correct_count)
+            terms.cond_acc_nums.append(correct_sum.clone())
+            terms.cond_acc_dens.append(cond_total)
 
             # Teacher forcing: next step consumes ground-truth ids shifted
             # left by 1 + ttt_step (right-padded with 0); the tail positions
