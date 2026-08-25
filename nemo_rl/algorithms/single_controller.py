@@ -1390,8 +1390,12 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
             )
+            # step_finished=True here since this is the final log of our current step.
             self._logger.log_metrics(
-                timing_metrics, step=self._train_steps, prefix="timing/train"
+                timing_metrics,
+                step=self._train_steps,
+                prefix="timing/train",
+                step_finished=True,
             )
             self._timer.reset()
 
