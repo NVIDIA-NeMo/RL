@@ -116,6 +116,7 @@ async_rl:
     port_range_high: 1200
     backend_timeout_s: 600.0          # covers a whole generation; Gym sets none at all
     connect_timeout_s: 5.0            # a local handshake is ms-or-never
+    max_inflight_requests_per_backend: null  # generation only; match max_num_seqs for n=1
     no_healthy_backend_status: 409    # must stay outside Gym's retry set
 
 checkpointing:

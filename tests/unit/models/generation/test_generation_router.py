@@ -25,6 +25,7 @@ misbehave over an actual socket.
 """
 
 import asyncio
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -95,6 +96,9 @@ class _Harness:
             port=self.port,
             backend_timeout_s=router_kwargs.pop("backend_timeout_s", 5.0),
             connect_timeout_s=router_kwargs.pop("connect_timeout_s", 2.0),
+            max_inflight_requests_per_backend=router_kwargs.pop(
+                "max_inflight_requests_per_backend", None
+            ),
             no_healthy_backend_status=router_kwargs.pop(
                 "no_healthy_backend_status", 409
             ),
@@ -127,11 +131,72 @@ class _Harness:
                 return response.status, await response.read(), dict(response.headers)
 
 
+class _GatedBackend(_Backend):
+    """Backend whose individual responses are released explicitly by a test."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.gates: list[asyncio.Future[None]] = []
+        self._request_started = asyncio.Event()
+
+    async def start(self) -> None:
+        app = web.Application()
+
+        async def _handle(request: web.Request) -> web.Response:
+            body = await request.read()
+            self.requests.append((request.method, request.path, body))
+            gate = asyncio.get_running_loop().create_future()
+            self.gates.append(gate)
+            self._request_started.set()
+            await gate
+            return web.Response(
+                status=200,
+                body=body,
+                headers={"X-Served-By": self.name},
+            )
+
+        app.router.add_route("*", "/{tail:.*}", _handle)
+        self._runner = web.AppRunner(app, access_log=None)
+        await self._runner.setup()
+        await web.TCPSite(self._runner, "127.0.0.1", self.port).start()
+
+    async def wait_for_started(self, count: int) -> None:
+        async def _wait() -> None:
+            while len(self.requests) < count:
+                self._request_started.clear()
+                if len(self.requests) < count:
+                    await self._request_started.wait()
+
+        await asyncio.wait_for(_wait(), timeout=2.0)
+
+    def release(self, index: int) -> None:
+        if not self.gates[index].done():
+            self.gates[index].set_result(None)
+
+    def release_all(self) -> None:
+        for gate in self.gates:
+            if not gate.done():
+                gate.set_result(None)
+
+
+async def _wait_until(predicate: Callable[[], bool]) -> None:
+    async def _wait() -> None:
+        while not predicate():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(_wait(), timeout=2.0)
+
+
 class TestRouterStartup:
     def test_default_range_uses_the_dedicated_head_node_carveout(self) -> None:
         config = GenerationRouterConfig()
 
         assert (config.port_range_low, config.port_range_high) == (1100, 1200)
+        assert config.max_inflight_requests_per_backend is None
+
+    def test_admission_cap_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="greater than 0"):
+            GenerationRouterConfig(max_inflight_requests_per_backend=0)
 
     def test_disabled_returns_an_unmodified_copy_of_raw_urls(self) -> None:
         raw_urls = ["http://a:1/v1", None, "http://b:2/v1"]
@@ -173,7 +238,9 @@ class TestRouterStartup:
             lambda value: "http://10.0.0.1:1107/v1" if value is base_url_ref else value,
         )
 
-        config = GenerationRouterConfig(enabled=True)
+        config = GenerationRouterConfig(
+            enabled=True, max_inflight_requests_per_backend=7
+        )
         config_before = config.model_dump()
         routed_urls, handle = maybe_start_generation_router(
             backend_urls=raw_urls,
@@ -193,6 +260,7 @@ class TestRouterStartup:
             port=1107,
             backend_timeout_s=600.0,
             connect_timeout_s=5.0,
+            max_inflight_requests_per_backend=7,
             no_healthy_backend_status=409,
             health_managed=False,
         )
@@ -304,6 +372,307 @@ class TestBackendSelection:
         assert harness.router._pick_backend() is not None
 
 
+class TestBoundedAdmission:
+    def test_the_cap_holds_excess_requests_centrally_in_fifo_order(self) -> None:
+        backend = _GatedBackend("only")
+
+        async def _main() -> None:
+            async with _Harness(
+                [backend], max_inflight_requests_per_backend=2
+            ) as harness:
+                tasks = [
+                    asyncio.create_task(
+                        harness.call("/v1/chat/completions", body=str(i).encode())
+                    )
+                    for i in range(2)
+                ]
+                await backend.wait_for_started(2)
+
+                for i in range(2, 5):
+                    tasks.append(
+                        asyncio.create_task(
+                            harness.call("/v1/chat/completions", body=str(i).encode())
+                        )
+                    )
+                    expected_queued = i - 1
+                    await _wait_until(
+                        lambda: harness.router._admission_queued == expected_queued
+                    )
+
+                assert len(backend.requests) == 2
+                assert max(harness.router._inflight.values()) == 2
+
+                backend.release(0)
+                await backend.wait_for_started(3)
+                assert backend.requests[2][2] == b"2"
+                backend.release(1)
+                await backend.wait_for_started(4)
+                assert backend.requests[3][2] == b"3"
+                backend.release(2)
+                await backend.wait_for_started(5)
+                assert backend.requests[4][2] == b"4"
+
+                backend.release_all()
+                await asyncio.gather(*tasks)
+                metrics = harness.router.metrics()
+                assert metrics["router/admission_queued_requests"] == 0.0
+                assert metrics["router/admission_queued_requests_peak"] == 3.0
+                assert (
+                    metrics["router/max_generation_inflight_per_backend_observed"]
+                    == 2.0
+                )
+                assert harness.router._inflight[backend.url] == 0
+
+        asyncio.run(_main())
+
+    def test_a_freed_backend_refills_while_another_backend_remains_busy(
+        self,
+    ) -> None:
+        first, second = _GatedBackend("first"), _GatedBackend("second")
+
+        async def _main() -> None:
+            async with _Harness(
+                [first, second], max_inflight_requests_per_backend=1
+            ) as harness:
+                tasks = [
+                    asyncio.create_task(
+                        harness.call("/v1/chat/completions", body=b"first")
+                    ),
+                    asyncio.create_task(
+                        harness.call("/v1/chat/completions", body=b"second")
+                    ),
+                ]
+                await asyncio.gather(
+                    first.wait_for_started(1), second.wait_for_started(1)
+                )
+                third = asyncio.create_task(
+                    harness.call("/v1/chat/completions", body=b"third")
+                )
+                tasks.append(third)
+                await _wait_until(lambda: harness.router._admission_queued == 1)
+
+                first.release(0)
+                await first.wait_for_started(2)
+                assert first.requests[1][2] == b"third"
+                assert len(second.requests) == 1, "second remains occupied"
+
+                first.release_all()
+                second.release_all()
+                await asyncio.gather(*tasks)
+
+        asyncio.run(_main())
+
+    def test_membership_readd_from_another_thread_wakes_a_waiter(self) -> None:
+        first, second = _GatedBackend("first"), _GatedBackend("second")
+
+        async def _main() -> None:
+            harness = _Harness([first, second], max_inflight_requests_per_backend=1)
+            harness.router.set_serving_backends([first.url])
+            async with harness:
+                active = asyncio.create_task(
+                    harness.call("/v1/chat/completions", body=b"active")
+                )
+                await first.wait_for_started(1)
+                queued = asyncio.create_task(
+                    harness.call("/v1/chat/completions", body=b"queued")
+                )
+                await _wait_until(lambda: harness.router._admission_queued == 1)
+
+                await asyncio.to_thread(
+                    harness.router.set_serving_backends, [first.url, second.url]
+                )
+                await second.wait_for_started(1)
+                assert second.requests[0][2] == b"queued"
+
+                first.release_all()
+                second.release_all()
+                await asyncio.gather(active, queued)
+
+        asyncio.run(_main())
+
+    def test_empty_membership_releases_queued_requests_with_409(self) -> None:
+        backend = _GatedBackend("only")
+
+        async def _main() -> None:
+            async with _Harness(
+                [backend], max_inflight_requests_per_backend=1
+            ) as harness:
+                active = asyncio.create_task(
+                    harness.call("/v1/chat/completions", body=b"active")
+                )
+                await backend.wait_for_started(1)
+                queued = asyncio.create_task(
+                    harness.call("/v1/chat/completions", body=b"queued")
+                )
+                await _wait_until(lambda: harness.router._admission_queued == 1)
+
+                await asyncio.to_thread(harness.router.set_serving_backends, [])
+                status, body, _ = await asyncio.wait_for(queued, timeout=1.0)
+                assert status == 409
+                assert b"no healthy generation backend" in body
+                assert len(backend.requests) == 1
+
+                backend.release_all()
+                await active
+
+        asyncio.run(_main())
+
+    @pytest.mark.parametrize("path", ["/tokenize", "/v1/models"])
+    def test_short_control_calls_bypass_the_generation_queue(self, path: str) -> None:
+        backend = _GatedBackend("only")
+
+        async def _main() -> None:
+            async with _Harness(
+                [backend], max_inflight_requests_per_backend=1
+            ) as harness:
+                generation = asyncio.create_task(
+                    harness.call("/v1/chat/completions", body=b"generation")
+                )
+                await backend.wait_for_started(1)
+                control = asyncio.create_task(harness.call(path, body=b"control"))
+                await backend.wait_for_started(2)
+
+                assert backend.requests[1][1] == path
+                assert backend.requests[1][2] == b"control"
+                assert harness.router._admission_queued == 0
+
+                backend.release_all()
+                await asyncio.gather(generation, control)
+
+        asyncio.run(_main())
+
+    @pytest.mark.parametrize("path", ["/tokenize", "/v1/models"])
+    def test_control_work_does_not_consume_a_generation_slot(self, path: str) -> None:
+        backend = _GatedBackend("only")
+
+        async def _main() -> None:
+            async with _Harness(
+                [backend], max_inflight_requests_per_backend=1
+            ) as harness:
+                control = asyncio.create_task(harness.call(path, body=b"control"))
+                await backend.wait_for_started(1)
+                generation = asyncio.create_task(
+                    harness.call("/v1/chat/completions", body=b"generation")
+                )
+                await backend.wait_for_started(2)
+
+                assert backend.requests[1][1] == "/v1/chat/completions"
+                assert backend.requests[1][2] == b"generation"
+                assert harness.router._admission_queued == 0
+                assert harness.router._inflight[backend.url] == 2
+                assert harness.router._generation_inflight[backend.url] == 1
+
+                backend.release_all()
+                await asyncio.gather(control, generation)
+
+        asyncio.run(_main())
+
+    def test_cancellation_never_leaks_a_reserved_slot(self) -> None:
+        backend = _Backend("only")
+        router = _Harness([backend], max_inflight_requests_per_backend=1).router
+
+        async def _main() -> None:
+            first = await router._acquire_backend()
+            assert first == backend.url
+
+            cancelled_while_queued = asyncio.create_task(router._acquire_backend())
+            await _wait_until(lambda: router._admission_queued == 1)
+            cancelled_while_queued.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled_while_queued
+            assert router._admission_queued == 0
+
+            # Dispatch reserves the released slot synchronously, but the waiter task
+            # has not resumed yet. Cancellation in this window must reclaim that slot.
+            assigned_before_resume = asyncio.create_task(router._acquire_backend())
+            await _wait_until(lambda: router._admission_queued == 1)
+            router._release_backend(first, is_generation=True)
+            assigned_before_resume.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await assigned_before_resume
+            assert router._inflight[backend.url] == 0
+
+            final = await asyncio.wait_for(router._acquire_backend(), timeout=1.0)
+            assert final == backend.url
+            router._release_backend(final, is_generation=True)
+            assert router._inflight[backend.url] == 0
+
+        asyncio.run(_main())
+
+    def test_queue_wait_does_not_consume_the_backend_timeout(self) -> None:
+        backend = _GatedBackend("only")
+
+        async def _main() -> None:
+            async with _Harness(
+                [backend],
+                max_inflight_requests_per_backend=1,
+                backend_timeout_s=0.2,
+            ) as harness:
+                reserved = await harness.router._acquire_backend()
+                assert reserved == backend.url
+                request = asyncio.create_task(
+                    harness.call("/v1/chat/completions", body=b"request")
+                )
+                await _wait_until(lambda: harness.router._admission_queued == 1)
+
+                # The request spends longer than backend_timeout_s in admission. That
+                # wait must not burn its router->backend deadline before forwarding.
+                await asyncio.sleep(0.25)
+                assert not request.done()
+                harness.router._release_backend(reserved, is_generation=True)
+                await backend.wait_for_started(1)
+                backend.release(0)
+
+                status, _, _ = await request
+                assert status == 200
+
+        asyncio.run(_main())
+
+    def test_backend_failure_handoff_respects_the_remaining_backend_cap(self) -> None:
+        failing = _HangingBackend("failing", delay_s=1.0)
+        healthy = _GatedBackend("healthy")
+
+        async def _main() -> None:
+            harness = _Harness(
+                [failing, healthy],
+                max_inflight_requests_per_backend=1,
+                backend_timeout_s=0.5,
+            )
+            harness.router.set_serving_backends([failing.url])
+            async with harness:
+                failing_call = asyncio.create_task(
+                    harness.call("/v1/chat/completions", body=b"A")
+                )
+                await _wait_until(lambda: len(failing.requests) == 1)
+                # Give A a head start so its timeout cannot race B's while we inspect
+                # the handoff. Both still use the same production timeout setting.
+                await asyncio.sleep(0.2)
+
+                harness.router.set_serving_backends([failing.url, healthy.url])
+                healthy_call = asyncio.create_task(
+                    harness.call("/v1/chat/completions", body=b"B")
+                )
+                await healthy.wait_for_started(1)
+                queued_call = asyncio.create_task(
+                    harness.call("/v1/chat/completions", body=b"C")
+                )
+                await _wait_until(lambda: harness.router._admission_queued == 1)
+
+                failing_status, _, _ = await failing_call
+                assert failing_status == 500
+                assert failing.url not in harness.router._serving
+                assert len(healthy.requests) == 1
+                assert harness.router._admission_queued == 1
+
+                healthy.release(0)
+                await healthy.wait_for_started(2)
+                assert healthy.requests[1][2] == b"C"
+                healthy.release(1)
+                await asyncio.gather(healthy_call, queued_call)
+
+        asyncio.run(_main())
+
+
 class TestNoHealthyBackend:
     def test_the_status_stays_outside_gyms_retry_set(self):
         """This is the whole ballgame.
@@ -348,6 +717,7 @@ class TestUrlStability:
             port=6000,
             backend_timeout_s=1.0,
             connect_timeout_s=1.0,
+            max_inflight_requests_per_backend=None,
             no_healthy_backend_status=409,
         )
         assert router.base_url() == "http://10.0.0.5:6000/v1"
@@ -365,6 +735,7 @@ class TestUrlStability:
             port=6000,
             backend_timeout_s=1.0,
             connect_timeout_s=1.0,
+            max_inflight_requests_per_backend=None,
             no_healthy_backend_status=409,
         )
         assert (
@@ -391,6 +762,7 @@ class TestUrlStability:
                 port=1,
                 backend_timeout_s=1.0,
                 connect_timeout_s=1.0,
+                max_inflight_requests_per_backend=None,
                 no_healthy_backend_status=409,
             )
 
@@ -558,6 +930,7 @@ class TestPortBinding:
                 port=port,
                 backend_timeout_s=1.0,
                 connect_timeout_s=1.0,
+                max_inflight_requests_per_backend=None,
                 no_healthy_backend_status=409,
             )
             with pytest.raises(OSError):
@@ -575,6 +948,7 @@ class TestUnknownUrlDiagnostic:
             port=6000,
             backend_timeout_s=1.0,
             connect_timeout_s=1.0,
+            max_inflight_requests_per_backend=None,
             no_healthy_backend_status=409,
         )
         router.set_serving_backends(["http://a:1/v1", "http://typo:9/v1"])

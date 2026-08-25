@@ -216,6 +216,7 @@ def test_optimized_recipe_enables_router_with_tail_safe_timeout() -> None:
     assert config.async_rl.generation_router.port_range_low == 1100
     assert config.async_rl.generation_router.port_range_high == 1200
     assert config.async_rl.generation_router.backend_timeout_s == 1200.0
+    assert config.async_rl.generation_router.max_inflight_requests_per_backend == 64
     assert config.grpo.deduplicate_multimodal_data is True
     assert config.grpo.debug_payload_metrics is False
     assert config.policy["generation"]["vllm_kwargs"]["max_num_seqs"] == 64

@@ -10,6 +10,9 @@ async_rl:
     # Above the observed 8-9 minute generation tail so a router timeout cannot
     # masquerade as a throughput improvement in the diagnostic A/B.
     backend_timeout_s: 1200.0
+    # NeMo-Gym sends one sequence per request. Match vLLM max_num_seqs so excess
+    # requests remain centrally dispatchable instead of sticking in backend queues.
+    max_inflight_requests_per_backend: 64
 policy:
   sequence_packing:
     logprob_mb_tokens: 32768

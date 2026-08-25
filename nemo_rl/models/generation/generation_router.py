@@ -48,6 +48,9 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections import deque
+from dataclasses import dataclass
+from time import monotonic
 from typing import Any, Optional
 
 import ray
@@ -70,6 +73,10 @@ _SKIPPED_RESPONSE_HEADERS = frozenset(
 # Body chunk size for the streaming pass-through. Large enough that a long completion
 # does not cost thousands of iterations, small enough not to buffer a whole response.
 _STREAM_CHUNK_BYTES = 64 * 1024
+# Only these endpoints consume vLLM sequence-scheduler slots. Tokenization and model
+# discovery stay outside bounded admission so a short control call cannot sit behind
+# thousands of long generations in the central FIFO.
+_GENERATION_ENDPOINTS = frozenset({"/v1/chat/completions", "/v1/responses"})
 # HTTP statuses NeMo-Gym retries internally (nemo_gym/openai_utils.py). For the
 # rate-limit subset it raises its own retry ceiling on each attempt, so answering with
 # one of these is an unbounded loop rather than a bounded one.
@@ -90,6 +97,12 @@ class GenerationRouterConfig(BaseModel, extra="allow"):
     backend_timeout_s: PositiveFloat = 600.0
     # TCP handshake deadline, separate from the whole-generation deadline.
     connect_timeout_s: PositiveFloat = 5.0
+    # Maximum forwarded generation requests per backend. ``/tokenize`` and
+    # ``/v1/models`` bypass this queue. ``None`` preserves unbounded behavior for
+    # workloads whose request-to-sequence ratio is not known. For the common n=1
+    # generation request, match this to vLLM's max_num_seqs so excess work stays
+    # centrally dispatchable instead of becoming pinned in one backend's queue.
+    max_inflight_requests_per_backend: Optional[PositiveInt] = None
     # Status returned when no shard is eligible.
     no_healthy_backend_status: PositiveInt = 409
 
@@ -128,6 +141,15 @@ class GenerationRouterConfig(BaseModel, extra="allow"):
         return self
 
 
+@dataclass
+class _AdmissionWaiter:
+    """One request waiting for a backend slot on the router's event loop."""
+
+    future: asyncio.Future[Optional[str]]
+    enqueued_at_s: float
+    queued: bool = True
+
+
 class GenerationRouterImpl:
     """Routing logic and HTTP server, split out so it is testable without Ray."""
 
@@ -139,6 +161,7 @@ class GenerationRouterImpl:
         port: int,
         backend_timeout_s: float,
         connect_timeout_s: float,
+        max_inflight_requests_per_backend: Optional[int],
         no_healthy_backend_status: int,
         health_managed: bool = False,
     ) -> None:
@@ -148,12 +171,22 @@ class GenerationRouterImpl:
         # Starts as every backend: a restarted router has no health history, and routing
         # to a shard that turns out to be dead is self-correcting on the next push.
         self._serving: list[str] = list(backend_urls)
+        # Total in-flight work remains the least-outstanding routing signal. Generation
+        # in-flight is separate because tokenize/model-discovery calls bypass bounded
+        # admission and must not consume vLLM sequence-scheduler slots.
         self._inflight: dict[str, int] = {url: 0 for url in backend_urls}
+        self._generation_inflight: dict[str, int] = {url: 0 for url in backend_urls}
         self._backend_failures: dict[str, int] = {url: 0 for url in backend_urls}
         self._host = host
         self._port = port
         self._backend_timeout_s = backend_timeout_s
         self._connect_timeout_s = connect_timeout_s
+        if (
+            max_inflight_requests_per_backend is not None
+            and max_inflight_requests_per_backend < 1
+        ):
+            raise ValueError("max_inflight_requests_per_backend must be >= 1")
+        self._max_inflight_requests_per_backend = max_inflight_requests_per_backend
         self._no_healthy_backend_status = no_healthy_backend_status
         # Whether a GenerationFleetHealth is driving set_serving_backends. It gates the
         # reflex drop in _handle: dropping a backend locally is only safe because a later
@@ -163,6 +196,16 @@ class GenerationRouterImpl:
         self._requests_total = 0
         self._no_backend_total = 0
         self._backend_error_total = 0
+        # Admission is owned by the aiohttp loop. Membership pushes arrive on the Ray
+        # actor thread and only schedule _dispatch_waiters onto this loop; they never
+        # touch Futures from the wrong thread.
+        self._admission_waiters: deque[_AdmissionWaiter] = deque()
+        self._admission_queued = 0
+        self._admission_queued_peak = 0
+        self._admission_wait_s_total = 0.0
+        self._admission_wait_s_max = 0.0
+        self._max_generation_inflight_per_backend_observed = 0
+        self._server_loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._socket: Any = None
 
@@ -194,6 +237,19 @@ class GenerationRouterImpl:
         # Rebound rather than mutated: the server thread reads this reference without a
         # lock, and swapping it wholesale means a reader always sees a consistent list.
         self._serving = eligible
+        self._schedule_waiter_dispatch()
+
+    def _schedule_waiter_dispatch(self) -> None:
+        """Wake admission waiters after a membership update from the actor thread."""
+        loop = self._server_loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(self._dispatch_waiters)
+        except RuntimeError:
+            # The loop can close between is_closed() and call_soon_threadsafe() during
+            # actor teardown. Pending handlers are cancelled as part of app cleanup.
+            return
 
     def drain_backend_failures(self) -> dict[str, int]:
         """Hand over the per-backend failure counts and reset them.
@@ -209,19 +265,147 @@ class GenerationRouterImpl:
         return counts
 
     def metrics(self) -> dict[str, float]:
+        # Every bounded request enters the FIFO before synchronous dispatch, so the
+        # queued peak is an enqueue high-water mark (and reaches at least one even when
+        # every request is admitted in the same event-loop turn).
         return {
             "router/requests_total": float(self._requests_total),
             "router/no_healthy_backend_total": float(self._no_backend_total),
             "router/backend_error_total": float(self._backend_error_total),
             "router/serving_backends": float(len(self._serving)),
+            "router/admission_queued_requests": float(self._admission_queued),
+            "router/admission_queued_requests_peak": float(self._admission_queued_peak),
+            "router/admission_wait_s_total": self._admission_wait_s_total,
+            "router/admission_wait_s_max": self._admission_wait_s_max,
+            "router/inflight_requests": float(sum(self._inflight.values())),
+            "router/generation_inflight_requests": float(
+                sum(self._generation_inflight.values())
+            ),
+            "router/max_generation_inflight_per_backend_observed": float(
+                self._max_generation_inflight_per_backend_observed
+            ),
         }
 
-    def _pick_backend(self) -> Optional[str]:
-        """Least-outstanding among eligible backends, or None if there are none."""
+    def _pick_backend(self, *, enforce_admission_limit: bool = True) -> Optional[str]:
+        """Least-outstanding eligible backend with admission capacity, if any."""
         serving = self._serving
         if not serving:
             return None
-        return min(serving, key=lambda url: (self._inflight.get(url, 0), url))
+        limit = (
+            self._max_inflight_requests_per_backend if enforce_admission_limit else None
+        )
+        candidates = (
+            serving
+            if limit is None
+            else [
+                url for url in serving if self._generation_inflight.get(url, 0) < limit
+            ]
+        )
+        if not candidates:
+            return None
+        return min(candidates, key=lambda url: (self._inflight.get(url, 0), url))
+
+    def _reserve_backend(self, backend: str, *, is_generation: bool) -> None:
+        inflight = self._inflight.get(backend, 0) + 1
+        self._inflight[backend] = inflight
+        if is_generation:
+            generation_inflight = self._generation_inflight.get(backend, 0) + 1
+            self._generation_inflight[backend] = generation_inflight
+            self._max_generation_inflight_per_backend_observed = max(
+                self._max_generation_inflight_per_backend_observed,
+                generation_inflight,
+            )
+
+    def _release_backend(self, backend: str, *, is_generation: bool) -> None:
+        self._inflight[backend] = max(0, self._inflight.get(backend, 0) - 1)
+        if is_generation:
+            self._generation_inflight[backend] = max(
+                0, self._generation_inflight.get(backend, 0) - 1
+            )
+        self._dispatch_waiters()
+
+    def _finish_queued_waiter(self, waiter: _AdmissionWaiter) -> None:
+        """Mark a dequeued or cancelled waiter and update its queue metrics once."""
+        if not waiter.queued:
+            return
+        waiter.queued = False
+        self._admission_queued = max(0, self._admission_queued - 1)
+
+    def _dispatch_waiters(self) -> None:
+        """Admit FIFO waiters while the current serving set has free capacity."""
+        while self._admission_waiters:
+            waiter = self._admission_waiters[0]
+            if not waiter.queued or waiter.future.cancelled():
+                self._admission_waiters.popleft()
+                self._finish_queued_waiter(waiter)
+                continue
+
+            if not self._serving:
+                # Preserve the existing fail-fast semantics: once fleet health says
+                # nothing is eligible, queued calls return the configured non-retried
+                # status instead of waiting forever for a hypothetical future push.
+                self._admission_waiters.popleft()
+                self._finish_queued_waiter(waiter)
+                waiter.future.set_result(None)
+                continue
+
+            backend = self._pick_backend()
+            if backend is None:
+                # At least one backend is serving, but every one is at its cap. A
+                # release or membership push will schedule the next dispatch.
+                return
+
+            self._admission_waiters.popleft()
+            self._finish_queued_waiter(waiter)
+            waited_s = monotonic() - waiter.enqueued_at_s
+            self._admission_wait_s_total += waited_s
+            self._admission_wait_s_max = max(self._admission_wait_s_max, waited_s)
+            # Reserve before waking the handler. Another request can run as soon as
+            # set_result yields control, and must already observe this slot as occupied.
+            self._reserve_backend(backend, is_generation=True)
+            waiter.future.set_result(backend)
+
+    async def _acquire_backend(
+        self, *, enforce_admission_limit: bool = True
+    ) -> Optional[str]:
+        """Return a reserved backend, waiting centrally when all are at capacity."""
+        if (
+            self._max_inflight_requests_per_backend is None
+            or not enforce_admission_limit
+        ):
+            backend = self._pick_backend(
+                enforce_admission_limit=enforce_admission_limit
+            )
+            if backend is not None:
+                self._reserve_backend(backend, is_generation=enforce_admission_limit)
+            return backend
+
+        loop = asyncio.get_running_loop()
+        waiter = _AdmissionWaiter(
+            future=loop.create_future(), enqueued_at_s=monotonic()
+        )
+        self._admission_waiters.append(waiter)
+        self._admission_queued += 1
+        self._admission_queued_peak = max(
+            self._admission_queued_peak, self._admission_queued
+        )
+        self._dispatch_waiters()
+        try:
+            return await waiter.future
+        except asyncio.CancelledError:
+            if waiter.queued:
+                # Awaiting a Future propagates task cancellation into that Future. Leave
+                # the tombstone for the dispatcher to discard without a deque scan.
+                waiter.future.cancel()
+                self._finish_queued_waiter(waiter)
+            elif waiter.future.done() and not waiter.future.cancelled():
+                # Cancellation can land after dispatch reserved a slot but before this
+                # task resumes from await. Reclaim it here: _handle never receives the
+                # backend and therefore cannot reach its normal finally block.
+                backend = waiter.future.result()
+                if backend is not None:
+                    self._release_backend(backend, is_generation=True)
+            raise
 
     @staticmethod
     def _target_url(backend: str, path_qs: str) -> str:
@@ -238,7 +422,8 @@ class GenerationRouterImpl:
         from aiohttp import ClientError, web
 
         self._requests_total += 1
-        backend = self._pick_backend()
+        is_generation = request.path in _GENERATION_ENDPOINTS
+        backend = await self._acquire_backend(enforce_admission_limit=is_generation)
         if backend is None:
             self._no_backend_total += 1
             # The status matters: NeMo-Gym retries 429/500/502/503/504/520, and for the
@@ -252,13 +437,12 @@ class GenerationRouterImpl:
                 status=self._no_healthy_backend_status,
             )
 
-        self._inflight[backend] = self._inflight.get(backend, 0) + 1
         try:
             return await self._forward(request, backend)
         except (TimeoutError, ClientError) as error:
             return self._on_backend_error(backend, error)
         finally:
-            self._inflight[backend] = max(0, self._inflight.get(backend, 0) - 1)
+            self._release_backend(backend, is_generation=is_generation)
 
     def _on_backend_error(self, backend: str, error: BaseException) -> Any:
         """Answer for a backend that failed, deliberately rather than by accident.
@@ -347,17 +531,21 @@ class GenerationRouterImpl:
         app = web.Application()
 
         async def _open_session(app_: Any) -> None:
-            # Explicit connector: aiohttp's default is TCPConnector(limit=100), which
-            # would cap the whole fleet's rollout traffic at 100 concurrent upstream
-            # requests -- the exemplar config alone puts 32 prompts x 16 generations =
-            # 512 in flight. Requests over the cap queue *inside this connector*, where
-            # the wait silently burns the total timeout before the backend ever sees
-            # them. Unlimited here sends the excess to vLLM's scheduler instead, where
-            # queueing is visible as engine metrics rather than proxy latency.
+            self._server_loop = asyncio.get_running_loop()
+            # Explicit connector: aiohttp's default global limit=100 would form a second,
+            # opaque queue below the router's per-backend admission queue. Keep the
+            # connector unlimited; _acquire_backend is the one auditable place that
+            # decides how much work each backend owns.
             app_["session"] = ClientSession(connector=TCPConnector(limit=0))
 
         async def _close_session(app_: Any) -> None:
+            while self._admission_waiters:
+                waiter = self._admission_waiters.popleft()
+                self._finish_queued_waiter(waiter)
+                if not waiter.future.done():
+                    waiter.future.cancel()
             await app_["session"].close()
+            self._server_loop = None
 
         app.on_startup.append(_open_session)
         app.on_cleanup.append(_close_session)
@@ -490,6 +678,7 @@ def maybe_start_generation_router(
         port=port,
         backend_timeout_s=config.backend_timeout_s,
         connect_timeout_s=config.connect_timeout_s,
+        max_inflight_requests_per_backend=(config.max_inflight_requests_per_backend),
         no_healthy_backend_status=config.no_healthy_backend_status,
         # Without health pushes, reflexively dropping a backend would retire it
         # permanently after one transient error.
