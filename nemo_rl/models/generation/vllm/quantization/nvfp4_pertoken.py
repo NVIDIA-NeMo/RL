@@ -21,9 +21,8 @@ BF16.
 """
 
 import re
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional
+from typing import Any, Optional
 
 import torch
 from vllm import _custom_ops as ops
@@ -48,8 +47,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
 )
 from nemo_rl.models.generation.vllm.vllm_backend import (
     VllmInternalWorkerExtension,
-    WeightUpdateFinalizer,
-    WeightUpdateTransport,
+    _ReloadWeightPreparer,
 )
 
 logger = init_logger(__name__)
@@ -411,10 +409,10 @@ class NvFp4PerTokenWorkerExtension(VllmInternalWorkerExtension):
 
     Quantizes routed-expert BF16 weights to NVFP4 at refit-load time
     (``NvFp4PerTokenQuantizer``), mirroring the fp8/mxfp8 real-quant rollout
-    path (``quantization/fp8.py``). Weight updates run inside vLLM's
-    layerwise reload lifecycle so quantized params are restored to load
-    format before loading and re-processed (per-token kernel rebuilt)
-    afterwards, preserving CUDA-graph-stable kernel storage.
+    path (``quantization/fp8.py``). IPC weight updates enter vLLM through its
+    native ``reload_weights`` API, which restores quantized params to load
+    format and re-processes them afterwards while preserving stable kernel
+    storage for CUDA graphs.
     """
 
     _quantizer: Optional[NvFp4PerTokenQuantizer] = None
@@ -424,8 +422,8 @@ class NvFp4PerTokenWorkerExtension(VllmInternalWorkerExtension):
             self._quantizer = NvFp4PerTokenQuantizer(self.model_runner.model)
         return self._quantizer
 
-    def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
-        super()._load_hf_weights(self._get_quantizer().process(policy_weights))
+    def _get_reload_weight_preparer(self) -> _ReloadWeightPreparer:
+        return self._get_quantizer()
 
     def maybe_init_zmq(self) -> None:
         """Use a longer ZMQ timeout.
@@ -438,34 +436,6 @@ class NvFp4PerTokenWorkerExtension(VllmInternalWorkerExtension):
         super().maybe_init_zmq()
         self.zmq_socket.setsockopt(zmq.SNDTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
         self.zmq_socket.setsockopt(zmq.RCVTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
-
-    @contextmanager
-    def _weight_update_lifecycle(
-        self, transport: WeightUpdateTransport
-    ) -> Iterator[WeightUpdateFinalizer]:
-        del transport
-        from vllm.model_executor.model_loader.reload import (
-            finalize_layerwise_reload,
-            initialize_layerwise_reload,
-        )
-
-        model = self.model_runner.model
-        # Reset on entry, not just at completion: _weight_update_errors_are_fatal
-        # is True, so a mid-refit exception propagates but the actor survives —
-        # a pending half from a failed refit must not silently pair with a
-        # fresh partner on the next one.
-        self._get_quantizer().reset()
-
-        with torch.device(self.device):
-            initialize_layerwise_reload(model)
-
-        def finalize() -> None:
-            self._get_quantizer().finish()
-            with torch.device(self.device):
-                finalize_layerwise_reload(model, self.model_config)
-            torch.accelerator.synchronize()
-
-        yield finalize
 
     def _weight_update_errors_are_fatal(self) -> bool:
         return True
