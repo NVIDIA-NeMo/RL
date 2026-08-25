@@ -39,6 +39,42 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.membership import RefitMembership, desired_membership
 
 
+def _settle_before_propagating(futures, budget_s, what: str) -> None:
+    """Let every rank finish unwinding before a refit failure reaches the caller.
+
+    ``ray.get`` raises on the FIRST future that fails and leaves the rest running. That is
+    fine when the caller is going to stop, and wrong when it is going to rebuild: a
+    communicator rebuild is itself a collective, so dispatching ``init_collective`` while
+    some ranks are still inside the old refit means they join late or not at all, and the
+    rendezvous times out instead of coming up.
+
+    Job 6512153 measured exactly that on the reshard kill variant. Rank 0 gave up on its
+    own deadline, the controller went straight into the recovery, and the rebuild began --
+    line 963 of the log -- two lines BEFORE rank 1's watchdog fired at all. The surviving
+    generation worker then spent 300s twice failing to reach a store that never came up,
+    and the run died at 690s having done everything else right.
+
+    Bounded, and swallowing whatever the stragglers raise: they are unwinding from the same
+    failure the caller is already holding, and replacing it with a straggler's version
+    would lose the diagnosis. If the budget runs out, propagate anyway -- a caller stuck
+    here would be a worse wedge than the one being recovered from.
+    """
+    if not futures:
+        return
+    try:
+        ready, pending = ray.wait(
+            list(futures), num_returns=len(futures), timeout=budget_s
+        )
+        if pending:
+            print(
+                f"  refit: {len(pending)} of {len(futures)} {what} rank(s) had not "
+                f"unwound after {budget_s}s; rebuilding anyway",
+                flush=True,
+            )
+    except Exception:  # noqa: BLE001 - the caller's failure is the one that matters
+        pass
+
+
 class CollectiveWeightSynchronizer(WeightSynchronizer):
     """Weight synchronizer using NCCL collectives for non-colocated deployments.
 
@@ -95,7 +131,15 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
                 refit_timeout_s=self._refit_timeout_s
             )
 
-            ray.get(futures_train)
+            try:
+                ray.get(futures_train)
+            except BaseException:
+                # Every train rank must be out of the old refit before the caller can
+                # rebuild over the survivors; see _settle_before_propagating.
+                _settle_before_propagating(
+                    futures_train, self._settle_budget_s(), "train"
+                )
+                raise
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
 
@@ -145,6 +189,16 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             total_gen_workers=len(self._generation.worker_group.workers),
             train_world_size=train_world_size,
         )
+
+    def _settle_budget_s(self) -> float:
+        """How long to let stragglers unwind: their own deadline, plus a little.
+
+        A rank that has not given up yet will do so when its watchdog fires, which is the
+        same ``refit_timeout_s`` every rank was armed with. Without a configured deadline
+        there is nothing bounding them, so fall back to a fixed wait rather than blocking
+        the recovery indefinitely.
+        """
+        return (self._refit_timeout_s or 60.0) + 30.0
 
     def reconcile_communicator(
         self, absent_shards: Sequence[int], force: bool = False
