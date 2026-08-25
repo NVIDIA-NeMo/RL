@@ -371,7 +371,6 @@ class MegatronConfig(TypedDict):
     freeze_vision_projector: NotRequired[bool]
     freeze_audio_encoder: NotRequired[bool]
     freeze_audio_projector: NotRequired[bool]
-    radio_force_cpe_eval_mode: NotRequired[bool]
     moe_router_dtype: str | None
     moe_router_load_balancing_type: str | list[str]
     moe_router_bias_update_rate: float
