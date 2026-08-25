@@ -3055,6 +3055,7 @@ class MegatronPolicyWorkerImpl(
                 hasattr(self, "optimizer")
                 and self.optimizer is not None
                 and not self.optimizer_cpu_offload
+                and self.offload_optimizer_for_refit
             ):
                 self.move_optimizer("cpu")
             gc.collect()

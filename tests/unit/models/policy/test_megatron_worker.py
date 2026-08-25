@@ -706,8 +706,13 @@ def test_enable_refit_prequantize_rejects_blockwise_fp8_storage():
         worker.enable_refit_prequantize(["model.weight"])
 
 
-@pytest.mark.parametrize("slim", [False, True])
-def test_offload_after_refit_routes_cleanup_by_mode(monkeypatch, slim):
+@pytest.mark.parametrize(
+    "slim,offload_optimizer",
+    [(False, True), (True, True), (True, False)],
+)
+def test_offload_after_refit_routes_cleanup_by_mode(
+    monkeypatch, slim, offload_optimizer
+):
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
@@ -727,6 +732,7 @@ def test_offload_after_refit_routes_cleanup_by_mode(monkeypatch, slim):
     worker._clear_rope_and_moe_dispatcher_caches = MagicMock()
     worker.optimizer = object()
     worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_refit = offload_optimizer
     worker.move_optimizer = MagicMock()
     worker.offload_before_refit = MagicMock()
     collect = MagicMock()
@@ -753,7 +759,10 @@ def test_offload_after_refit_routes_cleanup_by_mode(monkeypatch, slim):
     if slim:
         worker._clear_fp8_caches.assert_called_once_with()
         worker._clear_rope_and_moe_dispatcher_caches.assert_called_once_with()
-        worker.move_optimizer.assert_called_once_with("cpu")
+        if offload_optimizer:
+            worker.move_optimizer.assert_called_once_with("cpu")
+        else:
+            worker.move_optimizer.assert_not_called()
         collect.assert_called_once_with()
         empty_cache.assert_called_once_with()
         worker.offload_before_refit.assert_not_called()
