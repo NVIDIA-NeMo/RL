@@ -21,10 +21,13 @@ returns without raising) was verified separately on real hardware.
 
 import sys
 import threading
+import asyncio
 import pickle
 import time
 
 from types import SimpleNamespace
+
+from unittest import mock
 
 import pytest
 
@@ -32,6 +35,7 @@ from nemo_rl.distributed.refit_watchdog import (
     REFIT_ABORTED_TOKEN,
     RefitAborted,
     RefitAbortWatchdog,
+    await_off_loop,
     is_refit_abort,
     sync_stream_within,
 )
@@ -525,3 +529,61 @@ class TestTheStreamWaitIsBounded:
         sync_stream_within(object(), budget, "the bulk parameter transfer")
         assert calls["synchronize"] == 1, "falls back to torch.cuda.synchronize()"
         assert calls["recorded"] == [], "and records no event at all"
+
+
+class TestTheRefitRunsOffTheActorsEventLoop:
+    """A blocking refit on a Ray actor starves every other call to that actor.
+
+    Ray runs a sync actor method directly in the event loop -- sync_to_async wraps it as
+    `async def wrapper: return func(...)`, with no executor -- so max_concurrency cannot
+    help: it interleaves coroutines, and a coroutine blocked in C never yields.
+
+    Job 6509685 is the cost. The controller gave up on the stuck refit and called
+    init_collective to rebuild, that call queued behind the refit still holding the loop,
+    rank 0 never created the rendezvous store, and the surviving generation worker timed
+    out dialling it for 300s -- twice -- before the run ended at 690s.
+    """
+
+    def test_the_loop_stays_free_while_the_blocking_call_runs(self):
+        """The property the rebuild depends on: another call can still be serviced."""
+        release = threading.Event()
+        serviced = []
+
+        async def _scenario():
+            refit = asyncio.ensure_future(await_off_loop(release.wait))
+            # Stands in for the recovery's init_collective arriving while the refit is
+            # still blocked. On the event loop, as Ray would run it.
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+                serviced.append(1)
+            assert not refit.done(), "premise: the refit is still blocked"
+            release.set()
+            await refit
+
+        asyncio.run(_scenario())
+        assert serviced, "the loop was starved; the rebuild could never be serviced"
+
+    def test_the_result_comes_back(self):
+        assert asyncio.run(await_off_loop(lambda: "refit-done")) == "refit-done"
+
+    def test_a_failure_propagates_rather_than_being_swallowed(self):
+        def _boom():
+            raise RefitAborted("aborted mid-collective")
+
+        with pytest.raises(RefitAborted, match="aborted mid-collective"):
+            asyncio.run(await_off_loop(_boom))
+
+    def test_the_thread_cannot_block_interpreter_exit(self):
+        """asyncio.to_thread's pool is non-daemon and joined at exit, so it is not used."""
+        seen = []
+        original = threading.Thread
+
+        def _record(*args, **kwargs):
+            thread = original(*args, **kwargs)
+            seen.append(thread)
+            return thread
+
+        with mock.patch.object(threading, "Thread", _record):
+            asyncio.run(await_off_loop(lambda: None))
+
+        assert seen and all(t.daemon for t in seen)

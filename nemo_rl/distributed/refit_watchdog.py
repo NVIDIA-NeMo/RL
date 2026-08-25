@@ -36,6 +36,7 @@ Inert unless armed with a positive timeout, so a run that does not configure one
 exactly as before, down to not starting a thread.
 """
 
+import asyncio
 import threading
 import time
 from collections.abc import Sequence
@@ -82,6 +83,46 @@ def is_refit_abort(error: BaseException) -> bool:
     abort was named, and the run still wedged because the handler never matched.
     """
     return isinstance(error, RefitAborted) or REFIT_ABORTED_TOKEN in str(error)
+
+
+async def await_off_loop(fn):
+    """Run a blocking call on a daemon thread so this actor's event loop stays free.
+
+    Ray runs a SYNC actor method directly in the event loop -- ``sync_to_async`` wraps it
+    as ``async def wrapper: return func(...)``, with no executor -- so a refit that blocks
+    in NCCL starves every other call to the same actor. ``max_concurrency`` cannot help;
+    it interleaves coroutines, and a coroutine blocked in C never yields.
+
+    That is why the recovery could not run in job 6509685. The controller gave up on the
+    stuck refit and called ``init_collective`` to rebuild, but that call queued behind the
+    refit still occupying this loop. Rank 0 is the rendezvous master, so the store was
+    never created, and the surviving generation worker timed out dialling it for 300s,
+    twice, before the run ended.
+
+    Daemon, because ``asyncio.to_thread``'s default executor is non-daemon and joined at
+    interpreter exit: a thread still parked in NCCL would hang shutdown, trading a wedge in
+    the refit for a wedge on the way out.
+
+    No timeout here on purpose. Bounding the wait is the controller's job
+    (``_sync_weights_within``); this only decides which thread blocks.
+    """
+    loop = asyncio.get_running_loop()
+    settled: asyncio.Future = loop.create_future()
+
+    def _settle(setter, value) -> None:
+        if not settled.done():
+            setter(value)
+
+    def _run() -> None:
+        try:
+            result = fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the loop below
+            loop.call_soon_threadsafe(_settle, settled.set_exception, exc)
+        else:
+            loop.call_soon_threadsafe(_settle, settled.set_result, result)
+
+    threading.Thread(target=_run, name="refit-off-loop", daemon=True).start()
+    return await settled
 
 
 def sync_stream_within(stream, budget_s: Optional[float], what: str) -> None:

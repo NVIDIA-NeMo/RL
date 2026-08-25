@@ -275,3 +275,39 @@ def test_the_abort_is_detected_by_message_not_by_type(module, method):
             )
             return
     raise AssertionError(f"{module}::{method} not found")
+
+
+def test_the_reshard_refit_does_not_occupy_the_actors_event_loop():
+    """A sync method here starves every other call to the same actor.
+
+    Ray runs a sync actor method directly in the event loop (sync_to_async wraps it as
+    `async def wrapper: return func(...)`, no executor), so a refit blocked in NCCL leaves
+    nothing able to service the recovery's init_collective. max_concurrency cannot fix
+    that -- it interleaves coroutines, and a coroutine blocked in C never yields.
+
+    Job 6509685: the controller gave up on the stuck refit and called init_collective to
+    rebuild, that call queued behind the refit still holding the loop, rank 0 never created
+    the rendezvous store, and the surviving generation worker timed out dialling it for
+    300s twice before the run ended.
+    """
+    worker = REPO_ROOT / "nemo_rl" / "models" / "policy" / "workers"
+    tree = ast.parse((worker / "megatron_policy_worker.py").read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+            node.name == "nccl_reshard_refit"
+        ):
+            assert isinstance(node, ast.AsyncFunctionDef), (
+                "nccl_reshard_refit must be async and hand the blocking transfer to a "
+                "thread; as a sync method it holds the actor's event loop for the whole "
+                "refit and the rebuild can never be serviced."
+            )
+            called = {
+                c.func.id
+                for c in ast.walk(node)
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            }
+            assert "await_off_loop" in called, (
+                "async alone is not enough -- the blocking body must leave the loop."
+            )
+            return
+    raise AssertionError("megatron_policy_worker.nccl_reshard_refit not found")
