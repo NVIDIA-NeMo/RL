@@ -328,6 +328,16 @@ class TestControllerCallSite:
         ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
         ctrl._gen_fleet = monitor
         ctrl._weight_synchronizer = synchronizer
+        # _reconcile_refit_membership evicts absent-but-alive shards before it rebuilds,
+        # and reads the generation worker group to do it.
+        ctrl._evicted_shards = set()
+        shard_count = getattr(monitor, "shard_count", 0) if monitor else 0
+        ctrl._gen = SimpleNamespace(
+            worker_group=SimpleNamespace(
+                workers=[SimpleNamespace(idx=i) for i in range(shard_count)],
+                dp_leader_worker_indices=list(range(shard_count)),
+            )
+        )
         return ctrl
 
     def test_without_fleet_health_the_transport_is_never_consulted(self):
