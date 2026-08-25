@@ -38,6 +38,7 @@ import asyncio
 import contextlib
 import logging
 import math
+import threading
 import os
 import time
 from collections import deque
@@ -1773,6 +1774,81 @@ class SingleControllerActor:
             last_checkpoint_step=self._train_steps,
         )
 
+    # Grace on top of the workers' own refit deadline, so their attributable error wins
+    # the race against this bound. They need to hit the deadline, abort, unwind, raise,
+    # and have Ray deliver it -- seconds, not minutes. If this fires first we lose their
+    # diagnosis and report only "the refit never came back", which is true but less useful.
+    _REFIT_UNWIND_GRACE_S = 60.0
+
+    def _refit_await_budget_s(self) -> Optional[float]:
+        """How long to wait for the refit before giving up, or None to wait forever."""
+        deadline = self._async_cfg.generation_fleet_health.refit_timeout_s
+        return None if deadline is None else deadline + self._REFIT_UNWIND_GRACE_S
+
+    async def _sync_weights_within(self, kv_scales, what: str) -> None:
+        """Run the refit off-loop, and stop waiting if it outlives the deadline.
+
+        WHY THIS IS NEEDED ON TOP OF EVERY WORKER-SIDE BOUND. A frozen-but-alive rank is a
+        Ray actor that never answers, and Ray puts no timeout on an actor call. So the
+        controller's await never resolves however well the workers behave. Job 6508251
+        measured that end state: the deadline fired, the workers aborted, the trainers
+        returned, every actor was idle -- and the run still sat for 1800s because this
+        await had no bound. It is the last unbounded wait on the refit path, and unlike the
+        others it is not in NCCL or CUDA.
+
+        Timing out raises RefitAborted so this joins the existing recovery path rather than
+        inventing a second one: the caller reconciles membership and retries once. By then
+        the fleet probe has usually condemned the silent shard, so the rebuild can exclude
+        it and the retry may genuinely succeed.
+
+        A DEDICATED DAEMON THREAD, not asyncio.to_thread. to_thread runs on the default
+        ThreadPoolExecutor, whose workers are non-daemon and are joined at interpreter
+        exit -- so a thread still blocked on the frozen actor would hang shutdown, trading
+        a wedge in the refit for a wedge on the way out. asyncio.wait_for cannot cancel a
+        running thread either way; this only controls whether the orphan can block exit.
+
+        The orphan is a real consequence, not a free win. If the retry succeeds the run
+        continues with a thread still parked inside the old sync_weights, and if that rank
+        were ever resumed it would wake up holding a communicator that has since been
+        replaced. Acceptable against a guaranteed 30-minute stall, and it is why this path
+        is bounded-failure-first rather than resume-and-forget.
+        """
+        budget_s = self._refit_await_budget_s()
+        if budget_s is None:
+            await asyncio.to_thread(
+                self._weight_synchronizer.sync_weights, kv_scales=kv_scales
+            )
+            return
+
+        loop = asyncio.get_running_loop()
+        settled: asyncio.Future = loop.create_future()
+
+        def _settle(setter, value) -> None:
+            # wait_for cancels `settled` on timeout, and setting a result on a cancelled
+            # future raises InvalidStateError inside the loop callback.
+            if not settled.done():
+                setter(value)
+
+        def _run() -> None:
+            try:
+                self._weight_synchronizer.sync_weights(kv_scales=kv_scales)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the loop below
+                loop.call_soon_threadsafe(_settle, settled.set_exception, exc)
+            else:
+                loop.call_soon_threadsafe(_settle, settled.set_result, None)
+
+        threading.Thread(target=_run, name=f"sc-refit-{what}", daemon=True).start()
+
+        try:
+            await asyncio.wait_for(settled, budget_s)
+        except asyncio.TimeoutError:
+            raise RefitAborted(
+                f"the {what} refit did not return within {budget_s}s. Every worker-side "
+                "bound has passed, so a generation rank is most likely alive but not "
+                "answering -- a Ray actor call has no timeout of its own, so waiting here "
+                "is unbounded. Giving up so the fleet can be reconciled and retried."
+            ) from None
+
     async def _sync_weights(
         self,
         *,
@@ -1840,19 +1916,13 @@ class SingleControllerActor:
         await self._reconcile_refit_membership()
 
         try:
-            await asyncio.to_thread(
-                self._weight_synchronizer.sync_weights,
-                kv_scales=kv_scales,
-            )
+            await self._sync_weights_within(kv_scales, "first")
         except (RefitAborted, RayActorError) as failure:
             with self._recovery_window():
                 await self._recover_from_failed_refit(failure)
                 # Once only: a second failure is a real fault, not a membership problem,
                 # and retrying forever would recreate the wedge this exists to remove.
-                await asyncio.to_thread(
-                    self._weight_synchronizer.sync_weights,
-                    kv_scales=kv_scales,
-                )
+                await self._sync_weights_within(kv_scales, "retry")
                 # Inside the window: this is what refills the serving set, so releasing
                 # the flag before it runs would reopen the gap it exists to close.
                 self._promote_refit_shards()

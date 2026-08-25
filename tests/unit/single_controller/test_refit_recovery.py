@@ -28,14 +28,17 @@ monitor whose verdict arrives on a probe schedule.
 """
 
 import asyncio
+import threading
+import time
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import MagicMock
 
 import pytest
 import ray.exceptions
 
 from nemo_rl.algorithms.single_controller import SingleControllerActor
-from nemo_rl.distributed.refit_watchdog import RefitAborted
+from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetHealth,
@@ -93,7 +96,12 @@ def _make_controller(
     ctrl._async_cfg = SimpleNamespace(
         recompute_kv_cache_after_weight_updates=False,
         generation_fleet_health=SimpleNamespace(
-            probe_timeout_s=1.0, probe_interval_s=0.01
+            probe_timeout_s=1.0,
+            probe_interval_s=0.01,
+            # None keeps the controller's refit await unbounded, which is what every
+            # test in this file was written against. A fixture standing in for a
+            # constructed actor has to carry every field the methods under test read.
+            refit_timeout_s=None,
         ),
     )
     ctrl._rollout_permitted = asyncio.Event()
@@ -379,3 +387,102 @@ class TestTheRefitHoldHook:
         monkeypatch.setenv("NRL_REFIT_HOLD_MAX_S", "0.2")
         self._hook()()
         assert hold.exists(), "returned on the deadline, not because the file went away"
+
+
+class TestTheControllerStopsWaitingForASilentRank:
+    """A frozen-but-alive rank is a Ray actor that never answers, and Ray never times out.
+
+    Every worker-side bound can behave perfectly and the controller still waits forever.
+    Job 6508251 measured that end state: the deadline fired, the workers aborted, the
+    trainers returned, every actor was idle -- and the run sat for 1800s because this await
+    had no bound. It is the last unbounded wait on the refit path.
+    """
+
+    @staticmethod
+    def _ctrl(refit_timeout_s, sync_weights):
+        # @ray.remote makes SingleControllerActor an ActorClass, not a class, so
+        # object.__new__ rejects it. Same unwrap the fixture above uses.
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._async_cfg = SimpleNamespace(
+            generation_fleet_health=SimpleNamespace(refit_timeout_s=refit_timeout_s)
+        )
+        ctrl._weight_synchronizer = SimpleNamespace(sync_weights=sync_weights)
+        return ctrl
+
+    def test_a_refit_that_never_returns_gives_up(self):
+        never = threading.Event()
+        ctrl = self._ctrl(0.2, lambda **_: never.wait())
+        ctrl._REFIT_UNWIND_GRACE_S = 0.3
+
+        started = time.monotonic()
+        with pytest.raises(RefitAborted, match="did not return within"):
+            asyncio.run(ctrl._sync_weights_within(None, "first"))
+        elapsed = time.monotonic() - started
+
+        never.set()
+        assert elapsed < 10.0, "it must give up, not wait on a rank that never answers"
+
+    def test_giving_up_is_recognised_as_an_abort(self):
+        """So it lands in the existing `except (RefitAborted, RayActorError)` recovery."""
+        never = threading.Event()
+        ctrl = self._ctrl(0.1, lambda **_: never.wait())
+        ctrl._REFIT_UNWIND_GRACE_S = 0.1
+
+        with pytest.raises(RefitAborted) as caught:
+            asyncio.run(ctrl._sync_weights_within(None, "first"))
+        never.set()
+        assert is_refit_abort(caught.value)
+
+    def test_the_budget_leaves_room_for_the_workers_own_error(self):
+        """If this bound fired first we would lose the attributable worker diagnosis."""
+        ctrl = self._ctrl(12.5, lambda **_: None)
+        assert ctrl._refit_await_budget_s() > 12.5
+
+    def test_no_deadline_configured_keeps_the_original_unbounded_await(self):
+        calls = []
+        ctrl = self._ctrl(None, lambda **kw: calls.append(kw))
+        assert ctrl._refit_await_budget_s() is None
+        asyncio.run(ctrl._sync_weights_within({"k": 1}, "first"))
+        assert calls == [{"kv_scales": {"k": 1}}]
+
+    def test_a_refit_that_succeeds_is_untouched(self):
+        calls = []
+        ctrl = self._ctrl(30.0, lambda **kw: calls.append(kw))
+        asyncio.run(ctrl._sync_weights_within({"k": 1}, "first"))
+        assert calls == [{"kv_scales": {"k": 1}}], "kv_scales must still reach the sync"
+
+    def test_a_real_failure_propagates_rather_than_becoming_a_timeout(self):
+        """A genuine refit bug must not be relabelled as a silent rank and retried."""
+
+        def _boom(**_):
+            raise ValueError("shape mismatch")
+
+        ctrl = self._ctrl(30.0, _boom)
+        with pytest.raises(ValueError, match="shape mismatch"):
+            asyncio.run(ctrl._sync_weights_within(None, "first"))
+
+    def test_the_worker_thread_cannot_block_interpreter_exit(self):
+        """asyncio.to_thread's pool is non-daemon and joined at exit, so it is not used.
+
+        Otherwise a thread still parked on the frozen actor would hang shutdown -- trading
+        a wedge in the refit for a wedge on the way out.
+        """
+        never = threading.Event()
+        seen = []
+
+        original = threading.Thread
+
+        def _record(*args, **kwargs):
+            thread = original(*args, **kwargs)
+            seen.append(thread)
+            return thread
+
+        ctrl = self._ctrl(0.1, lambda **_: never.wait())
+        ctrl._REFIT_UNWIND_GRACE_S = 0.1
+        with mock.patch.object(threading, "Thread", _record):
+            with pytest.raises(RefitAborted):
+                asyncio.run(ctrl._sync_weights_within(None, "first"))
+        never.set()
+
+        assert seen, "the refit must run on a thread we control"
+        assert all(t.daemon for t in seen), "and every one of them must be a daemon"
