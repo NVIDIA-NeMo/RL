@@ -51,7 +51,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass
 from time import monotonic
-from typing import Any, Optional
+from typing import Any, Callable, Optional, cast
 
 import ray
 from pydantic import BaseModel, PositiveFloat, PositiveInt, model_validator
@@ -245,7 +245,8 @@ class GenerationRouterImpl:
         if loop is None or loop.is_closed():
             return
         try:
-            loop.call_soon_threadsafe(self._dispatch_waiters)
+            callback = cast(Callable[..., object], self._dispatch_waiters)
+            loop.call_soon_threadsafe(callback)
         except RuntimeError:
             # The loop can close between is_closed() and call_soon_threadsafe() during
             # actor teardown. Pending handlers are cancelled as part of app cleanup.
