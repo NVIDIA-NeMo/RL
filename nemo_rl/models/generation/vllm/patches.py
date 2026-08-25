@@ -620,6 +620,8 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
         write_back(content.replace(old_snippet, new_snippet, 1))
 
     logger.info("Successfully disabled decoder-level SP-MoE for GLM DSA models.")
+
+
 def _patch_vllm_moe_routed_experts_capture(logger) -> None:
     """Fire the routed-experts capture hook on the monolithic fused-MoE path.
 
