@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nemo_rl.models.megatron.draft.dflash import DFlashBody, DFlashBodyConfig
 from nemo_rl.models.megatron.draft.eagle import EagleModel
 from nemo_rl.models.megatron.draft.hidden_capture import (
     CapturedStates,
@@ -26,6 +27,8 @@ from nemo_rl.models.megatron.draft.utils import (
 
 __all__ = [
     "CapturedStates",
+    "DFlashBody",
+    "DFlashBodyConfig",
     "HiddenStateCapture",
     "get_capture_context",
     "EagleModel",
