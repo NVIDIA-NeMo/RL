@@ -125,11 +125,16 @@ def _make_controller(
     sync.bind(monitor)
     ctrl._weight_synchronizer = sync
 
+    # The eviction reads worker_group off _gen and tracks what it has already killed. A
+    # fixture standing in for a constructed actor has to carry every field the methods
+    # under test read -- the same rule the refit_timeout_s note above records.
+    ctrl._evicted_shards = set()
     ctrl._gen = SimpleNamespace(
         requires_kv_scale_sync=False,
         invalidate_kv_cache=MagicMock(),
         worker_group=SimpleNamespace(
             get_dp_leader_worker_idx=lambda shard: shard,
+            dp_leader_worker_indices=list(range(shard_count)),
             workers=[
                 SimpleNamespace(
                     is_alive=SimpleNamespace(
