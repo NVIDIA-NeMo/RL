@@ -119,6 +119,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         inference_cluster=None,
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
+        finalizer_actors=[],
         data_plane_checkpoint_metadata=None,
     )
     args.update(overrides)
