@@ -1252,6 +1252,8 @@ async def async_generate_response_for_sample_turn(
         tokenizer: Tokenizer to use
         max_seq_len: Maximum sequence length
         greedy: Whether to use greedy decoding
+        session_id: Stable Dynamo session ID reused across every turn of one
+            trajectory attempt. Ignored unless the generation backend is Dynamo.
         sample_multimodal_data: vLLM-ready media fields for this sample.
         deduplicate_multimodal_data: Avoid sending both vLLM-ready and policy-ready
             media through the async generation boundary.
