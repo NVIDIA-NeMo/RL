@@ -189,6 +189,7 @@ def _create_value_test_config(
                 "clip_grad": 1.0,
                 "optimizer_cpu_offload": False,
                 "optimizer_offload_fraction": 0.0,
+                "overlap_cpu_optimizer_d2h_h2d": False,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
@@ -258,6 +259,35 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
             )
         else:
             raise ValueError(f"Unknown config_updates key: {k!r}")
+
+
+def test_prepare_for_training_leaves_native_cpu_optimizer_placement():
+    """HybridDeviceOptimizer owns state placement for value-model training."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    class _TrainableModel:
+        def __init__(self) -> None:
+            self.train_called = False
+
+        def train(self) -> None:
+            self.train_called = True
+
+    worker = object.__new__(MegatronValueWorkerImpl)
+    model = _TrainableModel()
+    worker.model = model
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = True
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+    worker.move_model = lambda model, device, move_grads, move_params: model
+    worker.move_optimizer = lambda device: pytest.fail(
+        "native optimizer CPU offload must not use the generic optimizer mover"
+    )
+
+    MegatronValueWorkerImpl.prepare_for_training(worker)
+
+    assert model.train_called
 
 
 @pytest.fixture

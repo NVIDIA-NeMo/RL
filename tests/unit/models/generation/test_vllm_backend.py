@@ -33,7 +33,7 @@ def _make_collective_update_extension(backend):
     state_info = object()
     ext.state_dict_info = {"model.weight": state_info}
     ext.model_update_group = object()
-    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
+    ext.model_runner = SimpleNamespace(model=torch.nn.Module(), vllm_config=object())
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
@@ -68,7 +68,9 @@ def _make_extension_with_drafter(mtp_start_layer_idx, num_mtp_layers):
         mtp_start_layer_idx=mtp_start_layer_idx, num_mtp_layers=num_mtp_layers
     )
     ext.model_runner = MagicMock()
-    ext.model_runner.drafter.model = SimpleNamespace(model=predictor)
+    draft_model = torch.nn.Module()
+    setattr(draft_model, "model", predictor)
+    ext.model_runner.drafter.model = draft_model
     # Isolate this test from _load_draft_weights internals.
     ext._load_draft_weights = MagicMock()
     return ext
@@ -119,6 +121,551 @@ def _make_mtp_refit_extension(
     return ext, drafter_model
 
 
+def _make_unquantized_moe_model(moe_backend: str) -> SimpleNamespace:
+    from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+        UnquantizedMoeBackend,
+    )
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    quant_method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
+    quant_method.unquantized_backend = UnquantizedMoeBackend(moe_backend)
+    module = SimpleNamespace(quant_method=quant_method)
+    return SimpleNamespace(modules=lambda: [module])
+
+
+@pytest.mark.vllm
+def test_refresh_hpc_modules_after_layerwise_reload(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    class FakeHpcModule:
+        def __init__(self):
+            self.process_weights_after_loading = MagicMock()
+
+    hpc_module = FakeHpcModule()
+    other_module = object()
+    model = SimpleNamespace(modules=lambda: [other_module, hpc_module])
+    monkeypatch.setattr("vllm.model_executor.layers.hpc.HpcModule", FakeHpcModule)
+
+    vllm_backend._refresh_hpc_modules_after_layerwise_reload(model)
+
+    hpc_module.process_weights_after_loading.assert_called_once_with(model)
+
+
+class _DeferredReloadLayer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first = torch.nn.Parameter(torch.zeros(2))
+        self.second = torch.nn.Parameter(torch.zeros(2))
+
+
+class _DeferredReloadModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layer = _DeferredReloadLayer()
+
+    def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
+        params = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+            param = params[name]
+            weight_loader = getattr(param, "weight_loader", None)
+            assert callable(weight_loader)
+            weight_loader(param, loaded_weight)
+
+
+@pytest.mark.vllm
+def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    call_order = []
+    model = _make_unquantized_moe_model("FlashInfer TRTLLM")
+    model_config = object()
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="auto"), quant_config=None
+    )
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext.model_config = model_config
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    @contextlib.contextmanager
+    def set_current_vllm_config(config):
+        assert config is vllm_config
+        call_order.append("config_enter")
+        try:
+            yield
+        finally:
+            call_order.append("config_exit")
+
+    monkeypatch.setattr("vllm.config.set_current_vllm_config", set_current_vllm_config)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda reload_model: call_order.append(("initialize", reload_model)),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.finalize_layerwise_reload",
+        lambda reload_model, config: call_order.append(
+            ("finalize", reload_model, config)
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "_refresh_hpc_modules_after_layerwise_reload",
+        lambda reload_model: call_order.append(("hpc", reload_model)),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        lambda *_args: pytest.fail(
+            "unquantized refit must use vLLM's native layerwise reload lifecycle"
+        ),
+    )
+
+    for _ in range(2):
+        with ext._weight_update_lifecycle("collective") as finalize:
+            call_order.append("load")
+            finalize()
+        assert ext._nrl_layerwise_reload_active is False
+
+    expected_cycle = [
+        "config_enter",
+        ("initialize", model),
+        "load",
+        ("finalize", model, model_config),
+        ("hpc", model),
+        "mtp",
+        "config_exit",
+    ]
+    assert call_order == expected_cycle * 2
+    ext._maybe_process_fp8_kv_cache.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_unquantized_nccl_reshard_keeps_existing_refit_lifecycle(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = _make_unquantized_moe_model("FlashInfer TRTLLM")
+    model_config = object()
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+        quant_config=None,
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext.model_config = model_config
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    process = MagicMock()
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda _: pytest.fail(
+            "NCCL reshard must preserve the direct-buffer parameter mapping"
+        ),
+    )
+
+    with ext._weight_update_lifecycle("nccl_reshard") as finalize:
+        finalize()
+
+    process.assert_called_once_with(model, model_config, ext.device)
+    ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
+    ext._maybe_process_fp8_kv_cache.assert_called_once_with()
+
+
+@pytest.mark.vllm
+def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypatch):
+    from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = _DeferredReloadModel()
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    ext.model_config = None
+    ext.device = torch.device("cpu")
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    ext._validate_native_layerwise_refit = lambda: None
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    transport_buffer = torch.empty(2)
+    record_metadata_for_reloading(model)
+
+    with ext._weight_update_lifecycle("collective") as finalize:
+        transport_buffer.copy_(torch.tensor([1.0, 2.0]))
+        ext._load_full_hf_weights([("layer.first", transport_buffer)])
+
+        transport_buffer.copy_(torch.tensor([7.0, 8.0]))
+        ext._load_full_hf_weights([("layer.second", transport_buffer)])
+        finalize()
+
+    torch.testing.assert_close(model.layer.first, torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(model.layer.second, torch.tensor([7.0, 8.0]))
+
+
+@pytest.mark.vllm
+def test_layerwise_reload_detaches_deferred_transport_weights(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    source = torch.ones(4)
+    unrelated = torch.full((2,), 7.0)
+    source_args = SimpleNamespace(arguments={"loaded_weight": source[:2]})
+    unrelated_args = SimpleNamespace(arguments={"loaded_weight": unrelated})
+    model = SimpleNamespace(modules=lambda: [object()])
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.layerwise.get_layerwise_info",
+        lambda _module: SimpleNamespace(
+            loaded_weights=[("source", source_args), ("other", unrelated_args)]
+        ),
+    )
+
+    vllm_backend._detach_pending_layerwise_weights(
+        model, {source.untyped_storage().data_ptr()}
+    )
+
+    detached = source_args.arguments["loaded_weight"]
+    assert detached.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+    assert unrelated_args.arguments["loaded_weight"] is unrelated
+    source.zero_()
+    torch.testing.assert_close(detached, torch.ones(2))
+
+
+@pytest.mark.vllm
+def test_layerwise_reload_preserves_weight_load_error(monkeypatch, caplog):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    load_error = RuntimeError("load failed")
+    model = SimpleNamespace(load_weights=MagicMock(side_effect=load_error))
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model)
+    ext._nrl_layerwise_reload_active = True
+    monkeypatch.setattr(
+        vllm_backend,
+        "_detach_pending_layerwise_weights",
+        MagicMock(side_effect=RuntimeError("detach failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="load failed") as exc_info:
+        ext._load_full_hf_weights([("model.weight", torch.ones(1))])
+
+    assert exc_info.value is load_error
+    assert "Failed to detach deferred weights" in caplog.text
+
+
+@pytest.mark.vllm
+def test_layerwise_reload_propagates_detach_error_after_successful_load(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    detach_error = RuntimeError("detach failed")
+    model = SimpleNamespace(load_weights=MagicMock())
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model)
+    ext._nrl_layerwise_reload_active = True
+    monkeypatch.setattr(
+        vllm_backend,
+        "_detach_pending_layerwise_weights",
+        MagicMock(side_effect=detach_error),
+    )
+
+    with pytest.raises(RuntimeError, match="detach failed") as exc_info:
+        ext._load_full_hf_weights([("model.weight", torch.ones(1))])
+
+    assert exc_info.value is detach_error
+    model.load_weights.assert_called_once()
+
+
+@pytest.mark.vllm
+def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = object()
+    model_config = object()
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+        quant_config=object(),
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext.model_config = model_config
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    process = MagicMock()
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda _: pytest.fail("FP8 must not use the unquantized reload lifecycle"),
+    )
+
+    with ext._weight_update_lifecycle("collective") as finalize:
+        finalize()
+
+    process.assert_called_once_with(model, model_config, ext.device)
+    ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
+    ext._maybe_process_fp8_kv_cache.assert_called_once_with()
+
+
+@pytest.mark.vllm
+def test_extension_capability_can_disable_unquantized_reload():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=object(),
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+            quant_config=None,
+        ),
+    )
+    ext._supports_unquantized_flashinfer_trtllm_refit = lambda: False
+
+    assert ext._uses_unquantized_flashinfer_trtllm() is False
+
+
+@pytest.mark.vllm
+def test_realized_moe_backend_controls_native_refit_lifecycle():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model("TRITON"),
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+            quant_config=None,
+        ),
+    )
+
+    assert ext._uses_unquantized_flashinfer_trtllm() is False
+
+    ext.model_runner.model = _make_unquantized_moe_model("FlashInfer TRTLLM")
+    ext.model_runner.vllm_config.kernel_config.moe_backend = "auto"
+
+    assert ext._uses_unquantized_flashinfer_trtllm() is True
+
+
+@pytest.mark.vllm
+def test_quantized_model_does_not_use_unquantized_refit_lifecycle():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model("FlashInfer TRTLLM"),
+        vllm_config=SimpleNamespace(quant_config=object()),
+    )
+
+    assert ext._uses_unquantized_flashinfer_trtllm() is False
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("moe_backend", "quant_config", "expected"),
+    [
+        ("FlashInfer TRTLLM", None, True),
+        ("TRITON", None, False),
+        ("FlashInfer TRTLLM", object(), False),
+    ],
+)
+def test_weight_update_errors_are_fatal_only_for_native_trtllm_refit(
+    moe_backend, quant_config, expected
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model(moe_backend),
+        vllm_config=SimpleNamespace(quant_config=quant_config),
+    )
+
+    assert ext._weight_update_errors_are_fatal() is expected
+
+
+@pytest.mark.vllm
+def test_unquantized_reload_rejects_cotrained_mtp_during_prepare():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model("FlashInfer TRTLLM"),
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+            quant_config=None,
+        ),
+    )
+    ext._mtp_drafter_refit_enabled = lambda: True
+
+    with pytest.raises(RuntimeError, match="co-trained MTP drafter"):
+        ext.prepare_refit_info({"model.weight": object()})
+
+    assert not hasattr(ext, "state_dict_info")
+
+
+@pytest.mark.vllm
+def test_failed_unquantized_reload_marks_worker_unusable(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model("FlashInfer TRTLLM"),
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+            quant_config=None,
+        ),
+    )
+    ext.model_config = object()
+    ext.device = torch.device("cpu")
+    ext._mtp_drafter_refit_enabled = lambda: False
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda _: None,
+    )
+
+    failure = RuntimeError("load failed")
+    with pytest.raises(RuntimeError, match="load failed"):
+        with ext._weight_update_lifecycle("collective"):
+            raise failure
+
+    assert ext._nrl_layerwise_reload_failure is failure
+    with pytest.raises(RuntimeError, match="worker is unusable"):
+        with ext._weight_update_lifecycle("collective"):
+            pass
+
+
+@pytest.mark.vllm
+def test_update_weights_from_collective_reraises_on_fatal_native_refit(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model("FlashInfer TRTLLM"),
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+            quant_config=None,
+        ),
+    )
+    ext.model_config = object()
+    ext.device = torch.device("cpu")
+    ext.state_dict_info = {"model.weight": ((1,), torch.float32)}
+    ext.model_update_group = object()
+    ext._mtp_drafter_refit_enabled = lambda: False
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda _: None,
+    )
+
+    def failing_consumer(**_kwargs):
+        raise RuntimeError("transport load failed")
+
+    monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", failing_consumer)
+
+    # The fatal-native path must re-raise instead of swallowing into False.
+    with pytest.raises(RuntimeError, match="transport load failed"):
+        ext.update_weights_from_collective()
+
+    assert ext._nrl_layerwise_reload_failure is not None
+    with pytest.raises(RuntimeError, match="worker is unusable"):
+        ext.update_weights_from_collective()
+
+
+@pytest.mark.vllm
+def test_native_collective_refit_uses_one_transport_buffer(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_collective_update_extension(vllm_backend)
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+
+    @contextlib.contextmanager
+    def lifecycle(_transport):
+        yield lambda: None
+
+    ext._weight_update_lifecycle = lifecycle
+    observed_num_buffers = None
+
+    def consume(*, iterator, group, src, post_unpack_func, num_buffers=None):
+        nonlocal observed_num_buffers
+        observed_num_buffers = num_buffers
+
+    monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", consume)
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", lambda: None)
+
+    assert ext.update_weights_from_collective() is True
+    assert observed_num_buffers == 1
+
+
+@pytest.mark.vllm
+def test_sparse_delta_refit_rejected_for_native_trtllm_backend():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model("FlashInfer TRTLLM"),
+        vllm_config=SimpleNamespace(quant_config=None),
+    )
+
+    with pytest.raises(RuntimeError, match="sparse-delta refit does not support"):
+        ext.prepare_sparse_delta_refit_info({})
+    with pytest.raises(RuntimeError, match="sparse-delta refit does not support"):
+        ext.update_weights_from_decoded_sparse_payload(b"")
+
+
 @pytest.mark.vllm
 @pytest.mark.parametrize("with_mtp", [False, True])
 def test_update_weights_from_collective_processes_weights_after_loading(
@@ -128,7 +675,7 @@ def test_update_weights_from_collective_processes_weights_after_loading(
 
     call_order = []
     process_calls = []
-    draft_model = object() if with_mtp else None
+    draft_model = torch.nn.Module() if with_mtp else None
     draft_model_config = object() if with_mtp else None
 
     def process_weights_after_loading(model, model_config, device):
@@ -164,7 +711,9 @@ def test_update_weights_from_collective_processes_weights_after_loading(
         call_order.append("load")
         assert weights == [("model.weight", "weight-value")]
 
-    def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
+    def packed_broadcast_consumer(
+        iterator, group, src, post_unpack_func, num_buffers=None
+    ):
         call_order.append("broadcast")
         assert list(iterator) == [("model.weight", expected_state_info)]
         assert group is ext.model_update_group
@@ -423,6 +972,62 @@ def test_load_mtp_weights_from_disk_loads_only_mtp_layer(tmp_path, monkeypatch):
         "model.layers.2.embed_tokens.weight",
     }
     process_weights.assert_called_once()
+
+
+@pytest.mark.vllm
+def test_load_mtp_weights_from_disk_uses_layerwise_reload_for_trtllm(
+    tmp_path, monkeypatch
+):
+    """TRTLLM draft weights reload into their preserved runtime storage."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model_dir = tmp_path / "ckpt"
+    _write_sharded_checkpoint(
+        model_dir,
+        {
+            "model-00001-of-00001.safetensors": {
+                "model.layers.2.mlp.up_proj.weight": torch.randn(4, 4),
+            }
+        },
+    )
+    ext = _make_extension_with_drafter(mtp_start_layer_idx=2, num_mtp_layers=1)
+    draft_model = ext._get_drafter_model()
+    draft_model.modules = _make_unquantized_moe_model("FlashInfer TRTLLM").modules
+    call_order = []
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda model: call_order.append(("initialize", model)),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.finalize_layerwise_reload",
+        lambda model, config: call_order.append(("finalize", model, config)),
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "_refresh_hpc_modules_after_layerwise_reload",
+        lambda model: call_order.append(("hpc", model)),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        lambda *_: pytest.fail("TRTLLM draft reload must use the layerwise path"),
+    )
+    ext._load_draft_weights.side_effect = lambda _: call_order.append("load")
+
+    assert ext.load_mtp_weights_from_disk(str(model_dir)) is True
+    assert call_order == [
+        ("initialize", draft_model),
+        "load",
+        (
+            "finalize",
+            draft_model,
+            ext.model_runner.vllm_config.speculative_config.draft_model_config,
+        ),
+        ("hpc", draft_model),
+    ]
 
 
 @pytest.mark.vllm

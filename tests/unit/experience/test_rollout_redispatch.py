@@ -12,12 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Re-dispatch policy: no prompt is discarded for infrastructure reasons.
+"""Re-dispatch policy: a prompt is retried before it is ever given up on.
 
 An infra failure means the fleet is unwell, not the prompt, so the attempt is retried.
 The retry re-enters generation-shard selection, which is what makes it land somewhere
 else -- generate_and_push itself knows nothing about shard health. Deterministic
 failures get a much smaller budget because another shard rejects the prompt identically.
+
+A prompt that exhausts its budget is discarded only within an explicit allowance, and
+the two classes get different allowances because they answer different questions.
+``max_skipped_prompts`` is a lifetime total: a dataset does not get better.
+``max_consecutive_dropped_prompts`` resets on every commit, so it asks whether the fleet
+is answering *anyone* right now. Both default to 0, which is the fail-on-the-first-one
+behaviour these budgets were added on top of.
 
 The invariants every test here upholds:
   - nothing is committed unless the rollout actually succeeded
@@ -99,6 +106,7 @@ def _make_manager(buffer, impl, policy) -> RolloutManager:
     manager._retry_policy = policy
     manager._stats = RolloutStats()
     manager._skipped_prompts = 0
+    manager._consecutive_infra_drops = 0
     return manager
 
 
@@ -272,6 +280,122 @@ class TestDataFailures:
         asyncio.run(_drive())
 
 
+class TestInfraDropTolerance:
+    """Exhausting the infra budget need not end the run.
+
+    A fleet large enough to lose the occasional shard would otherwise fail a job over a
+    single unlucky prompt. The budget is on *consecutive* drops so that tolerance never
+    accumulates into ignoring a fleet that has stopped answering altogether -- the same
+    shape as the v1 stack's ``max_generation_failures``.
+    """
+
+    def test_exhaustion_drops_the_prompt_instead_of_failing_the_run(self, no_sleep):
+        buffer = _Buffer()
+        impl = _ScriptedImpl([GenerationUnavailable("shard down")] * 10)
+        manager = _make_manager(
+            buffer,
+            impl,
+            RolloutRetryPolicy.single_attempt(
+                max_infra_attempts=2, max_consecutive_dropped_prompts=3
+            ),
+        )
+
+        outcome = asyncio.run(manager.generate_and_push(_sample()))
+
+        assert outcome is RolloutOutcome.SKIPPED
+        assert impl.attempts == 2, "the retry budget is still spent in full first"
+        assert buffer.commits == [], "a dropped prompt must never reach training"
+        assert len(buffer.removals) == 2, "every reserved slot released"
+
+    def test_a_commit_clears_the_run_of_drops(self, no_sleep):
+        """Tolerance is per-outage, so a recovered fleet starts from zero again."""
+        buffer = _Buffer()
+        # fail, succeed, fail, succeed, ... with a budget of 1 consecutive drop. Four
+        # drops in total, none of them consecutive, so the run survives all of them.
+        impl = _ScriptedImpl([GenerationUnavailable("x"), None] * 4)
+        manager = _make_manager(
+            buffer,
+            impl,
+            RolloutRetryPolicy.single_attempt(max_consecutive_dropped_prompts=1),
+        )
+
+        async def _drive():
+            for _ in range(4):
+                assert await manager.generate_and_push(_sample()) is (
+                    RolloutOutcome.SKIPPED
+                )
+                assert await manager.generate_and_push(_sample()) is (
+                    RolloutOutcome.COMMITTED
+                )
+
+        asyncio.run(_drive())
+
+        assert manager.stats.committed == 4
+        assert manager.stats.max_consecutive_infra_drops == 1
+
+    def test_an_outage_that_does_not_recover_still_fails_the_run(self, no_sleep):
+        buffer = _Buffer()
+        impl = _ScriptedImpl([ray.exceptions.RayActorError()] * 20)
+        manager = _make_manager(
+            buffer,
+            impl,
+            RolloutRetryPolicy.single_attempt(max_consecutive_dropped_prompts=2),
+        )
+
+        async def _drive():
+            assert await manager.generate_and_push(_sample()) is RolloutOutcome.SKIPPED
+            assert await manager.generate_and_push(_sample()) is RolloutOutcome.SKIPPED
+            with pytest.raises(
+                RolloutRedispatchExhausted, match="max_consecutive_dropped_prompts=2"
+            ):
+                await manager.generate_and_push(_sample())
+
+        asyncio.run(_drive())
+
+    def test_the_default_budget_fails_on_the_first_drop(self, no_sleep):
+        """The knob is opt-in: without it, exhaustion ends the run as it always did."""
+        buffer = _Buffer()
+        impl = _ScriptedImpl([GenerationUnavailable("x")] * 5)
+        manager = _make_manager(
+            buffer, impl, RolloutRetryPolicy.single_attempt(max_infra_attempts=2)
+        )
+
+        assert manager._retry_policy.max_consecutive_dropped_prompts == 0
+        with pytest.raises(RolloutRedispatchExhausted):
+            asyncio.run(manager.generate_and_push(_sample()))
+
+    def test_the_infra_budget_is_not_spent_by_data_skips(self, no_sleep):
+        """Sharing one allowance would let a bad dataset mask a dying fleet."""
+        buffer = _Buffer()
+        # Two data skips, then an infra exhaustion. With a shared counter the infra drop
+        # would be the third and would abort; the budgets are independent, so it is the
+        # first infra drop and is tolerated.
+        impl = _ScriptedImpl(
+            [
+                RolloutDataFailure("bad prompt"),
+                RolloutDataFailure("bad prompt"),
+                GenerationUnavailable("shard down"),
+            ]
+        )
+        manager = _make_manager(
+            buffer,
+            impl,
+            RolloutRetryPolicy.single_attempt(
+                max_skipped_prompts=5, max_consecutive_dropped_prompts=1
+            ),
+        )
+
+        async def _drive():
+            for _ in range(3):
+                assert await manager.generate_and_push(_sample()) is (
+                    RolloutOutcome.SKIPPED
+                )
+
+        asyncio.run(_drive())
+
+        assert manager.stats.max_consecutive_infra_drops == 1
+
+
 class TestCancellationIsNeverRetried:
     def test_cancellation_propagates_and_releases_the_slot(self, no_sleep):
         buffer = _Buffer()
@@ -343,3 +467,45 @@ class TestStats:
         assert metrics["rollout/skipped_total"] == 1.0
         assert metrics["rollout/committed_total"] == 0.0
         assert metrics["rollout/data_failures_total/RolloutDataFailure"] == 1.0
+
+    def test_infra_drops_are_distinguishable_from_redispatches(self, no_sleep):
+        """Redispatches alone cannot say whether the fleet recovered; drops can."""
+        buffer = _Buffer()
+        impl = _ScriptedImpl([GenerationUnavailable("x")] * 5)
+        manager = _make_manager(
+            buffer,
+            impl,
+            RolloutRetryPolicy.single_attempt(
+                max_infra_attempts=2, max_consecutive_dropped_prompts=5
+            ),
+        )
+
+        asyncio.run(manager.generate_and_push(_sample()))
+
+        metrics = manager.stats.as_metrics()
+        assert metrics["rollout/infra_drops_total"] == 1.0
+        assert metrics["rollout/infra_drops_total/GenerationUnavailable"] == 1.0
+        # One retry happened before the budget ran out, so both series move -- but by
+        # different amounts, which is the whole reason they are separate.
+        assert metrics["rollout/redispatch_total"] == 1.0
+
+    def test_the_consecutive_high_water_mark_survives_recovery(self, no_sleep):
+        """The live counter resets on commit, so only this records a near-miss."""
+        buffer = _Buffer()
+        impl = _ScriptedImpl([GenerationUnavailable("x")] * 3 + [None])
+        manager = _make_manager(
+            buffer,
+            impl,
+            RolloutRetryPolicy.single_attempt(max_consecutive_dropped_prompts=5),
+        )
+
+        async def _drive():
+            for _ in range(3):
+                await manager.generate_and_push(_sample())
+            await manager.generate_and_push(_sample())
+
+        asyncio.run(_drive())
+
+        metrics = manager.stats.as_metrics()
+        assert metrics["rollout/max_consecutive_infra_drops"] == 3.0
+        assert manager._consecutive_infra_drops == 0, "the commit cleared the live run"

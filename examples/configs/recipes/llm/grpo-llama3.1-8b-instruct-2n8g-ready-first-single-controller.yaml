@@ -1,0 +1,13 @@
+defaults: ./grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2.yaml
+logger:
+  log_dir: logs/grpo-llama3.1-8b-instruct-2n8g-ready-first-sc
+  wandb:
+    name: grpo-llama3.1-8b-instruct-2n8g-ready-first-sc
+grpo:
+  skip_reference_policy_logprobs_calculation: true
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  force_on_policy_ratio: false
+async_rl:
+  sampler:
+    name: ready_first

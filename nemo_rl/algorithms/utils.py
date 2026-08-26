@@ -300,6 +300,10 @@ def get_tokenizer(
                     - "default": Uses the tokenizer's default template
                     - A custom jinja2 template string
                     If not specified, the tokenizer's default template will be used.
+                - tokenizer_kwargs: Extra keyword arguments forwarded to tokenizer
+                  loading, e.g. {"fix_mistral_regex": False}. When
+                  get_processor=True, these are passed through
+                  AutoProcessor.from_pretrained().
         get_processor: Whether to return a processor (via AutoProcessor) instead of a tokenizer.
 
     Returns:
@@ -359,15 +363,21 @@ def get_tokenizer(
     maybe_patch_fastokens(bool(tokenizer_config.get("use_fastokens")))
 
     processor = None
+    tokenizer_kwargs = dict(tokenizer_config.get("tokenizer_kwargs") or {})
 
     if get_processor:
         processor = AutoProcessor.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True, use_fast=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            use_fast=tokenizer_kwargs.pop("use_fast", True),
+            **tokenizer_kwargs,
         )
         tokenizer = processor.tokenizer
     else:
         tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            **tokenizer_kwargs,
         )
 
     if tokenizer.pad_token is None:
@@ -521,8 +531,12 @@ def print_performance_metrics(
     metrics: dict[str, Any],
     timing_metrics: dict[str, float],
     master_config: dict,
+    *,
+    num_prompts_per_step: int,
+    num_generations_per_prompt: int,
+    is_async_rl: bool,
 ) -> dict[str, float]:
-    """Print performance metrics for GRPO."""
+    """Print performance metrics for an RL training step."""
 
     # =====================================================
     # Generate Token Imbalance Visualization
@@ -739,10 +753,10 @@ def print_performance_metrics(
     total_num_gpus = num_nodes * gpus_per_node
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
-    # Idle Time from Training Worker (Async GRPO only)
+    # Idle time from the training worker in async RL.
     if (
         "exposed_generation" in timing_metrics
-        and master_config.grpo.async_grpo.enabled
+        and is_async_rl
         and not colocated_inference
     ):
         exposed_generation_time = timing_metrics["exposed_generation"]
@@ -764,15 +778,6 @@ def print_performance_metrics(
             training_worker_idle_time_ratio
         )
 
-    # Detect which algorithm config key is being used
-    grpo_config = getattr(master_config, "grpo", None)
-    algo_config = grpo_config or getattr(master_config, "ppo", None) or {}
-    if isinstance(algo_config, dict):
-        num_prompts_per_step = algo_config.get("num_prompts_per_step", 1)
-        num_generations_per_prompt = algo_config.get("num_generations_per_prompt", 1)
-    else:
-        num_prompts_per_step = algo_config.num_prompts_per_step
-        num_generations_per_prompt = algo_config.num_generations_per_prompt
     number_of_samples_per_step = num_prompts_per_step * num_generations_per_prompt
 
     if colocated_inference:
@@ -920,13 +925,13 @@ def print_performance_metrics(
     return performance_metrics
 
 
-def log_generation_metrics_to_wandb(
+def log_generation_metrics(
     generation_logger_metrics: dict[str, dict[int, list[Any]]],
     step: int,
     timeline_interval: float,
     logger: Logger,
 ) -> None:
-    """Log generation metrics to wandb.
+    """Log generation metric timelines to every configured logger backend.
 
     Args:
         generation_logger_metrics: Dictionary of generation logger metrics
