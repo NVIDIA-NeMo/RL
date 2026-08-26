@@ -1291,7 +1291,9 @@ class VllmGeneration(GenerationInterface):
             clear_cache=clear_cache,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
-        return all(ray.get(futures))
+        if not all(ray.get(futures)):
+            raise RuntimeError("Failed to pause every async vLLM engine")
+        return True
 
     def resume_generation(self) -> bool:
         """Resume every async vLLM engine paused for refit."""
@@ -1304,7 +1306,9 @@ class VllmGeneration(GenerationInterface):
             "resume_generation_async",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
-        return all(ray.get(futures))
+        if not all(ray.get(futures)):
+            raise RuntimeError("Failed to resume every async vLLM engine")
+        return True
 
     @property
     def requires_kv_scale_sync(self) -> bool:

@@ -490,9 +490,11 @@ class GenerationInterface(ABC):
     def pause_generation(self, *, clear_cache: bool) -> bool:
         """Pause in-flight generation while preserving request state.
 
-        Backends with native in-flight refit support may override this hook.
-        In-flight requests are frozen rather than aborted and resume from
-        :meth:`resume_generation`; new requests queue until then.
+        Backends with native in-flight refit support override this hook. The default
+        implementation warns and lets the refit continue with the backend's existing
+        in-flight behavior. On supported backends, in-flight requests are frozen
+        rather than aborted and resume from :meth:`resume_generation`; new requests
+        queue until then.
 
         Args:
             clear_cache: Also clear the engine's reusable caches at pause time so
@@ -500,17 +502,28 @@ class GenerationInterface(ABC):
 
         Returns:
             True if every engine paused; False when the backend has no native pause
-            support or did not pause successfully.
+            support. Backends with native support raise when pausing fails.
         """
+        print(
+            f"⚠️ {type(self).__name__} does not support pausing generation during "
+            "in-flight weight updates; continuing without native pause"
+        )
         return False
 
     def resume_generation(self) -> bool:
         """Resume generation paused by :meth:`pause_generation`.
 
+        The default implementation warns and lets the refit continue for backends
+        without native pause/resume support.
+
         Returns:
             True if every engine resumed; False when the backend has no native resume
-            support or did not resume successfully.
+            support. Backends with native support raise when resuming fails.
         """
+        print(
+            f"⚠️ {type(self).__name__} does not support resuming generation after "
+            "in-flight weight updates; continuing"
+        )
         return False
 
     def blocks_training(self) -> bool:

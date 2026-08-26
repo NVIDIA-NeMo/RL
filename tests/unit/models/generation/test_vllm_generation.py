@@ -210,6 +210,29 @@ def test_vllm_generation_broadcasts_native_pause_and_resume(
     )
 
 
+def test_vllm_generation_rejects_partial_pause_and_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": True}}
+    generation.worker_group = MagicMock()
+    generation.worker_group.workers = [object(), object()]
+    generation.worker_group.run_all_workers_single_data.return_value = [
+        object(),
+        object(),
+    ]
+    monkeypatch.setattr(
+        ray,
+        "get",
+        MagicMock(side_effect=[[True, False], [False, True]]),
+    )
+
+    with pytest.raises(RuntimeError, match="pause every async vLLM engine"):
+        generation.pause_generation(clear_cache=False)
+    with pytest.raises(RuntimeError, match="resume every async vLLM engine"):
+        generation.resume_generation()
+
+
 def test_sampling_params_preserve_bad_words():
     worker = object.__new__(VllmGenerationWorkerImpl)
     worker.cfg = {

@@ -61,6 +61,7 @@ from nemo_rl.experience.interfaces import (
     PENDING_PROMPTS_KEY,
     RETAINED_TASK_INDICES_KEY,
 )
+from nemo_rl.models.generation.interfaces import GenerationInterface
 
 
 @ray.remote(num_cpus=0)
@@ -105,6 +106,8 @@ class MockGenerationInterface:
         self.finish_calls = 0
         self.pause_generation_calls: list[bool] = []
         self.resume_generation_calls = 0
+        self.pause_generation_supported = True
+        self.resume_generation_supported = True
 
     def prepare_for_generation(self, **kwargs):
         self.prepare_calls += 1
@@ -114,11 +117,15 @@ class MockGenerationInterface:
 
     def pause_generation(self, *, clear_cache: bool) -> bool:
         self.pause_generation_calls.append(clear_cache)
-        return True
+        if self.pause_generation_supported:
+            return True
+        return GenerationInterface.pause_generation(self, clear_cache=clear_cache)
 
     def resume_generation(self) -> bool:
         self.resume_generation_calls += 1
-        return True
+        if self.resume_generation_supported:
+            return True
+        return GenerationInterface.resume_generation(self)
 
 
 class TestReplayBufferImplCheckpointing:
@@ -2422,17 +2429,19 @@ class TestAsyncTrajectoryCollector:
         collector.policy_generation.invalidate_kv_cache.assert_not_called()
         assert collector._refit_pause_cleared.is_set()
 
-    def test_vllm_pause_failure_keeps_collection_paused(self) -> None:
+    def test_generation_pause_error_keeps_collection_paused(self) -> None:
         collector = self.create_local_collector()
         collector.master_config.policy["generation"] = {
             "backend": "vllm",
             "vllm_cfg": {"async_engine": True},
         }
         collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
-        collector.policy_generation.pause_generation = mock.Mock(return_value=False)
+        collector.policy_generation.pause_generation = mock.Mock(
+            side_effect=RuntimeError("worker pause failed")
+        )
         collector.wait_for_pending_generations = mock.Mock()
 
-        with pytest.raises(RuntimeError, match="Failed to pause vLLM generation"):
+        with pytest.raises(RuntimeError, match="worker pause failed"):
             collector.prepare_for_refit()
 
         collector.wait_for_pending_generations.assert_not_called()
@@ -2454,29 +2463,45 @@ class TestAsyncTrajectoryCollector:
         assert collector.policy_generation.pause_generation_calls == []
         collector.wait_for_pending_generations.assert_called_once_with()
 
-    def test_non_vllm_async_backend_keeps_legacy_in_flight_path(self) -> None:
+    def test_non_vllm_async_backend_uses_pause_contract_and_legacy_fallback(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         collector = self.create_local_collector()
         collector.master_config.policy["generation"] = {"backend": "megatron"}
-        collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
+        async_cfg = collector.master_config.grpo.async_grpo
+        async_cfg.in_flight_weight_updates = True
+        async_cfg.recompute_kv_cache_after_weight_updates = False
+        collector.policy_generation.pause_generation_supported = False
+        collector.policy_generation.resume_generation_supported = False
         collector.wait_for_pending_generations = mock.Mock()
 
         collector.prepare_for_refit()
 
-        assert collector.policy_generation.pause_generation_calls == []
+        assert collector.policy_generation.pause_generation_calls == [False]
         collector.wait_for_pending_generations.assert_not_called()
         assert not collector._refit_pause_cleared.is_set()
 
-    def test_vllm_resume_failure_keeps_collection_paused(self) -> None:
+        collector.resume_after_refit()
+
+        assert collector.policy_generation.resume_generation_calls == 1
+        assert collector._refit_pause_cleared.is_set()
+        output = capsys.readouterr().out
+        assert "does not support pausing generation" in output
+        assert "does not support resuming generation" in output
+
+    def test_resume_failure_after_successful_pause_keeps_collection_paused(
+        self,
+    ) -> None:
         collector = self.create_local_collector()
         collector.master_config.policy["generation"] = {
             "backend": "vllm",
             "vllm_cfg": {"async_engine": True},
         }
         collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
+        collector.prepare_for_refit()
         collector.policy_generation.resume_generation = mock.Mock(return_value=False)
-        collector._refit_pause_cleared.clear()
 
-        with pytest.raises(RuntimeError, match="Failed to resume vLLM generation"):
+        with pytest.raises(RuntimeError, match="after successful pause"):
             collector.resume_after_refit()
 
         assert not collector._refit_pause_cleared.is_set()
