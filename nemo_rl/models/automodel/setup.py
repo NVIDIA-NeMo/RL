@@ -795,6 +795,7 @@ def setup_model_and_optimizer(
                 torch_dtype=draft_dtype,
                 mesh=device_mesh["dp_cp"],
                 target_num_hidden_layers=target_text_config.num_hidden_layers,
+                policy_model=model,
             )
             draft_learning_rate = float(eagle3_options.learning_rate)
             draft_ttt_steps = int(eagle3_options.ttt_steps)

@@ -41,6 +41,14 @@ DSPARK_REQUIRED_CONFIG_FIELDS = ("block_size", "target_layer_ids", "mask_token_i
 DRAFT_CHECKPOINT_DIRNAME = "draft"
 DSPARK_META_FILENAME = "dspark_meta.json"
 
+# eagle3 checkpoints exported by SGLang SpecForge (e.g.
+# lmsys/SGLang-EAGLE3-*): a plain HF-style flat config (no speculators
+# wrapper), one decoder layer under the "midlayer." key prefix instead of
+# the vendored model's "layers.0.", and no embed_tokens of their own (the
+# drafter shares the target model's embedding table). See
+# _adapt_native_flat_eagle3_config / _load_native_eagle3_weights.
+NATIVE_FLAT_EAGLE3_ARCHS = ("LlamaForCausalLMEagle3",)
+
 
 def load_draft_hf_config(
     model_name: str,
@@ -82,10 +90,16 @@ def load_draft_hf_config(
             )
         return _adapt_speculators_dspark_config(config_dict, algo=algo)
     if algo == "eagle3":
-        raise ValueError(
-            f"Draft checkpoint {model_name} is not speculators-format; only "
-            "speculators-format eagle3 checkpoints are supported on the "
-            "DTensor-v2 path."
+        architectures = config_dict.get("architectures") or []
+        if not any(arch in architectures for arch in NATIVE_FLAT_EAGLE3_ARCHS):
+            raise ValueError(
+                f"Draft checkpoint {model_name} is not speculators-format and "
+                f"does not declare one of {list(NATIVE_FLAT_EAGLE3_ARCHS)}; only "
+                "speculators-format and SGLang SpecForge-style eagle3 "
+                "checkpoints are supported on the DTensor-v2 path."
+            )
+        return _adapt_native_flat_eagle3_config(
+            config_dict, model_name, target_num_hidden_layers
         )
     flat_config = AutoConfig.from_pretrained(model_name)
     if not hasattr(flat_config, "sample_from_anchor"):
@@ -225,6 +239,49 @@ def _adapt_speculators_eagle3_config(
             )
         aux_ids = default_eagle3_aux_layer_ids_vllm(target_num_hidden_layers)
     adapted.target_layer_ids = [int(i) - 1 for i in aux_ids]
+    return adapted
+
+
+def _adapt_native_flat_eagle3_config(
+    config_dict: dict[str, Any],
+    model_name: str,
+    target_num_hidden_layers: Optional[int],
+) -> Any:
+    """Adapt a native (non-speculators) flat eagle3 config, e.g. SpecForge.
+
+    Unlike the speculators family, these configs load through AutoConfig
+    directly (draft_vocab_size etc. sit at the top level, model_type is a
+    real HF value); what they don't record is the aux capture layer ids or
+    the first-layer residual convention, so both are filled in the same way
+    as the speculators adapter does when a checkpoint pins neither.
+    """
+    from transformers import AutoConfig
+
+    adapted = AutoConfig.from_pretrained(model_name)
+    adapted._attn_implementation = "sdpa"
+    if not getattr(adapted, "draft_vocab_size", None):
+        raise ValueError(
+            f"eagle3 draft checkpoint {model_name} config is missing "
+            "draft_vocab_size."
+        )
+    aux_ids = config_dict.get("eagle_aux_hidden_state_layer_ids") or config_dict.get(
+        "aux_hidden_state_layer_ids"
+    )
+    if not aux_ids:
+        if target_num_hidden_layers is None:
+            raise ValueError(
+                f"eagle3 draft checkpoint {model_name} pins no aux layer ids "
+                "and no target layer count was provided to derive vLLM's "
+                "default selection."
+            )
+        aux_ids = default_eagle3_aux_layer_ids_vllm(target_num_hidden_layers)
+    adapted.target_layer_ids = [int(i) - 1 for i in aux_ids]
+    if not hasattr(adapted, "norm_before_residual"):
+        # Not recorded in the checkpoint and not independently verified
+        # against the SpecForge training source -- confirm empirically
+        # (does draft_loss/accept_rate converge sanely?) before trusting a
+        # run's numbers, and flip this if it turns out wrong.
+        adapted.norm_before_residual = False
     return adapted
 
 
@@ -368,16 +425,28 @@ def build_eagle3_draft_model(
     torch_dtype: torch.dtype,
     mesh: Any,
     target_num_hidden_layers: int,
+    policy_model: Optional[nn.Module] = None,
 ) -> Qwen3Eagle3DraftModel:
-    """Build, validate, and FSDP2-shard an EAGLE3 draft from a checkpoint."""
+    """Build, validate, and FSDP2-shard an EAGLE3 draft from a checkpoint.
+
+    ``policy_model`` is only required for native-flat (SpecForge-style)
+    checkpoints, which ship no ``embed_tokens`` of their own -- see
+    ``_load_native_eagle3_weights``.
+    """
     draft_hf_config = load_draft_hf_config(
         model_name, algo="eagle3", target_num_hidden_layers=target_num_hidden_layers
     )
     # "Eagle3DraftModel" is the current speculators class name (e.g.
     # RedHatAI/Qwen3-30B-A3B-Instruct-2507-speculator.eagle3);
     # "Eagle3Speculator" is an older speculators naming that some earlier
-    # checkpoints still carry.
-    accepted_archs = ("Eagle3Speculator", "Eagle3DraftModel", "Qwen3Eagle3DraftModel")
+    # checkpoints still carry; NATIVE_FLAT_EAGLE3_ARCHS covers non-speculators
+    # exports (e.g. SGLang SpecForge).
+    accepted_archs = (
+        "Eagle3Speculator",
+        "Eagle3DraftModel",
+        "Qwen3Eagle3DraftModel",
+        *NATIVE_FLAT_EAGLE3_ARCHS,
+    )
     architectures = getattr(draft_hf_config, "architectures", None) or []
     if not any(arch in architectures for arch in accepted_archs):
         raise ValueError(
@@ -390,11 +459,15 @@ def build_eagle3_draft_model(
             f"{eagle3_options.ttt_steps}."
         )
 
-    draft_model = Qwen3Eagle3DraftModel.from_pretrained(
-        model_name,
-        config=draft_hf_config,
-        torch_dtype=torch_dtype,
-    )
+    if any(arch in architectures for arch in NATIVE_FLAT_EAGLE3_ARCHS):
+        draft_model = Qwen3Eagle3DraftModel(draft_hf_config).to(torch_dtype)
+        _load_native_eagle3_weights(draft_model, model_name, policy_model)
+    else:
+        draft_model = Qwen3Eagle3DraftModel.from_pretrained(
+            model_name,
+            config=draft_hf_config,
+            torch_dtype=torch_dtype,
+        )
     draft_model = draft_model.to("cuda")
 
     draft_model.requires_grad_(True)
@@ -406,6 +479,68 @@ def build_eagle3_draft_model(
         fully_shard(layer, mesh=mesh)
     fully_shard(draft_model, mesh=mesh)
     return draft_model
+
+
+def _load_native_eagle3_weights(
+    draft_model: Qwen3Eagle3DraftModel,
+    model_name: str,
+    policy_model: Optional[nn.Module],
+) -> None:
+    """Load a native (SGLang SpecForge-style) eagle3 checkpoint's weights.
+
+    These checkpoints publish their single decoder layer under the
+    ``midlayer.`` key prefix (the vendored model's ``nn.ModuleList`` uses
+    ``layers.0.``) and ship no ``embed_tokens`` at all -- the drafter is
+    meant to share the target model's embedding table. True weight tying
+    (aliasing the same ``nn.Parameter``) isn't possible here: the draft and
+    policy are ``fully_shard``-ed on different device meshes, so this copies
+    the policy's embedding VALUES once at init instead (matching how the
+    megatron eagle path backfills a checkpoint's missing lm_head from the
+    policy) and lets the copy train independently thereafter, governed by
+    ``train_embed_and_head`` like the rest of the embedding/head.
+    """
+    import os
+
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+
+    weights_path = (
+        os.path.join(model_name, "model.safetensors")
+        if os.path.isdir(model_name)
+        else hf_hub_download(model_name, "model.safetensors")
+    )
+    state_dict = {
+        (key.replace("midlayer.", "layers.0.", 1) if key.startswith("midlayer.") else key): value
+        for key, value in load_file(weights_path).items()
+    }
+
+    if policy_model is None:
+        raise ValueError(
+            f"eagle3 draft checkpoint {model_name} ships no embed_tokens weight "
+            "(it expects to share the target model's embedding table), but no "
+            "policy model was provided to copy it from."
+        )
+    policy_base, _ = _resolve_layers(policy_model)
+    policy_embed = getattr(policy_base, "embed_tokens", None)
+    if policy_embed is None:
+        raise ValueError(
+            f"Cannot initialize eagle3 draft embed_tokens for {model_name}: the "
+            "policy model has no `.embed_tokens`."
+        )
+    embed_weight = policy_embed.weight.detach()
+    if isinstance(embed_weight, DTensor):
+        embed_weight = embed_weight.full_tensor()
+    state_dict["embed_tokens.weight"] = embed_weight.to(
+        draft_model.embed_tokens.weight.dtype
+    )
+
+    missing, unexpected = draft_model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        raise ValueError(
+            f"eagle3 native checkpoint {model_name} state dict mismatch after "
+            f"the midlayer->layers.0 remap: missing={missing}, "
+            f"unexpected={unexpected}."
+        )
 
 
 def _resolve_layers(
