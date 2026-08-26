@@ -46,13 +46,15 @@ DP_TRAIN_FIELDS = (
 
 # Full known tensor schema for SingleController's long-lived rollout partition.
 # The initial rollout put writes the first seven payload fields; later stages add
-# student/reference logprobs, advantages, and the MOPD teacher column. Registering
-# their names once before concurrent producers start avoids TransferQueue's lazy
-# field-name registration race.
+# student/reference logprobs, advantages, PPO critic columns, and the MOPD teacher
+# column. Registering their names once before concurrent producers start avoids
+# TransferQueue's lazy field-name registration race.
 SC_ROLLOUT_SCHEMA_FIELDS = (
     *DP_TRAIN_FIELDS,
     "prompt_ids_for_adv",
     "total_reward",
+    "values",
+    "returns",
     "teacher_reference_logprobs",
 )
 
@@ -66,6 +68,23 @@ LP_SEED_FIELDS = (
 
 # Text-only inputs fetched by frozen MOPD teachers for logprob inference.
 TEACHER_LP_FIELDS = (INPUT_IDS, INPUT_LENGTHS)
+
+# Kept out of DP_TRAIN_FIELDS: a GRPO run writes neither, and a worker fetching
+# a column nobody wrote errors out rather than reading zeros.
+PPO_VALUE_FIELDS = (
+    "values",
+    "returns",
+)
+
+DP_VALUE_TRAIN_FIELDS = (
+    "input_ids",
+    "input_lengths",
+    "token_mask",
+    "sample_mask",
+    *PPO_VALUE_FIELDS,
+)
+
+VALUE_SEED_FIELDS = LP_SEED_FIELDS
 
 # Fields requested for KV-scale calibration. Positive include-list:
 # calibration only handles seq-dim tensor inputs, so we name them

@@ -48,6 +48,8 @@ TOKEN_ALIGNED_FIELDS = frozenset(
         "reference_policy_logprobs",
         "teacher_reference_logprobs",
         "advantages",
+        "returns",
+        "values",
         "token_mask",
         "sample_mask",
         "routed_experts",

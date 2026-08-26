@@ -191,11 +191,11 @@ Choose among colocated IPC, NCCL, sparse delta, and NIXL refit transports.
 Use NIXL checkpoint-engine refit to update non-colocated vLLM generation workers from policy workers.
 :::
 
-:::{grid-item-card} {octicon}`workflow` Single-Controller (Async GRPO)
+:::{grid-item-card} {octicon}`workflow` Single-Controller (Async GRPO and PPO)
 :link: guides/single-controller
 :link-type: doc
 
-Run async GRPO via the SingleController path: TransferQueue data plane, pluggable staleness samplers, and streaming trainer.
+Run async GRPO or PPO via the SingleController path: TransferQueue data plane, pluggable staleness samplers, and streaming trainer.
 :::
 
 ::::

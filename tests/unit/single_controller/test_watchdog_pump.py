@@ -81,6 +81,7 @@ def _make_controller(
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_steps=max_num_steps)
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = SimpleNamespace(stats=stats)
     ctrl._inflight_rollouts = inflight
     ctrl._train_steps = train_steps

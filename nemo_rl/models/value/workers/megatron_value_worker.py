@@ -52,6 +52,7 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -216,7 +217,7 @@ def _value_loss_prepare_fn(
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
-class MegatronValueWorkerImpl(AbstractPolicyWorker):
+class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
     """Megatron-Core based value function worker for PPO.
 
     This worker wraps a Megatron-Core GPT model backbone with a value head
@@ -237,6 +238,51 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             return f"{self.__class__.__qualname__}[rank={torch.distributed.get_rank()}]"
         else:
             return f"{self.__class__.__qualname__}"
+
+    def _local_coords(self) -> dict[str, int]:
+        """Axis to local-rank mapping. Deliberate copy of MegatronPolicyWorkerImpl."""
+        if not torch.distributed.is_initialized():
+            return {}
+        return {
+            "tensor_parallel": parallel_state.get_tensor_model_parallel_rank(),
+            "context_parallel": parallel_state.get_context_parallel_rank(),
+            "pipeline_parallel": parallel_state.get_pipeline_model_parallel_rank(),
+        }
+
+    def _get_replica_group(self) -> Optional[Any]:
+        """Replica group = TP x CP x PP siblings within this DP rank.
+
+        Deliberate copy of MegatronPolicyWorkerImpl._get_replica_group; see
+        there for why it is never gated on CP > 1 and why new_group has to be
+        called collectively.
+        """
+        if not torch.distributed.is_initialized():
+            return None
+        cached = getattr(self, "_replica_group_cache", "uninit")
+        if cached != "uninit":
+            return cached
+
+        world_size = torch.distributed.get_world_size()
+        my_dp_rank = parallel_state.get_data_parallel_rank()
+        my_replica_ranks_t = torch.full(
+            (world_size,),
+            -1,
+            dtype=torch.long,
+            device="cuda",
+        )
+        my_replica_ranks_t[torch.distributed.get_rank()] = my_dp_rank
+        torch.distributed.all_reduce(
+            my_replica_ranks_t, op=torch.distributed.ReduceOp.MAX
+        )
+        all_dp_ranks = my_replica_ranks_t.tolist()
+
+        groups: dict[int, Any] = {}
+        for dp in sorted(set(all_dp_ranks)):
+            ranks = [r for r, d in enumerate(all_dp_ranks) if d == dp]
+            grp = torch.distributed.new_group(ranks=ranks, backend="nccl")
+            groups[dp] = grp
+        self._replica_group_cache = groups[my_dp_rank]
+        return self._replica_group_cache
 
     @staticmethod
     def configure_worker(
