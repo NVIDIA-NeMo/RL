@@ -104,3 +104,47 @@ def test_a_clean_run_still_returns_its_summary():
 
     result = asyncio.run(asyncio.wait_for(ctrl.run(), timeout=5.0))
     assert result == {"train_steps": 7, "trainer_version": 7}
+
+
+class _Boom(RuntimeError):
+    """Distinct from RolloutStall so a test cannot pass on the wrong task."""
+
+
+def _fails_after(delay):
+    async def _pump():
+        await asyncio.sleep(delay)
+        raise _Boom("simulated failure")
+
+    return _pump
+
+
+def test_a_rollout_failure_propagates_while_the_train_pump_is_still_working():
+    """The loop's comment says rollout failures propagate immediately. The
+    three tests above only ever have the rollout pump exhaust cleanly or never
+    finish, so nothing exercised the raise. Under a loop that stops watching,
+    a failed rollout task sits in `pending` unawaited while run() parks on the
+    train pump -- the job then holds its GPUs until the scheduler kills it.
+    """
+    ctrl = _bare_actor()
+    ctrl._rollout_pump = _fails_after(0.02)
+    ctrl._train_pump = _wedged
+    ctrl._stall_watchdog_pump = _wedged
+
+    with pytest.raises(_Boom):
+        asyncio.run(asyncio.wait_for(ctrl.run(), timeout=5.0))
+
+
+def test_the_fleet_probe_still_aborts_after_the_rollout_pump_exhausts():
+    """`_bare_actor` sets `_gen_fleet = None`, so no test above creates the
+    probe task at all and the `probe_task in done` branch is unreached. Fleet
+    health is the seconds-scale liveness signal; the probe pump loops forever,
+    so it finishing means it raised."""
+    ctrl = _bare_actor()
+    ctrl._gen_fleet = object()  # truthy -> run() creates the probe task
+    ctrl._rollout_pump = _exhausts
+    ctrl._train_pump = _wedged
+    ctrl._stall_watchdog_pump = _wedged
+    ctrl._gen_fleet_probe_pump = _fails_after(0.02)
+
+    with pytest.raises(_Boom):
+        asyncio.run(asyncio.wait_for(ctrl.run(), timeout=5.0))
