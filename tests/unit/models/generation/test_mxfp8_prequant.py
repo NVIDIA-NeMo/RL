@@ -75,6 +75,14 @@ def test_last_dim_not_divisible_raises():
         _mxfp8_e4m3_quantize_torch(x)
 
 
+def test_refit_quantize_preserves_single_scale_block_dimension():
+    x = torch.randn(8, MXFP8_BLOCK_SIZE, dtype=torch.bfloat16)
+
+    _, scales = mxfp8_e4m3_quantize_for_refit(x)
+
+    assert scales.shape == (8, 1)
+
+
 def test_blackwell_refit_prequantization_requires_flashinfer(monkeypatch):
     class FakeBlackwellTensor:
         is_cuda = True

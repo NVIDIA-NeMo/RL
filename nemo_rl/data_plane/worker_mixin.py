@@ -15,7 +15,8 @@
 
 Mix into a worker class to add per-rank TQ-mediated entrypoints
 (:meth:`train_presharded`, :meth:`get_logprobs_presharded`,
-:meth:`get_reference_policy_logprobs_presharded`) without touching
+:meth:`get_reference_policy_logprobs_presharded`, and the frozen-teacher
+variant) without touching
 ``BasePolicyWorker``. Subclasses that don't need TQ keep their bare
 inheritance and stay zero-cost.
 
@@ -522,6 +523,41 @@ class TQWorkerMixin:
             result,
             result_key="reference_logprobs",
             tq_field="reference_policy_logprobs",
+        )
+        del result
+
+    @wrap_with_nvtx_name("policy_worker/get_teacher_logprobs_presharded")
+    def get_teacher_logprobs_presharded(
+        self,
+        meta: "KVBatchMeta",
+        micro_batch_size: Optional[int] = None,
+    ) -> None:
+        """Per-rank frozen-teacher logprob entrypoint for SingleController MOPD."""
+        data = self._fetch(meta)
+        cfg = getattr(self, "cfg", {})
+        batching_enabled = bool(
+            cfg.get("sequence_packing", {}).get("enabled", False)
+            or cfg.get("dynamic_batching", {}).get("enabled", False)
+        )
+        extra = meta.extra_info or {}
+        if batching_enabled and not (
+            MICRO_BATCH_INDICES in extra and MICRO_BATCH_LENGTHS in extra
+        ):
+            raise RuntimeError(
+                "SingleController teacher batching requires driver-provided global "
+                "micro_batch_indices and micro_batch_lengths; local worker planning "
+                "can desynchronize data-parallel collectives."
+            )
+        data = self._attach_or_repack_pack_metadata(data, meta)
+        result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
+            data=data,
+            micro_batch_size=micro_batch_size,
+        )
+        self._write_back_result_field(
+            meta,
+            result,
+            result_key="logprobs",
+            tq_field="teacher_reference_logprobs",
         )
         del result
 

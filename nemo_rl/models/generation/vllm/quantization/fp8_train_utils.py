@@ -64,7 +64,7 @@ def mxfp8_e4m3_quantize_for_refit(
     """Quantize a weight to MXFP8 on the trainer for pre-quantized refit.
 
     Mirrors the receiver path in quantization/fp8.py load_weights
-    (mxfp8_e4m3_quantize + scale squeeze) so the streamed E4M3 data and
+    (mxfp8_e4m3_quantize + scale reshape) so the streamed E4M3 data and
     *_scale_from_checkpoint scales load bit-identically without receiver-side
     re-quantization. Uses the same flashinfer kernel as vLLM on Blackwell and
     the torch reference elsewhere.
@@ -86,7 +86,7 @@ def mxfp8_e4m3_quantize_for_refit(
                 x_scales = x_scales.view(x.size(0), -1)
     if x_q is None or x_scales is None:
         x_q, x_scales = _mxfp8_e4m3_quantize_torch(x)
-    x_scales = torch.squeeze(x_scales, dim=-1)
+    x_scales = x_scales.reshape(*x.shape[:-1], x.shape[-1] // MXFP8_BLOCK_SIZE)
     # Match the receiver path's zero-scale clamp: an E8M0 byte of 0 (2^-127)
     # destabilizes the TRTLLM kernels, and pre-quantized tensors skip the
     # receiver-side quantize branch where the clamp normally runs.

@@ -46,6 +46,7 @@ TOKEN_ALIGNED_FIELDS = frozenset(
         "generation_logprobs",
         "prev_logprobs",
         "reference_policy_logprobs",
+        "teacher_reference_logprobs",
         "advantages",
         "returns",
         "values",
