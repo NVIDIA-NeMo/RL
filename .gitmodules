@@ -5,10 +5,9 @@
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
-	# Day-0 Qwen4Exp/Engram support. This private branch carries the corrected
-	# QSA indexer implementation required by BrightDelta final weights.
-	url = git@github.com:sharonyu-115/Automodel-day0.git
-	branch = shuangy/fix/qwen4-ple-compute-dtype
+	# Qwen3.8 FlashNext release branch. The branch is populated for release.
+	url = https://github.com/NVIDIA-NeMo/Automodel.git
+	branch = huiyingl/feat/qwen3-8-flash-next-rl
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
 	url = https://github.com/NVIDIA-NeMo/Gym.git
