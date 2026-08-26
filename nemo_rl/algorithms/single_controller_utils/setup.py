@@ -410,8 +410,7 @@ def _generation_max_seq_len(generation_config) -> int:
     """Return the per-backend max sequence length.
 
     vllm uses vllm_cfg.max_model_len; sglang uses sglang_cfg.context_length;
-    megatron generation has no dedicated field and routes max_new_tokens
-    through as max_sequence_length on the inference worker.
+    megatron uses mcore_generation_config.max_model_len.
     """
     backend = generation_config["backend"]
     if backend == "vllm":
@@ -419,7 +418,7 @@ def _generation_max_seq_len(generation_config) -> int:
     if backend == "sglang":
         return generation_config["sglang_cfg"]["context_length"]
     if backend == "megatron":
-        return generation_config["max_new_tokens"]
+        return generation_config["mcore_generation_config"]["max_model_len"]
     raise ValueError(f"Unknown generation backend: {backend!r}")
 
 

@@ -48,11 +48,13 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
         enabled: true
       generation:
         backend: "megatron"
+        mcore_generation_config:
+          expose_http_server: true  # required for NeMo-Gym rollouts
         colocated:
           enabled: false
           resources:
             num_nodes: 1
-            gpus_per_node: 4
+            gpus_per_node: 1  # inference GPUs; remainder go to training
     ```
 
 3. **One RL step = one optimizer step.** The SC train pump does not support multi-mini-step inside a single RL step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)):
