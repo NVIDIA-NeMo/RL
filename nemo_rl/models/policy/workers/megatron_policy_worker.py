@@ -79,7 +79,10 @@ from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_obj_from_pp_rank,
     broadcast_tensors_from_last_stage,
 )
-from nemo_rl.models.megatron.router_replay import router_replay_enabled
+from nemo_rl.models.megatron.router_replay import (
+    router_replay_dimensions,
+    router_replay_enabled,
+)
 from nemo_rl.models.megatron.setup import (
     build_inference_model,
     finalize_megatron_setup,
@@ -339,6 +342,10 @@ class MegatronPolicyWorkerImpl(
             "context_parallel": parallel_state.get_context_parallel_rank(),
             "pipeline_parallel": parallel_state.get_pipeline_model_parallel_rank(),
         }
+
+    def _routed_experts_dimensions(self) -> tuple[int, int]:
+        """Return route dimensions from the initialized Megatron model config."""
+        return router_replay_dimensions(self._get_model_config())
 
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.
