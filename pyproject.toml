@@ -150,6 +150,7 @@ vllm = [
   "vllm==0.26.0 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.14",
+  "flashinfer-cubin==0.6.14",
   "flashinfer-jit-cache==0.6.14",
   "nvidia-cutlass-dsl[cu13]==4.6.0",
 ]
@@ -285,6 +286,7 @@ mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "a14b1dff
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
+flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
@@ -311,6 +313,11 @@ explicit = true
 [[tool.uv.index]]
 name = "flashinfer-cu130"
 url = "https://flashinfer.ai/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer"
+url = "https://flashinfer.ai/whl"
 explicit = true
 
 [tool.uv]
@@ -435,10 +442,17 @@ constraint-dependencies = [
   "opencv-python-headless>=5.0.0",            # CVE floor: patches CVE-2025-9951, CVE-2025-1594, CVE-2024-31582 (bundled FFmpeg 5.1.6 in 4.x)
 ]
 
-# Workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base
-# and libs-cu13 wheels overlap and race on shared paths. libs-cu13 is a
-# functional superset at 4.5.2, so drop libs-base to make installs deterministic.
-exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
+# CUTLASS DSL 4.5.x ships overlapping base and cu13 wheels, while 4.6.x
+# requires libs-base/libs-core for common Python and MLIR modules. Keep the
+# workaround scoped to the 4.5.x versions present in this lockfile.
+exclude-dependencies = [
+  { package = { name = "nvidia-cutlass-dsl", version = "4.5.0" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
+  { package = { name = "nvidia-cutlass-dsl", version = "4.5.1" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
+  { package = { name = "nvidia-cutlass-dsl", version = "4.5.2" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
+  { package = { name = "nvidia-cutlass-dsl-libs-cu13", version = "4.5.0" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
+  { package = { name = "nvidia-cutlass-dsl-libs-cu13", version = "4.5.1" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
+  { package = { name = "nvidia-cutlass-dsl-libs-cu13", version = "4.5.2" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
+]
 
 conflicts = [
   [
