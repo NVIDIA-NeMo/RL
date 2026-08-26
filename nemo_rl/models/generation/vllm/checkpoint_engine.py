@@ -85,6 +85,9 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
 
     checkpoint_engine: "CheckpointEngine"
 
+    def _validate_checkpoint_engine_weight_update(self) -> None:
+        """Run worker-specific compatibility checks before receiving weights."""
+
     def checkpoint_engine_total_memory_bytes(self) -> int:
         device = torch.cuda.current_device()
         return torch.cuda.get_device_properties(device).total_memory
@@ -137,6 +140,7 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
             checkpoint_engine.finalize()
 
     async def _update_weights_from_checkpoint_engine_async(self) -> bool:
+        self._validate_checkpoint_engine_weight_update()
         loaded_tensors = 0
         loaded_bytes = 0
         loaded_batches = 0

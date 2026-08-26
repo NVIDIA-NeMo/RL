@@ -11,11 +11,11 @@ policy:
       is_mx: true
       refit_prequantize: true
       refit_cache_loader_routes: true
-      quantization_ignored_layer_kws:
-        - q_proj
-        - k_proj
-        - v_proj
-        - o_proj
+      quantization_ignore_patterns:
+        - model.layers.*.self_attn.*
+        - lm_head
+    vllm_kwargs:
+      moe_backend: flashinfer_trtllm
 logger:
   log_dir: logs/grpo-qwen3-32b-8n4g-async-1off-mxfp8-rollout
   wandb:

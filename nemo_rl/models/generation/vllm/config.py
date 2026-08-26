@@ -73,6 +73,11 @@ class VllmSpecificArgs(TypedDict):
     refit_prequantize: NotRequired[bool]
     # Cache and replay stable vLLM weight-loader routes across refits.
     refit_cache_loader_routes: NotRequired[bool]
+    # Deprecated in 0.8. Use quantization_ignore_patterns instead.
+    quantization_ignored_layer_kws: NotRequired[list[str]]
+    # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
+    # Supports exact names, substrings, and fnmatch wildcards.
+    quantization_ignore_patterns: NotRequired[list[str]]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]

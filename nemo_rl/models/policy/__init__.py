@@ -21,7 +21,7 @@ from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 def _patch_transformers_tokenizer_class_set():
     """Undo the transformers block on deepseek_v3 tokenizers.
 
-    Root cause: transformers 5.4-5.11 lists "deepseek_v3" in two internal
+    Root cause: transformers >=5.4 lists "deepseek_v3" in two internal
     registries -- MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS (a set) and
     TOKENIZER_MAPPING_NAMES (a dict pinning it to "TokenizersBackend"). Together
     they force the fast tokenizer backend and suppress trust_remote_code, so
@@ -42,16 +42,16 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # This whole patch exists only because Megatron-Bridge caps the transformers
-    # upper bound below 5.9 today, which forces us onto a transformers version
-    # that still has the deepseek_v3 tokenizer-blocklist bug. Once MBridge relaxes
-    # its transformers upper bound to >=5.12, we can drop this workaround.
-    # TODO: remove this patch (and the assert below) once MBridge relaxes its
-    # transformers upper bound past the deepseek_v3 fix (~transformers 5.12).
+    # The upstream fix was expected around 5.12, but 5.12.1 still ships both
+    # registry entries, so the patch is still load-bearing there. The sglang
+    # worker venv pins transformers==5.12.1 (sglang requirement), while other
+    # backend venvs retain their prior 5.5.x or 5.8.1 pins, so this runs on all.
+    # TODO: remove this patch (and the assert below) once the deepseek_v3
+    # entries actually disappear upstream.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.12.0"), (
+    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
         f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was written for <5.12. "
+        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
         "Check if the upstream fix now applies and remove this patch if so."
     )
 

@@ -2270,18 +2270,24 @@ class TestValidateAndSetConfig:
 
         assert "Reward models are not yet supported" in str(exc_info.value)
 
-    def test_generation_colocation_detection(self):
-        """Test that generation colocation is properly detected."""
-        # This test would require more mocking to fully test
-        # For now, we just verify the config parsing works
-        from nemo_rl.models.megatron.setup import validate_and_set_config
+    @pytest.mark.parametrize(
+        ("backend", "colocated", "expected_cumem"),
+        [("vllm", True, None), ("vllm", False, "1"), ("sglang", False, "0")],
+    )
+    @patch.dict(os.environ, {}, clear=True)
+    def test_generation_refit_environment(self, backend, colocated, expected_cumem):
+        from nemo_rl.models.megatron.setup import (
+            configure_refit_environment,
+            validate_and_set_config,
+        )
 
         config = {
             "generation": {
+                "backend": backend,
                 "temperature": 1.0,
                 "top_p": 1.0,
                 "top_k": None,
-                "colocated": {"enabled": True},
+                "colocated": {"enabled": colocated},
             },
             "precision": "bfloat16",
             "megatron_cfg": {
@@ -2293,7 +2299,8 @@ class TestValidateAndSetConfig:
             "offload_optimizer_for_logprob": False,
         }
 
-        # The function would fail on setup_model_config, but we test the initial parsing
+        configure_refit_environment(config)
+
         with patch(
             "nemo_rl.models.megatron.setup.setup_model_config"
         ) as mock_setup_model_config:
@@ -2314,8 +2321,9 @@ class TestValidateAndSetConfig:
                     optimizer_path=None,
                 )
 
-                assert runtime_config.is_generation_colocated is True
+                assert runtime_config.is_generation_colocated is colocated
                 assert runtime_config.offload_optimizer_for_refit is True
+                assert os.environ.get("NCCL_CUMEM_ENABLE") == expected_cumem
 
 
 @pytest.mark.mcore
