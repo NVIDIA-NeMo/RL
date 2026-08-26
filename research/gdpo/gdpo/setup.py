@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Resolution and validation of dLLM policy configuration.
+"""Resolution and validation of masked-diffusion policy configuration.
 
 Masked diffusion policies are incompatible with most of the machinery that
 assumes causal attention and an exact token-level likelihood. Every such
@@ -22,32 +22,39 @@ because a subtly wrong ELBO still trains and still logs a plausible reward.
 
 from typing import Any, Optional
 
-from nemo_rl.models.policy.dllm.config import DllmConfig
+from gdpo.config import DenoiseConfig, MaskedDiffusionConfig
 
 
-def dllm_config_from_policy(policy_cfg: Any) -> Optional[DllmConfig]:
+def masked_diffusion_config_from_policy(
+    policy_cfg: Any,
+) -> Optional[MaskedDiffusionConfig]:
     """Resolves the dLLM config from a policy config, or None if not in use.
 
     ``PolicyConfig`` is a ``TypedDict``, so the nested block arrives from
     omegaconf as a plain dict rather than a validated model. This is the single
-    place that coercion happens, so defaults come from :class:`DllmConfig`'s
+    place that coercion happens, so defaults come from
+    :class:`MaskedDiffusionConfig`'s
     fields instead of being re-invented at each call site.
 
     Args:
         policy_cfg: The policy config section, as loaded from YAML.
 
     Returns:
-        The validated :class:`DllmConfig` when the block is present and enabled,
+        The validated config when the block is present and enabled,
         otherwise ``None``.
     """
-    raw = policy_cfg.get("dllm")
+    raw = policy_cfg.get("masked_diffusion")
     if raw is None:
         return None
-    cfg = raw if isinstance(raw, DllmConfig) else DllmConfig.model_validate(raw)
+    cfg = (
+        raw
+        if isinstance(raw, MaskedDiffusionConfig)
+        else MaskedDiffusionConfig.model_validate(raw)
+    )
     return cfg if cfg.enabled else None
 
 
-def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -> None:
+def validate_gdpo_config(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -> None:
     """Rejects dLLM configurations that would train against a wrong likelihood.
 
     Args:
@@ -62,7 +69,7 @@ def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -
             causal attention, or with a loss configuration that is not the
             sequence-level objective the ELBO is meaningful under.
     """
-    if dllm_config_from_policy(policy_cfg) is None:
+    if masked_diffusion_config_from_policy(policy_cfg) is None:
         return
 
     def _enabled(section: str) -> bool:
@@ -84,7 +91,7 @@ def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -
     for name, is_on in causal_only.items():
         if is_on:
             raise ValueError(
-                f"policy.{name} is not supported with policy.dllm.enabled=true: "
+                f"policy.{name} is not supported with policy.masked_diffusion.enabled=true: "
                 "masked diffusion models are bidirectional and are scored at "
                 f"masked positions, which {name} assumes away. Disable it."
             )
@@ -93,11 +100,11 @@ def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -
     if dtensor_cfg and dtensor_cfg.get("context_parallel_size", 1) > 1:
         raise ValueError(
             "policy.dtensor_cfg.context_parallel_size > 1 is not supported with "
-            "policy.dllm.enabled=true: context parallelism shards the sequence, "
+            "policy.masked_diffusion.enabled=true: context parallelism shards the sequence, "
             "but the ELBO masks positions across the whole sequence. Set it to 1."
         )
 
-    # The dllm backend has no async engine, so
+    # The Automodel backend has no async engine, so
     # nemo_rl.models.generation.interfaces.should_use_async_rollouts returns
     # False for it. Asking for async_grpo would therefore run plain synchronous
     # rollouts and silently ignore every async setting.
@@ -111,7 +118,7 @@ def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -
         if enabled:
             raise ValueError(
                 "grpo.async_grpo.enabled is not supported with "
-                "policy.dllm.enabled=true: the dllm generation backend has no "
+                "policy.masked_diffusion.enabled=true: Automodel generation has no "
                 "async engine, so rollouts would silently run synchronously. "
                 "Set grpo.async_grpo.enabled=false."
             )
@@ -121,55 +128,65 @@ def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -
         if seq_error_threshold is not None:
             raise ValueError(
                 "grpo.seq_logprob_error_threshold is not supported with "
-                "policy.dllm.enabled=true: denoising does not expose generation-time "
+                "policy.masked_diffusion.enabled=true: denoising does not expose generation-time "
                 "log probabilities to compare with policy ELBOs. Set it to null."
             )
 
-    dllm_cfg = dllm_config_from_policy(policy_cfg)
-    _validate_dllm_generation(policy_cfg.get("generation"), dllm_cfg)
-    _validate_dllm_loss(loss_cfg, dllm_cfg)
+    diffusion_cfg = masked_diffusion_config_from_policy(policy_cfg)
+    _validate_generation(policy_cfg.get("generation"), diffusion_cfg)
+    _validate_loss(loss_cfg, diffusion_cfg)
 
 
-def _validate_dllm_generation(generation_cfg: Any, dllm_cfg: Any) -> None:
+def denoise_config_from_generation(generation_cfg: Any) -> DenoiseConfig:
+    """Validate and return the generation-side denoising configuration."""
+    raw = generation_cfg.get("denoise_cfg")
+    if raw is None:
+        raise ValueError("policy.generation.denoise_cfg is required for GDPO")
+    return raw if isinstance(raw, DenoiseConfig) else DenoiseConfig.model_validate(raw)
+
+
+def _validate_generation(generation_cfg: Any, diffusion_cfg: Any) -> None:
     """Rejects rollout settings the denoising sampler cannot honor."""
     if generation_cfg is None:
         return
 
     backend = generation_cfg.get("backend")
-    if backend != "dllm":
+    if backend != "automodel":
         raise ValueError(
-            f"policy.generation.backend is '{backend}', but policy.dllm.enabled "
+            f"policy.generation.backend is '{backend}', but policy.masked_diffusion.enabled "
             "is true. Masked diffusion models decode a fixed-width canvas and "
             "have no KV cache. SGLang serves LLaDA2.0 and SDAR, but not "
             "LLaDA-8B, and vLLM and TRT-LLM serve no diffusion models. "
-            "Set policy.generation.backend='dllm'."
+            "Set policy.generation.backend='automodel'."
         )
 
     if not generation_cfg.get("colocated", {}).get("enabled", True):
         raise ValueError(
             "policy.generation.colocated.enabled must be true with "
-            "policy.generation.backend='dllm': rollouts run in the training "
+            "policy.generation.backend='automodel': rollouts run in the training "
             "workers, so there is no separate inference cluster to place."
         )
 
     if generation_cfg.get("stop_strings"):
         raise ValueError(
             "policy.generation.stop_strings is not supported with "
-            "policy.generation.backend='dllm': iterative denoising stops on token "
+            "policy.generation.backend='automodel': iterative denoising stops on token "
             "ids, and cannot incrementally match decoded strings. Set it to null "
             "and use stop_token_ids."
         )
 
+    denoise_cfg = denoise_config_from_generation(generation_cfg)
     max_new_tokens = generation_cfg.get("max_new_tokens")
-    if max_new_tokens is not None and max_new_tokens % dllm_cfg.block_length != 0:
+    if max_new_tokens is not None and max_new_tokens % denoise_cfg.block_length != 0:
         raise ValueError(
             f"policy.generation.max_new_tokens ({max_new_tokens}) must be a "
-            f"multiple of policy.dllm.block_length ({dllm_cfg.block_length}): "
+            f"multiple of policy.generation.denoise_cfg.block_length "
+            f"({denoise_cfg.block_length}): "
             "the generation region is denoised in whole blocks."
         )
 
 
-def _validate_dllm_loss(loss_cfg: Any, dllm_cfg: Any) -> None:
+def _validate_loss(loss_cfg: Any, diffusion_cfg: Any) -> None:
     """Rejects loss settings the ELBO cannot be substituted into."""
 
     def _get(key: str, default: Any) -> Any:
@@ -185,14 +202,14 @@ def _validate_dllm_loss(loss_cfg: Any, dllm_cfg: Any) -> None:
     # not -- positions not masked at a given quadrature point contribute zero.
     if not _get("sequence_level_importance_ratios", False):
         raise ValueError(
-            "policy.dllm.enabled=true requires "
+            "policy.masked_diffusion.enabled=true requires "
             "loss_fn.sequence_level_importance_ratios=true: the ELBO is a "
             "sequence-level likelihood, so per-token importance ratios are not "
             "well defined for it."
         )
     if _get("token_level_loss", True):
         raise ValueError(
-            "policy.dllm.enabled=true requires loss_fn.token_level_loss=false, "
+            "policy.masked_diffusion.enabled=true requires loss_fn.token_level_loss=false, "
             "to match the sequence-level ratio (the GSPO-style objective GDPO "
             "builds on)."
         )
@@ -202,19 +219,19 @@ def _validate_dllm_loss(loss_cfg: Any, dllm_cfg: Any) -> None:
     if _get("use_importance_sampling_correction", False):
         raise ValueError(
             "loss_fn.use_importance_sampling_correction=true is not supported "
-            "with policy.dllm.enabled=true: denoising rollouts produce no "
+            "with policy.masked_diffusion.enabled=true: denoising rollouts produce no "
             "per-token sampling log probabilities to correct against."
         )
     if _get("reference_policy_kl_penalty", 0.0) != 0:
         raise ValueError(
             "loss_fn.reference_policy_kl_penalty must be 0 with "
-            "policy.dllm.enabled=true: the existing KL estimator expects token "
+            "policy.masked_diffusion.enabled=true: the existing KL estimator expects token "
             "log probabilities, not per-position ELBO contributions."
         )
     if _get("use_kl_in_reward", False):
         raise ValueError(
             "loss_fn.use_kl_in_reward is not supported with "
-            "policy.dllm.enabled=true: reward KL requires token log probabilities, "
+            "policy.masked_diffusion.enabled=true: reward KL requires token log probabilities, "
             "not per-position ELBO contributions."
         )
     # The policy decides whether its log probabilities are position-aligned; the
@@ -222,11 +239,11 @@ def _validate_dllm_loss(loss_cfg: Any, dllm_cfg: Any) -> None:
     # match. Disagreement is an off-by-one at every position that still runs, so
     # require them to be stated consistently rather than inferring one silently.
     position_aligned = _get("position_aligned_logprobs", False)
-    if position_aligned == dllm_cfg.shift_targets:
+    if position_aligned == diffusion_cfg.shift_targets:
         raise ValueError(
             f"loss_fn.position_aligned_logprobs={position_aligned} is "
-            f"inconsistent with policy.dllm.shift_targets="
-            f"{dllm_cfg.shift_targets}. A policy that scores token i at "
+            f"inconsistent with policy.masked_diffusion.shift_targets="
+            f"{diffusion_cfg.shift_targets}. A policy that scores token i at "
             "position i (shift_targets=false) emits log probabilities as long "
             "as the sequence, which the loss must not shift "
             "(position_aligned_logprobs=true), and vice versa."

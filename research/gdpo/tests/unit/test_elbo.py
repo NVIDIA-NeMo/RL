@@ -19,9 +19,10 @@ import math
 import pytest
 import torch
 
-from nemo_rl.models.policy.dllm import (
-    DllmConfig,
+from gdpo import (
+    MaskedDiffusionConfig,
     SdmcElboEstimator,
+    SdmcLikelihoodConfig,
     accumulate_elbo_logprobs,
     get_quadrature,
     make_dllm_mask_seeds,
@@ -31,10 +32,8 @@ from nemo_rl.models.policy.dllm import (
 MASK_ID = 126336
 
 
-def make_cfg(**overrides) -> DllmConfig:
-    kwargs = {"enabled": True, "mask_id": MASK_ID}
-    kwargs.update(overrides)
-    return DllmConfig(**kwargs)
+def make_cfg(**overrides) -> SdmcLikelihoodConfig:
+    return SdmcLikelihoodConfig(**overrides)
 
 
 def make_batch(
@@ -157,7 +156,7 @@ def test_same_seed_gives_identical_masks():
     assert not all(torch.equal(a, c) for a, c in zip(first, third))
 
 
-def test_mask_seeds_are_stable_and_distinct_per_row():
+def test_mask_seeds_are_stable_per_sequence():
     input_ids, _ = make_batch(batch=3)
     input_ids[1] = input_ids[0]
 
@@ -166,7 +165,7 @@ def test_mask_seeds_are_stable_and_distinct_per_row():
 
     torch.testing.assert_close(first, second)
     assert first.dtype == torch.int64
-    assert first.unique().numel() == input_ids.shape[0]
+    assert first[0] == first[1]
 
 
 @pytest.mark.parametrize("quadrature", ["gauss-3", "mc"])
@@ -355,30 +354,28 @@ class _FakeModelConfig:
 
 def test_mask_id_is_read_from_the_model_when_unset():
     """LLaDA publishes mask_token_id=126336, so users should not retype it."""
-    cfg = DllmConfig(enabled=True)
+    cfg = MaskedDiffusionConfig(enabled=True)
     assert cfg.mask_id is None
     assert resolve_mask_id(cfg, _FakeModelConfig(mask_token_id=MASK_ID)) == MASK_ID
 
 
 def test_explicit_mask_id_overrides_the_model():
     """An escape hatch for a model whose config is wrong or absent."""
-    cfg = make_cfg(mask_id=999)
+    cfg = MaskedDiffusionConfig(enabled=True, mask_id=999)
     assert resolve_mask_id(cfg, _FakeModelConfig(mask_token_id=MASK_ID)) == 999
 
 
 def test_missing_mask_id_everywhere_raises_with_guidance():
     """Silently guessing a mask id would corrupt the likelihood, not crash."""
-    cfg = DllmConfig(enabled=True)
+    cfg = MaskedDiffusionConfig(enabled=True)
     with pytest.raises(ValueError, match="no mask token id is available"):
         resolve_mask_id(cfg, _FakeModelConfig(vocab_size=126464))
 
 
 def test_defaults_match_the_papers_recommended_setting():
-    cfg = DllmConfig(mask_id=MASK_ID)
+    cfg = SdmcLikelihoodConfig()
     assert cfg.quadrature == "gauss-2"
     assert cfg.mc_samples == 1
-    assert cfg.shift_targets is False
-    assert not cfg.enabled
     assert SdmcElboEstimator(cfg, MASK_ID).num_forwards == 2
 
 

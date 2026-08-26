@@ -1,4 +1,4 @@
-# GRPO for masked diffusion language models (dLLMs).
+# GDPO for masked diffusion language models.
 #
 # Implements the training setup of GDPO (https://arxiv.org/abs/2510.08554):
 # sequences are scored by an ELBO estimated with Semi-deterministic Monte Carlo
@@ -7,7 +7,7 @@
 #
 # Not to be confused with `grpo.adv_estimator.name = "gdpo"`, which is the
 # unrelated multi-reward estimator from https://arxiv.org/abs/2601.05242.
-defaults: "grpo_math_1B.yaml"
+defaults: "../../../examples/configs/grpo_math_1B.yaml"
 
 grpo:
   num_prompts_per_step: 32
@@ -47,37 +47,27 @@ policy:
   # training data size to be a multiple of the global batch size.
   train_global_batch_size: 192
   train_micro_batch_size: 1
-  # Must equal train_micro_batch_size: the old, reference, and current ELBOs of
-  # a rollout are only comparable when estimated at identical masks, and the
-  # masks are drawn from a seeded generator over the microbatch's shape.
+  # Each likelihood costs several forwards, so keep scoring microbatches small.
+  # Per-sequence seeds keep old, reference, and current ELBO masks identical
+  # even when scoring uses a different microbatch partition.
   logprob_batch_size: 1
   max_total_sequence_length: 512
   precision: "bfloat16"
 
-  dllm:
+  masked_diffusion:
     # Switches the policy from next-token logprobs to the SDMC ELBO.
     enabled: true
     # Read from the model config (LLaDA publishes `mask_token_id`) when unset.
     # 126336 for LLaDA-8B, 156895 for LLaDA2.0.
     mask_id: null
-    # Integration rule over the mask ratio t. "gauss-1".."gauss-5" are the
-    # deterministic Gauss-Legendre rules of the SDMC scheme; "simpson" and "mc"
-    # (double Monte Carlo) are kept for ablations. Each likelihood evaluation
-    # costs len(quadrature points) * mc_samples forward passes.
-    quadrature: "gauss-3"
-    mc_samples: 1
-    # Probability of masking each prompt token. 0.0 keeps the prompt intact,
-    # matching the dLLM SFT objective.
-    p_mask_prompt: 0.0
     # False for masked diffusion LMs, which are trained position-aligned.
     shift_targets: false
-    # Block-wise denoising schedule. max_new_tokens must be a multiple of
-    # block_length.
-    block_length: 32
-    diffusion_steps: 128
-    # Unsupervised classifier-free guidance. 0.0 disables it and halves the
-    # number of forward passes per denoising step.
-    cfg_scale: 0.0
+    likelihood:
+      type: "sdmc"
+      # Each likelihood costs quadrature points * mc_samples forwards.
+      quadrature: "gauss-3"
+      mc_samples: 1
+      p_mask_prompt: 0.0
 
   dtensor_cfg:
     enabled: true
@@ -114,7 +104,7 @@ policy:
   generation:
     # Masked diffusion models decode a fixed-width canvas and keep no KV cache,
     # so rollouts run in the training workers rather than in vLLM/SGLang/TRT-LLM.
-    backend: "dllm"
+    backend: "automodel"
     colocated:
       enabled: true
     max_new_tokens: 256
@@ -123,6 +113,11 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
+    denoise_cfg:
+      type: "block"
+      block_length: 32
+      diffusion_steps: 128
+      cfg_scale: 0.0
 
 cluster:
   gpus_per_node: 8

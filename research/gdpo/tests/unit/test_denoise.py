@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the dLLM block-denoising sampler."""
+"""Tests for the masked-diffusion block-denoising sampler."""
 
 import pytest
 import torch
 
-from nemo_rl.models.generation.dllm.denoise import (
+from gdpo.denoise import (
     block_denoise,
     build_canvas,
     get_num_transfer_tokens,

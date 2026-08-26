@@ -40,7 +40,7 @@ from typing import Any, Iterator, Optional
 
 import torch
 
-from nemo_rl.models.policy.dllm.config import DllmConfig
+from gdpo.config import SdmcLikelihoodConfig
 
 # Gauss-Legendre nodes and weights on [-1, 1]. Mapped onto the unit interval by
 # t = (x + 1) / 2, w = w_x / 2 in get_quadrature().
@@ -89,7 +89,7 @@ _SIMPSON: tuple[tuple[float, ...], tuple[float, ...]] = (
 
 
 def make_dllm_mask_seeds(input_ids: torch.Tensor) -> torch.Tensor:
-    """Build a stable, distinct mask seed for each row of a token batch.
+    """Build a stable mask seed for each row of a token batch.
 
     The returned tensor can travel with a :class:`BatchedDataDict`, so slicing
     into different microbatch sizes preserves each sample's RNG stream.
@@ -104,10 +104,7 @@ def make_dllm_mask_seeds(input_ids: torch.Tensor) -> torch.Tensor:
         1, input_ids.shape[1] + 1, dtype=torch.int64, device=input_ids.device
     )
     content_hash = (input_ids.to(torch.int64) * token_positions).sum(dim=-1)
-    row_offsets = torch.arange(
-        input_ids.shape[0], dtype=torch.int64, device=input_ids.device
-    )
-    return torch.remainder(content_hash + row_offsets * 1_000_003, 2**31 - 1)
+    return torch.remainder(content_hash, 2**31 - 1)
 
 
 def get_quadrature(rule: str) -> tuple[tuple[float, ...], tuple[float, ...]]:
@@ -180,14 +177,14 @@ class SdmcElboEstimator:
     that the rest of the training stack already understands.
     """
 
-    def __init__(self, cfg: DllmConfig, mask_id: int):
+    def __init__(self, cfg: SdmcLikelihoodConfig, mask_id: int):
         """Initializes the estimator.
 
         Args:
             cfg: The dLLM policy configuration supplying the integration rule
                 and the number of Monte Carlo mask draws.
             mask_id: The resolved mask token id, from
-                :func:`nemo_rl.models.policy.dllm.config.resolve_mask_id`. Passed
+                :func:`gdpo.config.resolve_mask_id`. Passed
                 separately rather than read off ``cfg`` because ``cfg.mask_id``
                 is optional -- it may still need resolving against the model.
         """

@@ -21,27 +21,36 @@ https://arxiv.org/abs/2510.08554). Not to be confused with
 estimator from https://arxiv.org/abs/2601.05242.
 """
 
-from nemo_rl.models.policy.dllm.config import DllmConfig, resolve_mask_id
-from nemo_rl.models.policy.dllm.elbo import (
+from gdpo.config import (
+    DenoiseConfig,
+    MaskedDiffusionConfig,
+    SdmcLikelihoodConfig,
+    resolve_mask_id,
+)
+from gdpo.elbo import (
     MaskPoint,
     SdmcElboEstimator,
     accumulate_elbo_logprobs,
     get_quadrature,
     make_dllm_mask_seeds,
 )
-from nemo_rl.models.policy.dllm.setup import (
-    dllm_config_from_policy,
-    validate_dllm_policy,
+from gdpo.setup import (
+    denoise_config_from_generation,
+    masked_diffusion_config_from_policy,
+    validate_gdpo_config,
 )
 
 __all__ = [
-    "DllmConfig",
-    "dllm_config_from_policy",
+    "DenoiseConfig",
+    "denoise_config_from_generation",
+    "MaskedDiffusionConfig",
+    "masked_diffusion_config_from_policy",
     "MaskPoint",
     "resolve_mask_id",
     "SdmcElboEstimator",
+    "SdmcLikelihoodConfig",
     "accumulate_elbo_logprobs",
     "get_quadrature",
     "make_dllm_mask_seeds",
-    "validate_dllm_policy",
+    "validate_gdpo_config",
 ]

@@ -1,4 +1,4 @@
-# RL for Masked Diffusion Language Models (dLLMs)
+# GDPO: RL for Masked Diffusion Language Models
 
 NeMo RL can train masked diffusion language models (dLLMs) such as
 [LLaDA](https://github.com/ML-GSAI/LLaDA) with GRPO. This implements the setup of
@@ -9,8 +9,7 @@ Diffusion Language Models via Group Diffusion Policy Optimization* (ICLR 2026).
 This is unrelated to `grpo.adv_estimator.name = "gdpo"`, which is the
 multi-reward advantage estimator from
 [arXiv:2601.05242](https://arxiv.org/abs/2601.05242). The diffusion support
-described here is enabled with `policy.dllm.enabled`, and adds no new algorithm
-name.
+described here is enabled with `policy.masked_diffusion.enabled`.
 ```
 
 ## Why dLLMs need a different likelihood
@@ -30,57 +29,61 @@ evaluated with a fixed Gauss-Legendre quadrature rule, and only the mask draw at
 each node stays stochastic. Two or three quadrature points with one mask draw
 each are usually enough; the published recipe uses three.
 
-The estimator is implemented in
-{py:class}`SdmcElboEstimator <nemo_rl.models.policy.dllm.elbo.SdmcElboEstimator>`.
+The estimator is implemented in [`SdmcElboEstimator`](gdpo/elbo.py).
 Crucially, the ELBO decomposes per position, so it occupies the same
 `[batch, seq_len]` slot that autoregressive log probabilities do: the loss
 functions, KL penalty, and advantage computation are unchanged.
 
 ## Enabling it
 
-Add a `policy.dllm` block and select the `dllm` generation backend:
+Add a `policy.masked_diffusion` block and select the `automodel` generation backend:
 
 ```yaml
 policy:
   model_name: "GSAI-ML/LLaDA-8B-Instruct"
-  dllm:
+  masked_diffusion:
     enabled: true
-    quadrature: "gauss-3"   # gauss-1..gauss-5, simpson, or mc
-    mc_samples: 1           # mask draws per quadrature point
-    block_length: 32        # denoising block width
-    diffusion_steps: 128    # total denoising steps per rollout
-    cfg_scale: 0.0          # unsupervised classifier-free guidance
+    mask_id: null
+    shift_targets: false
+    likelihood:
+      type: "sdmc"
+      quadrature: "gauss-3"
+      mc_samples: 1
   generation:
-    backend: "dllm"
-    max_new_tokens: 256     # must be a multiple of block_length
+    backend: "automodel"
+    max_new_tokens: 256
+    denoise_cfg:
+      type: "block"
+      block_length: 32
+      diffusion_steps: 128
+      cfg_scale: 0.0
 ```
 
-A ready-to-edit exemplar lives at `examples/configs/dllm_grpo_llada_8b.yaml`, and a
+A ready-to-edit exemplar lives at `research/gdpo/configs/gdpo_llada_8b.yaml`, and a
 runnable recipe at
-`examples/configs/recipes/llm/grpo-llada-8b-instruct-1n8g-fsdp2tp1-dllm.yaml`:
+`research/gdpo/configs/recipes/llm/gdpo-llada-8b-instruct-1n8g-fsdp2tp1.yaml`:
 
 ```sh
-uv run examples/run_grpo.py \
-    --config examples/configs/recipes/llm/grpo-llada-8b-instruct-1n8g-fsdp2tp1-dllm.yaml
+uv run research/gdpo/gdpo.py \
+    --config research/gdpo/configs/recipes/llm/gdpo-llada-8b-instruct-1n8g-fsdp2tp1.yaml
 ```
 
 ### Cost
 
 Each likelihood evaluation costs `len(quadrature points) * mc_samples` forward
-passes, and GRPO evaluates the likelihood three times per step (current, previous,
-and reference policy). `gauss-3` with `mc_samples: 1` therefore triples the forward
-cost relative to an autoregressive policy. Setting `cfg_scale > 0` doubles the cost
+passes. GDPO evaluates it for the old and current policy on each step;
+`gauss-3` with `mc_samples: 1` therefore uses six model forwards per sequence
+across scoring and training. Setting
+`generation.denoise_cfg.cfg_scale > 0` doubles the cost
 of *generation* on top of that.
 
 ### Prompt masking
 
-`policy.dllm.p_mask_prompt` corrupts prompt tokens as a regularizer. Leave it at
-`0.0` to reproduce GDPO: its SDMC estimator masks only completion positions, so
-the setting is inert there despite appearing in the published configs, where it
-is inherited from the [d1](https://github.com/dllm-reasoning/d1) *diffu*-GRPO
-trainer that GDPO builds on. d1's one-shot estimator does use it, dividing the
-loss at each position by that position's masking probability. Corrupted prompt
-positions are never scored here.
+`policy.masked_diffusion.likelihood.p_mask_prompt` optionally corrupts prompt
+tokens as a regularizer. Leave it at `0.0` to reproduce GDPO. The setting is
+inherited from the [d1](https://github.com/dllm-reasoning/d1) *diffu*-GRPO
+trainer that GDPO builds on; corrupted prompt positions condition the model but
+are never scored by the SDMC estimator.
 
 ### Adapters
 
@@ -93,7 +96,7 @@ room than the same model trained autoregressively.
 ### Mask token
 
 The mask token id is read from the model config (LLaDA publishes `mask_token_id`).
-Set `policy.dllm.mask_id` explicitly only for a model that does not publish one —
+Set `policy.masked_diffusion.mask_id` explicitly only for a model that does not publish one —
 a wrong value silently corrupts the likelihood rather than failing.
 
 ## Generation
@@ -107,11 +110,11 @@ with low-confidence and joint-threshold remasking, covering `LLaDA2MoeModelLM`
 which is the model the GDPO recipe uses, and vLLM and TRT-LLM have no diffusion
 support at all.
 
-The `dllm` backend therefore denoises inside the training workers, which means:
+The `automodel` backend therefore denoises inside the training workers, which means:
 
 - Generation is **colocated by construction** and reads the live training weights,
   so there is no refit step.
-- Blocks of `block_length` positions are denoised left to right; within a block,
+- Blocks of `generation.denoise_cfg.block_length` positions are denoised left to right; within a block,
   each step unmasks the highest-confidence positions.
 - The response length is recovered after the fact by scanning the filled canvas for
   the first stop token, since the model fills the whole region regardless.
@@ -132,7 +135,7 @@ loss_fn:
 ```
 
 `position_aligned_logprobs` reflects that a dLLM scores token `i` at position `i`,
-with no autoregressive shift to undo. It must agree with `policy.dllm.shift_targets`.
+with no autoregressive shift to undo. It must agree with `policy.masked_diffusion.shift_targets`.
 The current KL estimators require token log probabilities, so both policy KL and
 reward KL are unsupported for the sequence-level ELBO.
 
@@ -156,7 +159,7 @@ low-variance groups; GDPO follows
 
 ## Unsupported combinations
 
-`validate_dllm_policy` rejects these at startup rather than letting them silently
+`validate_gdpo_config` rejects these at startup rather than letting them silently
 train against the wrong likelihood:
 
 | Setting | Why |

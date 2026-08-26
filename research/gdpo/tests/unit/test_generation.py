@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the dLLM generation backend's dispatch and lifecycle."""
+"""Tests for the Automodel generation adapter's dispatch and lifecycle."""
 
 import pytest
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.dllm import DllmGeneration
+from gdpo.generation import AutomodelGeneration
 
 
 class FakeWorkerGroup:
@@ -60,7 +60,7 @@ def make_backend(data_parallel_size=2, results=None, max_new_tokens=64):
         results = [make_output(2), make_output(2, offset=100)]
     config = {
         "generation": {
-            "backend": "dllm",
+            "backend": "automodel",
             "max_new_tokens": max_new_tokens,
             "temperature": 1.0,
             "top_p": 1.0,
@@ -71,7 +71,7 @@ def make_backend(data_parallel_size=2, results=None, max_new_tokens=64):
         }
     }
     policy = FakePolicy(data_parallel_size, results)
-    return DllmGeneration(config=config, policy=policy), policy
+    return AutomodelGeneration(config=config, policy=policy), policy
 
 
 def make_input(batch_size=4):
@@ -86,14 +86,14 @@ def make_input(batch_size=4):
 class TestConstruction:
     def test_generation_config_is_exposed_as_cfg(self):
         backend, _ = make_backend()
-        assert backend.cfg["backend"] == "dllm"
+        assert backend.cfg["backend"] == "automodel"
         assert backend.cfg["max_new_tokens"] == 64
 
     def test_a_missing_generation_block_is_rejected(self):
         with pytest.raises(
             AssertionError, match="policy.generation must be configured"
         ):
-            DllmGeneration(config={"generation": None}, policy=FakePolicy(1, []))
+            AutomodelGeneration(config={"generation": None}, policy=FakePolicy(1, []))
 
 
 class TestGenerate:

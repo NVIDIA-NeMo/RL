@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generation backend for masked diffusion language models."""
+"""Automodel generation adapter for masked diffusion language models."""
 
 from typing import TYPE_CHECKING, Any
 
@@ -30,7 +30,15 @@ if TYPE_CHECKING:
     from nemo_rl.models.policy.lm_policy import Policy
 
 
-class DllmGeneration(GenerationInterface):
+class _NoOpWeightSynchronizer:
+    """Weight-sync adapter for generation that shares policy tensors."""
+
+    def sync_weights(self, **kwargs: Any) -> dict[str, float]:
+        """Return immediately because there is no second weight copy."""
+        return {}
+
+
+class AutomodelGeneration(GenerationInterface):
     """Generation interface that denoises on the training policy's own weights.
 
     Masked diffusion models decode by iteratively unmasking a fixed-width canvas
@@ -46,18 +54,18 @@ class DllmGeneration(GenerationInterface):
         """Initializes the backend around an existing training policy.
 
         Args:
-            config: The full ``PolicyConfig``, whose ``generation`` block supplies
-                the sampling parameters and whose ``dllm`` block supplies the
-                denoising schedule.
+            config: The full policy configuration. Its ``generation`` block
+                supplies sampling and denoising parameters.
             policy: The training ``Policy`` whose workers will denoise.
         """
         generation_config = config["generation"]
         assert generation_config is not None, (
-            "policy.generation must be configured to use the dllm backend."
+            "policy.generation must be configured to use the automodel backend."
         )
         self._policy_config = config
         self.cfg: GenerationConfig = generation_config
         self._policy = policy
+        self.weight_synchronizer = _NoOpWeightSynchronizer()
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
@@ -78,7 +86,7 @@ class DllmGeneration(GenerationInterface):
             A BatchedDataDict conforming to ``GenerationOutputSpec``.
         """
         # Sequence packing and dynamic batching are rejected for dLLM policies
-        # (see validate_dllm_policy), so a plain data-parallel split is enough.
+        # (see validate_gdpo_config), so a plain data-parallel split is enough.
         sharded_data = data.shard_by_batch_size(
             self._policy.data_parallel_size, batch_size=None
         )
@@ -107,7 +115,7 @@ class DllmGeneration(GenerationInterface):
 
         Denoising runs in the training workers themselves, so it always holds
         the GPUs training needs. This backend is colocated by construction --
-        validate_dllm_policy rejects anything else -- so unlike
+        validate_gdpo_config rejects anything else -- so unlike
         MegatronGeneration there is no non-colocated case to distinguish.
         """
         return True

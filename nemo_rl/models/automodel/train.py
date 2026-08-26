@@ -58,7 +58,6 @@ from nemo_rl.models.automodel.data import (
     filter_multimodal_kwargs_for_model,
 )
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.dllm import dllm_config_from_policy
 
 # Union type for any post-processing function
 PostProcessingFunction = Union[
@@ -349,7 +348,6 @@ def forward_with_post_processing_fn(
     global_valid_toks: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     sequence_dim: int = 1,
-    elbo_scorer: Optional[Callable[[ProcessedMicrobatch], torch.Tensor]] = None,
 ) -> Tuple[Any, dict[str, Any], ProcessedMicrobatch]:
     """Perform forward pass with pre-processed microbatch and apply post-processing.
 
@@ -389,26 +387,6 @@ def forward_with_post_processing_fn(
     # keeps use_cache=True for KV-sharing models under activation checkpointing
     # (NVIDIA-NeMo/Automodel#1705).
     use_cache = _needs_kv_cache_for_shared_layers(model)
-
-    # Masked diffusion policies are scored by an ELBO accumulated over several
-    # masked views of the sequence, so there is no single logits tensor to hand
-    # the loss. The accumulation stays differentiable through every forward, so
-    # backward flows through all quadrature points.
-    if elbo_scorer is not None:
-        elbo_logprobs = elbo_scorer(processed_mb)
-        assert isinstance(post_processing_fn, LossPostProcessor), (
-            "elbo_scorer is only supported for the training (loss) path; "
-            "get_logprobs accumulates the ELBO itself."
-        )
-        result, metrics = post_processing_fn(
-            logits=elbo_logprobs,
-            data_dict=data_dict,
-            processed_inputs=processed_inputs,
-            global_valid_seqs=global_valid_seqs,
-            global_valid_toks=global_valid_toks,
-            sequence_dim=sequence_dim,
-        )
-        return result, metrics, processed_mb
 
     # Model forward pass
     outputs = model_forward(
@@ -505,7 +483,6 @@ def automodel_forward_backward(
     train_context_fn: Optional[Callable[[ProcessedInputs], Any]] = None,
     num_valid_microbatches: Optional[int] = None,
     on_microbatch_start: Optional[Callable[[int], None]] = None,
-    elbo_scorer: Optional[Callable[[ProcessedMicrobatch], torch.Tensor]] = None,
 ) -> list[Tuple[Any, dict[str, Any]]]:
     """Execute forward and backward passes for automodel.
 
@@ -570,7 +547,6 @@ def automodel_forward_backward(
                 global_valid_toks=global_valid_toks,
                 sampling_params=sampling_params,
                 sequence_dim=sequence_dim,
-                elbo_scorer=elbo_scorer,
             )
 
             # Check if this is a dummy batch
@@ -623,6 +599,7 @@ class LossPostProcessor:
         dp_size: int,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        precomputed_logprobs: bool = False,
     ):
         """Initialize LossPostProcessor.
 
@@ -636,6 +613,8 @@ class LossPostProcessor:
             dp_size: Data parallel size
             enable_seq_packing: Whether sequence packing is enabled
             sampling_params: Sampling parameters
+            precomputed_logprobs: Whether ``logits`` already contains token
+                log probabilities and should bypass vocabulary reduction.
         """
         self.loss_fn: LossFunction = loss_fn
         self.cfg: PolicyConfig = cfg
@@ -646,9 +625,7 @@ class LossPostProcessor:
         self.dp_size = dp_size
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
-        # dLLM policies hand the loss a pre-accumulated per-position ELBO
-        # instead of logits, so prepare_loss_input must not reduce it again.
-        self.precomputed_logprobs = dllm_config_from_policy(cfg) is not None
+        self.precomputed_logprobs = precomputed_logprobs
 
     def __call__(
         self,
@@ -727,6 +704,7 @@ class LogprobsPostProcessor:
         cp_size: int,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        shift_targets: bool = True,
     ):
         """Initialize LogprobsPostProcessor.
 
@@ -738,6 +716,7 @@ class LogprobsPostProcessor:
             cp_size: Context parallel size
             enable_seq_packing: Whether sequence packing is enabled
             sampling_params: Sampling parameters
+            shift_targets: Whether position ``i`` scores token ``i+1``.
         """
         self.cfg = cfg
         self.device_mesh = device_mesh
@@ -747,11 +726,7 @@ class LogprobsPostProcessor:
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
         self.logprob_chunk_size = cfg.get("logprob_chunk_size", None)
-        # Masked diffusion LMs score token i at position i; autoregressive
-        # models score token i+1. Absent a dllm policy this stays True, so every
-        # existing caller is unaffected.
-        dllm_cfg = dllm_config_from_policy(cfg)
-        self.shift_targets = True if dllm_cfg is None else dllm_cfg.shift_targets
+        self.shift_targets = shift_targets
 
     def __call__(
         self,

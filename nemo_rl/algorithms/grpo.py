@@ -106,7 +106,6 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
 )
-from nemo_rl.models.generation.dllm import DllmGeneration
 from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -129,11 +128,6 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.dllm import (
-    dllm_config_from_policy,
-    make_dllm_mask_seeds,
-    validate_dllm_policy,
-)
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
@@ -501,6 +495,10 @@ def setup(
     val_dataset: Optional[AllTaskProcessedDataset],
     processor: Optional[AutoProcessor] = None,
     policy_factory: Optional[Callable[..., ColocatablePolicyInterface]] = None,
+    generation_factory: Optional[
+        Callable[[PolicyConfig, ColocatablePolicyInterface], GenerationInterface]
+    ] = None,
+    generation_logprobs_available: bool = True,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
@@ -758,7 +756,7 @@ def setup(
     loss_fn = ClippedPGLossFn(
         loss_config,
         use_fused_linear_logprobs=use_fused_linear_logprobs,
-        generation_logprobs_available=dllm_config_from_policy(policy_config) is None,
+        generation_logprobs_available=generation_logprobs_available,
     )
 
     # Validate force_on_policy_ratio
@@ -783,10 +781,6 @@ def setup(
         )
 
     _validate_use_kl_in_reward_compat(master_config)
-    validate_dllm_policy(
-        master_config.policy, master_config.loss_fn, master_config.grpo
-    )
-
     # ==========================
     #          Cluster
     # ==========================
@@ -900,7 +894,8 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=policy_gpus_per_node,
             max_colocated_worker_groups=1
-            if generation_config["backend"] in ("megatron", "dllm")
+            if generation_config["backend"] == "megatron"
+            or generation_factory is not None
             else 2,
             port_range_low=cluster_config.get("master_port_range_low"),
             port_range_high=cluster_config.get("master_port_range_high"),
@@ -1342,8 +1337,26 @@ def setup(
 
         return policy_generation, policy
 
+    # A caller-supplied factory supports research generation adapters without
+    # coupling the core algorithm to their runtime or configuration.
+    if generation_factory is not None:
+        assert colocated_inference, (
+            "Custom generation factories currently require colocated generation."
+        )
+        policy, policy_time = init_policy()
+        setup_timing_metrics.policy_init_time_s = policy_time
+        generation_t0 = time.perf_counter()
+        policy_generation = generation_factory(policy_config, policy)
+        setup_timing_metrics.generation_init_time_s = (
+            time.perf_counter() - generation_t0
+        )
+        print(
+            f"  ✓ Using custom {backend} generation with {policy_config['model_name']}",
+            flush=True,
+        )
+
     # Handle generation-specific setup
-    if backend == "megatron":
+    elif backend == "megatron":
         if enable_nemo_gym:
             print(
                 "  ⚡ Reserving the Megatron server address for overlapped NeMo Gym init",
@@ -1416,26 +1429,6 @@ def setup(
             # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
             policy_generation, megatron_gen_time = init_megatron_generation(policy)
             setup_timing_metrics.generation_init_time_s = megatron_gen_time
-
-        print(
-            f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
-            flush=True,
-        )
-
-    elif backend == "dllm":
-        # Masked diffusion models denoise on the training weights, so there is
-        # no inference engine to stand up and nothing to refit.
-        assert colocated_inference, (
-            "The dllm generation backend runs inside the training workers, so "
-            "policy.generation.colocated.enabled must be true."
-        )
-        policy, policy_time = init_policy()
-        setup_timing_metrics.policy_init_time_s = policy_time
-        # Wrapping the training policy is effectively free, but every backend
-        # reports into the same generic field.
-        dllm_gen_t0 = time.perf_counter()
-        policy_generation = DllmGeneration(config=policy_config, policy=policy)
-        setup_timing_metrics.generation_init_time_s = time.perf_counter() - dllm_gen_t0
 
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
@@ -2274,25 +2267,6 @@ def _preserve_router_replay_routed_experts(
         target["routed_experts"] = flat_messages["routed_experts"]
 
 
-def _attach_dllm_mask_seed(
-    target: BatchedDataDict, policy_config: PolicyConfig
-) -> None:
-    """Give the batch a mask seed, so every ELBO of it is taken at the same masks.
-
-    The old, reference, and current policy each estimate the ELBO of this batch
-    separately. Unless all three mask the same positions, their differences
-    measure mask noise rather than the policy update, and the importance ratio
-    is meaningless.
-
-    Each row gets a stable seed derived from its contents and row index. Keeping
-    seeds per row makes the masks independent across samples and invariant to
-    how later policy passes split the batch into microbatches.
-    """
-    if dllm_config_from_policy(policy_config) is None:
-        return
-    target["dllm_mask_seed"] = make_dllm_mask_seeds(target["input_ids"])
-
-
 def _policy_dtype(policy_config: PolicyConfig) -> torch.dtype:
     """Resolve the configured policy precision to its matching torch dtype."""
     return getattr(torch, policy_config["precision"])
@@ -2315,7 +2289,6 @@ def _build_async_grpo_train_data(
         }
     )
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
-    _attach_dllm_mask_seed(train_data, policy_config)
     # update multimodal data unconditionally
     extra_multimodal_data = flat_messages.get_multimodal_dict(
         as_tensors=False, pixel_dtype=_policy_dtype(policy_config)
@@ -2506,12 +2479,6 @@ def refit_policy_generation(
     Returns:
         Scalar metrics reported by the selected weight synchronizer.
     """
-    # A dLLM denoises with the training policy's own weights, so there is
-    # nothing to transfer. Without this the colocated path below would stream
-    # the weights to the very workers they already live on.
-    if isinstance(policy_generation, DllmGeneration):
-        return {}
-
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
@@ -3349,7 +3316,6 @@ def grpo_train(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
-                    _attach_dllm_mask_seed(train_data, master_config.policy)
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
@@ -3447,7 +3413,7 @@ def grpo_train(
                     del extra_multimodal_data
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
-                if skip_prev_logprobs or dllm_config_from_policy(master_config.policy):
+                if skip_prev_logprobs or not loss_fn.generation_logprobs_available:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:
@@ -5050,7 +5016,7 @@ def async_grpo_train(
                         )
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
-                if skip_prev_logprobs or dllm_config_from_policy(master_config.policy):
+                if skip_prev_logprobs or not loss_fn.generation_logprobs_available:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:
