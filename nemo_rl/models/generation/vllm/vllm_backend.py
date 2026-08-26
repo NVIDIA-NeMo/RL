@@ -796,7 +796,7 @@ class VllmInternalWorkerExtension:
                 )
                 if strategy is None:
                     raise RuntimeError(
-                        "Unquantized FlashInfer TRTLLM nccl_reshard refit could "
+                        "BF16 FlashInfer TRTLLM nccl_reshard refit could "
                         "not determine the expert placement strategy of "
                         f"{type(module).__name__}; refusing to assume linear "
                         "placement"
@@ -805,7 +805,7 @@ class VllmInternalWorkerExtension:
             unsupported_placements = sorted(realized_placements - {"linear"})
             if unsupported_placements:
                 raise RuntimeError(
-                    "Unquantized FlashInfer TRTLLM nccl_reshard refit requires "
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
                     "linear expert placement; realized "
                     f"{unsupported_placements!r}"
                 )
@@ -1124,7 +1124,7 @@ class VllmInternalWorkerExtension:
             ]
             if unsupported_shards:
                 raise ValueError(
-                    "Unquantized FlashInfer TRTLLM nccl_reshard refit requires "
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
                     "expert-parallel destination shards; unsupported tensor shard "
                     f"dimensions {unsupported_shards} for {param_info['name']!r}"
                 )
@@ -1149,7 +1149,7 @@ class VllmInternalWorkerExtension:
             # instead of silently loading experts onto the wrong ranks.
             if ep_size > 0 and num_global_experts % ep_size != 0:
                 raise ValueError(
-                    "Unquantized FlashInfer TRTLLM nccl_reshard refit requires "
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
                     "the global expert count to divide evenly across EP ranks; "
                     f"got {num_global_experts} experts over {ep_size} ranks for "
                     f"{param_info['name']!r}"
@@ -1173,7 +1173,7 @@ class VllmInternalWorkerExtension:
             dtype = _STR_TO_DTYPE.get(str(dtype_value))
             if dtype is None:
                 raise ValueError(
-                    "Unquantized FlashInfer TRTLLM nccl_reshard refit got an "
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit got an "
                     f"unsupported wire dtype {dtype_value!r} for "
                     f"{param_info['name']!r}"
                 )
@@ -1200,7 +1200,7 @@ class VllmInternalWorkerExtension:
                     missing = [name for name, _ in weights if name not in loaded_names]
                     if missing:
                         raise RuntimeError(
-                            "Unquantized FlashInfer TRTLLM nccl_reshard refit "
+                            "BF16 FlashInfer TRTLLM nccl_reshard refit "
                             f"failed to load staged expert weights {missing!r}"
                         )
 
