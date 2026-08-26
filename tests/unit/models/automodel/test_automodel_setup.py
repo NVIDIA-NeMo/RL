@@ -32,6 +32,7 @@ from nemo_rl.models.automodel.setup import (
     ModelAndOptimizerState,
     RuntimeConfig,
     _maybe_set_force_hf,
+    _setup_fused_linear_logprobs_for_automodel,
     get_tokenizer,
     setup_distributed,
     setup_model_and_optimizer,
@@ -43,6 +44,68 @@ from nemo_rl.models.automodel.setup import (
 def test_token_classification_backport_still_required():
     with pytest.raises(ImportError):
         from nemo_automodel import NeMoAutoModelForTokenClassification  # noqa: F401
+
+
+class _MockDeviceMesh:
+    def __init__(self):
+        self.tp_group = object()
+
+    def __getitem__(self, key: str):
+        assert key == "tp"
+        return self
+
+    def get_group(self):
+        return self.tp_group
+
+
+class _DirectLmHeadModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lm_head = torch.nn.Linear(4, 7, bias=False)
+
+
+class _LanguageModelLmHeadModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.language_model = torch.nn.Module()
+        self.language_model.lm_head = torch.nn.Linear(4, 7, bias=False)
+
+
+class _InnerModelLmHeadModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.lm_head = torch.nn.Linear(4, 7, bias=False)
+
+
+def _fused_logprob_config(chunk_size: int | None = 2) -> dict[str, object]:
+    config: dict[str, object] = {"use_fused_linear_logprobs": True}
+    if chunk_size is not None:
+        config["fused_linear_logprobs_chunk_size"] = chunk_size
+    return config
+
+
+@pytest.mark.automodel
+@pytest.mark.parametrize(
+    ("model_cls", "expected_path"),
+    [
+        (_DirectLmHeadModel, "lm_head"),
+        (_LanguageModelLmHeadModel, "language_model.lm_head"),
+        (_InnerModelLmHeadModel, "model.lm_head"),
+    ],
+)
+def test_setup_fused_linear_logprobs_finds_supported_lm_head_paths(
+    model_cls, expected_path
+):
+    model = model_cls()
+
+    _setup_fused_linear_logprobs_for_automodel(
+        model, _fused_logprob_config(), _MockDeviceMesh()
+    )
+
+    assert model._use_fused_linear_logprobs is True
+    assert model._fused_linear_logprobs_lm_head_path == expected_path
+    assert model._fused_linear_logprobs_chunk_size == 2
 
 
 @pytest.fixture
@@ -74,6 +137,60 @@ def mock_config():
             "kwargs": {"lr": 1e-4},
         },
     }
+
+
+@pytest.mark.automodel
+def test_setup_fused_linear_logprobs_does_not_duplicate_lm_head_parameters():
+    model = _DirectLmHeadModel()
+    before_parameter_names = [name for name, _ in model.named_parameters()]
+
+    _setup_fused_linear_logprobs_for_automodel(
+        model, _fused_logprob_config(), _MockDeviceMesh()
+    )
+
+    assert [name for name, _ in model.named_parameters()] == before_parameter_names
+
+
+@pytest.mark.automodel
+def test_setup_fused_linear_logprobs_can_skip_lm_head_and_capture_hidden_states():
+    model = _DirectLmHeadModel()
+    _setup_fused_linear_logprobs_for_automodel(
+        model, _fused_logprob_config(), _MockDeviceMesh()
+    )
+
+    hidden_states = torch.randn(2, 3, 4)
+
+    normal_output = model.lm_head(hidden_states)
+    assert normal_output.shape == (2, 3, 7)
+    assert model._fused_linear_logprobs_hidden_states is hidden_states
+
+    model._skip_lm_head_for_fused_linear_logprobs = True
+    skipped_output = model.lm_head(hidden_states)
+    assert skipped_output.shape == (1,)
+    assert skipped_output.device == hidden_states.device
+    assert skipped_output.dtype == hidden_states.dtype
+    assert model._fused_linear_logprobs_hidden_states is hidden_states
+
+    model._skip_lm_head_for_fused_linear_logprobs = False
+    assert model.lm_head(hidden_states).shape == (2, 3, 7)
+
+
+@pytest.mark.automodel
+def test_setup_fused_linear_logprobs_requires_lm_head():
+    with pytest.raises(RuntimeError, match="no LM head"):
+        _setup_fused_linear_logprobs_for_automodel(
+            torch.nn.Module(), _fused_logprob_config(), _MockDeviceMesh()
+        )
+
+
+@pytest.mark.automodel
+def test_setup_fused_linear_logprobs_requires_chunk_size():
+    with pytest.raises(ValueError, match="requires"):
+        _setup_fused_linear_logprobs_for_automodel(
+            _DirectLmHeadModel(),
+            _fused_logprob_config(chunk_size=None),
+            _MockDeviceMesh(),
+        )
 
 
 @pytest.fixture
