@@ -298,6 +298,8 @@ _REWARD_PENALTY_FLAGS = (
 class GRPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
+    # Number of policy updates performed on each rollout batch.
+    num_iterations: int = Field(default=1, ge=1)
     max_num_epochs: int = 1
     max_num_steps: int = 1000000
     max_rollout_turns: int = 1
@@ -1180,7 +1182,7 @@ def setup(
 
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(
+        total_train_iters = grpo_config.num_iterations * min(
             grpo_config.max_num_steps,
             grpo_config.max_num_epochs * train_sample_count,
         )
@@ -3473,13 +3475,22 @@ def grpo_train(
                     policy.prepare_for_training()  # set model train and reload optim to GPU
                     POLICY_GENERATION_STALE = True
 
-                print("▶ Training policy...", flush=True)
+                num_iterations = master_config.grpo.num_iterations
                 with timer.time("policy_training"):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    for iteration in range(num_iterations):
+                        print(
+                            f"▶ Training policy iteration {iteration + 1}/{num_iterations}...",
+                            flush=True,
+                        )
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
+                        print(
+                            f"    • Policy loss: {train_results['loss'].mean().item():.4f}",
+                            flush=True,
+                        )
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
@@ -5098,13 +5109,22 @@ def async_grpo_train(
                     policy.prepare_for_training()
                     POLICY_GENERATION_STALE = True
 
-                print("▶ Training policy...")
+                num_iterations = master_config.grpo.num_iterations
                 with timer.time("policy_training"):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    for iteration in range(num_iterations):
+                        print(
+                            f"▶ Training policy iteration {iteration + 1}/{num_iterations}...",
+                            flush=True,
+                        )
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
+                        print(
+                            f"    • Policy loss: {train_results['loss'].mean().item():.4f}",
+                            flush=True,
+                        )
 
                 is_last_step = step + 1 == master_config.grpo.max_num_steps
                 should_save_by_step = (

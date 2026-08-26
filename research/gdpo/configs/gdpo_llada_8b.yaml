@@ -12,6 +12,8 @@ defaults: "../../../examples/configs/grpo_math_1B.yaml"
 grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 6
+  # Reuse each rollout batch for the 12 policy updates used by official GDPO.
+  num_iterations: 12
   # The ELBO is a noisy estimate of the sequence likelihood, so dividing the
   # group advantage by its standard deviation amplifies estimator noise on
   # low-variance groups. GDPO follows Dr.GRPO in leaving advantages unnormalized.

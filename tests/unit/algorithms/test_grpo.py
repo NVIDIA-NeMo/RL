@@ -3736,6 +3736,18 @@ def test_grpo_train_preserves_advantages_when_clipping_disabled(
     assert torch.equal(advantages, extreme_advantages)
 
 
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_train_reuses_rollouts_for_policy_iterations(
+    mock_grpo_components, train_func, monkeypatch
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.num_iterations = 2
+
+    _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch)
+
+    assert mock_grpo_components["policy"].train.call_count == 2
+
+
 def test_clip_grpo_advantages_respects_config_bounds():
     """Shared clip helper clamps only when bounds are configured."""
     from nemo_rl.algorithms.grpo import _clip_grpo_advantages
