@@ -7,8 +7,8 @@
 	path = 3rdparty/Automodel-workspace/Automodel
 	# Day-0 Qwen4Exp/Engram support. This private branch carries the corrected
 	# QSA indexer implementation required by BrightDelta final weights.
-	url = git@github.com:HuiyingLi/Automodel-day0.git
-	branch = huiyingl/feat/qwen4-engram
+	url = git@github.com:sharonyu-115/Automodel-day0.git
+	branch = shuangy/fix/qwen4-ple-compute-dtype
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
 	url = https://github.com/NVIDIA-NeMo/Gym.git

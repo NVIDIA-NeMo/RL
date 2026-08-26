@@ -188,7 +188,9 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(
+        self,
+    ) -> Optional[dict[str, Any] | list[dict[str, Any]]]:
         pass
 
     @abstractmethod

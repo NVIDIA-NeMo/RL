@@ -1042,7 +1042,9 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during policy shutdown: {e}")
             return False
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self, state_dict_info: dict[str, Any] | list[dict[str, Any]]
+    ) -> None:
         """Prepare the info for refit."""
         # Choose the appropriate method based on async_engine setting
         method_name = (
@@ -1051,12 +1053,65 @@ class VllmGeneration(GenerationInterface):
             else "prepare_refit_info"
         )
 
-        # Use run_all_workers_single_data to send data to all workers
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name,
-            state_dict_info=state_dict_info,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
+        if isinstance(state_dict_info, list):
+            total_workers = len(self.worker_group.workers)
+            if len(state_dict_info) != total_workers:
+                raise ValueError(
+                    "Rank-specific refit metadata must match the generation GPU "
+                    f"count: got {len(state_dict_info)} manifests for "
+                    f"{total_workers} workers"
+                )
+            if self.dp_size <= 0 or total_workers % self.dp_size:
+                raise ValueError(
+                    f"Invalid vLLM worker topology: {total_workers=} {self.dp_size=}"
+                )
+            workers_per_group = total_workers // self.dp_size
+            per_engine_info = [
+                state_dict_info[start : start + workers_per_group]
+                for start in range(0, total_workers, workers_per_group)
+            ]
+
+            def merge_engine_manifests(
+                manifests: list[dict[str, Any]],
+            ) -> dict[str, Any]:
+                merged: dict[str, Any] = {}
+                for manifest in manifests:
+                    for name, metadata in manifest.items():
+                        if name in merged and merged[name] != metadata:
+                            raise ValueError(
+                                "Conflicting rank-specific refit metadata for "
+                                f"{name!r}: {merged[name]} != {metadata}"
+                            )
+                        merged[name] = metadata
+                return merged
+
+            # Every data-parallel rollout replica must receive a complete copy
+            # of the same logical model. This catches owner-sharded training
+            # layouts paired with too-small rollout TP groups before refit can
+            # silently leave a replica's non-local shards stale.
+            engine_manifests = [
+                merge_engine_manifests(manifests) for manifests in per_engine_info
+            ]
+            if any(
+                manifest != engine_manifests[0] for manifest in engine_manifests[1:]
+            ):
+                raise ValueError(
+                    "Rank-specific refit manifests do not form the same complete "
+                    "model in every vLLM replica. Match rollout model parallelism "
+                    "to the policy's owner-sharded topology or add an explicit "
+                    "cross-replica reshard transport."
+                )
+            futures = self.worker_group.run_all_workers_multiple_data(
+                method_name,
+                state_dict_info=per_engine_info,
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            )
+        else:
+            futures = self.worker_group.run_all_workers_single_data(
+                method_name,
+                state_dict_info=state_dict_info,
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            )
 
         # Wait for all futures to complete
         ray.get(futures)
