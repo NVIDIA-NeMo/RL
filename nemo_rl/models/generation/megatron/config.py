@@ -52,6 +52,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
     enable_prefix_caching: bool
     async_sched_mode: NotRequired[Literal["legacy", "async"]]
     vision_embedding_cache_max_bytes: NotRequired[int]
+    allow_stale_multimodal_embeddings: NotRequired[bool]
     logprobs_mode: NotRequired[Literal["raw_logprobs", "processed_logprobs"]]
 
     refit_backend: Literal["gloo", "nccl", "nvshmem"]
@@ -66,7 +67,6 @@ class MCoreGenerationSpecificArgs(TypedDict):
     video_temporal_patch_size: NotRequired[int]
     video_target_num_patches: NotRequired[int]
     video_maintain_aspect_ratio: NotRequired[bool]
-    multimodal_prompt_config: NotRequired[dict]
     megatron_inference_wrapper: NotRequired[str]
 
     # KV cache lifecycle across suspend/resume:
