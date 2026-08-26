@@ -419,6 +419,48 @@ class _EffortShapingMetrics:
     high_lengths: list[int]
 
 
+def _terminal_completion_length(result: dict) -> Optional[int]:
+    """Terminal assistant completion length for effort shaping, or None.
+
+    Legacy rollouts carry tokens inline: the last ``message_log`` entry is the
+    terminal turn, and its ``token_ids`` length is the completion length (0 if
+    that turn is not an assistant turn, matching the pre-receipt behavior).
+
+    Token-capture receipt rollouts carry ``message_log: []`` by design — the
+    tokens live in the capture ledger. The manifest's ``delta_len`` is NOT the
+    same quantity (a root call's delta stages prompt + generation, per the
+    ledger invariant ``parentless rows have prev_len == 0``), so the length
+    comes from the scored response's usage block instead: ``output_tokens``
+    is the terminal call's generation length, matching the legacy semantics.
+    A receipt row with no usable usage returns None so the caller skips
+    shaping rather than inventing a length.
+    """
+    message_log = result.get("message_log") or []
+    if message_log:
+        last = message_log[-1]
+        return len(last["token_ids"]) if last["role"] == "assistant" else 0
+    # TODO(token-capture): the agent ACCUMULATES usage across model calls onto
+    # the scored response (simple_agent accumulate_response_usage), so
+    # output_tokens equals the terminal generation only for single-call
+    # rollouts; on multi-call rollouts this shapes on the accumulated total
+    # while the legacy path uses the final assistant turn only. All observed
+    # capture runs are single-call (finalize/calls_per_rollout == 1.0). The
+    # durable fix is upstream: per-call generation counts on the receipt
+    # (Gym preserving per-call usage, or CallRecord recording generation
+    # length distinct from staged delta_len).
+    full_result = result.get("full_result")
+    if isinstance(full_result, dict):
+        response = full_result.get("response")
+        if isinstance(response, dict):
+            usage = response.get("usage")
+            if isinstance(usage, dict):
+                for key in ("output_tokens", "completion_tokens"):
+                    tokens = usage.get(key)
+                    if isinstance(tokens, (int, float)):
+                        return int(tokens)
+    return None
+
+
 def _apply_effort_shaping(
     results: list[dict],
     nemo_gym_rows: list[dict],
@@ -447,14 +489,14 @@ def _apply_effort_shaping(
             length_rewards_low, rewards_low, low_lengths, high_lengths
         )
 
-    lengths = [
-        len(r["message_log"][-1]["token_ids"])
-        if r["message_log"][-1]["role"] == "assistant"
-        else 0
-        for r in results
-    ]
+    lengths = [_terminal_completion_length(r) for r in results]
     orig_rewards = [r["full_result"]["reward"] for r in results]
     for i, result in enumerate(results):
+        # Token-capture receipt rows with no resolvable terminal length are
+        # skipped fail-closed: shaping a length we do not have would award the
+        # maximum shortness bonus to a row that may be arbitrarily long.
+        if lengths[i] is None:
+            continue
         prompt = next(
             (
                 msg["content"]
