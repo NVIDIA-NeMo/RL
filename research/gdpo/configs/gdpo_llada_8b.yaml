@@ -81,8 +81,9 @@ policy:
     # `quadrature * mc_samples` forward activations alive for the backward pass.
     lora_cfg:
       enabled: true
+      # Automodel matches target patterns against fully qualified module names.
       target_modules:
-        [q_proj, k_proj, v_proj, o_proj, up_proj, down_proj, gate_proj]
+        ["*.q_proj", "*.k_proj", "*.v_proj", "*.o_proj", "*.up_proj", "*.down_proj", "*.gate_proj"]
       exclude_modules: []
       match_all_linear: false
       dim: 128
