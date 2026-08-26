@@ -288,6 +288,43 @@ def test_cross_shard_pair_is_quantized_once_and_written_to_source_shards(
     for name in _quantized_names(up_name):
         assert output_index["weight_map"][name] == up_shard
 
+    output_config = _read_json(save_dir / "config.json")
+    assert "kv_cache_scheme" not in output_config["quantization_config"]
+    hf_quantization = _read_json(save_dir / "hf_quant_config.json")["quantization"]
+    assert "kv_cache_quant_algo" not in hf_quantization
+
+
+def test_non_fp8_source_kv_scheme_does_not_advertise_fp8(tmp_path: Path) -> None:
+    model_dir = tmp_path / "source"
+    save_dir = tmp_path / "converted"
+    model_dir.mkdir()
+    save_dir.mkdir()
+    _write_json(
+        model_dir / "hf_quant_config.json",
+        {"quantization": {"kv_cache_quant_algo": "FP8"}},
+    )
+    config = {
+        "quantization_config": {
+            "kv_cache_scheme": {"dynamic": False, "num_bits": 4, "type": "int"}
+        }
+    }
+
+    nvfp4_setup._write_output_metadata(
+        model_dir=str(model_dir),
+        save_dir=str(save_dir),
+        config=config,
+        result=nvfp4_setup._ConversionResult(),
+    )
+
+    output_config = _read_json(save_dir / "config.json")
+    assert output_config["quantization_config"]["kv_cache_scheme"] == {
+        "dynamic": False,
+        "num_bits": 4,
+        "type": "int",
+    }
+    hf_quantization = _read_json(save_dir / "hf_quant_config.json")["quantization"]
+    assert "kv_cache_quant_algo" not in hf_quantization
+
 
 def test_single_side_extra_skip_keeps_entire_expert_container_in_bf16(
     tmp_path: Path,
@@ -520,6 +557,42 @@ def test_existing_checkpoint_ignore_is_merged_back_into_refit_config(
         user_only,
         checkpoint_only,
     ]
+
+
+def test_external_hf_quant_config_checkpoint_is_rejected_before_conversion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    _write_json(source_dir / "config.json", {"num_hidden_layers": 1})
+    _write_json(
+        source_dir / "hf_quant_config.json",
+        {
+            "quantization": {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+                "exclude_modules": ["model.layers.0.self_attn*"],
+            }
+        },
+    )
+    cache_root = tmp_path / "cache"
+    quantization_cfg: dict[str, Any] = {
+        "scheme": "nvfp4",
+        "cache_root": str(cache_root),
+    }
+    monkeypatch.setattr(
+        nvfp4_setup,
+        "convert_nvfp4",
+        lambda *_args, **_kwargs: pytest.fail("unsupported checkpoint must fail early"),
+    )
+
+    with pytest.raises(ValueError, match="Externally quantized NVFP4 checkpoint"):
+        nvfp4_setup.ensure_nvfp4_checkpoint(
+            model_path=str(source_dir),
+            quantization_cfg=quantization_cfg,
+        )
+    assert not cache_root.exists()
 
 
 def test_existing_checkpoint_rejects_new_head_layer_bf16_policy(
