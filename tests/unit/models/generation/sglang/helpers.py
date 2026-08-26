@@ -84,7 +84,7 @@ def make_sglang_cfg(
             "dtype": "bfloat16",
             "context_length": 1024,
             "log_level": "warning",
-            "disable_piecewise_cuda_graph": True,
+            "cuda_graph_backend_prefill": "disabled",
             "disable_cuda_graph": True,
             "mem_fraction_static": 0.3,
             "sglang_server_config": {

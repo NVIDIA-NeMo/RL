@@ -1559,9 +1559,6 @@ def setup(
             setup_timing_metrics=setup_timing_metrics,
         )
 
-        # Capture rollout TP size on the policy once; refit calls no longer need it.
-        policy.set_rollout_num_gpus_per_engine(policy_generation.num_gpus_per_engine)
-
         print(
             f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
             flush=True,
@@ -1671,6 +1668,7 @@ def setup(
     # if it is not colocated inference, initialize collective communication for update weights
     elif (
         not colocated_inference
+        and backend != "sglang"
         and remote_transport is None
         and checkpoint_engine_config is None
     ):
@@ -1742,6 +1740,21 @@ def setup(
         print(
             f"Using checkpoint-engine refit backend: {checkpoint_engine_config['backend']}",
             flush=True,
+        )
+    elif backend == "sglang":
+        t0 = time.perf_counter()
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+        )
+        # Only exchanges refit metadata. SGLang's own weight-update group is
+        # established lazily on the first refit.
+        policy_generation.weight_synchronizer.init_communicator()
+        setup_timing_metrics.extras["sglang_weight_sync_init_time_s"] = (
+            time.perf_counter() - t0
         )
     else:
         if getattr(
@@ -2455,9 +2468,21 @@ def refit_policy_generation(
     Returns:
         Scalar metrics reported by the selected weight synchronizer.
     """
+    # Every SGLang deployment reaches its refit through this hook: `setup`
+    # attaches an SGLang synchronizer that owns the whole lifecycle (phase
+    # transitions, engine recovery, pause/flush, transport), so SGLang never
+    # touches the branches below.
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
+
+    if isinstance(policy_generation, SGLangGeneration):
+        # Fail loudly rather than falling through to the vLLM branches, which
+        # would call methods the SGLang path does not implement.
+        raise RuntimeError(
+            "SGLang refits require policy_generation.weight_synchronizer to be "
+            "set. Attach one with create_weight_synchronizer(...) during setup."
+        )
 
     if colocated_inference:
         policy.offload_before_refit()
@@ -2484,36 +2509,21 @@ def refit_policy_generation(
                     policy.get_free_memory_bytes() * float(memory_ratio)
                 )
 
-            if isinstance(policy_generation, SGLangGeneration):
-                # Stream weights to colocated SGLang engines via CUDA IPC over HTTP.
-                futures_train = policy.stream_weights_via_http(
-                    rollout_engine_urls=policy_generation.get_rollout_engine_urls(),
-                    buffer_size_bytes=buffer_size_bytes,
-                )
-                # Wait for all workers to complete
-                ray.get(futures_train)
-                update_success = True
-            else:
-                # ZMQ IPC path: shared by vLLM and TRT-LLM colocated. Trainer
-                # streams CUDA IPC handles in chunks; receiver reconstructs
-                # tensors in-place and feeds them into the inference engine's
-                # loader.
-                futures_train = policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes,
-                    kv_scales=kv_scales,
-                )
-                futures_inference = policy_generation.update_weights_via_ipc_zmq()
-                # wait for all futures to complete
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
-                update_success = all(result for result in results if result is not None)
+            # ZMQ IPC path: shared by vLLM and TRT-LLM colocated. Trainer
+            # streams CUDA IPC handles in chunks; receiver reconstructs
+            # tensors in-place and feeds them into the inference engine's
+            # loader.
+            futures_train = policy.stream_weights_via_ipc_zmq(
+                buffer_size_bytes=buffer_size_bytes,
+                kv_scales=kv_scales,
+            )
+            futures_inference = policy_generation.update_weights_via_ipc_zmq()
+            # wait for all futures to complete
+            ray.get(futures_train)
+            results = ray.get(futures_inference)
+            update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl (vLLM) or megatron reshard
-            # SGLang haven't implemented non-colocated inference mode.
-            if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
-                )
+            # update weights through nccl (vLLM)
             futures_train = policy.broadcast_weights_for_collective(
                 kv_scales=kv_scales,
             )

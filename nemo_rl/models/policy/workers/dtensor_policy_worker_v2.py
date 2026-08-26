@@ -391,31 +391,11 @@ class DTensorPolicyWorkerV2Impl(
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
-        # Rollout topology constant for SGLang colocated refit: set once via
-        # ``set_rollout_num_gpus_per_engine`` after the SGLang generation
-        # handle exists and consumed by ``stream_weights_via_http`` on each
-        # refit. Only initialized on the SGLang colocated path since no other
-        # generation backend uses this attribute.
-        generation_backend = config.get("generation", {}).get("backend")
-        if generation_backend == "sglang":
-            from nemo_rl.models.generation.sglang.utils.train_utils import (
-                monkey_patch_torch_reductions,
-            )
-
-            monkey_patch_torch_reductions()
-            if self.is_generation_colocated:
-                self._rollout_num_gpus_per_engine: Optional[int] = None
-                self._ipc_worker_state: dict = {}
-
     def _update_moe_gate_bias_if_supported(self) -> None:
         """Update the non-gradient MoE routing bias after the optimizer step."""
         update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
         if update_moe_gate_bias is not None:
             update_moe_gate_bias()
-
-    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
-        """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
-        self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
@@ -1152,45 +1132,46 @@ class DTensorPolicyWorkerV2Impl(
         )
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_http")
-    def stream_weights_via_http(
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/update_weights_to_sglang_colocated")
+    def update_weights_to_sglang_colocated(
         self,
-        rollout_engine_urls: list[str],
+        *,
+        rollout_engines: list,
         buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
+        """Send FSDP weights to colocated SGLang engines via Ray CUDA IPC.
 
-        Args:
-            rollout_engine_urls: ``http://host:port`` base URLs of each
-                engine's ``node_rank=0`` SGLang HTTP server. The driver
-                resolves these once via ``engine.get_base_url`` and passes
-                them down so every FSDP rank doesn't redo the Ray RPC.
-            buffer_size_bytes: Max bucket size in bytes before flushing.
-
-        ``num_gpus_per_engine`` is recorded once via
-        ``set_rollout_num_gpus_per_engine`` after the SGLang generation handle
-        is created, so the caller doesn't have to pass it on every refit.
+        Synchronous: each chunk is awaited via ``ray.get`` inside
+        :func:`send_hf_buckets_via_ipc_actor_impl` before the next chunk is
+        sent, so trainer-side IPC tensors stay alive until the engine has
+        copied them and per-chunk engine failures surface immediately.
         """
-        assert self._rollout_num_gpus_per_engine is not None, (
-            "stream_weights_via_http called before set_rollout_num_gpus_per_engine; "
-            "wire the rollout TP size on the policy after SGLangGeneration is built."
-        )
+        if target_precision != "bf16":
+            raise NotImplementedError(
+                "The FSDP/DTensor policy only supports BF16 SGLang refits; "
+                f"got target_precision={target_precision!r}."
+            )
+        del sglang_quantization_cfg  # accepted for dispatch parity, bf16-only
 
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             self.model = self.move_to_cuda(self.model)
 
-        from nemo_rl.models.policy.utils import stream_weights_via_http_impl
+        from nemo_rl.models.policy.utils import (
+            iter_named_tensor_buckets,
+            send_hf_buckets_via_ipc_actor_impl,
+        )
 
-        stream_weights_via_http_impl(
-            params_generator=dtensor_params_generator(self.model, self.dtype),
-            rollout_engine_urls=rollout_engine_urls,
-            num_gpus_per_engine=self._rollout_num_gpus_per_engine,
-            rank=self.rank,
-            world_size=torch.distributed.get_world_size(),
-            worker_name=str(self),
+        bucket_iter = iter_named_tensor_buckets(
+            dtensor_params_generator(self.model, self.dtype),
             buffer_size_bytes=buffer_size_bytes,
-            worker_state=self._ipc_worker_state,
+        )
+        send_hf_buckets_via_ipc_actor_impl(
+            bucket_iterator=bucket_iter,
+            rollout_engines=list(rollout_engines),
+            worker_state=self._refit_transport_state("sglang_ipc"),
         )
 
     def _checkpoint_engine_params(

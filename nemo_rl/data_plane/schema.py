@@ -52,6 +52,23 @@ LP_SEED_FIELDS = (
     "sample_mask",
 )
 
+# Kept out of DP_TRAIN_FIELDS: a GRPO run writes neither, and a worker fetching
+# a column nobody wrote errors out rather than reading zeros.
+PPO_VALUE_FIELDS = (
+    "values",
+    "returns",
+)
+
+DP_VALUE_TRAIN_FIELDS = (
+    "input_ids",
+    "input_lengths",
+    "token_mask",
+    "sample_mask",
+    *PPO_VALUE_FIELDS,
+)
+
+VALUE_SEED_FIELDS = LP_SEED_FIELDS
+
 # Fields requested for KV-scale calibration. Positive include-list:
 # calibration only handles seq-dim tensor inputs, so we name them
 # explicitly. Train-side deltas (logprobs/advantages/masks) and
