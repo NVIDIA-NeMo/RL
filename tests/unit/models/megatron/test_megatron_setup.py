@@ -3051,8 +3051,10 @@ class TestFinalizeMegatronSetup:
     @patch("nemo_rl.models.megatron.setup._update_model_config_funcs")
     @patch("nemo_rl.models.megatron.setup.build_tokenizer")
     @patch("nemo_rl.models.megatron.setup.AutoBridge")
+    @patch("nemo_rl.models.megatron.setup.get_model_config")
     def test_basic_finalize_setup(
         self,
+        mock_get_model_config,
         mock_auto_bridge,
         mock_build_tokenizer,
         mock_update_model_config,
@@ -3066,6 +3068,8 @@ class TestFinalizeMegatronSetup:
         mock_megatron_cfg.model.make_vocab_size_divisible_by = 128
 
         mock_model = MagicMock()
+        runtime_model_config = MagicMock()
+        mock_get_model_config.return_value = runtime_model_config
         mock_optimizer = MagicMock()
 
         mock_worker_sharding = MagicMock()
@@ -3107,6 +3111,8 @@ class TestFinalizeMegatronSetup:
 
         # Verify function calls
         mock_update_model_config.assert_called_once()
+        mock_get_model_config.assert_called_once_with(mock_model)
+        assert mock_update_model_config.call_args.args[1] is runtime_model_config
         mock_build_tokenizer.assert_called_once()
         mock_auto_bridge.from_hf_pretrained.assert_called_once_with(
             "test-model", trust_remote_code=True
