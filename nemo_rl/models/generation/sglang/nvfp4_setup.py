@@ -90,6 +90,28 @@ def _read_source_config(model_dir: str) -> dict[str, Any]:
     return _read_json(config_path)
 
 
+def _read_external_nvfp4_quantization_config(
+    model_dir: str,
+) -> dict[str, Any] | None:
+    """Read NVFP4 metadata from ModelOpt's companion file."""
+    hf_quant_path = os.path.join(model_dir, "hf_quant_config.json")
+    if not os.path.isfile(hf_quant_path):
+        return None
+    hf_quant = _read_json(hf_quant_path)
+    return next(
+        (
+            candidate
+            for candidate in (
+                hf_quant.get("quantization"),
+                hf_quant.get("quantization_config"),
+                hf_quant,
+            )
+            if is_nvfp4_quantization_config(candidate)
+        ),
+        None,
+    )
+
+
 def _num_hidden_layers(config: dict[str, Any]) -> int:
     value = config.get("num_hidden_layers")
     if value is None and isinstance(config.get("text_config"), dict):
@@ -479,10 +501,18 @@ def _write_output_metadata(
         {
             "exclude_modules": ignore,
             "group_size": NVFP4_GROUP_SIZE,
-            "kv_cache_quant_algo": "FP8",
             "quant_algo": "NVFP4",
         }
     )
+    output_kv_cache_scheme = quantization_config.get("kv_cache_scheme")
+    if (
+        isinstance(output_kv_cache_scheme, dict)
+        and output_kv_cache_scheme.get("type") == "float"
+        and output_kv_cache_scheme.get("num_bits") == 8
+    ):
+        hf_quantization["kv_cache_quant_algo"] = "FP8"
+    else:
+        hf_quantization.pop("kv_cache_quant_algo", None)
     with open(os.path.join(save_dir, "hf_quant_config.json"), "w") as file:
         json.dump(hf_quant_config, file, indent=2)
 
@@ -632,10 +662,19 @@ def _hash_qualified_save_dir(
 
 def is_existing_nvfp4_checkpoint(path: str) -> bool:
     config = _read_source_config(path)
-    quantization_config = (
-        config.get("quantization_config") if isinstance(config, dict) else None
-    )
+    quantization_config = config.get("quantization_config")
     return is_nvfp4_quantization_config(quantization_config)
+
+
+def _reject_unsupported_external_nvfp4_checkpoint(path: str) -> None:
+    if _read_external_nvfp4_quantization_config(path) is None:
+        return
+    raise ValueError(
+        f"Externally quantized NVFP4 checkpoint at {path} is not supported for "
+        "SGLang online refit because its tensor layout may differ from NeMo-RL's "
+        "MoE-only refit layout. Use a BF16 source checkpoint or a checkpoint "
+        "converted by NeMo-RL."
+    )
 
 
 def _sync_checkpoint_ignore(
@@ -709,11 +748,14 @@ def ensure_nvfp4_checkpoint(
     if is_existing_nvfp4_checkpoint(model_path):
         _sync_checkpoint_ignore(model_path, quantization_cfg)
         return model_path
+    _reject_unsupported_external_nvfp4_checkpoint(model_path)
 
     converted = quantization_cfg.get("converted_model_path")
     if converted and is_existing_nvfp4_checkpoint(converted):
         _sync_checkpoint_ignore(converted, quantization_cfg)
         return converted
+    if converted:
+        _reject_unsupported_external_nvfp4_checkpoint(converted)
 
     cache_root = (
         quantization_cfg.get("cache_root")
@@ -728,6 +770,7 @@ def ensure_nvfp4_checkpoint(
     if is_existing_nvfp4_checkpoint(save_dir):
         _sync_checkpoint_ignore(save_dir, quantization_cfg)
         return save_dir
+    _reject_unsupported_external_nvfp4_checkpoint(save_dir)
 
     source_config = _read_source_config(model_path)
     num_hidden_layers = _num_hidden_layers(source_config)
