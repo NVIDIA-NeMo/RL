@@ -867,34 +867,13 @@ def setup(
 
     elif backend == "sglang":
         generation_config = cast(SGLangConfig, generation_config)
-
-        # Set model_path if not already set
-        if "model_path" not in generation_config["sglang_cfg"]:
-            generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
-
-        sglang_quantization_cfg = generation_config["sglang_cfg"]["quantization"]
-        from nemo_rl.models.generation.sglang.config import (
-            get_sglang_quantization_scheme,
-        )
         from nemo_rl.models.generation.sglang.quantization_utils import (
-            ensure_sglang_quantized_checkpoint,
-            validate_sglang_quantized_refit_backend,
+            prepare_sglang_quantized_generation,
         )
 
-        sglang_quantization_scheme = get_sglang_quantization_scheme(
-            sglang_quantization_cfg
-        )
-        validate_sglang_quantized_refit_backend(
-            scheme=sglang_quantization_scheme,
-            use_megatron=bool(
-                policy_config.get("megatron_cfg", {}).get("enabled", False)
-            ),
-        )
-        generation_config["sglang_cfg"]["model_path"] = (
-            ensure_sglang_quantized_checkpoint(
-                model_path=generation_config["sglang_cfg"]["model_path"],
-                quantization_config=sglang_quantization_cfg,
-            )
+        prepare_sglang_quantized_generation(
+            generation_config=generation_config,
+            policy_config=policy_config,
         )
 
         policy_generation, policy, value_model = initialize_generation_with_policy(

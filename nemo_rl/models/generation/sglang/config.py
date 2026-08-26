@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Mapping
 from typing import Any, Literal, NotRequired, Required, TypedDict, cast
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
@@ -21,7 +22,7 @@ SUPPORTED_SGLANG_QUANTIZATION_SCHEMES = frozenset({"bf16", "mxfp8"})
 
 
 def get_sglang_quantization_scheme(
-    quantization_config: dict[str, Any],
+    quantization_config: Mapping[str, Any],
 ) -> SglangQuantizationScheme:
     """Return and validate the configured SGLang weight precision.
 
