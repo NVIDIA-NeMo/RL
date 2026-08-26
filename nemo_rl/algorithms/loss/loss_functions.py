@@ -1200,7 +1200,17 @@ class DistillationLossFn(LossFunction):
 
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
-            "num_valid_samples": data["input_ids"].shape[0],
+            # From the mask, not the batch dimension: workers gate on
+            # ``num_valid_samples > 0`` to decide whether a microbatch is
+            # recorded at all, so the raw batch size makes a fully-masked
+            # microbatch look like it contributed and dilutes the step's
+            # reported loss with its zero. Falls back to the batch dimension
+            # when there is no mask, where every sample is valid by definition.
+            "num_valid_samples": (
+                data["sample_mask"].sum().item()
+                if "sample_mask" in data
+                else data["input_ids"].shape[0]
+            ),
         }
 
         return kl_loss, metrics
@@ -1335,7 +1345,8 @@ class MseValueLossFn(LossFunction):
             "values_max": values_max,
             "returns_sq_mean": returns_sq_mean,
             "residual_sq_mean": residual_sq_mean,
-            "num_valid_samples": int(values.shape[0]),
+            # See DistillationLossFn: the critic's workers gate on this too.
+            "num_valid_samples": sample_mask.sum().item(),
         }
 
         return loss, metrics
@@ -1709,7 +1720,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             "ce_loss": ce_loss.item(),
             "kl_loss_scale": kl_scale.item(),
             "accuracy": accuracy.item(),
-            "num_valid_samples": data["input_ids"].shape[0],
+            # See DistillationLossFn.
+            "num_valid_samples": data["sample_mask"].sum().item(),
         }
         metrics.update(per_teacher_metrics)
         return loss, metrics
