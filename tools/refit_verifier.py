@@ -255,6 +255,7 @@ def setup_configs(args, tokenizer):
                 # Optimizer CPU offload settings
                 "optimizer_cpu_offload": False,
                 "optimizer_offload_fraction": 0.0,
+                "overlap_cpu_optimizer_d2h_h2d": False,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
@@ -610,7 +611,6 @@ def init_sglang(inference_cluster, generation_config):
 def initialize_generation_with_policy(
     init_generation_fn: Callable,
     init_policy_fn: Callable,
-    init_time_key: str,
     colocated_inference: bool,
     worker_init_timing_metrics: dict,
     policy: Policy | None = None,
@@ -625,7 +625,6 @@ def initialize_generation_with_policy(
     Args:
         init_generation_fn: Callable returning (engine, init_time_s).
         init_policy_fn: Callable returning (policy, init_time_s).
-        init_time_key: Metrics key for generation init time.
         colocated_inference: Whether inference is colocated with training.
         worker_init_timing_metrics: Dict populated with init/parallel timing.
         policy: Optional pre-initialized policy; if set, init_policy_fn is skipped.
@@ -648,7 +647,7 @@ def initialize_generation_with_policy(
             policy, policy_time = policy_future.result()
         parallel_wall_time = time.perf_counter() - parallel_start_time
 
-        worker_init_timing_metrics[init_time_key] = generation_time
+        worker_init_timing_metrics["generation_init_time_s"] = generation_time
         worker_init_timing_metrics["policy_init_time_s"] = policy_time
         worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
         worker_init_timing_metrics["parallel_init_enabled"] = 1.0
@@ -658,7 +657,7 @@ def initialize_generation_with_policy(
             flush=True,
         )
         policy_generation, generation_time = init_generation_fn()
-        worker_init_timing_metrics[init_time_key] = generation_time
+        worker_init_timing_metrics["generation_init_time_s"] = generation_time
 
         if policy is None:
             policy, policy_time = init_policy_fn()
@@ -765,7 +764,6 @@ def main_sglang():
     policy_generation, _ = initialize_generation_with_policy(
         init_generation_fn=lambda: init_sglang(cluster, generation_config),
         init_policy_fn=init_policy_fn,
-        init_time_key="sglang_init_time_s",
         colocated_inference=True,
         worker_init_timing_metrics=worker_init_timing_metrics,
     )

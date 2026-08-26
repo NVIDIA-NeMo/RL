@@ -49,17 +49,39 @@ def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
 
     monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", fake_put)
     monkeypatch.setattr(tq_adapter.tq, "kv_clear", fake_clear)
+    # bootstrap=False only connects to an existing controller; stubbing that
+    # lets the real __init__ run, so this test cannot drift from it.
+    monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
 
-    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client = tq_adapter.TQDataPlaneClient(
+        {
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "simple",
+            "claim_meta_poll_interval_s": 0.5,
+        },
+        bootstrap=False,
+    )
     client.register_partition(
         partition_id="obj-backend",
         fields=["msg_log"],
         num_samples=8,
         consumer_tasks=["read"],
     )
+    # Same fields again: already warmed, so no second put/clear.
     client.register_partition(
         partition_id="obj-backend",
         fields=["msg_log"],
+        num_samples=8,
+        consumer_tasks=["read"],
+    )
+    assert len(put_calls) == 1
+
+    # A genuinely new field warms only that field, under a fresh key --
+    # mooncake has no upsert, so a reused key would hit stale metadata.
+    client.register_partition(
+        partition_id="obj-backend",
+        fields=["msg_log", "rewards"],
         num_samples=8,
         consumer_tasks=["read"],
     )
@@ -74,7 +96,7 @@ def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
     ]
     assert [list(call["fields"].keys()) for call in put_calls] == [
         ["msg_log"],
-        ["msg_log"],
+        ["rewards"],
     ]
     assert clear_calls == [
         {"keys": [schema_keys[0]], "partition_id": "obj-backend"},

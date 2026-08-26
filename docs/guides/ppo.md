@@ -57,6 +57,18 @@ policy:
 
 When only one node remains for policy and generation after other resources are reserved, `gpus_per_node` reserves that many GPUs for generation and `num_nodes` must be `null` or `1`. When more than one node remains for training and generation, generation uses complete nodes: set `num_nodes` to the number of inference nodes and `gpus_per_node` equal to `cluster.gpus_per_node`. Non-colocated SGLang generation is not currently supported by PPO.
 
+### Asynchronous PPO
+
+Set `ppo.async_ppo.enabled: true` to overlap rollout generation with training. A background collector fills a replay buffer on the non-colocated vLLM GPUs while the policy and value model train on their shared cluster. Values and policy/reference log probabilities are recomputed when a trajectory is sampled, then PPO runs GAE and its normal `ppo_epochs` updates before publishing one new policy version to vLLM.
+
+Async PPO reuses the trajectory collector, replay buffer, and weight-versioning infrastructure described in the [Async GRPO guide](async-grpo.md); this section focuses on PPO-specific behavior and constraints.
+
+Async PPO requires non-colocated vLLM generation with `vllm_cfg.async_engine: true`, `loss_fn.use_importance_sampling_correction: true`, and `loss_fn.force_on_policy_ratio: false`. Dynamic sampling, reward scaling, reward shaping, multiple dataloaders, NeMo Gym, colocated generation, and FP8 KV-scale synchronization are not supported yet.
+
+`max_trajectory_age_steps` is the normal policy-training age limit. The recommended value is `1`; larger values improve overlap but increase off-policy bias in GAE. When `policy_training_start_step > 0`, set `warmup_generation_lead_steps` to a larger value to bank additional rollout batches while the policy is frozen for critic warmup. The collector caps frozen-policy targets at `policy_training_start_step + max_trajectory_age_steps`, so their actual policy-update age remains within the normal limit. The buffer keeps these batches valid through that frontier and then restores the normal age limit. `null` uses `max_trajectory_age_steps` as the generation lead throughout.
+
+Async training stops at `max_num_steps`; the collector cycles the training dataloader as needed. `max_num_epochs` is not supported yet and must be set to `-1`; use `max_num_steps` to control training length. Async checkpoints save the collector dataloader and replay-buffer state together with policy and value state. By default, incomplete restored targets are retained and gap-filled. Setting `drop_incomplete_targets_on_restore: true` discards their restored rows and fills the target from subsequent dataloader prompts; it does not regenerate the original prompts.
+
 ### Value Model Configuration
 
 ```yaml
@@ -235,6 +247,14 @@ ppo:
   # null logs mismatch metrics without masking; set a threshold to mask sequences.
   seq_logprob_error_threshold: null
 
+  async_ppo:
+    enabled: false
+    max_trajectory_age_steps: 1
+    warmup_generation_lead_steps: null
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+    drop_incomplete_targets_on_restore: false
+
   adv_estimator:
     name: "gae"
     gae_lambda: 0.95
@@ -275,6 +295,7 @@ value_loss_fn:
 - **`ppo.ppo_epochs`**: Number of training updates per rollout batch
 - **`ppo.policy_training_start_step`**: Number of critic-only warmup steps before policy training begins
 - **`ppo.seq_logprob_error_threshold`**: Nullable sequence-level multiplicative probability-error threshold. PPO always logs sequence-level train/generation mismatch metrics; when this is set, sequences above the threshold are excluded from advantage and loss computation.
+- **`ppo.async_ppo`**: Enables replay-buffer-based asynchronous PPO. See [Asynchronous PPO](#asynchronous-ppo) for requirements and staleness controls.
 - **`ppo.adv_estimator.name`**: Set to `"gae"` for GAE advantage estimation (PPO default)
 - **`ppo.adv_estimator.gae_lambda`**: GAE $\lambda$ parameter (bias-variance tradeoff, typically 0.95)
 - **`ppo.adv_estimator.gae_gamma`**: Discount factor $\gamma$ (typically 1.0 for outcome-supervised tasks)
@@ -282,7 +303,7 @@ value_loss_fn:
 - **`value_loss_fn.cliprange`**: Clip range for value function predictions
 - **`loss_fn.positive_example_nll_weight`**: VAPO NLL auxiliary loss weight on correct samples (0 = disabled)
 
-All other parameters (clipping, KL, importance sampling, dynamic sampling, reward shaping, reward scaling) work identically to GRPO. See the [GRPO Guide](grpo.md) for details.
+For synchronous PPO, the remaining clipping, KL, sampling, and reward options work as documented in the [GRPO Guide](grpo.md). Async PPO has the limitations listed above.
 
 ## Metrics
 
