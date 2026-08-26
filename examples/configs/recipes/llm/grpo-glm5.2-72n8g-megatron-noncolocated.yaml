@@ -67,7 +67,6 @@ policy:
       dsa_kernel_backend: cudnn
       dsa_indexer_loss_coeff: 0.0
       dsa_indexer_use_sparse_loss: false
-      deallocate_pipeline_outputs: true
       persist_layer_norm: true
       bias_dropout_fusion: true
     clear_memory_caches_before_refit: true

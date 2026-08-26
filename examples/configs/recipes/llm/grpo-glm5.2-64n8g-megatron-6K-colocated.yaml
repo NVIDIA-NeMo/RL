@@ -37,7 +37,6 @@ policy:
     qk_rope_head_dim: 64
   train_global_batch_size: 128
   train_micro_batch_size: 1
-  logprob_batch_size: 1
   max_total_sequence_length: 6144
   # Keep every packed microbatch at one fixed length. With the legacy data path,
   # unequal DP-rank lengths hang the MoE all-gather token dispatcher.
@@ -88,19 +87,14 @@ policy:
       persist_layer_norm: true
       bias_dropout_fusion: true
     clear_memory_caches_before_refit: true
-  sequence_packing:
-    train_mb_tokens: ${policy.max_total_sequence_length}
-    logprob_mb_tokens: ${policy.max_total_sequence_length}
   optimizer: null
   scheduler: null
   generation:
     max_new_tokens: 4096
     vllm_cfg:
-      precision: bfloat16
       tensor_parallel_size: 32
       expert_parallel_size: 128
       gpu_memory_utilization: 0.5
-      max_model_len: 6144
       enforce_eager: true
     vllm_kwargs:
       max_num_batched_tokens: 4096
