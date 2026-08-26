@@ -87,23 +87,6 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.timer import Timer
 
 
-def _keep_native_dtype_keywords(model: nn.Module) -> list[str]:
-    """FQN substrings whose tensors keep their native dtype during refit.
-
-    Mirrors the HF/Automodel ``_keep_in_fp32_modules(_strict)`` convention:
-    models declare tensors that must not be downcast to the policy compute
-    dtype. Example: NemotronH stores its ``e_score_correction_bias`` MoE
-    routing buffers in fp32, and rounding them to bf16 during weight transfer
-    can change expert selection on the generation side.
-    """
-    keywords: list[str] = []
-    for attr in ("_keep_in_fp32_modules_strict", "_keep_in_fp32_modules"):
-        value = getattr(model, attr, None)
-        if isinstance(value, (list, tuple, set)):
-            keywords.extend(str(keyword) for keyword in value)
-    return list(dict.fromkeys(keywords))
-
-
 def dtensor_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -118,7 +101,6 @@ def dtensor_params_generator(
         Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
     """
     module_map = dict(model.named_modules())
-    keep_native_dtype_keywords = _keep_native_dtype_keywords(model)
     for name, tensor in model.state_dict().items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
@@ -127,18 +109,11 @@ def dtensor_params_generator(
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            # Convert to target dtype, except tensors the model declares as
-            # dtype-sensitive (e.g. fp32 MoE router bias buffers), which keep
-            # their native dtype. prepare_refit_info mirrors this rule so the
-            # receiver-side manifest matches the bytes actually streamed.
-            if any(kw in adapted_fqn for kw in keep_native_dtype_keywords):
-                out_tensor = adapted_tensor.contiguous()
-            else:
-                out_tensor = adapted_tensor.to(
-                    target_dtype, non_blocking=True
-                ).contiguous()
-            yield (adapted_fqn, out_tensor)
-            del out_tensor
+            # Convert to target dtype
+            yield (
+                adapted_fqn,
+                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
+            )
             del adapted_tensor
         del adapted_fqn_tensors
         del merged_tensor
@@ -1099,26 +1074,18 @@ class DTensorPolicyWorkerV2Impl(
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
-        keep_native_dtype_keywords = _keep_native_dtype_keywords(self.model)
         for name, tensor in self.model.state_dict().items():
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
                 continue
             full_tensor = (
                 tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
             )
-            # Tensors are cast to self.dtype by dtensor_params_generator in
-            # stream_weights_via_ipc_zmq/broadcast_weights_for_collective,
-            # except dtype-sensitive tensors (e.g. fp32 MoE router bias
-            # buffers), which are streamed in their native dtype.
+            # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
             adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
                 self.model, name, full_tensor
             )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                if any(kw in adapted_fqn for kw in keep_native_dtype_keywords):
-                    refit_dtype = adapted_tensor.dtype
-                else:
-                    refit_dtype = self.dtype
-                state_dict_info[adapted_fqn] = (adapted_tensor.shape, refit_dtype)
+                state_dict_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
 
         return state_dict_info
 

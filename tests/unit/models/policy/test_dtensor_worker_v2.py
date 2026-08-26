@@ -729,43 +729,6 @@ class TestDTensorParamsGenerator:
                 f"Tensor {name} should be converted to {target_dtype}"
             )
 
-    def test_keep_in_fp32_declared_buffer_keeps_native_dtype(self):
-        """Tensors matching _keep_in_fp32_modules(_strict) keep their native dtype.
-
-        Mirrors the NemotronH fp32 e_score_correction_bias routing buffers:
-        blanket-casting them to bf16 during refit changes MoE expert selection
-        on the generation side.
-        """
-
-        # Arrange
-        class Gate(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.weight = nn.Parameter(torch.zeros(4, 4, dtype=torch.float32))
-                self.register_buffer(
-                    "e_score_correction_bias", torch.zeros(4, dtype=torch.float32)
-                )
-
-        class Model(nn.Module):
-            _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
-
-            def __init__(self):
-                super().__init__()
-                self.gate = Gate()
-
-        model = Model()
-
-        # Act
-        results = dict(dtensor_params_generator(model, torch.bfloat16))
-
-        # Assert
-        assert results["gate.weight"].dtype == torch.bfloat16, (
-            "Undeclared tensors should be cast to the target dtype"
-        )
-        assert results["gate.e_score_correction_bias"].dtype == torch.float32, (
-            "Declared dtype-sensitive buffers must keep their native dtype"
-        )
-
     def test_contiguous_output(self):
         """Test that output tensors are contiguous."""
         # Arrange
@@ -856,45 +819,6 @@ class TestDTensorParamsGenerator:
         for name, tensor in results:
             assert tensor.dtype == target_dtype
             assert tensor.is_contiguous()
-
-
-@pytest.mark.automodel
-@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_prepare_refit_info_keeps_declared_buffer_native_dtype():
-    """prepare_refit_info must declare the same dtype dtensor_params_generator streams.
-
-    Mirrors NemotronH's fp32 ``e_score_correction_bias`` MoE routing buffers:
-    if the manifest declared bf16 while the sender streamed fp32 bytes, the
-    receiver would misinterpret the payload.
-    """
-
-    class Gate(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.zeros(4, 4, dtype=torch.float32))
-            self.register_buffer(
-                "e_score_correction_bias", torch.zeros(4, dtype=torch.float32)
-            )
-
-    class Model(nn.Module):
-        _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
-
-        def __init__(self):
-            super().__init__()
-            self.gate = Gate()
-
-    worker = object.__new__(DTensorPolicyWorkerV2Impl)
-    worker.model = Model()
-    worker.dtype = torch.bfloat16
-
-    state_dict_info = DTensorPolicyWorkerV2Impl.prepare_refit_info(worker)
-
-    assert state_dict_info["gate.weight"][1] == torch.bfloat16, (
-        "Undeclared tensors should be declared in the policy compute dtype"
-    )
-    assert state_dict_info["gate.e_score_correction_bias"][1] == torch.float32, (
-        "Declared dtype-sensitive buffers must be declared in their native dtype"
-    )
 
 
 @pytest.mark.automodel
