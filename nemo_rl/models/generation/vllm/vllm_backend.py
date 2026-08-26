@@ -580,6 +580,12 @@ class VllmInternalWorkerExtension:
         self._validate_native_layerwise_refit()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
+        # Non-FP8 runs serialize no FP8 config; skip the fp8 module (and its
+        # heavyweight vLLM imports) entirely so quant backends stubbed without
+        # the full vLLM surface can still prepare refit info.
+        if serialized_fp8_config is None:
+            return None
+
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         fp8.install_fp8_config(serialized_fp8_config)

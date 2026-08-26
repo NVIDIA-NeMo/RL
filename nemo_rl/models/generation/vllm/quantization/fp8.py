@@ -668,12 +668,6 @@ def load_weights(weights, model_runner):
                 weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
             )
         if global_fp8_config.is_mx:
-            # vLLM 0.25 returns row-major [M, K / 32] E8M0 scales.
-            # All-zero blocks quantize to E8M0 byte 0, which destabilizes the
-            # TRTLLM MXFP8 kernel; clamp to byte 1 (weights are 0 anyway).
-            param_scale = torch.where(
-                param_scale == 0, torch.ones_like(param_scale), param_scale
-            )
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_from_checkpoint", param_scale])
         else:

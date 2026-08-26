@@ -1094,7 +1094,10 @@ def test_load_weights_preserves_prequantized_mxfp8_and_clamps_scales(
     assert loaded[2][0] == "model.prequantized.weight_scale_from_checkpoint"
     assert loaded[2][1] is prequantized_scales
     assert loaded[3][0] == "model.receiver.weight"
-    assert loaded[3][1] is receiver_fp8
+    # quantize_mxfp8_weight reshapes to the checkpoint layout, so compare
+    # contents rather than object identity.
+    assert loaded[3][1].dtype == torch.float8_e4m3fn
+    assert torch.equal(loaded[3][1].view(torch.uint8), receiver_fp8.view(torch.uint8))
     assert loaded[4][0] == "model.receiver.weight_scale_from_checkpoint"
     torch.testing.assert_close(
         loaded[4][1],

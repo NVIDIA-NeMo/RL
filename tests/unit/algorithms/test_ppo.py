@@ -1462,6 +1462,7 @@ def _run_noncolocated_setup(monkeypatch, config):
     policy.init_collective.return_value = ["policy-future"]
     value_model = MagicMock()
     generation = MagicMock()
+    generation.prepare_refit_info.return_value = None
     generation.init_collective.return_value = ["generation-future"]
     policy_factory = MagicMock(return_value=policy)
     value_factory = MagicMock(return_value=value_model)
