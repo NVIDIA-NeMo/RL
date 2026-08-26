@@ -43,10 +43,11 @@ contains Qwen3.8-Flash-Next support.
 
 Sources:
 
-- **AutoModel** — the `huiyingl/feat/qwen3-8-flash-next-rl` branch of
-  `NVIDIA-NeMo/Automodel`, pinned by this repository's AutoModel submodule.
-- **vLLM** — [main branch](https://github.com/vllm-project/vllm), where
-  Qwen3.8-Flash-Next support is merged.
+- **AutoModel** — the
+  [`huiyingl/feat/qwen3-8-flash-next-rl` branch](https://github.com/NVIDIA-NeMo/Automodel/tree/huiyingl/feat/qwen3-8-flash-next-rl),
+  pinned by this repository's AutoModel submodule.
+- **vLLM** — the Qwen3.8-Flash-Next support branch from
+  [vLLM PR #53896](https://github.com/vllm-project/vllm/pull/53896).
 
 The root `pyproject.toml` resolves vLLM from the editable local path
 `3rdparty/vLLM-workspace/vllm`. Clone the source at that exact path before
@@ -57,6 +58,8 @@ git submodule update --init 3rdparty/Automodel-workspace/Automodel
 
 mkdir -p 3rdparty/vLLM-workspace
 git clone https://github.com/vllm-project/vllm.git 3rdparty/vLLM-workspace/vllm
+git -C 3rdparty/vLLM-workspace/vllm fetch origin pull/53896/head
+git -C 3rdparty/vLLM-workspace/vllm checkout --detach FETCH_HEAD
 ```
 
 The vLLM environment uses FlashInfer 0.6.17. `flashinfer-cubin` is not an
