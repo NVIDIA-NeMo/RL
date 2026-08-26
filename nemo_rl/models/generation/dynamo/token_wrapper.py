@@ -475,7 +475,7 @@ class DynamoTokenWrapperServer:
             status_code, response_body = await self._forward_chat_completion(
                 prepared_body,
                 authorization=request.headers.get("authorization"),
-                session_id=request.headers.get("x-dynamo-session-id"),
+                session_id=request.headers.get(DYNAMO_SESSION_ID_HEADER),
             )
             if 200 <= status_code < 300:
                 try:

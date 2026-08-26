@@ -458,11 +458,11 @@ class DynamoGeneration(GenerationInterface):
         )
         response: dict[str, Any] = {}
         for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
-            request_kwargs: dict[str, Any] = {}
-            if request_headers is not None:
-                request_kwargs["headers"] = request_headers
             response = await async_http_post_json(
-                request_url, payload, self._request_timeout_s(), **request_kwargs
+                request_url,
+                payload,
+                self._request_timeout_s(),
+                headers=request_headers,
             )
             if not _is_retryable_http_response(response):
                 break

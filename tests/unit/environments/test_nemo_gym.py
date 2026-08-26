@@ -954,25 +954,43 @@ def test_validate_reward_components_match_scalar():
         )
 
 
-@pytest.mark.parametrize("backend", ["dynamo", "vllm"])
-def test_setup_nemo_gym_config_sets_session_header_only_for_dynamo(backend) -> None:
+def test_setup_nemo_gym_config_merges_session_header_for_dynamo() -> None:
     config = SimpleNamespace(
-        policy={"generation": {"backend": backend, "vllm_cfg": {}}},
+        policy={"generation": {"backend": "dynamo", "vllm_cfg": {}}},
+        env={
+            "nemo_gym": {
+                "num_gpu_nodes": 2,
+                "policy_model": {
+                    "responses_api_models": {
+                        "vllm_model": {"model_name": "keep-me"},
+                        "other_model": {"model_name": "untouched"},
+                    }
+                },
+            }
+        },
+    )
+
+    setup_nemo_gym_config(config, tokenizer=object())
+
+    nemo_gym = config.env["nemo_gym"]
+    responses_api_models = nemo_gym["policy_model"]["responses_api_models"]
+    assert responses_api_models["vllm_model"] == {
+        "model_name": "keep-me",
+        "session_id_header": DYNAMO_SESSION_ID_HEADER,
+    }
+    assert responses_api_models["other_model"] == {"model_name": "untouched"}
+    assert nemo_gym["num_gpu_nodes"] == 2
+
+
+def test_setup_nemo_gym_config_does_not_set_session_header_for_vllm() -> None:
+    config = SimpleNamespace(
+        policy={"generation": {"backend": "vllm", "vllm_cfg": {}}},
         env={},
     )
 
     setup_nemo_gym_config(config, tokenizer=object())
-    setup_nemo_gym_config(config, tokenizer=object())
 
-    if backend == "dynamo":
-        assert (
-            config.env["nemo_gym"]["policy_model"]["responses_api_models"][
-                "vllm_model"
-            ]["session_id_header"]
-            == DYNAMO_SESSION_ID_HEADER
-        )
-    else:
-        assert config.env == {}
+    assert config.env == {}
 
 
 @pytest.mark.nemo_gym

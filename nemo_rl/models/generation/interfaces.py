@@ -294,7 +294,7 @@ class GenerationDatumSpec(TypedDict):
     - input_ids: Tensor of token IDs representing the input sequences (right padded)
     - input_lengths: Tensor containing the actual length of each sequence (without padding)
     - stop_strings: Optional list of strings to stop generation (per sample)
-    - session_ids: Optional stable request session ID for each sample
+    - session_ids: Optional per-sample stable session IDs; honored only by the Dynamo backend
     - __extra__: Additional model-specific data fields
 
     Example of a batch with 4 entries with different sequence lengths:

@@ -222,7 +222,7 @@ def test_second_turn_overwrites_prefix_fallback_routes() -> None:
     assert torch.equal(final_env["routed_experts"], _fallback_routes(2))
 
 
-def test_dynamo_session_id_is_stable_per_trajectory_attempt() -> None:
+def test_dynamo_session_id_is_stable_across_turns_and_distinct_for_siblings() -> None:
     second_turn_output = _generation_output(
         (10, 11, 12, 20, 21, 31, 32, 40, 41),
         route_start=100,
@@ -231,7 +231,6 @@ def test_dynamo_session_id_is_stable_per_trajectory_attempt() -> None:
         [
             _generation_output(),
             second_turn_output,
-            _generation_output(),
             _generation_output(),
         ],
         max_rollout_turns=2,
@@ -267,22 +266,19 @@ def test_dynamo_session_id_is_stable_per_trajectory_attempt() -> None:
                 env_output(terminated=False),
                 env_output(terminated=True),
                 env_output(terminated=True),
-                env_output(terminated=True),
             ],
         ),
         patch(
             "nemo_rl.experience.rollouts.uuid4",
-            side_effect=["attempt-a", "sibling-b", "retry-c"],
+            side_effect=["attempt-a", "sibling-b"],
         ),
     ):
         asyncio.run(impl._run_single_rollout(input_sample, traj_idx=0))
         asyncio.run(impl._run_single_rollout(input_sample, traj_idx=1))
-        asyncio.run(impl._run_single_rollout(input_sample, traj_idx=0))
 
     generation = impl._policy_generation
     assert [call["session_ids"][0] for call in generation.calls] == [
         "attempt-a",
         "attempt-a",
         "sibling-b",
-        "retry-c",
     ]

@@ -74,10 +74,7 @@ async def async_http_post_json(
     timeout = aiohttp.ClientTimeout(total=timeout_s)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            request_kwargs: dict[str, Any] = {"json": payload}
-            if headers is not None:
-                request_kwargs["headers"] = headers
-            async with session.post(url, **request_kwargs) as response:
+            async with session.post(url, json=payload, headers=headers) as response:
                 body = await response.read()
                 if response.status >= 400:
                     return {

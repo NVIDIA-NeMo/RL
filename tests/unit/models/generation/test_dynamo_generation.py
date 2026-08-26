@@ -211,8 +211,19 @@ def test_blocking_generate_is_rejected_and_async_generation_uses_http(
     assert requests[0][3]["headers"] == {"X-Dynamo-Session-ID": "trajectory-session"}
 
 
-@pytest.mark.parametrize("session_ids", [[], [""]])
-def test_async_generation_rejects_invalid_session_ids(monkeypatch, session_ids) -> None:
+@pytest.mark.parametrize(
+    ("session_ids", "expected_message"),
+    [
+        ([], "one value for each input sample"),
+        (["a", "b"], "one value for each input sample"),
+        ([""], "must be non-empty strings"),
+        (["   "], "must be non-empty strings"),
+        ([None], "must be non-empty strings"),
+    ],
+)
+def test_async_generation_rejects_invalid_session_ids(
+    monkeypatch, session_ids, expected_message
+) -> None:
     _patch_runtime(monkeypatch)
     generation = DynamoGeneration(cluster=object(), config=_config())
     data = _data()
@@ -221,7 +232,7 @@ def test_async_generation_rejects_invalid_session_ids(monkeypatch, session_ids) 
     async def collect():
         return [item async for item in generation.generate_async(data)]
 
-    with pytest.raises(ValueError, match="Dynamo session"):
+    with pytest.raises(ValueError, match=expected_message):
         asyncio.run(collect())
 
 
@@ -506,7 +517,7 @@ def test_completion_retry_stops_on_nonretryable_or_exhaustion(
     _patch_runtime(monkeypatch)
     calls = []
 
-    async def fake_post(*args):
+    async def fake_post(*args, **kwargs):
         calls.append(args)
         return {"status": "error", "http_status": status}
 
@@ -539,7 +550,7 @@ def test_direct_completions_are_not_limited_by_default_thread_pool(
     all_entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def fake_post(*args):
+    async def fake_post(*args, **kwargs):
         nonlocal entered_count
         entered_count += 1
         if entered_count == request_count:
