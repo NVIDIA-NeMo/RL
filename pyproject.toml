@@ -491,18 +491,6 @@ constraint-dependencies = [
   "opencv-python-headless>=5.0.0",            # CVE floor: patches CVE-2025-9951, CVE-2025-1594, CVE-2024-31582 (bundled FFmpeg 5.1.6 in 4.x)
 ]
 
-# CUTLASS DSL 4.5.x ships overlapping base and cu13 wheels, while 4.6.x
-# requires libs-base/libs-core for common Python and MLIR modules. Keep the
-# workaround scoped to the 4.5.x versions present in this lockfile.
-exclude-dependencies = [
-  { package = { name = "nvidia-cutlass-dsl", version = "4.5.0" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
-  { package = { name = "nvidia-cutlass-dsl", version = "4.5.1" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
-  { package = { name = "nvidia-cutlass-dsl", version = "4.5.2" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
-  { package = { name = "nvidia-cutlass-dsl-libs-cu13", version = "4.5.0" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
-  { package = { name = "nvidia-cutlass-dsl-libs-cu13", version = "4.5.1" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
-  { package = { name = "nvidia-cutlass-dsl-libs-cu13", version = "4.5.2" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
-]
-
 conflicts = [
   [
     { package = "nemo-rl", extra = "automodel" },
@@ -608,6 +596,42 @@ flash_mla = [{ requirement = "torch", match-runtime = true }]
 # sync with docker/Dockerfile's BASE_IMAGE CUDA major version (currently cuda13.x).
 [tool.uv.extra-build-variables]
 torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
+
+# CUTLASS DSL 4.5.x publishes overlapping base and cu13 wheels. Override the
+# affected metadata so those versions use the self-contained cu13 wheel, while
+# 4.6.x retains libs-base/libs-core for its common Python and MLIR modules.
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.0"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.0; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.1"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.1; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.2"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.2; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.0"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.1"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.2"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
