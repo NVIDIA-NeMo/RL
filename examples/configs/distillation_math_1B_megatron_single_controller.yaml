@@ -1,0 +1,107 @@
+# SingleController variant of distillation_math_megatron.yaml.
+#
+# The teacher shares the training GPUs with the student rather than taking its
+# own: setup builds it as a second worker group on the train cluster and the
+# train pump offloads one while the other is resident, so this needs the same
+# GPU count as the GRPO variant.
+defaults: distillation_math_megatron.yaml
+
+distillation:
+  # SC has no validation loop yet, so these three must be off.
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  # num_prompts_per_step * num_generations_per_prompt must equal
+  # policy.train_global_batch_size: SC maps one RL step onto exactly one
+  # optimizer.step, so a multi-mini-step RL step has nowhere to go.
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 4
+  # How many teacher logits per position reach the loss. The teacher forward
+  # writes [B, S, k] twice (values and indices), so this is the one knob that
+  # sizes the data-plane traffic of the teacher stage.
+  topk_logits_k: 64
+
+async_rl:
+  sampler:
+    name: in_order
+    # How far generation may run ahead of the trainer.
+    max_lookahead_versions: 1
+  # Recompute generation KV caches after each weight update.
+  recompute_kv_cache_after_weight_updates: false
+  # Min ready groups the streaming trainer waits for before dispatching a batch.
+  min_groups_for_streaming_train: ${distillation.num_prompts_per_step}
+  # Cap on in-flight generate_and_push calls in the rollout pump.
+  max_inflight_prompts: ${distillation.num_prompts_per_step}
+  # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
+  max_buffered_rollouts: 64
+  diagnostics: false
+
+  rollout_failure:
+    max_infra_attempts_per_prompt: 5
+    max_data_attempts_per_prompt: 2
+    max_skipped_prompts: 0
+    max_consecutive_dropped_prompts: 0
+    min_step_batch_fraction: 0.9
+    on_dropped_prompt: shrink
+
+  stall_watchdog:
+    interval_s: 30.0
+    stall_timeout_s: 600.0
+    stall_action: warn
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/distillation-single-controller
+  # SC collects no val: metrics, so only a train: metric is selectable here.
+  metric_name: null
+
+policy:
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+
+  generation:
+    port_range_low: 11001
+    port_range_high: 15000
+    vllm_cfg:
+      async_engine: true
+    colocated:
+      # SC drives rollout through RolloutManager.generate_and_push, which only
+      # the disaggregated async engine supports.
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 1
+
+teacher:
+  # The parent shards the teacher across 8 GPUs (CP2 x TP2 x PP2). It shares the
+  # student's training GPUs here, so it takes the same single-GPU shape.
+  megatron_cfg:
+    context_parallel_size: 1
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+
+logger:
+  wandb:
+    name: distillation-single-controller-dev
+  swanlab:
+    name: distillation-single-controller-dev
+  mlflow:
+    run_name: distillation-single-controller-dev
+
+# The parent has no data_plane block -- distillation has only ever run on the
+# legacy path -- so the whole thing is spelled out here.
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: "simple"                  # TQ storage backend ('simple' or 'mooncake_cpu')
+  claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
+  simple:
+    storage_capacity: 1000000        # max samples retained per partition
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
+
+cluster:
+  gpus_per_node: 2
+  master_port_range_low: 25000
+  master_port_range_high: 28000

@@ -1088,6 +1088,8 @@ def setup_single_controller(
     setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
     if "value_time" in time_metrics:
         setup_timing_metrics.value_init_time_s = time_metrics["value_time"]
+    if "teacher_time" in time_metrics:
+        setup_timing_metrics.teacher_init_time_s = time_metrics["teacher_time"]
 
     if use_nemo_gym:
         env_handles["nemo_gym"], gym_time = results["nemo_gym"]
