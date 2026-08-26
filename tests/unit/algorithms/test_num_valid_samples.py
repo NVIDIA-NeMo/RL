@@ -102,17 +102,29 @@ class TestDistillationLossFn:
 
     def test_without_a_mask_every_sample_is_valid(self):
         """The unmasked branch has nothing to count, so the batch dimension is
-        the honest answer there."""
+        the honest answer there.
+
+        Written to hold whichever way this lands relative to #3496, which
+        replaces that branch with a raise. Until it lands the fallback is live
+        and must report the batch size; after it lands the branch is gone and
+        the only correct behaviour is the raise. Asserting one of them
+        unconditionally makes the two PRs fail as a pair while each passes
+        alone -- which is exactly what happened when I merged the stack.
+        """
         data = {"input_ids": torch.randint(0, 8, (B, S))}
         student = torch.randn(B, S - 1, 5).log_softmax(-1)
         teacher = torch.randn(B, S - 1, 5).log_softmax(-1)
         loss_fn = DistillationLossFn(DistillationLossConfig(kl_type="forward"))
-        _, metrics = loss_fn(
-            student_topk_logprobs=student,
-            teacher_topk_logprobs=teacher,
-            H_all=None,
-            data=data,
-            global_valid_seqs=torch.tensor(1.0),
-            global_valid_toks=torch.tensor(1.0),
-        )
+        try:
+            _, metrics = loss_fn(
+                student_topk_logprobs=student,
+                teacher_topk_logprobs=teacher,
+                H_all=None,
+                data=data,
+                global_valid_seqs=torch.tensor(1.0),
+                global_valid_toks=torch.tensor(1.0),
+            )
+        except ValueError as exc:
+            assert "token_mask" in str(exc) and "sample_mask" in str(exc), exc
+            return  # #3496 has landed: the branch this covers no longer exists
         assert metrics["num_valid_samples"] == B
