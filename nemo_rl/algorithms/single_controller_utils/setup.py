@@ -21,6 +21,7 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 
 from __future__ import annotations
 
+import os
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -152,8 +153,11 @@ class SingleControllerActorArgs:
     partition_id: str
     save_state: GRPOSaveState
     last_checkpoint_path: Optional[str]
+    finalizer_actors: list[Any]
+    # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
-    # None when async_rl.generation_fleet_health is disabled.
+    # None when async_rl.generation_fleet_health is disabled; the SingleController drives the
+    # probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
     # None unless async_rl.generation_router is enabled.
     generation_router: Optional[ray.actor.ActorHandle[GenerationRouterImpl]] = None
@@ -675,6 +679,12 @@ def _spinup_gym(
         enable_router_replay=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+        # Ledger config rides into Gym's policy model server (§ 9.1).
+        token_capture=(
+            master_config.token_capture.model_dump()
+            if master_config.token_capture.enabled
+            else None
+        ),
     )
     return actor, time.perf_counter() - t0
 
@@ -983,6 +993,53 @@ def setup_single_controller(
     checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+
+    # Token capture: validate the MVP matrix loudly at setup (§ 6, § 10) and
+    # give capture-enabled vLLM workers a venv that carries nemo_gym (the
+    # worker hosts Gym's capture core + adapter in-process).
+    token_capture_cfg = master_config.token_capture
+    if token_capture_cfg.enabled:
+        if not should_use_nemo_gym(master_config):
+            raise ValueError(
+                "token_capture.enabled requires the NeMo-Gym rollout path "
+                "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
+                "policy model server"
+            )
+        if generation_config["backend"] != "vllm":
+            raise NotImplementedError(
+                "token_capture.enabled supports the vllm backend only; got "
+                f"{generation_config['backend']!r}"
+            )
+        if not generation_config["vllm_cfg"]["async_engine"]:
+            raise ValueError(
+                "token_capture.enabled requires "
+                "policy.generation.vllm_cfg.async_engine=true (the capture "
+                "host is the worker's in-process HTTP server)"
+            )
+        from nemo_rl.distributed.ray_actor_environment_registry import (
+            ACTOR_ENVIRONMENT_REGISTRY,
+        )
+        from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+
+        ACTOR_ENVIRONMENT_REGISTRY[
+            "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+        ] = PY_EXECUTABLES.VLLM_GYM
+
+        # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
+        # per-run control-plane bearer token and the process-shared capture
+        # directory used by every Gym worker.
+        if token_capture_cfg.control_auth_token is None:
+            # Deferred import: only needed on the capture path.
+            import secrets
+
+            token_capture_cfg.control_auth_token = secrets.token_hex(32)
+        if token_capture_cfg.capture_dir is None:
+            token_capture_cfg.capture_dir = os.path.abspath(
+                os.path.join(
+                    master_config.logger.get("log_dir") or "logs",
+                    "gym_token_capture",
+                )
+            )
 
     set_seed(algo_cfg.seed)
 
@@ -1354,22 +1411,87 @@ def setup_single_controller(
     # ==========================
     # Connect-only DP client; TQPolicy already bootstrapped the controller.
     dp_client = build_data_plane_client(dp_config, bootstrap=False)
-    # SingleController reuses one partition for the run. Warm every known
-    # tensor field before rollout, policy, and teacher writers become
-    # concurrent; TransferQueue otherwise registers field names lazily.
-    dp_client.register_partition(
-        partition_id=partition_id,
-        fields=fields_with_optional_routed_experts(
-            SC_ROLLOUT_SCHEMA_FIELDS,
-            enabled=router_replay_enabled(policy_config),
-        ),
-        num_samples=(
-            master_config.async_rl.max_buffered_rollouts
-            * algo_cfg.num_generations_per_prompt
-        ),
-        consumer_tasks=["prev_lp", "ref_lp", "train"],
-        grpo_group_size=algo_cfg.num_generations_per_prompt,
-    )
+
+    # Token-capture mode: pre-register both rollout partitions from this
+    # single driver thread before any producer is live. TQ's controller
+    # registers unseen field names lazily inside update_production_status
+    # without a lock, so the first concurrent puts into an unregistered
+    # partition can race kv_retrieve_meta and kill the controller thread
+    # (see TQDataPlaneClient.register_partition).
+    token_capture_cfg = master_config.token_capture
+    if not token_capture_cfg.enabled:
+        # SingleController reuses one partition for the run. Warm every known
+        # tensor field before rollout, policy, and teacher writers become
+        # concurrent; TransferQueue otherwise registers field names lazily.
+        dp_client.register_partition(
+            partition_id=partition_id,
+            fields=fields_with_optional_routed_experts(
+                SC_ROLLOUT_SCHEMA_FIELDS,
+                enabled=router_replay_enabled(policy_config),
+            ),
+            num_samples=(
+                master_config.async_rl.max_buffered_rollouts
+                * algo_cfg.num_generations_per_prompt
+            ),
+            consumer_tasks=["prev_lp", "ref_lp", "train"],
+            grpo_group_size=algo_cfg.num_generations_per_prompt,
+        )
+    else:
+        from nemo_rl.data_plane.schema import (
+            DP_TRAIN_FIELDS,
+        )
+        from nemo_rl.data_plane.schema import (
+            ROUTED_EXPERTS_FIELD as STAGING_ROUTED_EXPERTS_FIELD,
+        )
+        from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
+
+        r3_enabled = router_replay_enabled(master_config.policy)
+        if token_capture_cfg.defer_routed_experts_to_policy and not r3_enabled:
+            raise ValueError(
+                "token_capture.defer_routed_experts_to_policy requires "
+                "policy.router_replay.enabled=true"
+            )
+        group_size = algo_cfg.num_generations_per_prompt
+        num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
+        dp_client.register_partition(
+            partition_id=partition_id,
+            fields=fields_with_optional_routed_experts(
+                DP_TRAIN_FIELDS,
+                enabled=r3_enabled
+                and not token_capture_cfg.defer_routed_experts_to_policy,
+            ),
+            num_samples=num_rollout_samples,
+            consumer_tasks=["prev_lp", "ref_lp", "train"],
+            grpo_group_size=group_size,
+        )
+        dp_client.register_partition(
+            partition_id=token_capture_cfg.staging_partition,
+            fields=list(STAGING_FIELDS)
+            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
+            num_samples=num_rollout_samples,
+            consumer_tasks=["finalize", "prev_lp", "train"],
+        )
+        # Host Gym's capture core in every vLLM DP leader (in-worker DP
+        # client + TQTokenSink + the single install_capture call), and give
+        # workers the initial weight version to stamp on captured calls.
+        try:
+            generation.setup_token_capture(
+                dp_config, token_capture_cfg.staging_partition
+            )
+        except Exception as error:
+            if "No module named 'nemo_gym'" in str(error):
+                # Worker venvs are cached by actor class name
+                # (nemo_rl/utils/venvs.py), so a venv prebuilt before token
+                # capture predates the nemo_gym extra and is reused as-is.
+                raise RuntimeError(
+                    "token_capture.enabled requires nemo_gym inside the vLLM "
+                    "worker venv, but the cached worker venv predates it. "
+                    "Rebuild worker venvs (NRL_FORCE_REBUILD_VENVS=true) or "
+                    "delete $NEMO_RL_VENV_DIR/nemo_rl.models.generation.vllm."
+                    "vllm_worker_async.VllmAsyncGenerationWorker and rerun."
+                ) from error
+            raise
+        generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
         t0 = time.perf_counter()
@@ -1403,7 +1525,30 @@ def setup_single_controller(
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
         require_routed_experts=router_replay_enabled(policy_config),
+        staging_partition_id=(
+            token_capture_cfg.staging_partition if token_capture_cfg.enabled else None
+        ),
     )
+    finalizer_actors: list[Any] = []
+    if token_capture_cfg.enabled:
+        from nemo_rl.experience.finalizer_actor import (
+            FinalizerActorConfig,
+            create_finalizer_actors,
+        )
+
+        finalizer_actors = create_finalizer_actors(
+            dp_config,
+            FinalizerActorConfig(
+                partition_id=partition_id,
+                staging_partition=token_capture_cfg.staging_partition,
+                pad_token_id=pad_id,
+                mixed_weight_version_policy=token_capture_cfg.mixed_weight_version_policy,
+                min_valid_fraction_per_group=token_capture_cfg.min_valid_fraction_per_group,
+                router_replay_enabled=router_replay_enabled(policy_config),
+                defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
+            ),
+            num_workers=token_capture_cfg.num_finalizer_workers,
+        )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -1448,6 +1593,7 @@ def setup_single_controller(
         partition_id=partition_id,
         save_state=save_state,
         last_checkpoint_path=last_checkpoint_path,
+        finalizer_actors=finalizer_actors,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,

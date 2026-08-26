@@ -73,6 +73,10 @@ class PY_EXECUTABLES:
     # Use NeMo-Gym dependencies
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 
+    # vLLM worker hosting Gym's token capture (token_capture.enabled): the
+    # worker imports nemo_gym's dependency-free capture core + vLLM adapter.
+    VLLM_GYM = f"uv run --locked --extra vllm --extra nemo_gym --directory {git_root}"
+
     # Use NeMo-RL direct dependencies and SGLang.
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
