@@ -444,10 +444,12 @@ class VllmAsyncGenerationWorkerImpl(
                 """Clamp the request's max output tokens so that input + output <= max_model_len."""
                 remaining = self.model_config.max_model_len - len(prompt_token_ids)
                 if remaining <= 0:
-                    raise ValueError(
+                    # preserve the literal "context length" in this message to match Gym's overflow handling
+                    raise VLLMValidationError(
                         f"Prompt length ({len(prompt_token_ids)}) fills or exceeds "
-                        f"max_model_len ({self.model_config.max_model_len}). "
-                        f"No room for output tokens."
+                        f"this model's maximum context length ({self.model_config.max_model_len}). "
+                        f"No room for output tokens.",
+                        parameter="max_model_len",
                     )
                 max_tokens = min(request_max_tokens, remaining)
                 self._set_max_tokens(request, max_tokens)
