@@ -25,17 +25,37 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.utils.timer import Timer
+from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy.lm_policy import Policy
 
 
-class _NoOpWeightSynchronizer:
+class _NoOpWeightSynchronizer(WeightSynchronizer):
     """Weight-sync adapter for generation that shares policy tensors."""
 
-    def sync_weights(self, **kwargs: Any) -> dict[str, float]:
+    @property
+    def is_stale(self) -> bool:
+        """Reports current weights because generation reads policy tensors."""
+        return False
+
+    def init_communicator(self) -> None:
+        """Skips communicator setup because there is no weight transfer."""
+        pass
+
+    def sync_weights(
+        self,
+        *,
+        timer: Timer | None = None,
+        kv_scales: dict[str, float] | None = None,
+    ) -> dict[str, float]:
         """Return immediately because there is no second weight copy."""
         return {}
+
+    def shutdown(self) -> None:
+        """Skips teardown because no communication resources are owned."""
+        pass
 
 
 class AutomodelGeneration(GenerationInterface):
