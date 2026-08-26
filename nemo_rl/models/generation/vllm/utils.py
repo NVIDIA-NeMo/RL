@@ -13,6 +13,8 @@
 # limitations under the License.
 
 from collections import defaultdict
+from collections.abc import Mapping
+from dataclasses import is_dataclass, replace
 from typing import Any, Optional
 
 import torch
@@ -31,6 +33,84 @@ VLLM_LOGPROB_FLOOR = -9999.0
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
+
+
+def remap_multimodal_placeholders(
+    *,
+    template_token_ids: list[int],
+    final_token_ids: list[int],
+    mm_placeholders: Mapping[str, list[Any]],
+) -> dict[str, list[Any]]:
+    """Move vLLM multimodal ranges into the final prompt coordinates.
+
+    vLLM computes multimodal placeholder offsets while preprocessing the
+    chat-template token sequence. NeMo-RL can subsequently replace the
+    re-tokenized history with the exact model-generated token prefix. Locate
+    each unchanged media-token span in that final sequence so its associated
+    multimodal features remain aligned.
+
+    Ranges are matched in global prompt order because different media items can
+    accumulate different shifts. A missing span fails closed rather than
+    submitting token IDs with incorrect multimodal positions.
+    """
+    if template_token_ids == final_token_ids or not mm_placeholders:
+        return {modality: list(ranges) for modality, ranges in mm_placeholders.items()}
+
+    entries: list[tuple[int, str, int, Any, int]] = []
+    remapped = {modality: list(ranges) for modality, ranges in mm_placeholders.items()}
+    for modality, ranges in mm_placeholders.items():
+        for item_index, placeholder_range in enumerate(ranges):
+            if isinstance(placeholder_range, Mapping):
+                offset = int(placeholder_range["offset"])
+                length = int(placeholder_range["length"])
+            else:
+                offset = int(placeholder_range.offset)
+                length = int(placeholder_range.length)
+
+            if offset < 0 or length <= 0 or offset + length > len(template_token_ids):
+                raise ValueError(
+                    f"Invalid {modality} placeholder range {item_index}: "
+                    f"offset={offset}, length={length}, "
+                    f"template_length={len(template_token_ids)}"
+                )
+            entries.append((offset, modality, item_index, placeholder_range, length))
+
+    search_start = 0
+    for old_offset, modality, item_index, placeholder_range, length in sorted(
+        entries, key=lambda entry: entry[0]
+    ):
+        expected = template_token_ids[old_offset : old_offset + length]
+        max_start = len(final_token_ids) - length
+        new_offset = next(
+            (
+                candidate
+                for candidate in range(search_start, max_start + 1)
+                if final_token_ids[candidate] == expected[0]
+                and final_token_ids[candidate : candidate + length] == expected
+            ),
+            None,
+        )
+        if new_offset is None:
+            raise ValueError(
+                f"Could not locate {modality} placeholder range {item_index} "
+                f"from template offset {old_offset} in the final exact-token prompt"
+            )
+
+        if isinstance(placeholder_range, Mapping):
+            updated_range = dict(placeholder_range)
+            updated_range["offset"] = new_offset
+        elif is_dataclass(placeholder_range):
+            updated_range = replace(placeholder_range, offset=new_offset)
+        else:
+            raise TypeError(
+                "Multimodal placeholder ranges must be mappings or dataclass "
+                f"instances, got {type(placeholder_range).__name__}"
+            )
+
+        remapped[modality][item_index] = updated_range
+        search_start = new_offset + length
+
+    return remapped
 
 
 def _as_routed_experts_tensor(

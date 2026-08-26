@@ -49,6 +49,7 @@ from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
+    remap_multimodal_placeholders,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
@@ -560,6 +561,13 @@ class VllmAsyncGenerationWorkerImpl(
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
+
+                if mm_placeholders := engine_prompt.get("mm_placeholders"):
+                    engine_prompt["mm_placeholders"] = remap_multimodal_placeholders(
+                        template_token_ids=engine_prompt["prompt_token_ids"],
+                        final_token_ids=final_prompt_token_ids,
+                        mm_placeholders=mm_placeholders,
+                    )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
