@@ -103,12 +103,22 @@ class MockGenerationInterface:
     def __init__(self):
         self.prepare_calls = 0
         self.finish_calls = 0
+        self.pause_generation_calls: list[bool] = []
+        self.resume_generation_calls = 0
 
     def prepare_for_generation(self, **kwargs):
         self.prepare_calls += 1
 
     def finish_generation(self):
         self.finish_calls += 1
+
+    def pause_generation(self, *, clear_cache: bool) -> bool:
+        self.pause_generation_calls.append(clear_cache)
+        return True
+
+    def resume_generation(self) -> bool:
+        self.resume_generation_calls += 1
+        return True
 
 
 class TestReplayBufferImplCheckpointing:
@@ -2382,6 +2392,66 @@ class TestAsyncTrajectoryCollector:
         ray.kill(collector)
         ray.kill(buffer)
         ray.kill(mock_env)
+
+    @pytest.mark.parametrize("recompute_kv_cache", [False, True])
+    def test_vllm_in_flight_refit_uses_native_keep_pause(
+        self, recompute_kv_cache: bool
+    ) -> None:
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {
+            "backend": "vllm",
+            "vllm_cfg": {"async_engine": True},
+        }
+        async_cfg = collector.master_config.grpo.async_grpo
+        async_cfg.in_flight_weight_updates = True
+        async_cfg.recompute_kv_cache_after_weight_updates = recompute_kv_cache
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
+        collector.wait_for_pending_generations = mock.Mock()
+
+        collector.prepare_for_refit()
+
+        assert collector.policy_generation.pause_generation_calls == [
+            recompute_kv_cache
+        ]
+        collector.wait_for_pending_generations.assert_not_called()
+        assert not collector._refit_pause_cleared.is_set()
+
+        collector.resume_after_refit()
+
+        assert collector.policy_generation.resume_generation_calls == 1
+        collector.policy_generation.invalidate_kv_cache.assert_not_called()
+        assert collector._refit_pause_cleared.is_set()
+
+    def test_vllm_refit_drains_without_native_pause_when_in_flight_disabled(
+        self,
+    ) -> None:
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {
+            "backend": "vllm",
+            "vllm_cfg": {"async_engine": True},
+        }
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = False
+        collector.wait_for_pending_generations = mock.Mock()
+
+        collector.prepare_for_refit()
+
+        assert collector.policy_generation.pause_generation_calls == []
+        collector.wait_for_pending_generations.assert_called_once_with()
+
+    def test_vllm_resume_failure_keeps_collection_paused(self) -> None:
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {
+            "backend": "vllm",
+            "vllm_cfg": {"async_engine": True},
+        }
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
+        collector.policy_generation.resume_generation = mock.Mock(return_value=False)
+        collector._refit_pause_cleared.clear()
+
+        with pytest.raises(RuntimeError, match="Failed to resume vLLM generation"):
+            collector.resume_after_refit()
+
+        assert not collector._refit_pause_cleared.is_set()
 
     def test_resume_after_refit_invalidates_cache_without_in_flight_updates(self):
         """Test resume after refit invalidates cache without in-flight updates."""

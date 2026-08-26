@@ -487,6 +487,17 @@ class GenerationInterface(ABC):
     def invalidate_kv_cache(self) -> bool:
         return False
 
+    def pause_generation(self, *, clear_cache: bool) -> bool:
+        """Pause in-flight generation while preserving request state.
+
+        Backends with native in-flight refit support may override this hook.
+        """
+        return False
+
+    def resume_generation(self) -> bool:
+        """Resume generation paused by :meth:`pause_generation`."""
+        return False
+
     def blocks_training(self) -> bool:
         """Whether this engine must stand down before a training step.
 

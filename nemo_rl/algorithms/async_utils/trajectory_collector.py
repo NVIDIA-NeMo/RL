@@ -929,12 +929,21 @@ class AsyncTrajectoryCollector:
         self._manual_pause_cleared.set()  # Signal collection to resume
         print("Trajectory collection resumed")
 
+    def _uses_vllm_native_pause_for_refit(self) -> bool:
+        """Whether refit should preserve requests with vLLM's native pause API."""
+        generation_cfg = self.master_config.policy.get("generation", {})
+        return (
+            generation_cfg.get("backend") == "vllm"
+            and generation_cfg.get("vllm_cfg", {}).get("async_engine", False)
+            and self.async_config.in_flight_weight_updates
+        )
+
     def prepare_for_refit(self) -> None:
         """Pause new generation starts and optionally wait for pending generations.
 
-        For backends with an async engine in-flight weight updates allows ongoing generations
-        to continue with their current KV caches while weights are updated.
-        This significantly improves async performance.
+        For async vLLM, native keep-mode pause preserves in-flight request state
+        across the weight update. Other async backends keep their existing in-flight
+        refit behavior. This significantly improves async performance.
 
         For non-async engines, waits for all pending generations to complete before refit.
         """
@@ -973,15 +982,24 @@ class AsyncTrajectoryCollector:
         in_flight_weight_updates = self.async_config.in_flight_weight_updates
 
         if is_async_engine and in_flight_weight_updates:
-            # async engines support in-flight weight updates
-            # Ongoing generations will continue with their current KV caches
-            # New generations (after weight update) will use the updated weights
-            print(
-                f"🚀 Using {backend} in-flight weight update - skipping wait for pending generations"
-            )
-            print(
-                f"   {len(self._inflight_threads)} ongoing generations will complete with current weights"
-            )
+            if self._uses_vllm_native_pause_for_refit():
+                clear_cache = self.async_config.recompute_kv_cache_after_weight_updates
+                print(
+                    "⏸️ Pausing vLLM generation with in-flight request state preserved"
+                )
+                if not self.policy_generation.pause_generation(clear_cache=clear_cache):
+                    raise RuntimeError("Failed to pause vLLM generation before refit")
+                print(
+                    f"   {len(self._inflight_threads)} ongoing generation batches paused"
+                )
+            else:
+                # Other async engines retain their existing in-flight update behavior.
+                print(
+                    f"🚀 Using {backend} in-flight weight update - skipping wait for pending generations"
+                )
+                print(
+                    f"   {len(self._inflight_threads)} ongoing generations will complete with current weights"
+                )
         else:
             # For non-async engines, wait for all pending generations to complete
             print(
@@ -995,6 +1013,13 @@ class AsyncTrajectoryCollector:
     def resume_after_refit(self) -> None:
         """Resume new generation starts after refit is complete."""
         print("🔄 Resuming generation starts after refit")
+
+        if self._uses_vllm_native_pause_for_refit():
+            print("▶️ Resuming vLLM generation after refit")
+            if not self.policy_generation.resume_generation():
+                raise RuntimeError("Failed to resume vLLM generation after refit")
+            self._refit_pause_cleared.set()
+            return
 
         # Invalidate&recompute vLLM caches after the weight updates (in-flight or not) if
         # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
