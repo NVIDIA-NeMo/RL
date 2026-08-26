@@ -59,6 +59,13 @@ class TaskDataSpec:
     prompt_file: Optional[PathLike] = None
 
     system_prompt_file: Optional[PathLike] = None
+    # TODO(rohitrango): Move model-specific media controls to ProcessorInterface.
+    num_frames: Optional[int] = None
+    video_sampling_style: Optional[str] = None
+    video_target_num_patches: Optional[int] = None
+    video_temporal_patch_size: Optional[int] = None
+    video_maintain_aspect_ratio: Optional[bool] = None
+    min_generation_tokens: Optional[int] = None
 
     def __post_init__(self) -> None:
         def load_prompt_file(

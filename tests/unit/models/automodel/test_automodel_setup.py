@@ -1836,6 +1836,19 @@ class TestGetTokenizer:
         assert result is mock_tokenizer
 
     @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_forwards_tokenizer_kwargs(self, mock_nemo_auto_tokenizer):
+        """Test tokenizer_kwargs are forwarded to NeMoAutoTokenizer."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer({"name": "gpt2", "tokenizer_kwargs": {"model_max_length": 123}})
+
+        mock_nemo_auto_tokenizer.from_pretrained.assert_called_once_with(
+            "gpt2", trust_remote_code=True, model_max_length=123
+        )
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
     def test_sets_pad_token_from_eos(self, mock_nemo_auto_tokenizer):
         """Test that pad_token is set to eos_token when None."""
         mock_tokenizer = MagicMock()
@@ -2014,6 +2027,30 @@ class TestGetTokenizer:
         assert mock_processor.eos_token_id == 1
         assert mock_processor.bos_token_id == 2
         assert mock_processor.name_or_path == "test-model"
+
+    @patch("nemo_rl.models.automodel.setup.AutoProcessor")
+    def test_get_processor_forwards_tokenizer_kwargs(self, mock_auto_processor):
+        """Test tokenizer_kwargs are forwarded through AutoProcessor."""
+        mock_processor = MagicMock()
+        mock_processor.tokenizer.pad_token = "<pad>"
+        mock_auto_processor.from_pretrained.return_value = mock_processor
+        config = {
+            "name": "test-vlm",
+            "tokenizer_kwargs": {"model_max_length": 123, "use_fast": False},
+        }
+
+        get_tokenizer(config, get_processor=True)
+
+        mock_auto_processor.from_pretrained.assert_called_once_with(
+            "test-vlm",
+            trust_remote_code=True,
+            use_fast=False,
+            model_max_length=123,
+        )
+        assert config["tokenizer_kwargs"] == {
+            "model_max_length": 123,
+            "use_fast": False,
+        }
 
     @patch("nemo_rl.models.automodel.setup.AutoProcessor")
     def test_get_processor_sets_pad_from_eos(self, mock_auto_processor):

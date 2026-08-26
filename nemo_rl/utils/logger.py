@@ -42,6 +42,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.metric_utils import is_histogram_metric
 
 # Flag to track if rich logging has been configured
 _rich_logging_configured = False
@@ -191,7 +192,8 @@ class TensorboardLogger(LoggerInterface):
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to Tensorboard."""
-        return
+        if len(histogram) > 0:
+            self.writer.add_histogram(name, np.asarray(histogram), step)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to Tensorboard.
@@ -1048,9 +1050,38 @@ class Logger(LoggerInterface):
             prefix: Optional prefix for metric names
             step_metric: Optional name of a field in metrics to use as step instead
                          of the provided step value (currently only needed for wandb)
+
+        Note:
+            Metrics identified by :func:`is_histogram_metric` are routed through
+            :meth:`log_histogram` instead of each backend's ``log_metrics``.
+            ``histogram/*`` keys retain their established
+            ``generation_metrics/`` namespace; other distributions inherit
+            ``prefix``.
         """
+        histogram_metrics = {
+            name: value for name, value in metrics.items() if is_histogram_metric(name)
+        }
+        metrics_to_log = {
+            name: value
+            for name, value in metrics.items()
+            if name not in histogram_metrics
+        }
+
+        for name, values in histogram_metrics.items():
+            # Preserve the established namespace for per-turn generation
+            # histograms; other distributions inherit the caller's prefix.
+            if name.startswith("histogram/"):
+                histogram_name = (
+                    f"generation_metrics/{name}"
+                    if prefix in ("", None, "train")
+                    else f"generation_metrics/{prefix}/{name}"
+                )
+            else:
+                histogram_name = f"{prefix}/{name}" if prefix else name
+            self.log_histogram(values, step, histogram_name)
+
         for logger in self.loggers:
-            logger.log_metrics(metrics, step, prefix, step_metric, step_finished)
+            logger.log_metrics(metrics_to_log, step, prefix, step_metric, step_finished)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to all enabled backends.
