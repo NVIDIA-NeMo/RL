@@ -16,6 +16,7 @@
 from typing import TYPE_CHECKING, Any
 
 import ray
+import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
@@ -110,13 +111,14 @@ class AutomodelGeneration(GenerationInterface):
         sharded_data = data.shard_by_batch_size(
             self._policy.data_parallel_size, batch_size=None
         )
+        seed = torch.randint(0, 2**31 - 1, ()).item()
         futures = self._policy.worker_group.run_all_workers_sharded_data(
             "generate",
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=["context_parallel", "tensor_parallel"],
             output_is_replicated=["context_parallel", "tensor_parallel"],
-            common_kwargs={"greedy": greedy},
+            common_kwargs={"greedy": greedy, "seed": seed},
         )
         return BatchedDataDict.from_batches(
             self._policy.worker_group.get_all_worker_results(futures)

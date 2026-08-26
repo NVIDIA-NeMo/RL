@@ -119,12 +119,18 @@ class TestGenerate:
     def test_greedy_is_forwarded_to_the_workers(self):
         backend, policy = make_backend()
         backend.generate(make_input(), greedy=True)
-        assert policy.worker_group.calls[0]["common_kwargs"] == {"greedy": True}
+        assert policy.worker_group.calls[0]["common_kwargs"]["greedy"] is True
 
     def test_greedy_defaults_to_false(self):
         backend, policy = make_backend()
         backend.generate(make_input())
-        assert policy.worker_group.calls[0]["common_kwargs"] == {"greedy": False}
+        assert policy.worker_group.calls[0]["common_kwargs"]["greedy"] is False
+
+    def test_one_generation_seed_is_shared_by_all_workers(self, monkeypatch):
+        monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: torch.tensor(17))
+        backend, policy = make_backend()
+        backend.generate(make_input())
+        assert policy.worker_group.calls[0]["common_kwargs"]["seed"] == 17
 
     def test_worker_results_are_concatenated(self):
         backend, _ = make_backend()

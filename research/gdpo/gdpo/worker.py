@@ -171,9 +171,16 @@ class DTensorGDPOPolicyWorker(DTensorPolicyWorkerV2Impl):
 
     @torch.no_grad()
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        *,
+        seed: int | None = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate rollouts by block-wise denoising on live training weights."""
+        if seed is None:
+            raise ValueError("GDPO generation requires an explicit rollout seed.")
+
         batch_stop_strings = data.get("stop_strings", [])
         if any(batch_stop_strings):
             raise ValueError(
@@ -204,12 +211,8 @@ class DTensorGDPOPolicyWorker(DTensorPolicyWorkerV2Impl):
         )
 
         generator = torch.Generator(device=canvas.device)
-        seed = torch.randint(0, 2**31 - 1, (), dtype=torch.int64, device=canvas.device)
-        if self.tp_size > 1:
-            tp_group = self.tp_mesh.get_group()
-            leader = torch.distributed.get_global_rank(tp_group, 0)
-            torch.distributed.broadcast(seed, src=leader, group=tp_group)
-        generator.manual_seed(seed.item())
+        dp_rank = self.dp_mesh.get_local_rank()
+        generator.manual_seed((seed + dp_rank) % (2**31 - 1))
 
         def logits_fn(input_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
             logits = self.model(
