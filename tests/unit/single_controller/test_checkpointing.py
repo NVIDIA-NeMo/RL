@@ -553,6 +553,7 @@ def _make_actor_args(
             save_state if save_state is not None else _initial_grpo_save_state()
         ),
         last_checkpoint_path=last_checkpoint_path,
+        finalizer_actors=[],
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
     )
 
