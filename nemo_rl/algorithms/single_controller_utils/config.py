@@ -587,6 +587,48 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         return self
 
 
+class TokenCaptureConfig(BaseModel, extra="allow"):
+    """Ledger-authoritative token capture (token-in/token-out via NeMo-Gym).
+
+    Dormant by default: with ``enabled=False`` every legacy codepath behaves
+    exactly as before — no staging partition is registered, no ledger is
+    installed, and rollouts ride the token-echo path. See
+    docs/design-docs/token-capture-ledger.md.
+    """
+
+    enabled: bool = False
+    # TQ partition holding per-call staged token deltas (cleared by the
+    # finalizer; distinct from the canonical rollout partition).
+    staging_partition: str = "rollout_staging"
+    # A failed worker-side stage poisons the rollout; "continue" serves the
+    # completion and lets the finalizer emit a placeholder row, "abort" fails
+    # the whole rollout in the ledger.
+    on_capture_failure: Literal["continue", "abort"] = "continue"
+    # "allow" trains groups whose calls span a refit (staleness accounted via
+    # group_min_wv); "reject" placeholders them. Strict modes beyond the MVP
+    # matrix raise NotImplementedError at setup.
+    mixed_weight_version_policy: Literal["allow", "reject"] = "allow"
+    # Drop the whole group when fewer than this fraction of its rollouts
+    # produced valid rows (None keeps every group).
+    min_valid_fraction_per_group: Optional[float] = None
+    # Bearer token for Gym's token-capture control routes. None =
+    # minted per run at setup; set explicitly only for multi-controller
+    # setups that must share one ledger.
+    control_auth_token: Optional[str] = None
+    # Hard deadline per control-plane call (S5 finding: control-plane death must
+    # surface as a failed dispatch, not a silent retry stall).
+    control_timeout_s: float = 60.0
+    # Root for Gym's per-rollout capture ledgers and base capture layer. None =
+    # derived at setup
+    # under the run's log dir.
+    capture_dir: Optional[str] = None
+    # Keep routed_experts out of canonical rows and assemble them on policy
+    # workers from strict staged-fragment plans.
+    defer_routed_experts_to_policy: bool = False
+    # Fixed CPU finalizer pool size; actors are never automatically replaced.
+    num_finalizer_workers: PositiveInt = 2
+
+
 class MasterConfig(BaseModel, extra="allow"):
     # algo configs
     grpo: Optional[GRPOConfig] = None
@@ -605,6 +647,7 @@ class MasterConfig(BaseModel, extra="allow"):
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
+    token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
 
     @model_validator(mode="after")
     def validate_algorithm_block(self) -> "MasterConfig":
@@ -1012,6 +1055,25 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "SingleController path: it has no validation loop yet, so only "
             "'train:<name>' metrics are collected. Use 'train:<name>' (e.g. "
             "'train:loss') or set checkpointing.metric_name=null."
+        )
+
+    token_capture_config = master_config.token_capture
+    if token_capture_config.defer_routed_experts_to_policy and not (
+        token_capture_config.enabled
+    ):
+        raise ValueError(
+            "token_capture.defer_routed_experts_to_policy requires "
+            "token_capture.enabled=true"
+        )
+    if (
+        token_capture_config.enabled
+        and token_capture_config.num_finalizer_workers
+        > async_config.max_buffered_rollouts
+    ):
+        warnings.warn(
+            "token_capture.num_finalizer_workers exceeds "
+            "async_rl.max_buffered_rollouts; excess finalizer actors cannot be busy",
+            stacklevel=2,
         )
 
     # A non-zero reference-policy KL penalty makes the loss read

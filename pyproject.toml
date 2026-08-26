@@ -292,7 +292,11 @@ test = [
 tensorrt-llm = { path = "3rdparty/TensorRT-LLM-workspace" }
 nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = true }
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge", editable = true }
-nemo_gym = { workspace = true }
+# Keep Gym as an editable path dependency rather than a workspace member. Both
+# projects define a ``vllm`` extra with intentionally different server stacks;
+# uv applies a requested extra name to every selected workspace member, which
+# makes the RL vLLM + base Gym worker environment impossible to select.
+nemo_gym = { path = "3rdparty/Gym-workspace/Gym", editable = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # Must stay on the rev megatron-core pins for its dev/otel extras: the workspace
 # resolves a single nemo-lens, and PyPI's newest release (0.1.0) is older than
@@ -326,7 +330,6 @@ flashinfer-jit-cache = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
 members = [
-  "3rdparty/Gym-workspace/Gym",
   # Research projects are also added here in order for them to share the global root level uv.lock.
   # If we don't do this, the research projects do not see the global uv.lock, and may mistakenly
   # install numpy>=2.0 because nemo-rl's core [dependencies] do not pin numpy, but when you inspect
@@ -489,26 +492,6 @@ constraint-dependencies = [
 exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
 
 conflicts = [
-  [
-    { package = "nemo-rl", extra = "automodel" },
-    { package = "nemo-gym", extra = "vllm" },
-  ],
-  [
-    { package = "nemo-rl", extra = "vllm" },
-    { package = "nemo-gym", extra = "vllm" },
-  ],
-  [
-    { package = "nemo-rl", extra = "sglang" },
-    { package = "nemo-gym", extra = "vllm" },
-  ],
-  [
-    { package = "nemo-rl", extra = "mcore" },
-    { package = "nemo-gym", extra = "vllm" },
-  ],
-  [
-    { package = "nemo-rl", extra = "trtllm" },
-    { package = "nemo-gym", extra = "vllm" },
-  ],
   [
     { extra = "fsdp" },
     { extra = "sglang" },

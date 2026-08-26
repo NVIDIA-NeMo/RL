@@ -142,6 +142,7 @@ def shard_meta_for_dp(
         flat_idx.extend(idx_list)
         rank_sample_ids = [meta.sample_ids[i] for i in idx_list]
         rank_seqlens = [seq_lens[i] for i in idx_list]
+        rank_tags = [meta.tags[i] for i in idx_list] if meta.tags is not None else None
         rank_extra = dict(base_extra)
         # Per-shard packing metadata — set by ``shard_by_batch_size`` when
         # sequence_packing or dynamic_batching is enabled. Workers'
@@ -165,6 +166,7 @@ def shard_meta_for_dp(
                 sample_ids=rank_sample_ids,
                 fields=meta.fields,
                 sequence_lengths=rank_seqlens,
+                tags=rank_tags,
                 extra_info=rank_extra,
             )
         )

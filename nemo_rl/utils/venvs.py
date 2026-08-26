@@ -113,7 +113,9 @@ def create_local_venv(
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
+    subprocess.run(
+        ["uv", "sync", "--locked", "--directory", git_root], env=env, check=True
+    )
     subprocess.run(exec_cmd, env=env, check=True)
 
     # Return the path to the python executable in the virtual environment
@@ -191,6 +193,15 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     ray.get(pg.ready())
 
     force_rebuild = os.environ.get("NRL_FORCE_REBUILD_VENVS", "false").lower() == "true"
+    # NRL_FORCE_REBUILD_VENVS_LIST: comma-separated venv names to rebuild even
+    # when the global flag is off — for containers whose baked venvs are only
+    # partially compatible with the checked-out branch.
+    rebuild_list = {
+        name
+        for name in os.environ.get("NRL_FORCE_REBUILD_VENVS_LIST", "").split(",")
+        if name
+    }
+    force_rebuild = force_rebuild or venv_name in rebuild_list
     # Launch one actor per node
     actors = [
         _env_builder.options(placement_group=pg).remote(
