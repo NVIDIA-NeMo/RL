@@ -183,3 +183,61 @@ class TestTrainFieldSelection:
 
         for field in DistillationLossDataDict.__annotations__:
             assert field in DP_DISTILLATION_TRAIN_FIELDS, field
+
+
+class TestTheShippedRecipe:
+    """The SC exemplar has to survive more than MasterConfig.
+
+    Three keys the distillation chain does not carry are read with ``[]``
+    rather than ``.get()`` further down -- two in setup, one in the launcher.
+    Each is ``NotRequired`` on its config type, so pydantic accepts the config
+    and the run dies later. Pin them here rather than at the next spin-up.
+    """
+
+    @staticmethod
+    def _resolved() -> dict:
+        from nemo_rl.utils.config import (
+            load_config_with_inheritance,
+            register_omegaconf_resolvers,
+        )
+
+        register_omegaconf_resolvers()
+        repo_root = Path(__file__).parents[3]
+        raw = load_config_with_inheritance(
+            str(
+                repo_root
+                / "examples"
+                / "configs"
+                / "distillation_math_1B_megatron_single_controller.yaml"
+            )
+        )
+        resolved = OmegaConf.to_container(raw, resolve=True)
+        assert isinstance(resolved, dict)
+        return resolved
+
+    def test_it_passes_the_single_controller_validator(self):
+        from nemo_rl.algorithms.single_controller_utils.config import (
+            validate_single_controller_config,
+        )
+
+        cfg = MasterConfig(**self._resolved())
+        validate_single_controller_config(cfg)
+        assert is_distillation_run(cfg)
+
+    def test_it_carries_the_keys_read_without_a_default(self):
+        cfg = MasterConfig(**self._resolved())
+
+        # examples/run_grpo_single_controller.py, before generation is configured
+        assert cfg.policy["draft"]["enabled"] is False
+        # single_controller_utils/setup.py, building the dataloader
+        assert cfg.data["use_multiple_dataloader"] is False
+        assert cfg.data["num_workers"] is not None
+
+    def test_the_loss_block_resolves_to_the_distillation_loss(self):
+        """`loss_fn` is a union. A distillation block binding to
+        ClippedPGLossConfig instead would give the run a phantom
+        reference_policy_kl_penalty and no kl_type."""
+        from nemo_rl.algorithms.loss.loss_functions import DistillationLossConfig
+
+        cfg = MasterConfig(**self._resolved())
+        assert isinstance(cfg.loss_fn, DistillationLossConfig)
