@@ -34,6 +34,8 @@ VideoSamplingStyle = Literal["nemotron_vl"]
 _TORCHCODEC_END_OF_STREAM_ERROR = (
     "Requested next frame while there are no more frames left to decode."
 )
+
+
 def _round_video_frame_count(
     num_frames: int,
     *,

@@ -789,9 +789,7 @@ class MegatronGenerationMixin:
         imgs = pixel_values.tensors[index]
         sizes = imgs_sizes.tensors[index]
         num_frames = (
-            packed_num_frames.tensors[index]
-            if packed_num_frames is not None
-            else None
+            packed_num_frames.tensors[index] if packed_num_frames is not None else None
         )
         if imgs is None and sizes is None:
             return None, None, None

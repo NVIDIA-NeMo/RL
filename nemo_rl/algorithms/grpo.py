@@ -77,7 +77,6 @@ from nemo_rl.data.llm_message_utils import (
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
     TOPO_RANK_UNKNOWN,
     ClusterConfig,
@@ -158,7 +157,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
@@ -4553,28 +4552,9 @@ def async_grpo_train(
     print(f"   - train_global_batch_size: {train_gbs}")
     print(f"   - min_trajectories_needed: {min_trajectories_needed} (async mode)")
 
-    _replay_py_exec = get_actor_python_env(
+    _replay_runtime_env = make_actor_runtime_env(
         "nemo_rl.algorithms.async_utils.ReplayBuffer"
     )
-    if _replay_py_exec.startswith("uv"):
-        # Lazily build a dedicated venv across all Ray nodes on-demand.
-        _replay_py_exec = create_local_venv_on_each_node(
-            _replay_py_exec,
-            "nemo_rl.algorithms.async_utils.ReplayBuffer",
-        )
-
-    _replay_py_venv = os.path.dirname(
-        os.path.dirname(_replay_py_exec)
-    )  # to remove the "bin/python" suffix
-
-    _replay_runtime_env = {
-        "py_executable": _replay_py_exec,
-        "env_vars": {
-            **os.environ,
-            "VIRTUAL_ENV": _replay_py_venv,
-            "UV_PROJECT_ENVIRONMENT": _replay_py_venv,
-        },
-    }
 
     # Calculate optimal buffer size based on generation limits to prevent length bias
     # Each weight version generates exactly num_prompts_per_step trajectories
@@ -4681,29 +4661,13 @@ def async_grpo_train(
         set(trained_task_indices) if frontier_restore else set()
     )
 
-    _tc_py_exec = get_actor_python_env(
-        "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
-    )
-    if _tc_py_exec.startswith("uv"):
-        _tc_py_exec = create_local_venv_on_each_node(
-            _tc_py_exec,
-            "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
-        )
-
-    _tc_py_venv = os.path.dirname(
-        os.path.dirname(_tc_py_exec)
-    )  # to remove the "bin/python" suffix
-
-    _tc_runtime_env = {
-        "py_executable": _tc_py_exec,
-        "env_vars": {
-            **os.environ,
-            "VIRTUAL_ENV": _tc_py_venv,
-            "UV_PROJECT_ENVIRONMENT": _tc_py_venv,
+    _tc_runtime_env = make_actor_runtime_env(
+        "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
+        extra_env_vars={
             # Names this actor's spans the way RayWorkerGroup names its groups'.
             "NRL_WORKER_GROUP": "trajectory_collector",
         },
-    }
+    )
 
     # Captured inside rl.grpo.job, so the collector's spans join this run's
     # trace instead of starting their own roots. Empty unless the job group is

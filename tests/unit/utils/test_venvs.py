@@ -16,7 +16,10 @@ import subprocess
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from nemo_rl.utils.venvs import create_local_venv
+from nemo_rl.utils.venvs import (
+    add_hf_modules_cache_to_pythonpath,
+    create_local_venv,
+)
 from tests.unit.conftest import TEST_ASSETS_DIR
 
 
@@ -48,3 +51,28 @@ def test_create_local_venv():
             # Verify the command executed successfully (return code 0)
             assert result.returncode == 0, f"Failed to import sphinx: {result.stderr}"
             assert "Sphinx package is installed" in result.stdout
+
+
+def test_add_hf_modules_cache_to_pythonpath():
+    result = add_hf_modules_cache_to_pythonpath(
+        {
+            "HF_MODULES_CACHE": "/hf/modules",
+            "PYTHONPATH": f"/project{os.pathsep}/other",
+        }
+    )
+
+    assert result["PYTHONPATH"].split(os.pathsep) == [
+        "/hf/modules",
+        "/project",
+        "/other",
+    ]
+
+
+def test_add_hf_modules_cache_does_not_duplicate_pythonpath_entry():
+    pythonpath = f"/project{os.pathsep}/hf/modules"
+
+    result = add_hf_modules_cache_to_pythonpath(
+        {"HF_MODULES_CACHE": "/hf/modules", "PYTHONPATH": pythonpath}
+    )
+
+    assert result["PYTHONPATH"] == pythonpath

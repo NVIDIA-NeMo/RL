@@ -1236,16 +1236,11 @@ def mock_async_grpo_infrastructure(
         checkpoint_cut_ordinal=checkpoint_cut_ordinal,
     )
 
-    # Patch venv creation
+    # Patch actor runtime environment creation
     stack.enter_context(
         patch(
-            "nemo_rl.algorithms.grpo.create_local_venv_on_each_node",
-            return_value="/fake/venv",
-        )
-    )
-    stack.enter_context(
-        patch(
-            "nemo_rl.algorithms.grpo.get_actor_python_env", return_value="/fake/python"
+            "nemo_rl.algorithms.grpo.make_actor_runtime_env",
+            return_value={"py_executable": "/fake/python", "env_vars": {}},
         )
     )
 
