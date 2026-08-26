@@ -64,7 +64,10 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
             num_generations_per_prompt=4,
             skip_reference_policy_logprobs_calculation=False,
         ),
-        policy={"train_global_batch_size": num_prompts_per_step * 4},
+        policy={
+            "train_global_batch_size": num_prompts_per_step * 4,
+            "generation": {"colocated": {"enabled": False}},
+        },
         # The last two are read only on the ready_first branch, which rejects a run
         # without them before it reaches anything under test here.
         loss_fn=SimpleNamespace(
@@ -369,7 +372,10 @@ class TestWrongPathFaultToleranceIsRejected:
                 num_generations_per_prompt=4,
                 skip_reference_policy_logprobs_calculation=False,
             ),
-            policy={"train_global_batch_size": 8},
+            policy={
+                "train_global_batch_size": 8,
+                "generation": {"colocated": {"enabled": False}},
+            },
             loss_fn=SimpleNamespace(reference_policy_kl_penalty=0),
             env={"should_use_nemo_gym": use_nemo_gym},
             # Read by the metric_name check upstream #3429 added to this same

@@ -41,8 +41,9 @@ import os
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional, Union
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import torch
@@ -71,7 +72,7 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
-from tests.unit.single_controller.test_single_controller_setup import (
+from tests.unit.single_controller.test_setup import (
     patched_factories,  # noqa: F401
 )
 
@@ -194,6 +195,9 @@ class _FakeSampler:
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
+
+    def set_gate_window(self, gate_window: int) -> None:
+        self.gate_window = gate_window
 
     def set_dispatch_index(self, resume_from_step: int) -> None:
         pass
@@ -329,6 +333,7 @@ def _actor_master_config(
         policy={
             # One optimizer.step per RL step: prompts * generations == gbs.
             "train_global_batch_size": num_prompts_per_step * 2,
+            "generation": {"colocated": {"enabled": False}},
         },
         loss_fn=ClippedPGLossConfig(),
         env={},
@@ -776,6 +781,148 @@ class TestAsyncSaveFinalization:
             actor._checkpointer.shutdown()
 
 
+# ── PPO save ordering ────────────────────────────────────────────────────────
+
+
+class _OrderRecordingPolicy:
+    """Policy stand-in logging the residency calls _save_checkpoint drives."""
+
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+
+    def offload_to_cpu(self) -> None:
+        self.calls.append("policy.offload_to_cpu")
+
+    def prepare_for_training(self) -> None:
+        self.calls.append("policy.prepare_for_training")
+
+    def save_checkpoint(self, **kwargs: Any) -> None:
+        self.save_kwargs = kwargs
+        self.calls.append("policy.save_checkpoint")
+
+    def finalize_async_save(self) -> None:
+        pass
+
+
+class _OrderRecordingCritic:
+    """Critic stand-in sharing the policy's call log."""
+
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+
+    def prepare_for_training(self) -> None:
+        self.calls.append("critic.prepare_for_training")
+
+    def save_checkpoint(self, **kwargs: Any) -> None:
+        self.save_kwargs = kwargs
+        self.calls.append("critic.save_checkpoint")
+
+    def finish_training(self) -> None:
+        self.calls.append("critic.finish_training")
+
+
+def _ppo_save_actor(tmp_path: Path, calls: list[str]):
+    """Bare actor carrying only what _save_checkpoint reads."""
+    actor = object.__new__(_ACTOR_CLS)
+    checkpoint_path = tmp_path / "tmp_step_1"
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+
+    actor._save_state = SimpleNamespace()
+    actor._train_steps = 1
+    actor._current_epoch = 0
+    actor._consumed_samples = 0
+    actor._total_valid_tokens = 0
+    actor._replacement_reserve = []
+    actor._async_cfg = SimpleNamespace(
+        sampler=SimpleNamespace(name="in_order"),
+        max_buffered_rollouts=4,
+    )
+    actor._master_config = SimpleNamespace(checkpointing={"metric_name": None})
+    actor._dataloader = SimpleNamespace(state_dict=lambda: {})
+    actor._buffer = SimpleNamespace(state_dict=AsyncMock(return_value={}))
+    actor._checkpointer = MagicMock()
+    actor._checkpointer.save_optimizer = True
+    actor._checkpointer.init_tmp_checkpoint.return_value = str(checkpoint_path)
+    actor._is_ppo = True
+    actor._trainer = _OrderRecordingPolicy(calls)
+    actor._value = _OrderRecordingCritic(calls)
+    return actor
+
+
+class TestPPOSaveOrder:
+    def test_the_policy_is_offloaded_across_the_critic_save(
+        self, tmp_path, monkeypatch
+    ):
+        """The critic shares the training GPUs, so the two saves serialize.
+
+        The critic goes first because offloading the policy runs
+        finalize_async_save, which would block on the policy's own write if that
+        had already been staged. The onload before the policy save is also what a
+        critic-warmup step needs, having skipped prepare_for_training in the pump.
+        """
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.single_controller._write_latest_checkpoint_status",
+            lambda *args, **kwargs: None,
+        )
+        calls: list[str] = []
+        actor = _ppo_save_actor(tmp_path, calls)
+
+        asyncio.run(actor._save_checkpoint({}, is_policy_training_step=True))
+
+        assert calls == [
+            "policy.offload_to_cpu",
+            "critic.prepare_for_training",
+            "critic.save_checkpoint",
+            "critic.finish_training",
+            "policy.prepare_for_training",
+            "policy.save_checkpoint",
+        ]
+
+
+class TestPPOWarmupCheckpoint:
+    """During critic warmup the policy optimizer has never stepped."""
+
+    @pytest.fixture
+    def actor(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.single_controller._write_latest_checkpoint_status",
+            lambda *args, **kwargs: None,
+        )
+        return _ppo_save_actor(tmp_path, [])
+
+    @pytest.mark.parametrize("is_policy_training_step", [False, True])
+    def test_the_policy_optimizer_is_written_only_once_it_has_stepped(
+        self, actor, is_policy_training_step
+    ):
+        asyncio.run(
+            actor._save_checkpoint({}, is_policy_training_step=is_policy_training_step)
+        )
+
+        written = actor._trainer.save_kwargs["optimizer_path"] is not None
+        assert written is is_policy_training_step
+        # The critic trains from step 0, so its optimizer is always written.
+        assert actor._value.save_kwargs["optimizer_path"] is not None
+
+    def test_warmup_step_skips_the_top_k_metric(self, actor):
+        """No policy metrics exist yet, so the checkpoint just is not a candidate."""
+        actor._master_config.checkpointing["metric_name"] = "train:loss"
+        # Seed it so the delattr in the warmup branch is observable; the bare
+        # namespace never had the attribute, so the assertion would be vacuous.
+        setattr(actor._save_state, "train:loss", 1.23)
+
+        with pytest.warns(UserWarning, match="not available during PPO critic warmup"):
+            asyncio.run(actor._save_checkpoint({}, is_policy_training_step=False))
+
+        assert not hasattr(actor._save_state, "train:loss")
+
+    def test_a_training_step_still_raises_on_a_missing_metric(self, actor):
+        """The warmup branch must not soften the misconfiguration error."""
+        actor._master_config.checkpointing["metric_name"] = "train:loss"
+
+        with pytest.raises(ValueError, match="not found in train metrics"):
+            asyncio.run(actor._save_checkpoint({}, is_policy_training_step=True))
+
+
 # ── metric_name behavior ─────────────────────────────────────────────────────
 
 
@@ -861,7 +1008,7 @@ def _write_checkpoint(
 def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
     """Partially-populated MasterConfig for setup_single_controller tests.
 
-    Same shape as test_single_controller_setup._make_master_config, plus the
+    Same shape as test_setup._make_master_config, plus the
     checkpointing block setup now reads.
     """
     return MasterConfig.model_construct(
@@ -890,7 +1037,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             "megatron_cfg": {"enabled": False},
             "generation": {
                 "backend": "vllm",
-                "colocated": {"enabled": True, "resources": {}},
+                "colocated": {"enabled": False, "resources": {}},
             },
         },
         loss_fn=ClippedPGLossConfig(),
