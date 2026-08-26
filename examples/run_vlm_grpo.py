@@ -19,9 +19,10 @@ import time
 
 from omegaconf import OmegaConf
 
-from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
+from nemo_rl.algorithms.grpo import MasterConfig, async_grpo_train, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
+from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
@@ -83,6 +84,8 @@ def main() -> None:
         )
 
     with rl_init_timer.time("ray_connect"):
+        # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
+        maybe_configure_data_plane_env(config.data_plane)
         init_ray()
 
     with rl_init_timer.time("tokenizer"):
@@ -120,8 +123,8 @@ def main() -> None:
             checkpointer,
             grpo_state,
             master_config,
-            _teacher_worker_groups,
-            _alias_to_group_alias,
+            teacher_worker_groups,
+            alias_to_group_alias,
         ) = setup(config, tokenizer, dataset, val_dataset, processor=processor)
 
     rl_init_timer.record("total", time.perf_counter() - main_start)
@@ -133,21 +136,56 @@ def main() -> None:
             print(f"  {label}: {value:.1f}s")
     print("=" * 60 + "\n", flush=True)
 
-    grpo_train(
-        policy,
-        policy_generation,
-        dataloader,
-        val_dataloader,
-        tokenizer,
-        loss_fn,
-        task_to_env,
-        val_task_to_env,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-        processor=processor,
-    )
+    if config.grpo.async_grpo.enabled:
+        if config.grpo.use_dynamic_sampling:
+            raise NotImplementedError(
+                "use_dynamic_sampling is not supported with async GRPO"
+            )
+        if config.grpo.reward_scaling.enabled:
+            raise NotImplementedError("reward_scaling is not supported with async GRPO")
+        if config.grpo.reward_shaping.enabled:
+            raise NotImplementedError("reward_shaping is not supported with async GRPO")
+        if config.data["use_multiple_dataloader"]:
+            raise NotImplementedError(
+                "use_multiple_dataloader is not supported with async GRPO"
+            )
+
+        print("🚀 Running async GRPO training")
+        async_grpo_train(
+            policy=policy,
+            policy_generation=policy_generation,
+            dataloader=dataloader,
+            val_dataloader=val_dataloader,
+            tokenizer=tokenizer,
+            loss_fn=loss_fn,
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=logger,
+            checkpointer=checkpointer,
+            grpo_save_state=grpo_state,
+            master_config=master_config,
+            max_trajectory_age_steps=config.grpo.async_grpo.max_trajectory_age_steps,
+            teacher_worker_groups=teacher_worker_groups,
+            alias_to_group_alias=alias_to_group_alias,
+            processor=processor,
+        )
+    else:
+        print("🚀 Running synchronous GRPO training")
+        grpo_train(
+            policy,
+            policy_generation,
+            dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            task_to_env,
+            val_task_to_env,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+            processor=processor,
+        )
 
 
 if __name__ == "__main__":

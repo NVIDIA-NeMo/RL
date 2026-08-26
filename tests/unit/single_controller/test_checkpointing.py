@@ -39,9 +39,11 @@ import asyncio
 import json
 import os
 import threading
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional, Union
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import torch
@@ -70,7 +72,7 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
-from tests.unit.single_controller.test_single_controller_setup import (
+from tests.unit.single_controller.test_setup import (
     patched_factories,  # noqa: F401
 )
 
@@ -92,8 +94,8 @@ class _FakeTrainer:
         self.save_calls: list[dict[str, Any]] = []
         self.finalize_calls: int = 0
 
-    def prepare_for_lp_inference(self) -> None:
-        pass
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        del keep_train_buffers
 
     def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
         pass
@@ -193,6 +195,9 @@ class _FakeSampler:
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
+
+    def set_gate_window(self, gate_window: int) -> None:
+        self.gate_window = gate_window
 
     def set_dispatch_index(self, resume_from_step: int) -> None:
         pass
@@ -328,6 +333,7 @@ def _actor_master_config(
         policy={
             # One optimizer.step per RL step: prompts * generations == gbs.
             "train_global_batch_size": num_prompts_per_step * 2,
+            "generation": {"colocated": {"enabled": False}},
         },
         loss_fn=ClippedPGLossConfig(),
         env={},
@@ -403,16 +409,22 @@ def _run_train_pump(
     actor_args: SingleControllerActorArgs,
     *,
     flush: bool = True,
+    seed: Optional[Callable[[Any], None]] = None,
 ):
     """Construct the actor in-process and drive _train_pump to completion.
 
     flush=True joins the (possibly async) checkpoint finalization afterwards,
     like run()'s exit path does, so step_N dirs are visible to assertions.
+
+    seed runs against the constructed actor before the pump does, for state the
+    pump is expected to persist but that no actor_args field carries.
     """
 
     async def _main():
         actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
         actor._sampler = _FakeSampler()
+        if seed is not None:
+            seed(actor)
         # In-process runs have no Ray runtime; the pump only reads the GPU
         # count for a throughput metric.
         with patch("ray.cluster_resources", return_value={"GPU": 0}):
@@ -437,6 +449,22 @@ def _run_actor_run(mc: MasterConfig, actor_args: SingleControllerActorArgs):
         actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
         result = await asyncio.wait_for(actor.run(), timeout=60.0)
         return actor, result
+
+    return asyncio.run(_main())
+
+
+def _run_reserve_restore(mc: MasterConfig, actor_args: SingleControllerActorArgs):
+    """Construct the actor and await only the spare-pool restore.
+
+    run() cannot stand in here: it starts the rollout pump, which drains any whole
+    step's worth of spares straight into training, so the pool is empty again by the
+    time the assertion runs.
+    """
+
+    async def _main():
+        actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
+        await actor._maybe_restore_replacement_reserve()
+        return actor
 
     return asyncio.run(_main())
 
@@ -753,6 +781,148 @@ class TestAsyncSaveFinalization:
             actor._checkpointer.shutdown()
 
 
+# ── PPO save ordering ────────────────────────────────────────────────────────
+
+
+class _OrderRecordingPolicy:
+    """Policy stand-in logging the residency calls _save_checkpoint drives."""
+
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+
+    def offload_to_cpu(self) -> None:
+        self.calls.append("policy.offload_to_cpu")
+
+    def prepare_for_training(self) -> None:
+        self.calls.append("policy.prepare_for_training")
+
+    def save_checkpoint(self, **kwargs: Any) -> None:
+        self.save_kwargs = kwargs
+        self.calls.append("policy.save_checkpoint")
+
+    def finalize_async_save(self) -> None:
+        pass
+
+
+class _OrderRecordingCritic:
+    """Critic stand-in sharing the policy's call log."""
+
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+
+    def prepare_for_training(self) -> None:
+        self.calls.append("critic.prepare_for_training")
+
+    def save_checkpoint(self, **kwargs: Any) -> None:
+        self.save_kwargs = kwargs
+        self.calls.append("critic.save_checkpoint")
+
+    def finish_training(self) -> None:
+        self.calls.append("critic.finish_training")
+
+
+def _ppo_save_actor(tmp_path: Path, calls: list[str]):
+    """Bare actor carrying only what _save_checkpoint reads."""
+    actor = object.__new__(_ACTOR_CLS)
+    checkpoint_path = tmp_path / "tmp_step_1"
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+
+    actor._save_state = SimpleNamespace()
+    actor._train_steps = 1
+    actor._current_epoch = 0
+    actor._consumed_samples = 0
+    actor._total_valid_tokens = 0
+    actor._replacement_reserve = []
+    actor._async_cfg = SimpleNamespace(
+        sampler=SimpleNamespace(name="in_order"),
+        max_buffered_rollouts=4,
+    )
+    actor._master_config = SimpleNamespace(checkpointing={"metric_name": None})
+    actor._dataloader = SimpleNamespace(state_dict=lambda: {})
+    actor._buffer = SimpleNamespace(state_dict=AsyncMock(return_value={}))
+    actor._checkpointer = MagicMock()
+    actor._checkpointer.save_optimizer = True
+    actor._checkpointer.init_tmp_checkpoint.return_value = str(checkpoint_path)
+    actor._is_ppo = True
+    actor._trainer = _OrderRecordingPolicy(calls)
+    actor._value = _OrderRecordingCritic(calls)
+    return actor
+
+
+class TestPPOSaveOrder:
+    def test_the_policy_is_offloaded_across_the_critic_save(
+        self, tmp_path, monkeypatch
+    ):
+        """The critic shares the training GPUs, so the two saves serialize.
+
+        The critic goes first because offloading the policy runs
+        finalize_async_save, which would block on the policy's own write if that
+        had already been staged. The onload before the policy save is also what a
+        critic-warmup step needs, having skipped prepare_for_training in the pump.
+        """
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.single_controller._write_latest_checkpoint_status",
+            lambda *args, **kwargs: None,
+        )
+        calls: list[str] = []
+        actor = _ppo_save_actor(tmp_path, calls)
+
+        asyncio.run(actor._save_checkpoint({}, is_policy_training_step=True))
+
+        assert calls == [
+            "policy.offload_to_cpu",
+            "critic.prepare_for_training",
+            "critic.save_checkpoint",
+            "critic.finish_training",
+            "policy.prepare_for_training",
+            "policy.save_checkpoint",
+        ]
+
+
+class TestPPOWarmupCheckpoint:
+    """During critic warmup the policy optimizer has never stepped."""
+
+    @pytest.fixture
+    def actor(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.single_controller._write_latest_checkpoint_status",
+            lambda *args, **kwargs: None,
+        )
+        return _ppo_save_actor(tmp_path, [])
+
+    @pytest.mark.parametrize("is_policy_training_step", [False, True])
+    def test_the_policy_optimizer_is_written_only_once_it_has_stepped(
+        self, actor, is_policy_training_step
+    ):
+        asyncio.run(
+            actor._save_checkpoint({}, is_policy_training_step=is_policy_training_step)
+        )
+
+        written = actor._trainer.save_kwargs["optimizer_path"] is not None
+        assert written is is_policy_training_step
+        # The critic trains from step 0, so its optimizer is always written.
+        assert actor._value.save_kwargs["optimizer_path"] is not None
+
+    def test_warmup_step_skips_the_top_k_metric(self, actor):
+        """No policy metrics exist yet, so the checkpoint just is not a candidate."""
+        actor._master_config.checkpointing["metric_name"] = "train:loss"
+        # Seed it so the delattr in the warmup branch is observable; the bare
+        # namespace never had the attribute, so the assertion would be vacuous.
+        setattr(actor._save_state, "train:loss", 1.23)
+
+        with pytest.warns(UserWarning, match="not available during PPO critic warmup"):
+            asyncio.run(actor._save_checkpoint({}, is_policy_training_step=False))
+
+        assert not hasattr(actor._save_state, "train:loss")
+
+    def test_a_training_step_still_raises_on_a_missing_metric(self, actor):
+        """The warmup branch must not soften the misconfiguration error."""
+        actor._master_config.checkpointing["metric_name"] = "train:loss"
+
+        with pytest.raises(ValueError, match="not found in train metrics"):
+            asyncio.run(actor._save_checkpoint({}, is_policy_training_step=True))
+
+
 # ── metric_name behavior ─────────────────────────────────────────────────────
 
 
@@ -838,7 +1008,7 @@ def _write_checkpoint(
 def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
     """Partially-populated MasterConfig for setup_single_controller tests.
 
-    Same shape as test_single_controller_setup._make_master_config, plus the
+    Same shape as test_setup._make_master_config, plus the
     checkpointing block setup now reads.
     """
     return MasterConfig.model_construct(
@@ -867,7 +1037,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             "megatron_cfg": {"enabled": False},
             "generation": {
                 "backend": "vllm",
-                "colocated": {"enabled": True, "resources": {}},
+                "colocated": {"enabled": False, "resources": {}},
             },
         },
         loss_fn=ClippedPGLossConfig(),
@@ -1218,3 +1388,111 @@ class TestReplayBufferPersistence:
         assert buffer.load_calls == []
         assert actor._buffer_capacity._value == 4
         assert any("skipping the buffer restore" in line for line in printed)
+
+
+# ── replacement reserve persistence ──────────────────────────────────────────
+
+
+class TestReplacementReservePersistence:
+    """The spare-prompt pool has to survive a restart, or the batch is lost.
+
+    Diverting a batch into the pool advances the dataloader, so the dataloader state
+    the checkpoint saves already records those prompts as consumed while they exist
+    only in memory. Resuming without them leaves a run whose iterator is positioned
+    past a batch nobody holds, and `_drain_reserve_into_steps` cannot get it back --
+    it only recovers spares held by the process that diverted them.
+    """
+
+    def test_save_writes_the_pooled_spares(self, tmp_path):
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
+
+        actor = _run_train_pump(
+            mc,
+            _make_actor_args(),
+            seed=lambda a: a._replacement_reserve.extend(["spare0", "spare1"]),
+        )
+
+        reserve_path = tmp_path / "checkpoints" / "step_2" / "replacement_reserve.pt"
+        assert reserve_path.exists()
+        assert torch.load(reserve_path, weights_only=False) == ["spare0", "spare1"]
+        # Saved, not consumed: the pool the run continues with is untouched.
+        assert list(actor._replacement_reserve) == ["spare0", "spare1"]
+
+    def test_save_omits_the_file_when_the_pool_is_empty(self, tmp_path):
+        """Which is every run that never diverted, i.e. every non-replace run.
+
+        The restore is silent about a missing file for exactly this reason, so an
+        always-written empty file would make that silence indefensible.
+        """
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
+
+        _run_train_pump(mc, _make_actor_args())
+
+        step_dir = tmp_path / "checkpoints" / "step_2"
+        assert step_dir.exists()
+        assert not (step_dir / "replacement_reserve.pt").exists()
+
+    def test_run_restores_the_pooled_spares(self, tmp_path):
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        torch.save(["spare0", "spare1"], ckpt_dir / "replacement_reserve.pt")
+        mc = _actor_master_config(tmp_path, max_num_steps=0)
+
+        actor = _run_reserve_restore(
+            mc,
+            _make_actor_args(
+                last_checkpoint_path=str(ckpt_dir),
+                save_state=_matching_save_state(),
+            ),
+        )
+
+        assert list(actor._replacement_reserve) == ["spare0", "spare1"]
+
+    def test_run_restores_the_pool_even_when_the_buffer_restore_is_skipped(
+        self, tmp_path
+    ):
+        """The sampler guard that protects the buffer must not cover the pool.
+
+        Spares never reached `admit`, so they carry no target-step stamp and nothing
+        about them depends on which sampler wrote the checkpoint. Skipping them here
+        would strand the batch permanently for the one case -- a sampler change on
+        resume -- where the operator is least likely to look for it.
+        """
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        torch.save({"groups": []}, ckpt_dir / "replay_buffer.pt")
+        # One spare is less than num_prompts_per_step, so the full run() path here
+        # holds it back rather than draining it, and the pool is still observable.
+        torch.save(["spare0"], ckpt_dir / "replacement_reserve.pt")
+        mc = _actor_master_config(tmp_path, max_num_steps=0)
+        save_state = _initial_grpo_save_state()
+        save_state.sampler_name = "in_order"  # current run uses windowed
+        buffer = _FakeTQBuffer(load_return=2)
+
+        actor, _ = _run_actor_run(
+            mc,
+            _make_actor_args(
+                tq_buffer=buffer,
+                last_checkpoint_path=str(ckpt_dir),
+                save_state=save_state,
+            ),
+        )
+
+        assert buffer.load_calls == []
+        assert list(actor._replacement_reserve) == ["spare0"]
+
+    def test_run_without_a_reserve_file_starts_with_an_empty_pool(self, tmp_path):
+        """A checkpoint predating this file, or any run that never diverted."""
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        mc = _actor_master_config(tmp_path, max_num_steps=0)
+
+        actor, _ = _run_actor_run(
+            mc,
+            _make_actor_args(
+                last_checkpoint_path=str(ckpt_dir),
+                save_state=_matching_save_state(),
+            ),
+        )
+
+        assert list(actor._replacement_reserve) == []

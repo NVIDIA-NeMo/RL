@@ -43,11 +43,15 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
+    resolve_vllm_video_config,
 )
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
+)
+from nemo_rl.models.generation.vllm.video_utils import (
+    register_torchcodec_vllm_video_loader,
 )
 from nemo_rl.models.generation.vllm.worker_utils import (
     resolve_data_parallel_local_rank,
@@ -596,6 +600,12 @@ class BaseVllmGenerationWorker:
         if logprobs_mode is not None:
             llm_kwargs["logprobs_mode"] = logprobs_mode
 
+        video_config = resolve_vllm_video_config(self.cfg)
+        if video_config is not None:
+            register_torchcodec_vllm_video_loader(
+                sampling_style=video_config.sampling_style,
+                temporal_patch_size=video_config.temporal_patch_size,
+            )
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0

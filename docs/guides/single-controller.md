@@ -1,10 +1,10 @@
-# Train with Single-Controller (Async GRPO)
+# Train with Single-Controller (Async GRPO and PPO)
 
 :::{warning}
 The Single-Controller path is a **beta feature** and still under active development. The API and configuration surface are not yet stable and may change without notice. Issues and feedback are welcome — please file them at [github.com/NVIDIA-NeMo/RL/issues](https://github.com/NVIDIA-NeMo/RL/issues).
 :::
 
-The Single-Controller (SC) path is an alternative async GRPO runtime that runs rollout generation and policy training as two independent *pumps* coordinated by a single Ray actor (`SingleControllerActor`) sitting over a shared TransferQueue (TQ) data plane. Compared to the legacy async GRPO in [async-grpo.md](./async-grpo.md), SC decouples per-prompt rollouts from the per-step batch boundary: producers push finished rollouts into `TQReplayBuffer` at group granularity, and a pluggable `StalenessSampler` decides which groups the trainer consumes on each step.
+The Single-Controller (SC) path is an alternative async GRPO and PPO runtime that runs rollout generation and policy training as two independent *pumps* coordinated by a single Ray actor (`SingleControllerActor`) sitting over a shared TransferQueue (TQ) data plane. Compared to the legacy async GRPO in [async-grpo.md](./async-grpo.md), SC decouples per-prompt rollouts from the per-step batch boundary: producers push finished rollouts into `TQReplayBuffer` at group granularity, and a pluggable `StalenessSampler` decides which groups the trainer consumes on each step.
 
 ## Configure the Single-Controller Path
 
@@ -14,7 +14,7 @@ The SC path is launched via a dedicated entrypoint:
 uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 ```
 
-`run_grpo_single_controller.py` mirrors `run_grpo.py` for config loading — the same YAML files apply — but requires a few settings the legacy path does not. The default exemplar lives at [examples/configs/grpo_math_1B_megatron_single_controller.yaml](../../examples/configs/grpo_math_1B_megatron_single_controller.yaml).
+`run_grpo_single_controller.py` mirrors `run_grpo.py` for config loading — the same YAML files apply — but requires a few settings the legacy path does not. The default exemplar lives at [examples/configs/grpo_math_1B_megatron_single_controller.yaml](../../examples/configs/grpo_math_1B_megatron_single_controller.yaml); the PPO one at [examples/configs/ppo_math_1B_megatron_single_controller.yaml](../../examples/configs/ppo_math_1B_megatron_single_controller.yaml).
 
 ### Mandatory settings
 
@@ -25,7 +25,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       enabled: true
     ```
 
-2. **Enable vLLM async engine** and **disable colocated inference** (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine):
+2. **Enable vLLM async engine** and **disable colocated inference** (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine; setup rejects `colocated.enabled: true`):
 
     ```yaml
     policy:
@@ -40,10 +40,11 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
             gpus_per_node: 4  # inference GPUs; remainder go to training
     ```
 
-3. **One RL step = one optimizer step.** The SC train pump does not support multi-mini-step inside a single RL step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)):
+3. **One RL step = one training batch.** The batch a step trains on is the whole step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)). A GRPO step is also one optimizer step; a PPO step is `ppo.ppo_epochs` of them over that same batch.
 
     ```python
     num_prompts_per_step * num_generations_per_prompt == policy.train_global_batch_size
+    num_prompts_per_step * num_generations_per_prompt == value.train_global_batch_size  # PPO
     ```
 
 4. **Enable importance sampling correction** whenever the sampler admits off-policy data (any `max_staleness_versions > 0` on the `windowed`/`weight_fifo` samplers, or `max_lookahead_versions > 0` on `in_order`). The correction and its derivation are the same as for legacy async GRPO — see [Why Importance Sampling Correction Is Required for Async](./async-grpo.md#why-importance-sampling-correction-is-required-for-async):
@@ -52,6 +53,8 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
     loss_fn:
       use_importance_sampling_correction: true
     ```
+
+5. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step.
 
 ## Async-RL Knobs and Sampler Modes
 
@@ -68,7 +71,7 @@ Pick one of four modes with `sampler.name`. Each mode takes its own knobs, liste
 
 | `sampler.name` | Rollout gating                                                                                                          | Train selection                                                                                                   | Typical use                                                                                                  |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `in_order`     | Dispatch may lead the trainer by up to `max_lookahead_versions` batches. Each dispatch is stamped with a `target_step`. | Consume the group whose `target_step == current_train_weight`.                                                    | Sync mode (`max_lookahead_versions=0`) and legacy-async exact-batch semantics (`max_lookahead_versions>=1`). |
+| `in_order`     | Dispatch may lead the trainer by up to `max_lookahead_versions` batches. Each dispatch is stamped with a `target_step`. | Consume the group whose `target_step == current_train_weight`.                                                    | Sync mode (`max_lookahead_versions=0`) and legacy-async exact-batch semantics (`max_lookahead_versions>=1`). The only mode supported on a PPO run. |
 | `weight_fifo`  | Same gate as `in_order` (`max_staleness_versions` of lookahead).                                                        | Drain the oldest in-window `start_weight` first, waiting for that weight's batch to fill.                         | Strict weight-version FIFO under a bounded lookahead.                                                        |
 | `windowed`     | Ungated — rollout keeps producing until the buffer fills.                                                               | Take any ready group with `start_weight` in `[train - max_staleness_versions, train]`, optionally freshest-first. | Over-sampled streaming; aged groups outside the window are evicted (wasted compute).                         |
 | `custom`       | Determined by the imported class.                                                                                       | Determined by the imported class.                                                                                 | `target: "module:ClassName"` — bring your own `PromptGroupSampler`.                                          |
@@ -89,8 +92,9 @@ The shipped exemplars cover three of the four modes:
 
 Field definitions:
 
-- `max_buffered_rollouts` — hard cap on unconsumed rollout groups buffered in the data plane. Validated at setup against the gated sampler's required capacity; a value too small deadlocks the rollout pump, so setup raises instead of silently blocking.
-- `min_groups_for_streaming_train` — minimum ready groups the trainer waits for before dispatching a batch. Set to `num_prompts_per_step` for sync/legacy semantics; lower for streaming.
+- `max_buffered_rollouts` — hard cap on unconsumed rollout groups buffered in the data plane. Validated at setup against the gated sampler's required capacity; a value too small deadlocks the rollout pump, so setup raises instead of silently blocking. Sized from the widest window the run ever uses, so `warmup_lookahead_versions` rather than `max_lookahead_versions` when it is set.
+- `min_groups_for_streaming_train` — minimum ready groups the trainer waits for before dispatching a batch. Set to `num_prompts_per_step` for sync/legacy semantics; lower for streaming. (PPO) Must equal `num_prompts_per_step` — the critic has no split train API, so one `train_from_meta` call is one optimizer step, and streaming a step across chunks would step the critic once per chunk.
+- `sampler.warmup_lookahead_versions` (PPO) — lookahead used while `ppo.policy_training_start_step` critic warmup is in progress, shrinking back to `max_lookahead_versions` afterwards. The SC equivalent of `ppo.async_ppo.warmup_generation_lead_steps`.
 
 ## Implementation Structure
 
@@ -128,14 +132,14 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 #### 5. `_rollout_pump` and `_train_pump`
 
 - `_rollout_pump`: pulls prompts from the dataloader, calls `sampler.admit`, dispatches `RolloutManager.generate_and_push`, and honours `max_inflight_prompts` as a backpressure cap.
-- `_train_pump`: `sampler.evict → sampler.select → _advantage_stage → TQPolicy split API (begin_train_step / train_microbatches_from_meta / finish_train_step) → dp_client.clear_samples`.
+- `_train_pump`: `sampler.evict → sampler.select → _value_stage (PPO only) → _advantage_stage → _value_train (PPO only) → TQPolicy split API (begin_train_step / train_microbatches_from_meta / finish_train_step) → dp_client.clear_samples`.
 
 ### Coordination Flow
 
 1. **Driver setup**: `setup_single_controller` builds the worker groups, virtual cluster, dp client, dataloader, `TQReplayBuffer`, `RolloutManager`, and weight synchronizer, and packs them into a `SingleControllerActorArgs` that the entrypoint cloudpickles into the actor.
 2. **Actor startup**: `SingleControllerActor` launches `_rollout_pump` and `_train_pump` concurrently as asyncio tasks; both share the same `TQReplayBuffer` and `StalenessSampler`.
 3. **Rollout pump loop**: `sampler.admit` gates dispatch against the current trainer version (returning a `target_step` for `in_order`); the pump then reserves a buffer slot, drives `RolloutManager.generate_and_push`, and commits with the observed `start_weight` / `end_weight`.
-4. **Train pump loop**: `sampler.evict` drops out-of-window groups, `sampler.select` picks the next batch, `_advantage_stage` computes advantages, and the TQPolicy split API runs one optimizer step per RL step.
+4. **Train pump loop**: `sampler.evict` drops out-of-window groups, `sampler.select` picks the next batch, `_value_stage` and `_value_train` run the critic forward and its optimizer step on a PPO run, `_advantage_stage` computes advantages, and the TQPolicy split API runs one optimizer step per RL step on GRPO, or `ppo.ppo_epochs` of them on PPO.
 5. **Weight sync**: after each optimizer step the pump bumps the trainer version, clears rollout permission, calls the weight synchronizer, and re-opens the rollout pump for the next version.
 
 ## Relation to Legacy Async GRPO
@@ -154,15 +158,16 @@ The [legacy async GRPO](./async-grpo.md) (`grpo.async_grpo.enabled: true` under 
 
 ### Migrating a legacy async config
 
-SC reads its async knobs from `async_rl:` and **requires `grpo.async_grpo: null`** — `run_grpo_single_controller.py` raises if a legacy block is still present, so null it out when porting rather than leaving it in place.
+SC reads its async knobs from `async_rl:` and **requires `grpo.async_grpo: null`** (or `ppo.async_ppo: null` on a PPO run) — `run_grpo_single_controller.py` raises if a legacy block is still present, so null it out when porting rather than leaving it in place.
 
-| Legacy `grpo.async_grpo.*` | SC equivalent `async_rl.*` |
+| Legacy `grpo.async_grpo.*` / `ppo.async_ppo.*` | SC equivalent `async_rl.*` |
 | -------------------------- | -------------------------- |
 | `enabled: true` | Implicit — SC is always async; use `sampler.max_lookahead_versions: 0` for sync semantics, `>= 1` for async |
 | `max_trajectory_age_steps: N` | `sampler.name: in_order` with `sampler.max_lookahead_versions: N` |
+| `warmup_generation_lead_steps` (PPO) | `sampler.warmup_lookahead_versions` — the lookahead to use while critic warmup is in progress |
 | `recompute_kv_cache_after_weight_updates` | `recompute_kv_cache_after_weight_updates` (same) |
 | `in_flight_weight_updates` | Always effectively true; `false`-equivalent behavior is not yet supported (drain-gate tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625)) |
-| *(no legacy equivalent — matches legacy full-batch train semantics)* | `min_groups_for_streaming_train: ${grpo.num_prompts_per_step}` |
+| *(no legacy equivalent — matches legacy full-batch train semantics)* | `min_groups_for_streaming_train: ${grpo.num_prompts_per_step}`, or `${ppo.num_prompts_per_step}` on a PPO run |
 | *(no legacy equivalent — matches legacy `max_trajectory_age + 1` batches in flight)* | `max_inflight_prompts: num_prompts_per_step × (max_lookahead_versions + 1)` |
 | *(no legacy equivalent — legacy sizes its buffer to `num_prompts_per_step × max_trajectory_age_steps × 2`)* | `max_buffered_rollouts: num_prompts_per_step × (max_lookahead_versions + 1)` (tight; see the [Config → behavior map](#config--behavior-map) for per-sampler values) |
 
@@ -172,6 +177,8 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
 - Generation backend: only vLLM is supported and validated; Megatron generation, SGLang, and TRT-LLM have not been tested on SC.
-- Checkpointing and validation are not yet supported (setup raises if enabled).
+- Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`).
+- (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, and the critic shards it against the configured `value.train_global_batch_size` rather than its actual size, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
+- Reward shaping and sample filtering — `overlong_filtering`, `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported.

@@ -266,17 +266,78 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
     assert events.index("finalize_async_save") < events.index("move_model")
 
 
-def test_megatron_offload_after_refit_finalizes_before_model_move(monkeypatch):
-    """Checkpoint CUDA IPC handles must be dropped before model storage is replaced."""
+@pytest.mark.parametrize("offload_optimizer", [False, True])
+def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
+    monkeypatch, offload_optimizer
+):
+    """offload_optimizer_for_refit=False must leave the optimizer untouched."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    moved = []
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = object()
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_refit = offload_optimizer
+    worker.fp8_cfg = None
+    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
+    worker.finalize_async_save = lambda: None
+    worker.move_model = lambda model, device, move_params, move_grads: model
+    worker.move_optimizer = lambda device: moved.append(device)
+
+    class _AllocatorWakeup:
+        def cuda(self):
+            pass
+
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+
+    MegatronPolicyWorkerImpl.offload_before_refit(worker)
+
+    assert moved == (["cpu"] if offload_optimizer else [])
+
+
+@pytest.mark.parametrize(
+    "generation_backend, colocated, has_inference_model, expect_move_params",
+    [
+        # Plain training worker (no generation config): params always move.
+        (None, False, False, True),
+        # Shared-model colocated Megatron generation: params must stay resident —
+        # inference CUDA graphs replay with capture-time param pointers, and a
+        # CPU round-trip re-allocates their storage.
+        ("megatron", True, False, False),
+        # Colocated reshard (dedicated inference model): params still move; the
+        # graphs live on the dedicated, torch_memory_saver-managed model.
+        ("megatron", True, True, True),
+    ],
+)
+def test_megatron_offload_after_refit_finalizes_before_model_move(
+    monkeypatch, generation_backend, colocated, has_inference_model, expect_move_params
+):
+    """Checkpoint CUDA IPC handles must be dropped before model storage is replaced,
+    and shared-model colocated generation must keep its params resident."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     events = []
+    move_kwargs = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.model = _FakeTrainableModel()
+    worker.cfg = (
+        {"generation": {"backend": generation_backend}} if generation_backend else {}
+    )
+    worker.is_generation_colocated = colocated
+    worker.inference_model = object() if has_inference_model else None
+    worker._colocated_reshard_plan = None
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
-    worker.move_model = lambda model, device: events.append("move_model") or model
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append("move_model") or move_kwargs.append(kwargs) or model
+    )
     worker.offload_before_refit = lambda: events.append("offload_before_refit")
 
     class _AllocatorWakeup:
@@ -299,6 +360,7 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(monkeypatch):
 
     assert events[0] == "finalize_async_save"
     assert events.index("finalize_async_save") < events.index("move_model")
+    assert move_kwargs[0]["move_params"] is expect_move_params
 
 
 def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
@@ -453,6 +515,29 @@ def test_megatron_prepare_for_training_restores_optimizer():
 
     assert model.train_called
     assert restored_devices == ["cuda"]
+
+
+def test_megatron_prepare_for_training_leaves_native_cpu_optimizer_placement():
+    """HybridDeviceOptimizer owns state placement when native offload is enabled."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    model = _FakeTrainableModel()
+
+    worker.model = model
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = True
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+    worker.move_model = lambda model, device, move_grads, move_params: model
+    worker.move_optimizer = lambda device: pytest.fail(
+        "native optimizer CPU offload must not use the generic optimizer mover"
+    )
+
+    MegatronPolicyWorkerImpl.prepare_for_training(worker)
+
+    assert model.train_called
 
 
 def test_set_moe_grad_scale_func_sets_and_clears_on_model_config():
@@ -623,6 +708,8 @@ def test_prepare_for_generation_disables_param_gather_hook_before_wake(
         lambda *, param_sync=False: events.append(("disable_hook", param_sync))
     )
     worker._inference_engine_initialized = True
+    # Asleep, so the idempotent-wake guard falls through to the full wake path.
+    worker._inference_engine_asleep = True
     worker._wake = lambda: events.append("wake_engine")
 
     monkeypatch.setattr(megatron_worker, "log_gpu_memory", lambda *_: None)
@@ -672,7 +759,6 @@ def create_megatron_test_config(
             "stop_token_ids": None,
             "stop_strings": None,
             "mcore_generation_config": {
-                "async_engine": False,
                 "max_model_len": 1024,
                 "buffer_size_gb": 2,
                 "num_cuda_graphs": 16,
@@ -752,6 +838,7 @@ def create_megatron_test_config(
                 "clip_grad": 1.0,
                 "optimizer_cpu_offload": False,
                 "optimizer_offload_fraction": 0.0,
+                "overlap_cpu_optimizer_d2h_h2d": False,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
