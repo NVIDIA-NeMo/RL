@@ -87,6 +87,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
+    COLLECTOR_DATA_EPOCH_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
 from nemo_rl.experience.rollouts import (
@@ -4060,6 +4061,53 @@ def aggregate_rollout_metrics(
     return aggregated
 
 
+def _warn_if_async_data_cannot_cover_training(
+    dataloader: StatefulDataLoader,
+    master_config: MasterConfig,
+) -> None:
+    """Report up front how many steps the training data can actually feed.
+
+    The async collector runs ahead of training in a background actor, so a
+    dataset too small for the requested step count does not surface until the
+    replay buffer starves mid-run — potentially hundreds of GPU-hours in. Do
+    the arithmetic at startup so the shortfall is visible in the first lines
+    of the log.
+
+    This warns rather than raises: ``grpo.max_num_steps`` is commonly set to a
+    sentinel (e.g. 100000 in
+    ``examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml``) to mean "train
+    until the data or the walltime runs out", and that is a legitimate setup
+    rather than a misconfiguration.
+
+    Args:
+        dataloader: Training dataloader handed to the trajectory collector.
+        master_config: Master configuration.
+    """
+    max_num_epochs = master_config.grpo.max_num_epochs
+    if max_num_epochs is None:
+        return
+    # MultipleDataloaderWrapper is an infinite iterator with no __len__.
+    if master_config.data["use_multiple_dataloader"]:
+        return
+
+    batches_per_epoch = len(dataloader)
+    available_steps = max_num_epochs * batches_per_epoch
+    max_num_steps = master_config.grpo.max_num_steps
+    if available_steps < max_num_steps:
+        needed_epochs = (
+            -(-max_num_steps // batches_per_epoch) if batches_per_epoch else 0
+        )
+        warnings.warn(
+            f"Async GRPO is configured for grpo.max_num_steps={max_num_steps} but the "
+            f"training data only supports {available_steps} steps "
+            f"({batches_per_epoch} batches/epoch x grpo.max_num_epochs={max_num_epochs}). "
+            f"The trajectory collector will exhaust its data at step {available_steps}. "
+            f"If you intended to reach {max_num_steps} steps, raise grpo.max_num_epochs "
+            f"to at least {needed_epochs} or use a larger dataset.",
+            stacklevel=2,
+        )
+
+
 def async_grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -4126,6 +4174,8 @@ def async_grpo_train(
             "examples/configs/recipes/llm/"
             "grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml"
         )
+
+    _warn_if_async_data_cannot_cover_training(dataloader, master_config)
 
     if master_config.grpo.async_grpo.max_trajectory_age_steps > 1:
         if not master_config.grpo.async_grpo.in_flight_weight_updates:
@@ -4255,6 +4305,9 @@ def async_grpo_train(
             (replay_buffer_restore_metadata or {}).get(NEXT_NEMO_GYM_TASK_INDEX_KEY, 0)
         ),
     )
+    # Checkpoints written before the collector tracked epochs have no entry;
+    # default to 0 so they resume with the full max_num_epochs allowance.
+    start_data_epoch = int((rollouts_state or {}).get(COLLECTOR_DATA_EPOCH_KEY, 0))
 
     _tc_py_exec = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
@@ -4293,6 +4346,7 @@ def async_grpo_train(
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
         next_nemo_gym_task_index=next_nemo_gym_task_index,
         processor=processor,
+        start_data_epoch=start_data_epoch,
     )
 
     # Start trajectory collection in background
@@ -4483,7 +4537,7 @@ def async_grpo_train(
                 f"Trajectory collector stopped: dataloader exhausted while waiting for initial buffer fill at step={step}. "
                 f"The dataset ran out of data before training could start. "
                 f"Collector status: {collector_status}. "
-                f"Increase data.train.max_num_epochs or use a larger dataset."
+                f"Increase grpo.max_num_epochs or use a larger dataset."
             )
 
         wait_iterations += 1
@@ -4599,7 +4653,7 @@ def async_grpo_train(
                                 f"Trajectory collector stopped: dataloader exhausted at training_step={step}. "
                                 f"The dataset ran out of data before training could complete. "
                                 f"Collector status: {collector_status}. "
-                                f"Increase data.train.max_num_epochs or use a larger dataset."
+                                f"Increase grpo.max_num_epochs or use a larger dataset."
                             )
 
                         with timer.time("idle/buffer_starvation"):

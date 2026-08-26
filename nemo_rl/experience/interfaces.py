@@ -19,6 +19,10 @@ from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 
 NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
+# Number of full passes the async trajectory collector has already made over
+# the training dataloader. Persisted in the checkpoint's rollouts.pt so a
+# resumed run does not restart its grpo.max_num_epochs allowance from zero.
+COLLECTOR_DATA_EPOCH_KEY = "collector_data_epoch"
 
 
 @dataclass

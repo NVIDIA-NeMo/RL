@@ -33,6 +33,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import (
+    COLLECTOR_DATA_EPOCH_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
@@ -73,6 +74,7 @@ class AsyncTrajectoryCollector:
         on_policy_distillation_cfg: Optional[dict[str, Any]] = None,
         next_nemo_gym_task_index: int = 0,
         processor: Any = None,
+        start_data_epoch: int = 0,
     ):
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
@@ -113,6 +115,11 @@ class AsyncTrajectoryCollector:
         self.initial_weight_version: int = start_step
         self.dataloader: StatefulDataLoader | None = None
         self.collection_thread: _threading.Thread | None = None
+
+        # Full passes already completed over the training dataloader. Restored
+        # from the checkpoint so `grpo.max_num_epochs` bounds the whole run
+        # rather than each resumed segment of it.
+        self._data_epoch: int = start_data_epoch
 
         # Track when generation limits cause collection to pause
         self._last_limit_warning_version: int | None = None
@@ -280,67 +287,43 @@ class AsyncTrajectoryCollector:
             "data_exhausted": self.data_exhausted,
             "errored": self.collection_failed,
             "inflight_workers": inflight_workers,
+            "data_epoch": self._data_epoch,
         }
 
     def _collection_loop(self):
-        """Run the collection loop in background thread."""
+        """Run the collection loop in background thread.
+
+        Iterates the training dataloader up to ``grpo.max_num_epochs`` times.
+        Unlike sync GRPO — where the epoch loop lives in the driver's
+        ``while current_epoch < max_num_epochs`` and simply re-iterates the
+        dataloader — the async collector owns data iteration entirely, so the
+        epoch bound has to be applied here. Taking a fresh ``iter(dataloader)``
+        per pass mirrors what the sync driver does, so epoch semantics
+        (including per-epoch reshuffling when ``data.shuffle`` is set) match
+        between the two paths.
+        """
         dataloader_exhausted = False
         if self.dataloader is None:
             raise RuntimeError(
                 "start_collection must set a dataloader before collection"
             )
         dataloader = self.dataloader
+        max_num_epochs = self.master_config.grpo.max_num_epochs
         try:
-            for batch in dataloader:
-                if not self.running:
+            while self.running:
+                if max_num_epochs is not None and self._data_epoch >= max_num_epochs:
+                    dataloader_exhausted = True
                     break
 
-                # Check if manually paused and wait
-                if not self._manual_pause_cleared.is_set() and self.running:
-                    self._manual_pause_cleared.wait()
-
-                # Check if refit is in progress and wait
-                if not self._refit_pause_cleared.is_set() and self.running:
-                    print("⏸️ Pausing collection for refit...")
-                    with self._efficiency_timer.time("idle/refit_event_wait"):
-                        self._refit_pause_cleared.wait()
-                    print("▶️ Refit completed, resuming collection")
-
-                # Check if generation limits require pausing collection
-                if self._should_pause_for_generation_limits() and self.running:
-                    self._generation_limit_cleared.clear()
-
-                    # Only log warning once per weight version
-                    if self._last_limit_warning_version != self.current_weight_version:
-                        max_trajectory_age = (
-                            self.master_config.grpo.async_grpo.max_trajectory_age_steps
-                        )
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
-
-                        print(
-                            f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                            f"already exist in buffer. Waiting for weight update..."
-                        )
-                        self._last_limit_warning_version = self.current_weight_version
-
-                    # Efficiently wait for generation limits to be cleared (no polling!)
-                    with self._efficiency_timer.time("idle/generation_limit_pause"):
-                        self._generation_limit_cleared.wait()
-
-                    # Double-check we're still running after being woken up
-                    if not self.running:
-                        break
-
-                if not self.running:
+                print(
+                    f"📚 Trajectory collector starting data epoch "
+                    f"{self._data_epoch + 1}"
+                    + (f"/{max_num_epochs}" if max_num_epochs is not None else "")
+                )
+                if not self._run_one_epoch(dataloader):
+                    # Stopped mid-epoch (shutdown), not out of data.
                     break
-
-                self._process_batch(batch)
-            else:
-                # for-loop completed without break → dataloader iterator exhausted
-                dataloader_exhausted = True
+                self._data_epoch += 1
 
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
@@ -353,12 +336,74 @@ class AsyncTrajectoryCollector:
             if dataloader_exhausted:
                 self.data_exhausted = True
                 print(
-                    "❌ Trajectory collection stopped: dataloader exhausted "
-                    "(max_num_epochs reached). No more data available for generation. "
-                    "Increase max_num_epochs or use a larger dataset."
+                    "❌ Trajectory collection stopped: dataloader exhausted after "
+                    f"{self._data_epoch} epoch(s) (grpo.max_num_epochs="
+                    f"{max_num_epochs} reached). No more data available for "
+                    "generation. Increase grpo.max_num_epochs or use a larger "
+                    "dataset."
                 )
             else:
                 print("🛑 Trajectory collection stopped")
+
+    def _run_one_epoch(self, dataloader: StatefulDataLoader) -> bool:
+        """Consume one full pass over ``dataloader``.
+
+        Args:
+            dataloader: The training dataloader to iterate.
+
+        Returns:
+            True if the pass ran to completion, False if it was cut short
+            because collection was stopped.
+        """
+        for batch in dataloader:
+            if not self.running:
+                return False
+
+            # Check if manually paused and wait
+            if not self._manual_pause_cleared.is_set() and self.running:
+                self._manual_pause_cleared.wait()
+
+            # Check if refit is in progress and wait
+            if not self._refit_pause_cleared.is_set() and self.running:
+                print("⏸️ Pausing collection for refit...")
+                with self._efficiency_timer.time("idle/refit_event_wait"):
+                    self._refit_pause_cleared.wait()
+                print("▶️ Refit completed, resuming collection")
+
+            # Check if generation limits require pausing collection
+            if self._should_pause_for_generation_limits() and self.running:
+                self._generation_limit_cleared.clear()
+
+                # Only log warning once per weight version
+                if self._last_limit_warning_version != self.current_weight_version:
+                    max_trajectory_age = (
+                        self.master_config.grpo.async_grpo.max_trajectory_age_steps
+                    )
+                    target_weights = [
+                        self.current_weight_version + i
+                        for i in range(max_trajectory_age)
+                    ]
+
+                    print(
+                        f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
+                        f"already exist in buffer. Waiting for weight update..."
+                    )
+                    self._last_limit_warning_version = self.current_weight_version
+
+                # Efficiently wait for generation limits to be cleared (no polling!)
+                with self._efficiency_timer.time("idle/generation_limit_pause"):
+                    self._generation_limit_cleared.wait()
+
+                # Double-check we're still running after being woken up
+                if not self.running:
+                    return False
+
+            if not self.running:
+                return False
+
+            self._process_batch(batch)
+
+        return True
 
     def _stamp_nemo_gym_task_indices(self, batch: BatchedDataDict[DatumSpec]) -> None:
         """Assign one stable, monotonic task index to every prompt in a batch."""
@@ -664,7 +709,10 @@ class AsyncTrajectoryCollector:
 
     def get_rollouts_state(self) -> dict[str, int]:
         """Get collector-side rollout state for checkpointing."""
-        return {NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index}
+        return {
+            NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index,
+            COLLECTOR_DATA_EPOCH_KEY: self._data_epoch,
+        }
 
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:
