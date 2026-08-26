@@ -372,6 +372,26 @@ class TrtllmAsyncGenerationWorkerImpl:
                 )
             llm_kwargs["ray_worker_nsight_options"] = _nsight
 
+        # Dump the fully-resolved TRT-LLM arguments. Nothing else in this path
+        # records them, so a recipe key that never reached AsyncLLM (a typo, a
+        # merge that silently dropped it, a driver override landing later) is
+        # otherwise invisible -- the run just behaves as if the key were absent.
+        # One line per generation actor; grep TRTLLM_LLM_KWARGS.
+        try:
+            import json as _json
+
+            print(
+                "TRTLLM_LLM_KWARGS "
+                + _json.dumps(
+                    {k: v for k, v in sorted(llm_kwargs.items())},
+                    default=repr,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        except Exception as _e:  # never let diagnostics break engine construction
+            print(f"TRTLLM_LLM_KWARGS_DUMP_FAILED {_e!r}", flush=True)
+
         # Defer __await__ (which fires setup_async) to post_init_async so
         # AsyncLLM setup runs on the Ray actor's asyncio loop.
         self.llm = AsyncLLM(**llm_kwargs)
