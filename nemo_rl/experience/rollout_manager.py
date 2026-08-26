@@ -827,10 +827,18 @@ class AsyncNemoGymRolloutImpl:
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
             rollout_inputs, timer, timer_prefix
         )
-        source_message_log = input_sample["message_log"]
-        attach_static_multimodal_payload(prompt_message_log, source_message_log)
-        for completion in completions:
-            attach_static_multimodal_payload(completion.message_log, source_message_log)
+        # Token-capture receipt rows carry empty message logs by design — the
+        # canonical row (and any media it needs) is rebuilt by the finalizer
+        # from the capture ledger, so there is nothing here to attach media to
+        # and the fewer-user-turns guard would reject every receipt group.
+        receipt_mode = bool(completions) and "ng_receipt" in completions[0].env_extras
+        if not receipt_mode:
+            source_message_log = input_sample["message_log"]
+            attach_static_multimodal_payload(prompt_message_log, source_message_log)
+            for completion in completions:
+                attach_static_multimodal_payload(
+                    completion.message_log, source_message_log
+                )
 
         timer.stop(f"{timer_prefix}/total")
         rollout_metrics.update(timer.get_timing_metrics("sum"))
@@ -1076,7 +1084,10 @@ class AsyncNemoGymRolloutImpl:
                 message_log=result["message_log"],
                 env_extras=env_extras,
                 truncated=False,
-                reward=float(result["full_result"]["reward"]),
+                # Same defensive read the receipt producer uses
+                # (nemo_gym._postprocess_receipt_mode): a gym result with no
+                # reward finalizes as 0.0 rather than a KeyError.
+                reward=float(result["full_result"].get("reward") or 0.0),
             )
 
         # Tensorize token fields.
@@ -1121,15 +1132,21 @@ class AsyncNemoGymRolloutImpl:
                 ((c.env_extras.get("ng_receipt") or {}).get("manifest") or [])
                 for c in completions
             ]
+            # .get with 0: _assemble_receipt ships raw ledger rows unvalidated
+            # when CallRecord validation fails (it only stamps
+            # capture_poisoned), so a malformed row must degrade a metric, not
+            # fail the group as a deterministic data failure.
             turn_count = [len(m) for m in manifests]
             total_tokens = [
-                max((entry["cum_len"] for entry in m), default=0) for m in manifests
+                max((entry.get("cum_len", 0) for entry in m), default=0)
+                for m in manifests
             ]
             assistant_tokens = [
-                sum(entry["delta_len"] for entry in m) for m in manifests
+                sum(entry.get("delta_len", 0) for entry in m) for m in manifests
             ]
             max_gen_tokens_per_turn = [
-                max((entry["delta_len"] for entry in m), default=0) for m in manifests
+                max((entry.get("delta_len", 0) for entry in m), default=0)
+                for m in manifests
             ]
         else:
             turn_count = [
@@ -1603,8 +1620,95 @@ class RolloutManager:
         target_step: Optional[int] = None,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
         lineage_group_id: Optional[str] = None,
+    ) -> Optional["FinalizationRequest"]:
+        """Run capture generation with the same retry budgets as the legacy path.
+
+        ``generate_and_push`` re-dispatches infrastructure failures onto a
+        fresh shard up to ``max_infra_attempts``; without the same loop here, a
+        single gym-side HTTP 500 — typed ``GymTransportError``, INFRA by
+        definition — killed the whole capture run while the legacy arm absorbed
+        hundreds of them (job 6544554 died this way after 3 clean steps).
+
+        Untracked callers reserve a fresh group and rollout ids for each attempt.
+        Recovery-tracked callers retain their durable group id. Exhaustion
+        follows the same drop policy as ``generate_and_push``: under the
+        consecutive-drop budget the prompt is dropped (``None`` — the caller
+        owns the backpressure permit and the step shortfall), beyond it the
+        fleet is declared broken via ``RolloutRedispatchExhausted``. There is
+        no replacement-reserve support on this branch; a dropped prompt always
+        closes its step short. Data failures follow ``max_data_attempts`` then
+        re-raise.
+        """
+        policy = self._retry_policy
+        infra_attempts = 0
+        data_attempts = 0
+        last_infra_error: Optional[Exception] = None
+        while infra_attempts < policy.max_infra_attempts:
+            try:
+                request = await self._generate_for_finalization_attempt(
+                    input_sample,
+                    target_step=target_step,
+                    inflight_registry=inflight_registry,
+                    lineage_group_id=lineage_group_id,
+                )
+            except Exception as error:
+                reason = type(error).__name__
+                if classify_rollout_failure(error) is FailureClass.INFRA:
+                    infra_attempts += 1
+                    last_infra_error = error
+                    if infra_attempts >= policy.max_infra_attempts:
+                        break
+                    self._stats.record_redispatch(reason)
+                    await asyncio.sleep(policy.backoff_for(infra_attempts))
+                    continue
+                data_attempts += 1
+                if data_attempts >= policy.max_data_attempts:
+                    raise
+                print(
+                    f"retrying capture rollout idx={input_sample['idx']} after "
+                    f"deterministic failure ({reason}: {error})",
+                    flush=True,
+                )
+                continue
+            # Same placement as generate_and_push: a successful dispatch proves
+            # the fleet is answering, clearing the consecutive-drop run.
+            self._consecutive_infra_drops = 0
+            return request
+
+        assert last_infra_error is not None
+        reason = type(last_infra_error).__name__
+        self._consecutive_infra_drops += 1
+        if self._consecutive_infra_drops > policy.max_consecutive_dropped_prompts:
+            raise RolloutRedispatchExhausted(
+                f"prompt idx={input_sample['idx']} exhausted its infrastructure "
+                f"retry budget after {infra_attempts} capture attempt(s) "
+                f"(max_infra_attempts_per_prompt={policy.max_infra_attempts}), and "
+                f"this was drop {self._consecutive_infra_drops} with no rollout "
+                f"committed in between, exceeding max_consecutive_dropped_prompts="
+                f"{policy.max_consecutive_dropped_prompts}; the generation fleet is "
+                f"not recovering. Last failure was {reason}: {last_infra_error}"
+            ) from last_infra_error
+        self._stats.record_infra_drop(reason, self._consecutive_infra_drops)
+        print(
+            f"dropping capture prompt idx={input_sample['idx']} after "
+            f"{infra_attempts} infrastructure failure(s) ({reason}: "
+            f"{last_infra_error}) [consecutive drop "
+            f"{self._consecutive_infra_drops}/"
+            f"{policy.max_consecutive_dropped_prompts}]",
+            flush=True,
+        )
+        self._stats.skipped += 1
+        return None
+
+    async def _generate_for_finalization_attempt(
+        self,
+        input_sample: DatumSpec,
+        *,
+        target_step: Optional[int],
+        inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]],
+        lineage_group_id: Optional[str],
     ) -> "FinalizationRequest":
-        """Run capture generation and return a metadata-only actor request.
+        """One capture-generation attempt; the retry loop above owns budgets.
 
         The replay-buffer slot remains reserved and unready. The caller owns
         finalizer submission and must either commit the returned group or stop

@@ -1374,6 +1374,18 @@ class SingleControllerActor:
                             inflight_registry=self._inflight_by_group_id,
                             lineage_group_id=lineage_group_id,
                         )
+                        if request is None:
+                            if self._rollout_recovery_enabled:
+                                assert lineage_group_id is not None
+                                async with self._data_plane_checkpoint_barrier.mutation():
+                                    self._rollout_manager.discard_prompt_group(
+                                        lineage_group_id
+                                    )
+                                    self._credit_shortfall(target_step)
+                            else:
+                                self._credit_shortfall(target_step)
+                            self._buffer_capacity.release()
+                            return
                         self._inflight_rollouts -= 1
                         inflight_count_released = True
                         sem.release()
