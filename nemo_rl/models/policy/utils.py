@@ -446,45 +446,67 @@ def stream_weights_via_ipc_zmq_impl(
             aligned_size = calculate_aligned_size(tensor.nbytes)
 
             # A parameter larger than a single staging buffer cannot be packed
-            # at all. Ship it on its own in a buffer sized to fit rather than
-            # failing the refit. The staging buffers are sized from *free
+            # with ordinary parameters. Ship it on its own rather than failing
+            # the refit. The staging buffers are sized from *free
             # memory* (NRL_REFIT_BUFFER_MEMORY_RATIO, default 0.3, halved again
             # for ping-pong) with no floor at the largest parameter, so a big
             # embedding can exceed one: DeepSeek-V3's model.embed_tokens.weight
-            # is 1.73 GiB against a 1.65 GiB buffer. This mirrors the HTTP
-            # streaming path, which already gives an oversized parameter a
-            # bucket of its own instead of raising.
+            # is 1.73 GiB against a 1.65 GiB buffer.
             if aligned_size > buffer_size_bytes:
                 if param_names:
                     await_recv = send_buffer_group_overlap(
                         current_buffer, param_names, used_bytes, await_recv
                     )
                     count_of_groups += 1
-                    current_buffer = (
-                        buffer_b if current_buffer is buffer_a else buffer_a
-                    )
                     used_bytes, param_names = 0, []
 
-                oversized_buffer = torch.empty(
-                    aligned_size,
-                    device=current_buffer.device,
-                    dtype=torch.uint8,
-                    requires_grad=False,
-                )
+                # The regular staging pair is no longer needed for this
+                # transfer.  Wait for its last consumer before releasing it;
+                # keeping both buffers alive can consume the only headroom
+                # available for a multi-GiB expert parameter.
+                if await_recv:
+                    zmq_socket.recv()
+                    await_recv = False
+                release_staging_buffers()
+
+                # The policy generators already yield contiguous tensors.  A
+                # uint8 view can therefore be exported through CUDA IPC
+                # directly, avoiding a second allocation as large as the
+                # parameter.  Retain the copy fallback for other callers that
+                # may yield a non-contiguous oversized tensor.
+                direct_ipc_buffer = None
+                oversized_buffer = None
+                transfer_buffer = None
                 try:
-                    packed_bytes = pack_tensor(oversized_buffer, tensor, 0)
-                    send_buffer_group_overlap(
-                        oversized_buffer, [name], packed_bytes, await_recv
+                    if tensor.is_contiguous():
+                        direct_ipc_buffer = tensor.reshape(-1).view(torch.uint8)
+                        transfer_buffer = direct_ipc_buffer
+                    else:
+                        oversized_buffer = torch.empty(
+                            aligned_size,
+                            device=tensor.device,
+                            dtype=torch.uint8,
+                            requires_grad=False,
+                        )
+                        pack_tensor(oversized_buffer, tensor, 0)
+                        transfer_buffer = oversized_buffer
+
+                    await_recv = send_buffer_group_overlap(
+                        transfer_buffer, [name], aligned_size, await_recv=False
                     )
                     count_of_groups += 1
-                    # Unlike the ping-pong pair, this buffer is not kept alive
-                    # across the next send, so its ACK must be consumed here
-                    # before it is freed.
+                    # The exported tensor or fallback buffer is not kept alive
+                    # across the next send, so consume its ACK before releasing
+                    # the last reference to its CUDA storage.
                     zmq_socket.recv()
                     await_recv = False
                 finally:
-                    del oversized_buffer
+                    del transfer_buffer, direct_ipc_buffer, oversized_buffer
                     torch.cuda.empty_cache()
+                # Drop the caller-side reference before requesting the next
+                # generator item; otherwise the next DTensor gather can overlap
+                # with this multi-GiB tensor even though its IPC consumer ACKed.
+                del tensor
                 continue
 
             # Check if we need to send current buffer and switch to the other one

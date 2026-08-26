@@ -1407,7 +1407,9 @@ class VllmAsyncGenerationWorkerImpl(
 
         return cast(list[str], list_of_worker_results)
 
-    async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
+    async def prepare_refit_info_async(
+        self, state_dict_info: dict[str, Any] | list[dict[str, Any]]
+    ) -> None:
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 

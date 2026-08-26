@@ -531,10 +531,13 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             return
         super()._synchronize_before_ipc_data_ack()
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self, state_dict_info: dict[str, Any] | list[dict[str, Any]]
+    ) -> None:
         super().prepare_refit_info(state_dict_info)
         if not self._is_real_quant_model():
             return
+        state_dict_info = self.state_dict_info
         self._get_modelopt_reload_roots()
         quant_config = (
             self.model_runner.vllm_config.model_config.hf_config.quantization_config

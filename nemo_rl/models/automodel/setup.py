@@ -17,6 +17,7 @@
 import importlib
 import inspect
 import os
+import re
 from functools import partial
 from typing import Any, Optional, Union
 
@@ -37,6 +38,7 @@ from nemo_automodel.components.distributed.config import (
 )
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from transformers import (
     AutoConfig,
@@ -60,6 +62,67 @@ STRING_TO_DTYPE = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
 }
+
+
+def _build_optimizer_params(
+    model: torch.nn.Module,
+    optimizer_kwargs: dict[str, Any],
+    param_group_overrides: Optional[list[dict[str, Any]]],
+) -> list[Any]:
+    """Build trainable optimizer parameters with optional LR/WD multipliers.
+
+    PyTorch schedulers preserve the relative learning rates stored on optimizer
+    parameter groups. Applying the multipliers here therefore gives selected
+    parameters a stable schedule-relative LR/WD without requiring a custom
+    scheduler. Parameter names are canonicalized so activation-checkpoint
+    wrappers do not change matching behavior.
+    """
+    named_params = [
+        (canonical_parameter_fqn(name), param)
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    ]
+    if not named_params:
+        raise ValueError("optimizer received no trainable parameters")
+    if not param_group_overrides:
+        return [param for _, param in named_params]
+
+    compiled_overrides = [
+        (re.compile(override["pattern"]), override)
+        for override in param_group_overrides
+    ]
+    default_params: list[torch.nn.Parameter] = []
+    matched_params: list[list[torch.nn.Parameter]] = [[] for _ in compiled_overrides]
+    for name, param in named_params:
+        for index, (pattern, _) in enumerate(compiled_overrides):
+            if pattern.search(name):
+                matched_params[index].append(param)
+                break
+        else:
+            default_params.append(param)
+
+    groups: list[dict[str, Any]] = []
+    if default_params:
+        groups.append({"params": default_params})
+    for (_, override), params in zip(compiled_overrides, matched_params, strict=True):
+        if not params:
+            raise ValueError(
+                "optimizer param_group_overrides pattern matched no trainable "
+                f"parameters: {override['pattern']!r}"
+            )
+        group: dict[str, Any] = {
+            "params": params,
+            "lr_mult": override["lr_mult"],
+            "wd_mult": override["wd_mult"],
+        }
+        if override["lr_mult"] != 1.0:
+            group["lr"] = optimizer_kwargs["lr"] * override["lr_mult"]
+        if override["wd_mult"] != 1.0:
+            group["weight_decay"] = (
+                optimizer_kwargs["weight_decay"] * override["wd_mult"]
+            )
+        groups.append(group)
+    return groups
 
 
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
@@ -764,11 +827,15 @@ def setup_model_and_optimizer(
                 optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
         # Only pass trainable params to the optimizer. TE FusedAdam's step()
         # allocates per-param state (exp_avg/exp_avg_sq/master_param) before the
-        # p.grad-is-None check, so passing frozen params (e.g. the visual
-        # encoder in text-only training) causes DCP to save unused state that
-        # later fails to reshard on resume.
+        # p.grad-is-None check, so passing frozen params (e.g. a QSA indexer)
+        # causes DCP to save unused state that later fails to reshard on resume.
+        optimizer_params = _build_optimizer_params(
+            model,
+            optimizer_kwargs,
+            config["optimizer"].get("param_group_overrides"),
+        )
         optimizer = optimizer_cls(
-            (p for p in model.parameters() if p.requires_grad),
+            optimizer_params,
             **optimizer_kwargs,
         )
 
