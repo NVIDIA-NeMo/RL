@@ -490,6 +490,8 @@ def vlm_hf_data_processor(
         pass  # Daily-Omni data is already formatted by DailyOmniDataset.format_data
     elif datum_dict["task_name"] in ("intent-train", "intent-bench"):
         pass  # IntentDataset.format_data already produces the message structure
+    elif "messages" in datum_dict:
+        pass  # Generic ResponseDataset data can already use the message structure
     else:
         raise ValueError(f"No data processor for task {datum_dict['task_name']}")
 

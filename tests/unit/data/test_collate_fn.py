@@ -16,7 +16,11 @@ from unittest.mock import MagicMock
 
 import torch
 
-from nemo_rl.data.collate_fn import eval_collate_fn, preference_collate_fn, rl_collate_fn
+from nemo_rl.data.collate_fn import (
+    eval_collate_fn,
+    preference_collate_fn,
+    rl_collate_fn,
+)
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 

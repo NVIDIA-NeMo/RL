@@ -133,9 +133,7 @@ def test_encode_images_deduplicates_sources_and_uses_a_bounded_thread_pool(
         return original_executor(*args, **kwargs)
 
     monkeypatch.setattr(nemo_gym_multimodal, "resolve_to_image", tracking_resolve)
-    monkeypatch.setattr(
-        nemo_gym_multimodal, "ThreadPoolExecutor", tracking_executor
-    )
+    monkeypatch.setattr(nemo_gym_multimodal, "ThreadPoolExecutor", tracking_executor)
 
     normalize_media_in_examples(examples)
 
@@ -208,5 +206,7 @@ def test_normalize_media_is_a_noop_for_text_only_examples():
     assert examples[0]["responses_create_params"]["input"][0]["content"] == before
 
     # Missing/oddly-shaped payloads must not raise.
-    assert normalize_media_in_examples([{}, {"responses_create_params": {}}]) is not None
+    assert (
+        normalize_media_in_examples([{}, {"responses_create_params": {}}]) is not None
+    )
     assert normalize_media_in_examples([{"responses_create_params": {"input": "nope"}}])
