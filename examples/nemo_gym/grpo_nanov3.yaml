@@ -245,6 +245,7 @@ policy:
       kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload". To select "recompute", set grpo.async_grpo.recompute_kv_cache_after_weight_updates=true.
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
+      logprobs_mode: processed_logprobs
       refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nccl".
       expose_http_server: true
       enable_prefix_caching: true

@@ -291,7 +291,7 @@ class MegatronGenerationMixin:
             ),
             logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
-            logprobs_mode="processed_logprobs",
+            logprobs_mode=mcore_generation_config["logprobs_mode"],
             max_requests=max_requests,
         )
 
@@ -966,8 +966,8 @@ class MegatronGenerationRefitMixin:
         """Initialize NVShmem collectively before any weight transfer.
 
         Must be called on ALL participating ranks (training + inference) simultaneously,
-        after `prepare_for_generation()` has completed and the CG has been recorded.
-        The `NVSHMEMCopyService` lazy init can corrupt CUDA graph state.
+        outside CUDA graph capture. Lazy initialization during graph recording or replay
+        can corrupt CUDA graph state.
         """
         if not hasattr(self, "refit_copy_service"):
             return

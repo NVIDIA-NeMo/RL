@@ -3,16 +3,21 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 # disable NVLS to avoid OOM issue
 export NCCL_NVLS_ENABLE=0
-export RAY_CGRAPH_get_timeout=2400
+
+# Use the DeepSeek-V3 checkpoint converted to BF16.
+if [[ -z "${NRL_DEEPSEEK_V3_BF16_CKPT:-}" ]]; then
+    echo "Need to set NRL_DEEPSEEK_V3_BF16_CKPT to the path of DeepSeek-V3 checkpoint converted to BF16. See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/deepseek.md for more details."
+    exit 1
+fi
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=32
+NUM_NODES=64
 GPUS_PER_NODE=4
-SEGMENT_SIZE=16
+SEGMENT_SIZE=16    # nodes per NVLink-domain segment; tools/launch passes it as sbatch --segment (keeps MoE EP intra-rack, #2937). Matches cluster.segment_size in the yaml.
 STEPS_PER_RUN=10
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=100
+NUM_MINUTES=240
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -22,6 +27,8 @@ cd $PROJECT_ROOT
 uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
+    policy.model_name="$NRL_DEEPSEEK_V3_BF16_CKPT" \
+    policy.tokenizer.name="$NRL_DEEPSEEK_V3_BF16_CKPT" \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
@@ -30,7 +37,6 @@ uv run examples/run_grpo.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
-    +policy.generation.vllm_kwargs.distributed_timeout_seconds=2400 \
     $@ \
     2>&1 | tee $RUN_LOG
 
