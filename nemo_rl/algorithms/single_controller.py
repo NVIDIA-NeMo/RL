@@ -57,6 +57,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_FILENAME,
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     DataPlaneCheckpointBarrier,
+    DataPlaneCheckpointMetadata,
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
@@ -210,9 +211,9 @@ class SingleControllerActor:
         # already defaulted any fields missing from older checkpoints.
         self._save_state: GRPOSaveState = actor_args.save_state
         self._last_checkpoint_path: Optional[str] = actor_args.last_checkpoint_path
-        self._data_plane_checkpoint_metadata: Optional[dict[str, Any]] = (
-            actor_args.data_plane_checkpoint_metadata
-        )
+        self._data_plane_checkpoint_metadata: Optional[
+            DataPlaneCheckpointMetadata
+        ] = actor_args.data_plane_checkpoint_metadata
         self._consumed_samples: int = actor_args.save_state.consumed_samples
         self._total_valid_tokens: int = actor_args.save_state.total_valid_tokens
 
@@ -237,11 +238,11 @@ class SingleControllerActor:
         if (
             self._master_config.checkpointing["enabled"]
             and self._sampler.supports_buffer_checkpoint
-            and not self._master_config.data_plane.get("checkpointing_enabled")
+            and not self._master_config.checkpointing.get("save_data_plane")
         ):
             raise ValueError(
                 "SingleController checkpointing with a replay-checkpoint-capable "
-                "sampler requires data_plane.checkpointing_enabled=true so "
+                "sampler requires checkpointing.save_data_plane=true so "
                 "completed, unconsumed rollouts are recoverable."
             )
         required_capacity = self._sampler.required_buffer_capacity(num_prompts_per_step)
@@ -260,10 +261,9 @@ class SingleControllerActor:
         # A future staging/finalizer path must join the same barrier before
         # native restore can be authoritative.
         self._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
-        if self._buffer is not None:
-            self._buffer.set_data_plane_checkpoint_barrier(
-                self._data_plane_checkpoint_barrier
-            )
+        self._buffer.set_data_plane_checkpoint_barrier(
+            self._data_plane_checkpoint_barrier
+        )
 
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
@@ -418,7 +418,7 @@ class SingleControllerActor:
         """Restore the local replay index for the native TQ checkpoint.
 
         Recovery is authoritative only for samplers that explicitly support
-        buffered-group restoration. The native snapshot and metadata sidecar
+        buffered-group restoration. The native snapshot and replay metadata file
         must both be present and agree on their manifest and group count.
         """
         if self._last_checkpoint_path is None:
@@ -455,7 +455,7 @@ class SingleControllerActor:
             )
             return
         print(f"📦 Restoring replay buffer metadata: {metadata_path}")
-        # weights_only=False: the metadata sidecar contains pickled KVBatchMeta
+        # weights_only=False: the replay metadata file contains pickled KVBatchMeta
         # objects but no rollout tensor payloads. It is a trusted same-job artifact.
         buffer_state = await asyncio.to_thread(
             torch.load, metadata_path, weights_only=False
@@ -526,8 +526,8 @@ class SingleControllerActor:
         unexpected_sample_ids = sorted(actual_sample_ids - expected_sample_ids)
         if missing_sample_ids or unexpected_sample_ids:
             raise RuntimeError(
-                "Native TQ checkpoint inventory does not match the replay "
-                "metadata sidecar: "
+                "Native TQ checkpoint inventory does not match "
+                f"{REPLAY_BUFFER_METADATA_FILENAME}: "
                 f"missing={missing_sample_ids[:10]!r} "
                 f"(total={len(missing_sample_ids)}), "
                 f"unexpected={unexpected_sample_ids[:10]!r} "
@@ -609,7 +609,7 @@ class SingleControllerActor:
         """Save a required TQ snapshot inside an SC checkpoint bundle.
 
         A sampler with replay-buffer recovery writes an authoritative native
-        TQ snapshot bound to its metadata-only sidecar by a digest. Other
+        TQ snapshot bound to its metadata-only replay index by a digest. Other
         samplers retain shadow-mode snapshots until their recovery contract is
         defined. Failures propagate so a finalized bundle never silently omits
         the advertised data-plane component.
@@ -618,27 +618,30 @@ class SingleControllerActor:
             checkpoint_path,
             DATA_PLANE_CHECKPOINT_DIR,
         )
-        metadata = {
+        save_state = self._save_state
+        checkpoint_trainer_version = save_state.trainer_version
+        if checkpoint_trainer_version is None:
+            raise RuntimeError(
+                "Cannot save a data-plane checkpoint before trainer_version "
+                "is captured in the controller save state"
+            )
+        metadata: DataPlaneCheckpointMetadata = {
             "data_plane_checkpoint_schema_version": (
                 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
             ),
-            "single_controller_train_steps": self._train_steps,
-            "single_controller_trainer_version": self._trainer_version,
-            "single_controller_epoch": self._current_epoch,
+            "single_controller_train_steps": save_state.current_step,
+            "single_controller_trainer_version": checkpoint_trainer_version,
+            "single_controller_epoch": save_state.current_epoch,
             "partition_id": self._partition_id,
             "sampler_name": self._async_cfg.sampler.name,
             "mode": "authoritative" if replay_metadata is not None else "shadow",
         }
         if replay_metadata is not None:
-            metadata.update(
-                {
-                    "replay_metadata_schema_version": (
-                        REPLAY_BUFFER_METADATA_SCHEMA_VERSION
-                    ),
-                    "replay_manifest_digest": replay_metadata["manifest_digest"],
-                    "replay_group_count": len(replay_metadata["groups"]),
-                }
+            metadata["replay_metadata_schema_version"] = (
+                REPLAY_BUFFER_METADATA_SCHEMA_VERSION
             )
+            metadata["replay_manifest_digest"] = replay_metadata["manifest_digest"]
+            metadata["replay_group_count"] = len(replay_metadata["groups"])
         started = time.monotonic()
         print(f"data-plane checkpoint save started: {checkpoint_dir}", flush=True)
         try:
@@ -1968,10 +1971,10 @@ class SingleControllerActor:
                 os.path.join(checkpoint_path, "replacement_reserve.pt"),
             )
         replay_metadata: Optional[TQReplayMetadataState] = None
-        if self._master_config.data_plane.get("checkpointing_enabled"):
+        if self._master_config.checkpointing.get("save_data_plane"):
             # Commits and destructive clears take the same barrier. Generation
             # may continue while a snapshot is written, but completed groups
-            # wait at commit, so TQ and the metadata sidecar describe exactly
+            # wait at commit, so TQ and the replay metadata file describe exactly
             # the same set of training-ready groups.
             async with self._data_plane_checkpoint_barrier.checkpoint():
                 if self._sampler.supports_buffer_checkpoint:

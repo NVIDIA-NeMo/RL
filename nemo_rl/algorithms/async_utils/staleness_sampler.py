@@ -661,25 +661,28 @@ def _custom_sampler_class(cfg: CustomSamplerConfig) -> type:
     return sampler_cls
 
 
+def _sampler_class_for_config(cfg: SamplerConfig) -> type:
+    """Return the sampler class selected by a built-in or custom config."""
+    if isinstance(cfg, CustomSamplerConfig):
+        return _custom_sampler_class(cfg)
+    try:
+        return {
+            WindowedSamplerConfig: WindowedSampler,
+            ReadyFirstSamplerConfig: ReadyFirstSampler,
+            WeightFifoSamplerConfig: WeightFifoSampler,
+            InOrderSamplerConfig: InOrderSampler,
+        }[type(cfg)]
+    except KeyError:
+        raise ValueError(f"unknown sampler config {type(cfg).__name__}") from None
+
+
 def sampler_supports_buffer_checkpoint(cfg: SamplerConfig) -> bool:
     """Return a sampler class's static replay-checkpoint capability.
 
     Custom classes are imported but not instantiated, allowing setup to fail
     before allocating cluster resources or triggering constructor side effects.
     """
-    sampler_cls: type
-    if isinstance(cfg, WindowedSamplerConfig):
-        sampler_cls = WindowedSampler
-    elif isinstance(cfg, ReadyFirstSamplerConfig):
-        sampler_cls = ReadyFirstSampler
-    elif isinstance(cfg, WeightFifoSamplerConfig):
-        sampler_cls = WeightFifoSampler
-    elif isinstance(cfg, InOrderSamplerConfig):
-        sampler_cls = InOrderSampler
-    elif isinstance(cfg, CustomSamplerConfig):
-        sampler_cls = _custom_sampler_class(cfg)
-    else:
-        raise ValueError(f"unknown sampler config {type(cfg).__name__}")
+    sampler_cls = _sampler_class_for_config(cfg)
 
     if isinstance(cfg, CustomSamplerConfig):
         # A custom subclass must opt in explicitly instead of inheriting a
@@ -705,31 +708,31 @@ def create_sampler(
         buffer: Shared TQReplayBuffer holding the candidate slots.
         cfg: Discriminated sampler config selecting the policy.
     """
+    sampler_cls = _sampler_class_for_config(cfg)
     sampler: PromptGroupSampler
     if isinstance(cfg, WindowedSamplerConfig):
-        sampler = WindowedSampler(
+        sampler = sampler_cls(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
             sample_freshest_first=cfg.sample_freshest_first,
         )
     elif isinstance(cfg, ReadyFirstSamplerConfig):
-        sampler = ReadyFirstSampler(
+        sampler = sampler_cls(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
         )
     elif isinstance(cfg, WeightFifoSamplerConfig):
-        sampler = WeightFifoSampler(
+        sampler = sampler_cls(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
         )
     elif isinstance(cfg, InOrderSamplerConfig):
-        sampler = InOrderSampler(
+        sampler = sampler_cls(
             buffer,
             max_lookahead_versions=cfg.max_lookahead_versions,
             warmup_lookahead_versions=cfg.warmup_lookahead_versions,
         )
     elif isinstance(cfg, CustomSamplerConfig):
-        sampler_cls = _custom_sampler_class(cfg)
         sampler_supports_buffer_checkpoint(cfg)
         sampler = sampler_cls(buffer, **(cfg.model_extra or {}))
         if not isinstance(sampler, PromptGroupSampler):

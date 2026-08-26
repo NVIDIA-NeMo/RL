@@ -152,10 +152,10 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _make_record() -> PromptGroupRecord:
+def _make_record(*, prompt_idx: int = 0) -> PromptGroupRecord:
     """Opaque PromptGroupRecord — converter is stubbed, so contents are unused."""
     return PromptGroupRecord(
-        prompt_idx=0,
+        prompt_idx=prompt_idx,
         prompt=[],
         extra_env_info=None,
         metadata={},
@@ -363,7 +363,7 @@ class TestTQReplayBufferReserveCommit:
         meta = _run(
             buf.commit(
                 group_id,
-                _make_record(),
+                _make_record(prompt_idx=418),
                 start_weight_version=3,
                 end_weight_version=4,
             )
@@ -380,8 +380,8 @@ class TestTQReplayBufferReserveCommit:
         assert buf.end_weight_list == [4]
         assert buf.ready_list == [True]
         assert buf.meta_list[0].sample_ids == meta.sample_ids
-        # TQ tag uses start_weight_version (dispatch time).
-        assert meta.tags == [{"weight_version": 3}] * _N_GENS
+        # TQ tags preserve both dispatch-time weight and dataset identity.
+        assert meta.tags == [{"weight_version": 3, "prompt_idx": 418}] * _N_GENS
         assert len(dp.put_calls) == 1
         assert len(trace_calls) == 1
         assert trace_calls[0]["keys"] == meta.sample_ids
@@ -472,7 +472,7 @@ class TestTQReplayBufferReserveCommit:
 
 
 class TestTQReplayBufferRemove:
-    def test_dp_clear_fails_without_bound_checkpoint_barrier(self):
+    def test_remove_with_dp_clear_fails_without_bound_checkpoint_barrier(self):
         dp = FakeDataPlaneClient()
         buf = TQReplayBuffer(
             dp,
@@ -481,7 +481,7 @@ class TestTQReplayBufferRemove:
         )
 
         with pytest.raises(RuntimeError, match="must be bound"):
-            _run(buf._clear_samples(sample_ids=["sample-1"]))
+            _run(buf.remove([0], remove_in_dp=True))
 
         assert dp.clear_calls == []
 
@@ -512,8 +512,15 @@ class TestTQReplayBufferRemove:
         async def exercise() -> tuple[FakeDataPlaneClient, int]:
             dp = FakeDataPlaneClient()
             buf = _make_buffer(dp)
+            group_id = buf.reserve(weight_version=0)
+            await buf.commit(
+                group_id,
+                _make_record(),
+                start_weight_version=0,
+                end_weight_version=0,
+            )
             event_loop_thread_id = threading.get_ident()
-            await buf._clear_samples(sample_ids=["sample-1"])
+            await buf.remove([0], remove_in_dp=True)
             return dp, event_loop_thread_id
 
         dp, event_loop_thread_id = asyncio.run(exercise())
@@ -876,6 +883,26 @@ class TestTQReplayBufferStateDict:
             list(third.sample_ids),
         ]
 
+    def test_state_dict_skips_older_long_tail_unready_group(self):
+        # Model a long-running rollout reserved on an older weight while newer
+        # rollouts finish. Completed-rollout recovery must checkpoint only the
+        # ready group; recovering the unfinished group belongs to partial-
+        # rollout checkpointing.
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        unfinished_group_id = buf.reserve(weight_version=1)
+        completed = _add_group(buf, weight=7)
+
+        state = buf.metadata_state_dict(saved_capacity=8)
+
+        assert [g["start_weight"] for g in state["groups"]] == [7]
+        assert [g["group_id"] for g in state["groups"]] == [
+            _group_id_of(completed)
+        ]
+        assert unfinished_group_id not in {
+            group["group_id"] for group in state["groups"]
+        }
+
 
 class TestTQReplayBufferLoadPreflight:
     """Malformed envelopes raise ValueError before any DataPlane write."""
@@ -935,9 +962,22 @@ class TestTQReplayBufferLoadPreflight:
         state = _make_metadata_envelope(
             [_make_group_entry(f"g{w}", weight=w) for w in (1, 2, 3)]
         )
-        self._assert_rejected(
-            state,
-            match="more replay groups than the current buffer capacity",
-            max_groups=2,
-            expected_manifest_digest=state["manifest_digest"],
-        )
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+
+        with pytest.raises(ValueError) as exc_info:
+            _load(
+                buf,
+                state,
+                max_groups=2,
+                expected_manifest_digest=state["manifest_digest"],
+            )
+
+        message = str(exc_info.value)
+        assert "checkpoint=3, current=2" in message
+        assert "async_rl.max_buffered_rollouts >= 3" in message
+        assert "Deleting replay_buffer_metadata.pt" in message
+        assert "skips loading the matching TQ checkpoint" in message
+        assert "dataloader has already moved past them" in message
+        assert dp.put_calls == []
+        assert buf.size() == 0

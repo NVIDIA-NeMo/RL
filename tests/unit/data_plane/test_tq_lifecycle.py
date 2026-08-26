@@ -22,7 +22,9 @@ the data-plane extra still passes.
 
 from __future__ import annotations
 
+import inspect
 import json
+from typing import Callable
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -33,9 +35,71 @@ from tensordict import TensorDict
 transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
-from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def _register_partition(client: DataPlaneClient) -> None:
+    client.register_partition(
+        partition_id="p",
+        fields=["x"],
+        num_samples=1,
+        consumer_tasks=["train"],
+    )
+
+
+def _claim_meta(client: DataPlaneClient) -> None:
+    client.claim_meta(
+        partition_id="p",
+        task_name="train",
+        required_fields=["x"],
+        batch_size=1,
+    )
+
+
+def _get_data(client: DataPlaneClient) -> None:
+    client.get_data(
+        KVBatchMeta(
+            partition_id="p",
+            task_name="train",
+            sample_ids=["sample-0"],
+            fields=["x"],
+        )
+    )
+
+
+def _check_consumption_status(client: DataPlaneClient) -> None:
+    client.check_consumption_status("p", ["train"])
+
+
+def _put_samples(client: DataPlaneClient) -> None:
+    client.put_samples(["sample-0"], "p")
+
+
+def _get_samples(client: DataPlaneClient) -> None:
+    client.get_samples(["sample-0"], "p", ["x"])
+
+
+def _list_sample_ids(client: DataPlaneClient) -> None:
+    client.list_sample_ids("p")
+
+
+def _clear_samples(client: DataPlaneClient) -> None:
+    client.clear_samples(["sample-0"], "p")
+
+
+_DATA_OPERATION_INVOKERS: dict[str, Callable[[DataPlaneClient], None]] = {
+    "register_partition": _register_partition,
+    "claim_meta": _claim_meta,
+    "get_data": _get_data,
+    "check_consumption_status": _check_consumption_status,
+    "put_samples": _put_samples,
+    "get_samples": _get_samples,
+    "list_sample_ids": _list_sample_ids,
+    "clear_samples": _clear_samples,
+}
+_LIFECYCLE_METHODS = {"save_checkpoint", "load_checkpoint", "close"}
 
 
 def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
@@ -107,6 +171,57 @@ def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
     ]
 
 
+def test_data_operation_guard_covers_the_full_interface() -> None:
+    public_abstract_methods = {
+        name
+        for name, member in inspect.getmembers(DataPlaneClient, inspect.isfunction)
+        if getattr(member, "__isabstractmethod__", False)
+    }
+    assert set(_DATA_OPERATION_INVOKERS) == public_abstract_methods - _LIFECYCLE_METHODS
+
+
+@pytest.mark.parametrize("operation_name", _DATA_OPERATION_INVOKERS)
+def test_each_public_data_operation_marks_the_client_dirty(
+    monkeypatch,
+    operation_name: str,
+) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    tq_meta = MagicMock(size=1, global_indexes=[0], custom_meta=[{}])
+    tq_client = MagicMock()
+    tq_client.get_meta.return_value = tq_meta
+    tq_client.kv_retrieve_keys.return_value = ["sample-0"]
+    tq_client.check_consumption_status.return_value = True
+    monkeypatch.setattr(tq_adapter.tq, "get_client", MagicMock(return_value=tq_client))
+    monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", MagicMock())
+    monkeypatch.setattr(
+        tq_adapter.tq,
+        "kv_batch_get",
+        MagicMock(
+            return_value=TensorDict(
+                {"x": torch.tensor([1])},
+                batch_size=[1],
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        tq_adapter.tq,
+        "kv_list",
+        MagicMock(return_value={"p": {"sample-0": {}}}),
+    )
+    monkeypatch.setattr(tq_adapter.tq, "kv_clear", MagicMock())
+
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._data_operations_started = False
+    client._warmed_fields = {}
+    client._poll_interval_s = 0
+    client._promote_1d = False
+
+    _DATA_OPERATION_INVOKERS[operation_name](client)
+
+    assert client._data_operations_started
+
+
 def test_checkpoint_lifecycle_forwards_to_tq(monkeypatch, tmp_path) -> None:
     from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
 
@@ -133,6 +248,7 @@ def test_checkpoint_lifecycle_forwards_to_tq(monkeypatch, tmp_path) -> None:
 
     client = object.__new__(tq_adapter.TQDataPlaneClient)
     client._backend = "simple"
+    client._supports_checkpointing = True
     client._data_operations_started = False
     checkpoint_dir = tmp_path / "step-7"
     checkpoint_dir.mkdir()
@@ -180,6 +296,7 @@ def test_checkpoint_load_rejects_client_after_data_operation(
 
     client = object.__new__(tq_adapter.TQDataPlaneClient)
     client._backend = "simple"
+    client._supports_checkpointing = True
     client._promote_1d = False
     client._data_operations_started = False
     client.put_samples(
@@ -213,6 +330,7 @@ def test_failed_checkpoint_load_leaves_client_in_dirty_state(
     )
     client = object.__new__(tq_adapter.TQDataPlaneClient)
     client._backend = "simple"
+    client._supports_checkpointing = True
     client._data_operations_started = False
 
     with pytest.raises(RuntimeError, match="injected partial restore"):
@@ -241,6 +359,7 @@ def test_mooncake_checkpoint_lifecycle_fails_loudly(
 
     client = object.__new__(tq_adapter.TQDataPlaneClient)
     client._backend = "mooncake_cpu"
+    client._supports_checkpointing = False
     client._data_operations_started = False
     checkpoint_dir = tmp_path / "step-7"
 

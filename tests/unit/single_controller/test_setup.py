@@ -28,6 +28,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     LEGACY_REPLAY_BUFFER_FILENAME,
     REPLAY_BUFFER_METADATA_FILENAME,
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+    DataPlaneCheckpointMetadata,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     CustomSamplerConfig,
@@ -61,6 +62,15 @@ class _CheckpointingCustomSampler(WindowedSampler):
         super().__init__(buffer, max_staleness_versions=1)
 
 
+class _NonCheckpointingCustomSampler(WindowedSampler):
+    """Custom sampler that explicitly opts out of replay recovery."""
+
+    supports_buffer_checkpoint = False
+
+    def __init__(self, buffer: Any) -> None:
+        super().__init__(buffer, max_staleness_versions=1)
+
+
 def _make_master_config(
     *,
     dp_enabled: bool = True,
@@ -82,7 +92,11 @@ def _make_master_config(
     only the dict-shaped fields setup reads.
     """
     return MasterConfig.model_construct(
-        data_plane={"enabled": dp_enabled, "impl": "transfer_queue"},
+        data_plane={
+            "enabled": dp_enabled,
+            "impl": "transfer_queue",
+            "backend": "simple",
+        },
         data={
             "use_multiple_dataloader": use_multiple_dataloader,
             "shuffle": False,
@@ -134,7 +148,7 @@ def _make_master_config(
 
 def _native_tq_metadata(
     *, step: int = 3, trainer_version: Optional[int] = None, epoch: int = 1
-) -> dict[str, Any]:
+) -> DataPlaneCheckpointMetadata:
     return {
         "data_plane_checkpoint_schema_version": (DATA_PLANE_CHECKPOINT_SCHEMA_VERSION),
         "single_controller_train_steps": step,
@@ -287,31 +301,39 @@ class TestSetup:
 
     def test_rejects_mooncake_data_plane_checkpointing(self):
         mc = _make_master_config()
-        mc.data_plane.update(
-            {
-                "backend": "mooncake_cpu",
-                "checkpointing_enabled": True,
-            }
-        )
-        with pytest.raises(NotImplementedError, match="backend='simple'"):
+        mc.data_plane["backend"] = "mooncake_cpu"
+        mc.checkpointing["save_data_plane"] = True
+        with pytest.raises(NotImplementedError, match="backend='mooncake_cpu'"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_rejects_windowed_checkpointing_without_native_tq(self):
         mc = _make_master_config()
         mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = False
         mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
-        mc.data_plane.update(
-            {
-                "backend": "simple",
-                "checkpointing_enabled": False,
-            }
-        )
+        mc.data_plane["backend"] = "simple"
 
         with pytest.raises(
             ValueError,
             match=(
                 "replay-checkpoint-capable sampler requires "
-                "data_plane.checkpointing_enabled=true"
+                "checkpointing.save_data_plane=true"
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_checkpointing_error_explains_mooncake_incompatibility(self):
+        mc = _make_master_config()
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = False
+        mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
+        mc.data_plane["backend"] = "mooncake_cpu"
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "backend='mooncake_cpu'.*backend='simple'.*"
+                "checkpointing.enabled=false"
             ),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -319,22 +341,34 @@ class TestSetup:
     def test_rejects_checkpointing_custom_sampler_without_native_tq(self):
         mc = _make_master_config()
         mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = False
         mc.async_rl.sampler = CustomSamplerConfig(
             target=f"{__name__}:_CheckpointingCustomSampler"
         )
-        mc.data_plane.update(
-            {
-                "backend": "simple",
-                "checkpointing_enabled": False,
-            }
-        )
+        mc.data_plane["backend"] = "simple"
 
         with pytest.raises(
             ValueError,
             match=(
                 "replay-checkpoint-capable sampler requires "
-                "data_plane.checkpointing_enabled=true"
+                "checkpointing.save_data_plane=true"
             ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_warns_when_custom_sampler_cannot_recover_buffered_rollouts(
+        self, patched_factories
+    ):
+        mc = _make_master_config()
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = False
+        mc.async_rl.sampler = CustomSamplerConfig(
+            target=f"{__name__}:_NonCheckpointingCustomSampler"
+        )
+        mc.data_plane["backend"] = "simple"
+
+        with pytest.warns(
+            UserWarning, match="cannot recover completed buffered rollouts"
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -843,7 +877,7 @@ class TestNativeTQRecoverySetup:
         assert events == ["load", "build"]
         assert actor_args.data_plane_checkpoint_metadata == _native_tq_metadata()
 
-    def test_loads_authoritative_tq_checkpoint_when_metadata_sidecar_exists(
+    def test_loads_authoritative_tq_checkpoint_when_metadata_file_exists(
         self, tmp_path
     ):
         checkpoint_path = tmp_path / "step_3"
@@ -902,7 +936,9 @@ class TestNativeTQRecoverySetup:
 
         policy.load_data_plane_checkpoint.assert_not_called()
 
-    def test_checkpoint_without_replay_artifacts_does_not_load_tq(self, tmp_path):
+    def test_checkpoint_without_replay_artifacts_does_not_load_tq(
+        self, tmp_path, capsys
+    ):
         checkpoint_path = tmp_path / "step_3"
         checkpoint_path.mkdir()
         policy = MagicMock()
@@ -917,8 +953,13 @@ class TestNativeTQRecoverySetup:
 
         assert restored is None
         policy.load_data_plane_checkpoint.assert_not_called()
+        output = capsys.readouterr().out
+        assert REPLAY_BUFFER_METADATA_FILENAME in output
+        assert "matching TQ checkpoint will not be loaded" in output
+        assert "dataloader cursor is still restored" in output
+        assert "buffered at checkpoint time will be discarded" in output
 
-    def test_metadata_sidecar_requires_matching_tq_directory(self, tmp_path):
+    def test_metadata_file_requires_matching_tq_directory(self, tmp_path):
         checkpoint_path = tmp_path / "step_3"
         checkpoint_path.mkdir()
         (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()

@@ -32,11 +32,14 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointMetadata,
+)
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
     DataPlaneConfig,
@@ -51,6 +54,24 @@ FIELDS = ["token_ids", "token_mask", "generation_logprobs"]
 DATA_PLANE_DIR = "data_plane"
 
 
+def _checkpoint_metadata(
+    expected_consumed_ids: list[str],
+    *,
+    schema_version: int = DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
+) -> dict[str, Any]:
+    """Build the typed SC envelope plus smoke-test-only cursor metadata."""
+    envelope: DataPlaneCheckpointMetadata = {
+        "data_plane_checkpoint_schema_version": schema_version,
+        "single_controller_train_steps": 0,
+        "single_controller_trainer_version": 0,
+        "single_controller_epoch": 0,
+        "partition_id": PARTITION_ID,
+        "sampler_name": "checkpoint_smoke",
+        "mode": "shadow",
+    }
+    return {**envelope, "expected_consumed_ids": expected_consumed_ids}
+
+
 def _data_plane_config(num_storage_units: int) -> DataPlaneConfig:
     return cast(
         DataPlaneConfig,
@@ -58,12 +79,11 @@ def _data_plane_config(num_storage_units: int) -> DataPlaneConfig:
             "enabled": True,
             "impl": "transfer_queue",
             "backend": "simple",
-            "checkpointing_enabled": True,
-            "storage_capacity": 1024,
-            "num_storage_units": num_storage_units,
             "claim_meta_poll_interval_s": 0.05,
-            "global_segment_size": 8 * 1024**3,
-            "local_buffer_size": 1024**3,
+            "simple": {
+                "storage_capacity": 1024,
+                "num_storage_units": num_storage_units,
+            },
         },
     )
 
@@ -114,12 +134,7 @@ def _save(checkpoint_dir: Path, num_storage_units: int) -> None:
 
         dp_client.save_checkpoint(
             checkpoint_dir,
-            metadata={
-                "data_plane_checkpoint_schema_version": (
-                    DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
-                ),
-                "expected_consumed_ids": consumed.sample_ids,
-            },
+            metadata=_checkpoint_metadata(consumed.sample_ids),
         )
     finally:
         dp_client.close()
@@ -132,6 +147,7 @@ def _load(checkpoint_dir: Path, num_storage_units: int) -> None:
     )
     try:
         metadata = dp_client.load_checkpoint(checkpoint_dir)
+        checkpoint_metadata = cast(DataPlaneCheckpointMetadata, metadata)
 
         restored = dp_client.get_samples(
             sample_ids=SAMPLE_IDS,
@@ -148,7 +164,7 @@ def _load(checkpoint_dir: Path, num_storage_units: int) -> None:
                 raise AssertionError(f"Restored field differs: {field}")
 
         if (
-            metadata["data_plane_checkpoint_schema_version"]
+            checkpoint_metadata["data_plane_checkpoint_schema_version"]
             != DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
         ):
             raise AssertionError("Unexpected data-plane checkpoint schema")

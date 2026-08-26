@@ -110,13 +110,6 @@ class DataPlaneConfig(TypedDict):
     has no static default, since no single value is right across cluster
     sizes, so a ``simple`` run without the block fails validation.
 
-    ``checkpointing_enabled`` opts SingleController into saving required TQ
-    state inside its checkpoint bundle. Samplers that support replay-buffer
-    recovery pair the native snapshot with a metadata-only local index; other
-    samplers save it in shadow mode. Other algorithm entrypoints do not consume
-    this field. It is optional because existing configs predate data-plane
-    checkpointing; exemplar configs carry the recommended default explicitly.
-
     Required keys (always set in the exemplar YAML): ``enabled``, ``impl``,
     ``backend``, ``claim_meta_poll_interval_s``.
 
@@ -131,12 +124,24 @@ class DataPlaneConfig(TypedDict):
     impl: Literal["transfer_queue"]
     backend: Literal["simple", "mooncake_cpu"]
     claim_meta_poll_interval_s: float
-    checkpointing_enabled: NotRequired[bool]
     simple: NotRequired[SimpleStorageConfig]
     mooncake_cpu: NotRequired[MooncakeCpuConfig]
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
+
+
+_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple"})
+
+
+def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
+    """Return whether the configured backend supports complete save/load.
+
+    This is a static allow-list so an unrecognized future backend defaults to
+    unsupported until its storage payload and controller metadata are both
+    known to round-trip through a checkpoint.
+    """
+    return cfg["backend"] in _CHECKPOINTABLE_BACKENDS
 
 
 _BACKEND_MODELS: dict[str, type[BaseModel]] = {

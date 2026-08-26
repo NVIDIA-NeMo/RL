@@ -25,6 +25,7 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
     DataPlaneConfig,
     KVBatchMeta,
+    data_plane_supports_checkpointing,
 )
 from nemo_rl.data_plane.observability import MetricsDataPlaneClient, log_event
 
@@ -35,6 +36,7 @@ __all__ = [
     "KVBatchMeta",
     "MetricsDataPlaneClient",
     "build_data_plane_client",
+    "data_plane_supports_checkpointing",
     "log_event",
     "materialize",
 ]

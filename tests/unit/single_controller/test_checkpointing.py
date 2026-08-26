@@ -55,6 +55,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     REPLAY_BUFFER_METADATA_STORAGE,
     DataPlaneCheckpointBarrier,
+    DataPlaneCheckpointMetadata,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
@@ -241,7 +242,7 @@ class _ExhaustingSampler(_FakeSampler):
 
 
 class _RestoredGroupsSampler(_FakeSampler):
-    """Drain the exact groups represented by a restored metadata sidecar."""
+    """Drain the exact groups represented by a restored replay metadata file."""
 
     def __init__(self, groups: list[dict[str, Any]]) -> None:
         super().__init__()
@@ -492,6 +493,7 @@ def _actor_master_config(
             "keep_top_k": None,
             "save_period": save_period,
             "save_optimizer": save_optimizer,
+            "save_data_plane": data_plane_checkpoint,
             "checkpoint_must_save_by": checkpoint_must_save_by,
             "ft_save_period": ft_save_period,
         },
@@ -499,7 +501,6 @@ def _actor_master_config(
             "enabled": True,
             "impl": "transfer_queue",
             "backend": "simple",
-            "checkpointing_enabled": data_plane_checkpoint,
         },
         async_rl=AsyncRLConfig(
             sampler=sampler_cfg,
@@ -518,7 +519,7 @@ def _make_actor_args(
     tq_buffer: Optional[_FakeTQBuffer] = None,
     dp_client: Optional[_FakeDPClient] = None,
     last_checkpoint_path: Optional[str] = None,
-    data_plane_checkpoint_metadata: Optional[dict[str, Any]] = None,
+    data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
         gen_handle=object(),
@@ -540,6 +541,34 @@ def _make_actor_args(
         last_checkpoint_path=last_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
     )
+
+
+def _data_plane_checkpoint_metadata(
+    *,
+    step: int = 0,
+    trainer_version: Optional[int] = None,
+    epoch: int = 0,
+    sampler_name: str = "in_order",
+    manifest_digest: str = "digest-1",
+    group_count: int = 0,
+) -> DataPlaneCheckpointMetadata:
+    """Build the authoritative SC envelope used by actor-level restore tests."""
+    return {
+        "data_plane_checkpoint_schema_version": (
+            DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
+        ),
+        "single_controller_train_steps": step,
+        "single_controller_trainer_version": (
+            step if trainer_version is None else trainer_version
+        ),
+        "single_controller_epoch": epoch,
+        "partition_id": _PARTITION_ID,
+        "sampler_name": sampler_name,
+        "mode": "authoritative",
+        "replay_metadata_schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+        "replay_manifest_digest": manifest_digest,
+        "replay_group_count": group_count,
+    }
 
 
 def _run_train_pump(
@@ -909,6 +938,39 @@ class TestSaveTrigger:
 
 
 class TestDataPlaneCheckpoint:
+    def test_metadata_uses_pre_await_save_state_snapshot(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=1,
+            data_plane_checkpoint=True,
+        )
+        save_state = _initial_grpo_save_state()
+        save_state.current_step = 3
+        save_state.trainer_version = 7
+        save_state.current_epoch = 2
+        dp_client = _FakeDPClient()
+
+        async def _main() -> None:
+            actor = _ACTOR_CLS(
+                mc,
+                _make_actor_args(save_state=save_state, dp_client=dp_client),
+                SetupTimingMetrics(),
+            )
+            # Simulate live fields diverging after _save_checkpoint captured
+            # save_state. The rollout pump can advance _current_epoch while
+            # checkpoint I/O awaits; both fields must come from one snapshot.
+            actor._trainer_version = 11
+            actor._current_epoch = 5
+            await actor._save_data_plane_checkpoint(str(tmp_path / "tmp_step_3"))
+            actor._checkpointer.shutdown()
+
+        asyncio.run(_main())
+
+        metadata = dp_client.save_calls[0]["metadata"]
+        assert metadata["single_controller_train_steps"] == 3
+        assert metadata["single_controller_trainer_version"] == 7
+        assert metadata["single_controller_epoch"] == 2
+
     def test_saves_authoritative_tq_state_and_metadata_only_replay_index(
         self, tmp_path
     ):
@@ -959,20 +1021,12 @@ class TestDataPlaneCheckpoint:
         assert save_call["checkpoint_dir"] == str(
             tmp_path / "checkpoints" / "tmp_step_1" / "data_plane"
         )
-        assert save_call["metadata"] == {
-            "data_plane_checkpoint_schema_version": (
-                DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
-            ),
-            "single_controller_train_steps": 1,
-            "single_controller_trainer_version": 1,
-            "single_controller_epoch": 0,
-            "partition_id": _PARTITION_ID,
-            "sampler_name": "windowed",
-            "mode": "authoritative",
-            "replay_metadata_schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
-            "replay_manifest_digest": "digest-1",
-            "replay_group_count": 1,
-        }
+        assert save_call["metadata"] == _data_plane_checkpoint_metadata(
+            step=1,
+            trainer_version=1,
+            sampler_name="windowed",
+            group_count=1,
+        )
         step_dir = tmp_path / "checkpoints" / "step_1"
         assert (step_dir / "data_plane" / "metadata.json").is_file()
         assert (
@@ -1239,8 +1293,8 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     )
     actor._sampler = _FakeSampler()
     actor._master_config = SimpleNamespace(
-        checkpointing={"metric_name": None},
-        data_plane={"checkpointing_enabled": False},
+        checkpointing={"metric_name": None, "save_data_plane": False},
+        data_plane={},
     )
     actor._dataloader = SimpleNamespace(state_dict=lambda: {})
     actor._buffer = SimpleNamespace(state_dict=AsyncMock(return_value={}))
@@ -1420,7 +1474,6 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             "enabled": True,
             "impl": "transfer_queue",
             "backend": "simple",
-            "checkpointing_enabled": True,
         },
         data={
             "use_multiple_dataloader": False,
@@ -1463,6 +1516,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             "keep_top_k": None,
             "save_period": 2,
             "save_optimizer": True,
+            "save_data_plane": True,
             "checkpoint_must_save_by": None,
         },
     )
@@ -1748,10 +1802,7 @@ class TestReplayBufferPersistence:
         ]
         envelope = {"groups": groups}
         torch.save(envelope, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
-        tq_metadata = {
-            "replay_manifest_digest": "digest-1",
-            "replay_group_count": 2,
-        }
+        tq_metadata = _data_plane_checkpoint_metadata(group_count=2)
         mc = _actor_master_config(
             tmp_path,
             max_num_steps=0,
@@ -1811,10 +1862,7 @@ class TestReplayBufferPersistence:
             for i in range(4)
         ]
         torch.save({"groups": groups}, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
-        tq_metadata = {
-            "replay_manifest_digest": "digest-1",
-            "replay_group_count": 4,
-        }
+        tq_metadata = _data_plane_checkpoint_metadata(group_count=4)
         mc = _actor_master_config(
             tmp_path,
             max_num_steps=2,
@@ -1874,10 +1922,7 @@ class TestReplayBufferPersistence:
             ]
         }
         torch.save(envelope, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
-        tq_metadata = {
-            "replay_manifest_digest": "digest-1",
-            "replay_group_count": 1,
-        }
+        tq_metadata = _data_plane_checkpoint_metadata(group_count=1)
         mc = _actor_master_config(
             tmp_path,
             max_num_steps=0,
@@ -1912,6 +1957,58 @@ class TestReplayBufferPersistence:
                 mc,
                 _make_actor_args(last_checkpoint_path=str(ckpt_dir)),
             )
+
+    def test_native_replay_metadata_rejects_group_count_mismatch(self, tmp_path):
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        torch.save({"groups": []}, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=0,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+        )
+        buffer = _FakeTQBuffer()
+
+        with pytest.raises(ValueError, match="group count does not match"):
+            _run_actor_run(
+                mc,
+                _make_actor_args(
+                    tq_buffer=buffer,
+                    last_checkpoint_path=str(ckpt_dir),
+                    data_plane_checkpoint_metadata=_data_plane_checkpoint_metadata(
+                        group_count=2
+                    ),
+                ),
+            )
+
+        assert buffer.load_calls == []
+
+    def test_native_replay_metadata_rejects_missing_manifest_digest(self, tmp_path):
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        torch.save({"groups": []}, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=0,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+        )
+        buffer = _FakeTQBuffer()
+        tq_metadata = _data_plane_checkpoint_metadata()
+        del tq_metadata["replay_manifest_digest"]
+
+        with pytest.raises(ValueError, match="missing a replay manifest digest"):
+            _run_actor_run(
+                mc,
+                _make_actor_args(
+                    tq_buffer=buffer,
+                    last_checkpoint_path=str(ckpt_dir),
+                    data_plane_checkpoint_metadata=tq_metadata,
+                ),
+            )
+
+        assert buffer.load_calls == []
 
     def test_run_missing_native_replay_metadata_starts_empty(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"
@@ -1951,10 +2048,7 @@ class TestReplayBufferPersistence:
                 tq_buffer=buffer,
                 last_checkpoint_path=str(ckpt_dir),
                 save_state=_matching_save_state(),
-                data_plane_checkpoint_metadata={
-                    "replay_manifest_digest": "digest-1",
-                    "replay_group_count": 0,
-                },
+                data_plane_checkpoint_metadata=_data_plane_checkpoint_metadata(),
             ),
         )
 

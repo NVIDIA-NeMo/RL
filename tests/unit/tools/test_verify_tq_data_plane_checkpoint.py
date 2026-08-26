@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 from tensordict import TensorDict
 
+from nemo_rl.data_plane.interfaces import backend_config
 from tools import verify_tq_data_plane_checkpoint as verifier
 
 
@@ -92,15 +93,24 @@ def _checkpoint_state(*, schema_version: int | None = None) -> dict[str, Any]:
     return {
         "fields": verifier._expected_fields(),
         "consumed": {verifier.SAMPLE_IDS[0]},
-        "metadata": {
-            "data_plane_checkpoint_schema_version": (
+        "metadata": verifier._checkpoint_metadata(
+            [verifier.SAMPLE_IDS[0]],
+            schema_version=(
                 verifier.DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
                 if schema_version is None
                 else schema_version
             ),
-            "expected_consumed_ids": [verifier.SAMPLE_IDS[0]],
-        },
+        ),
     }
+
+
+def test_data_plane_config_uses_nested_simple_backend_config() -> None:
+    config = verifier._data_plane_config(num_storage_units=3)
+
+    simple_config = backend_config(config)
+
+    assert simple_config.num_storage_units == 3
+    assert simple_config.storage_capacity == 1024
 
 
 def test_save_load_round_trip_exercises_payload_and_cursor_restore(

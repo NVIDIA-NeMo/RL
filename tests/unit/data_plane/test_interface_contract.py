@@ -20,6 +20,8 @@ be installed, so CI exercises the contract on every push.
 
 from __future__ import annotations
 
+import pickle
+
 import pytest
 import torch
 from tensordict import TensorDict
@@ -188,3 +190,20 @@ def test_checkpoint_load_requires_clean_client(tmp_path) -> None:
     with pytest.raises(RuntimeError, match="clean data-plane client"):
         source.load_checkpoint(checkpoint_dir)
     source.close()
+
+
+def test_noop_checkpoint_load_explains_missing_partitions(tmp_path) -> None:
+    checkpoint_dir = tmp_path / "data-plane"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "noop_state.pkl"
+    with checkpoint_file.open("wb") as state_file:
+        pickle.dump({"metadata": {}}, state_file)
+
+    client = NoOpDataPlaneClient()
+    with pytest.raises(ValueError) as exc_info:
+        client.load_checkpoint(checkpoint_dir)
+
+    message = str(exc_info.value)
+    assert str(checkpoint_file) in message
+    assert "has no 'partitions' key" in message
+    assert "Delete it and re-run the test" in message

@@ -22,6 +22,7 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 from __future__ import annotations
 
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -39,6 +40,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     LEGACY_REPLAY_BUFFER_FILENAME,
     REPLAY_BUFFER_METADATA_FILENAME,
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+    DataPlaneCheckpointMetadata,
     TQReplayBuffer,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
@@ -71,6 +73,7 @@ from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
     DataPlaneClient,
     build_data_plane_client,
+    data_plane_supports_checkpointing,
 )
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
@@ -134,7 +137,7 @@ class SingleControllerActorArgs:
     partition_id: str
     save_state: GRPOSaveState
     last_checkpoint_path: Optional[str]
-    data_plane_checkpoint_metadata: Optional[dict[str, Any]] = None
+    data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
     # None when async_rl.generation_fleet_health is disabled.
     fleet_monitor: Optional[GenerationFleetHealth] = None
     # None unless async_rl.generation_router is enabled.
@@ -151,10 +154,10 @@ def _maybe_restore_native_data_plane_checkpoint(
     save_state: GRPOSaveState,
     partition_id: str,
     sampler_name: str,
-) -> Optional[dict[str, Any]]:
+) -> Optional[DataPlaneCheckpointMetadata]:
     """Load and validate an authoritative native TQ checkpoint when present.
 
-    The metadata-only replay sidecar is the format marker. Checkpoints without
+    The replay metadata file is the format marker. Checkpoints without
     any replay artifact resume trainer state with an empty replay buffer;
     legacy tensor-bearing replay files are rejected rather than silently
     ignored. Rollout tensors are never serialized into a controller-side
@@ -173,6 +176,14 @@ def _maybe_restore_native_data_plane_checkpoint(
                 "with the older implementation or explicitly start without "
                 "restoring buffered rollouts."
             )
+        print(
+            f"⚠️ No {REPLAY_BUFFER_METADATA_FILENAME} found in checkpoint "
+            f"{checkpoint_path}. The matching TQ checkpoint will not be loaded, "
+            "and recovery will use an empty replay buffer. The dataloader cursor "
+            "is still restored, so any prompt groups buffered at checkpoint time "
+            "will be discarded.",
+            flush=True,
+        )
         return None
 
     data_plane_path = checkpoint_path / DATA_PLANE_CHECKPOINT_DIR
@@ -183,13 +194,14 @@ def _maybe_restore_native_data_plane_checkpoint(
         )
 
     print(f"📦 Restoring native TQ checkpoint: {data_plane_path}", flush=True)
-    metadata = policy.load_data_plane_checkpoint(data_plane_path)
-    if not isinstance(metadata, dict):
+    raw_metadata = policy.load_data_plane_checkpoint(data_plane_path)
+    if not isinstance(raw_metadata, dict):
         raise TypeError(
             "Native TQ checkpoint load must return a metadata dictionary, "
-            f"got {type(metadata).__name__}"
+            f"got {type(raw_metadata).__name__}"
         )
-    expected_values: dict[str, Any] = {
+    metadata = cast(DataPlaneCheckpointMetadata, raw_metadata)
+    expected_values: DataPlaneCheckpointMetadata = {
         "data_plane_checkpoint_schema_version": (DATA_PLANE_CHECKPOINT_SCHEMA_VERSION),
         "single_controller_train_steps": save_state.current_step,
         "single_controller_trainer_version": (
@@ -718,22 +730,44 @@ def setup_single_controller(
             "master_config.data_plane.enabled=True. The async-RL "
             "SingleController path is built on the TransferQueue data plane."
         )
-    if dp_config.get("checkpointing_enabled") and dp_config["backend"] != "simple":
-        raise NotImplementedError(
-            "SingleController data-plane checkpointing currently requires "
-            "data_plane.backend='simple'; Mooncake storage cannot be restored "
-            "by TQ v0.1.9."
-        )
+    data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     if (
-        master_config.checkpointing["enabled"]
-        and sampler_supports_buffer_checkpoint(master_config.async_rl.sampler)
-        and not dp_config.get("checkpointing_enabled")
+        master_config.checkpointing.get("save_data_plane")
+        and not data_plane_checkpointing_supported
     ):
-        raise ValueError(
-            "SingleController checkpointing with a replay-checkpoint-capable "
-            "sampler requires data_plane.checkpointing_enabled=true so "
-            "completed, unconsumed rollouts are recoverable."
+        raise NotImplementedError(
+            "SingleController data-plane checkpointing is not supported for "
+            f"data_plane.backend={dp_config['backend']!r}."
         )
+    if master_config.checkpointing["enabled"]:
+        sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
+            master_config.async_rl.sampler
+        )
+        if (
+            sampler_supports_replay_recovery
+            and not master_config.checkpointing.get("save_data_plane")
+        ):
+            error_message = (
+                "SingleController checkpointing with a replay-checkpoint-capable "
+                "sampler requires checkpointing.save_data_plane=true so "
+                "completed, unconsumed rollouts are recoverable."
+            )
+            if not data_plane_checkpointing_supported:
+                error_message += (
+                    f" The configured data_plane.backend={dp_config['backend']!r} "
+                    "does not support data-plane checkpointing; use "
+                    "data_plane.backend='simple' or set "
+                    "checkpointing.enabled=false."
+                )
+            raise ValueError(error_message)
+        if not sampler_supports_replay_recovery:
+            warnings.warn(
+                f"Sampler {master_config.async_rl.sampler.name!r} cannot recover "
+                "completed buffered rollouts. On resume, the dataloader cursor "
+                "is restored while buffered prompt groups are discarded.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     assert generation_config is not None, (
         "single_controller_utils.setup requires policy.generation in master_config"

@@ -45,6 +45,18 @@ class FakeWeightSynchronizer:
     pass
 
 
+class _InitBuffer:
+    """Minimal non-optional TQ buffer contract for actor-init tests."""
+
+    def __init__(self) -> None:
+        self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
+
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        self.checkpoint_barrier = barrier
+
+
 def _checkpointing_config(tmp_path) -> dict:
     """Minimal checkpointing block for actors built through __init__."""
     return {
@@ -83,6 +95,7 @@ def _grpo_master_config(tmp_path) -> MasterConfig:
 
 def _actor_args_for_init(**overrides) -> SimpleNamespace:
     """Minimal actor args for a controller built through the real __init__."""
+    tq_buffer = _InitBuffer()
     args = dict(
         partition_id="rollout_data",
         dp_client=None,
@@ -92,8 +105,8 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         weight_synchronizer=FakeWeightSynchronizer(),
         advantage_estimator=None,
         loss_fn=None,
-        tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        tq_buffer=tq_buffer,
+        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -131,6 +144,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         logger={},
         env={},
     )
+    tq_buffer = _InitBuffer()
     actor_args = SimpleNamespace(
         partition_id="rollout_data",
         dp_client=None,
@@ -140,8 +154,8 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         weight_synchronizer=None,
         advantage_estimator=None,
         loss_fn=None,
-        tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        tq_buffer=tq_buffer,
+        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -190,26 +204,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         # __init__ builds a CheckpointManager + TimeoutChecker from this block.
         checkpointing=_checkpointing_config(tmp_path),
     )
-    actor_args = SimpleNamespace(
-        partition_id="rollout_data",
-        dp_client=None,
-        gen_handle=None,
-        trainer_handle=None,
-        dataloader=None,
-        weight_synchronizer=FakeWeightSynchronizer(),
-        advantage_estimator=None,
-        loss_fn=None,
-        tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
-        env_handles={},
-        fleet_monitor=None,
-        generation_router=None,
-        train_cluster=None,
-        inference_cluster=None,
-        save_state=_initial_grpo_save_state(),
-        last_checkpoint_path=None,
-        data_plane_checkpoint_metadata=None,
-    )
+    actor_args = _actor_args_for_init()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
     controller_cls(
@@ -320,27 +315,7 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
     setup_metrics = SetupTimingMetrics(
         generation_init_time_s=1.5, policy_init_time_s=2.5
     )
-    actor_args = SimpleNamespace(
-        partition_id="rollout_data",
-        dp_client=None,
-        gen_handle=None,
-        trainer_handle=None,
-        dataloader=None,
-        weight_synchronizer=FakeWeightSynchronizer(),
-        advantage_estimator=None,
-        loss_fn=None,
-        tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
-        train_cluster=None,
-        inference_cluster=None,
-        # A real field of SingleControllerActorArgs. Read directly rather than via a
-        # getattr default, so omitting it breaks here instead of silently degrading
-        # watchdog.gym_subprocess_check into a no-op at runtime.
-        env_handles={},
-        save_state=_initial_grpo_save_state(),
-        last_checkpoint_path=None,
-        data_plane_checkpoint_metadata=None,
-    )
+    actor_args = _actor_args_for_init()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
     controller_cls(

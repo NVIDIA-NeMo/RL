@@ -294,6 +294,14 @@ class NoOpDataPlaneClient(DataPlaneClient):
         metadata = state.get("metadata", {})
         if not isinstance(metadata, dict):
             raise ValueError("NoOp checkpoint metadata must be a dictionary")
+        if "partitions" not in state:
+            raise ValueError(
+                f"NoOp checkpoint at {checkpoint_file} has no 'partitions' key. "
+                "It was written by an incompatible version of this adapter, or the "
+                "write was interrupted. Delete it and re-run the test that produced "
+                "it; there is nothing to recover because this adapter holds no "
+                "training state."
+            )
         self._partitions = state["partitions"]
         self._closed = False
         return dict(metadata)

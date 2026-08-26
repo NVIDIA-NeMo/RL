@@ -24,7 +24,7 @@ from collections import Counter
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from numbers import Integral, Real
-from typing import Any, Iterable, Literal, Optional, TypedDict
+from typing import Any, Iterable, Literal, NotRequired, Optional, TypedDict
 
 import ray
 import torch
@@ -66,7 +66,7 @@ class TQReplayGroupMetadata(TypedDict):
 
 
 class TQReplayMetadataState(TypedDict):
-    """Versioned metadata-only replay sidecar paired with a TQ snapshot."""
+    """Versioned metadata-only replay index paired with a TQ snapshot."""
 
     schema_version: int
     storage: Literal["tq_checkpoint"]
@@ -74,6 +74,25 @@ class TQReplayMetadataState(TypedDict):
     saved_capacity: int
     manifest_digest: str
     groups: list[TQReplayGroupMetadata]
+
+
+class DataPlaneCheckpointMetadata(TypedDict):
+    """SC metadata envelope stored with a native data-plane checkpoint.
+
+    The replay fields are present together in ``authoritative`` mode and
+    absent in ``shadow`` mode.
+    """
+
+    data_plane_checkpoint_schema_version: int
+    single_controller_train_steps: int
+    single_controller_trainer_version: int
+    single_controller_epoch: int
+    partition_id: str
+    sampler_name: str
+    mode: Literal["authoritative", "shadow"]
+    replay_metadata_schema_version: NotRequired[int]
+    replay_manifest_digest: NotRequired[str]
+    replay_group_count: NotRequired[int]
 
 
 def _canonical_manifest_value(value: Any, *, path: str) -> Any:
@@ -1015,7 +1034,10 @@ class TQReplayBuffer:
             )
         train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
         sample_ids, fields, tags = pack_payload(
-            train_batch, weight_version=start_weight_version, group_id=group_id
+            train_batch,
+            weight_version=start_weight_version,
+            group_id=group_id,
+            prompt_idx=record.prompt_idx,
         )
         if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
             raise RuntimeError(
@@ -1147,13 +1169,17 @@ class TQReplayBuffer:
 
         The caller must hold the exclusive side of the shared data-plane
         checkpoint barrier through this capture and the matching TQ save.
-        Commits and destructive clears use shared mutation slots, so the sidecar
-        and native snapshot describe one exact set of training-ready groups.
+        Commits and destructive clears use shared mutation slots, so the replay
+        index and native snapshot describe one exact set of training-ready groups.
         Every operation that mutates the canonical rollout partition or its
-        controller-local replay membership must participate in that barrier
-        across the complete publish/index or clear/remove transition. This
-        includes future finalizer paths; canonical writes are not required to
-        originate specifically from :meth:`commit`.
+        controller-local replay membership must either participate in that
+        barrier across the complete publish/index or clear/remove transition,
+        or run in the same asyncio task as the checkpoint save. The advantage
+        stage relies on the latter: it and ``_save_checkpoint`` both live in
+        ``_train_pump``, so they cannot interleave. Any new writer outside
+        ``_train_pump`` -- including future finalizer paths -- must take a
+        mutation slot; canonical writes are not required to originate
+        specifically from :meth:`commit`.
         In-flight reservations are intentionally omitted.
         """
         groups: list[TQReplayGroupMetadata] = []
@@ -1191,9 +1217,9 @@ class TQReplayBuffer:
     ) -> int:
         """Restore the local replay index for an already-restored TQ snapshot.
 
-        The sidecar never contains tensor payloads and this method never writes
-        to the DataPlane. TQ must be restored first; the caller binds the two
-        artifacts by passing the manifest digest returned by TQ checkpoint
+        The replay index never contains tensor payloads and this method never
+        writes to the DataPlane. TQ must be restored first; the caller binds the
+        two artifacts by passing the manifest digest returned by TQ checkpoint
         loading.
 
         Staleness is intentionally NOT handled here — load only loads. The
@@ -1211,7 +1237,7 @@ class TQReplayBuffer:
                 hold exactly this many rows (a changed group size silently
                 breaks the group-relative baseline).
             expected_manifest_digest: Digest returned by the matching native
-                TQ checkpoint load. It must match the metadata sidecar.
+                TQ checkpoint load. It must match the replay metadata file.
 
         Returns:
             Number of groups restored into the buffer.
@@ -1320,7 +1346,13 @@ class TQReplayBuffer:
         if len(groups) > max_groups:
             raise ValueError(
                 "Native TQ checkpoint contains more replay groups than the current "
-                f"buffer capacity: checkpoint={len(groups)}, current={max_groups}"
+                f"buffer capacity: checkpoint={len(groups)}, current={max_groups}. "
+                f"Resume with async_rl.max_buffered_rollouts >= {len(groups)} to "
+                f"keep them. Deleting {REPLAY_BUFFER_METADATA_FILENAME} from the "
+                "checkpoint directory also allows startup, but skips loading the "
+                "matching TQ checkpoint and discards these groups and the prompts "
+                "that produced them because the dataloader has already moved past "
+                "them."
             )
 
         for group in groups:
@@ -1393,16 +1425,6 @@ class TQReplayBuffer:
 
     def __len__(self) -> int:
         return len(self.meta_list)
-
-    async def _clear_samples(self, *, sample_ids: list[str]) -> None:
-        """Clear rows without overlapping a bound data-plane checkpoint."""
-        if self._data_plane_checkpoint_barrier is None:
-            raise RuntimeError(
-                "TQReplayBuffer must be bound to the controller data-plane "
-                "checkpoint barrier before clearing samples"
-            )
-        async with self._data_plane_checkpoint_barrier.mutation():
-            await self._clear_samples_unlocked(sample_ids=sample_ids)
 
     async def _clear_samples_unlocked(self, *, sample_ids: list[str]) -> None:
         """Clear rows while the caller holds a barrier mutation slot."""

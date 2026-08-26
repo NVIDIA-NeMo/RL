@@ -51,6 +51,7 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneConfig,
     KVBatchMeta,
     backend_config,
+    data_plane_supports_checkpointing,
 )
 from nemo_rl.data_plane.schema import PROMOTE_1D_FIELDS
 
@@ -728,6 +729,7 @@ class TQDataPlaneClient(DataPlaneClient):
         # squeezes the trailing 1 back on get. Drop when upstream TQ
         # unifies the schema/data shapes for 1D fields.
         self._backend = cfg["backend"]
+        self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
         self._promote_1d = cfg["backend"] == "mooncake_cpu"
 
         if bootstrap:
@@ -740,6 +742,19 @@ class TQDataPlaneClient(DataPlaneClient):
         # This process-local guard catches incorrect ordering through this
         # adapter; setup must still ensure no other client has touched TQ.
         self._data_operations_started = False
+        # Fields whose schema this process has already warmed, per partition.
+        # The controller's field map is append-only, so each field only needs
+        # warming once for the lifetime of this client.
+        self._warmed_fields: dict[str, set[str]] = {}
+
+    def _require_checkpointing_support(self) -> None:
+        """Reject backends that cannot round-trip all data-plane state."""
+        if not self._supports_checkpointing:
+            raise NotImplementedError(
+                "TQ checkpointing is not supported for "
+                f"data_plane.backend={self._backend!r}: the backend cannot "
+                "persist and restore all storage rows."
+            )
 
     def _mark_data_operation_started(self) -> None:
         """Make a later checkpoint load fail instead of mixing TQ states."""
@@ -752,11 +767,6 @@ class TQDataPlaneClient(DataPlaneClient):
                 "load_checkpoint requires a clean TQ client before any "
                 "register, claim, get, list, put, clear, or consumption operation"
             )
-
-        # Fields whose schema this process has already warmed, per partition.
-        # See register_partition: the controller's field map is append-only,
-        # so a field only ever needs warming once.
-        self._warmed_fields: dict[str, set[str]] = {}
 
     # ── (A) task-mediated ───────────────────────────────────────────────
 
@@ -1013,12 +1023,7 @@ class TQDataPlaneClient(DataPlaneClient):
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """Save TQ controller metadata and storage data."""
-        if self._backend == "mooncake_cpu":
-            raise NotImplementedError(
-                "TQ checkpointing is not supported for the mooncake_cpu "
-                "backend: MooncakeStorageManager cannot persist its in-memory "
-                "rows, so TQ would silently create a metadata-only checkpoint."
-            )
+        self._require_checkpointing_support()
         _connect_existing()
         tq.save_checkpoint(checkpoint_dir, metadata=metadata)
 
@@ -1029,11 +1034,7 @@ class TQDataPlaneClient(DataPlaneClient):
         TQ client, so the recovery coordinator must also guarantee globally
         clean setup ordering.
         """
-        if self._backend == "mooncake_cpu":
-            raise NotImplementedError(
-                "TQ checkpoint restore is not supported for the mooncake_cpu "
-                "backend because its in-memory rows cannot be restored."
-            )
+        self._require_checkpointing_support()
         self._require_clean_for_load()
         # Validate the adapter-owned metadata before starting TQ's
         # non-transactional storage/controller restore.

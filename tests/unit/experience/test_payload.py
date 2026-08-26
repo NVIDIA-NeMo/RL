@@ -124,6 +124,7 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
         train_batch,
         weight_version=3,
         group_id="group",
+        prompt_idx=17,
     )
     assert sample_ids == ["group_g0", "group_g1"]
     assert "routed_experts" in fields
@@ -132,7 +133,10 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
     packed_rows = list(packed_routes.unbind())
     assert torch.equal(packed_rows[0], expected_routes[0])
     assert torch.equal(packed_rows[1], expected_routes[1])
-    assert tags == [{"weight_version": 3}, {"weight_version": 3}]
+    assert tags == [
+        {"weight_version": 3, "prompt_idx": 17},
+        {"weight_version": 3, "prompt_idx": 17},
+    ]
 
 
 def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
@@ -148,6 +152,7 @@ def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
         train_batch,
         weight_version=3,
         group_id="group",
+        prompt_idx=17,
     )
     assert "routed_experts" not in fields
 
@@ -187,6 +192,11 @@ def test_record_to_train_batch_backfills_routes_for_failed_completion() -> None:
     # It is fully loss-masked either way.
     assert train_batch["token_mask"][1, :2].tolist() == [0, 0]
 
-    _, fields, _ = pack_payload(train_batch, weight_version=3, group_id="group")
+    _, fields, _ = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+        prompt_idx=17,
+    )
     assert "routed_experts" in fields
     assert list(fields["routed_experts"].unbind())[1].shape == (2, 2, 2)
