@@ -82,7 +82,7 @@ class GRPOAdvantageEstimator:
         self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
         self.normalize_rewards = estimator_config.normalize_rewards
 
-    def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
+    def compute_advantage(self, prompt_ids, rewards, mask, valid_mask=None, **kwargs):
         """Compute GRPO advantages.
 
         Args:
@@ -90,6 +90,11 @@ class GRPOAdvantageEstimator:
             rewards: Tensor of shape [batch_size] containing reward for each sample.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
                   Used only for expanding advantages to token-level shape.
+            valid_mask: Optional tensor of shape [batch_size], 1.0 for samples whose
+                  reward should participate in the per-prompt baseline/std. Token-capture
+                  placeholder rows carry 0.0 (their sample_mask already excludes them
+                  from the loss; excluding them here keeps siblings' baselines unbiased).
+                  None keeps the legacy all-valid behavior.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -98,7 +103,7 @@ class GRPOAdvantageEstimator:
         baseline, std = calculate_baseline_and_std_per_prompt(
             prompt_ids,
             rewards,
-            torch.ones_like(rewards),
+            torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),
             leave_one_out_baseline=self.use_leave_one_out_baseline,
         )
         advantages = (rewards - baseline).unsqueeze(-1)
