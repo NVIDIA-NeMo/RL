@@ -1632,6 +1632,85 @@ def test_distillation_topk_non_tp_defers_fp32_upcast():
     assert torch.equal(student.grad, reference.grad)
 
 
+def _topk_grad_with(indices, upstream, logits):
+    """Gradient w.r.t. ``logits`` under the deferred-upcast implementation."""
+    student = logits.clone().requires_grad_(True)
+    topk_logprobs, _, _ = get_distillation_topk_logprobs_from_logits(
+        student_logits=student,
+        teacher_topk_logits=torch.zeros_like(upstream),
+        teacher_topk_indices=indices,
+        zero_outside_topk=False,
+        calculate_entropy=False,
+    )
+    (topk_logprobs * upstream[:, :-1, :]).sum().backward()
+    return student.grad
+
+
+def _topk_grad_reference(indices, upstream, logits):
+    """Gradient under the previous full-vocab-upcast formulation."""
+    reference = logits.clone().requires_grad_(True)
+    expected = torch.nn.functional.log_softmax(
+        reference.to(torch.float32).gather(dim=-1, index=indices),
+        dim=-1,
+    )[:, :-1, :]
+    (expected * upstream[:, :-1, :]).sum().backward()
+    return reference.grad
+
+
+def test_deferred_upcast_matches_only_because_padded_positions_are_masked():
+    """The equivalence is conditional, and this pins the condition.
+
+    ``gather``'s backward is a scatter-add, and padded positions carry K copies
+    of index 0 -- ``dtensor_policy_worker.py`` pads the sequence axis with
+    ``value=0``. There the old formulation accumulates in fp32 and this one
+    accumulates in bf16, which is a different number.
+
+    They agree because ``DistillationLossFn`` masks those positions to exactly
+    0.0, so the incoming gradient is zero and there is nothing to accumulate.
+    Both directions are checked: masked agrees, unmasked does not. The second
+    half is why the loss now raises on missing masks instead of falling back to
+    an unmasked mean.
+
+    Two things would make this test pass without testing anything:
+      - top-k indices are distinct within a position, so only the padded tail
+        has duplicates at all -- ``torch.randperm`` everywhere reproduces
+        nothing;
+      - a uniform upstream gradient makes the unmasked case agree too, since
+        ``log_softmax`` over K duplicated logits is uniform and its gradient
+        for an all-ones upstream is exactly zero.
+    """
+    torch.manual_seed(0)
+    batch, seq, vocab, k = 2, 8, 512, 4
+    pad_from = 6
+
+    logits = torch.randn(batch, seq, vocab, dtype=torch.bfloat16)
+    indices = torch.stack(
+        [
+            torch.stack([torch.randperm(vocab)[:k] for _ in range(seq)])
+            for _ in range(batch)
+        ]
+    )
+    indices[:, pad_from:, :] = 0  # the padded tail, as the worker writes it
+
+    upstream = torch.randn(batch, seq, k)  # non-uniform, deliberately
+    mask = torch.ones(batch, seq, 1)
+    mask[:, pad_from:, :] = 0.0
+
+    assert torch.equal(
+        _topk_grad_with(indices, upstream * mask, logits),
+        _topk_grad_reference(indices, upstream * mask, logits),
+    ), "masked: the deferred upcast must be bitwise equal"
+
+    assert not torch.equal(
+        _topk_grad_with(indices, upstream, logits),
+        _topk_grad_reference(indices, upstream, logits),
+    ), (
+        "unmasked: the two must DIFFER -- if they do not, this test has stopped "
+        "reproducing the duplicate-index accumulation and the ValueError in "
+        "DistillationLossFn is no longer pinned by anything"
+    )
+
+
 def test_distillation_topk_gathers_before_upcasting(monkeypatch):
     """The full-vocab tensor must still be bf16 when ``gather`` runs.
 
