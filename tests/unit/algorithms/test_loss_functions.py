@@ -131,6 +131,114 @@ def test_filtered_positions_leave_the_actor_term_but_not_the_kl():
     assert loss_kept.item() != pytest.approx(loss_all.item())
 
 
+def _keep_mask_data(keep_mask, *, rewards=None):
+    """The same fixture as the test above, reused by the reductions below.
+
+    Three positions, the third filtered. ``curr_logprobs`` carries the
+    substituted ``0.0`` there, so every reduction that fails to drop it reads a
+    fabricated ratio of ``exp(0.0 - (-1.0)) = e``.
+    """
+    batch, seq = 1, 4
+    data = BatchedDataDict(
+        {
+            "token_mask": torch.ones(batch, seq),
+            "sample_mask": torch.ones(batch),
+            "advantages": torch.full((batch, seq), 0.5),
+            "prev_logprobs": torch.full((batch, seq), -1.0),
+            "generation_logprobs": torch.full((batch, seq), -1.0),
+            "reference_policy_logprobs": torch.full((batch, seq), -2.0),
+            "curr_logprobs_unfiltered": torch.tensor([[-0.5, -0.6, -3.0]]),
+        }
+    )
+    if keep_mask is not None:
+        data["curr_logprobs_keep_mask"] = keep_mask
+    if rewards is not None:
+        data["rewards"] = rewards
+    return data
+
+
+_CURR_LOGPROBS = torch.tensor([[-0.5, -0.6, 0.0]])
+_KEEP = torch.tensor([[1.0, 1.0, 0.0]])
+_GVT = torch.tensor(3.0)
+_GVS = torch.tensor(1.0)
+
+
+def _run_with_and_without_keep(loss_fn, **data_kwargs):
+    """Returns (all, kept) for the same loss with and without the keep mask."""
+    return (
+        loss_fn(_CURR_LOGPROBS, _keep_mask_data(None, **data_kwargs), _GVS, _GVT),
+        loss_fn(_CURR_LOGPROBS, _keep_mask_data(_KEEP, **data_kwargs), _GVS, _GVT),
+    )
+
+
+def test_keep_mask_narrows_the_sequence_level_ratio():
+    """The GSPO sequence ratio is a masked_mean with NO global normalization
+    factor, so a filtered position corrupts both the numerator and the divisor
+    -- and the result is exponentiated, so the error compounds."""
+    # Wide clip on purpose. At the default 0.2 both ratios land above 1.2 and
+    # clamp to the same value, so the loss is identical either way and this
+    # would assert nothing -- the metrics below still differ, which is what
+    # makes the degenerate case easy to miss.
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            sequence_level_importance_ratios=True,
+            token_level_loss=False,
+            ratio_clip_min=5.0,
+            ratio_clip_max=5.0,
+        )
+    )
+    (loss_all, m_all), (loss_kept, m_kept) = _run_with_and_without_keep(loss_fn)
+
+    assert loss_kept.item() != pytest.approx(loss_all.item())
+    assert m_kept["probs_ratio"] != pytest.approx(m_all["probs_ratio"])
+
+
+def test_keep_mask_narrows_the_sequence_level_actor_loss():
+    """SEQUENCE_LEVEL reduces token-first over the actor mask. The inner
+    masked_mean normalizes by the mask sum, so the filtered position both
+    injects a fabricated clip_loss and inflates its own divisor. This one moves
+    the gradient, not a dashboard number."""
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            token_level_loss=False,
+            ratio_clip_min=5.0,
+            ratio_clip_max=5.0,
+        )
+    )
+    (loss_all, _), (loss_kept, _) = _run_with_and_without_keep(loss_fn)
+
+    assert loss_kept.item() != pytest.approx(loss_all.item())
+
+
+def test_keep_mask_narrows_the_positive_example_nll():
+    """VAPO's positive-example NLL normalizes by its own mask sum, so on a
+    revert the filtered position contributes -0.0 to the numerator and +1 to
+    the denominator: the term is deflated rather than merely noisy."""
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            positive_example_nll_weight=1.0,
+        )
+    )
+    rewards = torch.ones(1)
+    (_, m_all), (_, m_kept) = _run_with_and_without_keep(loss_fn, rewards=rewards)
+
+    assert m_kept["positive_nll_loss"] != pytest.approx(m_all["positive_nll_loss"])
+
+
+def test_keep_mask_narrows_the_reported_ratio_means():
+    """probs_ratio and probs_ratio_clamped are the headline train/inference
+    mismatch numbers. The existing test pins only probs_ratio_max, which comes
+    from a separate un-narrowed reduction, so both means were uncovered."""
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.5))
+    (_, m_all), (_, m_kept) = _run_with_and_without_keep(loss_fn)
+
+    assert m_kept["probs_ratio"] != pytest.approx(m_all["probs_ratio"])
+    assert m_kept["probs_ratio_clamped"] != pytest.approx(m_all["probs_ratio_clamped"])
+
+
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
     seq_len = 4
     data = {
