@@ -1159,7 +1159,15 @@ class TQReplayBuffer:
                             f"post-write enrichment failed for group_id={group_id!r}"
                         ) from error
 
-                idx = self._group_ids.index(group_id)
+                try:
+                    idx = self._group_ids.index(group_id)
+                except ValueError:
+                    # Evicted during the awaited write: un-write the rows so the
+                    # partition holds nothing the buffer no longer tracks.
+                    raise ValueError(
+                        f"TQReplayBuffer.commit: group {group_id} was evicted "
+                        "during the write; rows cleared"
+                    ) from None
                 self.meta_list[idx] = meta
                 self.end_weight_list[idx] = end_weight_version
                 self.ready_list[idx] = True

@@ -60,6 +60,18 @@ from nemo_rl.environments.nemo_gym import (
         ({"content": [None]}, False, False),
         ({"content": [{"text": None}]}, False, False),
         ({"type": "reasoning", "summary": None}, False, False),
+        # A tool-call-only assistant item carries content: None — a structured
+        # (executed) call, never a penalty (regression: jobs 6342333/6358268).
+        (
+            {"content": None, "tool_calls": [{"function": {"name": "bash"}}]},
+            False,
+            False,
+        ),
+        (
+            {},
+            False,
+            False,
+        ),
     ],
 )
 def test_detect_invalid_tool_call_and_malformed_thinking(
