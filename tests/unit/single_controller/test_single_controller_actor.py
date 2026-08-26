@@ -1157,6 +1157,83 @@ def test_train_pump_prunes_stamps_older_than_the_step_that_just_closed(
     assert ctrl._batch_shortfall == {5: 1}
 
 
+class _AgeReportingSampler(_EmptySampler):
+    """Yields one meta per configured age list, then goes empty.
+
+    A step is assembled from several selects on the streaming path, so the
+    metric has to accumulate ACROSS them -- an assignment instead of an extend
+    reports only the last select's ages and passes any single-select test.
+    """
+
+    def __init__(self, meta: KVBatchMeta, age_batches: list[list[int]]) -> None:
+        self._meta = meta
+        self._age_batches = list(age_batches)
+        self.last_selection_trajectory_ages: list[int] = []
+
+    async def select(self, **kwargs):
+        del kwargs
+        if not self._age_batches:
+            self.last_selection_trajectory_ages = []
+            return None, 0
+        self.last_selection_trajectory_ages = self._age_batches.pop(0)
+        return self._meta, 1
+
+
+def _age_meta() -> KVBatchMeta:
+    return KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+
+
+def _run_age_pump(age_batches, monkeypatch) -> dict:
+    ctrl = _train_pump_controller(
+        sampler=_AgeReportingSampler(_age_meta(), age_batches)
+    )
+    ctrl._master_config.grpo.num_prompts_per_step = len(age_batches) or 1
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    for call in ctrl._logger.log_metrics.call_args_list:
+        metrics = call.args[0] if call.args else call.kwargs.get("metrics", {})
+        if "avg_trajectory_age" in metrics or "max_trajectory_age" in metrics:
+            return metrics
+    return {}
+
+
+def test_train_pump_accumulates_trajectory_age_across_every_select(monkeypatch):
+    """Two selects in one step. Averaging only the last one would give 5.0."""
+    metrics = _run_age_pump([[1, 3], [5, 5]], monkeypatch)
+
+    assert metrics.get("avg_trajectory_age") == pytest.approx(3.5)
+    assert metrics.get("max_trajectory_age") == 5
+
+
+def test_train_pump_omits_trajectory_age_when_no_ages_are_reported(monkeypatch):
+    """A sampler that reports no ages must leave the keys out, not divide by
+    zero. This is the path every sampler without the property takes -- the
+    metric is deliberately not on the Protocol."""
+    ctrl = _train_pump_controller(sampler=_OneThenEmptySampler(_age_meta()))
+    ctrl._master_config.grpo.num_prompts_per_step = 1
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    for call in ctrl._logger.log_metrics.call_args_list:
+        metrics = call.args[0] if call.args else call.kwargs.get("metrics", {})
+        assert "avg_trajectory_age" not in metrics
+        assert "max_trajectory_age" not in metrics
+
+
 def test_train_pump_rejects_step_with_no_valid_training_chunks() -> None:
     meta = KVBatchMeta(
         partition_id="rollout_data",
