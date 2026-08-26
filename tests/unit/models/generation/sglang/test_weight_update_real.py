@@ -18,8 +18,10 @@ End-to-end weight update tests using SGLangGeneration + mock FSDP trainer.
 Verifies the full weight-streaming path:
   1. SGLangGeneration.check_weights("snapshot")  — save original weights
   2. SGLangGeneration.check_weights("reset_tensors") — randomize weights
-  3. Mock FSDP trainer streams weights via send_hf_buckets_via_ipc_actor_impl
-  4. SGLangGeneration.check_weights("compare")  — verify restored weights
+  3. SGLangGeneration.begin_weight_update() — open the engine update session
+  4. Mock FSDP trainer streams weights via send_hf_buckets_via_ipc_actor_impl
+  5. SGLangGeneration.end_weight_update() — finalize the engine update session
+  6. SGLangGeneration.check_weights("compare")  — verify restored weights
 
 Parametrised over two configurations (both use 2 GPUs total):
   • 1 server  × TP=2  — single-server multi-GPU
@@ -217,7 +219,7 @@ def test_weight_update_roundtrip(sglang_gen, mock_trainer):
 
     Exercises the full colocated-refit memory dance:
       snapshot -> reset_tensors -> offload_weights -> offload_kv ->
-      onload_weights -> update_weights (stream) -> check compare ->
+      onload_weights -> begin update -> stream -> end update -> check compare ->
       onload_kv.
     """
     # 1. Snapshot original Qwen3-1.7B weights.
@@ -248,12 +250,16 @@ def test_weight_update_roundtrip(sglang_gen, mock_trainer):
     )
     rollout_engines = sglang_gen.rollout_engines
     num_gpus_per_engine = sglang_gen.num_gpus_per_engine
-    ray.get(
-        [
-            w.stream_weights.remote(rollout_engines, num_gpus_per_engine)
-            for w in mock_trainer
-        ]
-    )
+    sglang_gen.begin_weight_update()
+    try:
+        ray.get(
+            [
+                w.stream_weights.remote(rollout_engines, num_gpus_per_engine)
+                for w in mock_trainer
+            ]
+        )
+    finally:
+        sglang_gen.end_weight_update()
     print("[STEP 5/7] Weight streaming complete.", flush=True)
 
     # 6. Compare current weights against snapshot - raises on mismatch.
@@ -347,6 +353,16 @@ def test_weight_update_roundtrip_with_router_generation(sglang_gen, mock_trainer
         for url in base_urls:
             post_and_assert_200(url, "resume_memory_occupation", {"tags": ["weights"]})
 
+    def _http_begin_weight_update_all():
+        """POST /begin_weight_update on every worker."""
+        for url in base_urls:
+            post_and_assert_200(url, "begin_weight_update", {})
+
+    def _http_end_weight_update_all():
+        """POST /end_weight_update on every worker."""
+        for url in base_urls:
+            post_and_assert_200(url, "end_weight_update", {})
+
     def _http_resume_kv_all():
         """POST /resume_memory_occupation(tags=[kv_cache, cuda_graph]) per worker."""
         for url in base_urls:
@@ -430,12 +446,16 @@ def test_weight_update_roundtrip_with_router_generation(sglang_gen, mock_trainer
     )
     rollout_engines = sglang_gen.rollout_engines
     num_gpus_per_engine = sglang_gen.num_gpus_per_engine
-    ray.get(
-        [
-            w.stream_weights.remote(rollout_engines, num_gpus_per_engine)
-            for w in mock_trainer
-        ]
-    )
+    _http_begin_weight_update_all()
+    try:
+        ray.get(
+            [
+                w.stream_weights.remote(rollout_engines, num_gpus_per_engine)
+                for w in mock_trainer
+            ]
+        )
+    finally:
+        _http_end_weight_update_all()
     print("[STEP 5/7] Weight streaming complete.", flush=True)
 
     print(
