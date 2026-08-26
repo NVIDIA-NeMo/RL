@@ -1,0 +1,76 @@
+# SingleController variant of ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-noncolocated-async.yaml.
+# Override some settings for testing complete features.
+defaults: ./ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-noncolocated-async.yaml
+
+logger:
+  log_dir: logs/ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-noncolocated-async-single-controller
+  wandb:
+    name: ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-noncolocated-async-single-controller
+
+ppo:
+  # Null out the legacy async_ppo block: SC reads async_rl instead, and the
+  # entrypoint raises if this block is set.
+  async_ppo: null
+  # SC does not support validation yet.
+  val_period: 0
+  val_at_start: false
+  # SC does not implement it, so leaving it enabled would describe filtering
+  # this run does not do.
+  overlong_filtering: false
+  # override from the inherited recipe.
+  num_prompts_per_step: 256
+  max_num_epochs: 1000
+  ppo_epochs: 4
+  policy_training_start_step: 10
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-noncolocated-async-single-controller
+  # Without a validation loop there is no val:accuracy to select on, and SC
+  # rejects any metric_name outside the train: namespace.
+  metric_name: null
+
+policy:
+  # The only thing on the SC path that takes the policy optimizer off the GPU,
+  # which the critic needs before its forward and train stages.
+  offload_optimizer_for_logprob: true
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+# TransferQueue data plane is mandatory for the SingleController path. The whole
+# block is spelled out because the PPO config chain has none; the fields have no
+# defaults. Values are grpo_math_1B.yaml's except default enabled.
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: "simple"
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    storage_capacity: 1000000
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+  mooncake_cpu:
+    global_segment_size: 68719476736
+    local_buffer_size:    4294967296
+    reuse_registered_buffers: true
+    staging_buffer_size:   268435456
+
+# SC async-RL runtime knobs, replacing the nulled ppo.async_ppo block.
+async_rl:
+  sampler:
+    name: in_order
+    # Matches grpo.async_grpo.max_trajectory_age_steps=1.
+    max_lookahead_versions: 1
+    # override from the inherited recipe.
+    warmup_lookahead_versions: 4
+  recompute_kv_cache_after_weight_updates: true
+  # SC PPO assembles each step from a single chunk; the critic has no split
+  # train API, so this must equal num_prompts_per_step.
+  min_groups_for_streaming_train: ${ppo.num_prompts_per_step}
+  max_inflight_prompts: 1280
+  # num_prompts_per_step * (warmup_lookahead_versions + 1) -- sized for the peak window.
+  max_buffered_rollouts: 1280

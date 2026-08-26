@@ -35,13 +35,14 @@ run_test() {
 }
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
+run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
 # Full mode only (~10 min): SIGKILLs a generation worker and asserts the job fails fast
 # and attributably instead of wedging. This is the ONLY end-to-end check of the
 # containment behaviour -- without it, a regression that restores the silent wedge is
 # caught by nothing, because a wedged job produces no exception and no failing assertion
 # anywhere else.
-run_test uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
 # Full mode only: the same Gym run, but with NeMo-Gym pointed at the NeMo-RL-owned router.
 # Without this the router has no functional coverage at all -- the default Gym run above
 # leaves it disabled, so a regression in the proxy would ship silently.
@@ -49,7 +50,7 @@ run_test uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chao
 # gen_kl_error is the assertion that earns its keep here: it compares vLLM's logprobs
 # against the trainer's recomputation, so a proxy that corrupts or truncates a response
 # blows it up. A run that merely completes would not prove the payload survived the hop.
-run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh \
+run_test      uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh \
     ++async_rl.generation_router.enabled=true \
     ++async_rl.generation_fleet_health.enabled=true
 
@@ -65,7 +66,7 @@ run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controll
 #
 # Needs >= 3 GPUs (2 generation + 1 trainer) and self-skips below that, so it is inert on
 # the 2-GPU L1 runners and only does its job on a larger box.
-run_test uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
 
 # grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout
 # rather than between calls. Registered because pinning the victim state -- which is what
@@ -76,10 +77,10 @@ run_test uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
 # either is invisible to the other.
 #
 # Cheap to add: the serving path fails in seconds, so this is dominated by startup.
-run_test env VICTIM_STATE=serving uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
+run_test      env VICTIM_STATE=serving uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
 
 # Checkpoint save/restore (upstream #3429).
-run_test uv run --no-sync bash ./tests/functional/grpo_checkpoint_single_controller.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_checkpoint_single_controller.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

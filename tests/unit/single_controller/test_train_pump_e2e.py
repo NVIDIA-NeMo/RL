@@ -302,7 +302,10 @@ def test_train_pump_drives_mcore_training_step(
         )
 
         master_config = MasterConfig.model_construct(
-            policy={"train_global_batch_size": train_gbs},
+            policy={
+                "train_global_batch_size": train_gbs,
+                "generation": {"colocated": {"enabled": False}},
+            },
             # _sync_weights gates stale-abort on should_use_nemo_gym(env); empty
             # env -> native path (nemo_gym disabled).
             env={},

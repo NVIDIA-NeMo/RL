@@ -67,6 +67,7 @@ from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
@@ -1565,6 +1566,21 @@ def build_inference_model(
         inference_provider.transformer_impl = policy_cfg["megatron_cfg"][
             "transformer_impl"
         ]
+    # CUDA graph config needs to be set correctly before init.
+    if "cuda_graph_impl" in policy_cfg["megatron_cfg"]:
+        cuda_graph_impl = policy_cfg["megatron_cfg"]["cuda_graph_impl"]
+        if cuda_graph_impl not in ("none", "local"):
+            raise ValueError(
+                "Megatron generation supports only cuda_graph_impl 'none' or "
+                f"'local' for inference CUDA graphs, got '{cuda_graph_impl}'. "
+                "'transformer_engine' and 'full_iteration' are training-only "
+                "capture modes."
+            )
+        inference_provider.cuda_graph_impl = cuda_graph_impl
+    if "inference_cuda_graph_scope" in policy_cfg["megatron_cfg"]:
+        inference_provider.inference_cuda_graph_scope = InferenceCudaGraphScope[
+            policy_cfg["megatron_cfg"]["inference_cuda_graph_scope"]
+        ]
     # A custom (uneven) pipeline split is tuned for the training PP; reset to an even split
     # when inference uses a different PP (the reshard maps params across stages by name).
     if (
@@ -2190,7 +2206,7 @@ def finalize_megatron_setup(
     """
     _update_model_config_funcs(
         [model],
-        megatron_cfg.model,
+        get_model_config(model),
         megatron_cfg.ddp,
         optimizer,
         align_grad_reduce=megatron_cfg.dist.align_grad_reduce,
