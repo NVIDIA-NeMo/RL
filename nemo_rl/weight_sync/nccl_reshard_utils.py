@@ -669,11 +669,12 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
         # Precision compatibility (train ↔ gen).  Supported combinations:
         #   BF16 train  ↔ BF16 gen   (default, tested)
         #   FP8  train  ↔ FP8  gen   (fp8_param=True + blockwise + vllm precision=fp8)
-        # BF16→FP8 (train-side quant on the fly) is not implemented; FP8→BF16
-        # has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
+        #   BF16 storage → MXFP8 gen  (receiver quantizes the resharded BF16 shard)
+        # FP8→BF16 has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
         fp8_param = fp8_cfg.get("fp8_param", False)
         fp8_recipe = fp8_cfg.get("fp8_recipe", None)
+        trainer_precision = policy.get("precision")
         gen_precision = vllm_cfg.get("precision", None)
 
         # The refit byte-copies weights train -> gen, so gen dtype must match
@@ -691,17 +692,35 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             )
 
         if gen_precision == "fp8":
-            if not fp8_param:
+            if fp8_param:
+                if vllm_cfg.get("is_mx"):
+                    violations.append(
+                        "policy.generation.vllm_cfg.is_mx=True does not support "
+                        "blockwise-FP8 storage from "
+                        "policy.megatron_cfg.fp8_cfg.fp8_param; use BF16 training "
+                        "storage for receiver-side MXFP8 quantization."
+                    )
+                elif fp8_recipe != "blockwise":
+                    violations.append(
+                        "policy.megatron_cfg.fp8_cfg.fp8_recipe must be 'blockwise' "
+                        f"when fp8_param=True (got {fp8_recipe!r}); other recipes "
+                        "don't produce export-ready scale_inv tensors."
+                    )
+            elif vllm_cfg.get("is_mx"):
+                # Policy precision uses the canonical NeMo-RL spelling; unlike
+                # vLLM precision, it does not accept "bf16", "auto", or None.
+                if trainer_precision != "bfloat16":
+                    violations.append(
+                        "policy.generation.vllm_cfg.is_mx=True with "
+                        "policy.megatron_cfg.fp8_cfg.fp8_param=False requires "
+                        "policy.precision='bfloat16' for receiver-side MXFP8 "
+                        f"quantization (got {trainer_precision!r})."
+                    )
+            else:
                 violations.append(
                     "policy.generation.vllm_cfg.precision='fp8' requires "
-                    "policy.megatron_cfg.fp8_cfg.fp8_param=True "
-                    "(BF16→FP8 train-side quantization is not implemented yet)."
-                )
-            elif fp8_recipe != "blockwise":
-                violations.append(
-                    "policy.megatron_cfg.fp8_cfg.fp8_recipe must be 'blockwise' "
-                    f"when fp8_param=True (got {fp8_recipe!r}); other recipes "
-                    "don't produce export-ready scale_inv tensors."
+                    "policy.megatron_cfg.fp8_cfg.fp8_param=True, or "
+                    "is_mx=True for BF16-to-MXFP8 refit."
                 )
         elif fp8_param:
             violations.append(

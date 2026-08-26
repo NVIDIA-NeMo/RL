@@ -358,12 +358,55 @@ class TestValidateAndPrepareConfig:
         mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
         mock_resolve_class.return_value = Mock
 
-        # Test with generation colocated disabled
+        mock_config["generation"]["backend"] = "vllm"
         mock_config["generation"]["colocated"]["enabled"] = False
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.is_generation_colocated is False
         # NCCL_CUMEM_ENABLE should be set when not colocated
         assert os.environ.get("NCCL_CUMEM_ENABLE") == "1"
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    @patch.dict(os.environ, {}, clear=True)
+    def test_generation_sglang_not_colocated(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config["generation"]["backend"] = "sglang"
+        mock_config["generation"]["colocated"]["enabled"] = False
+
+        result = validate_and_prepare_config(mock_config, None, 0)
+
+        assert result.is_generation_colocated is False
+        assert os.environ.get("NCCL_CUMEM_ENABLE") == "0"
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    @patch.dict(os.environ, {}, clear=True)
+    def test_no_generation_leaves_nccl_cumem_unset(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        del mock_config["generation"]
+
+        result = validate_and_prepare_config(mock_config, None, 0)
+
+        assert result.is_generation_colocated is None
+        assert "NCCL_CUMEM_ENABLE" not in os.environ
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -1836,6 +1879,19 @@ class TestGetTokenizer:
         assert result is mock_tokenizer
 
     @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_forwards_tokenizer_kwargs(self, mock_nemo_auto_tokenizer):
+        """Test tokenizer_kwargs are forwarded to NeMoAutoTokenizer."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer({"name": "gpt2", "tokenizer_kwargs": {"model_max_length": 123}})
+
+        mock_nemo_auto_tokenizer.from_pretrained.assert_called_once_with(
+            "gpt2", trust_remote_code=True, model_max_length=123
+        )
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
     def test_sets_pad_token_from_eos(self, mock_nemo_auto_tokenizer):
         """Test that pad_token is set to eos_token when None."""
         mock_tokenizer = MagicMock()
@@ -2014,6 +2070,30 @@ class TestGetTokenizer:
         assert mock_processor.eos_token_id == 1
         assert mock_processor.bos_token_id == 2
         assert mock_processor.name_or_path == "test-model"
+
+    @patch("nemo_rl.models.automodel.setup.AutoProcessor")
+    def test_get_processor_forwards_tokenizer_kwargs(self, mock_auto_processor):
+        """Test tokenizer_kwargs are forwarded through AutoProcessor."""
+        mock_processor = MagicMock()
+        mock_processor.tokenizer.pad_token = "<pad>"
+        mock_auto_processor.from_pretrained.return_value = mock_processor
+        config = {
+            "name": "test-vlm",
+            "tokenizer_kwargs": {"model_max_length": 123, "use_fast": False},
+        }
+
+        get_tokenizer(config, get_processor=True)
+
+        mock_auto_processor.from_pretrained.assert_called_once_with(
+            "test-vlm",
+            trust_remote_code=True,
+            use_fast=False,
+            model_max_length=123,
+        )
+        assert config["tokenizer_kwargs"] == {
+            "model_max_length": 123,
+            "use_fast": False,
+        }
 
     @patch("nemo_rl.models.automodel.setup.AutoProcessor")
     def test_get_processor_sets_pad_from_eos(self, mock_auto_processor):
