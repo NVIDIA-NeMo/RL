@@ -514,9 +514,16 @@ Config keys:
 
 This is a gate on group-relative length scaling. It does not define a separate penalty by itself.
 
+Defaults: `group_length_penalty_profile_gate_channel: total`,
+`group_length_penalty_profile_gate_field: a`,
+`group_length_penalty_profile_gate_positive_only: true`.
+
 For each prompt group:
 
 1. Read a threshold from `profile_band[channel][field]`, for example `profile_band["total"]["a"]`.
+   The band is the row's `profile_band` metadata merged over the global
+   `length_bonus.profile_band.defaults` (row channels win), so the gate also works on datasets
+   without per-prompt bands when global defaults are configured.
 2. Compute the mean rollout length for the selected channel.
 3. If `group_length_penalty_profile_gate_positive_only` is true, use only positive rollouts in
    that mean.
@@ -527,6 +534,12 @@ For each prompt group:
    ```
 
 If the gate is closed, all group-relative coefficients are set to zero for that prompt group.
+
+The gate fails closed: when the threshold cannot be resolved — no `profile_band` available for
+the channel (neither per-row nor global), an unknown channel name, or no eligible rollouts to
+average (e.g. `positive_only: true` and the whole group scored 0) — group-relative scaling is
+disabled for that prompt group. The verbose per-group logs record the reason
+(`missing_profile_limit`, `unknown_channel`, `no_lengths`, `mean_le_limit`, `mean_gt_limit`).
 
 `group_length_penalty_profile_gate_positive_only` only affects the gate decision. It does not
 change the rollouts that receive the group-relative adjustment after the gate opens. In the
