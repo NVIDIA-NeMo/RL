@@ -30,8 +30,8 @@ from nemo_rl.data.multimodal_utils import (
     IMAGE_CONTENT_TYPES,
     VIDEO_CONTENT_TYPES,
     PackedTensor,
-    extract_multimodal_model_inputs,
     extract_input_media_sources_from_responses_messages,
+    extract_multimodal_model_inputs,
     get_dim_to_pack_along,
     get_responses_content_part_url,
     image_to_data_url,
@@ -60,11 +60,8 @@ _NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS = 8
 
 def _encode_single_image_source(source: str) -> str:
     """Resolve, encode, and close one local image source."""
-    image = resolve_to_image(source)
-    try:
+    with resolve_to_image(source) as image:
         return image_to_data_url(image)
-    finally:
-        image.close()
 
 
 def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
@@ -101,7 +98,11 @@ def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
                     continue
 
                 present_keys = [key for key in source_keys if key in part]
-                if not present_keys and part_type == "input_image" and "file_id" in part:
+                if (
+                    not present_keys
+                    and part_type == "input_image"
+                    and "file_id" in part
+                ):
                     continue
                 if len(present_keys) != 1:
                     raise ValueError(
@@ -109,7 +110,9 @@ def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
                     )
 
                 source = part[present_keys[0]]
-                nested_detail = source.get("detail") if isinstance(source, dict) else None
+                nested_detail = (
+                    source.get("detail") if isinstance(source, dict) else None
+                )
                 url = (
                     source.get("url") or source.get("path", "")
                     if isinstance(source, dict)

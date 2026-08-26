@@ -1528,6 +1528,113 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
     asyncio.run(_run())
 
 
+@pytest.mark.parametrize("modality", ["image", "video"])
+def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
+    """Round-trip normalized media and a mocked Megatron HTTP response through Gym."""
+
+    async def _run():
+        if modality == "image":
+            media_path = tmp_path / "clevr.png"
+            Image.new("RGB", (2, 2), color="red").save(media_path)
+            media_part = {"type": "input_image", "image_url": str(media_path)}
+            expected_prefix = "data:image/png;base64,"
+        else:
+            media_path = tmp_path / "vstat.mp4"
+            media_path.write_bytes(b"toy-video")
+            media_part = {"type": "input_video", "video_url": str(media_path)}
+            expected_prefix = "data:video/mp4;base64,"
+
+        row = {
+            "_rowidx": 3,
+            "agent_ref": {"name": "mock-megatron-agent"},
+            "responses_create_params": {
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            media_part,
+                            {"type": "input_text", "text": "What is shown?"},
+                        ],
+                    }
+                ]
+            },
+        }
+
+        class _Tokenizer:
+            def batch_decode(self, batches):
+                return [" ".join(map(str, token_ids)) for token_ids in batches]
+
+        class _RolloutCollectionHelper:
+            def run_examples(self, examples, head_server_config):
+                assert head_server_config.backend == "megatron"
+                dispatched_row = examples[0]
+                dispatched_part = dispatched_row["responses_create_params"]["input"][0][
+                    "content"
+                ][0]
+                media_url = dispatched_part[f"{modality}_url"]
+                assert media_url.startswith(expected_prefix)
+
+                mocked_result = {
+                    "responses_create_params": {
+                        "input": deepcopy(
+                            dispatched_row["responses_create_params"]["input"]
+                        )
+                    },
+                    "response": {
+                        "agent_input": deepcopy(
+                            dispatched_row["responses_create_params"]["input"]
+                        ),
+                        "output": [
+                            {
+                                "type": "message",
+                                "prompt_token_ids": [10, 99, 20],
+                                "generation_token_ids": [71, 72],
+                                "generation_log_probs": [-0.25, -0.5],
+                            }
+                        ],
+                    },
+                }
+
+                async def _completed_result():
+                    return dispatched_row, mocked_result
+
+                return [_completed_result()]
+
+        class _MockSelf:
+            cfg = {}
+            rch = _RolloutCollectionHelper()
+            head_server_config = SimpleNamespace(backend="megatron")
+            _tokenizer = _Tokenizer()
+            _processor = None
+
+            def _require_spinup(self):
+                pass
+
+        streamed = []
+        async for item in NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            _MockSelf(), [row], "test"
+        ):
+            streamed.append(item)
+
+        row_index, result, _metrics = streamed[0]
+        assert row_index == 3
+        assert [message["role"] for message in result["message_log"]] == [
+            "user",
+            "assistant",
+        ]
+        assert result["message_log"][0]["token_ids"].tolist() == [10, 99, 20]
+        assert result["message_log"][1]["token_ids"].tolist() == [71, 72]
+        assert result["message_log"][1]["generation_logprobs"].tolist() == [
+            -0.25,
+            -0.5,
+        ]
+        assert result["full_result"]["response"]["output"][0]["generation_str"] == (
+            "71 72"
+        )
+
+    asyncio.run(_run())
+
+
 def test_nemo_gym_postprocess_no_generation_data_raises():
     """When no output item carries generation data, the postprocess should raise a
     ValueError that reports the prompt length and the response.output item types."""

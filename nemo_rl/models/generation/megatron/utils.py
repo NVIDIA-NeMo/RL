@@ -42,18 +42,24 @@ def build_image_preprocessing_config(
     pixel_mean = read("norm_mean", "image_mean")
     pixel_std = read("norm_std", "image_std")
 
-    missing = [
-        name
-        for name, value in (
-            ("patch_size", patch_dim),
-            ("min_num_patches", min_patches),
-            ("max_num_patches", max_patches),
-            ("norm_mean", pixel_mean),
-            ("norm_std", pixel_std),
-        )
-        if value is None
-    ]
-    if missing:
+    if (
+        patch_dim is None
+        or min_patches is None
+        or max_patches is None
+        or pixel_mean is None
+        or pixel_std is None
+    ):
+        missing = [
+            name
+            for name, value in (
+                ("patch_size", patch_dim),
+                ("min_num_patches", min_patches),
+                ("max_num_patches", max_patches),
+                ("norm_mean", pixel_mean),
+                ("norm_std", pixel_std),
+            )
+            if value is None
+        ]
         raise ValueError(
             f"{type(image_processor).__name__} does not expose {', '.join(missing)}, "
             "so MCore cannot preprocess raw images the way this model's data "

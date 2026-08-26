@@ -1064,6 +1064,7 @@ _VIDEO_EXT_TO_MIME = {
     ".avi": "x-msvideo",
 }
 
+
 def video_path_to_data_url(video_path: str) -> str:
     """Inline a local or ``file://`` video as a base64 data URL."""
     if video_path.startswith("data:"):
