@@ -1041,7 +1041,7 @@ class TestDataPlaneCheckpoint:
 
         assert not (tmp_path / "checkpoints" / "step_1").exists()
 
-    def test_gated_sampler_keeps_tq_checkpoint_in_shadow_mode(self, tmp_path):
+    def test_gated_sampler_writes_authoritative_tq_checkpoint(self, tmp_path):
         mc = _actor_master_config(
             tmp_path,
             max_num_steps=1,
@@ -1057,11 +1057,11 @@ class TestDataPlaneCheckpoint:
             _make_actor_args(dp_client=dp_client, tq_buffer=buffer),
         )
 
-        assert dp_client.save_calls[0]["metadata"]["mode"] == "shadow"
+        assert dp_client.save_calls[0]["metadata"]["mode"] == "authoritative"
         step_dir = tmp_path / "checkpoints" / "step_1"
-        assert not (step_dir / REPLAY_BUFFER_METADATA_FILENAME).exists()
+        assert (step_dir / REPLAY_BUFFER_METADATA_FILENAME).exists()
         assert not (step_dir / "replay_buffer.pt").exists()
-        assert buffer.metadata_state_dict_calls == []
+        assert buffer.metadata_state_dict_calls == [4]
 
     def test_tq_save_failure_aborts_checkpoint(self, tmp_path):
         mc = _actor_master_config(
@@ -1092,7 +1092,9 @@ class TestDataPlaneCheckpoint:
             )
             actor._train_steps = 1
             actor._trainer_version = 1
-            save_task = asyncio.create_task(actor._save_checkpoint({"loss": 1.0}))
+            save_task = asyncio.create_task(
+                actor._save_checkpoint({"loss": 1.0}, is_policy_training_step=True)
+            )
             started = await asyncio.to_thread(dp_client.save_started.wait, 30.0)
             assert started
 
@@ -1226,6 +1228,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
 
     actor._save_state = SimpleNamespace()
     actor._train_steps = 1
+    actor._trainer_version = 1
     actor._current_epoch = 0
     actor._consumed_samples = 0
     actor._total_valid_tokens = 0
@@ -1234,7 +1237,11 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
         sampler=SimpleNamespace(name="in_order"),
         max_buffered_rollouts=4,
     )
-    actor._master_config = SimpleNamespace(checkpointing={"metric_name": None})
+    actor._sampler = _FakeSampler()
+    actor._master_config = SimpleNamespace(
+        checkpointing={"metric_name": None},
+        data_plane={"checkpointing_enabled": False},
+    )
     actor._dataloader = SimpleNamespace(state_dict=lambda: {})
     actor._buffer = SimpleNamespace(state_dict=AsyncMock(return_value={}))
     actor._checkpointer = MagicMock()
@@ -1409,7 +1416,12 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
     checkpointing block setup now reads.
     """
     return MasterConfig.model_construct(
-        data_plane={"enabled": True, "impl": "transfer_queue"},
+        data_plane={
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "simple",
+            "checkpointing_enabled": True,
+        },
         data={
             "use_multiple_dataloader": False,
             "shuffle": False,
@@ -2015,25 +2027,19 @@ class TestReplacementReservePersistence:
 
         assert list(actor._replacement_reserve) == ["spare0", "spare1"]
 
-    def test_run_restores_the_pool_even_when_the_buffer_restore_is_skipped(
-        self, tmp_path
-    ):
-        """The sampler guard that protects the buffer must not cover the pool.
+    def test_run_restores_the_pool_when_replay_metadata_is_absent(self, tmp_path):
+        """An empty replay restore must not suppress the independent spare pool.
 
         Spares never reached `admit`, so they carry no target-step stamp and nothing
-        about them depends on which sampler wrote the checkpoint. Skipping them here
-        would strand the batch permanently for the one case -- a sampler change on
-        resume -- where the operator is least likely to look for it.
+        about them depends on replay metadata. Skipping them here would strand the
+        batch permanently even though starting with an empty replay index is valid.
         """
         ckpt_dir = tmp_path / "resume_ckpt"
         ckpt_dir.mkdir()
-        torch.save({"groups": []}, ckpt_dir / "replay_buffer.pt")
         # One spare is less than num_prompts_per_step, so the full run() path here
         # holds it back rather than draining it, and the pool is still observable.
         torch.save(["spare0"], ckpt_dir / "replacement_reserve.pt")
         mc = _actor_master_config(tmp_path, max_num_steps=0)
-        save_state = _initial_grpo_save_state()
-        save_state.sampler_name = "in_order"  # current run uses windowed
         buffer = _FakeTQBuffer(load_return=2)
 
         actor, _ = _run_actor_run(
@@ -2041,7 +2047,7 @@ class TestReplacementReservePersistence:
             _make_actor_args(
                 tq_buffer=buffer,
                 last_checkpoint_path=str(ckpt_dir),
-                save_state=save_state,
+                save_state=_matching_save_state(),
             ),
         )
 
