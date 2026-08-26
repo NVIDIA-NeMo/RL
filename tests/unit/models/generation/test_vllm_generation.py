@@ -685,7 +685,7 @@ def test_nvfp4_pertoken_accepts_qwen3_all_moe_layout():
 
 def test_main_worker_configures_nvfp4_pertoken_engine_kwargs(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_worker
-    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
         DEFAULT_NVFP4_IGNORE,
     )
 
@@ -2071,6 +2071,7 @@ def test_vllm_http_server(cluster, tokenizer):
         d["choices"][0]["logprobs"]["content"][0].pop("logprob")
 
         # Remove version-dependent fields that vLLM may or may not include
+        d.pop("ec_transfer_params", None)
         message = d["choices"][0]["message"]
         for key in ("reasoning", "reasoning_content"):
             message.pop(key, None)

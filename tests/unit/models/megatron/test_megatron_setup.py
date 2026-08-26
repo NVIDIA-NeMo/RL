@@ -1543,7 +1543,7 @@ class TestApplyPerformanceConfig:
 
         recipe_path = (
             Path(__file__).resolve().parents[4]
-            / "examples/configs/te_precision/attn_bf16_mlp_nvfp4.yaml"
+            / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
         )
         model_cfg = SimpleNamespace()
         apply_te_precision_config(
