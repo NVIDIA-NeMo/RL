@@ -83,6 +83,169 @@ def _patch_sglang_safe_unpickler() -> None:
     logger.info("Patched SafeUnpickler allowlist in %s.", file_to_patch)
 
 
+def _patch_sglang_non_gated_fp8_moe() -> None:
+    """Backport sglang#36097 for MXFP8/NVFP4 non-gated MoE models.
+
+    The pinned ``sglang-miles`` revision always sizes the fused ``w13``
+    buffers for a gated MoE. Nemotron-H uses one non-gated projection, so the
+    extra uninitialized shard either fails TP loading or silently corrupts the
+    expert weights. This is the source-compatible part of upstream commit
+    ``46d9427b913b20ce0d72b95a9209717448b37368``.
+    """
+    file_to_patch = _get_sglang_file("srt/layers/quantization/fp8.py")
+
+    with open(file_to_patch, "r") as f:
+        content = f.read()
+
+    sentinel = "w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1"
+    if sentinel in content:
+        return
+
+    replacements = (
+        (
+            "        tp_size = get_parallel().tp_size\n\n",
+            f"        tp_size = get_parallel().tp_size\n        {sentinel}\n\n",
+            1,
+        ),
+        (
+            "            is_concat=True,\n",
+            "            is_concat=layer.moe_runner_config.is_gated,\n",
+            1,
+        ),
+        (
+            "        if self.with_bias:\n"
+            "            w13_up_dim = (\n"
+            "                2 * intermediate_size_per_partition\n"
+            "                if layer.moe_runner_config.is_gated\n"
+            "                else intermediate_size_per_partition\n"
+            "            )\n"
+            "            w13_weight_bias = torch.nn.Parameter(\n"
+            "                torch.empty(num_experts, w13_up_dim, dtype=torch.float32),\n",
+            "        if self.with_bias:\n"
+            "            w13_weight_bias = torch.nn.Parameter(\n"
+            "                torch.empty(\n"
+            "                    num_experts,\n"
+            "                    w13_num_shards * intermediate_size_per_partition,\n"
+            "                    dtype=torch.float32,\n"
+            "                ),\n",
+            1,
+        ),
+        (
+            "2 * intermediate_size_per_partition",
+            "w13_num_shards * intermediate_size_per_partition",
+            5,
+        ),
+        (
+            "2 * ((intermediate_size_per_partition + block_n - 1) // block_n)",
+            "w13_num_shards\n"
+            "                    * ((intermediate_size_per_partition + block_n - 1) // block_n)",
+            1,
+        ),
+        (
+            "            # Allocate 2 scales for w1 and w3 respectively.\n"
+            "            # They will be combined to a single scale after weight loading.\n"
+            "            w13_weight_scale = torch.nn.Parameter(\n"
+            "                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False\n"
+            "            )\n",
+            "            # One scale per w13 shard; a gated layer combines its two into a\n"
+            "            # single scale after weight loading.\n"
+            "            w13_weight_scale = torch.nn.Parameter(\n"
+            "                torch.ones(num_experts, w13_num_shards, dtype=torch.float32),\n"
+            "                requires_grad=False,\n"
+            "            )\n",
+            1,
+        ),
+        (
+            "            assert layer.w13_weight_scale is not None\n"
+            "            shard_size = layer.intermediate_size_per_partition\n"
+            "            max_w13_scales = layer.w13_weight_scale.max(dim=1).values\n"
+            "            for expert_id in range(layer.num_local_experts):\n"
+            "                start = 0\n"
+            "                for shard_id in range(2):\n"
+            "                    dq_weight = per_tensor_dequantize(\n"
+            "                        layer.w13_weight[expert_id][start : start + shard_size, :],\n"
+            "                        layer.w13_weight_scale[expert_id][shard_id],\n"
+            "                    )\n"
+            "                    (\n"
+            "                        layer.w13_weight[expert_id][start : start + shard_size, :],\n"
+            "                        _,\n"
+            "                    ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])\n"
+            "                    start += shard_size\n",
+            "            assert layer.w13_weight_scale is not None\n"
+            f"            {sentinel}\n"
+            "            shard_size = layer.intermediate_size_per_partition\n"
+            "            max_w13_scales = layer.w13_weight_scale.max(dim=1).values\n"
+            "            # A single shard already carries one scale per expert; nothing to fuse.\n"
+            "            if w13_num_shards > 1:\n"
+            "                for expert_id in range(layer.num_local_experts):\n"
+            "                    start = 0\n"
+            "                    for shard_id in range(w13_num_shards):\n"
+            "                        dq_weight = per_tensor_dequantize(\n"
+            "                            layer.w13_weight[expert_id][\n"
+            "                                start : start + shard_size, :\n"
+            "                            ],\n"
+            "                            layer.w13_weight_scale[expert_id][shard_id],\n"
+            "                        )\n"
+            "                        (\n"
+            "                            layer.w13_weight[expert_id][\n"
+            "                                start : start + shard_size, :\n"
+            "                            ],\n"
+            "                            _,\n"
+            "                        ) = scaled_fp8_quant(\n"
+            "                            dq_weight, max_w13_scales[expert_id]\n"
+            "                        )\n"
+            "                        start += shard_size\n",
+            1,
+        ),
+        (
+            "        assert layer.w13_weight_scale is not None\n"
+            "        shard_size = layer.intermediate_size_per_partition\n"
+            "        max_w13_scales = layer.w13_weight_scale.max(dim=1).values\n",
+            "        assert layer.w13_weight_scale is not None\n"
+            f"        {sentinel}\n"
+            "        shard_size = layer.intermediate_size_per_partition\n"
+            "        max_w13_scales = layer.w13_weight_scale.max(dim=1).values\n",
+            1,
+        ),
+        (
+            "            for shard_id in range(2):\n"
+            "                if layer.w13_weight_scale[expert_id][shard_id] != max_w13_scale_fp8:\n",
+            "            for shard_id in range(w13_num_shards):\n"
+            "                if layer.w13_weight_scale[expert_id][shard_id] != max_w13_scale_fp8:\n",
+            1,
+        ),
+        (
+            "        intermediate_size_per_partition = layer.intermediate_size_per_partition\n\n"
+            "        self.ab_strides1 = torch.full(\n",
+            "        intermediate_size_per_partition = layer.intermediate_size_per_partition\n"
+            f"        {sentinel}\n\n"
+            "        self.ab_strides1 = torch.full(\n",
+            1,
+        ),
+    )
+
+    for anchor, replacement, expected_count in replacements:
+        actual_count = content.count(anchor)
+        if actual_count != expected_count:
+            raise RuntimeError(
+                "SGLang non-gated FP8 MoE compat-patch anchor mismatch in "
+                f"{file_to_patch}: expected {expected_count}, found {actual_count} "
+                f"for {anchor[:80]!r}."
+            )
+        content = content.replace(anchor, replacement)
+
+    _write_and_verify(
+        file_to_patch,
+        content,
+        (
+            sentinel,
+            "is_concat=layer.moe_runner_config.is_gated",
+            "for shard_id in range(w13_num_shards)",
+        ),
+    )
+    logger.info("Patched non-gated FP8 MoE weight sizing in %s.", file_to_patch)
+
+
 def _override_sglang_imbalance_check_env() -> None:
     """Force-disable sglang's per-GPU memory imbalance check.
 
@@ -173,6 +336,7 @@ def _patch_megatron_training_hook_mode() -> None:
 
 def _apply_sglang_compat_patches() -> None:
     _patch_sglang_safe_unpickler()
+    _patch_sglang_non_gated_fp8_moe()
     _override_sglang_imbalance_check_env()
     _patch_megatron_dynamic_context_hook_mode()
     _patch_megatron_training_hook_mode()
