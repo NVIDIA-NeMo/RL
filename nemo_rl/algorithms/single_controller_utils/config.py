@@ -728,10 +728,9 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     """
     algo_cfg = algo_config(master_config)
 
-    # An enabled one here describes shaping this run does not do. reward_scaling
-    # is off this list because _advantage_stage now applies it through the same
-    # scale_rewards helper grpo.py uses -- rejecting a knob is only right while
-    # nobody implements it.
+    # An enabled one here describes shaping this run does not do. An entry
+    # leaves this list when the SC path starts implementing it -- rejecting a
+    # knob is only right while nobody honours it.
     unsupported = [
         name
         for name, enabled in (
