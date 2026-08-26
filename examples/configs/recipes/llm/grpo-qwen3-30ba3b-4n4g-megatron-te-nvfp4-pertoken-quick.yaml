@@ -1,6 +1,6 @@
 defaults: performance/grpo-qwen3-30ba3b-4n4g.yaml
 grpo:
-  max_num_steps: 2
+  max_num_steps: 20
   num_prompts_per_step: 8
   num_generations_per_prompt: 2
 checkpointing:
