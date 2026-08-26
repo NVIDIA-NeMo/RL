@@ -929,8 +929,8 @@ class AsyncTrajectoryCollector:
         self._manual_pause_cleared.set()  # Signal collection to resume
         print("Trajectory collection resumed")
 
-    def _uses_vllm_native_pause_for_refit(self) -> bool:
-        """Whether refit should preserve requests with vLLM's native pause API."""
+    def _vllm_inflight_weight_update(self) -> bool:
+        """Whether refit uses vLLM's in-flight weight-update path."""
         generation_cfg = self.master_config.policy.get("generation", {})
         return (
             generation_cfg.get("backend") == "vllm"
@@ -982,7 +982,7 @@ class AsyncTrajectoryCollector:
         in_flight_weight_updates = self.async_config.in_flight_weight_updates
 
         if is_async_engine and in_flight_weight_updates:
-            if self._uses_vllm_native_pause_for_refit():
+            if self._vllm_inflight_weight_update():
                 clear_cache = self.async_config.recompute_kv_cache_after_weight_updates
                 print(
                     "⏸️ Pausing vLLM generation with in-flight request state preserved"
@@ -1014,7 +1014,7 @@ class AsyncTrajectoryCollector:
         """Resume new generation starts after refit is complete."""
         print("🔄 Resuming generation starts after refit")
 
-        if self._uses_vllm_native_pause_for_refit():
+        if self._vllm_inflight_weight_update():
             print("▶️ Resuming vLLM generation after refit")
             if not self.policy_generation.resume_generation():
                 raise RuntimeError("Failed to resume vLLM generation after refit")
