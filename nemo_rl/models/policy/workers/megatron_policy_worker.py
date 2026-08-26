@@ -785,6 +785,7 @@ class MegatronPolicyWorkerImpl(
             "check_dim_skip_keys is only supported by the v2 DTensor worker; "
             "Megatron does not run cross-tokenizer distillation."
         )
+        self._assert_model_onloaded("train", "prepare_for_training")
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
@@ -1858,6 +1859,7 @@ class MegatronPolicyWorkerImpl(
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        self._assert_model_onloaded("get_logprobs", "prepare_for_lp_inference")
         self.timer.start("get_logprobs")
         no_grad = torch.no_grad()
         no_grad.__enter__()
@@ -2082,6 +2084,7 @@ class MegatronPolicyWorkerImpl(
                 - topk_logits: Tensor of top-k logits for each position in the sequence
                 - topk_indices: Tensor of top-k indices for each position in the sequence
         """
+        self._assert_model_onloaded("get_topk_logits", "prepare_for_lp_inference")
         no_grad = torch.no_grad()
         no_grad.__enter__()
 

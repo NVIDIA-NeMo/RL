@@ -148,10 +148,17 @@ class PolicyInterface(ABC):
 
     @abstractmethod
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
+        """Onload the model and optimizer state to GPU so training can run.
+
+        Call this before :meth:`train`. Implementations offload parameters to
+        CPU between phases, so skipping it leaves them on CPU while the training
+        step assumes CUDA.
+        """
         pass
 
     @abstractmethod
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
+        """Release training-only state after a :meth:`train` phase completes."""
         pass
 
     @abstractmethod
@@ -274,7 +281,12 @@ class ColocatablePolicyInterface(PolicyInterface):
 
     @abstractmethod
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
-        """Put the policy in eval mode for logprob inference.
+        """Onload the model and put the policy in eval mode for logprob inference.
+
+        Call this before :meth:`get_logprobs`, :meth:`get_reference_policy_logprobs`,
+        :meth:`get_topk_logits`, or :meth:`score`. As with
+        :meth:`prepare_for_training`, parameters are offloaded to CPU between
+        phases and must be onloaded again first.
 
         Args:
             keep_train_buffers: Leave grad buffers and optimizer state on CUDA
