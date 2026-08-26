@@ -9,14 +9,14 @@ It is **off by default**. Set `async_rl.generation_fleet_health.enabled: true` t
 
 ## What is supported
 
-Be aware of these limits before enabling it.
+Know these limits before enabling it.
 
 **Weight-sync transports** — only the two that own an NCCL world can rebuild one:
 
 | `policy.generation.refit_transport` | Recovers a lost shard |
 |---|---|
 | `collective` (packed broadcast) | ✅ full |
-| `nccl_reshard` | ⚠️ dead process only — see [the wedged case](#a-wedged-engine-is-different) |
+| `nccl_reshard` | ⚠️ dead process only — see [A wedged engine is different](#a-wedged-engine-is-different) |
 | colocated IPC, HTTP, checkpoint-engine, `vllm_remote_sparse` | ❌ no communicator to rebuild |
 
 **Generation backends** — only vLLM implements the fleet-health hooks:
@@ -33,48 +33,26 @@ sharded for, so there is nothing to recover onto. This feature is about generati
 ## Who watches what
 
 One ledger, `GenerationFleetHealth`, holds a state per shard. It lives in the
-SingleController process and no GPU worker ever writes to it.
+SingleController process, and no GPU worker ever writes to it.
 
-```mermaid
-flowchart LR
-    subgraph SC["SingleController process (no GPU)"]
-        LEDGER["GenerationFleetHealth<br/>state per shard"]
-        PROBE["probe loop<br/>every probe_interval_s"]
-        REFIT["weight sync<br/>reconcile then refit"]
-        PICK["shard selection<br/>and router push"]
-    end
-    GEN["generation shards<br/>Ray actors, GPU"]
-
-    PROBE -->|"is_alive()"| GEN
-    PROBE -->|"record_probe / record_actor_death"| LEDGER
-    GEN -.->|"a request fails or times out<br/>report_failure / report_success"| LEDGER
-    LEDGER -->|"serving_shards()"| PICK
-    LEDGER -->|"absent_shards()"| REFIT
-    REFIT -->|"rebuild over survivors"| GEN
-```
-
-Two things are worth knowing about that picture:
-
-- **`is_alive()` is answered by the Ray actor, not the engine.** It proves the process
-  exists. It cannot see an engine that has stopped generating.
-- **A shard is dropped from the refit only when its process is gone or restarting.**
-  `SUSPECT` (failing, not yet condemned) and `STALE` (restarted, holding old weights) both
-  still take part — a `STALE` shard is refit precisely so it stops being stale.
+![The fleet-health ledger: what writes it, what reads it, and the two states that surprise people](../assets/sc-fault-tolerance-ledger.png)
 
 ## What happens when a shard fails
 
 Two things decide the outcome: what the ledger already thought of the shard when the sync
 began, and how the sync then went.
 
+![Shard state before the sync crossed with how the sync went, showing which combinations recover and which end the run](../assets/sc-fault-tolerance-grid.png)
+
 | Shard state | Refit | Outcome | Why |
 |---|---|---|---|
-| `HEALTHY` | succeeds | continues | The ordinary step. |
-| `HEALTHY` | hangs | **run ends** | Every process is alive and nothing was suspect, so there is nobody to drop. Guessing would condemn a healthy shard and leave the real culprit in the group. |
-| `HEALTHY` | crashes | recovers | The crash names the shard. Mark it dead, rebuild without it, retry once. |
-| `SUSPECT` | succeeds | continues | A wedged engine can still do NCCL. It keeps failing generations and reaches `DEAD` on its own. |
-| `SUSPECT` | hangs | depends | The one suspect is condemned, the group shrinks, retry once. Works on `collective`; ends the run on `nccl_reshard`. |
-| `SUSPECT` | crashes | recovers | The dead process is visible, so no attribution is needed. |
-| `DEAD` | any | continues | Already excluded before the collective started, so it cannot affect this refit at all. |
+| `HEALTHY` | succeeds | ✅ continues | The ordinary step. |
+| `HEALTHY` | hangs | 🛑 run ends | Every process is alive and nothing was suspect, so there is nobody to drop. Guessing would condemn a healthy shard and leave the real culprit in the group. |
+| `HEALTHY` | crashes | ✅ recovers | The crash names the shard. Mark it dead, rebuild without it, retry once. |
+| `SUSPECT` | succeeds | ✅ continues | A wedged engine can still do NCCL. It keeps failing generations and reaches `DEAD` on its own. |
+| `SUSPECT` | hangs | ⚠️ depends | The one suspect is condemned, the group shrinks, retry once. Works on `collective`; ends the run on `nccl_reshard`. |
+| `SUSPECT` | crashes | ✅ recovers | The dead process is visible, so no attribution is needed. |
+| `DEAD` | any | ✅ continues | Already excluded before the collective started, so it cannot affect this refit at all. |
 
 Recovery is **rebuild, then retry once** — and the rebuild needs a shard to drop. That is
 why a crash recovers and a hang only recovers when the ledger already held a suspect.
@@ -113,5 +91,5 @@ refit takes seconds, so the default leaves a wide margin.
 
 ## Related
 
-- [Single-Controller (Async GRPO)](single-controller.md) — the surrounding execution model
-- [Weight Refit](refit.md) — choosing a refit transport
+- [Single-Controller (Async GRPO)](../guides/single-controller.md) — the surrounding execution model
+- [Weight Refit](../guides/refit.md) — choosing a refit transport

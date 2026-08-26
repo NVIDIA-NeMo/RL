@@ -198,13 +198,6 @@ Use NIXL checkpoint-engine refit to update non-colocated vLLM generation workers
 Run async GRPO via the SingleController path: TransferQueue data plane, pluggable staleness samplers, and streaming trainer.
 :::
 
-:::{grid-item-card} {octicon}`shield-check` Generation Fault Tolerance
-:link: guides/single-controller-fault-tolerance
-:link-type: doc
-
-Keep training when a generation shard dies: which transports and backends support it, and what happens in each failure case.
-:::
-
 ::::
 
 ## Advanced Topics
@@ -217,6 +210,13 @@ Keep training when a generation shard dies: which transports and backends suppor
 :link-type: doc
 
 Deep dive into NeMo RL's architecture, APIs, and design decisions for scalable RL.
+:::
+
+:::{grid-item-card} {octicon}`shield-check` Generation Fault Tolerance
+:link: design-docs/single-controller-fault-tolerance
+:link-type: doc
+
+Keep training when a generation shard dies: which transports and backends support it, and what happens in each failure case.
 :::
 
 :::{grid-item-card} {octicon}`bug` Debugging
@@ -325,7 +325,6 @@ guides/models/index.md
 model-quirks.md
 guides/async-grpo.md
 guides/single-controller.md
-guides/single-controller-fault-tolerance.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
@@ -379,6 +378,7 @@ design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md
 design-docs/nccl-reshard-refit.md
+design-docs/single-controller-fault-tolerance.md
 design-docs/media-token-validity-mask.md
 ```
 
