@@ -96,8 +96,7 @@ The recipe is DAPO-style GRPO on DAPO-Math-17K with AIME-2024 validation,
 AutoModel (DTensor) training with colocated vLLM generation, on 8 nodes x 8 GPUs.
 Recipe YAML files under `examples/configs/recipes/` are the source of truth.
 
-The YAML defaults to the currently validated 4k launch configuration. A 9k
-configuration may run out of memory.
+The YAML defaults to the currently validated 4k launch configuration.
 
 | Validated seq | Training EP | Rollout TP/EP | `max_new_tokens` | Recipe |
 |---|---|---|---|---|
@@ -152,5 +151,3 @@ uv run examples/run_grpo.py --config <recipe> cluster.num_nodes=8
 ## Known Issues
 
 - **Long-run convergence is not validated.** Current evidence covers short runs only.
-- **The 9k configuration may OOM.** Use the default 4k recipe unless
-  additional memory headroom has been established for the target system.
