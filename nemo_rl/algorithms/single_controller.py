@@ -1382,6 +1382,14 @@ class SingleControllerActor:
                         inflight_count_released = True
                         sem.release()
                         generation_permit_released = True
+                        if request is None:
+                            # Dropped within the infra budget: nothing was
+                            # committed, so the train pump will never release
+                            # this permit, and the step it was stamped for
+                            # must be allowed to close short.
+                            self._buffer_capacity.release()
+                            self._credit_shortfall(target_step)
+                            return
                         await self._finalize_with_actor(request)
                         ownership_transferred = True
                     except BaseException:
