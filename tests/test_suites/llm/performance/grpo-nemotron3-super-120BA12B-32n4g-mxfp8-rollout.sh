@@ -3,12 +3,11 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 # disable NVLS to avoid OOM issue
 export NCCL_NVLS_ENABLE=0
-export RAY_CGRAPH_get_timeout=2400
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=32
 GPUS_PER_NODE=4
-SEGMENT_SIZE=16
+SEGMENT_SIZE=8     # nodes per NVLink-domain segment; tools/launch passes it as sbatch --segment. Matches cluster.segment_size in the yaml.
 STEPS_PER_RUN=10
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
@@ -30,7 +29,6 @@ uv run examples/run_grpo.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
-    +policy.generation.vllm_kwargs.distributed_timeout_seconds=2400 \
     $@ \
     2>&1 | tee $RUN_LOG
 
