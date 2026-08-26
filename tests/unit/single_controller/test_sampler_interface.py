@@ -187,9 +187,9 @@ class TestFactory:
         ("config", "expected"),
         [
             (WindowedSamplerConfig(), True),
-            (ReadyFirstSamplerConfig(), False),
-            (WeightFifoSamplerConfig(), False),
-            (InOrderSamplerConfig(), False),
+            (ReadyFirstSamplerConfig(), True),
+            (WeightFifoSamplerConfig(), True),
+            (InOrderSamplerConfig(), True),
             (
                 CustomSamplerConfig(target=f"{__name__}:EchoSampler"),
                 False,
@@ -531,20 +531,19 @@ class TestDefaultEvictSkipsUnready:
 
 
 class TestDispatchCursorRestore:
-    """Checkpoint resume calls set_dispatch_index(current_step), restoring the
-    fresh-start invariant _dispatch_index == trainer_version - 1. Without it,
-    a restored InOrderSampler would stamp target_steps starting at 0 and every
-    dispatched batch would be instantly evicted (target < trainer_version)."""
+    """Checkpoint resume restores the exact last admitted dispatch batch."""
 
-    def test_resumed_in_order_stamps_from_trainer_version(self):
+    def test_resumed_in_order_stamps_after_exact_cursor(self):
         s = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
-        s.set_dispatch_index(7)
+        s.restore_dispatch_index(6)
+        assert s.dispatch_index == 6
         assert _run(s.admit(trainer_version_fn=lambda: 7)) == 7
         assert _run(s.admit(trainer_version_fn=lambda: 8)) == 8
+        assert s.dispatch_index == 8
 
     def test_resumed_gate_admits_window_then_blocks(self):
         s = WeightFifoSampler(FakeBuffer(), max_staleness_versions=0)
-        s.set_dispatch_index(7)
+        s.restore_dispatch_index(6)
         # Resumed at step 7, window 0: one batch admitted, then the gate
         # closes exactly as it would on a fresh run at step 0.
         assert _run(s.admit(trainer_version_fn=lambda: 7)) is None
@@ -556,13 +555,13 @@ class TestDispatchCursorRestore:
         s.set_dispatch_index(0)
         assert _run(s.admit(trainer_version_fn=lambda: 0)) == 0
 
-    def test_negative_resume_step_rejected(self):
-        with pytest.raises(ValueError, match="resume_from_trainer_version"):
-            WindowedSampler(FakeBuffer(), max_staleness_versions=1).set_dispatch_index(
-                -1
-            )
+    def test_dispatch_index_below_initial_value_rejected(self):
+        with pytest.raises(ValueError, match="dispatch_index"):
+            WindowedSampler(
+                FakeBuffer(), max_staleness_versions=1
+            ).restore_dispatch_index(-2)
 
-    def test_custom_fqn_sampler_supports_seeding(self):
+    def test_custom_fqn_sampler_supports_exact_restore(self):
         from nemo_rl.algorithms.async_utils.staleness_sampler import (
             CustomSamplerConfig,
         )
@@ -573,7 +572,7 @@ class TestDispatchCursorRestore:
                 target=f"{__name__}:EchoSampler", max_lookahead_versions=1
             ),
         )
-        s.set_dispatch_index(6)
+        s.restore_dispatch_index(5)
         assert _run(s.admit(trainer_version_fn=lambda: 6)) == 6
 
 

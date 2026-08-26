@@ -117,8 +117,17 @@ class PromptGroupSampler(Protocol):
         """Buffer-capacity the policy needs, or ``None`` if unconstrained."""
         ...
 
+    @property
+    def dispatch_index(self) -> int:
+        """Last admitted dispatch batch index."""
+        ...
+
     def set_dispatch_index(self, resume_from_trainer_version: int) -> None:
-        """Seed the dispatch cursor when resuming from a checkpoint."""
+        """Seed the cursor for checkpoints that predate exact sampler state."""
+        ...
+
+    def restore_dispatch_index(self, dispatch_index: int) -> None:
+        """Restore the exact dispatch cursor from controller state."""
         ...
 
 
@@ -138,15 +147,17 @@ class BaseSampler(abc.ABC):
         # batch through a zero-staleness gate.
         self._dispatch_index: int = -1
 
+    @property
+    def dispatch_index(self) -> int:
+        """Return the last admitted dispatch batch index."""
+        return self._dispatch_index
+
     def set_dispatch_index(self, resume_from_trainer_version: int) -> None:
-        """Seed the dispatch cursor when resuming from a checkpoint.
+        """Seed the cursor for checkpoints that predate exact sampler state.
 
         Args:
-            resume_from_trainer_version: Trainer weight version this run starts
-                from — 0 for a fresh run, the restored trainer version when
-                resuming. Sets the cursor to one before that version so gated
-                ``admit`` and ``InOrderSampler`` target-step stamps line up with
-                the restored trainer version. Call before the first ``admit``.
+            resume_from_trainer_version: Trainer version from which the run
+                resumes. The next admitted batch receives that version.
         """
         if resume_from_trainer_version < 0:
             raise ValueError(
@@ -154,6 +165,19 @@ class BaseSampler(abc.ABC):
                 f"{resume_from_trainer_version}"
             )
         self._dispatch_index = resume_from_trainer_version - 1
+
+    def restore_dispatch_index(self, dispatch_index: int) -> None:
+        """Restore the exact dispatch cursor.
+
+        Args:
+            dispatch_index: Last admitted batch index, or ``-1`` when no batch
+                has been admitted. Call before the first ``admit``.
+        """
+        if dispatch_index < -1:
+            raise ValueError(
+                f"dispatch_index must be at least -1, got {dispatch_index}"
+            )
+        self._dispatch_index = dispatch_index
 
     # ── rollout-pump side ────────────────────────────────────────────────
     @abc.abstractmethod
@@ -375,6 +399,9 @@ class ReadyFirstSampler(_GatedSampler):
     rollout is ever discarded.
     """
 
+    # Committed groups retain start_weight, which is sufficient for selection.
+    supports_buffer_checkpoint: ClassVar[bool] = True
+
     def __init__(
         self,
         buffer: TQReplayBuffer,
@@ -412,6 +439,9 @@ class WeightFifoSampler(_GatedSampler):
     ``select`` drains the oldest in-window ``start_weight`` first and waits for
     that weight's batch to fill. Evict uses the weight window (default).
     """
+
+    # Committed groups retain start_weight, which is sufficient for selection.
+    supports_buffer_checkpoint: ClassVar[bool] = True
 
     def __init__(self, buffer: TQReplayBuffer, *, max_staleness_versions: int) -> None:
         super().__init__(buffer, gate_window=max_staleness_versions)
@@ -459,6 +489,10 @@ class InOrderSampler(_GatedSampler):
     so the widened lookahead does not turn into permanent extra staleness. Buffer
     capacity is sized for the peak of the two.
     """
+
+    # Committed groups retain target_step, which is sufficient for selection.
+    # The controller checkpoints the exact dispatch cursor separately.
+    supports_buffer_checkpoint: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -647,7 +681,12 @@ def sampler_supports_buffer_checkpoint(cfg: SamplerConfig) -> bool:
     else:
         raise ValueError(f"unknown sampler config {type(cfg).__name__}")
 
-    capability = getattr(sampler_cls, "supports_buffer_checkpoint", None)
+    if isinstance(cfg, CustomSamplerConfig):
+        # A custom subclass must opt in explicitly instead of inheriting a
+        # built-in sampler's capability declaration accidentally.
+        capability = sampler_cls.__dict__.get("supports_buffer_checkpoint", False)
+    else:
+        capability = getattr(sampler_cls, "supports_buffer_checkpoint", None)
     if not isinstance(capability, bool):
         raise TypeError(
             f"{sampler_cls.__name__}.supports_buffer_checkpoint must be a "
@@ -697,7 +736,8 @@ def create_sampler(
             raise TypeError(
                 f"{cfg.target} does not implement the PromptGroupSampler "
                 f"interface (needs admit/select/evict/should_abort_inflight, "
-                f"set_dispatch_index, is_on_policy, supports_buffer_checkpoint, "
+                f"dispatch_index, set_dispatch_index, restore_dispatch_index, "
+                f"is_on_policy, supports_buffer_checkpoint, "
                 f"required_buffer_capacity)"
             )
     else:

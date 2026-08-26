@@ -227,7 +227,13 @@ class SingleControllerActor:
         )
         num_prompts_per_step = self._algo_cfg.num_prompts_per_step
         self._sampler = create_sampler(self._buffer, self._async_cfg.sampler)
-        self._sampler.set_dispatch_index(restored_trainer_version)
+        restored_dispatch_index = actor_args.save_state.sampler_dispatch_index
+        if restored_dispatch_index is None:
+            # Checkpoints predating exact sampler state reconstruct the original
+            # fresh-step invariant from the restored trainer version.
+            self._sampler.set_dispatch_index(restored_trainer_version)
+        else:
+            self._sampler.restore_dispatch_index(restored_dispatch_index)
         if (
             self._master_config.checkpointing["enabled"]
             and self._sampler.supports_buffer_checkpoint
@@ -1860,8 +1866,9 @@ class SingleControllerActor:
         save_state.consumed_samples = self._consumed_samples
         save_state.total_valid_tokens = self._total_valid_tokens
         save_state.sampler_name = self._async_cfg.sampler.name
+        save_state.sampler_dispatch_index = self._sampler.dispatch_index
         # Snapshot before any await so it can't interleave with
-        # _rollout_pump iterating this same dataloader.
+        # _rollout_pump advancing either the sampler cursor or this dataloader.
         dataloader_state = self._dataloader.state_dict()
         # The spare pool has to be saved with that snapshot, not left out of the
         # checkpoint: diverting a batch already advanced the iterator, so the state

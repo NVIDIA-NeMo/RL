@@ -59,6 +59,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     WindowedSamplerConfig,
+    sampler_supports_buffer_checkpoint,
 )
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
@@ -173,6 +174,7 @@ class _FakeSampler:
     def __init__(self, supports_buffer_checkpoint: bool = True) -> None:
         self._supports_buffer_checkpoint = supports_buffer_checkpoint
         self._step = 0
+        self._dispatch_index = -1
 
     async def admit(self, *, trainer_version_fn) -> Optional[int]:
         return None
@@ -213,8 +215,15 @@ class _FakeSampler:
     def set_gate_window(self, gate_window: int) -> None:
         self.gate_window = gate_window
 
+    @property
+    def dispatch_index(self) -> int:
+        return self._dispatch_index
+
     def set_dispatch_index(self, resume_from_trainer_version: int) -> None:
-        pass
+        self._dispatch_index = resume_from_trainer_version - 1
+
+    def restore_dispatch_index(self, dispatch_index: int) -> None:
+        self._dispatch_index = dispatch_index
 
 
 class _ExhaustingSampler(_FakeSampler):
@@ -438,7 +447,7 @@ def _actor_master_config(
     num_prompts_per_step: int = 2,
     max_num_epochs: int = 1,
     buffer_checkpoint: bool = False,
-    data_plane_checkpoint: bool = False,
+    data_plane_checkpoint: bool = True,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
@@ -552,7 +561,9 @@ def _run_train_pump(
     async def _main():
         actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
         actor._sampler = _FakeSampler(
-            supports_buffer_checkpoint=(mc.async_rl.sampler.name == "windowed")
+            supports_buffer_checkpoint=sampler_supports_buffer_checkpoint(
+                mc.async_rl.sampler
+            )
         )
         if seed is not None:
             seed(actor)
@@ -659,7 +670,7 @@ class TestCounterRestore:
         assert actor._trainer_version == 7
         # The sampler dispatch cursor is seeded to preserve the fresh-start
         # invariant _dispatch_index == trainer_version - 1.
-        assert actor._sampler._dispatch_index == 6
+        assert actor._sampler.dispatch_index == 6
         assert actor._consumed_samples == 42
         assert actor._current_epoch == 2
         assert actor._total_valid_tokens == 1234
@@ -677,7 +688,22 @@ class TestCounterRestore:
 
         assert actor._train_steps == 7
         assert actor._trainer_version == 11
-        assert actor._sampler._dispatch_index == 10
+        assert actor._sampler.dispatch_index == 10
+
+    def test_restores_exact_sampler_dispatch_index(self, tmp_path):
+        save_state = _initial_grpo_save_state()
+        save_state.current_step = 7
+        save_state.trainer_version = 11
+        save_state.sampler_dispatch_index = 13
+
+        actor = _ACTOR_CLS(
+            _actor_master_config(tmp_path),
+            _make_actor_args(save_state=save_state),
+            SetupTimingMetrics(),
+        )
+
+        assert actor._trainer_version == 11
+        assert actor._sampler.dispatch_index == 13
 
     def test_fresh_start_defaults(self, tmp_path):
         actor = _ACTOR_CLS(
@@ -686,7 +712,7 @@ class TestCounterRestore:
 
         assert actor._train_steps == 0
         assert actor._trainer_version == 0
-        assert actor._sampler._dispatch_index == -1
+        assert actor._sampler.dispatch_index == -1
         assert actor._consumed_samples == 0
         assert actor._current_epoch == 0
         assert actor._total_valid_tokens == 0
@@ -710,7 +736,7 @@ class TestCounterRestore:
         )
 
         assert actor._train_steps == 5
-        assert actor._sampler._dispatch_index == 4
+        assert actor._sampler.dispatch_index == 4
         assert actor._total_valid_tokens == 0
 
     def test_resumed_pump_continues_to_max_steps(self, tmp_path):
@@ -752,6 +778,7 @@ class TestSaveTrigger:
         info_2 = _training_info(ckpt_dir, 2)
         assert info_2["current_step"] == 2
         assert info_2["trainer_version"] == 2
+        assert info_2["sampler_dispatch_index"] == -1
         assert info_2["total_steps"] == 2
         assert info_2["consumed_samples"] == 4  # 2 prompts/step * 2 steps
         # No validation ran, so the default val_reward is dropped.
@@ -1638,6 +1665,7 @@ class TestReplayBufferPersistence:
             max_num_steps=2,
             save_period=2,
             buffer_checkpoint=True,
+            data_plane_checkpoint=False,
         )
 
         with pytest.raises(
@@ -1646,9 +1674,13 @@ class TestReplayBufferPersistence:
         ):
             _ACTOR_CLS(mc, _make_actor_args(), SetupTimingMetrics())
 
-    def test_no_replay_buffer_with_gated_sampler(self, tmp_path):
+    def test_gated_sampler_writes_native_replay_metadata(self, tmp_path):
         mc = _actor_master_config(
-            tmp_path, max_num_steps=2, save_period=2, buffer_checkpoint=False
+            tmp_path,
+            max_num_steps=2,
+            save_period=2,
+            buffer_checkpoint=False,
+            data_plane_checkpoint=True,
         )
         buffer = _FakeTQBuffer()
 
@@ -1657,7 +1689,8 @@ class TestReplayBufferPersistence:
         ckpt_dir = tmp_path / "checkpoints"
         assert (ckpt_dir / "step_2" / "training_info.json").exists()
         assert not (ckpt_dir / "step_2" / "replay_buffer.pt").exists()
-        assert not (ckpt_dir / "step_2" / REPLAY_BUFFER_METADATA_FILENAME).exists()
+        assert (ckpt_dir / "step_2" / REPLAY_BUFFER_METADATA_FILENAME).exists()
+        assert buffer.metadata_state_dict_calls == [4]
 
     def test_run_rejects_legacy_replay_file(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"
@@ -1887,17 +1920,41 @@ class TestReplayBufferPersistence:
         assert buffer.load_calls == []
         assert actor._buffer_capacity._value == 4  # zero permits consumed
 
-    def test_run_rejects_native_replay_state_with_gated_sampler(self, tmp_path):
+    def test_run_restores_native_replay_state_with_in_order_sampler(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"
         ckpt_dir.mkdir()
-        torch.save({"groups": []}, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
-        mc = _actor_master_config(tmp_path, max_num_steps=0, buffer_checkpoint=False)
+        envelope = {"groups": []}
+        torch.save(envelope, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=0,
+            buffer_checkpoint=False,
+            data_plane_checkpoint=True,
+        )
+        buffer = _FakeTQBuffer()
 
-        with pytest.raises(RuntimeError, match="does not support replay-buffer"):
-            _run_actor_run(
-                mc,
-                _make_actor_args(last_checkpoint_path=str(ckpt_dir)),
-            )
+        _run_actor_run(
+            mc,
+            _make_actor_args(
+                tq_buffer=buffer,
+                last_checkpoint_path=str(ckpt_dir),
+                save_state=_matching_save_state(),
+                data_plane_checkpoint_metadata={
+                    "replay_manifest_digest": "digest-1",
+                    "replay_group_count": 0,
+                },
+            ),
+        )
+
+        assert buffer.load_calls == [
+            {
+                "state": envelope,
+                "max_groups": 4,
+                "expected_partition_id": _PARTITION_ID,
+                "expected_group_size": 2,
+                "expected_manifest_digest": "digest-1",
+            }
+        ]
 
 
 # ── replacement reserve persistence ──────────────────────────────────────────

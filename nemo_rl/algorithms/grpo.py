@@ -381,6 +381,9 @@ class GRPOSaveState:
     # used to gate the SC buffer restore. None on checkpoints from the other
     # algorithms and from SC runs that predate this field.
     sampler_name: Optional[str] = None
+    # SingleController only: exact last admitted dispatch batch. None preserves
+    # compatibility with checkpoints that only recorded the trainer version.
+    sampler_dispatch_index: Optional[int] = None
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:
@@ -393,6 +396,7 @@ def _initial_grpo_save_state() -> GRPOSaveState:
         val_reward=-99999999.0,
         trainer_version=None,
         sampler_name=None,
+        sampler_dispatch_index=None,
     )
 
 
