@@ -55,6 +55,8 @@ from nemo_rl.experience.rollouts import EffortLevelsConfig
 class _CheckpointingCustomSampler(WindowedSampler):
     """Custom sampler whose static capability must be validated during setup."""
 
+    supports_buffer_checkpoint = True
+
     def __init__(self, buffer: Any) -> None:
         super().__init__(buffer, max_staleness_versions=1)
 
