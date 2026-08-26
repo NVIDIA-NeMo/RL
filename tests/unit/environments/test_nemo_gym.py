@@ -60,6 +60,7 @@ from nemo_rl.experience.rollouts import (
     _reattach_original_multimodal_payloads,
     attach_static_multimodal_payload,
 )
+from nemo_rl.models.generation.dynamo.token_wrapper import DYNAMO_SESSION_ID_HEADER
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -951,6 +952,27 @@ def test_validate_reward_components_match_scalar():
                 },
             ]
         )
+
+
+@pytest.mark.parametrize("backend", ["dynamo", "vllm"])
+def test_setup_nemo_gym_config_sets_session_header_only_for_dynamo(backend) -> None:
+    config = SimpleNamespace(
+        policy={"generation": {"backend": backend, "vllm_cfg": {}}},
+        env={},
+    )
+
+    setup_nemo_gym_config(config, tokenizer=object())
+    setup_nemo_gym_config(config, tokenizer=object())
+
+    if backend == "dynamo":
+        assert (
+            config.env["nemo_gym"]["policy_model"]["responses_api_models"][
+                "vllm_model"
+            ]["session_id_header"]
+            == DYNAMO_SESSION_ID_HEADER
+        )
+    else:
+        assert config.env == {}
 
 
 @pytest.mark.nemo_gym

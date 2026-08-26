@@ -24,6 +24,7 @@ from collections import defaultdict
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
+from uuid import uuid4
 
 import ray
 import torch
@@ -75,6 +76,25 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+def _create_dynamo_session_id(
+    policy_generation: GenerationInterface,
+) -> str | None:
+    generation_config = getattr(policy_generation, "cfg", {})
+    if generation_config.get("backend") == "dynamo":
+        return str(uuid4())
+    return None
+
+
+def _add_dynamo_session_id(
+    generation_input_data: BatchedDataDict[GenerationDatumSpec],
+    policy_generation: GenerationInterface,
+    session_id: str | None,
+) -> None:
+    generation_config = getattr(policy_generation, "cfg", {})
+    if session_id is not None and generation_config.get("backend") == "dynamo":
+        generation_input_data["session_ids"] = [session_id]
 
 
 def attach_initial_nemo_gym_image_payloads(
@@ -1127,6 +1147,7 @@ async def async_generate_response_for_sample_turn(
     max_seq_len: int,
     greedy: bool = False,
     *,
+    session_id: str | None = None,
     sample_multimodal_data: dict[str, Any] | None = None,
     deduplicate_multimodal_data: bool = False,
 ) -> tuple[list[dict], torch.Tensor, torch.Tensor, dict[str, float]]:
@@ -1164,6 +1185,11 @@ async def async_generate_response_for_sample_turn(
             "input_lengths": input_lengths,
             "stop_strings": [sample_stop_strings],
         }
+    )
+    _add_dynamo_session_id(
+        generation_input_data,
+        policy_generation,
+        session_id,
     )
 
     # Create a dummy batch for generate_responses_async
@@ -1237,6 +1263,7 @@ async def run_sample_multi_turn_rollout(
     current_extra_env_info = copy.deepcopy(initial_sample_state["extra_env_info"])
     current_stop_strings = initial_sample_state.get("stop_strings", None)
     task_name = initial_sample_state["task_name"]
+    session_id = _create_dynamo_session_id(policy_generation)
     sample_multimodal_data = {
         key: initial_sample_state[key]
         for key in NATIVE_MULTIMODAL_KEYS
@@ -1287,6 +1314,7 @@ async def run_sample_multi_turn_rollout(
                 tokenizer,
                 max_seq_len,
                 greedy=greedy,
+                session_id=session_id,
                 sample_multimodal_data=turn_multimodal_data,
                 deduplicate_multimodal_data=deduplicate_multimodal_data,
             )

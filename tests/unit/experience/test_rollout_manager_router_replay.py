@@ -48,12 +48,20 @@ class _FakeTokenizer:
 
 
 class _FakeGeneration:
-    def __init__(self, outputs: BatchedDataDict | list[BatchedDataDict]) -> None:
+    def __init__(
+        self,
+        outputs: BatchedDataDict | list[BatchedDataDict],
+        *,
+        backend: str | None = None,
+    ) -> None:
         self._outputs = outputs if isinstance(outputs, list) else [outputs]
         self._next_output = 0
+        self.calls = []
+        if backend is not None:
+            self.cfg = {"backend": backend}
 
     async def generate_async(self, data: BatchedDataDict):
-        del data
+        self.calls.append(data)
         output = self._outputs[self._next_output]
         self._next_output += 1
         yield 0, output
@@ -63,6 +71,7 @@ def _rollout_impl(
     output: BatchedDataDict | list[BatchedDataDict],
     *,
     max_rollout_turns: int = 1,
+    backend: str | None = None,
 ) -> AsyncRolloutImpl:
     return AsyncRolloutImpl(
         tokenizer=_FakeTokenizer(),  # type: ignore[arg-type]
@@ -70,7 +79,7 @@ def _rollout_impl(
         num_generations_per_prompt=1,
         max_seq_len=32,
         max_rollout_turns=max_rollout_turns,
-        policy_generation=_FakeGeneration(output),  # type: ignore[arg-type]
+        policy_generation=_FakeGeneration(output, backend=backend),  # type: ignore[arg-type]
     )
 
 
@@ -211,3 +220,69 @@ def test_second_turn_overwrites_prefix_fallback_routes() -> None:
         torch.cat((_routes(1, start=107), _fallback_routes(1))),
     )
     assert torch.equal(final_env["routed_experts"], _fallback_routes(2))
+
+
+def test_dynamo_session_id_is_stable_per_trajectory_attempt() -> None:
+    second_turn_output = _generation_output(
+        (10, 11, 12, 20, 21, 31, 32, 40, 41),
+        route_start=100,
+    )
+    impl = _rollout_impl(
+        [
+            _generation_output(),
+            second_turn_output,
+            _generation_output(),
+            _generation_output(),
+        ],
+        max_rollout_turns=2,
+        backend="dynamo",
+    )
+    input_sample = {
+        "idx": 0,
+        "message_log": [
+            {
+                "role": "user",
+                "content": "prompt",
+                "token_ids": torch.tensor([10, 11, 12]),
+            }
+        ],
+        "extra_env_info": None,
+        "task_name": "test",
+    }
+
+    def env_output(*, terminated: bool) -> EnvironmentReturn:
+        return EnvironmentReturn(
+            observations=[{"role": "user", "content": "environment"}],
+            metadata=[None],
+            next_stop_strings=[None],
+            rewards=torch.tensor([0.0]),
+            terminateds=torch.tensor([terminated]),
+            answers=[None],
+        )
+
+    with (
+        patch(
+            "nemo_rl.experience.rollout_manager.calculate_rewards",
+            side_effect=[
+                env_output(terminated=False),
+                env_output(terminated=True),
+                env_output(terminated=True),
+                env_output(terminated=True),
+            ],
+        ),
+        patch(
+            "nemo_rl.experience.rollouts.uuid4",
+            side_effect=["attempt-a", "sibling-b", "retry-c"],
+        ),
+    ):
+        asyncio.run(impl._run_single_rollout(input_sample, traj_idx=0))
+        asyncio.run(impl._run_single_rollout(input_sample, traj_idx=1))
+        asyncio.run(impl._run_single_rollout(input_sample, traj_idx=0))
+
+    generation = impl._policy_generation
+    assert [call["session_ids"][0] for call in generation.calls] == [
+        "attempt-a",
+        "attempt-a",
+        "sibling-b",
+        "retry-c",
+    ]
