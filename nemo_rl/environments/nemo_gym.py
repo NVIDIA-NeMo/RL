@@ -21,7 +21,6 @@ from collections.abc import AsyncGenerator, Mapping
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
 
-import aiohttp
 import ray
 import torch
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -641,15 +640,6 @@ Depending on your data shape, you may want to change these values."""
             with timer.time(label=f"{timer_prefix}/await_results"):
                 try:
                     nemo_gym_row, nemo_gym_result = await task
-                except aiohttp.ClientResponseError as e:
-                    # aiohttp exceptions carry CIMultiDictProxy headers that
-                    # Ray cannot pickle across the actor boundary, masking the
-                    # real error with a TypeError; re-raise as a plain,
-                    # picklable RuntimeError.
-                    raise RuntimeError(
-                        f"NemoGym rollout HTTP error: {e.status} "
-                        f"{e.message} url={e.request_info.real_url}"
-                    ) from None
                 except Exception as error:
                     if hasattr(error, "response_content"):
                         print(
