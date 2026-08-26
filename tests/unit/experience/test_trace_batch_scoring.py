@@ -215,6 +215,7 @@ def test_reinforce_baseline_is_invariant_when_one_rollout_splits_into_traces():
     assert prepared["rollout_advantages"] == pytest.approx(
         {"split-rollout": -1.0, "unsplit-rollout": 1.0}
     )
+    assert prepared["plan"]["advantage_estimator_name"] == "reinforce_baseline"
     assert [row["advantage"] for row in prepared["plan"]["rows"]] == pytest.approx(
         [-1.0, -1.0, -1.0, 1.0]
     )

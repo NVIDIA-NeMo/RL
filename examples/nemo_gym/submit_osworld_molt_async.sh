@@ -128,6 +128,7 @@ export SETUP_COMMAND="${SETUP_COMMAND:-/opt/nemo_rl_venv/bin/pip install --quiet
 CONFIG="${ROOT}/examples/nemo_gym/grpo_nemotron_omni_30ba3b_osworld_cc_molt_async.yaml"
 PARSER="${ROOT}/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py"
 export COMMAND="cd ${ROOT} && uv run --locked examples/nemo_gym/run_grpo_nemo_gym.py --config ${CONFIG} policy.generation.vllm_cfg.reasoning_parser_plugin=${PARSER}"
+SBATCH_SCRIPT="${SBATCH_SCRIPT:-${ROOT}/ray.sub}"
 
 sbatch --parsable \
   --chdir="${RUNTIME_ROOT}" \
@@ -139,4 +140,4 @@ sbatch --parsable \
   --time="${SBATCH_TIME:-04:00:00}" \
   --output="${BASE_LOG_DIR}/slurm-%j.out" \
   --export=ALL \
-  "${ROOT}/ray.sub"
+  "${SBATCH_SCRIPT}"

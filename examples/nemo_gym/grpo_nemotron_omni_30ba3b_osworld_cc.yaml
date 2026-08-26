@@ -49,7 +49,7 @@ policy:
   max_total_sequence_length: ${oc.decode:${oc.env:OSWORLD_MAX_MODEL_LEN,8192}}
   make_sequence_length_divisible_by: 8
   router_replay:
-    enabled: true
+    enabled: ${oc.decode:${oc.env:MOLT_ROUTER_REPLAY_ENABLED,true}}
   megatron_cfg:
     distributed_data_parallel_config:
       overlap_grad_reduce: false

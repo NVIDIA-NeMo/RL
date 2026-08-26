@@ -17,7 +17,6 @@ import copy
 import gc
 import logging
 import threading
-import time
 import uuid
 import warnings
 from typing import Any, AsyncGenerator, Optional, cast
@@ -334,6 +333,20 @@ class VllmAsyncGenerationWorkerImpl(
         if self._sparse_refit_receiver is not None:
             hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
             self._sparse_refit_receiver.set_worker_hostnames(hostnames)
+
+    async def pause_generation_for_refit_async(self) -> bool:
+        """Pause vLLM scheduling while preserving in-flight request state."""
+        if self.llm is None:
+            raise RuntimeError("Cannot pause an uninitialized vLLM engine")
+        await self.llm.pause_generation(mode="keep")
+        return True
+
+    async def resume_generation_after_refit_async(self) -> bool:
+        """Resume requests preserved across a Molt-style in-flight refit."""
+        if self.llm is None:
+            raise RuntimeError("Cannot resume an uninitialized vLLM engine")
+        await self.llm.resume_generation()
+        return True
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -673,7 +686,8 @@ class VllmAsyncGenerationWorkerImpl(
             # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
             # Right now we explicitly assert set this to -1.
             assert request.top_k in (None, -1), (
-                f"Top k sampling parameter must be unset, empty, or -1. Got `{request.top_k}`"
+                "Top k sampling parameter must be unset, empty, or -1. "
+                f"Got `{request.top_k}`"
             )
             request.top_k = -1
 
@@ -704,15 +718,18 @@ class VllmAsyncGenerationWorkerImpl(
 
             if isinstance(generator, ErrorResponse):
                 return JSONResponse(
-                    content=generator.model_dump(), status_code=generator.error.code
+                    content=generator.model_dump(),
+                    status_code=generator.error.code,
                 )
 
-            elif isinstance(generator, ChatCompletionResponse):
+            if isinstance(generator, ChatCompletionResponse):
                 return JSONResponse(
                     content=model_dump_chat_response_with_routed_experts(generator)
                 )
 
-            return StreamingResponse(content=generator, media_type="text/event-stream")
+            return StreamingResponse(
+                content=generator, media_type="text/event-stream"
+            )
 
         ########################################
         # /tokenize endpoint

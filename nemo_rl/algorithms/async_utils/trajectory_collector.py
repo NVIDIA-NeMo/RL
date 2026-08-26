@@ -456,8 +456,12 @@ class AsyncTrajectoryCollector:
         # capture the start weight, and start a worker. Once this returns, every
         # in-flight worker was admitted before this refit snapshot.
         with self._generation_check_lock:
-            self._refit_pause_cleared.clear()
-            self._refit_epoch += 1
+            # Keep this transition idempotent so the driver can safely retry an
+            # RPC after a transient Ray keepalive timeout. The first RPC may
+            # have executed even when its response was lost.
+            if self._refit_pause_cleared.is_set():
+                self._refit_pause_cleared.clear()
+                self._refit_epoch += 1
         print("⏸️ New generation starts paused")
 
         # Check if we're using async engine

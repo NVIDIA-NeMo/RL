@@ -47,7 +47,7 @@ export MOLT_OPTIMIZER_OFFLOAD_FRACTION="${MOLT_OPTIMIZER_OFFLOAD_FRACTION:-1.0}"
 # the same run/checkpoint directory resumes the atomic Molt buffer and trainer
 # state from the latest completed optimizer step.
 export CHECKPOINTING_ENABLED=true
-export CHECKPOINT_SAVE_PERIOD="${CHECKPOINT_SAVE_PERIOD:-1}"
+export CHECKPOINT_SAVE_PERIOD="${CHECKPOINT_SAVE_PERIOD:-10}"
 export CHECKPOINT_KEEP_TOP_K="${CHECKPOINT_KEEP_TOP_K:-2}"
 export OSWORLD_VAL_PERIOD="${OSWORLD_VAL_PERIOD:-100000}"
 export OSWORLD_VAL_AT_START="${OSWORLD_VAL_AT_START:-false}"

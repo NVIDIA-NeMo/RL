@@ -7,7 +7,7 @@
 defaults: grpo_nemotron_omni_30ba3b_osworld_cc.yaml
 
 policy:
-  # TP8 x CP2 requires padding in 32-token units.
+  # Keep padding configurable across Megatron topology profiles.
   make_sequence_length_divisible_by: ${oc.decode:${oc.env:MOLT_SEQUENCE_LENGTH_DIVISOR,32}}
   # The first logprob pass fills the frozen projected-image cache. Keep
   # optimizer state off GPU during that one-time RADIO pass.
@@ -15,13 +15,11 @@ policy:
   megatron_cfg:
     tensor_model_parallel_size: ${oc.decode:${oc.env:MOLT_TENSOR_PARALLEL_SIZE,8}}
     pipeline_model_parallel_size: ${oc.decode:${oc.env:MOLT_PIPELINE_PARALLEL_SIZE,1}}
-    # EP=16 is used for the regular 2-train-node topology. A 2-node debug
-    # allocation (1 train + 1 inference) uses EP=8 so all expert groups fit
-    # within the single 8-GPU training node.
+    # Jianh's proven AutoModel profile uses TP1/EP8/CP8 on one actor node.
+    # Megatron profiles may choose a different decomposition after validation.
     expert_model_parallel_size: ${oc.decode:${oc.env:MOLT_EXPERT_MODEL_PARALLEL_SIZE,16}}
-    # 48K multimodal trajectories exceed one H100's activation budget at
-    # CP=1. The regular two-trainer-node topology shards sequence activations
-    # across both nodes while preserving the full logical context.
+    # CP shards the post-RADIO language sequence; it does not shard images
+    # inside RADIO. Frozen per-image encoding bounds the vision peak.
     context_parallel_size: ${oc.decode:${oc.env:MOLT_CONTEXT_PARALLEL_SIZE,2}}
     # Match the official Nemotron Omni RL recipe: optimize the language policy
     # while running the fixed sensory towers and projectors without autograd.
@@ -55,6 +53,9 @@ grpo:
     enabled: true
     # Molt's bounded producer/consumer payload queue.
     async_queue_size: ${oc.decode:${oc.env:MOLT_ASYNC_QUEUE_SIZE,1}}
+    # Keep more prompt groups in flight than one optimizer batch and train on
+    # the first complete groups instead of waiting for the dispatched slow tail.
+    vllm_generate_batch_size: ${oc.decode:${oc.env:MOLT_VLLM_GENERATE_BATCH_SIZE,null}}
     # Independently reject queued groups that have become too stale.
     max_trajectory_age_steps: ${oc.decode:${oc.env:MOLT_MAX_STALENESS,1}}
     # Publish each optimizer update without draining in-flight Gym episodes.
@@ -67,8 +68,8 @@ loss_fn:
   # Molt gates the complete logical rollout by the geometric mean behavior
   # ratio. Surviving action tokens retain their raw token-level IS weights.
   truncated_importance_sampling_type: seq-mask-tis
-  truncated_importance_sampling_ratio_min: ${oc.decode:${oc.env:MOLT_IS_RATIO_MIN,0.95}}
-  truncated_importance_sampling_ratio: ${oc.decode:${oc.env:MOLT_IS_RATIO_MAX,1.05}}
+  truncated_importance_sampling_ratio_min: ${oc.decode:${oc.env:MOLT_IS_RATIO_MIN,0.99}}
+  truncated_importance_sampling_ratio: ${oc.decode:${oc.env:MOLT_IS_RATIO_MAX,1.01}}
   sequence_level_importance_ratios: false
   token_level_loss: true
   # Keep PPO's optimization ratio at one while independently correcting
@@ -86,6 +87,10 @@ checkpointing:
   # multi-terabyte checkpoint accumulation.
   save_period: ${oc.decode:${oc.env:CHECKPOINT_SAVE_PERIOD,1}}
   keep_top_k: ${oc.decode:${oc.env:CHECKPOINT_KEEP_TOP_K,2}}
+  # Two full Megatron optimizer snapshots exceed this workspace's quota while
+  # both chunk experiments run. Keep resumable policy/control-plane state and
+  # reinitialize optimizer state after a Slurm-boundary resume.
+  save_optimizer: ${oc.decode:${oc.env:MOLT_SAVE_OPTIMIZER,false}}
   checkpoint_must_save_by: ${oc.env:OSWORLD_CHECKPOINT_MUST_SAVE_BY,00:03:40:00}
 
 logger:

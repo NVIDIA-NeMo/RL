@@ -298,6 +298,11 @@ def prepare_trace_batch_for_scoring(
         prompt_ids=prompt_ids,
         rewards=rewards,
     )
+    advantage_estimator_name = (
+        "reinforce_baseline"
+        if isinstance(advantage_estimator, ReinforceBaselineAdvantageEstimator)
+        else "grpo"
+    )
 
     plan = build_trace_batch_plan(
         bundles,
@@ -306,7 +311,7 @@ def prepare_trace_batch_for_scoring(
         batch_quantum=batch_quantum,
         optimizer_step_id=optimizer_step_id,
         training_admission=training_admission,
-        advantage_estimator_name="grpo",
+        advantage_estimator_name=advantage_estimator_name,
         sequence_level_ratios_enabled=False,
         sequence_level_clipping_enabled=False,
     )

@@ -977,6 +977,34 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    def pause_generation_for_refit(self) -> None:
+        """Pause vLLM scheduling while preserving in-flight requests and KV."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "Molt-style in-flight refit requires vLLM async_engine=True"
+            )
+        futures = self.worker_group.run_all_workers_single_data(
+            "pause_generation_for_refit_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        results = ray.get(futures)
+        if not results or not all(result for result in results if result is not None):
+            raise RuntimeError("Failed to pause vLLM generation before refit")
+
+    def resume_generation_after_refit(self) -> None:
+        """Resume vLLM requests preserved across an in-flight refit."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "resume_generation_after_refit_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        results = ray.get(futures)
+        if not results or not all(result for result in results if result is not None):
+            raise RuntimeError("Failed to resume vLLM generation after refit")
+
     def init_nccl_reshard_comm_group(
         self,
         pp_ips: list[str],

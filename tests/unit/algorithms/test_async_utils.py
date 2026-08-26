@@ -42,6 +42,7 @@ from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     MasterConfig,
     _get_next_nemo_gym_task_index,
+    _resolve_async_generation_batch_size,
     add_grpo_token_loss_masks_and_generation_logprobs,
     extract_initial_prompt_messages,
 )
@@ -79,6 +80,40 @@ from nemo_rl.environments.interfaces import (
 def test_get_next_nemo_gym_task_index(rollouts_state, replay_buffer_state, expected):
     assert (
         _get_next_nemo_gym_task_index(rollouts_state, replay_buffer_state) == expected
+    )
+
+
+def test_async_generation_batch_size_matches_molt_pool_capacity():
+    config = GRPOConfig(
+        num_prompts_per_step=8,
+        async_grpo=AsyncGRPOConfig(
+            enabled=True,
+            async_queue_size=2,
+            vllm_generate_batch_size=16,
+        ),
+    )
+
+    assert (
+        _resolve_async_generation_batch_size(config, num_prompts_per_step=8) == 16
+    )
+
+
+@pytest.mark.parametrize("generate_batch_size", [4, 24])
+def test_async_generation_batch_size_is_independent_from_train_fifo(
+    generate_batch_size,
+):
+    config = GRPOConfig(
+        num_prompts_per_step=8,
+        async_grpo=AsyncGRPOConfig(
+            enabled=True,
+            async_queue_size=2,
+            vllm_generate_batch_size=generate_batch_size,
+        ),
+    )
+
+    assert (
+        _resolve_async_generation_batch_size(config, num_prompts_per_step=8)
+        == generate_batch_size
     )
 
 
@@ -136,6 +171,54 @@ class TestReplayBufferImplCheckpointing:
     Ray actor execution is not reliably attributed to source coverage, so these
     tests cover the checkpoint/restore helpers on the local implementation class.
     """
+
+    def test_reserve_incrementally_refills_available_pool_capacity(self):
+        buffer = ReplayBufferImpl(max_size=4)
+
+        assert buffer.reserve(3) == 3
+        assert buffer.reserve(3) == 1
+        assert buffer.reserve(1) == 0
+        assert buffer.get_debug_info()["reserved_slots"] == 4
+
+        buffer.release_reserved(4)
+
+    def test_finished_fifo_and_inflight_capacity_are_independent(self):
+        buffer = ReplayBufferImpl(max_size=2, max_reserved_slots=2)
+        assert buffer.reserve(2) == 2
+        assert buffer.add({"batch": {"data": "a"}}, 0, reserved=True) == "success"
+        assert buffer.add({"batch": {"data": "b"}}, 0, reserved=True) == "success"
+
+        assert buffer.size() == 2
+        assert buffer.reserve(2) == 2
+        assert buffer.get_debug_info()["reserved_slots"] == 2
+        assert buffer.add({"batch": {"data": "c"}}, 0, reserved=True) == "full"
+        assert buffer.get_debug_info()["reserved_slots"] == 2
+
+        assert buffer.sample(1, current_weight_version=0, max_age_steps=1)
+        assert buffer.add({"batch": {"data": "c"}}, 0, reserved=True) == "success"
+        assert buffer.get_debug_info()["reserved_slots"] == 1
+        buffer.release_reserved(1)
+
+    def test_sample_evicts_nonprefix_stale_groups_preserving_valid_fifo(self):
+        buffer = ReplayBufferImpl(max_size=4)
+        for name, version in (("fresh-a", 5), ("stale", 2), ("fresh-b", 5)):
+            assert (
+                buffer.add({"batch": {"data": name}}, weight_version=version)
+                == "success"
+            )
+
+        result = buffer.sample(
+            2,
+            current_weight_version=5,
+            max_age_steps=1,
+        )
+
+        assert result is not None
+        assert [
+            trajectory["batch"]["data"] for trajectory in result["trajectories"]
+        ] == ["fresh-a", "fresh-b"]
+        assert result["evicted_stale_count"] == 1
+        assert buffer.size() == 0
 
     def _state(
         self,
@@ -1589,6 +1672,68 @@ class TestAsyncTrajectoryCollector:
         assert collector.get_rollouts_state() == {"next_ng_task_index": 39}
         assert target_weight not in collector._generating_targets
 
+    def test_process_batch_preserves_remainder_across_partial_reservations(
+        self, monkeypatch
+    ):
+        """A larger Molt generation batch is admitted in full as capacity opens."""
+
+        class ReserveRemoteMethod:
+            def __init__(self):
+                self.grants = iter((2, 2))
+
+            def remote(self, *args, **kwargs):
+                return next(self.grants)
+
+        class ReleaseRemoteMethod:
+            def remote(self, *args, **kwargs):
+                return None
+
+        class FakeReplayBuffer:
+            reserve = ReserveRemoteMethod()
+            release_reserved = ReleaseRemoteMethod()
+
+        started_threads = []
+
+        class RecordingThread:
+            def __init__(self, *, target, daemon):
+                assert daemon
+                self.target = target
+
+            def start(self):
+                started_threads.append(self)
+                self.target()
+
+            def is_alive(self):
+                return False
+
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.running = True
+        captured_prompt_batches = []
+
+        async def capture_batch(**kwargs):
+            repeated_batch = kwargs["repeated_batch"]
+            captured_prompt_batches.append(
+                [
+                    messages[0]["content"]
+                    for messages in repeated_batch["message_log"][::3]
+                ]
+            )
+
+        collector._run_rollout_batch_worker = capture_batch
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(grpo_mod, "_should_use_nemo_gym", lambda config: False)
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading, "Thread", RecordingThread
+        )
+
+        collector._process_batch(self.create_mock_batch(size=4))
+
+        assert len(started_threads) == 2
+        assert captured_prompt_batches == [
+            ["Test prompt 0", "Test prompt 1"],
+            ["Test prompt 2", "Test prompt 3"],
+        ]
+
     def test_process_batch_non_gym_uses_one_batched_worker(self, monkeypatch):
         """Native collection repeats all prompts into one batch worker."""
 
@@ -2479,14 +2624,14 @@ class TestMoltFIFOScheduling:
         assert [t["batch"]["data"] for t in second["trajectories"]] == ["v3"]
         assert buffer.sample(1, current_weight_version=3, max_age_steps=10) is None
 
-    def test_capacity_reservations_apply_full_backpressure(self):
+    def test_capacity_reservations_are_separate_from_finished_backpressure(self):
         buffer = ReplayBufferImpl(max_size=2)
         assert buffer.reserve(2) == 2
         assert buffer.reserve(1) == 0
         assert buffer.add(self._trajectory("reserved"), 0, reserved=True) == "success"
-        assert buffer.add(self._trajectory("unreserved"), 0) == "full"
+        assert buffer.add(self._trajectory("unreserved"), 0) == "success"
+        assert buffer.add(self._trajectory("tail"), 0) == "full"
         buffer.release_reserved(1)
-        assert buffer.add(self._trajectory("tail"), 0) == "success"
 
     def test_stale_head_eviction_does_not_target_pin(self):
         buffer = ReplayBufferImpl(max_size=5)

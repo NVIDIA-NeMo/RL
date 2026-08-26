@@ -188,6 +188,9 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     enabled: bool = False
     # Number of complete optimizer batches admitted to the bounded FIFO.
     async_queue_size: int = Field(default=1, ge=1)
+    # Independent persistent-pool capacity for prompt groups in generation.
+    # Defaults to one optimizer batch for backward compatibility.
+    vllm_generate_batch_size: Optional[int] = Field(default=None, ge=1)
     # Maximum trajectory age in training steps for samples drawn from the
     # async replay buffer. Trajectories older than this are excluded during
     # sampling; buffer sizing also scales with this value.
@@ -197,6 +200,14 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
     recompute_kv_cache_after_weight_updates: bool = False
+
+
+def _resolve_async_generation_batch_size(
+    grpo_config: "GRPOConfig", *, num_prompts_per_step: int
+) -> int:
+    """Resolve persistent rollout-pool capacity independently of train FIFO size."""
+    configured = grpo_config.async_grpo.vllm_generate_batch_size
+    return configured if configured is not None else num_prompts_per_step
 
 
 class ContextCompactionTrainingConfig(BaseModel, extra="forbid"):
@@ -448,6 +459,20 @@ def setup(
         dataloader_batch_size = data_config["num_prompts_per_dataloader"]
     else:
         dataloader_batch_size = num_prompts_per_step
+
+    if grpo_config.async_grpo.enabled:
+        generation_batch_size = _resolve_async_generation_batch_size(
+            grpo_config,
+            num_prompts_per_step=num_prompts_per_step,
+        )
+        if generation_batch_size > dataloader_batch_size:
+            dataloader_batch_size = generation_batch_size
+            print(
+                "  ✓ Molt rollout over-dispatch enabled: "
+                f"train_groups={num_prompts_per_step}, "
+                f"inflight_groups={generation_batch_size}",
+                flush=True,
+            )
 
     # Validate batch_multiplier
     batch_multiplier = grpo_config.batch_multiplier
@@ -2493,6 +2518,30 @@ def _write_latest_checkpoint_status(
     status["last_checkpoint_step"] = last_checkpoint_step
     with open(status_path, "w") as f:
         json.dump(status, f)
+
+
+def _ray_actor_call_with_transient_retry(
+    call: Callable[[], Any],
+    *,
+    operation_name: str,
+    max_attempts: int = 6,
+    retry_delay_s: float = 5.0,
+) -> Any:
+    """Retry an idempotent actor RPC after transient Ray keepalive failures."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return ray.get(call())
+        except ray.exceptions.ActorUnavailableError:
+            if attempt == max_attempts:
+                raise
+            print(
+                f"⚠️ {operation_name} actor temporarily unavailable; "
+                f"retrying in {retry_delay_s:.1f}s "
+                f"({attempt}/{max_attempts})",
+                flush=True,
+            )
+            time.sleep(retry_delay_s)
+    raise AssertionError("unreachable")
 
 
 def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
@@ -5405,7 +5454,10 @@ def async_grpo_train(
                     # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
                     with timer.time("exposed_generation"):
-                        ray.get(trajectory_collector.prepare_for_refit.remote())
+                        _ray_actor_call_with_transient_retry(
+                            trajectory_collector.prepare_for_refit.remote,
+                            operation_name="prepare_for_refit",
+                        )
 
                     # Collect generation logger metrics for performance reporting
                     # inflight batch sizes and num pending samples are collected from each worker
@@ -5426,8 +5478,16 @@ def async_grpo_train(
 
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
-                        trajectory_collector.set_weight_version.remote(weight_version)
-                        trajectory_collector.resume_after_refit.remote()
+                        _ray_actor_call_with_transient_retry(
+                            lambda: trajectory_collector.set_weight_version.remote(
+                                weight_version
+                            ),
+                            operation_name="set_weight_version",
+                        )
+                        _ray_actor_call_with_transient_retry(
+                            trajectory_collector.resume_after_refit.remote,
+                            operation_name="resume_after_refit",
+                        )
 
                     timer.stop("idle/refit_bubble")
 
@@ -5652,15 +5712,19 @@ def async_grpo_train(
                             ),
                             checkpointing_cfg=master_config.checkpointing,
                         )
-                        # Freeze FIFO admission and settle admitted workers before
-                        # capturing the algorithm state. This prevents a prompt
-                        # group from moving between the dataloader, in-flight set,
-                        # and replay snapshots while they are serialized.
+                        # Freeze new FIFO admission while taking a bounded-time
+                        # snapshot. Do not drain admitted workers here: OSWorld
+                        # trajectories can run for 150 turns, and checkpoint-time
+                        # draining leaves trainer GPUs idle long enough for the
+                        # cluster job reaper to cancel an otherwise healthy run.
+                        #
+                        # In-flight groups that commit after this snapshot are
+                        # intentionally absent from it. The dataloader cursor and
+                        # replay FIFO therefore describe one conservative resume
+                        # boundary; at worst those groups are regenerated after a
+                        # restart rather than blocking every checkpoint.
                         ray.get(trajectory_collector.pause.remote())
                         try:
-                            ray.get(
-                                trajectory_collector.wait_for_pending_generations.remote()
-                            )
                             actual_dataloader_state = ray.get(
                                 trajectory_collector.get_dataloader_state.remote()
                             )

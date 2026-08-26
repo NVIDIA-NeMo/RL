@@ -38,10 +38,18 @@ class ReplayBufferImpl(ReplayBufferProtocol):
     grpo.num_generations_per_prompt (required to compute per-prompt advantages).
     """
 
-    def __init__(self, max_size: int):
+    def __init__(self, max_size: int, max_reserved_slots: int | None = None):
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
+        if max_reserved_slots is None:
+            max_reserved_slots = max_size
+        if max_reserved_slots <= 0:
+            raise ValueError(
+                "max_reserved_slots must be positive, "
+                f"got {max_reserved_slots}"
+            )
         self.max_size = max_size
+        self.max_reserved_slots = max_reserved_slots
         self.trajectories = []  # List[dict[str, Any]]
         # Admission order is the scheduling order.  A version is the oldest
         # weight that may have contributed tokens to the prompt group.
@@ -85,8 +93,10 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             if reserved:
                 if self._reserved_slots <= 0:
                     raise RuntimeError("add(reserved=True) without a reserved slot")
+                if len(self.trajectories) >= self.max_size:
+                    return "full"
                 self._reserved_slots -= 1
-            elif len(self.trajectories) + self._reserved_slots >= self.max_size:
+            elif len(self.trajectories) >= self.max_size:
                 return "full"
 
             self.trajectories.append(trajectory)
@@ -95,17 +105,12 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             return "success"
 
     def reserve(self, num_prompt_groups: int) -> int:
-        """Atomically reserve FIFO capacity for admitted rollout workers."""
+        """Atomically reserve independent in-flight rollout capacity."""
         if num_prompt_groups < 0:
             raise ValueError("num_prompt_groups must be non-negative")
-        if num_prompt_groups > self.max_size:
-            raise ValueError(
-                f"cannot reserve batch of {num_prompt_groups} groups in "
-                f"max_size={self.max_size} FIFO"
-            )
         with self._lock:
-            available = self.max_size - len(self.trajectories) - self._reserved_slots
-            granted = num_prompt_groups if available >= num_prompt_groups else 0
+            available = self.max_reserved_slots - self._reserved_slots
+            granted = min(num_prompt_groups, available)
             self._reserved_slots += granted
             return granted
 
@@ -128,6 +133,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             "trajectory_versions": self.trajectory_versions,
             "target_weight_versions": self.target_weight_versions,
             "max_size": self.max_size,
+            "max_reserved_slots": self.max_reserved_slots,
             "reserved_slots": self._reserved_slots,
         }
         if self.trajectories:
@@ -211,7 +217,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         current_weight_version: int,
         max_age_steps: int,
     ) -> Optional[dict[str, Any]]:
-        """Consume one complete FIFO batch, evicting stale entries at the head.
+        """Consume one complete FIFO batch after evicting every stale entry.
 
         Returns:
             Dictionary with 'trajectories', 'avg_trajectory_age',
@@ -220,13 +226,13 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         """
         with self._lock:
             min_valid_version = max(0, current_weight_version - max_age_steps)
-            evicted_stale_count = 0
-            while (
-                self.trajectory_versions
-                and self.trajectory_versions[0] < min_valid_version
-            ):
-                self._remove_indices([0])
-                evicted_stale_count += 1
+            stale_indices = [
+                idx
+                for idx, version in enumerate(self.trajectory_versions)
+                if version < min_valid_version
+            ]
+            self._remove_indices(stale_indices)
+            evicted_stale_count = len(stale_indices)
 
             total_trajectories = len(self.trajectories)
             if total_trajectories < num_prompt_groups:
@@ -269,7 +275,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         """Return serializable state for checkpointing."""
         with self._lock:
             return {
-                "format_version": 2,
+                "format_version": 3,
                 "trajectories": list(self.trajectories),
                 "trajectory_versions": list(self.trajectory_versions),
                 # Retained for checkpoint readers from the target-pinned era.
@@ -278,6 +284,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                     self.last_target_weight_already_generated
                 ),
                 "max_size": self.max_size,
+                "max_reserved_slots": self.max_reserved_slots,
             }
 
     def load_state_dict(
@@ -321,6 +328,16 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 print(
                     "ReplayBuffer max_size changed: "
                     f"checkpoint={state['max_size']}, current={self.max_size}. "
+                    "Using current config value."
+                )
+            if (
+                "max_reserved_slots" in state
+                and state["max_reserved_slots"] != self.max_reserved_slots
+            ):
+                print(
+                    "ReplayBuffer max_reserved_slots changed: "
+                    f"checkpoint={state['max_reserved_slots']}, "
+                    f"current={self.max_reserved_slots}. "
                     "Using current config value."
                 )
 
@@ -492,17 +509,14 @@ class ReplayBufferImpl(ReplayBufferProtocol):
     def _ready_fifo_count(
         self, current_weight_version: int, max_age_steps: int | None
     ) -> int:
-        """Count entries after the stale prefix without mutating the queue."""
+        """Count all age-valid entries without assuming version-sorted completion."""
         if max_age_steps is None:
             return len(self.trajectories)
         min_valid_version = max(0, current_weight_version - max_age_steps)
-        first_valid = 0
-        while (
-            first_valid < len(self.trajectory_versions)
-            and self.trajectory_versions[first_valid] < min_valid_version
-        ):
-            first_valid += 1
-        return len(self.trajectories) - first_valid
+        return sum(
+            min_valid_version <= version <= current_weight_version
+            for version in self.trajectory_versions
+        )
 
     def _remove_incomplete_target_steps(self, num_prompts_per_step: int) -> None:
         """Remove target steps without a complete batch.
