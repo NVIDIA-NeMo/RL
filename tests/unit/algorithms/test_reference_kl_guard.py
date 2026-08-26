@@ -80,6 +80,29 @@ def _call_grpo(master_config):
     )
 
 
+def test_the_grpo_guard_that_actually_fires_is_in_setup():
+    """`grpo_train_sync`'s guard is shadowed and never reached.
+
+    `grpo.setup` checks the same pairing before the train loop starts, so on
+    GRPO the setup one is what a user hits. It was an assert too, so under
+    `python -O` both were stripped and nothing was left. Converting only the
+    train-loop copy would have fixed the unreachable one.
+
+    Asserted on the source rather than by calling `setup`, which would need a
+    cluster: the point is that the reachable guard is not an assert.
+    """
+    import inspect
+
+    from nemo_rl.algorithms import grpo
+
+    src = inspect.getsource(grpo.setup)
+    marker = "skip_reference_policy_logprobs_calculation:"
+    assert marker in src
+    guard = src[src.index(marker) : src.index(marker) + 400]
+    assert "raise ValueError" in guard, "the reachable GRPO guard must not be an assert"
+    assert "reference_policy_kl_penalty=0" in guard
+
+
 @pytest.mark.parametrize(
     ("call", "block"),
     [(_call_ppo, "ppo"), (_call_grpo, "grpo")],

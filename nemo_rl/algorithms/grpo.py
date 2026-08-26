@@ -766,10 +766,11 @@ def setup(
 
     # Validate skip_reference_policy_logprobs_calculation
     if grpo_config.skip_reference_policy_logprobs_calculation:
-        assert loss_config.reference_policy_kl_penalty == 0, (
-            "grpo.skip_reference_policy_logprobs_calculation=True requires "
-            "loss_fn.reference_policy_kl_penalty == 0"
-        )
+        if loss_config.reference_policy_kl_penalty != 0:
+            raise ValueError(
+                "Skipping reference logprobs requires "
+                "loss_fn.reference_policy_kl_penalty=0"
+            )
         print(
             "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
         )
