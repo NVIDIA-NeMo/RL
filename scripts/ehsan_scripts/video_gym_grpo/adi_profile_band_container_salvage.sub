@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:1
+#SBATCH --time=00:30:00
+#SBATCH --job-name=adi-profile-band-container-salvage
+
+set -euo pipefail
+
+readonly source_file=/raid/containers/pyxis-runtime/103303/16535323.0.squashfs
+readonly output_dir=/lustre/fsw/portfolios/llmservice/users/ehosseiniasl/github_repos/nemorl/RL-3604/.cache/containers
+readonly output_file=${output_dir}/nemo-rl-main_20260807_super_ultra_omni_prefetched_venvs_x86_64-pyxis.sqsh
+readonly partial_file=${output_file}.inprogress
+
+test -s "${source_file}"
+test ! -e "${output_file}"
+test ! -e "${partial_file}"
+mkdir -p "${output_dir}"
+
+stat -c 'SALVAGE_SOURCE size=%s modified=%y path=%n' "${source_file}"
+unsquashfs -s "${source_file}"
+cp --sparse=always "${source_file}" "${partial_file}"
+unsquashfs -s "${partial_file}"
+mv "${partial_file}" "${output_file}"
+echo "CONTAINER_SALVAGE_PASS job=${SLURM_JOB_ID} output=${output_file}"

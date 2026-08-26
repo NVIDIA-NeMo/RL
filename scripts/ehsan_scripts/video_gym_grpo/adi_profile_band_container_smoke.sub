@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:1
+#SBATCH --time=00:20:00
+#SBATCH --job-name=adi-profile-band-container-smoke
+
+set -euo pipefail
+
+: "${CONTAINER:?CONTAINER must point to the validated Python 3.13 video-RL image}"
+: "${MOUNTS:?MOUNTS must expose the checkout and /lustre}"
+
+echo "SMOKE_START job=${SLURM_JOB_ID} account=${SLURM_JOB_ACCOUNT} partition=${SLURM_JOB_PARTITION}"
+
+srun \
+  --mpi=pmix \
+  --no-container-mount-home \
+  --container-image="${CONTAINER}" \
+  --container-mounts="${MOUNTS}" \
+  --container-workdir=/opt/nemo-rl \
+  bash -lc '
+    set -euo pipefail
+    export PATH=/opt/nemo_rl_venv/bin:/root/.local/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/mpi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin:/opt/amazon/efa/bin
+    export LD_LIBRARY_PATH=/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+    export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:/usr/local/cuda/lib64/stubs:
+    export UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
+    export UV_LINK_MODE=copy
+    export NRL_CONTAINER=1
+    export RAY_USAGE_STATS_ENABLED=0
+    export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+    export NEMO_RL_VENV_DIR=/opt/ray_venvs
+    export NEMO_GYM_VENV_DIR=/opt/gym_venvs
+    export CUDA_HOME=/usr/local/cuda
+    export CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
+    export CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
+    export CUDNN_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
+    uv_bin=/root/.local/bin/uv
+    test -x "${uv_bin}"
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPATH=/opt/nemo-rl:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:${PYTHONPATH:-}
+
+    "${uv_bin}" run --no-sync python -c "import sys; print(sys.version); assert sys.version_info >= (3, 13, 14); import torch, ray, transformers, omegaconf; import nemo_rl.algorithms.grpo, nemo_rl.environments.nemo_gym; print(\"MAIN_IMPORTS_OK\", torch.__version__, ray.__version__, transformers.__version__)"
+    generation_vllm_python=/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
+    stat -c "GENERATION_VLLM_PYTHON type=%F mode=%a size=%s path=%n" "${generation_vllm_python}"
+    test -x "${generation_vllm_python}"
+    "${generation_vllm_python}" -c "import vllm; from nemo_rl.models.generation.vllm.vllm_worker_async import VllmAsyncGenerationWorker; print(\"GENERATION_VLLM_IMPORT_OK\", vllm.__version__)"
+    gym_model_python=/opt/gym_venvs/responses_api_models/vllm_model/.venv/bin/python
+    test -x "${gym_model_python}"
+    "${gym_model_python}" -c "import openai; from responses_api_models.vllm_model.app import VLLMModel; print(\"GYM_MODEL_PROXY_IMPORTS_OK\", openai.__version__)"
+    gym_agent_python=/opt/gym_venvs/responses_api_agents/simple_agent/.venv/bin/python
+    test -x "${gym_agent_python}"
+    "${gym_agent_python}" -c "import openai; from nemo_gym.global_config import GlobalConfigDictParserConfig; from nemo_gym.cli import RunHelper; from nemo_gym.rollout_collection import RolloutCollectionHelper; print(\"GYM_AGENT_IMPORTS_OK\", openai.__version__)"
+    "${uv_bin}" run --no-sync python reports/auto_research/adi_profile_band_video_async/verify_profile_band.py
+    "${uv_bin}" run --no-sync python tools/config_cli.py expand examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp2ep16-async-gym-video-adi-profile-band.v1.yaml >/tmp/adi_profile_band_expanded.yaml
+    grep -A8 "length_bonus:" /tmp/adi_profile_band_expanded.yaml
+    "${uv_bin}" run --no-sync python -c "from transformers import AutoConfig, AutoProcessor, AutoTokenizer; p=\"/lustre/fsw/portfolios/llmservice/users/arushig/workspace/output/generalist-49k-video-mpo-20260812-113202/checkpoints/tp_1_hf/iter_0000125/mcore_to_hf\"; AutoConfig.from_pretrained(p, trust_remote_code=True); AutoProcessor.from_pretrained(p, trust_remote_code=True, use_fast=True); AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); print(\"CHECKPOINT_LOAD_OK\")"
+    nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+  '
+
+echo "SMOKE_PASS job=${SLURM_JOB_ID}"

@@ -18,6 +18,7 @@ import logging
 import re
 import uuid
 from collections import defaultdict
+from collections.abc import Sequence
 from copy import deepcopy
 from io import BytesIO
 from typing import Any, Optional, Union
@@ -32,8 +33,11 @@ from transformers.video_utils import load_video
 
 VLLM_MULTIMODAL_DATA_KEYS = frozenset({"vllm_images", "vllm_videos", "vllm_audios"})
 NATIVE_MULTIMODAL_KEYS = frozenset({"vllm_content", *VLLM_MULTIMODAL_DATA_KEYS})
+IMAGE_CONTENT_TYPES = frozenset({"input_image", "image", "image_url"})
+VIDEO_CONTENT_TYPES = frozenset({"input_video", "video", "video_url"})
+AUDIO_CONTENT_TYPES = frozenset({"input_audio", "audio", "audio_url"})
 MULTIMODAL_CONTENT_TYPES = frozenset(
-    {"input_image", "image", "image_url", "video", "audio"}
+    {*IMAGE_CONTENT_TYPES, *VIDEO_CONTENT_TYPES, *AUDIO_CONTENT_TYPES}
 )
 
 # List of allowed placeholder strings for different media types in the dataset string
@@ -783,7 +787,15 @@ def extract_multimodal_model_inputs(
 
     extracted: dict[str, PackedTensor | torch.Tensor] = {}
     multimodal_keys = list(get_multimodal_keys_from_processor(processor))
-    for key in ("imgs_sizes", "num_frames"):
+    # TODO(rohitrango): Let ProcessorInterface declare model-specific media inputs.
+    # Some remote-code processors omit these inputs from model_input_names even
+    # though their model forward requires them.
+    for key in (
+        "imgs_sizes",
+        "num_frames",
+        "pixel_values_flat",
+        "image_num_patches",
+    ):
         if key in processed and key not in multimodal_keys:
             multimodal_keys.append(key)
     for key in multimodal_keys:
@@ -1052,16 +1064,25 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
             if not isinstance(content, list):
                 continue
             for part in content:
-                if not isinstance(part, dict) or part.get("type") != "input_image":
+                if (
+                    not isinstance(part, dict)
+                    or part.get("type") not in IMAGE_CONTENT_TYPES
+                ):
                     continue
-                url = part.get("image_url", "")
+                media_key = next(
+                    (key for key in ("image_url", "image", "url") if key in part),
+                    None,
+                )
+                if media_key is None:
+                    continue
+                url = part.get(media_key)
                 if isinstance(url, dict):
-                    url = url.get("url", "")
+                    url = url.get("url") or url.get("path") or ""
                 if not isinstance(url, str) or not url:
                     continue
                 if url.startswith(("http://", "https://", "data:")):
                     continue
-                part["image_url"] = image_to_data_url(resolve_to_image(url))
+                part[media_key] = image_to_data_url(resolve_to_image(url))
     return nemo_gym_examples
 
 
@@ -1151,3 +1172,130 @@ def load_media_from_message(
                 loaded_media["video"].append(vid)
 
     return loaded_media
+
+
+def build_media_token_validity_mask(
+    input_ids: torch.Tensor,
+    media_token_id: int,
+    media_counts_by_row: Sequence[int],
+    base_mask: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Mark media-token positions in rows that carry no media of that modality.
+
+    A media token is an ordinary vocabulary entry with its own embedding row.
+    It only means "a projected feature belongs here" when media is attached;
+    in a text-only row the same id is whatever the author wrote, and counting
+    it as a placeholder makes the model demand a feature that does not exist.
+
+    Rows that do carry media keep every position valid, so a real
+    placeholder/feature disagreement there is still reported rather than
+    silently masked away.
+
+    Args:
+        input_ids: ``[B, S]`` token ids, one row per sample.
+        media_token_id: Vocabulary id the model treats as a media placeholder.
+        media_counts_by_row: Attached media items per row, e.g. from
+            :meth:`PackedTensor.logical_segment_counts_by_row`.
+        base_mask: Optional ``[B, S]`` validity mask to refine, so masks for
+            several modalities can be combined.
+
+    Returns:
+        A ``[B, S]`` bool mask, or ``None`` when nothing needs masking and the
+        caller should leave the model's own derivation untouched.
+    """
+    if input_ids.ndim != 2:
+        raise ValueError(f"input_ids must be [B, S], got {tuple(input_ids.shape)}")
+    if len(media_counts_by_row) != input_ids.shape[0]:
+        raise ValueError(
+            "media_counts_by_row must have one entry per row: got "
+            f"{len(media_counts_by_row)} for {input_ids.shape[0]} rows"
+        )
+
+    empty_rows = [row for row, count in enumerate(media_counts_by_row) if count == 0]
+    if not empty_rows:
+        return base_mask
+
+    is_media_token = input_ids == media_token_id
+    if not bool(is_media_token[empty_rows].any()):
+        # Text-only rows exist but none of them spell the token, so the
+        # model's own derivation is already correct.
+        return base_mask
+
+    mask = (
+        torch.ones_like(input_ids, dtype=torch.bool)
+        if base_mask is None
+        else base_mask.clone()
+    )
+    for row in empty_rows:
+        mask[row] &= ~is_media_token[row]
+    return mask
+
+
+def media_placeholder_token_id_from_chunks(chunks: Sequence[Any]) -> Optional[int]:
+    """The vocabulary id these model chunks treat as a media placeholder, if any."""
+    for chunk in chunks:
+        token_id = getattr(chunk, "image_token_index", None)
+        if token_id is not None:
+            return int(token_id)
+    return None
+
+
+def chunks_accept_media_token_validity_mask(chunks: Sequence[Any]) -> bool:
+    """Whether a model chunk's forward takes an explicit media-token validity mask.
+
+    Checked against the signature rather than a class flag so a model that does
+    not know about the mask never receives it: such a forward would absorb it
+    into ``**kwargs`` and silently ignore it, which looks identical to the mask
+    having been applied. Failing to send it is visible; sending it into a void
+    is not.
+    """
+    for chunk in chunks:
+        try:
+            parameters = inspect.signature(chunk.forward).parameters
+        except (TypeError, ValueError):
+            continue
+        if "media_token_validity_mask" in parameters:
+            return True
+    return False
+
+
+def image_counts_by_row(batch: Any, num_rows: int) -> Optional[list[int]]:
+    """How many images each row of the batch actually carries.
+
+    Returns None when the batch describes its images in a way this cannot read,
+    so the caller leaves the model's own derivation alone rather than guessing a
+    count and masking against it.
+    """
+    pixel_values = batch.get("pixel_values", None)
+    if pixel_values is None:
+        # A text-only batch genuinely has no images anywhere, which is exactly
+        # the case the mask exists for -- not a missing-data case.
+        return [0] * num_rows
+    if not isinstance(pixel_values, PackedTensor):
+        return None
+    counts = pixel_values.logical_segment_counts_by_row()
+    return counts if len(counts) == num_rows else None
+
+
+def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) -> None:
+    """Mark media tokens that anchor nothing, so the model keeps their embedding.
+
+    Builds the mask while rows still are samples. Sequence packing later
+    concatenates those rows into one THD sequence, after which no per-row
+    question can be asked, so the packing step carries this through the same
+    transform as ``input_ids`` rather than deriving it downstream.
+
+    The batch is duck-typed rather than annotated as ``BatchedDataDict``:
+    that module imports this one, so naming it here would be circular.
+    """
+    if media_token_id is None:
+        return
+    input_ids = batch.get("input_ids", None)
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+        return
+    counts = image_counts_by_row(batch, input_ids.shape[0])
+    if counts is None:
+        return
+    mask = build_media_token_validity_mask(input_ids, media_token_id, counts)
+    if mask is not None:
+        batch["media_token_validity_mask"] = mask

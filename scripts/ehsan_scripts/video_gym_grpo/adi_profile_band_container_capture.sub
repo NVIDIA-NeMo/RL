@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:1
+#SBATCH --time=02:00:00
+#SBATCH --job-name=adi-profile-band-container-capture
+
+set -euo pipefail
+
+readonly image_ref=gitlab-master.nvidia.com#yifuw/images/nemo-rl:main_20260807_super_ultra_omni_prefetched_venvs_x86_64
+readonly output_dir=/lustre/fsw/portfolios/llmservice/users/ehosseiniasl/github_repos/nemorl/RL-3604/.cache/containers
+readonly output_file=${output_dir}/nemo-rl-main_20260807_super_ultra_omni_prefetched_venvs_x86_64-pyxis.sqsh
+readonly partial_file=${output_file}.inprogress
+readonly pyxis_save_file=${partial_file}.pyxis-save
+readonly source_file=/raid/containers/pyxis-runtime/$(id -u)/${SLURM_JOB_ID}.0.squashfs
+
+test ! -e "${output_file}"
+test ! -e "${partial_file}"
+test ! -e "${pyxis_save_file}"
+mkdir -p "${output_dir}"
+
+echo "CONTAINER_CAPTURE_START job=${SLURM_JOB_ID} source=${source_file}"
+
+srun \
+  --mpi=pmix \
+  --no-container-mount-home \
+  --container-image="${image_ref}" \
+  --container-save="${pyxis_save_file}" \
+  bash -lc '
+    set -euo pipefail
+    /opt/nemo_rl_venv/bin/python -c "import sys; print(sys.version); assert sys.version_info >= (3, 13, 14)"
+    gym_vllm_python=/opt/gym_venvs/responses_api_models/vllm_model/.venv/bin/python
+    stat -c "GYM_VLLM_PYTHON type=%F mode=%a size=%s path=%n" "${gym_vllm_python}"
+    test -x "${gym_vllm_python}"
+    "${gym_vllm_python}" -c "import vllm, vllm._C; print(\"GYM_VLLM_IMPORT_OK\", vllm.__version__)"
+    nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+  ' &
+step_pid=$!
+
+while [[ ! -s "${source_file}" ]]; do
+    if ! kill -0 "${step_pid}" 2>/dev/null; then
+        wait "${step_pid}" || true
+        echo "ERROR: Pyxis step ended before publishing ${source_file}" >&2
+        exit 1
+    fi
+    sleep 1
+done
+
+# Hold the inode open. Pyxis may unlink the runtime path during step teardown,
+# but the completed image remains readable through this descriptor.
+exec 9<"${source_file}"
+echo "CONTAINER_CAPTURE_FD_OPEN job=${SLURM_JOB_ID}"
+
+set +e
+wait "${step_pid}"
+step_rc=$?
+set -e
+echo "CONTAINER_CAPTURE_STEP_DONE job=${SLURM_JOB_ID} step_rc=${step_rc}"
+
+stat -Lc 'CAPTURED_SOURCE size=%s modified=%y path=%n' /proc/self/fd/9
+cp --sparse=always /proc/self/fd/9 "${partial_file}"
+unsquashfs -s "${partial_file}"
+mv "${partial_file}" "${output_file}"
+echo "CONTAINER_CAPTURE_PASS job=${SLURM_JOB_ID} output=${output_file}"

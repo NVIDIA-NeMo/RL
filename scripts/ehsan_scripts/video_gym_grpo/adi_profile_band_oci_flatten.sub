@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:1
+#SBATCH --time=04:00:00
+#SBATCH --job-name=adi-profile-band-oci-flatten
+
+set -euo pipefail
+
+readonly registry_host=gitlab-master.nvidia.com
+readonly image_repo=yifuw/images/nemo-rl
+readonly manifest_digest=sha256:62938ff9f9164323e5ccdaf2163952536b3fefd8c7a19390ed9af4fbf27c3dc3
+readonly image_tag=adi-omni-20260807
+readonly repo_dir=/lustre/fsw/portfolios/llmservice/users/ehosseiniasl/github_repos/nemorl/RL-adi-gdpo-lenpen-video-async
+readonly umoci_bin=${repo_dir}/reports/auto_research/adi_profile_band_video_async/tools/umoci-v0.6.0-linux-amd64
+readonly umoci_sha256=b51c267ec394499e42c6fde47f240b7b7dba57ea49df0b5acd304378b82a3b71
+readonly output_dir=/lustre/fsw/portfolios/llmservice/users/ehosseiniasl/github_repos/nemorl/RL-3604/.cache/containers
+readonly output_file=${output_dir}/nemo-rl-main_20260807-super-ultra-omni-oci-flat-x86_64.sqsh
+readonly partial_file=${output_file}.job-${SLURM_JOB_ID}.inprogress
+readonly required_scratch_bytes=150000000000
+
+test ! -e "${output_file}"
+test ! -e "${partial_file}"
+test -x "${umoci_bin}"
+printf '%s  %s\n' "${umoci_sha256}" "${umoci_bin}" | sha256sum -c -
+mkdir -p "${output_dir}"
+
+scratch_parent=
+for candidate in \
+  "/raid/containers/oci-flat/$(id -u)" \
+  "/raid/oci-flat/$(id -u)" \
+  "/tmp/oci-flat-$(id -u)"
+do
+  if mkdir -p "${candidate}" 2>/dev/null; then
+    available_bytes=$(df -PB1 "${candidate}" | awk 'NR == 2 {print $4}')
+    if [[ "${available_bytes}" =~ ^[0-9]+$ ]] && (( available_bytes >= required_scratch_bytes )); then
+      scratch_parent=${candidate}
+      break
+    fi
+  fi
+done
+
+if [[ -z "${scratch_parent}" ]]; then
+  echo "ERROR: no writable node-local filesystem has ${required_scratch_bytes} bytes free" >&2
+  df -h /raid /tmp 2>/dev/null || true
+  exit 1
+fi
+
+readonly scratch_parent
+readonly scratch_dir=${scratch_parent}/job-${SLURM_JOB_ID}
+readonly oci_dir=${scratch_dir}/image
+readonly blob_dir=${oci_dir}/blobs/sha256
+readonly bundle_dir=${scratch_dir}/bundle
+readonly local_sqsh=${scratch_dir}/image.sqsh
+
+test ! -e "${scratch_dir}"
+mkdir -p "${blob_dir}"
+
+cleanup() {
+  local cleanup_rc=$?
+  if [[ -e "${partial_file}" ]]; then
+    rm -f -- "${partial_file}"
+  fi
+  case "${scratch_dir}" in
+    "${scratch_parent}"/job-"${SLURM_JOB_ID}")
+      rm -rf --one-file-system -- "${scratch_dir}"
+      ;;
+    *)
+      echo "ERROR: refusing unsafe scratch cleanup: ${scratch_dir}" >&2
+      ;;
+  esac
+  exit "${cleanup_rc}"
+}
+trap cleanup EXIT
+
+echo "OCI_FLATTEN_START job=${SLURM_JOB_ID} account=${SLURM_JOB_ACCOUNT} partition=${SLURM_JOB_PARTITION}"
+echo "manifest=${manifest_digest} scratch=${scratch_dir} output=${output_file}"
+df -h "${scratch_parent}"
+
+registry_token() {
+  curl -fsSL --max-time 60 \
+    "https://${registry_host}/jwt/auth?service=container_registry&scope=repository%3A${image_repo//\//%2F}%3Apull" \
+    | jq -er '.token'
+}
+
+verify_blob() {
+  local path=$1
+  local digest=$2
+  local expected_size=$3
+  [[ -f "${path}" ]] || return 1
+  [[ "$(stat -Lc '%s' "${path}")" == "${expected_size}" ]] || return 1
+  [[ "sha256:$(sha256sum "${path}" | awk '{print $1}')" == "${digest}" ]]
+}
+
+fetch_blob() {
+  local digest=$1
+  local expected_size=$2
+  local target=${blob_dir}/${digest#sha256:}
+  local part=${target}.part
+  local token
+
+  if verify_blob "${target}" "${digest}" "${expected_size}"; then
+    return 0
+  fi
+  if verify_blob "${part}" "${digest}" "${expected_size}"; then
+    mv "${part}" "${target}"
+    return 0
+  fi
+
+  for attempt in 1 2 3 4 5; do
+    token=$(registry_token)
+    echo "FETCH_BLOB digest=${digest} bytes=${expected_size} attempt=${attempt}"
+    if curl -fL \
+      --connect-timeout 30 \
+      --speed-limit 1024 \
+      --speed-time 180 \
+      --continue-at - \
+      -H "Authorization: Bearer ${token}" \
+      "https://${registry_host}/v2/${image_repo}/blobs/${digest}" \
+      -o "${part}"; then
+      if verify_blob "${part}" "${digest}" "${expected_size}"; then
+        mv "${part}" "${target}"
+        return 0
+      fi
+    fi
+    sleep 5
+  done
+
+  echo "ERROR: failed to download and verify ${digest}" >&2
+  return 1
+}
+
+source_manifest_path=${blob_dir}/${manifest_digest#sha256:}
+manifest_part=${source_manifest_path}.part
+manifest_token=$(registry_token)
+curl -fsSL --max-time 120 \
+  -H "Authorization: Bearer ${manifest_token}" \
+  -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+  "https://${registry_host}/v2/${image_repo}/manifests/${manifest_digest}" \
+  -o "${manifest_part}"
+[[ "sha256:$(sha256sum "${manifest_part}" | awk '{print $1}')" == "${manifest_digest}" ]]
+mv "${manifest_part}" "${source_manifest_path}"
+
+config_digest=$(jq -er '.config.digest' "${source_manifest_path}")
+config_size=$(jq -er '.config.size' "${source_manifest_path}")
+fetch_blob "${config_digest}" "${config_size}"
+
+layer_count=$(jq -er '.layers | length' "${source_manifest_path}")
+compressed_bytes=$(jq -er '[.layers[].size] | add' "${source_manifest_path}")
+[[ "${layer_count}" == 53 ]]
+[[ "${compressed_bytes}" == 29017572457 ]]
+
+layer_index=0
+while IFS=$'\t' read -r layer_digest layer_size; do
+  layer_index=$((layer_index + 1))
+  echo "LAYER ${layer_index}/${layer_count} digest=${layer_digest} bytes=${layer_size}"
+  fetch_blob "${layer_digest}" "${layer_size}"
+done < <(jq -r '.layers[] | [.digest, (.size | tostring)] | @tsv' "${source_manifest_path}")
+
+oci_manifest_part=${scratch_dir}/oci-manifest.json
+jq -c '
+  .mediaType = "application/vnd.oci.image.manifest.v1+json"
+  | .config.mediaType = "application/vnd.oci.image.config.v1+json"
+  | .layers[].mediaType = "application/vnd.oci.image.layer.v1.tar+gzip"
+' "${source_manifest_path}" >"${oci_manifest_part}"
+oci_manifest_hash=$(sha256sum "${oci_manifest_part}" | awk '{print $1}')
+oci_manifest_digest=sha256:${oci_manifest_hash}
+oci_manifest_path=${blob_dir}/${oci_manifest_hash}
+mv "${oci_manifest_part}" "${oci_manifest_path}"
+
+printf '{"imageLayoutVersion":"1.0.0"}\n' >"${oci_dir}/oci-layout"
+manifest_size=$(stat -Lc '%s' "${oci_manifest_path}")
+jq -n \
+  --arg digest "${oci_manifest_digest}" \
+  --arg tag "${image_tag}" \
+  --argjson size "${manifest_size}" \
+  '{schemaVersion: 2, manifests: [{mediaType: "application/vnd.oci.image.manifest.v1+json", digest: $digest, size: $size, annotations: {"org.opencontainers.image.ref.name": $tag}}]}' \
+  >"${oci_dir}/index.json"
+
+echo "OCI_LAYOUT_READY layers=${layer_count} compressed_bytes=${compressed_bytes}"
+"${umoci_bin}" stat --image "${oci_dir}:${image_tag}"
+"${umoci_bin}" unpack --rootless --image "${oci_dir}:${image_tag}" "${bundle_dir}"
+
+rootfs=${bundle_dir}/rootfs
+test -d "${rootfs}/opt/nemo_rl_venv"
+test -d "${rootfs}/opt/gym_venvs/responses_api_models/vllm_model/.venv"
+test -f "${rootfs}/opt/nemo-rl/pyproject.toml"
+test -f "${rootfs}/opt/nemo-rl/uv.lock"
+echo "OCI_UNPACK_READY"
+du -sh "${rootfs}"
+
+mksquashfs "${rootfs}" "${local_sqsh}" \
+  -all-root \
+  -noappend \
+  -comp gzip \
+  -processors "${SLURM_CPUS_PER_TASK:-8}" \
+  -no-progress
+unsquashfs -s "${local_sqsh}"
+
+cp --sparse=always "${local_sqsh}" "${partial_file}"
+unsquashfs -s "${partial_file}"
+mv "${partial_file}" "${output_file}"
+echo "OCI_FLATTEN_PASS job=${SLURM_JOB_ID} output=${output_file}"

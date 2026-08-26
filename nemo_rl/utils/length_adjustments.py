@@ -35,6 +35,8 @@ import logging
 import statistics
 from typing import Any
 
+import torch
+
 logger = logging.getLogger(__name__)
 
 # MAD/median floor for zMAD (fixed; matches ``flag_reasoning_length_outliers`` default).
@@ -65,6 +67,8 @@ _PARAM_KEYS = (
     "profile_band_total",
     "profile_band_reasoning",
     "profile_band_answer",
+    "profile_band",
+    "reasoning_end_token_id",
     "group_length_penalty_profile_gate",
     "group_length_penalty_profile_gate_channel",
     "group_length_penalty_profile_gate_field",
@@ -86,6 +90,10 @@ _STR_PARAM_KEYS = frozenset({
     "group_length_penalty_profile_gate_channel",
     "group_length_penalty_profile_gate_field",
 })
+
+_MAPPING_PARAM_KEYS = frozenset({"profile_band"})
+
+_OPTIONAL_INT_PARAM_KEYS = frozenset({"reasoning_end_token_id"})
 
 _GDPO_LENGTH_FEATURE_PARAM_KEYS = frozenset({
     "reasoning_bonus",
@@ -174,6 +182,60 @@ def _extract_reasoning_and_answer_text(result: dict[str, Any]) -> tuple[str, str
                 answer_text += content
 
     return reasoning_text, answer_text
+
+
+def _generated_assistant_token_lengths(
+    result: dict[str, Any], reasoning_end_token_id: int
+) -> tuple[int, int]:
+    """Count generated reasoning and answer tokens without prompt history.
+
+    ``message_log`` contains the full conversation while ``input_message_log``
+    is its prompt prefix. Only generated assistant turns after that prefix are
+    counted. Each turn is split at its first reasoning-end token; an unfinished
+    turn counts entirely as reasoning.
+    """
+    input_message_count = len(result.get("input_message_log", []))
+    generated_messages = result.get("message_log", [])[input_message_count:]
+
+    reasoning_length = 0
+    answer_length = 0
+    for message in generated_messages:
+        if message.get("role") != "assistant":
+            continue
+        token_ids = message.get("token_ids")
+        if token_ids is None:
+            raise ValueError(
+                "Generated assistant messages must include token_ids when "
+                "reasoning_end_token_id is configured"
+            )
+        if isinstance(token_ids, torch.Tensor):
+            if token_ids.ndim != 1:
+                raise ValueError(
+                    "Generated assistant token_ids must be one-dimensional when "
+                    "reasoning_end_token_id is configured, got "
+                    f"shape={tuple(token_ids.shape)}"
+                )
+            token_id_list = token_ids.tolist()
+        elif isinstance(token_ids, list) and all(
+            isinstance(token_id, int) and not isinstance(token_id, bool)
+            for token_id in token_ids
+        ):
+            token_id_list = token_ids
+        else:
+            raise TypeError(
+                "Generated assistant token_ids must be a one-dimensional integer "
+                "sequence when reasoning_end_token_id is configured"
+            )
+
+        try:
+            split_idx = token_id_list.index(reasoning_end_token_id)
+        except ValueError:
+            reasoning_length += len(token_id_list)
+        else:
+            reasoning_length += split_idx
+            answer_length += len(token_id_list) - split_idx - 1
+
+    return reasoning_length, answer_length
 
 
 def _extract_gdpo_length_feature_params(feature_cfg: Any) -> dict[str, Any]:
@@ -298,6 +360,18 @@ def apply_group_length_adjustments(
             defaults[k] = default_cfg.get(k, True)
         elif k == "group_length_penalty_profile_gate_positive_only":
             defaults[k] = default_cfg.get(k, True)
+        elif k in _MAPPING_PARAM_KEYS:
+            value = default_cfg.get(k)
+            defaults[k] = dict(value) if isinstance(value, dict) else None
+        elif k in _OPTIONAL_INT_PARAM_KEYS:
+            value = default_cfg.get(k)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(
+                    f"{k} must be a non-negative integer or null, got {value!r}"
+                )
+            defaults[k] = value
         elif k in _BOOL_PARAM_KEYS:
             defaults[k] = default_cfg.get(k, False)
         elif k == "profiled_length_min_samples":
@@ -355,11 +429,19 @@ def apply_group_length_adjustments(
 
         group_lt = params.pop("length_type", "tokens")
         use_tokens = group_lt == "tokens"
+        reasoning_end_token_id = params.pop("reasoning_end_token_id", None)
+        configured_profile_band = params.pop("profile_band", None)
 
         for k in range(group_size):
             idx = g + k
             r_text, a_text = texts[idx]
-            if use_tokens and tokenizer is not None:
+            if use_tokens and reasoning_end_token_id is not None:
+                reasoning_lengths[idx], answer_lengths[idx] = (
+                    _generated_assistant_token_lengths(
+                        results[idx], reasoning_end_token_id
+                    )
+                )
+            elif use_tokens and tokenizer is not None:
                 reasoning_lengths[idx] = len(tokenizer.encode(r_text, add_special_tokens=False)) if r_text else 0
                 answer_lengths[idx] = len(tokenizer.encode(a_text, add_special_tokens=False)) if a_text else 0
             else:
@@ -372,7 +454,11 @@ def apply_group_length_adjustments(
         total_lengths[g : g + group_size] = group_total[:group_size]
         group_rewards = original_rewards[g : g + num_gens]
         gate_info = _group_length_profile_gate_info(
-            band=_merged_profile_band(results[g].get("profile_band"), global_band),
+            band=_merged_profile_band(
+                results[g].get("profile_band"),
+                global_band,
+                configured_profile_band,
+            ),
             params=params,
             rewards=group_rewards[:group_size],
             reasoning_lengths=group_reasoning[:group_size],
@@ -702,15 +788,15 @@ def _resolve_global_profile_band(pb_cfg: Any) -> dict[str, dict[str, Any]]:
 def _merged_profile_band(
     row_band: dict[str, Any] | None,
     global_band: dict[str, dict[str, Any]],
+    configured_band: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Merge per-row profile_band over global defaults (row channel wins)."""
-    if not global_band:
-        return row_band
-    if not row_band:
-        return dict(global_band)
+    """Resolve profile bands with row > agent/default > global precedence."""
     merged: dict[str, Any] = dict(global_band)
-    merged.update(row_band)
-    return merged
+    if configured_band:
+        merged.update(configured_band)
+    if row_band:
+        merged.update(row_band)
+    return merged or None
 
 
 def _apply_profile_band_multipliers(
@@ -753,7 +839,11 @@ def _apply_profile_band_multipliers(
         use_ans = bool(params.get("profile_band_answer", False))
         if not (use_total or use_rsn or use_ans):
             continue
-        band = _merged_profile_band(results[g].get("profile_band"), global_band)
+        band = _merged_profile_band(
+            results[g].get("profile_band"),
+            global_band,
+            params.get("profile_band"),
+        )
         if not band:
             continue
         ch_total = band.get("total") if use_total else None
@@ -948,6 +1038,20 @@ def _resolve_agent_params(
                 merged[key] = overrides[key]
             elif key in _BOOL_PARAM_KEYS:
                 merged[key] = bool(overrides[key])
+            elif key in _MAPPING_PARAM_KEYS:
+                value = overrides[key]
+                merged[key] = dict(value) if isinstance(value, dict) else None
+            elif key in _OPTIONAL_INT_PARAM_KEYS:
+                value = overrides[key]
+                if value is not None and (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                ):
+                    raise ValueError(
+                        f"{key} must be a non-negative integer or null, got {value!r}"
+                    )
+                merged[key] = value
             else:
                 merged[key] = float(overrides[key])
     return merged
