@@ -248,6 +248,9 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
     assert vllm_cfg["is_mx"] is True
     assert "quantization_ignored_layer_kws" not in vllm_cfg
     assert vllm_cfg["quantization_ignore_patterns"] == expected["ignore_patterns"]
+    assert bool(vllm_cfg.get("refit_prequantize")) is case_name.startswith("grpo-qwen3")
+    assert vllm_cfg["refit_cache_loader_routes"] is True
+    assert config["policy"]["megatron_cfg"]["enabled"] is True
     assert cluster["num_nodes"] == expected["nodes"]
     assert cluster["gpus_per_node"] == expected["gpus_per_node"]
     assert cluster["segment_size"] == expected["segment_size"]
@@ -274,6 +277,20 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
     assert async_grpo["in_flight_weight_updates"] is expected_async
     if expected_async:
         assert config["policy"]["generation"]["colocated"]["enabled"] is False
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    sorted(PERF_CONFIG_DIR.glob("*mxfp8-rollout.yaml")),
+    ids=lambda path: path.stem,
+)
+def test_all_mxfp8_rollout_recipes_enable_refit_optimizations(
+    config_path: Path,
+) -> None:
+    config = _load_resolved_yaml(config_path)
+    vllm_cfg = config["policy"]["generation"]["vllm_cfg"]
+
+    assert vllm_cfg["refit_cache_loader_routes"] is True
 
 
 def test_mxfp8_rollout_recipes_are_in_gb200_performance_suite() -> None:

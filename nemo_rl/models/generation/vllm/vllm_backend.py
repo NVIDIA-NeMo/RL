@@ -13,11 +13,12 @@
 # limitations under the License.
 import gc
 import logging
+import os
 import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import torch
 import zmq
@@ -26,6 +27,9 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineMixin,
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
+)
+from nemo_rl.models.generation.vllm.worker_utils import (
+    refit_cache_loader_routes_enabled,
 )
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
@@ -201,6 +205,139 @@ def fix_gemma3_vision_weight_name(key: str) -> str:
     )
 
 
+class _RefitLoaderCache:
+    """Recorded weight_loader calls for refit weight names.
+
+    vLLM's model.load_weights re-resolves every weight name through the
+    model's stacked/expert parameter mappings on each call; for large MoE
+    refits that is millions of substring checks per refit over a key set that
+    is static after the prepare_refit_info handshake. This cache records, per
+    name, the (loader, param, args, kwargs) of every weight_loader call the
+    first time a name is loaded and replays them directly afterwards.
+    """
+
+    def __init__(self) -> None:
+        self.calls: dict[str, list[tuple[Any, torch.nn.Parameter, tuple, dict]]] = {}
+        # Names whose loads never reached a wrapped weight_loader (skipped,
+        # transformed before dispatch, or default-loaded); these keep going
+        # through model.load_weights.
+        self.uncached: set[str] = set()
+        self.snapshot: dict[str, torch.nn.Parameter] = {}
+
+    def reset(self) -> None:
+        self.calls.clear()
+        self.uncached.clear()
+        self.snapshot.clear()
+
+
+def _cached_params_still_valid(model: Any, cache: _RefitLoaderCache) -> bool:
+    current = dict(model.named_parameters())
+    return all(current.get(name) is param for name, param in cache.snapshot.items())
+
+
+def _record_loader_calls(
+    model: Any, cache: _RefitLoaderCache, weights: list[tuple[str, torch.Tensor]]
+) -> set[str]:
+    """Run model.load_weights once while recording every weight_loader call.
+
+    Incoming weights are matched to loader calls by tensor object identity,
+    so only loads that pass the original tensor through a parameter's
+    weight_loader attribute are captured; everything else lands in
+    cache.uncached. Returns the loaded names from model.load_weights.
+    """
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    weight_names = {id(weight): name for name, weight in weights}
+    recorded: dict[str, list] = {}
+    originals: list[tuple[torch.nn.Parameter, Any]] = []
+
+    def make_recorder(loader):
+        def recorder(param, loaded_weight, *args, **kwargs):
+            name = weight_names.get(id(loaded_weight))
+            if name is not None:
+                recorded.setdefault(name, []).append((loader, param, args, kwargs))
+            return loader(param, loaded_weight, *args, **kwargs)
+
+        return recorder
+
+    try:
+        for param_name, param in model.named_parameters():
+            loader = getattr(param, "weight_loader", None)
+            # Leave default_weight_loader params unwrapped: model
+            # load_weights implementations dispatch on
+            # `weight_loader == default_weight_loader` with a different
+            # argument list.
+            if loader is None or loader is default_weight_loader:
+                continue
+            cache.snapshot[param_name] = param
+            originals.append((param, loader))
+            param.weight_loader = make_recorder(loader)
+        loaded = model.load_weights(weights=weights)
+    finally:
+        for param, loader in originals:
+            param.weight_loader = loader
+
+    for name, _ in weights:
+        calls = recorded.get(name)
+        if calls is None:
+            cache.uncached.add(name)
+        else:
+            cache.calls[name] = calls
+    return loaded if loaded is not None else set()
+
+
+def load_weights_maybe_cached(
+    model: Any,
+    weights: list[tuple[str, torch.Tensor]],
+    *,
+    cache_loader_routes: bool,
+) -> set[str]:
+    """Load weights, optionally replaying cached loader routes.
+
+    Cached parameter identities are re-validated against named_parameters()
+    on every call, so a process_weights_after_loading pass that replaces
+    parameter objects drops the cache instead of loading into orphans.
+    Returns the set of loaded weight names, mirroring model.load_weights.
+    """
+    if not cache_loader_routes:
+        return model.load_weights(weights=weights)
+
+    cache = getattr(model, "_nrl_refit_loader_cache", None)
+    if cache is None:
+        cache = _RefitLoaderCache()
+        model._nrl_refit_loader_cache = cache
+
+    replay = []
+    fallback = []
+    record = []
+    for name, weight in weights:
+        if name in cache.calls:
+            replay.append((name, weight))
+        elif name in cache.uncached:
+            fallback.append((name, weight))
+        else:
+            record.append((name, weight))
+
+    if replay and not _cached_params_still_valid(model, cache):
+        cache.reset()
+        return model.load_weights(weights=weights)
+
+    loaded: set[str] = set()
+    for name, weight in replay:
+        for loader, param, args, kwargs in cache.calls[name]:
+            # Expert loaders return False for non-local shards; a name only
+            # counts as loaded when some call does not report failure.
+            if loader(param, weight, *args, **kwargs) is not False:
+                loaded.add(name)
+    if record:
+        loaded |= _record_loader_calls(model, cache, record)
+    if fallback:
+        fallback_loaded = model.load_weights(weights=fallback)
+        if fallback_loaded is not None:
+            loaded |= fallback_loaded
+    return loaded
+
+
 def _read_mtp_layer_weights_from_checkpoint(
     model_path: str, mtp_layer_indices: set[int]
 ) -> list[tuple[str, torch.Tensor]]:
@@ -219,7 +356,6 @@ def _read_mtp_layer_weights_from_checkpoint(
         tensors on CPU.
     """
     import json
-    import os
 
     from safetensors import safe_open
 
@@ -267,7 +403,13 @@ class VllmInternalWorkerExtension:
     ) -> None:
         """Load HF weights and detach any deferred reload tensors from transport storage."""
         if not getattr(self, "_nrl_layerwise_reload_active", False):
-            self.model_runner.model.load_weights(weights=policy_weights)
+            load_weights_maybe_cached(
+                self.model_runner.model,
+                policy_weights,
+                cache_loader_routes=refit_cache_loader_routes_enabled(
+                    self.model_runner.vllm_config
+                ),
+            )
             return
 
         source_storage_ptrs = {
@@ -275,7 +417,13 @@ class VllmInternalWorkerExtension:
         }
         load_error: Exception | None = None
         try:
-            self.model_runner.model.load_weights(weights=policy_weights)
+            load_weights_maybe_cached(
+                self.model_runner.model,
+                policy_weights,
+                cache_loader_routes=refit_cache_loader_routes_enabled(
+                    self.model_runner.vllm_config
+                ),
+            )
         except Exception as error:
             load_error = error
             raise
@@ -412,7 +560,11 @@ class VllmInternalWorkerExtension:
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self,
+        state_dict_info: dict[str, Any],
+        serialized_fp8_config: Optional[dict[str, Any]] = None,
+    ) -> Optional[list[str]]:
         """Prepare state dict metadata for weight refitting and IPC streaming.
 
         Args:
@@ -423,9 +575,33 @@ class VllmInternalWorkerExtension:
             RuntimeError: If the model realizes the unquantized FlashInfer TRTLLM
                 MoE backend while a co-trained MTP drafter is enabled (unsupported
                 by the native layerwise refit lifecycle).
+
+        Returns:
+            When MXFP8 trainer-side pre-quantization is enabled
+            (vllm_cfg.refit_prequantize), the list of parameter names this
+            worker will quantize at load time; the trainer quantizes exactly
+             these and streams E4M3 data plus *_scale_from_checkpoint scales.
+             None otherwise.
         """
         self._validate_native_layerwise_refit()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        fp8.install_fp8_config(serialized_fp8_config)
+        fp8.set_refit_manifest_names(set(state_dict_info))
+        if not (
+            fp8.global_fp8_config is not None
+            and fp8.global_fp8_config.is_mx
+            and fp8.global_fp8_config.refit_prequantize
+            and fp8.is_fp8_model(self.model_runner.vllm_config)
+        ):
+            return None
+        return [
+            name
+            for name in state_dict_info
+            if fp8._is_fp8_weight(name, self.model_runner.model)
+        ]
 
     def prepare_sparse_delta_refit_info(
         self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]
@@ -441,28 +617,6 @@ class VllmInternalWorkerExtension:
         cache_config = getattr(vllm_config, "cache_config", None)
         kv_cache_dtype = getattr(cache_config, "cache_dtype", None)
         return kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
-
-    def _maybe_process_fp8_kv_cache(self) -> None:
-        """Process weights after loading for FP8 KV cache (static scales)."""
-        if not self._uses_fp8_kv_cache():
-            return
-
-        # FP8 KV cache: process KV scales after weight loading
-        from vllm.config import set_current_vllm_config
-        from vllm.model_executor.model_loader.utils import (
-            process_weights_after_loading,
-        )
-
-        # Get target device for processing
-        target_device = next(self.model_runner.model.parameters()).device
-
-        # Call process_weights_after_loading to handle KV scales
-        with set_current_vllm_config(self.model_runner.vllm_config):
-            process_weights_after_loading(
-                self.model_runner.model,
-                self.model_runner.model_config,
-                target_device,
-            )
 
     @staticmethod
     def _split_policy_and_draft_weights(
@@ -837,9 +991,8 @@ class VllmInternalWorkerExtension:
             self._maybe_process_mtp_drafter_after_loading()
 
         yield finalize
-        # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
-        # this optional second pass, just as it was before lifecycle hooks.
-        self._maybe_process_fp8_kv_cache()
+        # KV-cache scales are covered by the full process_weights_after_loading
+        # pass in finalize(); no second pass is needed.
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""

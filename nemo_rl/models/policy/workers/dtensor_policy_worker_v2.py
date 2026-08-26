@@ -265,6 +265,9 @@ class DTensorPolicyWorkerV2Impl(
 
         # Store configuration
         self.cfg = config
+        # Staging-buffer cache for refit weight streaming; only populated when
+        # cfg["refit_persistent_ipc_buffers"] is enabled.
+        self._refit_ipc_buffer_cache: dict[str, Any] = {}
 
         # Reconstruct tokenizer/processor locally to avoid pickling across
         # incompatible transformers versions (v4 head node → v5 worker).
@@ -1144,6 +1147,11 @@ class DTensorPolicyWorkerV2Impl(
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
+            buffer_cache=(
+                self._refit_ipc_buffer_cache
+                if self.cfg.get("refit_persistent_ipc_buffers")
+                else None
+            ),
         )
 
     @torch.no_grad()

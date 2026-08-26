@@ -6,6 +6,7 @@ policy:
     vllm_cfg:
       precision: "fp8"
       is_mx: true
+      refit_cache_loader_routes: true
       quantization_ignore_patterns:
         - model.layers.*.mixer.in_proj
         - model.layers.*.mixer.out_proj

@@ -181,6 +181,8 @@ policy:
 
   megatron_cfg:
     enabled: false
+    refit_slim_offload_after: false
+    pinned_reference_swap: false
     model_overrides: {}
     checkpoint:
       async_save: true
@@ -332,6 +334,7 @@ policy:
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
   make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  refit_persistent_ipc_buffers: false
   max_grad_norm: 1.0
 
   optimizer:
@@ -405,6 +408,9 @@ policy:
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
+      # MXFP8 + Megatron only: quantize on trainer and stream E4M3 values plus scales.
+      refit_prequantize: false
+      refit_cache_loader_routes: false # Replay stable vLLM loader routes across refits.
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
       tensor_parallel_size: 1
