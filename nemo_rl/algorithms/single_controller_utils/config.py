@@ -36,10 +36,13 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.value import ValueConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 # ── User-facing SingleController configs ────────────────────────────────────
@@ -534,16 +537,57 @@ class AsyncRLConfig(BaseModel, extra="allow"):
 
 
 class MasterConfig(BaseModel, extra="allow"):
+    # algo configs
+    grpo: Optional[GRPOConfig] = None
+    ppo: Optional[PPOConfig] = None
     policy: PolicyConfig
+    value: Optional[ValueConfig] = None  # PPO extras
     loss_fn: ClippedPGLossConfig
+    value_loss_fn: Optional[MseValueLossConfig] = None  # PPO extras
+    # common configs
     env: dict[str, Any]
     data: DataConfig
-    grpo: GRPOConfig
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
+
+    @model_validator(mode="after")
+    def validate_algorithm_block(self) -> "MasterConfig":
+        # Both are Optional so a PPO run can omit `grpo`; without this the
+        # entrypoint dereferences the absent block before validation runs.
+        if self.grpo is not None and self.ppo is not None:
+            raise ValueError(
+                "Only one algorithm block can be set, either `grpo` or `ppo`."
+            )
+        if self.grpo is None and self.ppo is None:
+            raise ValueError(
+                "At least one algorithm block must be set, either `grpo` or `ppo`."
+            )
+        return self
+
+
+def is_ppo_run(master_config: MasterConfig) -> bool:
+    """Whether this SingleController run trains a PPO critic alongside the policy.
+
+    Single source of truth for the flag: setup reads it to decide whether to
+    build the value model, and the controller reads it to decide whether the
+    train pump runs the critic stages. ``model_construct`` skips defaults, so
+    the attribute can genuinely be missing on a hand-built config.
+    """
+    return getattr(master_config, "ppo", None) is not None
+
+
+def algo_config(master_config: MasterConfig) -> GRPOConfig | PPOConfig:
+    """The active algorithm block: ``ppo`` on a PPO run, else ``grpo``.
+
+    Exactly one of the two is set; MasterConfig.validate_algorithm_block checks
+    that at construction.
+    """
+    if is_ppo_run(master_config):
+        return master_config.ppo  # type: ignore
+    return master_config.grpo  # type: ignore
 
 
 def validate_sampler_buffer_capacity(
@@ -639,7 +683,7 @@ def _validate_failure_settings(
         warnings.warn(
             f"async_rl.rollout_failure.min_step_batch_fraction="
             f"{failure_config.min_step_batch_fraction} gives a floor of {floor} of "
-            f"grpo.num_prompts_per_step={num_prompts_per_step}, so no prompt may be "
+            f"num_prompts_per_step={num_prompts_per_step}, so no prompt may be "
             f"dropped -- but max_skipped_prompts="
             f"{failure_config.max_skipped_prompts} / max_consecutive_dropped_prompts="
             f"{failure_config.max_consecutive_dropped_prompts} permit drops, and the "
@@ -666,7 +710,7 @@ def _validate_failure_settings(
         warnings.warn(
             f"async_rl.rollout_failure.replacement_reserve_prompts="
             f"{failure_config.replacement_reserve_prompts} exceeds "
-            f"grpo.num_prompts_per_step={num_prompts_per_step}. The pool is refilled "
+            f"num_prompts_per_step={num_prompts_per_step}. The pool is refilled "
             "by diverting one whole dataloader batch, so a mark above one batch "
             "diverts several in a row before any is admitted -- and diverting happens "
             "before admit(), outside the sampler gate and the buffer-capacity valve, "
@@ -675,19 +719,182 @@ def _validate_failure_settings(
         )
 
 
+def _validate_algo_settings(master_config: MasterConfig) -> None:
+    """Reject algorithm blocks the SingleController path cannot honour.
+
+    Both directions on the critic: one the PPO path needs and does not have, and
+    one a GRPO run carries and would never build. Plus the reward shaping and
+    filtering knobs SC reads on neither path.
+    """
+    algo_cfg = algo_config(master_config)
+
+    # SC reads none of these on either path, so an enabled one describes shaping
+    # this run does not do. Async GRPO rejects three of them the same way.
+    unsupported = [
+        name
+        for name, enabled in (
+            ("overlong_filtering", algo_cfg.overlong_filtering),
+            ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
+            ("reward_scaling", algo_cfg.reward_scaling.enabled),
+            ("reward_shaping", algo_cfg.reward_shaping.enabled),
+        )
+        if enabled
+    ]
+    if unsupported:
+        names = ", ".join(unsupported)
+        raise NotImplementedError(
+            f"{names} not supported on the SingleController path, which "
+            "implements none of them -- the run would silently skip the "
+            "shaping. Disable them."
+        )
+
+    if master_config.policy["generation"]["colocated"]["enabled"]:
+        raise ValueError(
+            "The SingleController path requires "
+            "policy.generation.colocated.enabled=false: SC drives rollout via "
+            "RolloutManager.generate_and_push, which is only supported on the "
+            "disaggregated async engine."
+        )
+
+    async_config = master_config.async_rl
+    # Capacity is sized from the peak window whatever the algorithm, so an inert
+    # setting still costs buffer and fails setup naming the wrong cause.
+    if (
+        getattr(async_config.sampler, "warmup_lookahead_versions", None) is not None
+        and getattr(algo_cfg, "policy_training_start_step", 0) == 0
+    ):
+        if is_ppo_run(master_config):
+            raise ValueError(
+                "async_rl.sampler.warmup_lookahead_versions requires "
+                "ppo.policy_training_start_step > 0; without critic warmup there is "
+                "no frozen-policy window to widen."
+            )
+        raise ValueError(
+            "async_rl.sampler.warmup_lookahead_versions is a PPO critic-warmup knob "
+            "and this run has no `ppo` block, so nothing ever widens the window -- "
+            "but max_buffered_rollouts is still validated against the wider one. "
+            "Remove it, or add a `ppo` block with policy_training_start_step > 0."
+        )
+
+    if not is_ppo_run(master_config):
+        # A value block without `ppo` is inert -- nothing builds the critic --
+        # and a config carrying one is asking for PPO by every reading except
+        # the one the code uses. Say so rather than training GRPO silently.
+        for name in ("value", "value_loss_fn"):
+            if getattr(master_config, name, None) is not None:
+                raise ValueError(
+                    f"{name} is set but the `ppo` block is absent, so this run "
+                    "trains GRPO and the value model would never be built. Add a "
+                    f"`ppo` block, or remove `{name}`."
+                )
+        return
+
+    for name in ("value", "value_loss_fn"):
+        if getattr(master_config, name, None) is None:
+            raise ValueError(
+                f"the `ppo` block selects the PPO path, which needs `{name}`. "
+                "See examples/configs/ppo_math_1B_megatron_single_controller.yaml."
+            )
+
+    # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
+    # setup_data_plane unconditionally, so a DTensor critic dies in Ray with the
+    # model already on GPU. ppo_math_1B.yaml ships dtensor_cfg.enabled=true.
+    value_megatron_cfg = master_config.value.get("megatron_cfg", {})  # type: ignore
+    if not value_megatron_cfg.get("enabled"):
+        raise ValueError(
+            "PPO on the SingleController path requires a Megatron critic "
+            "(value.megatron_cfg.enabled=true). The DTensor value worker does not "
+            "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
+        )
+
+    if algo_cfg.ppo_epochs < 1:
+        raise ValueError("ppo.ppo_epochs must be at least 1")
+
+    # Without it the critic steps once per chunk and the policy once per step,
+    # which is two effective learning rates from one config, and no error.
+    if async_config.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step:
+        raise ValueError(
+            "PPO on the SingleController path requires "
+            "async_rl.min_groups_for_streaming_train "
+            f"({async_config.min_groups_for_streaming_train}) == "
+            f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) so that each RL "
+            "step is assembled from a single chunk: the critic steps its "
+            "optimizer once per chunk and the policy once per step. Streaming "
+            "PPO needs a split train API on the value workers, which they do "
+            "not have yet (#2625)."
+        )
+
+    failure_config = async_config.rollout_failure
+    drop_budget = (
+        failure_config.max_skipped_prompts
+        + failure_config.max_consecutive_dropped_prompts
+    )
+    if drop_budget > 0:
+        raise ValueError(
+            "PPO on the SingleController path requires "
+            "async_rl.rollout_failure.max_skipped_prompts=0 and "
+            "max_consecutive_dropped_prompts=0, but they sum to "
+            f"{drop_budget}. A drop shortens the step, and the critic shards that "
+            "step against the configured value.train_global_batch_size rather than "
+            "its actual size, so the first short step fails a divisibility assert "
+            "inside the value workers (#2625)."
+        )
+
+    policy_megatron_cfg = master_config.policy.get("megatron_cfg", {})  # type: ignore
+    if (
+        getattr(algo_cfg, "policy_training_start_step", 0) > 0
+        and master_config.checkpointing["enabled"]
+        and master_config.checkpointing["save_optimizer"]
+        and policy_megatron_cfg.get("enabled")
+        and policy_megatron_cfg.get("checkpoint", {}).get(
+            "ckpt_assume_constant_structure"
+        )
+    ):
+        raise ValueError(
+            "policy.megatron_cfg.checkpoint.ckpt_assume_constant_structure=true "
+            "is incompatible with PPO critic warmup when optimizer checkpointing "
+            "is enabled. Set ckpt_assume_constant_structure=false, "
+            "ppo.policy_training_start_step=0, or checkpointing.save_optimizer=false."
+        )
+
+    sampler_name = async_config.sampler.name
+    if sampler_name != "in_order":
+        raise ValueError(
+            "PPO on the SingleController path only supports "
+            f"async_rl.sampler.name='in_order', but got '{sampler_name}'. "
+            "Other samplers are not supported yet (in particular during critic "
+            "warmup) (#2625)."
+        )
+
+    rl_step_samples = (
+        algo_cfg.num_prompts_per_step * algo_cfg.num_generations_per_prompt
+    )
+    value_global_batch_size = master_config.value["train_global_batch_size"]  # type: ignore
+    if rl_step_samples != value_global_batch_size:
+        raise ValueError(
+            "num_prompts_per_step * num_generations_per_prompt "
+            f"({rl_step_samples}) must equal value.train_global_batch_size "
+            f"({value_global_batch_size}) so that one RL step maps to exactly one "
+            "critic optimizer.step."
+        )
+
+
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    _validate_algo_settings(master_config)
+
     async_config = master_config.async_rl
-    num_prompts_per_step = master_config.grpo.num_prompts_per_step
-    if num_prompts_per_step < async_config.min_groups_for_streaming_train:
+    algo_cfg = algo_config(master_config)
+
+    if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
         raise ValueError(
-            f"grpo.num_prompts_per_step ({num_prompts_per_step}) "
+            f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) "
             f"must be >= async_rl.min_groups_for_streaming_train "
             f"({async_config.min_groups_for_streaming_train})"
         )
 
     rl_step_samples = (
-        num_prompts_per_step * master_config.grpo.num_generations_per_prompt
+        algo_cfg.num_prompts_per_step * algo_cfg.num_generations_per_prompt
     )
     train_global_batch_size = master_config.policy["train_global_batch_size"]
     if rl_step_samples != train_global_batch_size:
@@ -701,7 +908,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     required_capacity = required_buffer_capacity_for_config(
         async_config.sampler,
-        num_prompts_per_step,
+        algo_cfg.num_prompts_per_step,
     )
     validate_sampler_buffer_capacity(
         async_config,
@@ -755,20 +962,20 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     if (
         reference_policy_kl_penalty
-        and master_config.grpo.skip_reference_policy_logprobs_calculation
+        and algo_cfg.skip_reference_policy_logprobs_calculation
     ):
         raise ValueError(
             "loss_fn.reference_policy_kl_penalty="
             f"{reference_policy_kl_penalty} requires reference_policy_logprobs, "
-            "but grpo.skip_reference_policy_logprobs_calculation=true skips "
+            "but skip_reference_policy_logprobs_calculation=true skips "
             "computing them on the SingleController path. Set "
-            "grpo.skip_reference_policy_logprobs_calculation=false, or set "
+            "skip_reference_policy_logprobs_calculation=false, or set "
             "loss_fn.reference_policy_kl_penalty=0."
         )
 
     if (
         reference_policy_kl_penalty == 0
-        and not master_config.grpo.skip_reference_policy_logprobs_calculation
+        and not algo_cfg.skip_reference_policy_logprobs_calculation
     ):
         print(
             "Reference policy logprob calculation will be skipped since "
@@ -776,7 +983,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "model was initialized."
         )
 
-    _validate_failure_settings(async_config, num_prompts_per_step)
+    _validate_failure_settings(async_config, algo_cfg.num_prompts_per_step)
 
     # Nesting says which knob applies to which path, but nothing stops an operator
     # filling in the block for the path this run is not taking -- and a populated
@@ -827,3 +1034,7 @@ class AdvantageConfig:
     policy_logprobs_field: str = "prev_logprobs"
     generation_logprobs_field: str = "generation_logprobs"
     reference_logprobs_field: str = "reference_policy_logprobs"
+    # PPO only: the critic's pre-update prediction (input) and GAE's
+    # regression target for it (output).
+    values_field: str = "values"
+    returns_field: str = "returns"

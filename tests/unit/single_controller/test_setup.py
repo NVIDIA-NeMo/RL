@@ -42,7 +42,7 @@ def _make_master_config(
     *,
     dp_enabled: bool = True,
     use_multiple_dataloader: bool = False,
-    colocated: bool = True,
+    colocated: bool = False,
     backend: str = "vllm",
     megatron_enabled: bool = False,
     env: dict | None = None,
@@ -166,9 +166,8 @@ def patched_factories():
             "create_weight_synchronizer",
             return_value=MagicMock(name="weight_sync"),
         ) as mock_weight_sync,
-        patch.object(
-            sc_setup_mod,
-            "_create_advantage_estimator",
+        patch(
+            "nemo_rl.algorithms.grpo._create_advantage_estimator",
             return_value=MagicMock(name="adv"),
         ) as mock_adv,
         patch.object(
@@ -244,7 +243,6 @@ class TestSetup:
             ),
             ("buffer_capacity", ValueError, "required capacity"),
             ("megatron_dtensor_trainer", ValueError, "megatron_cfg.enabled"),
-            ("megatron_colocated", NotImplementedError, "colocated Megatron"),
             ("megatron_gym_without_http_server", ValueError, "expose_http_server"),
             ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
         ],
@@ -270,17 +268,13 @@ class TestSetup:
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=False
             )
-        elif invalid_case == "megatron_colocated":
-            mc = _make_master_config(
-                colocated=True, backend="megatron", megatron_enabled=True
-            )
         elif invalid_case == "megatron_gym_without_http_server":
             mc = self._make_gym_megatron_config()
             mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = (
                 False
             )
         elif invalid_case == "gym_on_sglang":
-            mc = _make_master_config(colocated=True, backend="sglang")
+            mc = _make_master_config(colocated=False, backend="sglang")
         else:  # pragma: no cover
             raise AssertionError(f"unknown test case {invalid_case}")
 
@@ -335,7 +329,7 @@ class TestSetup:
         patched_factories["_build_clusters"].assert_not_called()
 
     def test_returns_actor_args(self, patched_factories):
-        mc = _make_master_config(colocated=True)
+        mc = _make_master_config()
         tokenizer = MagicMock(pad_token_id=0)
 
         actor_args, _ = setup_single_controller(mc, tokenizer)
@@ -416,7 +410,7 @@ class TestSetup:
         assert call_kwargs["effort_config"] is None
 
     def test_router_replay_requires_routes_in_tq_buffer(self, patched_factories):
-        mc = _make_master_config(colocated=True)
+        mc = _make_master_config()
         mc.policy["router_replay"] = {"enabled": True}
 
         actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -530,7 +524,7 @@ class TestSetup:
 
     def test_nemo_gym_wires_env_handle(self, patched_factories):
         """When should_use_nemo_gym is True the nemo-gym actor is spun up and stored."""
-        mc = _make_master_config(colocated=True, backend="vllm")
+        mc = _make_master_config(backend="vllm")
         mc.policy["generation"]["model_name"] = "test-model"
         mc.policy["generation"]["stop_strings"] = None
         mc.policy["generation"]["stop_token_ids"] = None
@@ -564,9 +558,9 @@ class TestSetup:
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 
-    def test_setup_timing_populated_for_colocated_vllm(self, patched_factories):
-        """Colocated vLLM records gen+policy+collective+total+worker fields."""
-        mc = _make_master_config(colocated=True, backend="vllm")
+    def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
+        """Non-colocated vLLM records every per-phase field."""
+        mc = _make_master_config(colocated=False, backend="vllm")
 
         _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -581,23 +575,6 @@ class TestSetup:
             value = getattr(metrics, field)
             assert value is not None, f"missing {field} on {metrics}"
             assert value >= 0
-        # parallel_wall_time_s / parallel_init_enabled are grpo.py-only in the
-        # shared SetupTimingMetrics — SC does not emit them.
-        assert metrics.parallel_wall_time_s is None
-        assert metrics.parallel_init_enabled is None
-        # Reserve/load split is populated on the gym-on path only.
-        assert metrics.generation_init_reserve_time_s is None
-        assert metrics.generation_init_load_time_s is None
-
-    def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
-        """Non-colocated vLLM records the same per-phase fields as colocated."""
-        mc = _make_master_config(colocated=False, backend="vllm")
-
-        _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
-
-        assert metrics.generation_init_time_s is not None
-        assert metrics.policy_init_time_s is not None
-        assert metrics.worker_setup_time_s is not None
         # parallel_wall_time_s / parallel_init_enabled are grpo.py-only.
         assert metrics.parallel_wall_time_s is None
         assert metrics.parallel_init_enabled is None
@@ -607,7 +584,7 @@ class TestSetup:
 
     def test_setup_timing_backend_agnostic_for_sglang(self, patched_factories):
         """SC uses the backend-agnostic generation_init_time_s regardless of backend."""
-        mc = _make_master_config(colocated=True, backend="sglang")
+        mc = _make_master_config(backend="sglang")
 
         _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -615,7 +592,7 @@ class TestSetup:
 
     def test_nemo_gym_uses_deferred_vllm_load(self, patched_factories):
         """NeMo-Gym path reserves vLLM ports up-front and finishes the load afterwards."""
-        mc = _make_master_config(colocated=True, backend="vllm")
+        mc = _make_master_config(backend="vllm")
         mc.policy["generation"]["model_name"] = "test-model"
         mc.policy["generation"]["stop_strings"] = None
         mc.policy["generation"]["stop_token_ids"] = None
@@ -641,7 +618,7 @@ class TestSetup:
 
     def test_nemo_gym_records_timing_metrics(self, patched_factories):
         """NeMo-Gym path records per-phase timings (vllm/policy/gym/worker)."""
-        mc = _make_master_config(colocated=True, backend="vllm")
+        mc = _make_master_config(backend="vllm")
         mc.policy["generation"]["model_name"] = "test-model"
         mc.policy["generation"]["stop_strings"] = None
         mc.policy["generation"]["stop_token_ids"] = None
@@ -694,9 +671,8 @@ class TestSetup:
         assert metrics.generation_init_time_s is not None
         assert metrics.policy_init_time_s is not None
 
-    @pytest.mark.parametrize("colocated", [True, False])
     def test_nemo_gym_generation_init_time_includes_reserve_time(
-        self, patched_factories, colocated
+        self, patched_factories
     ):
         """generation_init_time_s folds in the deferred-VllmGeneration reserve time.
 
@@ -706,7 +682,7 @@ class TestSetup:
         gym-on runs undercount generation setup by the worker-group span. The
         reserve/load split is also exposed for overlap analysis.
         """
-        mc = _make_master_config(colocated=colocated, backend="vllm")
+        mc = _make_master_config(colocated=False, backend="vllm")
         mc.policy["generation"]["model_name"] = "test-model"
         mc.policy["generation"]["stop_strings"] = None
         mc.policy["generation"]["stop_token_ids"] = None
@@ -897,6 +873,23 @@ class TestSetup:
         else:
             # Reserve/load split is populated on the gym-on path only.
             assert metrics.generation_init_reserve_time_s is None
+
+    @pytest.mark.parametrize("backend", ["sglang"])
+    def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):
+        """SC nemo-gym wiring supports vllm and megatron; every other backend must raise."""
+        mc = _make_master_config(backend=backend)
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "spinup_nemo_gym_actor") as mock_spinup,
+            pytest.raises(NotImplementedError, match="vllm"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+        mock_spinup.assert_not_called()
 
     def test_megatron_fleet_health_rejected_with_clean_backend_error(self):
         """megatron + generation_fleet_health fails naming the backend.

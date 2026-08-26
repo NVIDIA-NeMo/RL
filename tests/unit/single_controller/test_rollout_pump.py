@@ -164,6 +164,7 @@ def test_rollout_pump_stamps_target_steps(
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
     # The sampler owns admission + target_step stamping (the dispatch counter
     # lives on the sampler, not the actor).
@@ -223,6 +224,7 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = _OutcomeRolloutManager()
     ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
     ctrl._dataloader = [
@@ -277,6 +279,7 @@ def test_rollout_pump_tops_up_restored_target_step(
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
     # lookahead=0 keeps the single batch on target_step 0.
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
@@ -354,6 +357,7 @@ def test_rollout_pump_credits_shortfall_only_for_stamped_prompts(
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = _SkippingRolloutManager()
     ctrl._sampler = make_sampler(buffer)
     prompt_batch = BatchedDataDict(
@@ -433,6 +437,7 @@ def _pump_controller(
             max_num_epochs=1, num_prompts_per_step=num_prompts_per_step
         )
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = manager
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=1)
     ctrl._dataloader = dataloader
@@ -716,6 +721,7 @@ class TestTargetGroupsForStep:
                 num_prompts_per_step=num_prompts_per_step,
             )
         )
+        ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._async_cfg = SimpleNamespace(
             rollout_failure=SimpleNamespace(min_step_batch_fraction=fraction)
         )
@@ -850,6 +856,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ctrl._master_config = SimpleNamespace(
             grpo=GRPOConfig.model_construct(max_num_epochs=1)
         )
+        ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._rollout_manager = manager
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -938,6 +945,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ctrl._master_config = SimpleNamespace(
             grpo=GRPOConfig.model_construct(max_num_epochs=1)
         )
+        ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._rollout_manager = _NeverCalledRolloutManager()
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -993,7 +1001,10 @@ def test_rollout_pump_writes_expected_tq_data(
     dp_adapter = _SyncDPAdapter(tq_actor)
 
     master_config = MasterConfig.model_construct(
-        policy={"train_global_batch_size": expected_samples},
+        policy={
+            "train_global_batch_size": expected_samples,
+            "generation": {"colocated": {"enabled": False}},
+        },
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=num_prompts,
             num_generations_per_prompt=num_generations,
