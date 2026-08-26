@@ -37,6 +37,7 @@ run_test() {
 run_test fast uv run --no-sync pytest -q \
     tests/unit/models/generation/test_mxfp8_prequant.py
 run_test uv run --no-sync bash ./tests/functional/grpo_vllm_mxfp8_rollout_gb200.sh
+run_test uv run --no-sync bash ./tests/functional/grpo_megatron_mxfp8_refit_gb200.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

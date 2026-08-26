@@ -16,6 +16,7 @@ import gc
 import logging
 import os
 import re
+import socket
 import time
 import warnings
 from collections import OrderedDict, defaultdict
@@ -50,8 +51,14 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.multimodal_utils import (
+    attach_media_token_validity_mask,
+    chunks_accept_media_token_validity_mask,
+    media_placeholder_token_id_from_chunks,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.held_port import receive_held_socket
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.megatron_worker import (
@@ -59,7 +66,10 @@ from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationRefitMixin,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
-from nemo_rl.models.megatron.common import get_moe_metrics
+from nemo_rl.models.megatron.common import (
+    get_aux_loss_track_names,
+    get_moe_metrics,
+)
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
@@ -93,7 +103,13 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    broadcast_hf_buckets_via_distributed_impl,
+    connect_rollout_engines_from_distributed,
+    disconnect_rollout_engines_from_distributed,
+    get_runtime_env_for_policy_worker,
+    send_hf_buckets_via_ipc_actor_impl,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.checkpoint_engine import (
     MegatronCheckpointEngineSendMixin,
@@ -179,6 +195,24 @@ def _model_slices_context_parallel_inputs(model: Any) -> bool:
         bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
         for chunk in chunks
     )
+
+
+def _unwrapped_chunks(model: Any) -> list[Any]:
+    """Model chunks as a flat list, whatever wrapping the caller handed us."""
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    return list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+
+
+def _model_media_placeholder_token_id(model: Any) -> Optional[int]:
+    """The vocabulary id this model treats as a media placeholder, if any."""
+    return media_placeholder_token_id_from_chunks(_unwrapped_chunks(model))
+
+
+def _model_accepts_media_token_validity_mask(model: Any) -> bool:
+    """Whether the model's forward takes an explicit media-token validity mask."""
+    return chunks_accept_media_token_validity_mask(_unwrapped_chunks(model))
 
 
 def _estimate_refit_tensor_size_in_bytes(
@@ -398,6 +432,7 @@ class MegatronPolicyWorkerImpl(
         *,
         worker_sharding_annotations: NamedSharding,
         skip_weight_load: bool = False,
+        reserved_http_server_port: Optional[int] = None,
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
@@ -446,8 +481,17 @@ class MegatronPolicyWorkerImpl(
         self.rank = get_rank_safe()
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
 
+        # Adopt the driver-reserved OpenAI server socket before any heavy init.
+        # The port holder has kept it bound and listening since reservation, so
+        # there was no window in which the pre-published URL could be stolen.
+        self._reserved_http_server_socket: Optional[socket.socket] = None
+        if reserved_http_server_port is not None and self.rank == 0:
+            self._reserved_http_server_socket = receive_held_socket(
+                reserved_http_server_port
+            )
+
         # Step 1: Setup distributed
-        setup_distributed()
+        setup_distributed(config)
         log_gpu_memory_diagnostics(
             label="after_nccl_init", worker_type="MegatronPolicyWorker"
         )
@@ -486,14 +530,6 @@ class MegatronPolicyWorkerImpl(
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Step 3: Setup model configuration
-        # Training workers cannot use inference_optimized transformer spec.
-        if init_optimizer:
-            assert (
-                config["megatron_cfg"].get("transformer_impl") != "inference_optimized"
-            ), (
-                "transformer_impl=inference_optimized must not be set on training workers. "
-                "Use policy.generation.mcore_generation_config.transformer_impl=inference_optimized instead."
-            )
         runtime_config = validate_and_set_config(
             config,
             self.rank,
@@ -609,6 +645,14 @@ class MegatronPolicyWorkerImpl(
         self.model_slices_context_parallel_inputs = (
             _model_slices_context_parallel_inputs(self.model)
         )
+        # A media placeholder is an ordinary vocabulary entry, so text that
+        # legitimately contains it must not be read as an anchor demanding a
+        # projected feature. Only models that accept the mask are sent one.
+        self.media_placeholder_token_id = (
+            _model_media_placeholder_token_id(self.model)
+            if _model_accepts_media_token_validity_mask(self.model)
+            else None
+        )
         if self.model_slices_context_parallel_inputs:
             if self.delegate_pack_to_model:
                 raise RuntimeError(
@@ -652,6 +696,7 @@ class MegatronPolicyWorkerImpl(
         self._held_gather_buffer = None
 
         self._init_inference_engine_state()
+        self._setup_colocated_cuda_graph_managers()
 
         log_gpu_memory_diagnostics(
             label="init_complete", worker_type="MegatronPolicyWorker"
@@ -826,6 +871,8 @@ class MegatronPolicyWorkerImpl(
                         "sample_mask"
                     ].unsqueeze(-1)
                     batch["mtp_loss_mask"] = mtp_loss_mask
+
+                attach_media_token_validity_mask(batch, self.media_placeholder_token_id)
 
                 (
                     data_iterator,
@@ -1065,6 +1112,13 @@ class MegatronPolicyWorkerImpl(
             moe_metrics = get_moe_metrics(
                 loss_scale=moe_loss_scale,
                 per_layer_logging=self.cfg["megatron_cfg"]["moe_per_layer_logging"],
+                # Pre-initialize the aux-loss tracker on every PP rank so the
+                # cross-PP all_reduce inside get_moe_metrics does not hang when a
+                # rank recorded no aux loss this step (e.g. a stage with no MoE
+                # layer, or MTP MoE on the last stage).
+                num_layers=getattr(model_config, "num_layers", None),
+                mtp_num_layers=getattr(model_config, "mtp_num_layers", None),
+                track_names=get_aux_loss_track_names(model_config),
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
@@ -1154,12 +1208,17 @@ class MegatronPolicyWorkerImpl(
     #    ``forward_backward_func`` calls between ``optimizer.step()`` would
     #    over-count: each call's terminal reduce sums an already-reduced
     #    bucket again. We wrap every call in ``self.model.no_sync()`` so
-    #    hooks accumulate locally only; one explicit ``start_grad_sync`` +
-    #    ``finish_grad_sync`` at finish does the single true reduce.
-    # 2. PP>1: the pipeline scheduler invokes ``config.grad_sync_func``
-    #    directly on last-microbatch boundaries — this bypasses the
-    #    ``no_sync`` gate. We null it for the duration of the step and
-    #    restore at finish/abort.
+    #    hooks accumulate locally only; the single true reduce happens once at
+    #    finish, inside the relocated ``finalize_model_grads_func`` call
+    #    (preceded by ``start_grad_sync`` when ``overlap_grad_reduce`` is set).
+    # 2. Three ``model.config`` hooks would otherwise fire a reduce mid-step,
+    #    none of them gated by the ``no_sync`` above: ``grad_sync_func`` (the
+    #    PP>1 scheduler calls it directly on last-microbatch boundaries),
+    #    ``no_sync_func`` (the PP=1 schedule runs its last microbatch outside
+    #    it) and ``finalize_model_grads_func`` (end of every
+    #    ``forward_backward_func``, i.e. once per chunk). All three are nulled
+    #    for the duration of the step and restored at finish/abort; see
+    #    ``begin_train_step`` for what each one does.
     # 3. Grad clip is bundled inside ``MegatronOptimizer.step()``; the 1/N
     #    rescale via ``self.model.scale_gradients(1/N)`` must run before
     #    ``optimizer.step()`` so the clip operates on the rescaled grad.
@@ -1195,9 +1254,14 @@ class MegatronPolicyWorkerImpl(
             "all_mb_metrics": [],
             "mb_losses": [],
             "total_num_microbatches": 0,
+            # One increment per train_microbatch call, i.e. the number of
+            # streaming chunks the controller has fed into this optimizer step
+            # so far.
+            "num_chunks": 0,
             # Saved across the step so we can restore at finish/abort.
             "saved_grad_sync_func": None,
             "saved_no_sync_func": None,
+            "saved_finalize_model_grads_func": None,
         }
 
     def _assert_step_open(self) -> dict[str, Any]:
@@ -1208,20 +1272,58 @@ class MegatronPolicyWorkerImpl(
             )
         return state
 
-    def _restore_saved_grad_sync_func(self, state: dict[str, Any]) -> None:
+    def _log_gpu_mem(self, tag: str) -> None:
+        """Emit per-rank CUDA allocator counters for memory forensics.
+
+        The ``max_*`` figures are interval peaks: the peak counters are reset on
+        every call, so each line reports the high-water mark since the previous
+        boundary rather than since process start. ``driver_used`` comes from the
+        driver and therefore includes NCCL's own device allocations, which the
+        torch counters do not see.
+
+        Resetting the peak counters is observable to anything else reading them,
+        so skip the whole body when the level is off rather than sampling and
+        discarding. Run with ``NRL_LOG_LEVEL=DEBUG`` to turn these on.
+
+        Args:
+            tag: Phase-boundary name this sample belongs to.
+        """
+        if not torch.cuda.is_available() or not log.isEnabledFor(logging.DEBUG):
+            return
+        dev = torch.cuda.current_device()
+        gib = float(1024**3)
+        free_b, total_b = torch.cuda.mem_get_info(dev)
+        log.debug(
+            "[gpumem] tag=%s rank=%d alloc=%.2f max_alloc=%.2f reserved=%.2f "
+            "max_reserved=%.2f driver_used=%.2f total=%.2f",
+            tag,
+            self.rank,
+            torch.cuda.memory_allocated(dev) / gib,
+            torch.cuda.max_memory_allocated(dev) / gib,
+            torch.cuda.memory_reserved(dev) / gib,
+            torch.cuda.max_memory_reserved(dev) / gib,
+            (total_b - free_b) / gib,
+            total_b / gib,
+        )
+        torch.cuda.reset_peak_memory_stats(dev)
+
+    def _restore_saved_mcore_hooks(self, state: dict[str, Any]) -> None:
         """Restore the mcore hooks nulled in ``begin_train_step``.
 
-        Restores both ``grad_sync_func`` and ``no_sync_func`` from the
-        saved values on the open-step state. Idempotent on those values;
-        safe to call from the happy-path finish/abort or from a try/except
-        cleanup in train_microbatch / finish_train_step when those raise
-        mid-body. See begin_train_step for why ``.config`` is read via
-        getattr-by-string.
+        Restores ``grad_sync_func``, ``no_sync_func`` and
+        ``finalize_model_grads_func`` from the saved values on the open-step
+        state. Idempotent on those values; safe to call from the happy-path
+        finish/abort or from a try/except cleanup in train_microbatch /
+        finish_train_step when those raise mid-body. See begin_train_step for
+        why ``.config`` is read via getattr-by-string.
         """
         model_config = getattr(self.model, "config", None)
         if model_config is not None:
             model_config.grad_sync_func = state.get("saved_grad_sync_func")
             model_config.no_sync_func = state.get("saved_no_sync_func")
+            model_config.finalize_model_grads_func = state.get(
+                "saved_finalize_model_grads_func"
+            )
 
     @wrap_with_nvtx_name("megatron_policy_worker/begin_train_step")
     def begin_train_step(
@@ -1251,7 +1353,7 @@ class MegatronPolicyWorkerImpl(
 
         state = self._split_step_state_init(loss_fn=loss_fn, gbs=gbs, mbs=mbs)
 
-        # Null both mcore hooks that would fire a mid-step DP reduce:
+        # Null the three mcore hooks that would fire a mid-step DP reduce:
         #   grad_sync_func — PP scheduler's direct call on last-MB boundaries
         #                    (PP>1 path).
         #   no_sync_func   — ``forward_backward_no_pipelining`` (PP=1, the
@@ -1262,7 +1364,20 @@ class MegatronPolicyWorkerImpl(
         #                    ``model.no_sync()`` we apply in train_microbatch,
         #                    triggering an assertion on the next begin/microbatch
         #                    pair (typically step 2).
-        # Save both so finish/abort restores them.
+        #   finalize_model_grads_func
+        #                  — every mcore schedule calls this at the END of each
+        #                    ``forward_backward_func`` invocation, so under
+        #                    streaming it fires once per chunk. Nothing we
+        #                    already override gates it: it reaches
+        #                    ``finish_grad_sync()`` directly, which ignores the
+        #                    ``is_last_microbatch`` flag that ``model.no_sync()``
+        #                    clears. With a distributed optimizer the
+        #                    reduce-scatter also writes into the buffer it reads,
+        #                    leaving this rank's shard DP-summed and the
+        #                    remainder local for the next chunk to accumulate on
+        #                    top of. The real callable runs once, in
+        #                    ``_finish_train_step_body``.
+        # Save all three so finish/abort restores them.
         # Read "config" via getattr-by-string so the token stays out of
         # begin_train_step.__code__.co_names; otherwise cloudpickle matches
         # torch.distributed.config (a non-pickleable ConfigModuleInstance).
@@ -1274,9 +1389,14 @@ class MegatronPolicyWorkerImpl(
             state["saved_no_sync_func"] = getattr(model_config, "no_sync_func", None)
             model_config.grad_sync_func = None
             model_config.no_sync_func = nullcontext
+            state["saved_finalize_model_grads_func"] = getattr(
+                model_config, "finalize_model_grads_func", None
+            )
+            model_config.finalize_model_grads_func = None
         else:
             state["saved_grad_sync_func"] = None
             state["saved_no_sync_func"] = None
+            state["saved_finalize_model_grads_func"] = None
 
         self._train_step_state = state
 
@@ -1298,16 +1418,17 @@ class MegatronPolicyWorkerImpl(
         try:
             self._train_microbatch_body(state, data)
         except Exception:
-            # The body left ``grad_sync_func`` nulled when begin_train_step
-            # opened the step. If we propagate without restoring, future
-            # steps run with the PP scheduler bypass disabled. Restore here;
-            # the caller is still expected to invoke abort_train_step
-            # (idempotent on the saved value) to drop ``_train_step_state``.
+            # The body left all three mcore hooks nulled when begin_train_step
+            # opened the step. If we propagate without restoring, future steps
+            # run with the PP scheduler bypass disabled and with no end-of-step
+            # gradient finalization at all. Restore here; the caller is still
+            # expected to invoke abort_train_step (idempotent on the saved
+            # values) to drop ``_train_step_state``.
             try:
-                self._restore_saved_grad_sync_func(state)
+                self._restore_saved_mcore_hooks(state)
             except Exception:
                 log.exception(
-                    "failed to restore grad_sync_func after train_microbatch error"
+                    "failed to restore mcore hooks after train_microbatch error"
                 )
             raise
 
@@ -1316,6 +1437,8 @@ class MegatronPolicyWorkerImpl(
         state: dict[str, Any],
         data: BatchedDataDict[Any],
     ) -> None:
+        state["num_chunks"] += 1
+        self._log_gpu_mem("chunk_enter")
         loss_fn = state["loss_fn"]
 
         # Accumulate local mask sums for the finish-time all_reduce.
@@ -1335,6 +1458,27 @@ class MegatronPolicyWorkerImpl(
 
         state["local_valid_seqs"] = state["local_valid_seqs"] + call_local_seqs
         state["local_valid_toks"] = state["local_valid_toks"] + call_local_toks
+
+        # The number of chunks per optimizer step is a first-class property of
+        # this path — it decides how many times gradients are accumulated before
+        # a single reduce — but it was previously only recoverable by calibrating
+        # per-phase timer ratios. Log it directly instead. Debug rather than
+        # print because this is per chunk per rank; run with NRL_LOG_LEVEL=DEBUG
+        # to see it. Guarded because the arguments are evaluated at the call site
+        # whether or not the record is emitted, and four of them are ``.item()``
+        # host-device syncs on the critical path. The per-step summary in
+        # ``_finish_train_step_body`` is the always-on one.
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "[chunk] chunks=%d rank=%d local_seqs=%.0f local_toks=%.0f "
+                "cum_local_seqs=%.0f cum_local_toks=%.0f",
+                state["num_chunks"],
+                self.rank,
+                call_local_seqs.item(),
+                call_local_toks.item(),
+                state["local_valid_seqs"].item(),
+                state["local_valid_toks"].item(),
+            )
 
         # Build the per-call iterator. Each ``train_microbatches_from_meta``
         # call carries one DP slice; the iterator subdivides into pipeline
@@ -1406,6 +1550,7 @@ class MegatronPolicyWorkerImpl(
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
+        self._log_gpu_mem("chunk_exit")
 
         # Collect per-mb metrics from the last PP stage; broadcast to all
         # PP ranks so non-last-stage ranks have something to all_reduce
@@ -1435,16 +1580,16 @@ class MegatronPolicyWorkerImpl(
         try:
             return self._finish_train_step_body(state)
         except Exception:
-            # Mid-finish failure: state machine is in a partial state and
-            # ``grad_sync_func`` may still be nulled (or restored, depending
-            # on how far the body got). Restore unconditionally so future
-            # steps run with the right config. Leave ``_train_step_state``
-            # for the caller's abort_train_step to clear.
+            # Mid-finish failure: state machine is in a partial state and the
+            # mcore hooks may still be nulled (or restored, depending on how far
+            # the body got). Restore unconditionally so future steps run with
+            # the right config. Leave ``_train_step_state`` for the caller's
+            # abort_train_step to clear.
             try:
-                self._restore_saved_grad_sync_func(state)
+                self._restore_saved_mcore_hooks(state)
             except Exception:
                 log.exception(
-                    "failed to restore grad_sync_func after finish_train_step error"
+                    "failed to restore mcore hooks after finish_train_step error"
                 )
             raise
 
@@ -1474,17 +1619,51 @@ class MegatronPolicyWorkerImpl(
         # Either way, opt.step sees the right-normalized gradient.
         self.model.scale_gradients(inv_n)
 
-        # Cross-DP grad reduce. Megatron-core's BucketGroup.finish_grad_sync,
-        # when overlap_grad_reduce=False, internally dispatches the synchronous
-        # collective via start_grad_sync(force_all_reduce=...). So calling
-        # both unconditionally double-reduces the grads (scales by world_size).
-        # Mirror the contract: only fire start_grad_sync ourselves when the
-        # overlap path needs it; finish_grad_sync handles the rest.
+        # End-of-step gradient finalization, exactly once per optimizer step.
+        # ``begin_train_step`` nulled ``finalize_model_grads_func`` so mcore's
+        # schedule cannot fire it per streaming chunk; the real callable runs
+        # here instead. Relocating it rather than deleting it matters because it
+        # owns more than the cross-DP reduce: the non-tensor-parallel / layernorm
+        # all-reduce across TP (sequence parallelism), the tied word-embedding
+        # and position-embedding all-reduces across PP, the MoE router
+        # expert-bias update, and reset_model_temporary_tensors.
+        #
+        # Both arguments are load-bearing by omission:
+        #   num_tokens=None — mcore rescales only when it is not None, and the
+        #     1/N normalization is already applied just above from this path's
+        #     own accumulated valid-token count.
+        #   no pg_collection — the saved callable is not bare
+        #     ``finalize_model_grads`` but Megatron-Bridge's
+        #     ``partial(finalize_model_grads, pg_collection=...)``
+        #     (bridge/training/setup.py, ``_update_model_config_funcs``), so
+        #     omitting the keyword lets that binding through where supplying one
+        #     would override it. It is group-equivalent to the
+        #     ``_build_default_pg_collection()`` the schedule passed on the
+        #     per-chunk path, down to the ``tp_dp_cp`` field that is the one
+        #     thing finalize_model_grads asserts on, for the expert-bias update.
+        #
+        # Checked before anything is dispatched, and asserted rather than
+        # falling back to a bare ``finish_grad_sync()``: that reduces across DP
+        # and silently skips every other collective listed above, which is wrong
+        # gradients with no error. Bridge binds the hook whenever an optimizer
+        # exists, and an open train step implies one because this method steps it
+        # below, so None here means the model config never went through setup.
+        finalize_model_grads_func = state["saved_finalize_model_grads_func"]
+        assert finalize_model_grads_func is not None, (
+            "finalize_model_grads_func was None at finish_train_step; expected "
+            "Megatron-Bridge's _update_model_config_funcs to have bound it on "
+            "the model config during setup"
+        )
+
+        # With overlap_grad_reduce, ``model.no_sync()`` stopped
+        # register_grad_ready from dispatching, so the finalize's internal
+        # finish_grad_sync has no outstanding handle to wait on — start the
+        # reduce ourselves in that case only.
         if self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
             "overlap_grad_reduce"
         ]:
             self.model.start_grad_sync()
-        self.model.finish_grad_sync()
+        finalize_model_grads_func([self.model], None)
 
         # Wait for the comm-stream reduce dispatched above before opt.step
         # reads main_grad. Without this, grad_norm collapses to ~1/2.
@@ -1505,11 +1684,46 @@ class MegatronPolicyWorkerImpl(
             num_zeros_in_grad, mp_group=pg_collection.mp
         )
 
+        # Mirrors train(): without re-enabling the pre-hook __init__ removed, the
+        # param all-gather never runs and each forward sees only its own shard.
+        if self._first_train_step_forward_pre_hook_disabled and update_successful:
+            self.enable_forward_pre_hook()
+            get_model_config(
+                self.model
+            ).param_sync_func = self._first_train_step_param_sync_func
+            self._first_train_step_param_sync_func = None
+            self._first_train_step_forward_pre_hook_disabled = False
+
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
             torch.cuda.empty_cache()
 
-        # Restore grad_sync_func before scheduler.step / further state.
-        self._restore_saved_grad_sync_func(state)
+        # Pair this step's chunk count with the gradient norm it produced on one
+        # line. Any dependence of grad_norm on chunks is a bug in the streaming
+        # accumulation, so making the two directly greppable together is the
+        # cheapest way to keep that testable.
+        #
+        # Info, so it is on in a default run: nemo_rl/__init__.py sets the
+        # `nemo_rl` logger to NRL_LOG_LEVEL, which defaults to INFO. Rank 0 only
+        # -- every field is uniform across ranks by this point (both counters are
+        # DP all_reduced, grad_norm is reduced across the model-parallel group),
+        # so the other ranks would contribute duplicate lines and two
+        # host-device syncs each.
+        if self.rank == 0:
+            log.info(
+                "[step] chunks=%d microbatches=%d global_valid_seqs=%.0f "
+                "global_valid_toks=%.0f grad_norm=%s",
+                state["num_chunks"],
+                state["total_num_microbatches"],
+                global_valid_seqs.item(),
+                global_valid_toks.item(),
+                grad_norm,
+            )
+        # Last worker call before the controller re-enters the select() wait, so
+        # this is also the "idle wait start" marker.
+        self._log_gpu_mem("step_finish")
+
+        # Restore the mcore hooks before scheduler.step / further state.
+        self._restore_saved_mcore_hooks(state)
 
         # Capture lr/wd BEFORE scheduler.step so the per-mb metrics carry
         # the value of THIS step, not the next one. (terrykong, #2683:832).
@@ -1610,6 +1824,13 @@ class MegatronPolicyWorkerImpl(
             moe_metrics = get_moe_metrics(
                 loss_scale=moe_loss_scale,
                 per_layer_logging=self.cfg["megatron_cfg"]["moe_per_layer_logging"],
+                # Pre-initialize the aux-loss tracker on every PP rank so the
+                # cross-PP all_reduce inside get_moe_metrics does not hang when a
+                # rank recorded no aux loss this step (e.g. a stage with no MoE
+                # layer, or MTP MoE on the last stage).
+                num_layers=getattr(model_config, "num_layers", None),
+                mtp_num_layers=getattr(model_config, "mtp_num_layers", None),
+                track_names=get_aux_loss_track_names(model_config),
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
@@ -1622,9 +1843,9 @@ class MegatronPolicyWorkerImpl(
         state = getattr(self, "_train_step_state", None)
         if state is None:
             return
-        # Restore grad_sync_func first so the model is back to a normal
+        # Restore the mcore hooks first so the model is back to a normal
         # state before zero_grad_buffer touches anything.
-        self._restore_saved_grad_sync_func(state)
+        self._restore_saved_mcore_hooks(state)
         self.model.zero_grad_buffer()
         self.optimizer.zero_grad()
         self._train_step_state = None
@@ -1660,6 +1881,11 @@ class MegatronPolicyWorkerImpl(
         )
 
         self.model.eval()
+
+        # Logprobs run the same forward as training, so a batch that needs the
+        # mask needs it here too -- otherwise these logprobs would be taken
+        # against a different media alignment than the one trained on.
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
 
         (
             mb_iterator,
@@ -1915,6 +2141,8 @@ class MegatronPolicyWorkerImpl(
         )
 
         self.model.eval()
+
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
 
         (
             mb_iterator,
@@ -2225,6 +2453,7 @@ class MegatronPolicyWorkerImpl(
         self,
         kv_scales: Optional[dict[str, float]] = None,
         conversion_tasks=None,
+        include_draft: bool = True,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
@@ -2234,6 +2463,10 @@ class MegatronPolicyWorkerImpl(
         ``conversion_tasks`` (optional) overrides ``self.refit_conversion_tasks``
         — used by the nccl_reshard_refit misc-refit path to pass a filtered subset so
         Bridge only does TP/EP all-gather for those tasks instead of the full model.
+
+        ``include_draft`` controls the ``draft.*`` EAGLE weights. SGLang refit
+        sets it False: the engine keeps draft weights via
+        ``enable_draft_weights_cpu_backup`` rather than receiving them.
         """
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
             get_vllm_qkv_scale_names,
@@ -2265,7 +2498,7 @@ class MegatronPolicyWorkerImpl(
             for name, tensor in base_iter:
                 yield from self._maybe_prequantize_param(name, tensor)
 
-        if self.draft_model is not None:
+        if include_draft and self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
 
             draft_weights = export_eagle_weights_to_hf(
@@ -2379,6 +2612,169 @@ class MegatronPolicyWorkerImpl(
             if not isinstance(hf_param, dict) and is_nccl_reshard_param(str(hf_param)):
                 yield str(hf_param), local_tensor
 
+    # ------------------------------------------------------------------
+    # SGLang weight update (colocate IPC + disaggregate broadcast)
+    # ------------------------------------------------------------------
+    def _iter_sglang_hf_weight_buckets(
+        self,
+        *,
+        target_precision: str,
+        sglang_quantization_cfg: Optional[dict] = None,
+        buffer_size_bytes: int,
+    ) -> Iterator[list[tuple[str, torch.Tensor]]]:
+        """Yield HF tensor buckets for SGLang refit.
+
+        Reuses the same two pieces as every other transport: the
+        ``export_hf_weights`` walk in ``_iter_params_with_optional_kv_scales``
+        (without vLLM KV/Q scales or draft weights — SGLang keeps drafts
+        engine-side via ``enable_draft_weights_cpu_backup``) and the shared
+        ``iter_named_tensor_buckets`` packing.
+        """
+        from nemo_rl.models.policy.utils import iter_named_tensor_buckets
+
+        if sglang_quantization_cfg is None:
+            raise ValueError("SGLang refit requires an explicit quantization config.")
+        configured_precision = sglang_quantization_cfg["scheme"]
+        if target_precision != configured_precision:
+            raise ValueError(
+                "SGLang refit target precision does not match its quantization "
+                f"config: target={target_precision!r}, "
+                f"configured={configured_precision!r}."
+            )
+        if target_precision != "bf16":
+            raise ValueError(f"Unsupported SGLang target precision: {target_precision}")
+
+        if self.refit_conversion_tasks is None:
+            self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
+                [self.model]
+            )
+
+        return iter_named_tensor_buckets(
+            self._iter_params_with_optional_kv_scales(include_draft=False),
+            buffer_size_bytes=buffer_size_bytes,
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/update_weights_to_sglang_colocated")
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict] = None,
+    ) -> None:
+        """Send finalized HF tensor buckets to colocated SGLang engines.
+
+        Synchronous: each chunk is awaited via ``ray.get`` inside
+        :func:`send_hf_buckets_via_ipc_actor_impl` before the next chunk
+        is sent, so trainer-side IPC tensors stay alive until the engine
+        has copied them and per-chunk engine failures surface immediately.
+        Raises ``RuntimeError`` on any chunk failure.
+        """
+        bucket_iter = self._iter_sglang_hf_weight_buckets(
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
+            buffer_size_bytes=buffer_size_bytes,
+        )
+        state = self._refit_transport_state("sglang_ipc")
+        state["weight_version"] = state.get("weight_version", 0) + 1
+        send_hf_buckets_via_ipc_actor_impl(
+            bucket_iterator=bucket_iter,
+            rollout_engines=list(rollout_engines),
+            worker_state=state,
+            weight_version=state["weight_version"],
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name(
+        "megatron_policy_worker/connect_sglang_rollout_engines_distributed"
+    )
+    def connect_sglang_rollout_engines_distributed(
+        self,
+        *,
+        rollout_engines: list,
+        engine_gpu_counts: list[int],
+        group_name: Optional[str] = None,
+    ) -> None:
+        """Bring up the trainer-rank-0 NCCL group for SGLang disaggregate refit.
+
+        Only trainer rank 0 broadcasts to SGLang, so only rank 0 owns the
+        torch process group. Other ranks return immediately. Calling this
+        again after engines recover destroys the stale group first.
+        """
+        if self.rank != 0:
+            return
+
+        state = self._refit_transport_state("sglang_dist")
+        if group_name is not None:
+            state["group_name"] = group_name
+        state.setdefault("group_name", "nemo_rl_sglang")
+
+        if state.get("group") is not None:
+            disconnect_rollout_engines_from_distributed(
+                group_name=state["group_name"],
+                model_update_group=state["group"],
+                rollout_engines=state.get("engines", []),
+            )
+            state["group"] = None
+            state["engines"] = []
+
+        state["group"] = connect_rollout_engines_from_distributed(
+            group_name=state["group_name"],
+            rollout_engines=list(rollout_engines),
+            engine_gpu_counts=list(engine_gpu_counts),
+        )
+        state["engines"] = list(rollout_engines)
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/update_weights_to_sglang_distributed")
+    def update_weights_to_sglang_distributed(
+        self,
+        *,
+        rollout_engines: list,
+        rollout_engine_lock,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict] = None,
+    ) -> None:
+        """Broadcast finalized HF tensors to SGLang engines from trainer rank 0.
+
+        Non-rank-0 trainers still walk the AutoBridge iterator (Megatron
+        gather + AutoBridge restoration is a collective), but they do not
+        participate in the NCCL broadcast. This matches the design's "trainer
+        rank 0 as the only source" decision.
+        """
+        bucket_iter = self._iter_sglang_hf_weight_buckets(
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
+            buffer_size_bytes=buffer_size_bytes,
+        )
+
+        if self.rank != 0:
+            # Drain the iterator so AutoBridge collectives complete on every
+            # rank, but do not broadcast.
+            for _ in bucket_iter:
+                pass
+            return
+
+        state = self._refit_transport_state("sglang_dist")
+        if state.get("group") is None:
+            raise RuntimeError(
+                "connect_sglang_rollout_engines_distributed must be called "
+                "before update_weights_to_sglang_distributed."
+            )
+        state["weight_version"] = state.get("weight_version", 0) + 1
+
+        broadcast_hf_buckets_via_distributed_impl(
+            bucket_iterator=bucket_iter,
+            rollout_engines=list(rollout_engines),
+            rollout_engine_lock=rollout_engine_lock,
+            group_name=state["group_name"],
+            model_update_group=state["group"],
+            weight_version=state["weight_version"],
+        )
+
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(
@@ -2409,7 +2805,9 @@ class MegatronPolicyWorkerImpl(
     def broadcast_weights_for_collective(
         self,
         kv_scales: Optional[dict[str, float]] = None,
+        *,
         buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
     ) -> None:
         """Broadcast the weights for collective communication."""
         # param_iterator will return (name, tensor), we only need tensor.
@@ -2419,6 +2817,7 @@ class MegatronPolicyWorkerImpl(
             src=0,
             post_iter_func=lambda x: x[1],
             buffer_size_bytes=buffer_size_bytes,
+            num_buffers=num_buffers,
         )
 
     def _build_layer_to_pp_stage(
@@ -2838,19 +3237,58 @@ class MegatronPolicyWorkerImpl(
             post_iter_func=lambda x: x[1].contiguous(),
         )
 
-    def prepare_for_lp_inference(self):
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        """Put the model in eval mode for logprob inference.
+
+        Args:
+            keep_train_buffers: Leave the grad buffers and the optimizer state on
+                CUDA. Set this when a train step is already open. mcore's
+                ``_ParamAndGradBuffer.offload_to_cpu(move_grads=True)`` does not
+                copy gradients anywhere — it calls
+                ``grad_data.storage().resize_(0)``, freeing them — and the
+                matching ``reload_from_cpu`` resizes the storage back and
+                ``zero_()``s it. ``param.main_grad`` stays a valid view of that
+                storage throughout, so nothing raises: the gradients accumulated
+                by earlier streaming chunks of this step are simply gone, leaving
+                only the last chunk's contribution against a 1/N normalizer
+                computed over all of them. Keeping the buffers resident also
+                avoids round-tripping tens of GiB per chunk.
+
+                Suppressing the offload here is sufficient only because of an
+                mcore invariant on the other side of the detour:
+                ``prepare_for_training`` runs before every chunk and reloads with
+                ``move_grads=True``, and ``reload_from_cpu`` resizes and
+                ``zero_()``s the grad buffer only ``if grad_data_size > 0``, a
+                counter set only by a matching ``offload_to_cpu``. With the
+                offload suppressed it stays 0, so the reload is a no-op and
+                the accumulated gradients survive. An mcore change that dropped
+                that guard, or that zeroed unconditionally, would silently
+                reinstate this bug.
+        """
+        # First worker call after the controller's select() wait returns, so this
+        # is also the "idle wait end" marker. Whether the offload was suppressed
+        # is the difference between accumulating gradients across chunks and
+        # discarding all but the last, so it is worth a line.
+        log.debug(
+            "[lp_prep] rank=%d keep_train_buffers=%s",
+            self.rank,
+            keep_train_buffers,
+        )
+        self._log_gpu_mem("lp_prep_enter")
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
 
-        # offload grads to cpu
-        self.model = self.move_model(
-            self.model, "cpu", move_params=False, move_grads=True
-        )  # get rid of grad buffers
+        if not keep_train_buffers:
+            # offload grads to cpu
+            self.model = self.move_model(
+                self.model, "cpu", move_params=False, move_grads=True
+            )  # get rid of grad buffers
 
         # offload optimizer to cpu
         torch.randn(1).cuda()  # wake up torch allocator
         if (
-            hasattr(self, "optimizer")
+            not keep_train_buffers
+            and hasattr(self, "optimizer")
             and self.optimizer is not None
             and not self.optimizer_cpu_offload
             and self.offload_optimizer_for_logprob
@@ -2859,6 +3297,7 @@ class MegatronPolicyWorkerImpl(
 
         gc.collect()
         torch.cuda.empty_cache()
+        self._log_gpu_mem("lp_prep_exit")
 
     def _build_colocated_inference_model(self, config: PolicyConfig) -> None:
         """Build the dedicated inference-layout model planned at setup."""
@@ -2901,6 +3340,10 @@ class MegatronPolicyWorkerImpl(
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
+        # The interval peak reported here covers the logprob phase and the
+        # grad/optimizer onload, which is the figure that decides whether keeping
+        # the train buffers resident fits in HBM.
+        self._log_gpu_mem("train_prep_exit")
 
     def finish_inference(self) -> None:
         """Offload model params to CPU after inference. Only used in PPO."""
@@ -3048,7 +3491,18 @@ class MegatronPolicyWorkerImpl(
 
         no_grad = torch.no_grad()
         no_grad.__enter__()
-        self.model = self.move_model(self.model, "cpu")
+        # Non-reshard colocated serves both models from the same param buffers.
+        generation_cfg = self.cfg.get("generation")
+        keep_params_for_generation = (
+            generation_cfg is not None
+            and generation_cfg.get("backend") == "megatron"
+            and self.is_generation_colocated
+            and self.inference_model is None
+            and self._colocated_reshard_plan is None
+        )
+        self.model = self.move_model(
+            self.model, "cpu", move_params=not keep_params_for_generation
+        )
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         if self.cfg["megatron_cfg"].get("refit_slim_offload_after"):

@@ -51,6 +51,7 @@ def packed_broadcast_producer(
     post_iter_func,
     *,
     buffer_size_bytes: int | None = None,
+    num_buffers: int | None = None,
 ):
     """Broadcast a list of tensors in a packed manner.
 
@@ -59,7 +60,8 @@ def packed_broadcast_producer(
         group: process group (vllm PyNcclCommunicator)
         src: source rank (0 in current implementation)
         post_iter_func: function to apply to each tensor before packing, should return a tensor
-        buffer_size_bytes: Optional explicit packing threshold.
+        buffer_size_bytes: packed-buffer target. Uses the NeMo-RL default when unset.
+        num_buffers: number of alternating CUDA buffers. Uses the default when unset.
 
     Returns:
         None
@@ -67,7 +69,7 @@ def packed_broadcast_producer(
     """
     target_packed_tensor_size = _resolve_target_packed_tensor_size(buffer_size_bytes)
 
-    num_buffers = get_num_buffers()
+    num_buffers = get_num_buffers() if num_buffers is None else num_buffers
     streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
 
@@ -135,6 +137,7 @@ def packed_broadcast_consumer(
     post_unpack_func,
     *,
     buffer_size_bytes: int | None = None,
+    num_buffers: int | None = None,
 ):
     """Consume a packed tensor and unpack it into a list of tensors.
 
@@ -144,6 +147,10 @@ def packed_broadcast_consumer(
         src: source rank (0 in current implementation)
         post_unpack_func: function to apply to each tensor after unpacking
         buffer_size_bytes: Optional explicit packing threshold.
+        num_buffers: number of alternating CUDA buffers/streams. Uses the
+            NRL_REFIT_NUM_BUFFERS default when unset. Chunk boundaries only
+            depend on the packed-buffer target size, so the producer and
+            consumer may use different buffer counts.
 
     Returns:
         None
@@ -194,7 +201,8 @@ def packed_broadcast_consumer(
 
     target_packed_tensor_size = _resolve_target_packed_tensor_size(buffer_size_bytes)
 
-    num_buffers = get_num_buffers()
+    if num_buffers is None:
+        num_buffers = get_num_buffers()
     streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
 

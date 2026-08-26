@@ -14,12 +14,16 @@
 
 import types
 from typing import Any
+from pathlib import Path
 
 import cloudpickle
 import pytest
 import torch
+import yaml
 
 pytestmark = pytest.mark.vllm
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 
 @pytest.fixture()
@@ -141,6 +145,444 @@ def test_ray_executor_v2_worker_applies_fp8_patches_before_model_load(
         {"WORKER_ENV": "1"},
         {"DRIVER_ENV": "1"},
         [2, 3],
+    )
+
+
+def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
+    fp8_module, monkeypatch
+):
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+
+    fp8 = fp8_module
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(
+        fp8.AutoModel,
+        "from_config",
+        lambda *_args, **_kwargs: pytest.fail(
+            "ModelOpt ignore patterns must not depend on AutoModel names"
+        ),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    vllm_kwargs = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+            "quantization_ignore_patterns": [
+                " model.layers.*.self_attn.* ",
+                "model.layers.*.mlp.gate",
+                "lm_head",
+            ],
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    quant_config = vllm_kwargs["hf_overrides"]["quantization_config"]
+    assert quant_config["ignore"] == [
+        "model.layers.*.self_attn.*",
+        "model.layers.*.mlp.gate",
+        "lm_head",
+    ]
+    assert quant_config["ignored_layers"] == ["lm_head"]
+
+    modelopt_config = ModelOptMxFp8Config.from_config(quant_config)
+    qwen3_quantizable_families = {
+        "model.layers.0.self_attn.qkv_proj",
+        "model.layers.0.self_attn.o_proj",
+        "model.layers.0.mlp.gate",
+        "model.layers.0.mlp.experts",
+        "lm_head",
+    }
+    mxfp8_families = {
+        name
+        for name in qwen3_quantizable_families
+        if not modelopt_config.is_layer_excluded(name)
+    }
+    assert mxfp8_families == {"model.layers.0.mlp.experts"}
+    assert not modelopt_config.is_layer_excluded("model.layers.0.mlp.gate_up_proj")
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        types.SimpleNamespace(
+            num_hidden_layers=43,
+            num_nextn_predict_layers=1,
+        ),
+        types.SimpleNamespace(
+            num_hidden_layers=78,
+            num_nextn_predict_layers=1,
+        ),
+        types.SimpleNamespace(
+            text_config=types.SimpleNamespace(
+                num_hidden_layers=61,
+                num_nextn_predict_layers=0,
+            )
+        ),
+        types.SimpleNamespace(
+            text_config=types.SimpleNamespace(
+                num_hidden_layers=32,
+                mtp_num_hidden_layers=1,
+            )
+        ),
+    ],
+)
+def test_init_fp8_does_not_add_draft_model_patterns_to_target_config(
+    fp8_module, monkeypatch, config
+):
+    fp8 = fp8_module
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: config,
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    vllm_kwargs = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    quant_config = vllm_kwargs["hf_overrides"]["quantization_config"]
+    assert quant_config["ignore"] == ["lm_head"]
+
+
+def test_init_fp8_loads_remote_model_config(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    config_loads = []
+
+    def load_config(*args, **kwargs):
+        config_loads.append((args, kwargs))
+        return types.SimpleNamespace(num_hidden_layers=61)
+
+    monkeypatch.setattr(fp8.AutoConfig, "from_pretrained", load_config)
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+        },
+        "remote-code-model",
+        model_parallel_size=1,
+    )
+
+    assert config_loads == [(("remote-code-model",), {"trust_remote_code": True})]
+
+
+def test_init_fp8_deduplicates_explicit_ignore_pattern(fp8_module, monkeypatch):
+    fp8 = fp8_module
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            num_hidden_layers=61,
+            num_nextn_predict_layers=1,
+        ),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    vllm_kwargs = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+            "quantization_ignore_patterns": ["lm_head", "lm_head"],
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    ignore = vllm_kwargs["hf_overrides"]["quantization_config"]["ignore"]
+    assert ignore == ["lm_head"]
+
+
+@pytest.mark.parametrize(
+    ("recipe_name", "quantized_modules", "bf16_modules"),
+    [
+        (
+            "grpo-deepseek-v3-64n4g-mxfp8-rollout.yaml",
+            {
+                "model.layers.3.mlp.experts",
+                "model.layers.60.mlp.experts",
+            },
+            {
+                "model.layers.2.mlp.experts",
+                "model.layers.3.self_attn.qkv_proj",
+                "model.layers.3.mlp.gate",
+                "model.layers.3.mlp.shared_experts.gate_up_proj",
+                "model.layers.61.mlp.experts",
+                "model.layers.61.mtp.fc",
+                "lm_head",
+            },
+        ),
+        (
+            "grpo-nemotron3-super-120BA12B-32n4g-mxfp8-rollout.yaml",
+            {"model.layers.3.mixer.experts"},
+            {
+                "model.layers.3.mixer.in_proj",
+                "model.layers.3.mixer.out_proj",
+                "model.layers.3.mixer.qkv_proj",
+                "model.layers.3.mixer.o_proj",
+                "model.layers.3.mixer.up_proj",
+                "model.layers.3.mixer.down_proj",
+                "model.layers.3.mixer.gate",
+                "model.layers.3.mixer.shared_experts.up_proj",
+                "model.layers.3.mixer.fc1_latent_proj",
+                "model.layers.3.mixer.fc2_latent_proj",
+                "lm_head",
+            },
+        ),
+    ],
+)
+def test_mxfp8_recipe_patterns_select_only_routed_experts(
+    recipe_name, quantized_modules, bf16_modules
+):
+    pytest.importorskip("vllm")
+
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+
+    recipe_path = (
+        PROJECT_ROOT / "examples/configs/recipes/llm/performance" / recipe_name
+    )
+    recipe = yaml.safe_load(recipe_path.read_text(encoding="utf-8"))
+    patterns = recipe["policy"]["generation"]["vllm_cfg"][
+        "quantization_ignore_patterns"
+    ]
+    modelopt_config = ModelOptMxFp8Config.from_config(
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "MXFP8",
+            "ignore": [*patterns, "lm_head"],
+            "ignored_layers": ["lm_head"],
+        }
+    )
+
+    assert all(
+        not modelopt_config.is_layer_excluded(name) for name in quantized_modules
+    )
+    assert all(modelopt_config.is_layer_excluded(name) for name in bf16_modules)
+
+
+def test_init_fp8_excludes_lm_head_from_regular_fp8(fp8_module, monkeypatch):
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    fp8 = fp8_module
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    vllm_kwargs = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": False,
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    quant_config = vllm_kwargs["hf_overrides"]["quantization_config"]
+    assert quant_config == {
+        **fp8.FP8_BLOCK_QUANT_KWARGS,
+        "ignored_layers": ["lm_head"],
+        "ignore": ["lm_head"],
+    }
+    assert Fp8Config.from_config(quant_config).ignored_layers == ["lm_head"]
+
+
+@pytest.mark.parametrize("patterns", ["lm_head", 1, {"lm_head"}])
+def test_init_fp8_rejects_non_list_modelopt_ignore_patterns(
+    fp8_module, monkeypatch, patterns
+):
+    fp8 = fp8_module
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+
+    with pytest.raises(ValueError, match="list of strings"):
+        fp8.init_fp8(
+            {
+                "precision": "fp8",
+                "kv_cache_dtype": "auto",
+                "async_engine": False,
+                "is_mx": True,
+                "quantization_ignore_patterns": patterns,
+            },
+            "dummy-model",
+            model_parallel_size=1,
+        )
+
+
+@pytest.mark.parametrize("pattern", ["", "   "])
+def test_init_fp8_rejects_empty_modelopt_ignore_pattern(
+    fp8_module, monkeypatch, pattern
+):
+    fp8 = fp8_module
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    with pytest.raises(ValueError, match="non-empty strings"):
+        fp8.init_fp8(
+            {
+                "precision": "fp8",
+                "kv_cache_dtype": "auto",
+                "async_engine": False,
+                "is_mx": True,
+                "quantization_ignore_patterns": [pattern],
+            },
+            "dummy-model",
+            model_parallel_size=1,
+        )
+
+
+def test_init_fp8_combines_legacy_and_modelopt_ignore_patterns(fp8_module, monkeypatch):
+    fp8 = fp8_module
+
+    class FakeModel:
+        def named_parameters(self):
+            return [
+                ("layers.0.self_attn.q_proj.weight", object()),
+                ("layers.0.mlp.experts.0.gate_proj.weight", object()),
+            ]
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(fp8.AutoModel, "from_config", lambda *_args: FakeModel())
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    with pytest.warns(
+        DeprecationWarning,
+        match="quantization_ignored_layer_kws.*quantization_ignore_patterns",
+    ):
+        vllm_kwargs = fp8.init_fp8(
+            {
+                "precision": "fp8",
+                "kv_cache_dtype": "auto",
+                "async_engine": False,
+                "is_mx": True,
+                "quantization_ignored_layer_kws": ["q_proj"],
+                "quantization_ignore_patterns": ["lm_head"],
+            },
+            "dummy-model",
+            model_parallel_size=1,
+        )
+
+    quant_config = vllm_kwargs["hf_overrides"]["quantization_config"]
+    assert quant_config["ignore"] == [
+        "lm_head",
+        "model.layers.0.self_attn.q_proj",
+    ]
+    assert quant_config["ignore"].count("lm_head") == 1
+
+
+def test_init_fp8_rejects_modelopt_ignore_patterns_for_regular_fp8(
+    fp8_module, monkeypatch
+):
+    fp8 = fp8_module
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    with pytest.raises(ValueError, match="requires is_mx=True"):
+        fp8.init_fp8(
+            {
+                "precision": "fp8",
+                "kv_cache_dtype": "auto",
+                "async_engine": False,
+                "is_mx": False,
+                "quantization_ignore_patterns": ["lm_head"],
+            },
+            "dummy-model",
+            model_parallel_size=1,
+        )
+
+
+@pytest.mark.parametrize("precision", [None, "auto", "bf16", "bfloat16"])
+def test_init_fp8_rejects_mxfp8_without_fp8_precision(
+    fp8_module, monkeypatch, precision
+):
+    fp8 = fp8_module
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+
+    with pytest.raises(ValueError, match="is_mx=True requires precision='fp8'"):
+        fp8.init_fp8(
+            {
+                "precision": precision,
+                "kv_cache_dtype": "auto",
+                "is_mx": True,
+            },
+            "dummy-model",
+            model_parallel_size=1,
+        )
+
+
+def test_quantize_mxfp8_weight_restores_grouped_expert_shape(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    weight = torch.zeros(2, 3, 32, dtype=torch.bfloat16)
+
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    def flattened_quantize(
+        tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rows = tensor.numel() // tensor.shape[-1]
+        return (
+            torch.zeros(rows, tensor.shape[-1], dtype=torch.float8_e4m3fn),
+            torch.tensor([0, 2, 0, 127, 255, 5], dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(mxfp8_utils, "mxfp8_e4m3_quantize", flattened_quantize)
+
+    value, scale = fp8.quantize_mxfp8_weight(weight)
+
+    assert value.shape == weight.shape
+    assert scale.shape == (2, 3, 1)
+    assert torch.equal(
+        scale.flatten(), torch.tensor([1, 2, 1, 127, 255, 5], dtype=torch.uint8)
     )
 
 
@@ -1088,3 +1530,201 @@ def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     assert layer.weight_scale_inv is scale_param
     # The processed values must actually land.
     assert torch.equal(layer.weight.data, torch.ones(4, 4))
+
+
+def _grouped_expert_model(fp8, monkeypatch, experts_dtype, wrap_language_model=False):
+    """Fake model mirroring vLLM's MoERunner -> RoutedExperts layout at
+    ``layers.0.mlp.experts``, with expert weights in ``experts_dtype``.
+
+    With ``wrap_language_model=True``, mirrors the Qwen3.5-VL layout instead:
+    no top-level ``model``/``layers``; the decoder sits at
+    ``language_model.model.layers`` while parameter names still carry the
+    synthetic ``model.language_model.layers.`` prefix — the key shape both
+    FP8 recipes actually refit at vLLM 0.25.1.
+    """
+    import torch
+
+    class _RoutedExperts:
+        pass
+
+    class _MoERunner:
+        pass
+
+    monkeypatch.setattr(fp8, "RoutedExperts", _RoutedExperts)
+    monkeypatch.setattr(fp8, "MoERunner", _MoERunner)
+
+    experts = _RoutedExperts()
+    experts.w13_weight = torch.zeros(2, 4, 4, dtype=experts_dtype)
+    experts.w2_weight = torch.zeros(2, 4, 4, dtype=experts_dtype)
+    runner = _MoERunner()
+    runner.routed_experts = experts
+
+    layer = torch.nn.Module()
+    layer.mlp = types.SimpleNamespace(experts=runner)
+    layers = torch.nn.ModuleList([layer])
+    if wrap_language_model:
+        return types.SimpleNamespace(
+            packed_modules_mapping={},
+            language_model=types.SimpleNamespace(
+                model=types.SimpleNamespace(layers=layers)
+            ),
+        )
+    return types.SimpleNamespace(
+        packed_modules_mapping={},
+        layers=layers,
+    )
+
+
+GROUPED_EXPERT_KEY_SHAPES = pytest.mark.parametrize(
+    "layers_prefix, wrap_language_model",
+    [("model.layers", False), ("model.language_model.layers", True)],
+    ids=["flat", "vl-wrapper"],
+)
+
+
+@GROUPED_EXPERT_KEY_SHAPES
+def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
+    fp8_module, monkeypatch, layers_prefix, wrap_language_model
+):
+    """Grouped-expert refit must respect ``ignored_layers``.
+
+    Experts covered by num_{first,last}_layers_in_bf16 or
+    quantization_ignored_layer_kws are built by vLLM as unquantized bf16 MoE
+    without ``*_weight_scale_inv`` params, so emitting per-expert FP8 + scale
+    entries for them has nowhere to load. The grouped bf16 slab must pass
+    through untouched.
+    """
+    import torch
+
+    fp8 = fp8_module
+    model = _grouped_expert_model(fp8, monkeypatch, torch.bfloat16, wrap_language_model)
+    loaded = []
+    model.load_weights = lambda pairs: loaded.extend(pairs)
+
+    gate_up = torch.randn(2, 256, 128).to(torch.bfloat16)
+    down = torch.randn(2, 128, 128).to(torch.bfloat16)
+    fp8.load_weights(
+        [
+            (f"{layers_prefix}.0.mlp.experts.gate_up_proj", gate_up),
+            (f"{layers_prefix}.0.mlp.experts.down_proj", down),
+        ],
+        types.SimpleNamespace(model=model),
+    )
+
+    assert [k for k, _ in loaded] == [
+        f"{layers_prefix}.0.mlp.experts.gate_up_proj",
+        f"{layers_prefix}.0.mlp.experts.down_proj",
+    ]
+    assert loaded[0][1] is gate_up
+    assert loaded[1][1] is down
+    # Pass-through is also what a failed lookup produces, so pin that the
+    # bf16 RoutedExperts was actually resolved.
+    assert isinstance(
+        fp8._get_module_from_param_name(
+            model, f"{layers_prefix}.0.mlp.experts.gate_up_proj"
+        ),
+        fp8.RoutedExperts,
+    )
+
+
+def _assert_dequant_close(weight_fp8, scale_inv, source_bf16):
+    """Dequantized FP8 must match the bf16 source within e4m3 half-ULP.
+
+    Worst-case blockwise quantization error is half the e4m3 ULP at the
+    block amax: amax * (16 / 448) = amax / 28.
+    """
+    import torch
+
+    dequant = weight_fp8.to(torch.float32) * scale_inv.repeat_interleave(
+        128, dim=0
+    ).repeat_interleave(128, dim=1)
+    source = source_bf16.to(torch.float32)
+    rows, cols = source.shape
+    block_amax = (
+        source.abs().reshape(rows // 128, 128, cols // 128, 128).amax(dim=(1, 3))
+    )
+    atol = block_amax.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1) / 28
+    assert torch.all((dequant - source).abs() <= atol + 1e-6 * source.abs())
+
+
+@GROUPED_EXPERT_KEY_SHAPES
+def test_load_weights_expands_grouped_experts_for_fp8_layers(
+    fp8_module, monkeypatch, layers_prefix, wrap_language_model
+):
+    """FP8-built experts keep the per-expert expand+quantize refit path.
+
+    Non-square expert shards (256x384 gate/up, 384x256 down) give a scale
+    grid larger than 1x1 so a transposed or misrouted scale cannot pass, and
+    the dequantization check pins values, not just names and shapes.
+    """
+    import torch
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = types.SimpleNamespace(
+        use_weight_pow2_scale=False, is_mx=False
+    )
+    model = _grouped_expert_model(
+        fp8, monkeypatch, torch.float8_e4m3fn, wrap_language_model
+    )
+    loaded = []
+    model.load_weights = lambda pairs: loaded.extend(pairs)
+
+    intermediate, hidden = 256, 384
+    gate_up = torch.randn(2, 2 * intermediate, hidden).to(torch.bfloat16)
+    down = torch.randn(2, hidden, intermediate).to(torch.bfloat16)
+    fp8.load_weights(
+        [
+            (f"{layers_prefix}.0.mlp.experts.gate_up_proj", gate_up),
+            (f"{layers_prefix}.0.mlp.experts.down_proj", down),
+        ],
+        types.SimpleNamespace(model=model),
+    )
+
+    base = f"{layers_prefix}.0.mlp.experts"
+    assert [k for k, _ in loaded] == [
+        f"{base}.{eid}.{proj}.weight{suffix}"
+        for proj in ("gate_proj", "up_proj")
+        for eid in (0, 1)
+        for suffix in ("", "_scale_inv")
+    ] + [
+        f"{base}.{eid}.down_proj.weight{suffix}"
+        for eid in (0, 1)
+        for suffix in ("", "_scale_inv")
+    ]
+    entries = dict(loaded)
+    shards = {
+        "gate_proj": (gate_up[:, :intermediate, :], (intermediate, hidden)),
+        "up_proj": (gate_up[:, intermediate:, :], (intermediate, hidden)),
+        "down_proj": (down, (hidden, intermediate)),
+    }
+    for proj, (source, shape) in shards.items():
+        for eid in (0, 1):
+            weight = entries[f"{base}.{eid}.{proj}.weight"]
+            scale = entries[f"{base}.{eid}.{proj}.weight_scale_inv"]
+            assert weight.dtype == torch.float8_e4m3fn
+            assert weight.shape == shape
+            assert scale.shape == (shape[0] // 128, shape[1] // 128)
+            _assert_dequant_close(weight, scale, source[eid])
+
+
+def test_load_weights_rejects_grouped_experts_for_mxfp8(fp8_module, monkeypatch):
+    """Grouped MoE expansion only implements blockwise FP8, not MXFP8."""
+    import torch
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = types.SimpleNamespace(
+        use_weight_pow2_scale=False, is_mx=True
+    )
+    model = _grouped_expert_model(fp8, monkeypatch, torch.float8_e4m3fn)
+    model.load_weights = lambda pairs: pytest.fail("must raise before loading")
+
+    with pytest.raises(NotImplementedError, match="MXFP8"):
+        fp8.load_weights(
+            [
+                (
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    torch.randn(2, 512, 384).to(torch.bfloat16),
+                )
+            ],
+            types.SimpleNamespace(model=model),
+        )
