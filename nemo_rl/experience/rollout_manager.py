@@ -76,8 +76,10 @@ from nemo_rl.experience.rollout_recovery import (
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
+    _add_dynamo_session_id,
     _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
+    _create_dynamo_session_id,
     _dummy_routed_experts_for_tokens,
     _effort_shaping_metrics,
     _EffortShapingMetrics,
@@ -592,6 +594,7 @@ class AsyncRolloutImpl:
         current_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
         current_stop_strings = input_sample.get("stop_strings", None)
         task_name = input_sample["task_name"]
+        session_id = _create_dynamo_session_id(self._policy_generation)
 
         total_reward = 0.0
         turn_count = 0
@@ -635,6 +638,7 @@ class AsyncRolloutImpl:
                     current_message_log,
                     current_stop_strings,
                     native_generation_data=turn_native_generation_data,
+                    session_id=session_id,
                 )
             except Exception as e:
                 raise _classify_generation_failure(
@@ -763,6 +767,7 @@ class AsyncRolloutImpl:
         stop_strings: list[str] | None,
         *,
         native_generation_data: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> tuple[dict, torch.Tensor, dict[str, Any]]:
         """Generate a single-turn response for one sample.
 
@@ -793,6 +798,11 @@ class AsyncRolloutImpl:
             generation_input_data.update(
                 {key: [value] for key, value in native_generation_data.items()}
             )
+        _add_dynamo_session_id(
+            generation_input_data,
+            self._policy_generation,
+            session_id,
+        )
 
         # Generate response
         # TODO: update generate_async to return a single item directly
