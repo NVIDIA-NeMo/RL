@@ -770,6 +770,17 @@ def _validate_failure_settings(
         )
 
 
+def _reject_colocated_generation(master_config: MasterConfig) -> None:
+    """SC drives rollout through the disaggregated async engine only."""
+    if master_config.policy["generation"]["colocated"]["enabled"]:
+        raise ValueError(
+            "The SingleController path requires "
+            "policy.generation.colocated.enabled=false: SC drives rollout via "
+            "RolloutManager.generate_and_push, which is only supported on the "
+            "disaggregated async engine."
+        )
+
+
 def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
@@ -781,22 +792,16 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
     # SC reads none of these on either path, so an enabled one describes shaping
     # this run does not do. Async GRPO rejects three of them the same way.
-    # DistillationConfig defines none of the four -- there is no reward to shape
-    # or filter on -- so there is nothing to reject on that path.
-    unsupported = (
-        []
-        if is_distillation_run(master_config)
-        else [
-            name
-            for name, enabled in (
-                ("overlong_filtering", algo_cfg.overlong_filtering),
-                ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
-                ("reward_scaling", algo_cfg.reward_scaling.enabled),
-                ("reward_shaping", algo_cfg.reward_shaping.enabled),
-            )
-            if enabled
-        ]
-    )
+    unsupported = [
+        name
+        for name, enabled in (
+            ("overlong_filtering", algo_cfg.overlong_filtering),
+            ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
+            ("reward_scaling", algo_cfg.reward_scaling.enabled),
+            ("reward_shaping", algo_cfg.reward_shaping.enabled),
+        )
+        if enabled
+    ]
     if unsupported:
         names = ", ".join(unsupported)
         raise NotImplementedError(
@@ -805,13 +810,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "shaping. Disable them."
         )
 
-    if master_config.policy["generation"]["colocated"]["enabled"]:
-        raise ValueError(
-            "The SingleController path requires "
-            "policy.generation.colocated.enabled=false: SC drives rollout via "
-            "RolloutManager.generate_and_push, which is only supported on the "
-            "disaggregated async engine."
-        )
+    _reject_colocated_generation(master_config)
 
     async_config = master_config.async_rl
     # Capacity is sized from the peak window whatever the algorithm, so an inert
@@ -938,7 +937,15 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
-    _validate_algo_settings(master_config)
+    if is_distillation_run(master_config):
+        # ``_validate_algo_settings`` is GRPO/PPO-shaped throughout:
+        # DistillationConfig defines none of the shaping knobs it rejects --
+        # there is no reward to shape or filter on -- and the rest of it is
+        # PPO-specific. The colocated requirement is the one part that applies,
+        # so it is called directly.
+        _reject_colocated_generation(master_config)
+    else:
+        _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
