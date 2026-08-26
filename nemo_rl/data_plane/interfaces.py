@@ -39,7 +39,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PositiveInt
 from tensordict import TensorDict
 
 
@@ -77,6 +77,11 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     admitted and never shrink — so raise it only when a per-key payload (one
     sample of one field) genuinely exceeds it, not for headroom.
 
+    ``use_gdr`` lets CUDA-initialized clients transfer through TransferQueue's
+    persistent GPU staging buffer. ``gdr_staging_buffer_mb`` is the positive
+    HBM capacity of that buffer per active GDR client. CPU-only clients keep
+    using the registered host-buffer path.
+
     Every RDMA rail on the host is offered to mooncake (see ``rdma_devices``).
     That is only safe with ``MC_ENABLE_DEST_DEVICE_AFFINITY=1``, which pins each
     transfer's peer rail to the local one by name; on a rail-isolated RoCE
@@ -88,6 +93,8 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     local_buffer_size: int = 4294967296  # 4 GiB per client process
     reuse_registered_buffers: bool = True
     staging_buffer_size: int = 268435456  # 256 MiB per pool slot
+    use_gdr: bool = False
+    gdr_staging_buffer_mb: PositiveInt = 1024
 
 
 class DataPlaneConfig(TypedDict):
@@ -114,7 +121,9 @@ class DataPlaneConfig(TypedDict):
     ``local_buffer_size`` used to sit at this level. A config still using that
     spelling is not rejected — the flat key is simply never read, and
     :func:`backend_config` resolves the nested block (or its defaults) as if it
-    were absent. See there.
+    were absent. Earlier revisions of PR #3501 also put ``use_gdr`` and
+    ``gdr_staging_buffer_mb`` here; those two spellings are rejected explicitly
+    so a stale GDR recipe cannot silently run with GDR disabled. See there.
     """
 
     enabled: bool
@@ -126,6 +135,14 @@ class DataPlaneConfig(TypedDict):
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
+
+    # Declared only so Pydantic preserves the first GDR integration's flat
+    # spellings until backend_config can raise the migration error below.
+    use_gdr: NotRequired[bool]
+    gdr_staging_buffer_mb: NotRequired[int]
+
+
+_FIRST_GDR_FLAT_KEYS = ("use_gdr", "gdr_staging_buffer_mb")
 
 
 _BACKEND_MODELS: dict[str, type[BaseModel]] = {
@@ -142,9 +159,16 @@ def backend_config(cfg: DataPlaneConfig) -> Any:
     (block already coerced to a model) or as a plain dict from a test.
 
     Sizing is read only from the nested block. A config still using the
-    pre-nesting flat spelling gets this backend's defaults, not its own values.
+    pre-nesting flat sizing spelling gets this backend's defaults, not its own
+    values. The first GDR integration's flat spelling raises instead because
+    silently disabling a requested transport would invalidate a benchmark.
     """
     backend = cfg["backend"]
+    stale_gdr = [key for key in _FIRST_GDR_FLAT_KEYS if key in cfg]
+    if stale_gdr:
+        keys = ",".join(stale_gdr)
+        raise ValueError(f"data_plane.{{{keys}}} moved under data_plane.mooncake_cpu")
+
     nested = cfg.get(backend) or {}
     if isinstance(nested, BaseModel):
         nested = nested.model_dump(exclude_unset=True)
