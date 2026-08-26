@@ -743,9 +743,8 @@ def setup_single_controller(
         sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
             master_config.async_rl.sampler
         )
-        if (
-            sampler_supports_replay_recovery
-            and not master_config.checkpointing.get("save_data_plane")
+        if sampler_supports_replay_recovery and not master_config.checkpointing.get(
+            "save_data_plane"
         ):
             error_message = (
                 "SingleController checkpointing with a replay-checkpoint-capable "

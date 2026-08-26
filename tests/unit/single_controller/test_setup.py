@@ -332,8 +332,7 @@ class TestSetup:
         with pytest.raises(
             ValueError,
             match=(
-                "backend='mooncake_cpu'.*backend='simple'.*"
-                "checkpointing.enabled=false"
+                "backend='mooncake_cpu'.*backend='simple'.*checkpointing.enabled=false"
             ),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))

@@ -211,9 +211,9 @@ class SingleControllerActor:
         # already defaulted any fields missing from older checkpoints.
         self._save_state: GRPOSaveState = actor_args.save_state
         self._last_checkpoint_path: Optional[str] = actor_args.last_checkpoint_path
-        self._data_plane_checkpoint_metadata: Optional[
-            DataPlaneCheckpointMetadata
-        ] = actor_args.data_plane_checkpoint_metadata
+        self._data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = (
+            actor_args.data_plane_checkpoint_metadata
+        )
         self._consumed_samples: int = actor_args.save_state.consumed_samples
         self._total_valid_tokens: int = actor_args.save_state.total_valid_tokens
 
@@ -603,7 +603,7 @@ class SingleControllerActor:
 
     async def _save_data_plane_checkpoint(
         self,
-        checkpoint_path: str,
+        checkpoint_path: PathLike,
         replay_metadata: Optional[TQReplayMetadataState] = None,
     ) -> None:
         """Save a required TQ snapshot inside an SC checkpoint bundle.

@@ -896,9 +896,7 @@ class TestTQReplayBufferStateDict:
         state = buf.metadata_state_dict(saved_capacity=8)
 
         assert [g["start_weight"] for g in state["groups"]] == [7]
-        assert [g["group_id"] for g in state["groups"]] == [
-            _group_id_of(completed)
-        ]
+        assert [g["group_id"] for g in state["groups"]] == [_group_id_of(completed)]
         assert unfinished_group_id not in {
             group["group_id"] for group in state["groups"]
         }

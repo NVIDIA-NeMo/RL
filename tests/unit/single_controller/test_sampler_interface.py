@@ -40,8 +40,8 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     WindowedSampler,
     WindowedSamplerConfig,
     create_sampler,
-    sampler_supports_buffer_checkpoint,
     required_buffer_capacity_for_config,
+    sampler_supports_buffer_checkpoint,
 )
 from nemo_rl.data_plane import KVBatchMeta
 

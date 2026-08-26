@@ -554,9 +554,7 @@ def _data_plane_checkpoint_metadata(
 ) -> DataPlaneCheckpointMetadata:
     """Build the authoritative SC envelope used by actor-level restore tests."""
     return {
-        "data_plane_checkpoint_schema_version": (
-            DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
-        ),
+        "data_plane_checkpoint_schema_version": (DATA_PLANE_CHECKPOINT_SCHEMA_VERSION),
         "single_controller_train_steps": step,
         "single_controller_trainer_version": (
             step if trainer_version is None else trainer_version
