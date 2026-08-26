@@ -9,6 +9,9 @@ For the full list of supported Qwen models, see
 
 ## Version Guides
 
+- **[Qwen3.8 FlashNext](qwen3-8-flash-next.md)** — the 180B partner model on the
+  AutoModel backend with vLLM inference. This guide covers environment setup,
+  the example recipe, and known issues.
 - **[Qwen3.5](qwen3-5.md)** — LLM and VLM recipes for `Qwen3.5-9B-Base`,
   `Qwen3.5-35B-A3B-Base`, and `Qwen3.5-397B-A17B` on the Megatron and AutoModel
   backends. This guide covers backend and parallelism support, example recipes, and the
@@ -26,5 +29,6 @@ truth for those models.
 ```{toctree}
 :hidden:
 
+qwen3-8-flash-next.md
 qwen3-5.md
 ```
