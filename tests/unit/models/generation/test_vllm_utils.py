@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -35,8 +36,52 @@ from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
+    remap_multimodal_placeholders,
 )
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
+
+
+@dataclass(frozen=True)
+class _PlaceholderRange:
+    offset: int
+    length: int
+    is_embed: object | None = None
+
+
+def test_remap_multimodal_placeholders_handles_accumulated_per_item_shift():
+    embed_mask = object()
+    media_tokens = [19, 18, 18, 20]
+    template_token_ids = [1, *media_tokens, 13, 2, *media_tokens, 13, 3, 21, 21, 22]
+    final_token_ids = [1, *media_tokens, 2, *media_tokens, 3, 21, 21, 22]
+    placeholders = {
+        # Deliberately list modalities in the opposite order from prompt order.
+        "audio": [{"offset": 13, "length": 3}],
+        "image": [
+            _PlaceholderRange(offset=1, length=4),
+            _PlaceholderRange(offset=7, length=4, is_embed=embed_mask),
+        ],
+    }
+
+    result = remap_multimodal_placeholders(
+        template_token_ids=template_token_ids,
+        final_token_ids=final_token_ids,
+        mm_placeholders=placeholders,
+    )
+
+    assert [item.offset for item in result["image"]] == [1, 6]
+    assert result["image"][1].is_embed is embed_mask
+    assert result["audio"] == [{"offset": 11, "length": 3}]
+
+
+def test_remap_multimodal_placeholders_fails_closed_when_span_is_missing():
+    with pytest.raises(
+        ValueError, match="Could not locate image placeholder range 0"
+    ):
+        remap_multimodal_placeholders(
+            template_token_ids=[1, 18, 18, 2],
+            final_token_ids=[1, 2],
+            mm_placeholders={"image": [_PlaceholderRange(offset=1, length=2)]},
+        )
 
 
 def _decoded_routes(payload: str) -> list:
