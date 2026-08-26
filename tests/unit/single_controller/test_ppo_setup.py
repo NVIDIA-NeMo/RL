@@ -343,18 +343,6 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
-    def test_reward_scaling_is_implemented_not_rejected(self):
-        """It is off the unsupported list because _advantage_stage applies it.
-
-        The list exists so an enabled knob cannot silently do nothing. Once the
-        stage calls the same ``scale_rewards`` helper grpo.py uses, rejecting it
-        would refuse a run the path now handles.
-        """
-        mc = _ppo_master_config()
-        mc.ppo.reward_scaling.enabled = True
-
-        validate_single_controller_config(mc)
-
     def test_rejects_shaping_on_a_grpo_run_too(self):
         mc = _make_master_config()
         mc.grpo.overlong_filtering = True
@@ -637,3 +625,15 @@ class TestTrainClusterSizesForTheCritic:
         else:
             # The critic never lands on the inference cluster.
             assert inference.kwargs["max_colocated_worker_groups"] == 1
+
+    def test_reward_scaling_is_implemented_not_rejected(self):
+        """It is off the unsupported list because _advantage_stage applies it.
+
+        The list exists so an enabled knob cannot silently do nothing. Once the
+        stage calls the same ``scale_rewards`` helper grpo.py uses, rejecting it
+        would refuse a run the path now handles.
+        """
+        mc = _ppo_master_config()
+        mc.ppo.reward_scaling.enabled = True
+
+        validate_single_controller_config(mc)
