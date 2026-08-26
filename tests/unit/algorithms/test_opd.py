@@ -735,6 +735,74 @@ def test_tq_teacher_enrichment_serializes_deduplicated_teacher(monkeypatch):
     assert max_active == 1
 
 
+def test_tq_teacher_enrichment_runs_distinct_teachers_concurrently():
+    """Distinct physical teachers hold distinct locks, so they overlap."""
+    import asyncio
+    import threading
+
+    from nemo_rl.algorithms import opd
+
+    barrier = threading.Barrier(2)
+
+    class BarrierTeacher(_MockTeacherWorkerGroup):
+        def get_logprobs_from_meta(self, meta):
+            del meta
+            # Both teachers must enter inference concurrently. One shared lock
+            # would serialize them and trip BrokenBarrierError.
+            barrier.wait(timeout=5)
+
+    coordinator = opd.TQTeacherLogprobCoordinator(
+        dp_client=object(),
+        teacher_worker_groups={
+            "primary": BarrierTeacher(dp_size=1),
+            "secondary": BarrierTeacher(dp_size=1),
+        },
+        alias_to_group_alias={"math": "primary", "code": "secondary"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {
+                "math": "/ckpt/math",
+                "code": "/ckpt/code",
+            }
+        },
+    )
+
+    async def run_both():
+        await asyncio.gather(
+            coordinator.enrich(_teacher_meta("math", 1, 4), _teacher_record("math")),
+            coordinator.enrich(_teacher_meta("code", 1, 4), _teacher_record("code")),
+        )
+
+    asyncio.run(run_both())
+
+    metrics = coordinator.drain_metrics()
+    assert metrics["on_policy_distillation/teacher_model_unique"] == 2.0
+
+
+def test_tq_teacher_metrics_omit_routing_cardinality_on_idle_drain():
+    """An idle interval reports zero activity without claiming zero teachers."""
+    from nemo_rl.algorithms import opd
+
+    coordinator = opd.TQTeacherLogprobCoordinator(
+        dp_client=object(),
+        teacher_worker_groups={"teacher": _MockTeacherWorkerGroup(dp_size=1)},
+        alias_to_group_alias={"math": "teacher"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"math": "/ckpt/teacher"}
+        },
+    )
+
+    metrics = coordinator.drain_metrics()
+
+    assert metrics["on_policy_distillation/teacher_batches"] == 0.0
+    assert metrics["on_policy_distillation/teacher_samples"] == 0.0
+    assert metrics["on_policy_distillation/teacher_logprob_time_s"] == 0.0
+    assert metrics["on_policy_distillation/teacher_inference_time_s"] == 0.0
+    assert metrics["on_policy_distillation/teacher_lock_wait_time_s"] == 0.0
+    assert "on_policy_distillation/teacher_alias_unique" not in metrics
+    assert "on_policy_distillation/teacher_model_unique" not in metrics
+    assert "on_policy_distillation/teacher_alias_to_model_compression" not in metrics
+
+
 # ---------------------------------------------------------------------------
 # Unsort / reorder_data regression test
 # ---------------------------------------------------------------------------

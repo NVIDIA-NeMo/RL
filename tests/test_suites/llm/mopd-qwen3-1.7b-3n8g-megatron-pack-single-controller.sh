@@ -54,7 +54,8 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/token_mult_prob_error") | .
         'median(data["train/token_mult_prob_error"]) < 1.1' \
         'max(data["train/on_policy_distillation/teacher_batches"]) > 0' \
         'max(data["train/on_policy_distillation/teacher_samples"]) > 0' \
-        'max(data["train/on_policy_distillation/teacher_model_unique"]) == 1'
+        'max(data["train/on_policy_distillation/teacher_model_unique"]) == 1' \
+        'max(data["train/on_policy_distillation/adv_std"]) < 0.01'
 
     rm -rf "$CKPT_DIR"
 fi

@@ -250,7 +250,6 @@ class TQTeacherLogprobCoordinator:
         self._teacher_inference_time_s = 0.0
         self._teacher_lock_wait_time_s = 0.0
         self._aliases_seen: set[str] = set()
-        self._models_seen: set[str] = set()
 
     def _resolve_teacher(self, record: PromptGroupRecord) -> tuple[str, str]:
         extra_env_info = record.extra_env_info
@@ -403,14 +402,12 @@ class TQTeacherLogprobCoordinator:
                 raise
         total_time_s = time.perf_counter() - started_at
 
-        teacher_model_by_agent_name = self._opd_cfg["teacher_model_by_agent_name"]
         self._teacher_batches += 1
         self._teacher_samples += meta.size
         self._teacher_logprob_time_s += total_time_s
         self._teacher_inference_time_s += inference_time_s
         self._teacher_lock_wait_time_s += lock_wait_s
         self._aliases_seen.add(alias)
-        self._models_seen.add(teacher_model_by_agent_name[alias])
         print(
             f"[teacher_logprob] group={group_alias} samples={meta.size} "
             f"lock_wait={lock_wait_s:.2f}s inference={inference_time_s:.2f}s "
@@ -421,27 +418,28 @@ class TQTeacherLogprobCoordinator:
 
     def drain_metrics(self) -> dict[str, float]:
         """Return and reset teacher activity accumulated since the last drain."""
-        alias_unique = len(self._aliases_seen)
-        model_unique = len(self._models_seen)
         metrics = {
             "on_policy_distillation/teacher_batches": float(self._teacher_batches),
             "on_policy_distillation/teacher_samples": float(self._teacher_samples),
             "on_policy_distillation/teacher_logprob_time_s": self._teacher_logprob_time_s,
             "on_policy_distillation/teacher_inference_time_s": self._teacher_inference_time_s,
             "on_policy_distillation/teacher_lock_wait_time_s": self._teacher_lock_wait_time_s,
-            "on_policy_distillation/teacher_alias_unique": float(alias_unique),
-            "on_policy_distillation/teacher_model_unique": float(model_unique),
-            "on_policy_distillation/teacher_alias_to_model_compression": float(
-                model_unique / max(alias_unique, 1)
-            ),
         }
+        if self._teacher_batches:
+            # Cardinality describes what ran. On an idle step, zero reads as
+            # "zero teacher models" rather than "no teacher activity."
+            metrics.update(
+                get_teacher_routing_metrics(
+                    sorted(self._aliases_seen),
+                    self._opd_cfg["teacher_model_by_agent_name"],
+                )
+            )
         self._teacher_batches = 0
         self._teacher_samples = 0
         self._teacher_logprob_time_s = 0.0
         self._teacher_inference_time_s = 0.0
         self._teacher_lock_wait_time_s = 0.0
         self._aliases_seen.clear()
-        self._models_seen.clear()
         return metrics
 
 

@@ -252,7 +252,16 @@ def test_get_logprobs_from_meta_builds_global_dynamic_batch_plan(monkeypatch):
     ]
     assert all(MICRO_BATCH_INDICES in shard.extra_info for shard in shards)
     assert all(MICRO_BATCH_LENGTHS in shard.extra_info for shard in shards)
-    assert len({len(shard.extra_info[MICRO_BATCH_LENGTHS]) for shard in shards}) == 1
+    assert (
+        len(
+            {
+                len(microbatch_lengths)
+                for shard in shards
+                for microbatch_lengths in shard.extra_info[MICRO_BATCH_LENGTHS]
+            }
+        )
+        == 1
+    )
     assert all(
         microbatch_length <= 128
         for shard in shards
@@ -324,6 +333,16 @@ def test_get_logprobs_from_meta_builds_global_sequence_packing_plan(monkeypatch)
     ]
     assert all(MICRO_BATCH_INDICES in shard.extra_info for shard in shards)
     assert all(MICRO_BATCH_LENGTHS in shard.extra_info for shard in shards)
+    assert (
+        len(
+            {
+                len(microbatch_lengths)
+                for shard in shards
+                for microbatch_lengths in shard.extra_info[MICRO_BATCH_LENGTHS]
+            }
+        )
+        == 1
+    )
 
 
 def test_teacher_worker_presharded_entrypoint_writes_teacher_tq_field():
