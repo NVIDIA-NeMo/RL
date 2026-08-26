@@ -198,6 +198,13 @@ Use NIXL checkpoint-engine refit to update non-colocated vLLM generation workers
 Run async GRPO via the SingleController path: TransferQueue data plane, pluggable staleness samplers, and streaming trainer.
 :::
 
+:::{grid-item-card} {octicon}`shield-check` Generation Fault Tolerance
+:link: guides/single-controller-fault-tolerance
+:link-type: doc
+
+Keep training when a generation shard dies: which transports and backends support it, and what happens in each failure case.
+:::
+
 ::::
 
 ## Advanced Topics
@@ -318,6 +325,7 @@ guides/models/index.md
 model-quirks.md
 guides/async-grpo.md
 guides/single-controller.md
+guides/single-controller-fault-tolerance.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
