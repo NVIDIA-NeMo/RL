@@ -19,6 +19,7 @@ import tempfile
 from copy import deepcopy
 from dataclasses import asdict
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 import ray
@@ -58,6 +59,7 @@ from nemo_rl.experience.rollout_manager import (
 )
 from nemo_rl.experience.rollouts import (
     _add_multimodal_generation_payload,
+    _create_dynamo_session_id,
     _reattach_original_multimodal_payloads,
     async_generate_response_for_sample_turn,
     generate_responses_async,
@@ -871,6 +873,16 @@ class _DummyDynamoGeneration(_DummySGLangGeneration):
         self.generation_input = data
         async for item in super().generate_async(data, greedy=greedy):
             yield item
+
+
+def test_create_dynamo_session_id_mints_a_real_uuid_string() -> None:
+    session_id = _create_dynamo_session_id(_DummyDynamoGeneration())
+
+    assert isinstance(session_id, str)
+    assert UUID(session_id).version == 4
+    assert session_id != _create_dynamo_session_id(_DummyDynamoGeneration())
+    assert _create_dynamo_session_id(_CapturingAsyncVllmGeneration()) is None
+    assert _create_dynamo_session_id(object()) is None
 
 
 def test_direct_session_id_is_added_only_for_dynamo() -> None:
