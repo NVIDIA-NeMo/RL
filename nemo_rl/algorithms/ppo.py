@@ -1226,7 +1226,11 @@ def ppo_train(
     assert policy_generation is not None  # for mypy type check
 
     if master_config.ppo.skip_reference_policy_logprobs_calculation:
-        assert master_config.loss_fn.reference_policy_kl_penalty == 0
+        if master_config.loss_fn.reference_policy_kl_penalty != 0:
+            raise ValueError(
+                "Skipping reference logprobs requires "
+                "loss_fn.reference_policy_kl_penalty=0"
+            )
         print(
             "Reference policy logprob calculation will be skipped since `ppo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
         )
