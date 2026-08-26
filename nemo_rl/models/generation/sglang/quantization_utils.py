@@ -144,15 +144,15 @@ def validate_checkpoint_high_precision_layout(
         if not name.endswith(".weight"):
             continue
         base_name = name.removesuffix(".weight")
-        has_quantized_companion = any(
+        companion_presence = tuple(
             base_name + suffix in names for suffix in quantized_companion_suffixes
         )
         should_stay_high_precision = any(
             substring in name for substring in high_precision_substrings
         )
-        if should_stay_high_precision and has_quantized_companion:
+        if should_stay_high_precision and any(companion_presence):
             conflicts.append(name)
-        elif not should_stay_high_precision and not has_quantized_companion:
+        elif not should_stay_high_precision and not all(companion_presence):
             missing_companions.append(name)
 
     if conflicts or missing_companions:
