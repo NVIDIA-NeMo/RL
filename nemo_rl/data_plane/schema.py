@@ -76,6 +76,25 @@ PPO_VALUE_FIELDS = (
     "returns",
 )
 
+# Kept out of DP_TRAIN_FIELDS for the same reason as PPO_VALUE_FIELDS: only a
+# distillation run writes them, and a worker fetching a column nobody wrote
+# errors out rather than reading zeros.
+TEACHER_TOPK_FIELDS = (
+    "teacher_topk_logits",
+    "teacher_topk_indices",
+)
+
+# What DistillationLossFn reads. Narrower than DP_TRAIN_FIELDS in both
+# directions: distillation writes no advantages and forms no importance ratio,
+# so none of the logprob columns exist on that run.
+DP_DISTILLATION_TRAIN_FIELDS = (
+    "input_ids",
+    "input_lengths",
+    "token_mask",
+    "sample_mask",
+    *TEACHER_TOPK_FIELDS,
+)
+
 DP_VALUE_TRAIN_FIELDS = (
     "input_ids",
     "input_lengths",

@@ -465,6 +465,7 @@ class TQPolicy(TQDriverMixin, Policy):
         self,
         meta: KVBatchMeta,
         timer: Optional[Timer] = None,
+        train_fields: tuple[str, ...] = DP_TRAIN_FIELDS,
     ) -> None:
         """Dispatch one meta slice (DP-sharded) into an open train step.
 
@@ -479,12 +480,22 @@ class TQPolicy(TQDriverMixin, Policy):
         ``.grad``. Returns nothing — per-microbatch metrics accumulate in
         the workers' open-step state and surface once via
         :meth:`finish_train_step`.
+
+        Args:
+            meta: One chunk's ``KVBatchMeta``.
+            timer: Optional timer for nested ``policy_training/*`` measurements.
+            train_fields: TQ columns workers fetch for this chunk; defaults to
+                the full ``DP_TRAIN_FIELDS`` schema. Same escape hatch as
+                :meth:`train_from_meta`'s -- a caller whose loss reads a
+                different set (distillation) or which skipped writing a column
+                this step must narrow it, since fetching a column nobody wrote
+                errors out.
         """
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                train_fields, enabled=self._router_replay_enabled
             ),
             task_name="train",
         )
