@@ -153,9 +153,10 @@ uv run examples/run_grpo.py --config <recipe> cluster.num_nodes=8
 
 ### Training curves
 
-> [!NOTE]
-> Reference training curves and metrics will be added after the production run
-> completes.
+The curves below show the first 26 steps of the initial 4k GRPO run. They are an
+early functional signal; long-run convergence has not yet been validated.
+
+![Initial 4k GRPO training curves for Qwen3.8-Flash-Next: validation accuracy, mean generated tokens per sample, approximate entropy, training loss, generation KL error, and reward](../../../assets/qwen3-8/qwen3.8-flash-next-4k-grpo-training-curves.png)
 
 ## Known Issues
 
