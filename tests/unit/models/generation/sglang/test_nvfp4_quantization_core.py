@@ -85,3 +85,12 @@ def test_live_nvfp4_entries_do_not_add_static_input_scale() -> None:
         "model.layers.1.mlp.experts.0.down_proj.weight_scale",
         "model.layers.1.mlp.experts.0.down_proj.weight_scale_2",
     ]
+
+
+def test_contiguous_pair_view_rejects_noncanonical_singleton_stride() -> None:
+    backing = torch.arange(40, dtype=torch.float32)
+    first = backing.as_strided((1, 4), (8, 1), 0)
+    second = backing.as_strided((1, 4), (8, 1), 4)
+
+    assert first.is_contiguous() and second.is_contiguous()
+    assert nvfp4._contiguous_pair_view(first, second) is None

@@ -34,7 +34,6 @@ TE_NVFP4_ROW_ALIGNMENT = 16
 NVFP4_QUANTIZATION_CONFIG: dict[str, Any] = {
     "group_size": NVFP4_GROUP_SIZE,
     "ignore": [],
-    "kv_cache_scheme": {"dynamic": False, "num_bits": 8, "type": "float"},
     "quant_algo": "NVFP4",
     "quant_method": "modelopt",
 }
@@ -314,6 +313,8 @@ def _contiguous_pair_view(
     second: torch.Tensor,
 ) -> torch.Tensor | None:
     if not first.is_contiguous() or not second.is_contiguous():
+        return None
+    if first.stride() != (first.shape[1], 1):
         return None
     if (
         first.device != second.device
