@@ -12,7 +12,7 @@ grpo:
   num_val_generations_per_prompt: 1
   val_batch_size: ${oc.decode:${oc.env:OSWORLD_VAL_BATCH_SIZE,32}}
   max_rollout_turns: ${oc.decode:${oc.env:OSWORLD_MAX_STEPS,3}}
-  max_num_epochs: 1
+  max_num_epochs: ${oc.decode:${oc.env:GRPO_MAX_NUM_EPOCHS,1}}
   max_num_steps: ${oc.decode:${oc.env:GRPO_MAX_NUM_STEPS,1}}
   val_period: ${oc.decode:${oc.env:OSWORLD_VAL_PERIOD,100}}
   val_at_start: ${oc.decode:${oc.env:OSWORLD_VAL_AT_START,false}}
