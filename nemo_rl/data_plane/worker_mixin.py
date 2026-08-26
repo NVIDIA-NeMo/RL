@@ -525,6 +525,31 @@ class TQWorkerMixin:
         )
         del result
 
+    @wrap_with_nvtx_name("value_worker/get_values_presharded")
+    def get_values_presharded(
+        self,
+        meta: "KVBatchMeta",
+        micro_batch_size: Optional[int] = None,
+    ) -> None:
+        """Per-rank value-forward entrypoint. Fetch → packing prep → run → write back.
+
+        Same contract as get_logprobs_presharded, and only the value workers
+        mix it in: only the PPO critic implements get_values.
+        """
+        data = self._fetch(meta)
+        data = self._attach_or_repack_pack_metadata(data, meta)
+        result: BatchedDataDict[Any] = self.get_values(  # type: ignore[attr-defined]
+            data=data,
+            micro_batch_size=micro_batch_size,
+        )
+        self._write_back_result_field(
+            meta,
+            result,
+            result_key="values",
+            tq_field="values",
+        )
+        del result
+
     # ── split-API entrypoints (SC async path) ──────────────────────────────
     #
     # The split path lets SingleController drive forward/backward per

@@ -739,10 +739,7 @@ class SGLangGeneration(GenerationInterface):
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         return []
 
-    def update_weights_from_collective(
-        self, buffer_size_bytes: int | None = None
-    ) -> list[ray.ObjectRef]:
-        del buffer_size_bytes
+    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         return []
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:

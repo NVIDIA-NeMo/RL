@@ -119,6 +119,31 @@ def test_refit_quantize_matches_receiver_path():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_refit_quantize_matches_receiver_quantize_mxfp8_weight():
+    """Sender prequantization and the receiver helper must agree bit-for-bit.
+
+    The trainer streams E4M3 data + *_scale_from_checkpoint produced by
+    mxfp8_e4m3_quantize_for_refit; weights the receiver quantizes itself go
+    through quantize_mxfp8_weight. Refit correctness relies on the two
+    implementations producing identical bits for the same input.
+    """
+    from nemo_rl.models.generation.vllm.quantization.fp8 import quantize_mxfp8_weight
+
+    torch.manual_seed(0)
+    x = torch.randn(256, 512, dtype=torch.bfloat16, device="cuda")
+    x[0].zero_()
+
+    recv_lp, recv_scale = quantize_mxfp8_weight(x)
+    sent_lp, sent_scale = mxfp8_e4m3_quantize_for_refit(x)
+
+    assert sent_lp.dtype == recv_lp.dtype
+    assert torch.equal(sent_lp.view(torch.uint8), recv_lp.view(torch.uint8))
+    assert sent_scale.dtype == recv_scale.dtype
+    assert sent_scale.shape == recv_scale.shape
+    assert torch.equal(sent_scale, recv_scale)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "is_gated,intermediate_size,hidden_size",
     [

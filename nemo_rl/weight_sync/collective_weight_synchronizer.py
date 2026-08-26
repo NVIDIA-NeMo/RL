@@ -52,8 +52,6 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         train_cluster: RayVirtualCluster for the training workers, used to
             obtain the master address/port and world size for collective init.
         inference_cluster: RayVirtualCluster for the inference workers.
-        refit_buffer_size_gb: Optional fixed packing threshold shared by the
-            collective producer and consumer.
     """
 
     def __init__(
@@ -62,19 +60,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         generation: Any,
         train_cluster: Any,
         inference_cluster: Any,
-        refit_buffer_size_gb: float | int | None = None,
     ):
         self._policy = policy
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
-        if refit_buffer_size_gb is not None and refit_buffer_size_gb <= 0:
-            raise ValueError("refit_buffer_size_gb must be > 0")
-        self._buffer_size_bytes = (
-            None
-            if refit_buffer_size_gb is None
-            else int(refit_buffer_size_gb * 1024**3)
-        )
         self._stale = True
 
     def sync_weights(
@@ -89,19 +79,13 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             else nullcontext()
         )
         with timer_context:
-            if self._buffer_size_bytes is None:
-                futures_train = self._policy.broadcast_weights_for_collective(
-                    kv_scales=kv_scales
-                )
-                futures_inference = self._generation.update_weights_from_collective()
-            else:
-                futures_train = self._policy.broadcast_weights_for_collective(
-                    kv_scales=kv_scales,
-                    buffer_size_bytes=self._buffer_size_bytes,
-                )
-                futures_inference = self._generation.update_weights_from_collective(
-                    buffer_size_bytes=self._buffer_size_bytes
-                )
+            sender_spec = self._generation.get_collective_sender_spec()
+            futures_train = self._policy.broadcast_weights_for_collective(
+                kv_scales=kv_scales,
+                buffer_size_bytes=sender_spec.buffer_size_bytes,
+                num_buffers=sender_spec.num_buffers,
+            )
+            futures_inference = self._generation.update_weights_from_collective()
 
             ray.get(futures_train)
             results = ray.get(futures_inference)
@@ -128,11 +112,18 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
 
         ip, port = self._train_cluster.get_master_address_and_port()
         train_world_size = self._train_cluster.world_size()
-        inference_world_size = self._inference_cluster.world_size()
+        inference_world_size = self._generation.get_inference_world_size()
+        if inference_world_size is None:
+            inference_world_size = self._inference_cluster.world_size()
         world_size = train_world_size + inference_world_size
 
+        sender_spec = self._generation.get_collective_sender_spec()
         futures_train = self._policy.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
+            ip,
+            port,
+            world_size,
+            train_world_size=train_world_size,
+            nccl_peer=sender_spec.nccl_peer,
         )
         futures_inference = self._generation.init_collective(
             ip, port, world_size, train_world_size=train_world_size

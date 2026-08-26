@@ -19,10 +19,12 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from nemo_rl.models.generation.constants import (
+    DYNAMO_BACKEND,
     MEGATRON_BACKEND,
     SGLANG_BACKEND,
     VLLM_BACKEND,
 )
+from nemo_rl.models.generation.interfaces import CollectiveSenderSpec
 from nemo_rl.weight_sync.collective_weight_synchronizer import (
     CollectiveWeightSynchronizer,
 )
@@ -75,6 +77,8 @@ def _mock_generation(**overrides):
     gen.update_weights_from_collective.return_value = [MagicMock()]
     gen.get_rollout_engine_urls.return_value = ["http://localhost:30000"]
     gen.init_collective.return_value = [MagicMock()]
+    gen.get_collective_sender_spec.return_value = CollectiveSenderSpec()
+    gen.get_inference_world_size.return_value = None
     for k, v in overrides.items():
         setattr(gen, k, v)
     return gen
@@ -441,7 +445,11 @@ class TestCollectiveWeightSynchronizer:
         sync.sync_weights()
         assert not sync.is_stale
 
-        policy.broadcast_weights_for_collective.assert_called_once()
+        policy.broadcast_weights_for_collective.assert_called_once_with(
+            kv_scales=None,
+            buffer_size_bytes=None,
+            num_buffers=None,
+        )
         gen.update_weights_from_collective.assert_called_once()
 
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
@@ -513,7 +521,7 @@ class TestCollectiveWeightSynchronizer:
         policy.prepare_refit_info.assert_called_once()
         gen.prepare_refit_info.assert_called_once()
         policy.init_collective.assert_called_once_with(
-            "10.0.0.1", 29500, 6, train_world_size=4
+            "10.0.0.1", 29500, 6, train_world_size=4, nccl_peer="nemo"
         )
         gen.init_collective.assert_called_once_with(
             "10.0.0.1", 29500, 6, train_world_size=4
@@ -549,6 +557,39 @@ class TestCollectiveWeightSynchronizer:
             call(updated_info),
         ]
         policy.init_collective.assert_called_once()
+
+    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+    def test_backend_sender_contract_controls_geometry_and_world_size(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        gen = _mock_generation()
+        gen.get_collective_sender_spec.return_value = CollectiveSenderSpec(
+            nccl_peer="vllm",
+            buffer_size_bytes=1024**3,
+            num_buffers=2,
+        )
+        gen.get_inference_world_size.return_value = 8
+        sync = CollectiveWeightSynchronizer(
+            policy,
+            gen,
+            _mock_cluster(world_size=4, ip="10.0.0.1", port=29500),
+            _mock_cluster(world_size=2),
+        )
+
+        sync.init_communicator()
+        sync.sync_weights()
+
+        policy.init_collective.assert_called_once_with(
+            "10.0.0.1", 29500, 12, train_world_size=4, nccl_peer="vllm"
+        )
+        gen.init_collective.assert_called_once_with(
+            "10.0.0.1", 29500, 12, train_world_size=4
+        )
+        policy.broadcast_weights_for_collective.assert_called_once_with(
+            kv_scales=None,
+            buffer_size_bytes=1024**3,
+            num_buffers=2,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -662,7 +703,9 @@ class TestMegatronWeightSynchronizer:
         assert sync.is_stale
         assert sync.sync_weights() == {}
         policy.offload_before_refit.assert_called_once()
-        gen.prepare_for_generation.assert_called_once_with()
+        # The refit-protocol tag makes the wake bypass the worker's
+        # engine-awake early-return (the reshard copy rides this wake).
+        gen.prepare_for_generation.assert_called_once_with(tags=["colocated_refit"])
         gen.suspend_for_refit.assert_not_called()
         policy.swap_weights_via_reshard.assert_not_called()
         assert not sync.is_stale
@@ -794,6 +837,17 @@ class TestFactory:
         )
         assert isinstance(sync, CollectiveWeightSynchronizer)
         assert sync._buffer_size_bytes == int(1.5 * 1024**3)
+
+    def test_non_colocated_dynamo_returns_collective(self):
+        sync = create_weight_synchronizer(
+            policy=_mock_policy(),
+            generation=_mock_generation(),
+            generation_backend=DYNAMO_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+        assert isinstance(sync, CollectiveWeightSynchronizer)
 
     def test_non_colocated_sglang_raises(self):
         policy = _mock_policy()

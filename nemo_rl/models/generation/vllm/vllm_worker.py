@@ -43,11 +43,15 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
+    resolve_vllm_video_config,
 )
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
+)
+from nemo_rl.models.generation.vllm.video_utils import (
+    register_torchcodec_vllm_video_loader,
 )
 from nemo_rl.models.generation.vllm.worker_utils import (
     configure_refit_runtime,
@@ -598,6 +602,12 @@ class BaseVllmGenerationWorker:
         if logprobs_mode is not None:
             llm_kwargs["logprobs_mode"] = logprobs_mode
 
+        video_config = resolve_vllm_video_config(self.cfg)
+        if video_config is not None:
+            register_torchcodec_vllm_video_loader(
+                sampling_style=video_config.sampling_style,
+                temporal_patch_size=video_config.temporal_patch_size,
+            )
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
@@ -1196,9 +1206,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             return False
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
-    def update_weights_from_collective(
-        self, buffer_size_bytes: Optional[int] = None
-    ) -> bool:
+    def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -1210,15 +1218,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                     "update_weights_from_collective can only be used with async_engine=False. Use update_weights_from_collective_async instead."
                 )
 
-            if buffer_size_bytes is None:
-                result_or_coro = self.llm.collective_rpc(
-                    "update_weights_from_collective", args=tuple()
-                )
-            else:
-                result_or_coro = self.llm.collective_rpc(
-                    "update_weights_from_collective",
-                    kwargs={"buffer_size_bytes": buffer_size_bytes},
-                )
+            result_or_coro = self.llm.collective_rpc(
+                "update_weights_from_collective", args=tuple()
+            )
             worker_results = cast(list[bool], result_or_coro)
 
             if not worker_results or not all(worker_results):

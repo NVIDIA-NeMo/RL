@@ -343,11 +343,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     async def update_weights_from_collective_async(
-        self,
-        *,
-        drain: bool = True,
-        recompute_kv: bool = False,
-        buffer_size_bytes: int | None = None,
+        self, *, drain: bool = True, recompute_kv: bool = False
     ) -> bool:
         """Async version of ``update_weights_from_collective``.
 
@@ -362,15 +358,9 @@ class TrtllmAsyncGenerationWorkerImpl:
         """
         assert self.llm is not None
         try:
-            update_kwargs: dict[str, bool | int] = {
-                "drain": drain,
-                "recompute_kv": recompute_kv,
-            }
-            if buffer_size_bytes is not None:
-                update_kwargs["buffer_size_bytes"] = buffer_size_bytes
             results = await self.llm.collective_rpc(
                 "update_weights_from_collective",
-                kwargs=update_kwargs,
+                kwargs={"drain": drain, "recompute_kv": recompute_kv},
             )
             worker_result = results[0] if results else True
             if not worker_result:

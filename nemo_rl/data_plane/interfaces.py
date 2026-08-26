@@ -39,7 +39,55 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
+from pydantic import BaseModel
 from tensordict import TensorDict
+
+
+class SimpleStorageConfig(BaseModel, extra="allow"):
+    """Sizing for ``backend="simple"``. Ignored by every other backend.
+
+    ``num_storage_units`` scales with the cluster: TQ round-robins storage
+    units over Ray nodes and recommends ``>= 2 x`` the node count. No static
+    default is correct across cluster sizes, so this is required rather than
+    defaulted — a class field cannot see ``cluster.num_nodes``, only the
+    exemplar YAML can, via ``${mul:2, ${cluster.num_nodes}}``. Every recipe
+    inherits that from the exemplar; set a plain int to pin it.
+    """
+
+    storage_capacity: int = 1000000  # max samples retained per partition
+    num_storage_units: int
+
+
+class MooncakeCpuConfig(BaseModel, extra="allow"):
+    """Sizing and RDMA knobs for ``backend="mooncake_cpu"``. Ignored otherwise.
+
+    ``global_segment_size`` / ``local_buffer_size`` are per client *process*
+    (one per GPU), so a node pays ``gpus_per_node x (segment + buffer)``. Under
+    RDMA that memory is pinned and resident from setup, so keep the per-node
+    product in mind when raising them. Under-sizing surfaces as
+    ``batch_get_tensor returned None``.
+
+    ``reuse_registered_buffers`` keeps a pool of RDMA-registered buffers alive
+    instead of registering a fresh one per transfer; set false to fall back to
+    upstream's per-call registration.
+
+    ``staging_buffer_size`` is that pool's per-slot ceiling. It is a pooling
+    threshold, not a size limit: a bigger payload still transfers, just with a
+    transient registration. Slots ratchet — they grow to the largest payload
+    admitted and never shrink — so raise it only when a per-key payload (one
+    sample of one field) genuinely exceeds it, not for headroom.
+
+    Every RDMA rail on the host is offered to mooncake (see ``rdma_devices``).
+    That is only safe with ``MC_ENABLE_DEST_DEVICE_AFFINITY=1``, which pins each
+    transfer's peer rail to the local one by name; on a rail-isolated RoCE
+    fabric a cross-rail pair has no route. It is set on RoCE-only hosts by
+    ``nemo_rl.data_plane.adapters.transfer_queue_env.configure_engine_env``.
+    """
+
+    global_segment_size: int = 68719476736  # 64 GiB per client process
+    local_buffer_size: int = 4294967296  # 4 GiB per client process
+    reuse_registered_buffers: bool = True
+    staging_buffer_size: int = 268435456  # 256 MiB per pool slot
 
 
 class DataPlaneConfig(TypedDict):
@@ -49,28 +97,58 @@ class DataPlaneConfig(TypedDict):
     the TQ adapter, not by NeMo-RL. ``impl`` selects which adapter we go
     through.
 
-    Required keys (always set in exemplar YAML — never defaulted in code):
-    ``enabled``, ``impl``, ``backend``, ``storage_capacity``,
-    ``num_storage_units``, ``claim_meta_poll_interval_s``,
-    ``global_segment_size``, ``local_buffer_size``.
+    Backend-specific knobs live under a block named for the backend that reads
+    them — ``simple:`` and ``mooncake_cpu:`` — mirroring TransferQueue's own
+    ``config.yaml`` and the per-backend overlay :func:`_init_tq` builds. Only
+    the block named by ``backend`` is consulted, so a config selecting
+    ``simple`` never has to mention mooncake's RDMA sizing at all. An absent
+    ``mooncake_cpu:`` block means "use :class:`MooncakeCpuConfig`'s
+    defaults" — but ``simple:`` is **not** optional: ``num_storage_units``
+    has no static default, since no single value is right across cluster
+    sizes, so a ``simple`` run without the block fails validation.
 
-    ``global_segment_size`` / ``local_buffer_size`` are only *read* when
-    ``backend == "mooncake_cpu"``; the simple backend ignores them.
-    They are required (not NotRequired) so the YAML carries the full
-    schema and there are no hidden Python defaults.
+    Required keys (always set in the exemplar YAML): ``enabled``, ``impl``,
+    ``backend``, ``claim_meta_poll_interval_s``.
+
+    ``storage_capacity`` / ``num_storage_units`` / ``global_segment_size`` /
+    ``local_buffer_size`` used to sit at this level. A config still using that
+    spelling is not rejected — the flat key is simply never read, and
+    :func:`backend_config` resolves the nested block (or its defaults) as if it
+    were absent. See there.
     """
 
     enabled: bool
     impl: Literal["transfer_queue"]
     backend: Literal["simple", "mooncake_cpu"]
-    storage_capacity: int
-    num_storage_units: int
     claim_meta_poll_interval_s: float
-    global_segment_size: int
-    local_buffer_size: int
+    simple: NotRequired[SimpleStorageConfig]
+    mooncake_cpu: NotRequired[MooncakeCpuConfig]
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
+
+
+_BACKEND_MODELS: dict[str, type[BaseModel]] = {
+    "simple": SimpleStorageConfig,
+    "mooncake_cpu": MooncakeCpuConfig,
+}
+
+
+def backend_config(cfg: DataPlaneConfig) -> Any:
+    """Return the validated sizing block for ``cfg["backend"]``.
+
+    Reads the nested block and lets the model supply anything it omits, so no
+    caller ever writes a fallback. Works whether ``cfg`` came through pydantic
+    (block already coerced to a model) or as a plain dict from a test.
+
+    Sizing is read only from the nested block. A config still using the
+    pre-nesting flat spelling gets this backend's defaults, not its own values.
+    """
+    backend = cfg["backend"]
+    nested = cfg.get(backend) or {}
+    if isinstance(nested, BaseModel):
+        nested = nested.model_dump(exclude_unset=True)
+    return _BACKEND_MODELS[backend].model_validate(nested)
 
 
 class ObservabilityConfig(TypedDict):

@@ -263,9 +263,10 @@ class MegatronOptimizerConfig(TypedDict):
     clip_grad: float
     # knob to enable optimizer cpu offload
     optimizer_cpu_offload: bool
-    # knob to set the fraction of parameters to keep on CPU
-    # currently if optimizer_cpu_offload is true, this knob must be 1.0
+    # knob to set the fraction of optimizer state and work to keep on CPU
     optimizer_offload_fraction: float
+    # overlap optimizer state transfers with CPU optimizer updates
+    overlap_cpu_optimizer_d2h_h2d: NotRequired[bool]
 
 
 class MegatronSchedulerConfig(TypedDict):
@@ -407,7 +408,9 @@ class MegatronConfig(TypedDict):
     # (used when transformer_impl='inference_optimized')
     moe_router_num_groups: NotRequired[int | None]
     moe_router_group_topk: NotRequired[int | None]
-    # Transformer implementation backing the model. Only valid on generation workers.
+    # Transformer implementation backing the model. 'inference_optimized'
+    # trains through the TE parent path and requires sequence_parallel with
+    # TP>1 (enforced at setup).
     # Options are 'transformer_engine' and 'inference_optimized'.
     transformer_impl: NotRequired[str]
     # CUDA-graph implementation.
@@ -489,6 +492,10 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # Passed through to the Megatron model's freeze() method.
+    # Supported keys are model-specific, such as freeze_vision_model,
+    # freeze_vision_projection, and freeze_language_model.
+    freeze_config: NotRequired[dict[str, Any]]
 
 
 class DraftConfigDisabled(TypedDict):
@@ -509,9 +516,12 @@ class DraftConfig(TypedDict):
 
 class TokenizerConfig(TypedDict):
     name: str
-    chat_template: NotRequired[str]
+    # None selects NeMo-RL's passthrough prompt/response template.
+    chat_template: NotRequired[str | None]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]
+    # Arguments forwarded to tokenizer loading via get_tokenizer.
+    tokenizer_kwargs: NotRequired[dict[str, Any] | None]
     # Multimodal configs
     audio: NotRequired[dict[str, Any]]
     video: NotRequired[dict[str, Any]]

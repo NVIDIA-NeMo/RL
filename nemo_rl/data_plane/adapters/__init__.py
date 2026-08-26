@@ -11,3 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Keep this file import-free. ``transfer_queue_env`` is importable only because
+# reaching it does not load ``transfer_queue`` (and therefore mooncake, which
+# snapshots MC_* on the way in); re-exporting an adapter here would break that.

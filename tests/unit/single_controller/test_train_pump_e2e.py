@@ -69,11 +69,12 @@ def _simple_tq_cfg() -> dict:
         "enabled": True,
         "impl": "transfer_queue",
         "backend": "simple",
-        "storage_capacity": 1024,
-        "num_storage_units": 1,
         "claim_meta_poll_interval_s": 0.5,
-        "global_segment_size": 8589934592,  # 8 GiB
-        "local_buffer_size": 1073741824,  # 1 GiB
+        "simple": {"storage_capacity": 1024, "num_storage_units": 1},
+        "mooncake_cpu": {
+            "global_segment_size": 8589934592,  # 8 GiB
+            "local_buffer_size": 1073741824,  # 1 GiB
+        },
     }
 
 
@@ -301,8 +302,11 @@ def test_train_pump_drives_mcore_training_step(
         )
 
         master_config = MasterConfig.model_construct(
-            policy={"train_global_batch_size": train_gbs},
-            # _sync_weights gates stale-abort on _should_use_nemo_gym(env); empty
+            policy={
+                "train_global_batch_size": train_gbs,
+                "generation": {"colocated": {"enabled": False}},
+            },
+            # _sync_weights gates stale-abort on should_use_nemo_gym(env); empty
             # env -> native path (nemo_gym disabled).
             env={},
             grpo=GRPOConfig.model_construct(
