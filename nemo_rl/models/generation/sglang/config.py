@@ -110,9 +110,10 @@ class SglangSpecificArgs(TypedDict):
     disable_radix_cache: NotRequired[bool]
     # Skip CUDA graphs only for batches that need padding; use them otherwise.
     disable_cuda_graph_padding: NotRequired[bool]
-    # Per-phase CUDA graph backend. "tc_piecewise" is the piecewise mode, which
-    # crashed with "illegal memory access" on torch 2.10; recipes pass
-    # "disabled" for prefill to stay off it. Replaces the pre-v0.5.16
+    # Per-phase CUDA graph backend. Prefill capture is off entirely: "tc_piecewise"
+    # crashed with "illegal memory access" on torch 2.10, and "breakable" (upstream's
+    # CUDA default) is rejected outright under memory saver, which
+    # sglang_server_config.needs_offload turns on. Replaces the pre-v0.5.16
     # `disable_piecewise_cuda_graph` boolean.
     cuda_graph_backend_decode: NotRequired[str]
     cuda_graph_backend_prefill: NotRequired[str]
