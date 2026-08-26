@@ -121,14 +121,6 @@ overrides = [
     { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=e7c550c5f80636cf841a8204b1d6f85a5f3f28b7" },
     { name = "xgrammar", specifier = ">=0.2.1,<1.0.0" },
 ]
-excludes = [
-    { package = { name = "nvidia-cutlass-dsl", version = "4.5.0" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
-    { package = { name = "nvidia-cutlass-dsl", version = "4.5.1" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
-    { package = { name = "nvidia-cutlass-dsl", version = "4.5.2" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
-    { package = { name = "nvidia-cutlass-dsl-libs-cu13", version = "4.5.0" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
-    { package = { name = "nvidia-cutlass-dsl-libs-cu13", version = "4.5.1" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
-    { package = { name = "nvidia-cutlass-dsl-libs-cu13", version = "4.5.2" }, dependencies = ["nvidia-cutlass-dsl-libs-base"] },
-]
 
 [[manifest.dependency-metadata]]
 name = "causal-conv1d"
@@ -173,6 +165,39 @@ requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 name = "nv-grouped-gemm"
 version = "1.1.4.post7"
 requires-dist = ["setuptools", "wheel", "torch", "numpy"]
+
+[[manifest.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.0"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.0 ; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[manifest.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.1"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.1 ; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[manifest.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.2"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.2 ; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[manifest.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.0"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
+
+[[manifest.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.1"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
+
+[[manifest.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.2"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
 
 [[manifest.dependency-metadata]]
 name = "tensorrt"
