@@ -1,0 +1,53 @@
+defaults: ../../../nemo_gym/grpo_qwen3_30ba3b_thinking_swe2.yaml
+checkpointing:
+  enabled: false
+policy:
+  model_name: Qwen/Qwen3-235B-A22B-Thinking-2507
+  max_total_sequence_length: 196608
+  offload_optimizer_for_logprob: false
+  megatron_cfg:
+    activation_checkpointing: false
+    expert_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+  make_sequence_length_divisible_by: 4
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 8
+    vllm_kwargs:
+      speculative_config:
+        method: ${oc.env:NRL_SPEC_METHOD}
+        model: ${oc.env:NRL_DRAFT_MODEL}
+        num_speculative_tokens: ${oc.decode:${oc.env:NRL_NUM_SPECULATIVE_TOKENS}}
+        draft_tensor_parallel_size: 1
+    colocated:
+      resources:
+        gpus_per_node: 4
+        num_nodes: 2
+data:
+  train:
+    data_path: ${oc.env:NRL_SWE_TRAIN_DATA}
+  validation:
+    data_path: ${oc.env:NRL_SWE_VAL_DATA}
+env:
+  nemo_gym:
+    is_trajectory_collection: true
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          container_formatter:
+          - ${oc.env:NRL_SWE_CONTAINER_FORMATTER}
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          container_formatter:
+          - ${oc.env:NRL_SWE_CONTAINER_FORMATTER}
+logger:
+  log_dir: logs/grpo-qwen3-235b-thinking-swe2-3n4g-megatron-tp4-rollout-only-specdec
+  wandb:
+    project: nemo-rl
+    name: qwen3-235b-thinking-swe2-rollout-only-specdec
+cluster:
+  gpus_per_node: 4
+  num_nodes: 3
+  segment_size: 1

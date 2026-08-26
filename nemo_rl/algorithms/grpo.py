@@ -495,6 +495,8 @@ def setup(
     val_dataset: Optional[AllTaskProcessedDataset],
     processor: Optional[AutoProcessor] = None,
     policy_factory: Optional[Callable[..., ColocatablePolicyInterface]] = None,
+    *,
+    init_optimizer: bool = True,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
@@ -511,6 +513,10 @@ def setup(
     dict[str, str],
 ]:
     """Main entry point for running GRPO algorithm.
+
+    Args:
+        init_optimizer: Whether policy workers initialize optimizer state. Disable
+            this for rollout-only execution that never updates policy weights.
 
     Returns:
         A 13-tuple, in order:
@@ -1227,7 +1233,7 @@ def setup(
             processor=processor,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
-            init_optimizer=True,
+            init_optimizer=init_optimizer,
             init_reference_model=init_reference_model,
             **extra_policy_kwargs,
         )

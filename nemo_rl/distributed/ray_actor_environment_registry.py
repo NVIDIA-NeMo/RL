@@ -17,26 +17,27 @@ import os
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
 USE_SYSTEM_EXECUTABLE = os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1"
-VLLM_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.VLLM
-)
-SGLANG_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.SGLANG
-)
-MCORE_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.MCORE
-)
-TRTLLM_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.TRTLLM
-)
+
+
+def _actor_executable(default: str) -> str:
+    return PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else default
+
+
+VLLM_EXECUTABLE = _actor_executable(PY_EXECUTABLES.VLLM)
+SGLANG_EXECUTABLE = _actor_executable(PY_EXECUTABLES.SGLANG)
+MCORE_EXECUTABLE = _actor_executable(PY_EXECUTABLES.MCORE)
+TRTLLM_EXECUTABLE = _actor_executable(PY_EXECUTABLES.TRTLLM)
+FSDP_EXECUTABLE = _actor_executable(PY_EXECUTABLES.FSDP)
+AUTOMODEL_EXECUTABLE = _actor_executable(PY_EXECUTABLES.AUTOMODEL)
+NEMO_GYM_EXECUTABLE = _actor_executable(PY_EXECUTABLES.NEMO_GYM)
 ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": VLLM_EXECUTABLE,
     "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker": VLLM_EXECUTABLE,
     "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": SGLANG_EXECUTABLE,
     "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker": PY_EXECUTABLES.SYSTEM,
-    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": PY_EXECUTABLES.FSDP,
-    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": PY_EXECUTABLES.AUTOMODEL,
-    "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2": PY_EXECUTABLES.AUTOMODEL,
+    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": FSDP_EXECUTABLE,
+    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": AUTOMODEL_EXECUTABLE,
+    "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2": AUTOMODEL_EXECUTABLE,
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": MCORE_EXECUTABLE,
     "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker": MCORE_EXECUTABLE,
     "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker": TRTLLM_EXECUTABLE,
@@ -48,23 +49,28 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.environments.code_jaccard_environment.CodeJaccardEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.games.sliding_puzzle.SlidingPuzzleEnv": PY_EXECUTABLES.SYSTEM,
     # AsyncTrajectoryCollector needs vLLM environment to handle exceptions from VllmGenerationWorker
-    "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector": PY_EXECUTABLES.VLLM,
+    "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector": VLLM_EXECUTABLE,
     # ReplayBuffer needs vLLM environment to handle trajectory data from VllmGenerationWorker
-    "nemo_rl.algorithms.async_utils.ReplayBuffer": PY_EXECUTABLES.VLLM,
+    "nemo_rl.algorithms.async_utils.ReplayBuffer": VLLM_EXECUTABLE,
     # SyncRolloutActor doesn't import vllm directly — policy_generation is a
     # Ray actor handle. The VLLM env is needed because (1) transfer_queue is
     # bundled into the VLLM venv (and the policy training venvs), and the
     # actor writes flattened tensors to TQ via dp_client.put_samples;
     # (2) same-node colocation with VllmGenerationWorker avoids duplicate
     # venv caches.
-    "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": PY_EXECUTABLES.VLLM,
+    "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": VLLM_EXECUTABLE,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": PY_EXECUTABLES.SYSTEM,
-    "nemo_rl.environments.nemo_gym.NemoGym": PY_EXECUTABLES.NEMO_GYM,
+    "nemo_rl.environments.nemo_gym.NemoGym": NEMO_GYM_EXECUTABLE,
 }
 
 from nemo_rl.modelopt.registry import MODELOPT_ACTOR_REGISTRY
 
-ACTOR_ENVIRONMENT_REGISTRY.update(MODELOPT_ACTOR_REGISTRY)
+ACTOR_ENVIRONMENT_REGISTRY.update(
+    {
+        actor_class_fqn: _actor_executable(executable)
+        for actor_class_fqn, executable in MODELOPT_ACTOR_REGISTRY.items()
+    }
+)
 
 
 def get_actor_python_env(actor_class_fqn: str) -> str:
