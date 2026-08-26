@@ -4580,7 +4580,8 @@ def async_grpo_train(
 
         print(
             f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
-            f"step {step} ready={current_step_ready}"
+            f"step {step} ready={current_step_ready}",
+            flush=True,
         )
 
         collector_status = ray.get(trajectory_collector.get_status.remote())
@@ -4671,7 +4672,8 @@ def async_grpo_train(
                 with timer.time("exposed_generation"):
                     buffer_size_current = ray.get(replay_buffer.size.remote())
                     print(
-                        f"📊 Step coordination: training_step={step}, max_age={max_trajectory_age_steps}, buffer_size={buffer_size_current}"
+                        f"📊 Step coordination: training_step={step}, max_age={max_trajectory_age_steps}, buffer_size={buffer_size_current}",
+                        flush=True,
                     )
 
                     # Sample the required number of per-prompt groups.
