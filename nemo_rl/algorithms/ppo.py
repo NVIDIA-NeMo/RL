@@ -27,6 +27,7 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
+    GAEConfig,
     GeneralizedAdvantageEstimator,
     RawRewardAdvantageEstimator,
 )
@@ -150,21 +151,6 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
         return self.warmup_generation_lead_steps
 
 
-class AdvEstimatorConfig(TypedDict):
-    """Configuration for PPO advantage estimator (GAE or raw_reward)."""
-
-    name: str  # "gae" or "raw_reward"
-    # GAE-specific (only used when name="gae")
-    gae_lambda: NotRequired[float]
-    gae_gamma: NotRequired[float]
-    normalize_advantages: NotRequired[bool]
-    # VAPO decoupled GAE (None = standard GAE, no decoupling)
-    gae_lambda_value: NotRequired[Optional[float]]
-    gae_lambda_policy: NotRequired[Optional[float]]
-    # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled.
-    length_adaptive_alpha: NotRequired[float]
-
-
 class PPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
@@ -193,18 +179,7 @@ class PPOConfig(BaseModel, extra="allow"):
     ppo_epochs: int = 4
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
-    # Advantage estimator configuration (gae or raw_reward)
-    adv_estimator: AdvEstimatorConfig = Field(
-        default_factory=lambda: AdvEstimatorConfig(
-            name="gae",
-            gae_lambda=0.95,
-            gae_gamma=1.0,
-            normalize_advantages=True,
-            gae_lambda_value=None,
-            gae_lambda_policy=None,
-            length_adaptive_alpha=0.0,
-        )
-    )
+    adv_estimator: GAEConfig = Field(default_factory=GAEConfig)
     # Number of PPO steps of critic-only warmup before policy training begins.
     # Value model trains from step 0; policy training is skipped for
     # total_steps < this value. Default 0 (train from start).
@@ -213,12 +188,14 @@ class PPOConfig(BaseModel, extra="allow"):
     # None logs metrics without masking; values above the threshold are excluded.
     seq_logprob_error_threshold: float | None = None
     # Asynchronous PPO uses a replay buffer with non-colocated generation.
-    async_ppo: AsyncPPOConfig = Field(default_factory=AsyncPPOConfig)
+    # Legacy async config block; SC reads its async knobs from `async_rl` instead.
+    async_ppo: AsyncPPOConfig | None = Field(default_factory=AsyncPPOConfig)
 
     @model_validator(mode="after")
     def validate_async_warmup_settings(self) -> "PPOConfig":
         if (
-            self.async_ppo.enabled
+            self.async_ppo is not None
+            and self.async_ppo.enabled
             and self.policy_training_start_step == 0
             and self.async_ppo.warmup_generation_lead_steps is not None
         ):
@@ -1140,11 +1117,11 @@ def _create_advantage_estimator(master_config: MasterConfig):
 
     adv_estimator_config = ppo_config.adv_estimator
 
-    adv_estimator_name = adv_estimator_config["name"]
+    adv_estimator_name = adv_estimator_config.name
     if adv_estimator_name == "gae":
         adv_estimator = GeneralizedAdvantageEstimator(adv_estimator_config, loss_config)
-        gae_lambda = adv_estimator_config["gae_lambda"]
-        gae_gamma = adv_estimator_config["gae_gamma"]
+        gae_lambda = adv_estimator_config.gae_lambda
+        gae_gamma = adv_estimator_config.gae_gamma
         print(f"  ✓ Using GAE advantage estimator (λ={gae_lambda}, γ={gae_gamma})")
     elif adv_estimator_name == "raw_reward":
         adv_estimator = RawRewardAdvantageEstimator(adv_estimator_config, loss_config)
@@ -1584,8 +1561,8 @@ def ppo_train(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=train_data["rewards"],
                         mask=advantage_mask,
-                        reference_logprobs=train_data.get("reference_policy_logprobs"),
-                        logprobs=train_data["prev_logprobs"],
+                        logprobs_policy=train_data["prev_logprobs"],
+                        logprobs_reference=train_data.get("reference_policy_logprobs"),
                     )
                     if "values" in train_data:
                         adv_kwargs["values"] = train_data["values"]
@@ -2574,8 +2551,8 @@ def async_ppo_train(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=train_data["rewards"],
                         mask=advantage_mask,
-                        reference_logprobs=train_data.get("reference_policy_logprobs"),
-                        logprobs=train_data["prev_logprobs"],
+                        logprobs_policy=train_data["prev_logprobs"],
+                        logprobs_reference=train_data.get("reference_policy_logprobs"),
                     )
                     if "values" in train_data:
                         adv_kwargs["values"] = train_data["values"]
