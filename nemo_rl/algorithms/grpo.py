@@ -4422,9 +4422,23 @@ def validate(
 
         # Calculate validation metrics
         num_samples = len(total_rewards)
+        num_val_generations = master_config.grpo.num_val_generations_per_prompt
+        pass_at_k = None
         if num_samples > 0:
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
             accuracy = rewards_t.mean().item()
+            if (
+                num_val_generations > 1
+                and num_samples % num_val_generations == 0
+            ):
+                pass_at_k = (
+                    rewards_t.reshape(-1, num_val_generations)
+                    .gt(0)
+                    .any(dim=1)
+                    .float()
+                    .mean()
+                    .item()
+                )
         else:
             accuracy = 0.0
 
@@ -4437,6 +4451,8 @@ def validate(
             "avg_length": avg_length,
             **additional_metrics_to_report,
         }
+        if pass_at_k is not None:
+            val_metrics[f"pass@{num_val_generations}"] = pass_at_k
 
         # Print sample conversations only once at the end of validation
         try:
@@ -4460,6 +4476,8 @@ def validate(
     # Print summary of validation results
     print("\n📊 Validation Results:")
     print(f"    • Accuracy: {accuracy:.4f}")
+    if pass_at_k is not None:
+        print(f"    • Pass@{num_val_generations}: {pass_at_k:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 

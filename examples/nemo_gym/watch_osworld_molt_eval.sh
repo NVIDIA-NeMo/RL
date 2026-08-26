@@ -22,7 +22,7 @@ fi
 EVAL_EVERY="${EVAL_EVERY:-25}"
 EVAL_POLL_SECONDS="${EVAL_POLL_SECONDS:-60}"
 EVAL_STATE_DIR="${EVAL_STATE_DIR:-${RUNTIME_ROOT}/results/osworld-cc-eval/.submitted/${MOLT_RUN_NAME}}"
-SUBMIT="${ROOT}/examples/nemo_gym/submit_osworld_cc_eval.sh"
+SUBMIT="${ROOT}/examples/nemo_gym/submit_osworld_cc_eval_jianh_parity.sh"
 mkdir -p "${EVAL_STATE_DIR}"
 
 submit_once() {

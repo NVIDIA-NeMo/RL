@@ -9,7 +9,7 @@ defaults: grpo_nemotron_omni_30ba3b_scripted_multiturn_cc.yaml
 grpo:
   num_prompts_per_step: ${oc.decode:${oc.env:OSWORLD_NUM_PROMPTS_PER_STEP,1}}
   num_generations_per_prompt: ${oc.decode:${oc.env:OSWORLD_NUM_GENERATIONS,2}}
-  num_val_generations_per_prompt: 1
+  num_val_generations_per_prompt: ${oc.decode:${oc.env:OSWORLD_NUM_VAL_GENERATIONS,1}}
   val_batch_size: ${oc.decode:${oc.env:OSWORLD_VAL_BATCH_SIZE,32}}
   max_rollout_turns: ${oc.decode:${oc.env:OSWORLD_MAX_STEPS,3}}
   max_num_epochs: ${oc.decode:${oc.env:GRPO_MAX_NUM_EPOCHS,1}}
