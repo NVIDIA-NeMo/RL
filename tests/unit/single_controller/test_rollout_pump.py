@@ -99,6 +99,8 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
+    # Empty means the legacy (non-token-capture) dispatch path.
+    ctrl._finalizer_actors = []
     ctrl._replacement_reserve = deque()
     ctrl._rollout_recovery_enabled = False
 
@@ -192,6 +194,7 @@ def test_rollout_pump_stamps_target_steps(
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
+    ctrl._finalizer_actors = []
     # The sampler owns admission + target_step stamping (the dispatch counter
     # lives on the sampler, not the actor).
     ctrl._sampler = make_sampler(buffer)
@@ -1006,6 +1009,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         )
         ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._rollout_manager = manager
+        ctrl._finalizer_actors = []
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
         ctrl._dataloader = [
@@ -1095,6 +1099,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         )
         ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._rollout_manager = _NeverCalledRolloutManager()
+        ctrl._finalizer_actors = []
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
         ctrl._dataloader = [
@@ -1118,6 +1123,86 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         assert created_semaphores[0]._value == 1
         assert ctrl._inflight_rollouts == 0
         assert ctrl._dispatched_rollouts == set()
+        assert ctrl._rollout_exhausted.is_set()
+
+    asyncio.run(_main())
+
+
+def test_actor_path_releases_generation_permit_before_finalization() -> None:
+    class _SplitRolloutManager:
+        def __init__(self) -> None:
+            self.generated = 0
+            self.two_generated = asyncio.Event()
+
+        async def generate_for_finalization(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+        ) -> Any:
+            del prompt, target_step, inflight_registry
+            self.generated += 1
+            if self.generated == 2:
+                self.two_generated.set()
+            return SimpleNamespace(group_id=f"g{self.generated}")
+
+    async def _main() -> None:
+        manager = _SplitRolloutManager()
+        release_finalizers = asyncio.Event()
+        finalizers_started = 0
+
+        async def _delayed_finalize(request: Any) -> None:
+            nonlocal finalizers_started
+            del request
+            finalizers_started += 1
+            await release_finalizers.wait()
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1,
+            diagnostics=False,
+            rollout_failure=_failure_cfg(),
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1)
+        )
+        ctrl._rollout_manager = manager
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._finalize_with_actor = _delayed_finalize
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict(
+                {
+                    "message_log": [
+                        [{"role": "user", "content": "first"}],
+                        [{"role": "user", "content": "second"}],
+                    ]
+                }
+            )
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(2)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        pump = asyncio.create_task(ctrl._rollout_pump())
+        await asyncio.wait_for(manager.two_generated.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        assert finalizers_started == 2
+        assert ctrl._inflight_rollouts == 0
+        release_finalizers.set()
+        await asyncio.wait_for(pump, timeout=1.0)
+
+        # Successful commits transfer both buffer permits to the train pump.
+        assert ctrl._buffer_capacity._value == 0
         assert ctrl._rollout_exhausted.is_set()
 
     asyncio.run(_main())
@@ -1222,6 +1307,7 @@ def test_rollout_pump_writes_expected_tq_data(
         partition_id=_PARTITION_ID,
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
+        finalizer_actors=[],
     )
     ctrl = SingleControllerActor.remote(
         master_config=master_config,

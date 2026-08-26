@@ -82,6 +82,7 @@ class _FakeBuffer:
         self.reserve_calls: list[int] = []  # weight_versions passed to reserve
         self.commit_calls: list[tuple[str, object, int, int]] = []
         self.remove_calls: list[str] = []
+        self.abort_calls: list[str] = []
         # reserve(weight_version=X) -> group_id; commit fills the slot.
         self._slots: list[str] = []
 
@@ -91,12 +92,21 @@ class _FakeBuffer:
         weight_version: int,
         target_step: int | None = None,
         group_id: str | None = None,
+        rollout_ids: list[str] | None = None,
     ) -> str:
+        del target_step, rollout_ids
         if group_id is None:
             group_id = str(uuid.uuid4())
         self.reserve_calls.append(weight_version)
         self._slots.append(group_id)
         return group_id
+
+    def abort(self, group_id: str) -> bool:
+        self.abort_calls.append(group_id)
+        if group_id in self._slots:
+            self._slots.remove(group_id)
+            return True
+        return False
 
     async def commit(
         self,
@@ -144,6 +154,7 @@ def _make_manager(
     mgr._num_generations_per_prompt = 1
     mgr._tq_buffer = buffer
     mgr._recovery_ledger = RolloutRecoveryLedger()
+    mgr._env_handles = {}
     mgr._weight_version = 0
     mgr._retry_policy = (
         retry_policy
@@ -501,6 +512,39 @@ class TestGenerateAndPushFlow:
         mgr._tq_buffer = None
         with pytest.raises(AssertionError, match="tq_buffer"):
             _run(mgr.generate_and_push({"prompt": "p"}))
+
+    def test_failed_rollout_aborts_reserved_slot(self):
+        """A dispatch that raises must not leave a phantom unready slot."""
+
+        async def _boom(_input_sample):
+            raise RuntimeError("rollout exploded")
+
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(on_run=_boom))
+
+        with pytest.raises(RuntimeError, match="rollout exploded"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert len(buf.reserve_calls) == 1
+        assert buf.commit_calls == []
+        assert len(buf.remove_calls) == 1
+        assert buf._slots == []  # the reserved slot was dropped
+
+    def test_failed_commit_aborts_reserved_slot(self):
+        """Commit failures (e.g. evicted slot) also abort the reservation."""
+
+        class _CommitBoomBuffer(_FakeBuffer):
+            async def commit(
+                self, group_id, record, start_weight_version, end_weight_version
+            ):
+                raise ValueError("no live slot")
+
+        buf = _CommitBoomBuffer()
+        mgr = _make_manager(buf, _FakeImpl())
+
+        with pytest.raises(ValueError, match="no live slot"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+        assert len(buf.remove_calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1125,3 +1169,100 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         assert orig_val == pytest.approx(new_val), (
             f"rollout_metrics[{key!r}] mismatch — original {orig_val}, manager {new_val}"
         )
+
+
+class _FakeCaptureBuffer(_FakeBuffer):
+    def __init__(self):
+        super().__init__()
+        self.reserve_rollout_ids: list[list[str] | None] = []
+
+    def reserve(
+        self, *, weight_version, target_step=None, group_id=None, rollout_ids=None
+    ):
+        self.reserve_rollout_ids.append(rollout_ids)
+        return super().reserve(
+            weight_version=weight_version,
+            target_step=target_step,
+            group_id=group_id,
+            rollout_ids=rollout_ids,
+        )
+
+
+def _receipt_record(rollout_ids, receipts):
+    completions = [
+        Completion(
+            message_log=[],
+            env_extras={"reward": 0.5, "ng_receipt": receipt, "ng_rollout_id": rid},
+            truncated=False,
+            reward=0.5,
+        )
+        for rid, receipt in zip(rollout_ids, receipts)
+    ]
+    return PromptGroupRecord(
+        prompt_idx=0,
+        prompt=[],
+        extra_env_info={},
+        metadata={"task_name": "nemo_gym"},
+        completions=completions,
+        rollout_metrics={},
+    )
+
+
+def _make_capture_manager(buf, *, on_run=None, num_generations=2):
+    mgr = object.__new__(RolloutManager)
+    mgr._tokenizer = None
+    mgr._num_generations_per_prompt = num_generations
+    mgr._tq_buffer = buf
+    mgr._env_handles = {}
+    mgr._weight_version = 7
+
+    class _CaptureImpl:
+        def __init__(self):
+            self.seen_rollout_ids = None
+
+        async def run_rollout(self, _sample, *, rollout_ids=None):
+            self.seen_rollout_ids = rollout_ids
+            if on_run is not None:
+                await on_run(_sample)
+            return _receipt_record(
+                rollout_ids, [{"rollout_id": rid} for rid in rollout_ids]
+            )
+
+    mgr._impl = _CaptureImpl()
+    return mgr
+
+
+class TestGenerateForFinalizationFlow:
+    def test_mints_ids_and_returns_metadata_request(self):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf)
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p"}, target_step=5))
+
+        # Rollout ids were minted from the reserved group id and threaded
+        # end to end: reserve -> impl -> metadata-only actor request.
+        (group_id,) = buf._slots
+        expected_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+        assert buf.reserve_rollout_ids == [expected_ids]
+        assert mgr._impl.seen_rollout_ids == expected_ids
+        assert request.group_id == group_id
+        assert request.rollout_ids == tuple(expected_ids)
+        assert [r["rollout_id"] for r in request.receipts] == expected_ids
+        assert request.rewards == (0.5, 0.5)
+        assert request.fallback_weight_version == 7
+        # Finalization and commit are exclusively owned by the controller's
+        # actor-pool path; the manager leaves the reservation unready.
+        assert buf.commit_calls == []
+
+    def test_failed_dispatch_aborts_the_reservation(self):
+        buf = _FakeCaptureBuffer()
+
+        async def _boom(_sample):
+            raise RuntimeError("rollout exploded")
+
+        mgr = _make_capture_manager(buf, on_run=_boom)
+        with pytest.raises(RuntimeError, match="rollout exploded"):
+            _run(mgr.generate_for_finalization({"prompt": "p"}))
+        # The slot is released; abandoned staged rows are swept with the
+        # staging partition at run end (no per-rollout control-plane call).
+        assert len(buf.abort_calls) == 1
