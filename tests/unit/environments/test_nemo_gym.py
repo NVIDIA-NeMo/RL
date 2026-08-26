@@ -1478,7 +1478,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             def run_examples(self, examples, head_server_config):
                 del head_server_config
                 content = examples[0]["responses_create_params"]["input"][0]["content"]
-                assert content[0]["video_url"] == video_path.resolve().as_uri()
+                assert content[0]["video_url"].startswith("data:video/mp4;base64,")
                 assert content[1]["image_url"].startswith("data:image/png;base64,")
 
                 async def _completed_result():

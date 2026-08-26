@@ -231,6 +231,7 @@ def test_http_server_port_reservation(monkeypatch):
                 rank=0,
                 cfg={"generation": {"mcore_generation_config": {"parsers": []}}},
                 _reserved_http_server_socket=reserved_socket,
+                inference_wrapped_model=SimpleNamespace(multimodal_prompt_config=None),
             )
             base_url = MegatronGenerationMixin._setup_openai_api_server(worker)
             assert started["sock"] is reserved_socket

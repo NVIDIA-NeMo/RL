@@ -95,12 +95,6 @@ policy:
       image_dynamic_resolution: true
       logprobs_mode: raw_logprobs
       megatron_inference_wrapper: megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper
-      multimodal_prompt_config:
-        image_spec: &media_prompt_spec
-          model_token: <image>
-          prefix: <img>
-          suffix: </img>
-        video_spec: *media_prompt_spec
     vllm_cfg:
       async_engine: true
       expose_http_server: true
