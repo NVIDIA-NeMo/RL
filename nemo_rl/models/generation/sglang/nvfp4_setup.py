@@ -23,10 +23,12 @@ import logging
 import os
 import re
 import shutil
+from collections.abc import Mapping
 from typing import Any
 
 import torch
 
+from nemo_rl.models.generation.sglang.config import SglangQuantizationConfig
 from nemo_rl.models.generation.sglang.nvfp4_quantization_core import (
     NVFP4_GROUP_SIZE,
     NVFP4_QUANTIZATION_CONFIG,
@@ -50,7 +52,10 @@ from nemo_rl.models.generation.sglang.quantization_utils import (
 
 logger = logging.getLogger(__name__)
 
-CONVERTER_VERSION = "1"
+# v2 stamps the NeMo-RL MoE-only layout marker required for cache reuse.
+CONVERTER_VERSION = "2"
+NEMO_RL_NVFP4_LAYOUT = "sglang_moe_only_v1"
+NEMO_RL_NVFP4_LAYOUT_KEY = "nemo_rl_nvfp4_layout"
 _NVFP4_ENV_KEYS = (
     "NVTE_NVFP4_4OVER6",
     "NVTE_NVFP4_4OVER6_E4M3_USE_256",
@@ -482,6 +487,7 @@ def _write_output_metadata(
             quantization_config["kv_cache_scheme"] = kv_cache_scheme
     quantization_config["ignore"] = ignore
     config["quantization_config"] = quantization_config
+    config[NEMO_RL_NVFP4_LAYOUT_KEY] = NEMO_RL_NVFP4_LAYOUT
 
     with open(os.path.join(save_dir, "config.json"), "w") as file:
         json.dump(config, file, indent=2)
@@ -601,7 +607,7 @@ def convert_nvfp4(
     return ignore
 
 
-def _quantization_fingerprint(quantization_cfg: dict[str, Any]) -> str:
+def _quantization_fingerprint(quantization_cfg: Mapping[str, Any]) -> str:
     relevant_keys = (
         "extra_high_precision_layers_hf",
         "modules_to_not_convert",
@@ -618,7 +624,7 @@ def _quantization_fingerprint(quantization_cfg: dict[str, Any]) -> str:
 
 
 def _validated_conversion_options(
-    quantization_cfg: dict[str, Any],
+    quantization_cfg: Mapping[str, Any],
     *,
     num_hidden_layers: int,
 ) -> tuple[tuple[str, ...], tuple[str, ...], int, int]:
@@ -643,7 +649,7 @@ def _hash_qualified_save_dir(
     *,
     model_dir: str,
     cache_root: str,
-    quantization_cfg: dict[str, Any],
+    quantization_cfg: Mapping[str, Any],
 ) -> str:
     absolute_model = os.path.abspath(model_dir)
     source_config = _read_source_config(model_dir)
@@ -663,11 +669,18 @@ def _hash_qualified_save_dir(
 def is_existing_nvfp4_checkpoint(path: str) -> bool:
     config = _read_source_config(path)
     quantization_config = config.get("quantization_config")
-    return is_nvfp4_quantization_config(quantization_config)
+    return (
+        is_nvfp4_quantization_config(quantization_config)
+        and config.get(NEMO_RL_NVFP4_LAYOUT_KEY) == NEMO_RL_NVFP4_LAYOUT
+    )
 
 
 def _reject_unsupported_external_nvfp4_checkpoint(path: str) -> None:
-    if _read_external_nvfp4_quantization_config(path) is None:
+    config = _read_source_config(path)
+    if (
+        not is_nvfp4_quantization_config(config.get("quantization_config"))
+        and _read_external_nvfp4_quantization_config(path) is None
+    ):
         return
     raise ValueError(
         f"Externally quantized NVFP4 checkpoint at {path} is not supported for "
@@ -679,7 +692,7 @@ def _reject_unsupported_external_nvfp4_checkpoint(path: str) -> None:
 
 def _sync_checkpoint_ignore(
     checkpoint_path: str,
-    quantization_cfg: dict[str, Any],
+    quantization_cfg: SglangQuantizationConfig,
 ) -> None:
     config = _read_source_config(checkpoint_path)
     checkpoint_quantization = config.get("quantization_config")
@@ -742,28 +755,63 @@ def _sync_checkpoint_ignore(
 def ensure_nvfp4_checkpoint(
     *,
     model_path: str,
-    quantization_cfg: dict[str, Any],
+    quantization_cfg: SglangQuantizationConfig,
 ) -> str:
-    """Return an NVFP4 checkpoint path and synchronize its ignore policy."""
-    if is_existing_nvfp4_checkpoint(model_path):
-        _sync_checkpoint_ignore(model_path, quantization_cfg)
-        return model_path
-    _reject_unsupported_external_nvfp4_checkpoint(model_path)
+    """Return a local preconverted NVFP4 checkpoint with synchronized skips.
+
+    Startup deliberately does not convert in the Ray driver: its base venv has
+    no Transformer Engine and the process is not guaranteed a GPU.
+    ``convert_nvfp4`` remains the explicit offline GPU conversion entry point.
+    """
+    local_model_path = os.path.abspath(os.path.expanduser(model_path))
+    if os.path.isdir(local_model_path) and is_existing_nvfp4_checkpoint(
+        local_model_path
+    ):
+        _sync_checkpoint_ignore(local_model_path, quantization_cfg)
+        return local_model_path
+    _reject_unsupported_external_nvfp4_checkpoint(local_model_path)
 
     converted = quantization_cfg.get("converted_model_path")
-    if converted and is_existing_nvfp4_checkpoint(converted):
-        _sync_checkpoint_ignore(converted, quantization_cfg)
-        return converted
-    if converted:
-        _reject_unsupported_external_nvfp4_checkpoint(converted)
+    if converted is not None:
+        if not isinstance(converted, str) or not converted.strip():
+            raise ValueError(
+                "SGLang quantization.converted_model_path must be a non-empty "
+                "local directory path."
+            )
+        converted_path = os.path.abspath(os.path.expanduser(converted))
+        if not os.path.isdir(converted_path):
+            raise ValueError(
+                "SGLang NVFP4 startup requires a local preconverted checkpoint, "
+                "but quantization.converted_model_path is not a directory: "
+                f"{converted!r}."
+            )
+        if not is_existing_nvfp4_checkpoint(converted_path):
+            _reject_unsupported_external_nvfp4_checkpoint(converted_path)
+            raise ValueError(
+                "SGLang NVFP4 startup requires a checkpoint converted by "
+                "NeMo-RL, but quantization.converted_model_path does not declare "
+                "its supported MoE-only NVFP4 layout marker in config.json: "
+                f"{converted_path!r}."
+            )
+        _sync_checkpoint_ignore(converted_path, quantization_cfg)
+        return converted_path
+
+    if not os.path.isdir(local_model_path):
+        raise ValueError(
+            "SGLang NVFP4 startup cannot auto-convert an HF repo id in the Ray "
+            f"driver: {model_path!r}. Download and convert the checkpoint offline "
+            "under the mcore environment on a GPU, then set "
+            "quantization.converted_model_path to a local directory visible to "
+            "every rollout worker."
+        )
 
     cache_root = (
         quantization_cfg.get("cache_root")
         or os.environ.get("NRL_NVFP4_CACHE")
         or os.path.join(os.path.expanduser("~"), ".cache", "nemo_rl", "nvfp4")
     )
-    save_dir = converted or _hash_qualified_save_dir(
-        model_dir=model_path,
+    save_dir = _hash_qualified_save_dir(
+        model_dir=local_model_path,
         cache_root=cache_root,
         quantization_cfg=quantization_cfg,
     )
@@ -772,33 +820,10 @@ def ensure_nvfp4_checkpoint(
         return save_dir
     _reject_unsupported_external_nvfp4_checkpoint(save_dir)
 
-    source_config = _read_source_config(model_path)
-    num_hidden_layers = _num_hidden_layers(source_config)
-    (
-        extra_high_precision_layers_hf,
-        modules_to_not_convert,
-        num_layers_at_start_in_bf16,
-        num_layers_at_end_in_bf16,
-    ) = _validated_conversion_options(
-        quantization_cfg,
-        num_hidden_layers=num_hidden_layers,
+    raise ValueError(
+        "SGLang NVFP4 startup does not quantize in the Ray driver because its "
+        "base environment has no Transformer Engine and may have no assigned "
+        "GPU. Run convert_nvfp4 offline under the mcore environment on a GPU, "
+        "then set quantization.converted_model_path to the output directory. "
+        f"The deterministic cache path for this source and policy is {save_dir!r}."
     )
-
-    logger.info(
-        "[nvfp4] Converting %s -> %s (start_bf16=%s, end_bf16=%s, extra_hp=%s)",
-        model_path,
-        save_dir,
-        num_layers_at_start_in_bf16,
-        num_layers_at_end_in_bf16,
-        extra_high_precision_layers_hf,
-    )
-    convert_nvfp4(
-        model_dir=model_path,
-        save_dir=save_dir,
-        num_layers_at_start_in_bf16=num_layers_at_start_in_bf16,
-        num_layers_at_end_in_bf16=num_layers_at_end_in_bf16,
-        extra_high_precision_layers_hf=extra_high_precision_layers_hf,
-        modules_to_not_convert=modules_to_not_convert,
-    )
-    _sync_checkpoint_ignore(save_dir, quantization_cfg)
-    return save_dir

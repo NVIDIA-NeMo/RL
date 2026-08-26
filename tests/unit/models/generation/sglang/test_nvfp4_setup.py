@@ -201,6 +201,9 @@ def test_same_shard_pair_writes_modelopt_fields_and_metadata(
         assert input_scale.item() == 1.0
 
     output_config = _read_json(save_dir / "config.json")
+    assert output_config[nvfp4_setup.NEMO_RL_NVFP4_LAYOUT_KEY] == (
+        nvfp4_setup.NEMO_RL_NVFP4_LAYOUT
+    )
     quantization_config = output_config["quantization_config"]
     assert quantization_config["quant_algo"] == "NVFP4"
     assert quantization_config["quant_method"] == "modelopt"
@@ -529,11 +532,12 @@ def test_existing_checkpoint_ignore_is_merged_back_into_refit_config(
         },
         num_hidden_layers=2,
         config_extra={
+            nvfp4_setup.NEMO_RL_NVFP4_LAYOUT_KEY: (nvfp4_setup.NEMO_RL_NVFP4_LAYOUT),
             "quantization_config": {
                 "quant_algo": "NVFP4",
                 "group_size": 16,
                 "ignore": [checkpoint_only],
-            }
+            },
         },
     )
     quantization_cfg: dict[str, Any] = {
@@ -559,21 +563,46 @@ def test_existing_checkpoint_ignore_is_merged_back_into_refit_config(
     ]
 
 
-def test_external_hf_quant_config_checkpoint_is_rejected_before_conversion(
+def test_standard_external_modelopt_checkpoint_is_rejected_before_conversion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_dir = tmp_path / "source"
-    source_dir.mkdir()
-    _write_json(source_dir / "config.json", {"num_hidden_layers": 1})
+    weight_name = "model.layers.0.self_attn.q_proj.weight"
+    qweight, block_scale, global_scale = _fake_quantized(
+        _weight(1.0),
+        qvalue=7,
+        global_scale=0.5,
+    )
+    weight_base = weight_name.removesuffix(".weight")
+    _write_source_checkpoint(
+        source_dir,
+        {
+            "model.safetensors": {
+                weight_name: qweight,
+                f"{weight_base}.weight_scale": block_scale,
+                f"{weight_base}.weight_scale_2": global_scale,
+            }
+        },
+        num_hidden_layers=1,
+        config_extra={
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+                "ignore": [],
+            }
+        },
+    )
     _write_json(
         source_dir / "hf_quant_config.json",
         {
+            "producer": {"name": "modelopt"},
             "quantization": {
                 "quant_algo": "NVFP4",
                 "group_size": 16,
-                "exclude_modules": ["model.layers.0.self_attn*"],
-            }
+                "exclude_modules": [],
+            },
         },
     )
     cache_root = tmp_path / "cache"
@@ -593,6 +622,39 @@ def test_external_hf_quant_config_checkpoint_is_rejected_before_conversion(
             quantization_cfg=quantization_cfg,
         )
     assert not cache_root.exists()
+
+
+def test_local_bf16_checkpoint_requires_offline_conversion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    _write_source_checkpoint(
+        source_dir,
+        {"model.safetensors": {_down(0): _weight(1.0)}},
+        num_hidden_layers=1,
+    )
+    cache_root = tmp_path / "cache"
+    monkeypatch.setattr(
+        nvfp4_setup,
+        "convert_nvfp4",
+        lambda *_args, **_kwargs: pytest.fail("driver must not run conversion"),
+    )
+
+    with pytest.raises(ValueError, match="does not quantize in the Ray driver"):
+        nvfp4_setup.ensure_nvfp4_checkpoint(
+            model_path=str(source_dir),
+            quantization_cfg={"scheme": "nvfp4", "cache_root": str(cache_root)},
+        )
+    assert not cache_root.exists()
+
+
+def test_hf_repo_id_requires_local_preconverted_checkpoint() -> None:
+    with pytest.raises(ValueError, match="cannot auto-convert an HF repo id"):
+        nvfp4_setup.ensure_nvfp4_checkpoint(
+            model_path="NVIDIA/model-nvfp4-source",
+            quantization_cfg={"scheme": "nvfp4"},
+        )
 
 
 def test_existing_checkpoint_rejects_new_head_layer_bf16_policy(
@@ -623,11 +685,12 @@ def test_existing_checkpoint_rejects_new_head_layer_bf16_policy(
         },
         num_hidden_layers=2,
         config_extra={
+            nvfp4_setup.NEMO_RL_NVFP4_LAYOUT_KEY: (nvfp4_setup.NEMO_RL_NVFP4_LAYOUT),
             "quantization_config": {
                 "quant_algo": "NVFP4",
                 "group_size": 16,
                 "ignore": [],
-            }
+            },
         },
     )
     quantization_cfg: dict[str, Any] = {
