@@ -83,7 +83,7 @@ config is already included in the repository:
 
 ```bash
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-brightdelta-180b-dapo-8n8g-automodel.yaml \
+  --config examples/configs/recipes/llm/grpo-qwen3.8-flash-next-dapo-8n8g-automodel.yaml \
   policy.model_name=/your/path/to/qwen3.8-flash-next-180b \
   policy.tokenizer.name=/your/path/to/qwen3.8-flash-next-180b
 ```
@@ -96,12 +96,12 @@ The recipe is DAPO-style GRPO on DAPO-Math-17K with AIME-2024 validation,
 AutoModel (DTensor) training with colocated vLLM generation, on 8 nodes x 8 GPUs.
 Recipe YAML files under `examples/configs/recipes/` are the source of truth.
 
-The YAML carries the full target configuration. The currently validated launch
-uses the 4k overrides shown below; the 9k configuration may run out of memory.
+The YAML defaults to the currently validated 4k launch configuration. A 9k
+configuration may run out of memory.
 
 | Validated seq | Training EP | Rollout TP/EP | `max_new_tokens` | Recipe |
 |---|---|---|---|---|
-| 4096 | 64 | 8/8 | 3072 | [`grpo-brightdelta-180b-dapo-8n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/grpo-brightdelta-180b-dapo-8n8g-automodel.yaml) |
+| 4096 | 64 | 8/8 | 3072 | [`grpo-qwen3.8-flash-next-dapo-8n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.8-flash-next-dapo-8n8g-automodel.yaml) |
 
 This is a DAPO-style recipe with overlong reward shaping, asymmetric clipping,
 and token-level loss. Dynamic sampling is disabled in the current recipe.
@@ -129,15 +129,9 @@ Use the 4k, 8-node launch below as the starting point for full-model training.
 export NRL_FORCE_REBUILD_VENVS=true
 
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-brightdelta-180b-dapo-8n8g-automodel.yaml \
+  --config examples/configs/recipes/llm/grpo-qwen3.8-flash-next-dapo-8n8g-automodel.yaml \
   policy.model_name=/your/path/to/qwen3.8-flash-next-180b \
-  policy.tokenizer.name=/your/path/to/qwen3.8-flash-next-180b \
-  policy.max_total_sequence_length=4096 \
-  policy.generation.max_new_tokens=3072 \
-  policy.generation.vllm_cfg.max_model_len=4096 \
-  policy.generation.vllm_cfg.gpu_memory_utilization=0.72 \
-  data.max_input_seq_length=1024 \
-  grpo.reward_shaping.max_response_length=3072
+  policy.tokenizer.name=/your/path/to/qwen3.8-flash-next-180b
 ```
 
 On Slurm, keep `cluster.num_nodes` in step with what you request from the scheduler.
@@ -158,5 +152,5 @@ uv run examples/run_grpo.py --config <recipe> cluster.num_nodes=8
 ## Known Issues
 
 - **Long-run convergence is not validated.** Current evidence covers short runs only.
-- **The 9k configuration may OOM.** Use the validated 4k overrides above unless
+- **The 9k configuration may OOM.** Use the default 4k recipe unless
   additional memory headroom has been established for the target system.
