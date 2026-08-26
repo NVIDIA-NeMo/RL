@@ -1916,12 +1916,21 @@ def get_distillation_topk_logprobs_from_logits(
         student_logits = student_logits
         parallel_group = None
 
-    # Only the paths that read the full vocabulary need a [B, S, V] fp32 copy:
-    # zero_outside_topk takes a full-vocab log_softmax, and the TP/CP paths feed
-    # chunked kernels that allocate their fp32 buffers from this tensor. The
-    # remaining path reads K columns, so it upcasts the gathered [B, S, K]
-    # instead -- gather-then-cast is equivalent to cast-then-gather, and avoids
-    # materializing the full-vocab fp32 tensor.
+    # Two different reasons to keep the full [B, S, V] fp32 copy here:
+    #
+    #   * ``zero_outside_topk`` takes a log_softmax over the whole vocabulary,
+    #     so it genuinely reads every column;
+    #   * the TP/CP paths reach ``ChunkedDistributedGatherLogprob``, whose
+    #     ``backward`` builds its grad as
+    #     ``torch.zeros_like(vocab_parallel_logits, dtype=torch.float32)`` and
+    #     returns it. Hand it a bf16 input and autograd rejects the fp32
+    #     gradient. (The forward would be fine either way -- it upcasts each
+    #     chunk itself -- so this is a backward-side constraint, and narrowing
+    #     the guard further would mean changing that autograd.Function.)
+    #
+    # The remaining path reads K columns, so it upcasts the gathered [B, S, K]
+    # instead -- gather-then-cast is equivalent to cast-then-gather there, and
+    # avoids materializing the full-vocab fp32 tensor.
     if zero_outside_topk or parallel_group is not None or cp_size > 1:
         student_logits = student_logits.to(torch.float32)
 
