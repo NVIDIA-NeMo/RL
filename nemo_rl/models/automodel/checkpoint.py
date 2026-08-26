@@ -36,6 +36,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoTokenizer
 
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.native_checkpoint import save_tokenizer_on_rank0
 
 
 def _patch_qwen_vl_vision_key_mapping() -> None:
@@ -325,8 +326,10 @@ class AutomodelCheckpointManager:
             )
 
         if tokenizer_path and tokenizer is not None:
-            print(f"Saving tokenizer (or processor) to {tokenizer_path}")
-            tokenizer.save_pretrained(tokenizer_path)
+            # Rank-0 guarded: passing tokenizer_path bypasses save_model()'s
+            # ConsolidatedHFAddon (we pass tokenizer=None above), which is where
+            # nemo_automodel applies its own rank-0 guard, so we must apply it here.
+            save_tokenizer_on_rank0(tokenizer, tokenizer_path)
 
     def load_checkpoint(
         self,

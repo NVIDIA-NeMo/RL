@@ -21,35 +21,140 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PERF_CONFIG_DIR = PROJECT_ROOT / "examples/configs/recipes/llm/performance"
 PERF_SUITE_DIR = PROJECT_ROOT / "tests/test_suites/llm/performance"
 GB200_SUITE = PROJECT_ROOT / "tests/test_suites/performance_gb200.txt"
+MXFP8_FUNCTIONAL_TEST = (
+    PROJECT_ROOT / "tests/functional/grpo_vllm_mxfp8_rollout_gb200.sh"
+)
 
 MXFP8_CASES = {
+    "grpo-deepseek-v3-64n4g-mxfp8-rollout": {
+        "nodes": 64,
+        "gpus_per_node": 4,
+        "segment_size": 16,
+        "async_engine": True,
+        "tensor_parallel_size": 32,
+        "moe_backend": "flashinfer_trtllm",
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "model.layers.*.mlp.gate",
+            "model.layers.*.mlp.shared_experts.*",
+            "model.layers.0.mlp.*",
+            "model.layers.1.mlp.*",
+            "model.layers.2.mlp.*",
+            "model.layers.61.*",
+            "mtp.*",
+            "language_model.mtp.*",
+        ],
+    },
+    "grpo-deepseek-v3-64n4g-async-1off-mxfp8-rollout": {
+        "nodes": 64,
+        "gpus_per_node": 4,
+        "segment_size": 16,
+        "async_engine": True,
+        "tensor_parallel_size": 16,
+        "moe_backend": "flashinfer_trtllm",
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "model.layers.*.mlp.gate",
+            "model.layers.*.mlp.shared_experts.*",
+            "model.layers.0.mlp.*",
+            "model.layers.1.mlp.*",
+            "model.layers.2.mlp.*",
+            "model.layers.61.*",
+            "mtp.*",
+            "language_model.mtp.*",
+        ],
+    },
+    "grpo-nemotron3-super-120BA12B-32n4g-mxfp8-rollout": {
+        "nodes": 32,
+        "gpus_per_node": 4,
+        "segment_size": 8,
+        "async_engine": True,
+        "tensor_parallel_size": 4,
+        "moe_backend": "flashinfer_trtllm",
+        "ignore_patterns": [
+            "model.layers.*.mixer.in_proj",
+            "model.layers.*.mixer.out_proj",
+            "model.layers.*.mixer.qkv_proj",
+            "model.layers.*.mixer.o_proj",
+            "model.layers.*.mixer.up_proj",
+            "model.layers.*.mixer.down_proj",
+            "model.layers.*.mixer.gate",
+            "model.layers.*.mixer.shared_experts.*",
+            "model.layers.*.mixer.fc1_latent_proj",
+            "model.layers.*.mixer.fc2_latent_proj",
+            "mtp.*",
+            "language_model.mtp.*",
+        ],
+    },
+    "grpo-nemotron3-super-120BA12B-32n4g-async-1off-mxfp8-rollout": {
+        "nodes": 32,
+        "gpus_per_node": 4,
+        "segment_size": 8,
+        "async_engine": True,
+        "tensor_parallel_size": 4,
+        "moe_backend": "flashinfer_trtllm",
+        "ignore_patterns": [
+            "model.layers.*.mixer.in_proj",
+            "model.layers.*.mixer.out_proj",
+            "model.layers.*.mixer.qkv_proj",
+            "model.layers.*.mixer.o_proj",
+            "model.layers.*.mixer.up_proj",
+            "model.layers.*.mixer.down_proj",
+            "model.layers.*.mixer.gate",
+            "model.layers.*.mixer.shared_experts.*",
+            "model.layers.*.mixer.fc1_latent_proj",
+            "model.layers.*.mixer.fc2_latent_proj",
+            "mtp.*",
+            "language_model.mtp.*",
+        ],
+    },
     "grpo-qwen3-30ba3b-4n4g-mxfp8-rollout": {
         "nodes": 4,
         "gpus_per_node": 4,
         "segment_size": 4,
         "async_engine": None,
-        "moe_backend": None,
+        "moe_backend": "flashinfer_trtllm",
+        "train_global_batch_size": 2048,
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "model.layers.*.mlp.gate",
+            "lm_head",
+        ],
     },
     "grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout": {
         "nodes": 4,
         "gpus_per_node": 4,
         "segment_size": 2,
         "async_engine": True,
-        "moe_backend": None,
+        "moe_backend": "flashinfer_trtllm",
+        "train_global_batch_size": 2048,
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "model.layers.*.mlp.gate",
+            "lm_head",
+        ],
     },
     "grpo-qwen3-32b-4n4g-mxfp8-rollout": {
         "nodes": 4,
         "gpus_per_node": 4,
         "segment_size": 4,
         "async_engine": None,
-        "moe_backend": None,
+        "moe_backend": "flashinfer_trtllm",
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "lm_head",
+        ],
     },
     "grpo-qwen3-32b-8n4g-async-1off-mxfp8-rollout": {
         "nodes": 8,
         "gpus_per_node": 4,
         "segment_size": 4,
         "async_engine": True,
-        "moe_backend": None,
+        "moe_backend": "flashinfer_trtllm",
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "lm_head",
+        ],
     },
     "grpo-qwen3-235b-16n4g-mxfp8-rollout": {
         "nodes": 16,
@@ -58,6 +163,11 @@ MXFP8_CASES = {
         "async_engine": True,
         "tensor_parallel_size": 4,
         "moe_backend": "flashinfer_trtllm",
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "model.layers.*.mlp.gate",
+            "lm_head",
+        ],
     },
     "grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout": {
         "nodes": 32,
@@ -66,6 +176,11 @@ MXFP8_CASES = {
         "async_engine": True,
         "tensor_parallel_size": 4,
         "moe_backend": "flashinfer_trtllm",
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "model.layers.*.mlp.gate",
+            "lm_head",
+        ],
     },
 }
 
@@ -116,33 +231,55 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
     assert config_path.is_file()
     assert script_path.is_file()
 
+    recipe = _load_yaml(config_path)
+    assert (
+        recipe["policy"]["generation"]["vllm_kwargs"]["moe_backend"]
+        == "flashinfer_trtllm"
+    )
+
     config = _load_resolved_yaml(config_path)
     vllm_cfg = config["policy"]["generation"]["vllm_cfg"]
     cluster = config["cluster"]
 
+    assert config["checkpointing"]["checkpoint_dir"] == f"results/{case_name}"
+    assert config["logger"]["log_dir"] == f"logs/{case_name}"
+    assert config["logger"]["wandb"]["name"] == case_name
     assert vllm_cfg["precision"] == "fp8"
     assert vllm_cfg["is_mx"] is True
-    assert vllm_cfg["quantization_ignored_layer_kws"] == [
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-    ]
+    assert "quantization_ignored_layer_kws" not in vllm_cfg
+    assert vllm_cfg["quantization_ignore_patterns"] == expected["ignore_patterns"]
     assert cluster["num_nodes"] == expected["nodes"]
     assert cluster["gpus_per_node"] == expected["gpus_per_node"]
     assert cluster["segment_size"] == expected["segment_size"]
+    assert f"SEGMENT_SIZE={expected['segment_size']}" in script_path.read_text(
+        encoding="utf-8"
+    )
     if expected.get("tensor_parallel_size") is not None:
         assert vllm_cfg["tensor_parallel_size"] == expected["tensor_parallel_size"]
     if expected["async_engine"] is not None:
         assert vllm_cfg["async_engine"] is expected["async_engine"]
-    if expected["moe_backend"] is not None:
+    assert (
+        config["policy"]["generation"]["vllm_kwargs"]["moe_backend"]
+        == expected["moe_backend"]
+    )
+    if expected.get("train_global_batch_size") is not None:
         assert (
-            config["policy"]["generation"]["vllm_kwargs"]["moe_backend"]
-            == expected["moe_backend"]
+            config["policy"]["train_global_batch_size"]
+            == expected["train_global_batch_size"]
         )
+
+    expected_async = "-async-1off-" in case_name
+    async_grpo = config["grpo"]["async_grpo"]
+    assert async_grpo["enabled"] is expected_async
+    assert async_grpo["in_flight_weight_updates"] is expected_async
+    if expected_async:
+        assert config["policy"]["generation"]["colocated"]["enabled"] is False
 
 
 def test_mxfp8_rollout_recipes_are_in_gb200_performance_suite() -> None:
+    recipe_names = {path.stem for path in PERF_CONFIG_DIR.glob("*-mxfp8-rollout.yaml")}
+    assert recipe_names == set(MXFP8_CASES)
+
     suite_text = GB200_SUITE.read_text(encoding="utf-8")
 
     for case_name in MXFP8_CASES:
@@ -157,12 +294,12 @@ def test_mxfp8_rollout_backend_variant_recipes_are_not_kept() -> None:
             assert not (PERF_SUITE_DIR / f"{variant_name}.sh").exists()
 
 
-def test_qwen3_235b_async_tp4_baseline_overlay() -> None:
-    config = _load_yaml(PERF_CONFIG_DIR / "grpo-qwen3-235b-32n4g-async-1off-tp4.yaml")
+def test_mxfp8_functional_test_uses_ignore_patterns() -> None:
+    script_text = MXFP8_FUNCTIONAL_TEST.read_text(encoding="utf-8")
 
-    assert config["defaults"] == "./grpo-qwen3-235b-32n4g-async-1off.yaml"
-    assert config["policy"]["generation"]["vllm_cfg"]["tensor_parallel_size"] == 4
-    assert config["cluster"]["segment_size"] == 16
+    assert "quantization_ignored_layer_kws" not in script_text
+    assert "quantization_ignore_patterns=[model.layers.*.self_attn.*]" in script_text
+    assert "assert_grep 'NRL_MXFP8_EFFECTIVE_IGNORE=.*self_attn'" in script_text
 
 
 def test_qwen3_235b_scripts_append_distributed_timeout_override() -> None:
@@ -194,3 +331,15 @@ def test_qwen3_235b_mxfp8_recipes_keep_baseline_runtime_knobs() -> None:
         assert "max_num_steps" not in grpo_config
         assert "val_batch_size" not in grpo_config
         assert "max_val_samples" not in grpo_config
+
+
+def test_deepseek_mxfp8_launchers_handle_unset_and_spaced_checkpoint_paths() -> None:
+    for case_name in (
+        "grpo-deepseek-v3-64n4g-mxfp8-rollout",
+        "grpo-deepseek-v3-64n4g-async-1off-mxfp8-rollout",
+    ):
+        script_text = (PERF_SUITE_DIR / f"{case_name}.sh").read_text(encoding="utf-8")
+
+        assert '[[ -z "${NRL_DEEPSEEK_V3_BF16_CKPT:-}" ]]' in script_text
+        assert 'policy.model_name="$NRL_DEEPSEEK_V3_BF16_CKPT"' in script_text
+        assert 'policy.tokenizer.name="$NRL_DEEPSEEK_V3_BF16_CKPT"' in script_text

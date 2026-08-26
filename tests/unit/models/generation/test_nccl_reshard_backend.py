@@ -421,7 +421,7 @@ def test_prepare_nccl_reshard_refit_info_validates_before_building_map(monkeypat
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
-    ext._validate_weight_update_compatibility = MagicMock(
+    ext._validate_native_layerwise_refit = MagicMock(
         side_effect=RuntimeError("unsupported weight update")
     )
     ext.build_hf_to_local_param_map = MagicMock()
@@ -434,7 +434,7 @@ def test_prepare_nccl_reshard_refit_info_validates_before_building_map(monkeypat
     with pytest.raises(RuntimeError, match="unsupported weight update"):
         ext.prepare_nccl_reshard_refit_info({"layer_names": []})
 
-    ext._validate_weight_update_compatibility.assert_called_once_with("nccl_reshard")
+    ext._validate_native_layerwise_refit.assert_called_once_with("nccl_reshard")
     restore_refit_info_placements.assert_not_called()
     ext.build_hf_to_local_param_map.assert_not_called()
     assert not hasattr(ext, "nccl_reshard_refit_info")
@@ -455,7 +455,7 @@ def test_nccl_reshard_lifecycle_repeats_for_trtllm_moe_modules(monkeypatch):
     ext.model_config = model_config
     ext.device = torch.device("cpu")
     ext._uses_unquantized_flashinfer_trtllm = lambda: True
-    ext._validate_weight_update_compatibility = lambda _transport=None: None
+    ext._validate_native_layerwise_refit = lambda _transport=None: None
     ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
 
     monkeypatch.setattr(
@@ -467,7 +467,12 @@ def test_nccl_reshard_lifecycle_repeats_for_trtllm_moe_modules(monkeypatch):
     monkeypatch.setattr(
         "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
     )
-    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        vllm_backend,
+        "_refresh_hpc_modules_after_layerwise_reload",
+        lambda _model: None,
+    )
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
         lambda module: call_order.append(("initialize", module)),

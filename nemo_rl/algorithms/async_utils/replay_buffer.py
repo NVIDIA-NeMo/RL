@@ -19,7 +19,7 @@ import threading as _threading
 import uuid
 from collections import Counter
 from collections.abc import Mapping
-from typing import Any, Iterable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Optional
 
 import ray
 import torch
@@ -30,10 +30,15 @@ from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
+    RETAINED_TASK_INDICES_KEY,
     PromptGroupRecord,
 )
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 from nemo_rl.utils.r3_trace import trace_rollout_payload
+
+
+class PostWriteEnrichmentError(RuntimeError):
+    """A rollout reached TQ but failed in required post-write processing."""
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -41,13 +46,20 @@ class ReplayBufferImpl(ReplayBufferProtocol):
     """Replay buffer storing per-prompt groups.
 
     A single entry corresponds to 1 prompt repeated by
-    grpo.num_generations_per_prompt (required to compute per-prompt advantages).
+    the algorithm's ``num_generations_per_prompt`` setting.
     """
 
-    def __init__(self, max_size: int):
+    def __init__(
+        self,
+        max_size: int,
+        drop_incomplete_targets_on_restore: bool,
+    ) -> None:
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
+        # True discards partial restored rows. The dataloader is not rewound,
+        # so replacement rollouts come from subsequent prompts.
+        self._drop_incomplete_targets_on_restore = drop_incomplete_targets_on_restore
         self.trajectories = []  # List[dict[str, Any]]
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
         self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
@@ -326,6 +338,22 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         with self._lock:
             return len(self.trajectories)
 
+    def get_held_task_indices(self) -> list[int]:
+        """Ordinals of every prompt group currently held in the buffer.
+
+        All held groups are untrained (sampling removes trained ones). The
+        checkpoint cut must not exceed any of these ordinals: with
+        ``checkpointing.load_replay_buffer=false`` the buffer is discarded on
+        resume, and ordinals below the cut are never re-yielded.
+        """
+        with self._lock:
+            return sorted(
+                int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
+                for trajectory in self.trajectories
+                if isinstance(trajectory, dict)
+                and trajectory.get(NEMO_GYM_TASK_INDEX_KEY) is not None
+            )
+
     def clear(self) -> None:
         """Clear the buffer."""
         with self._lock:
@@ -361,8 +389,20 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         num_prompts_per_step: int | None = None,
         current_training_step: int | None = None,
         max_age_steps: int | None = None,
-    ) -> dict[str, int]:
-        """Restore inside the actor and return only compact coordination metadata."""
+    ) -> dict[str, Any]:
+        """Restore inside the actor and return only compact coordination metadata.
+
+        Returns:
+            Mapping with ``num_trajectories`` (pre-filter count),
+            ``NEXT_NEMO_GYM_TASK_INDEX_KEY`` (one past the highest saved task
+            index, computed before age/step filtering; on a legacy resume this
+            keeps used indices from being re-issued, while a frontier-aligned
+            resume deliberately rewinds the counter to the saved base ordinal
+            so the covered window re-yields under its original indices), and
+            ``RETAINED_TASK_INDICES_KEY`` (the sorted task indices of the
+            groups that survived filtering — what a frontier-aligned resume
+            must not regenerate).
+        """
         state = torch.load(path, weights_only=False)
         saved_task_indices = [
             int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
@@ -379,9 +419,17 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         )
         del state
         gc.collect()
+        with self._lock:
+            retained_task_indices = sorted(
+                int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
+                for trajectory in self.trajectories
+                if isinstance(trajectory, dict)
+                and trajectory.get(NEMO_GYM_TASK_INDEX_KEY) is not None
+            )
         return {
             "num_trajectories": num_trajectories,
             NEXT_NEMO_GYM_TASK_INDEX_KEY: next_task_index,
+            RETAINED_TASK_INDICES_KEY: retained_task_indices,
         }
 
     def load_state_dict(
@@ -448,6 +496,12 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 "last_target_weight_already_generated"
             ]
 
+            # Filter stale rows before checking target completeness. Otherwise a
+            # target can look complete, lose stale rows, and remain partially
+            # restored even when incomplete targets should be dropped.
+            if max_age_steps is not None and self.trajectories:
+                self._remove_stale_trajectories(max_age_steps)
+
             if current_training_step is not None and num_prompts_per_step is not None:
                 self._prepare_for_training_step(
                     current_step=current_training_step,
@@ -455,11 +509,6 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 )
             elif num_prompts_per_step is not None and self.trajectories:
                 self._remove_incomplete_target_steps(num_prompts_per_step)
-
-            if max_age_steps is not None and self.trajectories:
-                self._remove_stale_trajectories(max_age_steps)
-                if current_training_step is None and num_prompts_per_step is not None:
-                    self._remove_incomplete_target_steps(num_prompts_per_step)
 
             self._truncate_to_max_size(current_training_step)
 
@@ -520,11 +569,33 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             "   Complete targets: "
             f"{sorted(complete_targets) if complete_targets else 'none'}"
         )
-        for target in sorted(incomplete_targets):
+        if incomplete_targets and self._drop_incomplete_targets_on_restore:
             print(
-                f"   Incomplete target {target}: "
-                f"{target_counts[target]}/{num_prompts_per_step}"
+                "   Dropping incomplete restored targets; replacements will use "
+                "subsequent prompts: "
+                + ", ".join(
+                    f"{target}={target_counts[target]}/{num_prompts_per_step}"
+                    for target in sorted(incomplete_targets)
+                )
             )
+            indices_to_keep = [
+                i
+                for i, target in enumerate(self.target_weight_versions)
+                if target not in incomplete_targets
+            ]
+            self.trajectories = [self.trajectories[i] for i in indices_to_keep]
+            self.trajectory_versions = [
+                self.trajectory_versions[i] for i in indices_to_keep
+            ]
+            self.target_weight_versions = [
+                self.target_weight_versions[i] for i in indices_to_keep
+            ]
+        else:
+            for target in sorted(incomplete_targets):
+                print(
+                    f"   Incomplete target {target}: "
+                    f"{target_counts[target]}/{num_prompts_per_step}"
+                )
 
         # Let the collector ask each target from current_step onward how many
         # trajectories are still needed, so incomplete restored batches can be
@@ -707,6 +778,16 @@ class TQReplayBuffer:
         self.target_step_list: list[Optional[int]] = []
         self.ready_list: list[bool] = []
         self._group_ids: list[str] = []
+        self._post_write_enricher: Optional[
+            Callable[[KVBatchMeta, PromptGroupRecord], Awaitable[KVBatchMeta]]
+        ] = None
+
+    def set_post_write_enricher(
+        self,
+        enricher: Callable[[KVBatchMeta, PromptGroupRecord], Awaitable[KVBatchMeta]],
+    ) -> None:
+        """Install the required enrichment stage run before slots become ready."""
+        self._post_write_enricher = enricher
 
     def reserve(
         self,
@@ -796,6 +877,14 @@ class TQReplayBuffer:
                 sequence_lengths=[int(s) for s in lengths.tolist()],
                 tags=[dict(t) for t in tags],
             )
+
+            if self._post_write_enricher is not None:
+                try:
+                    meta = await self._post_write_enricher(meta, record)
+                except Exception as error:
+                    raise PostWriteEnrichmentError(
+                        f"post-write enrichment failed for group_id={group_id!r}"
+                    ) from error
 
             idx = self._group_ids.index(group_id)
             self.meta_list[idx] = meta
