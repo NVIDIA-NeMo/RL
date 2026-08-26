@@ -187,7 +187,6 @@ class TestVllmRemoteSparseWeightSynchronizer:
         sync._targets = ["tcp://relay"]
         sync._stale = False
 
-        sync.mark_stale()
         sync.shutdown()
 
         assert mock_ray.cancel.call_count == 2

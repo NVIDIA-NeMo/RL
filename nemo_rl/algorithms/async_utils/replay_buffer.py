@@ -30,6 +30,7 @@ from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
+    RETAINED_TASK_INDICES_KEY,
     PromptGroupRecord,
 )
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
@@ -41,13 +42,20 @@ class ReplayBufferImpl(ReplayBufferProtocol):
     """Replay buffer storing per-prompt groups.
 
     A single entry corresponds to 1 prompt repeated by
-    grpo.num_generations_per_prompt (required to compute per-prompt advantages).
+    the algorithm's ``num_generations_per_prompt`` setting.
     """
 
-    def __init__(self, max_size: int):
+    def __init__(
+        self,
+        max_size: int,
+        drop_incomplete_targets_on_restore: bool,
+    ) -> None:
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
+        # True discards partial restored rows. The dataloader is not rewound,
+        # so replacement rollouts come from subsequent prompts.
+        self._drop_incomplete_targets_on_restore = drop_incomplete_targets_on_restore
         self.trajectories = []  # List[dict[str, Any]]
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
         self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
@@ -326,6 +334,22 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         with self._lock:
             return len(self.trajectories)
 
+    def get_held_task_indices(self) -> list[int]:
+        """Ordinals of every prompt group currently held in the buffer.
+
+        All held groups are untrained (sampling removes trained ones). The
+        checkpoint cut must not exceed any of these ordinals: with
+        ``checkpointing.load_replay_buffer=false`` the buffer is discarded on
+        resume, and ordinals below the cut are never re-yielded.
+        """
+        with self._lock:
+            return sorted(
+                int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
+                for trajectory in self.trajectories
+                if isinstance(trajectory, dict)
+                and trajectory.get(NEMO_GYM_TASK_INDEX_KEY) is not None
+            )
+
     def clear(self) -> None:
         """Clear the buffer."""
         with self._lock:
@@ -361,8 +385,20 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         num_prompts_per_step: int | None = None,
         current_training_step: int | None = None,
         max_age_steps: int | None = None,
-    ) -> dict[str, int]:
-        """Restore inside the actor and return only compact coordination metadata."""
+    ) -> dict[str, Any]:
+        """Restore inside the actor and return only compact coordination metadata.
+
+        Returns:
+            Mapping with ``num_trajectories`` (pre-filter count),
+            ``NEXT_NEMO_GYM_TASK_INDEX_KEY`` (one past the highest saved task
+            index, computed before age/step filtering; on a legacy resume this
+            keeps used indices from being re-issued, while a frontier-aligned
+            resume deliberately rewinds the counter to the saved base ordinal
+            so the covered window re-yields under its original indices), and
+            ``RETAINED_TASK_INDICES_KEY`` (the sorted task indices of the
+            groups that survived filtering — what a frontier-aligned resume
+            must not regenerate).
+        """
         state = torch.load(path, weights_only=False)
         saved_task_indices = [
             int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
@@ -379,9 +415,17 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         )
         del state
         gc.collect()
+        with self._lock:
+            retained_task_indices = sorted(
+                int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
+                for trajectory in self.trajectories
+                if isinstance(trajectory, dict)
+                and trajectory.get(NEMO_GYM_TASK_INDEX_KEY) is not None
+            )
         return {
             "num_trajectories": num_trajectories,
             NEXT_NEMO_GYM_TASK_INDEX_KEY: next_task_index,
+            RETAINED_TASK_INDICES_KEY: retained_task_indices,
         }
 
     def load_state_dict(
@@ -448,6 +492,12 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 "last_target_weight_already_generated"
             ]
 
+            # Filter stale rows before checking target completeness. Otherwise a
+            # target can look complete, lose stale rows, and remain partially
+            # restored even when incomplete targets should be dropped.
+            if max_age_steps is not None and self.trajectories:
+                self._remove_stale_trajectories(max_age_steps)
+
             if current_training_step is not None and num_prompts_per_step is not None:
                 self._prepare_for_training_step(
                     current_step=current_training_step,
@@ -455,11 +505,6 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 )
             elif num_prompts_per_step is not None and self.trajectories:
                 self._remove_incomplete_target_steps(num_prompts_per_step)
-
-            if max_age_steps is not None and self.trajectories:
-                self._remove_stale_trajectories(max_age_steps)
-                if current_training_step is None and num_prompts_per_step is not None:
-                    self._remove_incomplete_target_steps(num_prompts_per_step)
 
             self._truncate_to_max_size(current_training_step)
 
@@ -520,11 +565,33 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             "   Complete targets: "
             f"{sorted(complete_targets) if complete_targets else 'none'}"
         )
-        for target in sorted(incomplete_targets):
+        if incomplete_targets and self._drop_incomplete_targets_on_restore:
             print(
-                f"   Incomplete target {target}: "
-                f"{target_counts[target]}/{num_prompts_per_step}"
+                "   Dropping incomplete restored targets; replacements will use "
+                "subsequent prompts: "
+                + ", ".join(
+                    f"{target}={target_counts[target]}/{num_prompts_per_step}"
+                    for target in sorted(incomplete_targets)
+                )
             )
+            indices_to_keep = [
+                i
+                for i, target in enumerate(self.target_weight_versions)
+                if target not in incomplete_targets
+            ]
+            self.trajectories = [self.trajectories[i] for i in indices_to_keep]
+            self.trajectory_versions = [
+                self.trajectory_versions[i] for i in indices_to_keep
+            ]
+            self.target_weight_versions = [
+                self.target_weight_versions[i] for i in indices_to_keep
+            ]
+        else:
+            for target in sorted(incomplete_targets):
+                print(
+                    f"   Incomplete target {target}: "
+                    f"{target_counts[target]}/{num_prompts_per_step}"
+                )
 
         # Let the collector ask each target from current_step onward how many
         # trajectories are still needed, so incomplete restored batches can be
@@ -879,6 +946,256 @@ class TQReplayBuffer:
             )
 
         return len(drop_idxs)
+
+    async def state_dict(self, *, saved_capacity: int) -> dict[str, Any]:
+        """Serialize ready groups (meta + DataPlane payloads) for checkpointing.
+
+        Snapshots the ready slots synchronously on the event loop first, then
+        fetches each group's rows from the DataPlane. Unready reservations are
+        in-flight rollouts and are dropped, matching legacy semantics. The
+        snapshot stays consistent during the async fetch: concurrent commits
+        only append/flip *other* slots, and the train pump — the only
+        remover — is the caller itself; groups committed mid-save land in the
+        next checkpoint.
+
+        Args:
+            saved_capacity: max_buffered_rollouts at save time, recorded so
+                load_state_dict can report capacity changes across restarts.
+
+        Returns:
+            Envelope: ``{"partition_id": ..., "saved_capacity": ...,
+            "groups": [{"meta", "start_weight", "end_weight", "target_step",
+            "group_id", "fields_data"}, ...]}``.
+        """
+        snapshot: list[tuple[KVBatchMeta, int, int, Optional[int], str]] = []
+        for i, ready in enumerate(self.ready_list):
+            if not ready:
+                continue
+            meta = self.meta_list[i]
+            assert meta is not None  # commit sets meta before ready=True
+            snapshot.append(
+                (
+                    meta,
+                    self.start_weight_list[i],
+                    self.end_weight_list[i],
+                    self.target_step_list[i],
+                    self._group_ids[i],
+                )
+            )
+
+        groups: list[dict[str, Any]] = []
+        for meta, start_weight, end_weight, target_step, group_id in snapshot:
+            fields_data = await self._call_dp(
+                "get_samples",
+                sample_ids=meta.sample_ids,
+                partition_id=self._partition_id,
+                select_fields=meta.fields,
+            )
+            groups.append(
+                {
+                    "meta": meta,
+                    "start_weight": start_weight,
+                    "end_weight": end_weight,
+                    "target_step": target_step,
+                    "group_id": group_id,
+                    "fields_data": fields_data,
+                }
+            )
+        return {
+            "partition_id": self._partition_id,
+            "saved_capacity": saved_capacity,
+            "groups": groups,
+        }
+
+    async def load_state_dict(
+        self,
+        state: dict[str, Any],
+        *,
+        max_groups: int,
+        expected_partition_id: str,
+        expected_group_size: int,
+    ) -> int:
+        """Validate and re-put checkpointed groups into the buffer.
+
+        The preflight runs entirely before any DataPlane write (legacy
+        precedent: validate, then truncate):
+          1. Validate the envelope and raise ValueError on malformed state.
+          2. Truncate to ``max_groups``, keeping the freshest groups, so the
+             restored count can never exceed the buffer's capacity. Groups
+             carrying a ``target_step`` are never truncated — an over-capacity
+             in-order checkpoint raises instead (see Raises).
+
+        Staleness is intentionally NOT handled here — load only loads. The
+        train pump's first ``sampler.evict`` drops any restored group that is
+        outside the staleness window and releases its capacity permit, keeping
+        eviction in one place.
+
+        Args:
+            state: Envelope produced by ``state_dict``.
+            max_groups: Current max_buffered_rollouts; the restored count
+                never exceeds it.
+            expected_partition_id: Partition this buffer writes to; must
+                match the envelope.
+            expected_group_size: num_generations_per_prompt; every group must
+                hold exactly this many rows (a changed group size silently
+                breaks the group-relative baseline).
+
+        Returns:
+            Number of groups restored into the buffer.
+
+        Raises:
+            ValueError: If the envelope is malformed (missing keys, partition
+                mismatch, misaligned or wrongly sized groups, duplicate
+                sample_ids), or if target-stamped groups exceed ``max_groups``.
+        """
+        required_keys = {"partition_id", "saved_capacity", "groups"}
+        missing_keys = required_keys - set(state)
+        if missing_keys:
+            raise ValueError(
+                f"Replay buffer checkpoint missing required keys: {missing_keys}"
+            )
+        if state["partition_id"] != expected_partition_id:
+            raise ValueError(
+                "Replay buffer checkpoint partition_id mismatch: "
+                f"checkpoint={state['partition_id']!r}, "
+                f"expected={expected_partition_id!r}"
+            )
+
+        groups = list(state["groups"])
+        group_keys = {
+            "meta",
+            "start_weight",
+            "end_weight",
+            "target_step",
+            "group_id",
+            "fields_data",
+        }
+        seen_sample_ids: set[str] = set()
+        for group in groups:
+            missing_group_keys = group_keys - set(group)
+            if missing_group_keys:
+                raise ValueError(
+                    f"Replay buffer checkpoint group missing keys: {missing_group_keys}"
+                )
+            meta = group["meta"]
+            num_tags = len(meta.tags) if meta.tags is not None else -1
+            num_lengths = (
+                len(meta.sequence_lengths) if meta.sequence_lengths is not None else -1
+            )
+            if not (
+                len(meta.sample_ids) == num_tags == num_lengths == expected_group_size
+            ):
+                raise ValueError(
+                    "Replay buffer checkpoint group misaligned: "
+                    f"sample_ids={len(meta.sample_ids)}, tags={num_tags}, "
+                    f"sequence_lengths={num_lengths}, "
+                    f"expected_group_size={expected_group_size}"
+                )
+            for sid in meta.sample_ids:
+                if sid in seen_sample_ids:
+                    raise ValueError(
+                        f"Replay buffer checkpoint has duplicate sample_id: {sid!r}"
+                    )
+                seen_sample_ids.add(sid)
+
+        if state["saved_capacity"] != max_groups:
+            print(
+                "TQReplayBuffer capacity changed: "
+                f"checkpoint={state['saved_capacity']}, current={max_groups}. "
+                "Using current config value."
+            )
+        num_truncated = 0
+        if len(groups) > max_groups:
+            if any(group["target_step"] is not None for group in groups):
+                raise ValueError(
+                    f"Replay buffer checkpoint holds {len(groups)} group(s) "
+                    f"but async_rl.max_buffered_rollouts is {max_groups}. "
+                    "These groups carry target_step stamps (in-order "
+                    "sampling) and are selected as whole per-step batches, so "
+                    "dropping any of them would deadlock the resumed run. "
+                    "Resume with async_rl.max_buffered_rollouts >= "
+                    f"{len(groups)}, or delete replay_buffer.pt from the "
+                    "checkpoint to resume with an empty buffer."
+                )
+            num_truncated = len(groups) - max_groups
+            # Keep the freshest max_groups groups, preserving original order.
+            prioritized = sorted(
+                range(len(groups)),
+                key=lambda i: (groups[i]["start_weight"], i),
+            )
+            indices_to_keep = sorted(prioritized[num_truncated:])
+            groups = [groups[i] for i in indices_to_keep]
+
+        for group in groups:
+            meta = group["meta"]
+            await self._call_dp(
+                "put_samples",
+                sample_ids=list(meta.sample_ids),
+                partition_id=self._partition_id,
+                fields=group["fields_data"],
+                tags=[dict(t) for t in meta.tags],
+            )
+            self.meta_list.append(meta)
+            self.start_weight_list.append(group["start_weight"])
+            self.end_weight_list.append(group["end_weight"])
+            self.target_step_list.append(group["target_step"])
+            self.ready_list.append(True)
+            self._group_ids.append(group["group_id"])
+
+        summary = f"📦 Restored {len(groups)} replay group(s) from checkpoint"
+        if num_truncated:
+            summary += f"; truncated {num_truncated} group(s) over capacity"
+        print(summary, flush=True)
+        return len(groups)
+
+    def count_for_target_step(self, target_step: int) -> int:
+        """Return how many slots are stamped with ``target_step``."""
+        return sum(1 for target in self.target_step_list if target == target_step)
+
+    def promote_ready_group(self, *, to_target_step: int) -> Optional[int]:
+        """Re-stamp a finished group from a later step so it lands in this one.
+
+        Fills a hole left by a dropped prompt with generation that is already done,
+        which is the point: the step closes immediately instead of waiting out a fresh
+        rollout. The step it was borrowed from is returned so the caller can repay it,
+        and the caller must -- an unrepaid loan is the same hole one step later, carried
+        forward until it reaches the last step, which has nobody to borrow from.
+
+        The furthest future step is preferred because it is due last and so has the most
+        slack to absorb the repayment. Only ready slots qualify: an unready one is a
+        reservation whose rollout is still running, so moving its stamp would hand this
+        step the same wait it is trying to avoid.
+
+        Promotion can only make a step fresher, never staler. Slots are appended in
+        dispatch order and the trainer version never decreases, so a group stamped for a
+        later step was generated at a weight version at least as new as the ones already
+        in this step.
+
+        Synchronous on purpose. ``remove`` deletes its indices before its own first
+        await, so as long as nothing here yields, the index picked below cannot be
+        shifted out from under the write by a selection running concurrently.
+
+        Args:
+            to_target_step: Training step to re-stamp the borrowed group onto -- the
+                step that lost a prompt. Must be at or ahead of the trainer version:
+                a group re-stamped onto a step already trained is never selectable
+                again and would only be evicted.
+
+        Returns:
+            The target step the group was taken from, or None when no later step has a
+            ready group to lend.
+        """
+        lender_idx: Optional[int] = None
+        lender_target: Optional[int] = None
+        for i, target in enumerate(self.target_step_list):
+            if target is None or target <= to_target_step or not self.ready_list[i]:
+                continue
+            if lender_target is None or target > lender_target:
+                lender_idx, lender_target = i, target
+        if lender_idx is None:
+            return None
+        self.target_step_list[lender_idx] = to_target_step
+        return lender_target
 
     def size(self) -> int:
         """Return the number of prompt-group entries currently held."""

@@ -10,6 +10,8 @@ Test suites are defined in `.txt` files that list the test scripts to run:
 - `release_gb200.txt` - GB200 tests for release CI (4 GPUs per node)
 - `performance.txt` - Performance benchmarks for H100 (8 GPUs per node)
 - `performance_gb200.txt` - Performance benchmarks for GB200 (4 GPUs per node)
+- `nightly_mlm.txt` - H100 tests for the MLM nightly CI suite (8 GPUs per node)
+- `nightly_mlm_gb200.txt` - GB200 tests for the MLM nightly CI suite (4 GPUs per node)
 
 ## Naming
 
