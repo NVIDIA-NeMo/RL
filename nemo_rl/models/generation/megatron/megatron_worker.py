@@ -374,6 +374,9 @@ class MegatronGenerationMixin:
             vision_embedding_cache_max_bytes=int(
                 mcore_generation_config.get("vision_embedding_cache_max_bytes", 0)
             ),
+            allow_stale_multimodal_embeddings=bool(
+                mcore_generation_config.get("allow_stale_multimodal_embeddings", False)
+            ),
             prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(
                 "first_prefix_block"
             ),
@@ -505,7 +508,6 @@ class MegatronGenerationMixin:
 
     def _setup_openai_api_server(self) -> str:
         """Start the OpenAI-compatible HTTP server on this worker."""
-        from megatron.core.inference.config import MultimodalPromptConfig
         from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (
             start_text_gen_server,
         )
@@ -522,9 +524,6 @@ class MegatronGenerationMixin:
         else:
             server_port = _get_free_port_local()
 
-        prompt_config = self.cfg["generation"]["mcore_generation_config"].get(
-            "multimodal_prompt_config"
-        )
         start_text_gen_server(
             coordinator_addr=self.coordinator_addr,
             tokenizer=self.megatron_tokenizer,
@@ -533,11 +532,7 @@ class MegatronGenerationMixin:
             parsers=self.cfg["generation"]["mcore_generation_config"]["parsers"],
             verbose=False,
             sock=reserved_socket,
-            multimodal_prompt_config=(
-                MultimodalPromptConfig.from_dict(prompt_config)
-                if prompt_config
-                else None
-            ),
+            multimodal_prompt_config=self.inference_wrapped_model.multimodal_prompt_config,
         )
 
         base_url = f"http://{ip}:{server_port}/v1"
