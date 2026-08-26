@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import datetime
+import json
 import logging
+import os
+import socket
 import sys
 import threading
 import time
@@ -22,6 +25,35 @@ from typing import Callable, Generator, Optional, Sequence, Union
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def _append_timeline_event(
+    path: str, label: str, start_epoch_ns: int, duration_ns: int
+) -> None:
+    """Append one best-effort Chrome complete event for a stopped timer."""
+    event = {
+        "name": label,
+        "cat": "training_timer",
+        "ph": "X",
+        "ts": start_epoch_ns / 1_000,
+        "dur": max(duration_ns, 0) / 1_000,
+        "pid": os.getpid(),
+        "tid": threading.get_native_id(),
+        "args": {
+            "hostname": socket.gethostname(),
+            "source": "nemo_rl.timer",
+            "status": "ok",
+        },
+    }
+    try:
+        payload = (json.dumps(event, separators=(",", ":")) + "\n").encode()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 class Timer:
@@ -85,6 +117,7 @@ class Timer:
         """
         self._timers: dict[str, list[float]] = {}
         self._start_times: dict[str, float] = {}
+        self._timeline_start_times: dict[str, tuple[int, int]] = {}
         self._markers: dict[str, list[tuple[float, Optional[dict]]]] = {}
         self._context = context or {}
         if "hostname" not in self._context:
@@ -107,6 +140,12 @@ class Timer:
         if label in self._start_times:
             raise ValueError(f"Timer '{label}' is already running")
         self._start_times[label] = time.perf_counter()
+        timeline_path = os.environ.get("NRL_TRAINING_TIMELINE_FPATH")
+        if timeline_path and os.environ.get("NRL_TRAINING_TIMELINE") == "1":
+            self._timeline_start_times[label] = (
+                time.time_ns(),
+                time.perf_counter_ns(),
+            )
         if should_log:
             logger.debug(self._fmt(label, "start"))
 
@@ -132,6 +171,16 @@ class Timer:
             self._timers[label] = []
         self._timers[label].append(elapsed)
         del self._start_times[label]
+        timeline_start = self._timeline_start_times.pop(label, None)
+        timeline_path = os.environ.get("NRL_TRAINING_TIMELINE_FPATH")
+        if timeline_start is not None and timeline_path:
+            start_epoch_ns, start_perf_ns = timeline_start
+            _append_timeline_event(
+                timeline_path,
+                label,
+                start_epoch_ns,
+                time.perf_counter_ns() - start_perf_ns,
+            )
         if should_log:
             logger.debug(self._fmt(label, f"end elapsed={elapsed:.4f}s"))
         return elapsed
@@ -329,11 +378,14 @@ class Timer:
                 del self._timers[label]
             if label in self._start_times:
                 del self._start_times[label]
+            if label in self._timeline_start_times:
+                del self._timeline_start_times[label]
             if label in self._markers:
                 del self._markers[label]
         else:
             self._timers = {}
             self._start_times = {}
+            self._timeline_start_times = {}
             self._markers = {}
 
 
