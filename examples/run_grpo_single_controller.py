@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Async GRPO launcher driven by the SingleController actor.
+"""Async GRPO / PPO launcher driven by the SingleController actor.
 
 Builds the full SC actor args driver-side via setup_single_controller and hands them
 to SingleControllerActor. Mirrors run_grpo.py for config loading so the same YAML
-files apply. data_plane.enabled=true is mandatory.
+files apply. data_plane.enabled=true is mandatory. A config carrying a `ppo:` block
+additionally brings up the PPO critic and trains it alongside the policy.
 """
 
 import argparse
@@ -33,9 +34,11 @@ from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
     MasterConfig,
     WatchdogConfig,
+    is_ppo_run,
     setup_single_controller,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.models.generation import configure_generation_config
@@ -60,7 +63,7 @@ while current_dir in sys.path:
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Run async GRPO training via SingleController"
+        description="Run async GRPO / PPO training via SingleController"
     )
     parser.add_argument(
         "--config", type=str, default=None, help="Path to YAML config file"
@@ -92,9 +95,13 @@ def main() -> None:
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 
-    if config.grpo.async_grpo is not None:
+    if is_ppo_run(config):
+        legacy_async_block, legacy_async = "ppo.async_ppo", config.ppo.async_ppo
+    else:
+        legacy_async_block, legacy_async = "grpo.async_grpo", config.grpo.async_grpo
+    if legacy_async is not None:
         raise ValueError(
-            "SC requires `grpo.async_grpo: null`; use `async_rl.*` instead. "
+            f"SC requires `{legacy_async_block}: null`; use `async_rl.*` instead. "
             "See docs/guides/single-controller.md#migrating-a-legacy-async-config."
         )
 
@@ -115,6 +122,8 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
+    # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
+    maybe_configure_data_plane_env(config.data_plane)
     init_ray()
 
     tokenizer = get_tokenizer(config.policy["tokenizer"])
@@ -161,7 +170,10 @@ def main() -> None:
         for resource_name, resource in (
             ("Generation", actor_args.gen_handle),
             ("Trainer", actor_args.trainer_handle),
+            ("Value", actor_args.value_handle),
         ):
+            if resource is None:
+                continue
             try:
                 resource.shutdown()
             except Exception as e:

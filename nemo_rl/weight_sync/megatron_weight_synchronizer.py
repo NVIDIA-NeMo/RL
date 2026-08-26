@@ -25,7 +25,7 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
     """Weight synchronization for the Megatron generation backend, both colocation modes.
 
     Colocated is the degenerate path: generation either aliases the training
-    weights outright (dual-mode) or re-partitions them into the worker's
+    weights outright (reshardless) or re-partitions them into the worker's
     dedicated inference model inside ``prepare_for_generation`` (when the
     configured inference layout/impl differs) — a genuine parallelism-changing
     transfer, but one the worker performs internally on wake. Sync therefore
@@ -98,11 +98,13 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         kv_scales: Optional[dict[str, float]] = None,
     ) -> Optional[dict[str, float]]:
         if self._colocated:
-            # The wake below carries any configured reshard; the loop already
-            # slept the engine before training (or it has not started yet),
-            # so no suspend is needed.
+            # The wake below carries any configured reshard; the loop already slept the engine
+            # before training, so no suspend is needed.
+            # Tagging the call bypasses the worker's engine-awake early-return, so the reshard
+            # copy riding this wake cannot be skipped. Any tag except "weights" works: the worker
+            # treats "weights" as the wake-suppressing mid-refit call.
             self._policy.offload_before_refit()
-            self._generation.prepare_for_generation()
+            self._generation.prepare_for_generation(tags=["colocated_refit"])
             self._stale = False
             return {}
 
