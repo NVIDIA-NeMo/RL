@@ -2422,6 +2422,22 @@ class TestAsyncTrajectoryCollector:
         collector.policy_generation.invalidate_kv_cache.assert_not_called()
         assert collector._refit_pause_cleared.is_set()
 
+    def test_vllm_pause_failure_keeps_collection_paused(self) -> None:
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {
+            "backend": "vllm",
+            "vllm_cfg": {"async_engine": True},
+        }
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
+        collector.policy_generation.pause_generation = mock.Mock(return_value=False)
+        collector.wait_for_pending_generations = mock.Mock()
+
+        with pytest.raises(RuntimeError, match="Failed to pause vLLM generation"):
+            collector.prepare_for_refit()
+
+        collector.wait_for_pending_generations.assert_not_called()
+        assert not collector._refit_pause_cleared.is_set()
+
     def test_vllm_refit_drains_without_native_pause_when_in_flight_disabled(
         self,
     ) -> None:
@@ -2437,6 +2453,18 @@ class TestAsyncTrajectoryCollector:
 
         assert collector.policy_generation.pause_generation_calls == []
         collector.wait_for_pending_generations.assert_called_once_with()
+
+    def test_non_vllm_async_backend_keeps_legacy_in_flight_path(self) -> None:
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {"backend": "megatron"}
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
+        collector.wait_for_pending_generations = mock.Mock()
+
+        collector.prepare_for_refit()
+
+        assert collector.policy_generation.pause_generation_calls == []
+        collector.wait_for_pending_generations.assert_not_called()
+        assert not collector._refit_pause_cleared.is_set()
 
     def test_vllm_resume_failure_keeps_collection_paused(self) -> None:
         collector = self.create_local_collector()

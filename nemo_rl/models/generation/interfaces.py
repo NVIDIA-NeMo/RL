@@ -491,11 +491,26 @@ class GenerationInterface(ABC):
         """Pause in-flight generation while preserving request state.
 
         Backends with native in-flight refit support may override this hook.
+        In-flight requests are frozen rather than aborted and resume from
+        :meth:`resume_generation`; new requests queue until then.
+
+        Args:
+            clear_cache: Also clear the engine's reusable caches at pause time so
+                preserved requests recompute their KV after the weight update.
+
+        Returns:
+            True if every engine paused; False when the backend has no native pause
+            support or did not pause successfully.
         """
         return False
 
     def resume_generation(self) -> bool:
-        """Resume generation paused by :meth:`pause_generation`."""
+        """Resume generation paused by :meth:`pause_generation`.
+
+        Returns:
+            True if every engine resumed; False when the backend has no native resume
+            support or did not resume successfully.
+        """
         return False
 
     def blocks_training(self) -> bool:

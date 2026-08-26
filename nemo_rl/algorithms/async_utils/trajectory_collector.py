@@ -58,7 +58,11 @@ from nemo_rl.experience.rollouts import (
     attach_initial_nemo_gym_image_payloads,
     run_async_multi_turn_rollout_groups,
 )
-from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
+from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
+    GenerationInterface,
+    should_use_async_rollouts,
+)
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
@@ -931,10 +935,10 @@ class AsyncTrajectoryCollector:
 
     def _vllm_inflight_weight_update(self) -> bool:
         """Whether refit uses vLLM's in-flight weight-update path."""
-        generation_cfg = self.master_config.policy.get("generation", {})
+        generation_cfg = self.master_config.policy["generation"]
         return (
-            generation_cfg.get("backend") == "vllm"
-            and generation_cfg.get("vllm_cfg", {}).get("async_engine", False)
+            generation_cfg["backend"] == "vllm"
+            and should_use_async_rollouts(generation_cfg)
             and self.async_config.in_flight_weight_updates
         )
 
@@ -943,7 +947,8 @@ class AsyncTrajectoryCollector:
 
         For async vLLM, native keep-mode pause preserves in-flight request state
         across the weight update. Other async backends keep their existing in-flight
-        refit behavior. This significantly improves async performance.
+        refit behavior. Both paths avoid stalling the training pipeline on the
+        longest in-flight generation.
 
         For non-async engines, waits for all pending generations to complete before refit.
         """
