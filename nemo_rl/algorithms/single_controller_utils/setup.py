@@ -734,7 +734,10 @@ def _spinup_gym(
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         # Ledger config rides into Gym's policy model server (§ 9.1).
         token_capture=(
-            master_config.token_capture.model_dump()
+            {
+                **master_config.token_capture.model_dump(),
+                "generation_backend": generation_config["backend"],
+            }
             if master_config.token_capture.enabled
             else None
         ),
@@ -1158,25 +1161,40 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
-        if generation_config["backend"] != "vllm":
+        if generation_config["backend"] not in ("vllm", "megatron"):
             raise NotImplementedError(
-                "token_capture.enabled supports the vllm backend only; got "
+                "token_capture.enabled supports vllm or megatron; got "
                 f"{generation_config['backend']!r}"
             )
-        if not generation_config["vllm_cfg"]["async_engine"]:
+        if (
+            generation_config["backend"] == "vllm"
+            and not generation_config["vllm_cfg"]["async_engine"]
+        ):
             raise ValueError(
                 "token_capture.enabled requires "
                 "policy.generation.vllm_cfg.async_engine=true (the capture "
                 "host is the worker's in-process HTTP server)"
             )
-        from nemo_rl.distributed.ray_actor_environment_registry import (
-            ACTOR_ENVIRONMENT_REGISTRY,
-        )
-        from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+        if generation_config["backend"] == "megatron":
+            if not generation_config["mcore_generation_config"]["expose_http_server"]:
+                raise ValueError(
+                    "Megatron token capture requires policy.generation."
+                    "mcore_generation_config.expose_http_server=true"
+                )
+            if router_replay_enabled(master_config.policy):
+                raise NotImplementedError(
+                    "Megatron token capture does not yet support router replay: "
+                    "MInf ledger routes are not delta-token aligned"
+                )
+        else:
+            from nemo_rl.distributed.ray_actor_environment_registry import (
+                ACTOR_ENVIRONMENT_REGISTRY,
+            )
+            from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
-        ACTOR_ENVIRONMENT_REGISTRY[
-            "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
-        ] = PY_EXECUTABLES.VLLM_GYM
+            ACTOR_ENVIRONMENT_REGISTRY[
+                "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+            ] = PY_EXECUTABLES.VLLM_GYM
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
         # per-run control-plane bearer token and the process-shared capture
@@ -1697,9 +1715,8 @@ def setup_single_controller(
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
-        # Host Gym's capture core in every vLLM DP leader (in-worker DP
-        # client + TQTokenSink + the single install_capture call), and give
-        # workers the initial weight version to stamp on captured calls.
+        # vLLM stages in its serving workers. MInf enables its local ledgers
+        # and installs one driver-side ledger-to-TQ converter.
         try:
             generation.setup_token_capture(
                 dp_config, token_capture_cfg.staging_partition
@@ -1710,8 +1727,8 @@ def setup_single_controller(
                 # (nemo_rl/utils/venvs.py), so a venv prebuilt before token
                 # capture predates the nemo_gym extra and is reused as-is.
                 raise RuntimeError(
-                    "token_capture.enabled requires nemo_gym inside the vLLM "
-                    "worker venv, but the cached worker venv predates it. "
+                    "token_capture.enabled requires nemo_gym in the capture "
+                    "host environment, but the cached environment predates it. "
                     "Rebuild worker venvs (NRL_FORCE_REBUILD_VENVS=true) or "
                     "delete $NEMO_RL_VENV_DIR/nemo_rl.models.generation.vllm."
                     "vllm_worker_async.VllmAsyncGenerationWorker and rerun."

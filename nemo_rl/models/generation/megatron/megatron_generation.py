@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import threading
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import ray
@@ -37,8 +39,12 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 if TYPE_CHECKING:
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
     from nemo_rl.distributed.worker_groups import RayWorkerGroup
     from nemo_rl.models.policy.lm_policy import Policy
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class MegatronGeneration(GenerationInterface):
@@ -199,6 +205,8 @@ class MegatronGeneration(GenerationInterface):
         self.dp_openai_server_base_urls: list[Optional[str]] = []
         # Installed by setup via create_weight_synchronizer.
         self.weight_synchronizer: Optional["WeightSynchronizer"] = None
+        self._token_capture = None
+        self._token_capture_flush_lock = threading.Lock()
 
         if policy is not None:
             # Reuse the existing training policy.
@@ -346,6 +354,177 @@ class MegatronGeneration(GenerationInterface):
         )
         ray.get(futures)
         return True
+
+    def setup_token_capture(
+        self, dp_cfg: "DataPlaneConfig", staging_partition: str
+    ) -> None:
+        """Enable each MInf ledger and install the driver-side TQ converter."""
+        if not self.cfg["mcore_generation_config"]["expose_http_server"]:
+            raise ValueError(
+                "Megatron token capture requires mcore_generation_config."
+                "expose_http_server=true"
+            )
+        # Deferred: nemo_gym is an optional extra absent in non-Gym runs.
+        from nemo_gym.token_id_capture.adapters.megatron import MegatronCaptureAdapter
+        from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
+
+        from nemo_rl.data_plane import build_data_plane_client
+        from nemo_rl.data_plane.tq_token_sink import TQTokenSink
+
+        dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        sink = TQTokenSink(dp_client, staging_partition=staging_partition)
+        self._token_capture = RolloutTokenCapture(
+            sink=sink,
+            weight_version_fn=lambda: 0,
+            adapter=MegatronCaptureAdapter(),
+        )
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "setup_token_capture"
+        )
+        ray.get(futures)
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the policy epoch stamped by MInf on subsequent requests."""
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "set_rollout_weight_version", version=version
+        )
+        ray.get(futures)
+
+    def flush_token_capture(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        """Batch-convert one rollout's MInf ledger rows into durable TQ rows."""
+        from nemo_gym.token_id_capture.adapters.megatron import MegatronCaptureAdapter
+        from nemo_gym.token_id_capture.staging.records import (
+            CaptureAdmission,
+            CallRecord,
+            PendingCallRecord,
+            RolloutReceipt,
+        )
+
+        capture = self._token_capture
+        if capture is None:
+            raise RuntimeError("Megatron token capture is not initialized")
+        pending_payloads = receipt.get("pending_manifest")
+        if not pending_payloads:
+            return receipt
+        if not isinstance(pending_payloads, list):
+            raise ValueError("pending_manifest must be a list")
+        if receipt.get("manifest"):
+            raise ValueError("a deferred receipt cannot already contain staged records")
+
+        with self._token_capture_flush_lock:
+            pending = [
+                PendingCallRecord.model_validate(payload)
+                for payload in pending_payloads
+            ]
+            request_uids = [record.ledger_request_uid for record in pending]
+            if len(request_uids) != len(set(request_uids)):
+                raise ValueError(
+                    "pending_manifest contains duplicate MInf request UIDs"
+                )
+            futures = self._policy.worker_group.run_all_workers_single_data(
+                "fetch_token_capture_records", request_uids=request_uids
+            )
+            worker_records = ray.get(futures)
+            records_by_uid: dict[str, dict[str, Any]] = {}
+            for uid in request_uids:
+                matches = [records[uid] for records in worker_records if uid in records]
+                if len(matches) != 1:
+                    raise RuntimeError(
+                        f"MInf request {uid!r} was present on {len(matches)} engine ranks; expected 1"
+                    )
+                records_by_uid[uid] = matches[0]
+
+            committed_records: list[CallRecord] = []
+            adapter = capture.adapter
+            if not isinstance(adapter, MegatronCaptureAdapter):
+                raise RuntimeError("Megatron token capture adapter is not installed")
+            prepared_calls = []
+            for record in pending:
+                ledger_payload = records_by_uid[record.ledger_request_uid]
+                prompt_token_ids = adapter.extract_prompt_ids(ledger_payload)
+                generated_token_ids, _ = adapter.extract_generation(ledger_payload)
+                if record.prev_len > len(prompt_token_ids):
+                    raise RuntimeError(
+                        f"MInf request {record.ledger_request_uid!r} has a prompt "
+                        f"shorter than prev_len={record.prev_len}"
+                    )
+                actual_delta_len = (
+                    len(prompt_token_ids) - record.prev_len + len(generated_token_ids)
+                )
+                if (
+                    actual_delta_len != record.delta_len
+                    or record.prev_len + actual_delta_len != record.cum_len
+                ):
+                    raise RuntimeError(
+                        f"MInf request {record.ledger_request_uid!r} differs from "
+                        "the HTTP lineage lengths"
+                    )
+                admission = CaptureAdmission(
+                    rollout_id=str(receipt["rollout_id"]),
+                    model_call_id=record.model_call_id,
+                    parent_call_id=record.parent_call_id,
+                    prev_len=record.prev_len,
+                    mode=record.mode,
+                    required_prefix_token_ids=(
+                        prompt_token_ids[: record.prev_len]
+                        if record.mode == "token_in"
+                        else []
+                    ),
+                )
+                weight_version = adapter.extract_weight_version(ledger_payload)
+                prepared_calls.append(
+                    (record, ledger_payload, admission, weight_version)
+                )
+
+            for record, ledger_payload, admission, weight_version in prepared_calls:
+                call = capture.begin_call(admission, weight_version=weight_version)
+                coords = capture.complete_call_from_response(call, ledger_payload)
+                if coords.disposition != "staged":
+                    raise RuntimeError(
+                        f"failed to stage MInf request {record.ledger_request_uid!r}"
+                    )
+                committed_records.append(
+                    CallRecord(
+                        model_call_id=coords.model_call_id,
+                        parent_call_id=coords.parent_call_id,
+                        prev_len=coords.prev_len,
+                        delta_len=coords.delta_len,
+                        cum_len=coords.cum_len,
+                        weight_version=coords.weight_version,
+                        digest=coords.digest,
+                        extras_digest=coords.extras_digest,
+                        staging_key=coords.staging_key,
+                        mode=record.mode,
+                        logical_request_id=record.logical_request_id,
+                        admitted_at=record.admitted_at,
+                    )
+                )
+
+            finalized = dict(receipt)
+            finalized.pop("pending_manifest", None)
+            finalized["manifest"] = [
+                record.model_dump(mode="json") for record in committed_records
+            ]
+            RolloutReceipt.model_validate(finalized)
+
+            discard_futures = self._policy.worker_group.run_all_workers_single_data(
+                "discard_token_capture_records", request_uids=request_uids
+            )
+            try:
+                discarded = ray.get(discard_futures)
+                if sum(int(count) for count in discarded) != len(request_uids):
+                    raise RuntimeError(
+                        "MInf ledger discard count did not match the staged batch"
+                    )
+            except Exception:
+                # TQ is now authoritative. Retaining a duplicate in the
+                # ephemeral ledger is safe and preferable to unsealing a
+                # rollout whose durable rows already exist.
+                LOGGER.warning(
+                    "Could not discard MInf ledger rows after durable staging",
+                    exc_info=True,
+                )
+            return finalized
 
     def blocks_training(self) -> bool:
         """Whether the engine must stand down before a training step.

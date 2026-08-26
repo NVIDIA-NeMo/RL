@@ -34,6 +34,7 @@ def _capture_env() -> NemoGym:
 def _manifest_record(
     call_id: str,
     *,
+    logical_request_id: str | None = None,
     response_id: str | None = None,
     parent: str | None = None,
     cumulative_hash: str | None = None,
@@ -51,8 +52,28 @@ def _manifest_record(
         "staging_key": f"r0/{call_id}",
         "mode": "text" if parent is None else "token_in",
         "response_id": response_id or f"resp-{call_id}",
+        "logical_request_id": logical_request_id,
         "cumulative_hash": cumulative_hash,
     }
+
+
+def _pending_record(
+    call_id: str, *, logical_request_id: str, parent: str | None = None
+) -> dict:
+    record = _manifest_record(
+        call_id, logical_request_id=logical_request_id, parent=parent
+    )
+    for field in (
+        "weight_version",
+        "digest",
+        "extras_digest",
+        "staging_key",
+    ):
+        record.pop(field)
+    record["ledger_request_uid"] = f"minf-{call_id}"
+    record["chain_hash"] = "c" * 64
+    record["cumulative_hash"] = "d" * 64
+    return record
 
 
 def test_receipt_postprocess_without_a_terminal_logical_id_uses_the_heuristic() -> None:
@@ -109,6 +130,29 @@ def test_receipt_postprocess_fetches_manifest_and_selects_terminal_row() -> None
     assert receipt["failure_reason"] is None
     assert receipt["reward"] == 1.0
     assert [r["model_call_id"] for r in receipt["manifest"]] == ["c1", "c2"]
+
+
+def test_receipt_assembly_preserves_pending_megatron_manifest() -> None:
+    env = _capture_env()
+    pending = [
+        _pending_record("c1", logical_request_id="lr-1"),
+        _pending_record("c2", logical_request_id="lr-2", parent="c1"),
+    ]
+    receipt = env._assemble_receipt(
+        "r0",
+        {
+            "rollout_id": "r0",
+            "records": [],
+            "pending_records": pending,
+            "failures": [],
+        },
+        terminal_logical_request_id="lr-2",
+        reward=1.0,
+    )
+    assert receipt["manifest"] == []
+    assert receipt["pending_manifest"] == pending
+    assert receipt["terminal_model_call_id"] == "c2"
+    assert receipt["capture_poisoned"] is False
 
 
 def test_receipt_assembly_poisons_on_failure_rows() -> None:

@@ -111,6 +111,7 @@ class MegatronGenerationMixin:
         )
         self._inference_loop = None
         self._inference_thread = None
+        self._token_capture_enabled = False
 
     def _setup_colocated_cuda_graph_managers(self) -> None:
         """Create inference CUDA-graph managers for shared-model colocated generation.
@@ -604,6 +605,88 @@ class MegatronGenerationMixin:
     def report_dp_openai_server_base_url(self) -> Optional[str]:
         """Return this worker's OpenAI server base URL (None if not the leader)."""
         return self.base_url
+
+    def setup_token_capture(self) -> bool:
+        """Enable MInf's local offload ledger on this engine rank."""
+        engine = self.dynamic_inference_engine
+        if engine is None:
+            raise RuntimeError(
+                "Megatron token capture requires an initialized inference engine"
+            )
+        missing = [
+            name
+            for name in (
+                "local_metadata_ledger_enabled",
+                "local_metadata_ledger_offload_enabled",
+                "fetch_from_metadata_ledger",
+            )
+            if not hasattr(engine, name)
+        ]
+        if missing:
+            raise RuntimeError(
+                "Megatron token capture requires the MInf ledger-capture API; "
+                f"missing {', '.join(missing)}"
+            )
+        engine.local_metadata_ledger_enabled = True
+        engine.local_metadata_ledger_offload_enabled = True
+        self._token_capture_enabled = True
+        return True
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Stamp subsequent MInf requests with the trainer weight version."""
+        if type(version) is not int or version < 0:
+            raise ValueError(
+                f"rollout weight version must be a non-negative int, got {version!r}"
+            )
+        if torch.distributed.get_rank() != 0:
+            return
+        if not self._token_capture_enabled or self.inference_client is None:
+            raise RuntimeError("Megatron token capture is not initialized")
+        setter = getattr(self.inference_client, "set_generation_epoch", None)
+        if not callable(setter):
+            raise RuntimeError(
+                "Megatron token capture requires InferenceClient.set_generation_epoch"
+            )
+        setter(version)
+
+    @staticmethod
+    def _serialize_token_capture_record(record) -> dict:
+        """Convert an MInf ``FinishedRequestRecord`` into Ray-safe plain data."""
+        routes = record.routing_indices
+        if routes is not None:
+            routes = routes.tolist() if hasattr(routes, "tolist") else list(routes)
+        return {
+            "policy_epoch": record.policy_epoch,
+            "kv_cache_epoch": record.kv_cache_epoch,
+            "num_evictions": int(record.num_evictions),
+            "prompt_token_ids": record.prompt_token_ids,
+            "generated_token_ids": record.generated_token_ids,
+            "generated_log_probs": record.generated_log_probs,
+            "prompt_log_probs": record.prompt_log_probs,
+            "routing_indices": routes,
+        }
+
+    def fetch_token_capture_records(self, request_uids: list[str]) -> dict[str, dict]:
+        """Read requested MInf ledger rows without relinquishing custody."""
+        if not self._token_capture_enabled or self.dynamic_inference_engine is None:
+            raise RuntimeError("Megatron token capture is not initialized")
+        found = self.dynamic_inference_engine.fetch_from_metadata_ledger(
+            request_uids, pop=False
+        )
+        return {
+            uid: self._serialize_token_capture_record(record)
+            for uid, record in found.items()
+        }
+
+    def discard_token_capture_records(self, request_uids: list[str]) -> int:
+        """Delete ledger rows after their whole rollout is durable in TQ."""
+        if not self._token_capture_enabled or self.dynamic_inference_engine is None:
+            raise RuntimeError("Megatron token capture is not initialized")
+        return len(
+            self.dynamic_inference_engine.fetch_from_metadata_ledger(
+                request_uids, pop=True
+            )
+        )
 
     def _build_sampling_params(
         self, greedy: bool, stop_words: Optional[list[str]]

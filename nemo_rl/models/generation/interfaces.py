@@ -585,6 +585,14 @@ class GenerationInterface(ABC):
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
+    def flush_token_capture(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        """Make a deferred capture receipt durable before it is sealed."""
+        if receipt.get("pending_manifest"):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not implement deferred token capture"
+            )
+        return receipt
+
     def blocks_training(self) -> bool:
         """Whether this engine must stand down before a training step.
 
@@ -603,10 +611,6 @@ class GenerationInterface(ABC):
         the collector's weight version with no explicit transfer.
         Backends whose wake does not reload weights must return False so the loop refits instead.
         """
-        return False
-
-    def wake_carries_weight_updates(self) -> bool:
-        """Whether waking this engine alone serves weights updated while asleep."""
         return False
 
     def clear_logger_metrics(self) -> None:
