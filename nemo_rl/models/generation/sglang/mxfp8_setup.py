@@ -28,10 +28,12 @@ import logging
 import os
 import re
 import shutil
+from collections.abc import Mapping
 from typing import Any
 
 import torch
 
+from nemo_rl.models.generation.sglang.config import SglangQuantizationConfig
 from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
     MXFP8_QUANTIZATION_CONFIG,
     MXFP8_SCALE_KEY_SUFFIX,
@@ -315,7 +317,7 @@ def _get_num_hidden_layers(cfg: dict[str, Any], *, config_path: str) -> int:
 
 
 def _validated_conversion_options(
-    quantization_cfg: dict[str, Any],
+    quantization_cfg: Mapping[str, Any],
     *,
     num_hidden_layers: int,
 ) -> tuple[tuple[str, ...], tuple[str, ...], int, int]:
@@ -340,7 +342,7 @@ def _validated_conversion_options(
 def _merge_checkpoint_modules_to_not_convert(
     *,
     checkpoint_path: str,
-    quantization_cfg: dict[str, Any],
+    quantization_cfg: SglangQuantizationConfig,
 ) -> None:
     """Merge the checkpoint's concrete ignore list into the refit config."""
     checkpoint_cfg = _read_source_config(checkpoint_path)
@@ -393,7 +395,7 @@ def _merge_checkpoint_modules_to_not_convert(
     )
 
 
-def _quantization_fingerprint(quantization_cfg: dict[str, Any]) -> str:
+def _quantization_fingerprint(quantization_cfg: Mapping[str, Any]) -> str:
     relevant_keys = (
         "extra_high_precision_layers_hf",
         "modules_to_not_convert",
@@ -411,7 +413,7 @@ def _quantization_fingerprint(quantization_cfg: dict[str, Any]) -> str:
 
 
 def _hash_qualified_save_dir(
-    *, model_dir: str, cache_root: str, quantization_cfg: dict[str, Any]
+    *, model_dir: str, cache_root: str, quantization_cfg: Mapping[str, Any]
 ) -> str:
     abs_model = os.path.abspath(model_dir)
     src_cfg = _read_source_config(model_dir)
@@ -434,31 +436,67 @@ def is_existing_mxfp8_checkpoint(path: str) -> bool:
 def ensure_mxfp8_checkpoint(
     *,
     model_path: str,
-    quantization_cfg: dict[str, Any],
+    quantization_cfg: SglangQuantizationConfig,
 ) -> str:
-    """Return an MXFP8 checkpoint path and synchronize its ignore policy."""
-    if is_existing_mxfp8_checkpoint(model_path):
+    """Return a local preconverted MXFP8 checkpoint with synchronized skips.
+
+    Startup deliberately does not convert in the Ray driver: its base venv has
+    no backend-specific FlashInfer package and the process is not guaranteed a
+    GPU. ``convert_mxfp8`` remains the explicit offline GPU conversion entry
+    point.
+    """
+    local_model_path = os.path.abspath(os.path.expanduser(model_path))
+    if os.path.isdir(local_model_path) and is_existing_mxfp8_checkpoint(
+        local_model_path
+    ):
         _merge_checkpoint_modules_to_not_convert(
-            checkpoint_path=model_path,
+            checkpoint_path=local_model_path,
             quantization_cfg=quantization_cfg,
         )
-        return model_path
+        return local_model_path
 
     converted = quantization_cfg.get("converted_model_path")
-    if converted and is_existing_mxfp8_checkpoint(converted):
+    if converted is not None:
+        if not isinstance(converted, str) or not converted.strip():
+            raise ValueError(
+                "SGLang quantization.converted_model_path must be a non-empty "
+                "local directory path."
+            )
+        converted_path = os.path.abspath(os.path.expanduser(converted))
+        if not os.path.isdir(converted_path):
+            raise ValueError(
+                "SGLang MXFP8 startup requires a local preconverted checkpoint, "
+                "but quantization.converted_model_path is not a directory: "
+                f"{converted!r}."
+            )
+        if not is_existing_mxfp8_checkpoint(converted_path):
+            raise ValueError(
+                "SGLang MXFP8 startup requires a valid preconverted MXFP8 "
+                "checkpoint, but quantization.converted_model_path does not "
+                "declare quant_method='mxfp8', weight_block_size=[1, 32], and "
+                f"scale_fmt='ue8m0': {converted_path!r}."
+            )
         _merge_checkpoint_modules_to_not_convert(
-            checkpoint_path=converted,
+            checkpoint_path=converted_path,
             quantization_cfg=quantization_cfg,
         )
-        return converted
+        return converted_path
+
+    if not os.path.isdir(local_model_path):
+        raise ValueError(
+            "SGLang MXFP8 startup cannot auto-convert an HF repo id in the Ray "
+            f"driver: {model_path!r}. Download and convert the checkpoint offline "
+            "on a GPU, then set quantization.converted_model_path to a local "
+            "directory visible to every rollout worker."
+        )
 
     cache_root = (
         quantization_cfg.get("cache_root")
         or os.environ.get("NRL_MXFP8_CACHE")
         or os.path.join(os.path.expanduser("~"), ".cache", "nemo_rl", "mxfp8")
     )
-    save_dir = converted or _hash_qualified_save_dir(
-        model_dir=model_path,
+    save_dir = _hash_qualified_save_dir(
+        model_dir=local_model_path,
         cache_root=cache_root,
         quantization_cfg=quantization_cfg,
     )
@@ -470,38 +508,10 @@ def ensure_mxfp8_checkpoint(
         )
         return save_dir
 
-    source_cfg = _read_source_config(model_path)
-    num_hidden_layers = _get_num_hidden_layers(
-        source_cfg,
-        config_path=os.path.join(model_path, "config.json"),
+    raise ValueError(
+        "SGLang MXFP8 startup does not quantize in the Ray driver because its "
+        "base environment has no backend-specific FlashInfer package and may "
+        "have no assigned GPU. Run convert_mxfp8 offline in a GPU environment, "
+        "then set quantization.converted_model_path to the output directory. "
+        f"The deterministic cache path for this source and policy is {save_dir!r}."
     )
-    (
-        extra_high_precision_layers_hf,
-        modules_to_not_convert,
-        num_layers_at_start_in_bf16,
-        num_layers_at_end_in_bf16,
-    ) = _validated_conversion_options(
-        quantization_cfg,
-        num_hidden_layers=num_hidden_layers,
-    )
-
-    logger.info(
-        f"[mxfp8] Converting {model_path} -> {save_dir} "
-        f"(start_bf16={num_layers_at_start_in_bf16}, "
-        f"end_bf16={num_layers_at_end_in_bf16}, "
-        f"extra_hp={extra_high_precision_layers_hf}, "
-        f"modules_to_not_convert={modules_to_not_convert})"
-    )
-    convert_mxfp8(
-        model_dir=model_path,
-        save_dir=save_dir,
-        num_layers_at_start_in_bf16=num_layers_at_start_in_bf16,
-        num_layers_at_end_in_bf16=num_layers_at_end_in_bf16,
-        extra_high_precision_layers_hf=extra_high_precision_layers_hf,
-        modules_to_not_convert=modules_to_not_convert,
-    )
-    _merge_checkpoint_modules_to_not_convert(
-        checkpoint_path=save_dir,
-        quantization_cfg=quantization_cfg,
-    )
-    return save_dir

@@ -16,13 +16,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING, Any
 
 from nemo_rl.models.generation.sglang.config import (
+    SGLangConfig,
+    SglangQuantizationConfig,
     SglangQuantizationScheme,
     get_sglang_quantization_scheme,
 )
+
+if TYPE_CHECKING:
+    from nemo_rl.models.policy import PolicyConfig
 
 HF_MOE_EXPERT_NAME_MARKERS = (
     ".experts.",
@@ -50,7 +55,7 @@ HF_FUSED_LINEAR_WEIGHT_GROUPS = (
 def ensure_sglang_quantized_checkpoint(
     *,
     model_path: str,
-    quantization_config: dict[str, Any],
+    quantization_config: SglangQuantizationConfig,
 ) -> str:
     """Resolve the startup checkpoint for the configured refit precision."""
     scheme = get_sglang_quantization_scheme(quantization_config)
@@ -80,6 +85,29 @@ def validate_sglang_quantized_refit_backend(
         )
 
 
+def prepare_sglang_quantized_generation(
+    *,
+    generation_config: SGLangConfig,
+    policy_config: "PolicyConfig",
+) -> None:
+    """Validate SGLang refit precision and resolve its startup checkpoint."""
+    sglang_cfg = generation_config["sglang_cfg"]
+    if "model_path" not in sglang_cfg:
+        sglang_cfg["model_path"] = policy_config["model_name"]
+
+    quantization_config = sglang_cfg["quantization"]
+    scheme = get_sglang_quantization_scheme(quantization_config)
+    megatron_config = policy_config.get("megatron_cfg")
+    validate_sglang_quantized_refit_backend(
+        scheme=scheme,
+        use_megatron=bool(megatron_config is not None and megatron_config["enabled"]),
+    )
+    sglang_cfg["model_path"] = ensure_sglang_quantized_checkpoint(
+        model_path=sglang_cfg["model_path"],
+        quantization_config=quantization_config,
+    )
+
+
 def validate_checkpoint_high_precision_layout(
     *,
     checkpoint_path: str,
@@ -88,11 +116,11 @@ def validate_checkpoint_high_precision_layout(
     high_precision_substrings: tuple[str, ...],
     quantized_companion_suffixes: tuple[str, ...],
 ) -> None:
-    """Ensure a reused checkpoint already honors the requested BF16 policy.
+    """Ensure a reused checkpoint matches the requested precision policy.
 
     Changing the online refit skip rules cannot change tensors already loaded
-    by SGLang. A matching weight with quantization companions proves that the
-    existing checkpoint still stores that tensor in the quantized layout.
+    by SGLang. High-precision tensors must have no quantization companion, and
+    every tensor selected for quantization must have one.
     """
     names: set[str] = set()
     for name in weight_names:
@@ -101,23 +129,44 @@ def validate_checkpoint_high_precision_layout(
         names.add(name)
 
     conflicts: list[str] = []
+    missing_companions: list[str] = []
     for name in sorted(names):
-        if not name.endswith(".weight") or not any(
-            substring in name for substring in high_precision_substrings
-        ):
+        if not name.endswith(".weight"):
             continue
         base_name = name.removesuffix(".weight")
-        if any(base_name + suffix in names for suffix in quantized_companion_suffixes):
+        has_quantized_companion = any(
+            base_name + suffix in names for suffix in quantized_companion_suffixes
+        )
+        should_stay_high_precision = any(
+            substring in name for substring in high_precision_substrings
+        )
+        if should_stay_high_precision and has_quantized_companion:
             conflicts.append(name)
+        elif not should_stay_high_precision and not has_quantized_companion:
+            missing_companions.append(name)
 
-    if conflicts:
-        preview = ", ".join(repr(name) for name in conflicts[:5])
-        if len(conflicts) > 5:
-            preview += f", ... ({len(conflicts)} total)"
+    if conflicts or missing_companions:
+        details: list[str] = []
+        if conflicts:
+            preview = ", ".join(repr(name) for name in conflicts[:5])
+            if len(conflicts) > 5:
+                preview += f", ... ({len(conflicts)} total)"
+            details.append(
+                "quantized tensors selected for high precision by the current "
+                f"configuration: {preview}"
+            )
+        if missing_companions:
+            preview = ", ".join(repr(name) for name in missing_companions[:5])
+            if len(missing_companions) > 5:
+                preview += f", ... ({len(missing_companions)} total)"
+            details.append(
+                "tensors selected for quantization that have no companion scale: "
+                f"{preview}"
+            )
         raise ValueError(
-            f"The existing {scheme} checkpoint at {checkpoint_path!r} contains "
-            "quantized tensors selected for high precision by the current "
-            f"configuration: {preview}. Reconvert the original HF checkpoint "
+            f"The existing {scheme} checkpoint at {checkpoint_path!r} has "
+            + "; ".join(details)
+            + ". Reconvert the original HF checkpoint "
             "with the requested extra/head/tail skip policy."
         )
 
@@ -208,7 +257,7 @@ def expand_sglang_atomic_high_precision_substrings(
 
 
 def _optional_string_tuple(
-    quantization_config: dict[str, Any],
+    quantization_config: Mapping[str, Any],
     key: str,
 ) -> tuple[str, ...]:
     value = quantization_config.get(key)
@@ -228,7 +277,7 @@ def _optional_string_tuple(
 
 
 def _optional_nonnegative_int(
-    quantization_config: dict[str, Any],
+    quantization_config: Mapping[str, Any],
     key: str,
 ) -> int:
     value = quantization_config.get(key)
@@ -243,7 +292,7 @@ def _optional_nonnegative_int(
 
 def get_dynamic_high_precision_substrings(
     *,
-    quantization_config: dict[str, Any],
+    quantization_config: Mapping[str, Any],
     num_hidden_layers: int,
 ) -> tuple[str, ...]:
     """Build HF-name substrings that must remain in high precision.
@@ -281,9 +330,12 @@ def get_dynamic_high_precision_substrings(
             )
 
     tail_start_idx = num_hidden_layers - num_layers_at_end_in_bf16
+    # ``layers.N.`` is boundary-safe and matches every HF decoder layout used
+    # in this repo: model.layers, model.language_model.layers,
+    # backbone.layers (Nemotron), and bare layers (DeepSeek).
     dynamic_layer_prefixes = [
-        *(f"model.layers.{i}." for i in range(num_layers_at_start_in_bf16)),
-        *(f"model.layers.{i}." for i in range(tail_start_idx, num_hidden_layers)),
+        *(f"layers.{i}." for i in range(num_layers_at_start_in_bf16)),
+        *(f"layers.{i}." for i in range(tail_start_idx, num_hidden_layers)),
     ]
 
     # Preserve user order while removing duplicates so matching and cache
@@ -301,7 +353,7 @@ def get_dynamic_high_precision_substrings(
 
 def build_dynamic_skip_substrings(
     *,
-    quantization_config: dict[str, Any],
+    quantization_config: Mapping[str, Any],
     num_hidden_layers: int,
     static_skip_substrings: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
