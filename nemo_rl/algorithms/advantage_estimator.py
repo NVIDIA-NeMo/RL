@@ -221,6 +221,10 @@ class ReinforcePlusPlusAdvantageEstimator:
         self.use_kl_in_reward = loss_config.use_kl_in_reward
         self.kl_coef = loss_config.reference_policy_kl_penalty
         self.kl_type = loss_config.reference_policy_kl_type
+        # Same config object the loss reads. Without these the reward-side KL
+        # silently uses calculate_kl's defaults instead of what was configured.
+        self.kl_input_clamp_value = loss_config.kl_input_clamp_value
+        self.kl_output_clamp_value = loss_config.kl_output_clamp_value
 
     def compute_advantage(
         self,
@@ -272,6 +276,8 @@ class ReinforcePlusPlusAdvantageEstimator:
                 logprobs_policy,
                 logprobs_reference,
                 kl_type=self.kl_type,
+                input_clamp_value=self.kl_input_clamp_value,
+                output_clamp_value=self.kl_output_clamp_value,
             )
             adv = adv - self.kl_coef * kl
 
@@ -358,6 +364,9 @@ class GeneralizedAdvantageEstimator:
         self.use_kl_in_reward = loss_config.use_kl_in_reward
         self.kl_coef = loss_config.reference_policy_kl_penalty
         self.kl_type = loss_config.reference_policy_kl_type
+        # See ReinforcePlusPlusAdvantageEstimator.
+        self.kl_input_clamp_value = loss_config.kl_input_clamp_value
+        self.kl_output_clamp_value = loss_config.kl_output_clamp_value
 
     def _reward_whiten(
         self,
@@ -407,7 +416,13 @@ class GeneralizedAdvantageEstimator:
             and logprobs_policy is not None
             and logprobs_reference is not None
         ):
-            kl = calculate_kl(logprobs_policy, logprobs_reference, self.kl_type)
+            kl = calculate_kl(
+                logprobs_policy,
+                logprobs_reference,
+                self.kl_type,
+                input_clamp_value=self.kl_input_clamp_value,
+                output_clamp_value=self.kl_output_clamp_value,
+            )
             token_level_rewards = token_level_rewards - self.kl_coef * kl
 
         # Place terminal reward at the last response token (last mask=1
