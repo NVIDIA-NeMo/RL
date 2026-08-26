@@ -17,8 +17,6 @@
 import copy
 
 import pytest
-from pydantic import ValidationError
-
 from gdpo import (
     DenoiseConfig,
     MaskedDiffusionConfig,
@@ -26,6 +24,7 @@ from gdpo import (
     masked_diffusion_config_from_policy,
     validate_gdpo_config,
 )
+from pydantic import ValidationError
 
 VALID_LOSS = {
     "sequence_level_importance_ratios": True,

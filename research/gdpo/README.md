@@ -88,10 +88,11 @@ are never scored by the SDMC estimator.
 ### Adapters
 
 The exemplar trains LoRA adapters (`policy.dtensor_cfg.lora_cfg`, r=128,
-alpha=64), as the published recipe does. This is not just a memory
-convenience: the ELBO keeps `quadrature * mc_samples` forward activations alive
-for the backward pass, so full fine-tuning an 8B dLLM needs considerably more
-room than the same model trained autoregressively.
+alpha=64, dropout=0.05) on the seven projection modules used by the published
+recipe. This is not just a memory convenience: the ELBO keeps
+`quadrature * mc_samples` forward activations alive for the backward pass, so
+full fine-tuning an 8B dLLM needs considerably more room than the same model
+trained autoregressively.
 
 ### Mask token
 

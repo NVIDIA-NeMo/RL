@@ -13,8 +13,8 @@
 # limitations under the License.
 """Automodel policy-worker extension for GDPO."""
 
-from typing import Any
 import warnings
+from typing import Any
 
 import ray
 import torch

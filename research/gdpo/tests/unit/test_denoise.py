@@ -16,7 +16,6 @@
 
 import pytest
 import torch
-
 from gdpo.denoise import (
     block_denoise,
     build_canvas,

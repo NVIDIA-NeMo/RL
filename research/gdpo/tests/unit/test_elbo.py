@@ -18,7 +18,6 @@ import math
 
 import pytest
 import torch
-
 from gdpo import (
     MaskedDiffusionConfig,
     SdmcElboEstimator,

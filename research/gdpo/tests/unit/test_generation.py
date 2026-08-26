@@ -16,9 +16,9 @@
 
 import pytest
 import torch
+from gdpo.generation import AutomodelGeneration
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from gdpo.generation import AutomodelGeneration
 
 
 class FakeWorkerGroup:
