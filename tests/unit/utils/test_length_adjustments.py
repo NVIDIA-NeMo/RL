@@ -318,3 +318,66 @@ class TestGroupRelativeLengthScaling:
         ]
         apply_group_length_adjustments(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
+
+
+class TestProfiledLengthPenalty:
+    """Profiled-length threshold penalty and its passing-samples requirement."""
+
+    @staticmethod
+    def make_profiled(reasoning, answer, reward, p_rewards, p_lengths):
+        r = make_result(reasoning, answer, reward)
+        r["profiled_rewards"] = p_rewards
+        r["profiled_output_lengths"] = p_lengths
+        return r
+
+    def cfg(self, min_samples=2):
+        return make_config(
+            default={
+                "enabled": True,
+                "profiled_length_penalty": 0.3,
+                "profiled_length_n_std": 1.0,
+                "profiled_length_min_samples": min_samples,
+            }
+        )
+
+    def test_enough_passes_penalizes_over_threshold(self):
+        # Passing profiled lengths 10 and 14: threshold = 12 + 1*std(=~2.83) ~ 14.83.
+        p_rewards, p_lengths = [1, 1, 0], [10, 14, 100]
+        results = [
+            self.make_profiled("12345", "12345", 1.0, p_rewards, p_lengths),  # 10 < thr
+            self.make_profiled("1234567890", "1234567890", 1.0, p_rewards, p_lengths),  # 20 >= thr
+        ]
+        apply_group_length_adjustments(results, self.cfg())
+        assert rewards_of(results) == pytest.approx([1.0, 0.7])
+        # The failing profiled length (100) must not have entered the threshold:
+        # with it, mean+std would exceed 20 and nothing would be penalized.
+
+    def test_one_pass_below_min_samples_no_penalty(self):
+        # Only 1 passing profiled rollout with min_samples=2: no penalty for
+        # anyone — no fallback to failing profiled lengths.
+        p_rewards, p_lengths = [1, 0, 0], [10, 100, 120]
+        results = [
+            self.make_profiled("1234567890", "1234567890", 1.0, p_rewards, p_lengths),
+            self.make_profiled("1" * 50, "1" * 50, 1.0, p_rewards, p_lengths),
+        ]
+        apply_group_length_adjustments(results, self.cfg())
+        assert rewards_of(results) == pytest.approx([1.0, 1.0])
+
+    def test_zero_passes_no_penalty(self):
+        p_rewards, p_lengths = [0, 0, 0], [10, 12, 14]
+        results = [
+            self.make_profiled("1234567890", "1234567890", 1.0, p_rewards, p_lengths),
+            self.make_profiled("1" * 50, "1" * 50, 1.0, p_rewards, p_lengths),
+        ]
+        apply_group_length_adjustments(results, self.cfg())
+        assert rewards_of(results) == pytest.approx([1.0, 1.0])
+
+    def test_one_pass_allowed_when_min_samples_is_one(self):
+        # min_samples=1 opts in to single-pass thresholds: threshold = 10 + 0.
+        p_rewards, p_lengths = [1, 0], [10, 100]
+        results = [
+            self.make_profiled("1234", "1234", 1.0, p_rewards, p_lengths),  # 8 < 10
+            self.make_profiled("1234567890", "1234567890", 1.0, p_rewards, p_lengths),  # 20 >= 10
+        ]
+        apply_group_length_adjustments(results, self.cfg(min_samples=1))
+        assert rewards_of(results) == pytest.approx([1.0, 0.7])

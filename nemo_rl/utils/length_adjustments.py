@@ -422,7 +422,9 @@ def apply_group_length_adjustments(
             groups_adjusted += 1
 
         # Profiled length penalty: penalize rollouts longer than mean + n_std of
-        # passing profiled lengths for this prompt.
+        # passing profiled lengths for this prompt. If fewer than min_samples
+        # profiled rollouts passed, the profiled model found the problem hard
+        # and its lengths carry no budget signal — apply no penalty at all.
         plp = params.get("profiled_length_penalty", 0.0)
         if plp > 0.0:
             p_rewards = results[g].get("profiled_rewards")
@@ -430,8 +432,6 @@ def apply_group_length_adjustments(
             if p_rewards is not None and p_lengths is not None:
                 min_samples = int(params.get("profiled_length_min_samples", 2))
                 passing = [l for r, l in zip(p_rewards, p_lengths) if r > 0]
-                if len(passing) < min_samples:
-                    passing = list(p_lengths)
                 if len(passing) >= min_samples:
                     mean_l = statistics.mean(passing)
                     std_l = statistics.stdev(passing) if len(passing) >= 2 else 0.0

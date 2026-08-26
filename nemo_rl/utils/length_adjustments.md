@@ -113,7 +113,7 @@ grpo:
 | `total_zmad_penalty` | Flat penalty applied to total lengths above the zMAD threshold. |
 | `profiled_length_penalty` | Flat penalty for rollouts longer than a per-prompt profiled-length threshold. |
 | `profiled_length_n_std` | Number of standard deviations used in `mean + n_std * std` for profiled-length thresholding. |
-| `profiled_length_min_samples` | Minimum profiled length samples needed before computing the profiled threshold. |
+| `profiled_length_min_samples` | Minimum PASSING profiled rollouts required; below this no profiled penalty is applied. |
 | `profile_band_total` | Enables per-prompt `{a,b,f}` multiplier on total length for correct rollouts. |
 | `profile_band_reasoning` | Enables per-prompt `{a,b,f}` multiplier on reasoning length for correct rollouts. |
 | `profile_band_answer` | Enables per-prompt `{a,b,f}` multiplier on answer length for correct rollouts. |
@@ -384,10 +384,11 @@ This uses per-prompt profiling metadata:
 
 For each prompt group:
 
-1. Prefer profiled lengths from passing rollouts.
-2. If there are fewer than `profiled_length_min_samples` passing rollouts, fall back to all
-   profiled lengths.
-3. Compute:
+1. Select profiled lengths from passing rollouts (`profiled_rewards > 0`) only.
+2. If there are fewer than `profiled_length_min_samples` passing rollouts, apply **no penalty**
+   for this prompt. A profile that mostly failed carries no signal about the right thinking
+   budget — the problem may simply need more than the profiled model had.
+3. Otherwise compute:
 
    ```text
    threshold = mean(profiled_lengths) + profiled_length_n_std * std(profiled_lengths)
