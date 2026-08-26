@@ -116,7 +116,14 @@ policy:
     # Use ["moe"] for MoE models to recompute expert activations only.
     recompute_modules: null
     tensor_model_parallel_size: 1
+    # Generalized Tensor Parallelism (GTP): total shards per weight across the TP
+    # and GTP axes. Must be a multiple of tensor_model_parallel_size; the quotient
+    # is the GTP degree, an extra dim-0 weight sharding taken out of the DP axis
+    # and all-gathered on demand. null (or equal to TP) leaves GTP off.
+    tensor_parallel_num_weight_shards: null
     expert_tensor_parallel_size: 1
+    # Expert-side counterpart, relative to expert_tensor_parallel_size.
+    expert_tensor_parallel_num_weight_shards: null
     expert_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null

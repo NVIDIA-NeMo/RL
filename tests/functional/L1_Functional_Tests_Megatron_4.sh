@@ -48,11 +48,31 @@ megatron_generation_supported() {
     return 0
 }
 
+# GTP needs a newer TransformerEngine than MCore itself does (MCore's GTP core
+# declares its own TE floor and degrades to import stubs below it). NeMo-RL
+# currently pins TE release_v2.15, which is under that floor, so the GTP test
+# cannot pass yet -- registering it unguarded would just make L1 permanently red.
+# Ask MCore directly rather than hardcoding a version here, so this re-enables
+# itself the moment the TE pin is bumped.
+# TODO: remove this guard once NeMo-RL's TE pin satisfies MCore's GTP floor.
+megatron_gtp_supported() {
+    if ! uv run --no-sync python -c \
+        'import sys; from megatron.core.tensor_parallel.gtp_api import HAVE_GTP; sys.exit(0 if HAVE_GTP else 1)' \
+        &> /dev/null; then
+        echo "WARNING: Skipping GTP test; Megatron-LM reports HAVE_GTP=False (TransformerEngine too old)"
+        return 1
+    fi
+    return 0
+}
+
 if megatron_generation_supported; then
     run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_topology.sh
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated.sh
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_reshard.sh
+    if megatron_gtp_supported; then
+        run_test  uv run --no-sync bash ./tests/functional/grpo_megatron_generation_gtp.sh
+    fi
     run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_async_grpo.sh
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_reshard_async_grpo.sh
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async_gym.sh

@@ -117,6 +117,17 @@ def dedicated_inference_megatron_cfg(
     """
     inference_mcfg = merged_inference_megatron_cfg(policy_config)
     inference_mcfg["context_parallel_size"] = 1
+    # Inference never uses GTP either: refit reassembles the training model's
+    # extra dim-0 weight shards into whole inference weights, and rematerializing
+    # them on every forward would be pure overhead. Pin the inference weight-shard
+    # counts to its own TP degrees so a GTP-sharded training model always takes
+    # the dedicated-inference-model reshard path.
+    inference_mcfg["tensor_parallel_num_weight_shards"] = inference_mcfg[
+        "tensor_model_parallel_size"
+    ]
+    inference_mcfg["expert_tensor_parallel_num_weight_shards"] = inference_mcfg[
+        "expert_tensor_parallel_size"
+    ]
 
     train_mcfg = cast(dict[str, Any], policy_config["megatron_cfg"])
     layout_keys = (
@@ -125,8 +136,24 @@ def dedicated_inference_megatron_cfg(
         "expert_model_parallel_size",
         "expert_tensor_parallel_size",
         "context_parallel_size",
+        "tensor_parallel_num_weight_shards",
+        "expert_tensor_parallel_num_weight_shards",
     )
-    layout_differs = any(inference_mcfg[k] != train_mcfg[k] for k in layout_keys)
+    # A null/absent weight-shard count means "no GTP", i.e. exactly the TP
+    # degree. Normalize before comparing so `null` and an explicit TP-equal
+    # value are not mistaken for a layout change.
+    normalized_train = {
+        **train_mcfg,
+        "tensor_parallel_num_weight_shards": (
+            train_mcfg.get("tensor_parallel_num_weight_shards")
+            or train_mcfg["tensor_model_parallel_size"]
+        ),
+        "expert_tensor_parallel_num_weight_shards": (
+            train_mcfg.get("expert_tensor_parallel_num_weight_shards")
+            or train_mcfg["expert_tensor_parallel_size"]
+        ),
+    }
+    layout_differs = any(inference_mcfg[k] != normalized_train[k] for k in layout_keys)
     impl_differs = inference_mcfg.get("transformer_impl") != train_mcfg.get(
         "transformer_impl"
     )
