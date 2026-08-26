@@ -508,6 +508,7 @@ def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
 
     class _PrequantCheckpointWorker(MegatronCheckpointEngineSendMixin):
         enable_refit_prequantize = MegatronPolicyWorkerImpl.enable_refit_prequantize
+        _is_fp8_export = MegatronPolicyWorkerImpl._is_fp8_export
         _iter_params_with_optional_kv_scales = (
             MegatronPolicyWorkerImpl._iter_params_with_optional_kv_scales
         )
@@ -517,6 +518,8 @@ def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
     weight = torch.randn(64, 64, dtype=torch.bfloat16)
     worker = _PrequantCheckpointWorker()
     worker._refit_prequant_names = set()
+    worker._refit_param_info_hf = None
+    worker.fp8_cfg = None
     worker.model = object()
     worker.draft_model = None
     worker.refit_conversion_tasks = []
@@ -524,7 +527,12 @@ def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
     worker.megatron_bridge = SimpleNamespace(
         export_hf_weights=lambda *_args, **_kwargs: iter([(name, weight)])
     )
-    worker.prepare_refit_info = lambda: {name: (weight.shape, weight.dtype)}
+
+    def _prepare_refit_info() -> dict[str, Any]:
+        worker._refit_param_info_hf = {name: (weight.shape, weight.dtype)}
+        return worker._refit_param_info_hf
+
+    worker.prepare_refit_info = _prepare_refit_info
     worker.checkpoint_engine = SimpleNamespace(get_target_weight_layout=lambda: None)
 
     class _Generation:
@@ -730,6 +738,62 @@ def test_enable_refit_prequantize_rejects_blockwise_fp8_storage():
     }
 
     with pytest.raises(ValueError, match="BF16 trainer-exported weights"):
+        worker.enable_refit_prequantize(["model.weight"])
+
+
+def test_enable_refit_prequantize_requires_prepare_refit_info():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = None
+    worker._refit_param_info_hf = None
+
+    with pytest.raises(RuntimeError, match="prepare_refit_info"):
+        worker.enable_refit_prequantize(["model.weight"])
+
+
+def test_enable_refit_prequantize_derives_metadata_without_export():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = None
+    worker._refit_param_info_hf = {
+        "model.a.weight": (torch.Size([4, 64]), torch.bfloat16),
+        "model.b.weight": (torch.Size([4, 64]), torch.bfloat16),
+    }
+
+    def _fail_iter(*_args, **_kwargs):
+        raise AssertionError("metadata derivation must not re-export weights")
+
+    worker._iter_params_with_optional_kv_scales = _fail_iter
+
+    info = worker.enable_refit_prequantize(["model.a.weight"])
+
+    assert info["model.a.weight"] == (torch.Size([4, 64]), torch.float8_e4m3fn)
+    assert info["model.a.weight_scale_from_checkpoint"] == (
+        torch.Size([4, 2]),
+        torch.uint8,
+    )
+    assert info["model.b.weight"] == (torch.Size([4, 64]), torch.bfloat16)
+    assert worker._refit_prequant_names == {"model.a.weight"}
+
+
+def test_enable_refit_prequantize_rejects_indivisible_last_dim():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = None
+    worker._refit_param_info_hf = {
+        "model.weight": (torch.Size([4, 48]), torch.bfloat16),
+    }
+
+    with pytest.raises(ValueError, match="divisible"):
         worker.enable_refit_prequantize(["model.weight"])
 
 

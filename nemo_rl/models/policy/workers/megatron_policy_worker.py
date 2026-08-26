@@ -468,6 +468,12 @@ class MegatronPolicyWorkerImpl(
         # HF param names to MXFP8-quantize on the trainer during refit; set via
         # enable_refit_prequantize() when vllm_cfg.refit_prequantize is on.
         self._refit_prequant_names: set[str] = set()
+        # HF param metadata cached by prepare_refit_info so that
+        # enable_refit_prequantize can derive updated metadata without
+        # re-running the export + quantize pass.
+        self._refit_param_info_hf: Optional[
+            dict[str, tuple[torch.Size, torch.dtype]]
+        ] = None
         # Pinned host staging for the reference-policy swap; only populated when
         # megatron_cfg["pinned_reference_swap"] is enabled. Buffer contents are
         # only live within a single use_reference_model call (every copy
@@ -2211,7 +2217,7 @@ class MegatronPolicyWorkerImpl(
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
-    def prepare_refit_info(self) -> None:
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
@@ -2220,10 +2226,16 @@ class MegatronPolicyWorkerImpl(
         for name, tensor in self._iter_params_with_optional_kv_scales():
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
+        self._refit_param_info_hf = refit_param_info_hf
         return refit_param_info_hf
 
     def enable_refit_prequantize(self, param_names: list[str]) -> dict[str, Any]:
         """Quantize the listed HF params to MXFP8 on the trainer during refit.
+
+        Derives the updated metadata from the shapes cached by
+        prepare_refit_info instead of re-running the export + quantize pass:
+        MXFP8 keeps the value shape and adds one uint8 E8M0 scale per 32-wide
+        block along the last dim, so no tensor needs to be materialized here.
 
         Args:
             param_names: fp8-eligible parameter names reported by the vLLM
@@ -2238,12 +2250,39 @@ class MegatronPolicyWorkerImpl(
                 "vllm_cfg.refit_prequantize requires BF16 trainer-exported weights; "
                 "Megatron blockwise FP8 parameter storage uses a different scale layout."
             )
+        if self._refit_param_info_hf is None:
+            raise RuntimeError(
+                "enable_refit_prequantize requires prepare_refit_info to have "
+                "run first so the HF parameter metadata is available."
+            )
+
+        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            MXFP8_BLOCK_SIZE,
+        )
 
         self._refit_prequant_names = set(param_names)
 
         refit_param_info_hf = {}
-        for name, tensor in self._iter_params_with_optional_kv_scales():
-            refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
+        for name, (shape, dtype) in self._refit_param_info_hf.items():
+            if name not in self._refit_prequant_names:
+                refit_param_info_hf[name] = (shape, dtype)
+                continue
+            if dtype == torch.float8_e4m3fn:
+                raise ValueError(
+                    "vllm_cfg.refit_prequantize requires BF16 trainer-exported weights; "
+                    f"{name} is already stored as E4M3 with a non-MXFP8 scale layout."
+                )
+            if shape[-1] % MXFP8_BLOCK_SIZE != 0:
+                raise ValueError(
+                    f"MXFP8 requires the last dim to be divisible by "
+                    f"{MXFP8_BLOCK_SIZE}; {name} has shape {tuple(shape)}."
+                )
+            scale_shape = torch.Size((*shape[:-1], shape[-1] // MXFP8_BLOCK_SIZE))
+            refit_param_info_hf[name] = (shape, torch.float8_e4m3fn)
+            refit_param_info_hf[name + "_scale_from_checkpoint"] = (
+                scale_shape,
+                torch.uint8,
+            )
         return refit_param_info_hf
 
     def _maybe_prequantize_param(
