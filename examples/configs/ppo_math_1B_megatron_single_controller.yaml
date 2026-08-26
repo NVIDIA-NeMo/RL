@@ -168,9 +168,9 @@ policy:
     loss_weight: 0.1
     num_layers: null
     aux_layer_indices: null
-    ttt_steps: 1 # >1 = multi-pass TTT draft training (requires CP=1, no sequence parallel, no sequence packing)
+    ttt_steps: 1 # >1 = multi-pass TTT draft training (requires sequence_parallel == false)
     ttt_pass_weights: null # per-pass loss weights alpha_d (len == ttt_steps); null = uniform 1.0
-    loss_seq_chunk_size: 4096 # sequence-dim tile for the multi-pass draft loss internals (memory vs a few extra TP collectives; never affects results)
+    loss_seq_chunk_size: 4096 # sequence-dim tile for the draft loss internals (memory vs a few extra TP collectives; never affects results)
     # Draft-only optimizer param group; all null = share the policy optimizer settings.
     lr: null
     min_lr: null # null = follow the draft lr (constant draft LR while the policy decays)

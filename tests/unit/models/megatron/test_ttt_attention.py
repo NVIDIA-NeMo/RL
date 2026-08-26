@@ -18,7 +18,9 @@ The reference is a dense fp32 joint softmax over the concatenated trunk
 (causal pass-1) and branch (same-anchor diagonal) key sets — the staircase
 mask materialized — with native autograd. The kernel path must match it in
 both outputs and all input gradients (including the cross-pass gradient
-accumulation into the stashed pass-1 KV).
+accumulation into the stashed pass-1 KV). Packed (THD) inputs must match the
+per-subsequence references; the CP=2 ring is covered in
+test_ttt_packing_cp.py.
 """
 
 from types import SimpleNamespace
@@ -51,6 +53,40 @@ requires_flash_attn = pytest.mark.skipif(
 )
 
 
+def _attn_config() -> SimpleNamespace:
+    return SimpleNamespace(softmax_scale=None)
+
+
+def apply_two_part_bshd(
+    q: torch.Tensor,
+    k1: torch.Tensor,
+    v1: torch.Tensor,
+    kb: torch.Tensor,
+    vb: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Drive the THD kernel entry with batched [B, S, ...] tensors.
+
+    Flattens the batch into B equal-length packed subsequences (the same
+    layout TTTDraftCoreAttention builds for unpacked input) and reshapes the
+    output back; autograd flows through the views to the [B, S, ...] leaves.
+    """
+    batch, seqlen = q.shape[0], q.shape[1]
+    cu_seqlens = torch.arange(0, batch + 1, device=q.device, dtype=torch.int32) * seqlen
+    out = TwoPartTTTAttention.apply(
+        q.reshape(batch * seqlen, *q.shape[2:]),
+        k1.reshape(batch * seqlen, *k1.shape[2:]),
+        v1.reshape(batch * seqlen, *v1.shape[2:]),
+        kb.reshape(batch * seqlen, *kb.shape[2:]) if kb is not None else None,
+        vb.reshape(batch * seqlen, *vb.shape[2:]) if vb is not None else None,
+        cu_seqlens,
+        seqlen,
+        softmax_scale,
+        None,
+    )
+    return out.view(batch, seqlen, *out.shape[1:])
+
+
 def dense_two_part_reference(
     q: torch.Tensor,
     k1: torch.Tensor,
@@ -61,8 +97,8 @@ def dense_two_part_reference(
 ) -> torch.Tensor:
     """Joint softmax over causal trunk + diagonal branch keys, materialized.
 
-    Shapes follow TwoPartTTTAttention: q ``[B,S,Hq,D]``, k1/v1 ``[B,S,Hkv,D]``,
-    kb/vb ``[B,S,Hkv,P,D]`` (P may be 0 for a pure causal pass).
+    Shapes: q ``[B,S,Hq,D]``, k1/v1 ``[B,S,Hkv,D]``, kb/vb ``[B,S,Hkv,P,D]``
+    (P may be 0 for a pure causal pass).
     """
     batch, seqlen, num_q_heads, _ = q.shape
     group = num_q_heads // k1.shape[2]
@@ -110,7 +146,7 @@ def test_two_part_function_matches_dense(num_kv_heads):
     kb = make(batch, seqlen, num_kv_heads, num_branch, head_dim)
     vb = make(batch, seqlen, num_kv_heads, num_branch, head_dim)
 
-    out = TwoPartTTTAttention.apply(q, k1, v1, kb, vb, softmax_scale)
+    out = apply_two_part_bshd(q, k1, v1, kb, vb, softmax_scale)
     dout = torch.randn_like(out)
     grads = torch.autograd.grad(out, (q, k1, v1, kb, vb), dout)
 
@@ -119,6 +155,60 @@ def test_two_part_function_matches_dense(num_kv_heads):
     ref_grads = torch.autograd.grad(out_ref, refs, dout.float())
 
     _assert_close(out, out_ref, "out")
+    for grad, ref_grad, name in zip(
+        grads, ref_grads, ("dq", "dk1", "dv1", "dkb", "dvb")
+    ):
+        _assert_close(grad, ref_grad, name)
+
+
+@requires_flash_attn
+def test_two_part_function_packed_matches_per_sequence():
+    """A packed row of unequal subsequences vs each subsequence run alone.
+
+    Both the varlen trunk (causal restart at cu boundaries) and the branch
+    diagonals (purely index-local, so untouched by packing) must reproduce
+    the per-subsequence dense oracle in outputs and all gradients.
+    """
+    torch.manual_seed(3)
+    lengths = [48, 80, 32]
+    num_q_heads, num_kv_heads, head_dim, num_branch = 8, 4, 64, 2
+    softmax_scale = head_dim**-0.5
+    total = sum(lengths)
+    cu = torch.tensor(
+        [0] + torch.cumsum(torch.tensor(lengths), 0).tolist(),
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    def make(*shape):
+        return torch.randn(
+            *shape, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+
+    q = make(total, num_q_heads, head_dim)
+    k1 = make(total, num_kv_heads, head_dim)
+    v1 = make(total, num_kv_heads, head_dim)
+    kb = make(total, num_kv_heads, num_branch, head_dim)
+    vb = make(total, num_kv_heads, num_branch, head_dim)
+
+    out = TwoPartTTTAttention.apply(
+        q, k1, v1, kb, vb, cu, max(lengths), softmax_scale, None
+    )
+    dout = torch.randn_like(out)
+    grads = torch.autograd.grad(out, (q, k1, v1, kb, vb), dout)
+
+    refs = [t.detach().float().requires_grad_() for t in (q, k1, v1, kb, vb)]
+    ref_grads = [torch.zeros_like(r) for r in refs]
+    for seq_idx, length in enumerate(lengths):
+        start, end = int(cu[seq_idx]), int(cu[seq_idx + 1])
+        seq_refs = [r[start:end].unsqueeze(0) for r in refs]
+        out_ref = dense_two_part_reference(*seq_refs, softmax_scale)
+        _assert_close(out[start:end], out_ref[0], f"out seq {seq_idx}")
+        seq_grads = torch.autograd.grad(
+            out_ref, refs, dout[start:end].unsqueeze(0).float(), retain_graph=True
+        )
+        for acc, g in zip(ref_grads, seq_grads):
+            acc += g
     for grad, ref_grad, name in zip(
         grads, ref_grads, ("dq", "dk1", "dv1", "dkb", "dvb")
     ):
@@ -137,11 +227,7 @@ def test_module_multi_pass_matches_dense_and_accumulates_trunk_grads():
     seqlen, batch, num_q_heads, num_kv_heads, head_dim = 64, 2, 4, 2, 32
     softmax_scale = head_dim**-0.5
 
-    module = TTTDraftCoreAttention(
-        SimpleNamespace(
-            attention_dropout=0.0, context_parallel_size=1, softmax_scale=None
-        )
-    )
+    module = TTTDraftCoreAttention(_attn_config())
 
     # sbhd layout, as handed to core_attention by MCore SelfAttention.
     qs = [
@@ -233,6 +319,114 @@ def test_module_multi_pass_matches_dense_and_accumulates_trunk_grads():
 
 
 @requires_flash_attn
+def test_module_packed_multi_pass_matches_unpacked():
+    """Packed THD multi-pass module runs == per-subsequence unpacked runs.
+
+    Feeds the module the exact tensors MCore hands it in THD mode ([T, H, D]
+    with packed_seq_params) and checks outputs AND gradients against separate
+    unpacked runs of each subsequence.
+    """
+    torch.manual_seed(5)
+    num_passes = 3
+    lengths = [40, 72]
+    num_q_heads, num_kv_heads, head_dim = 4, 2, 32
+    total = sum(lengths)
+    cu = torch.tensor(
+        [0] + torch.cumsum(torch.tensor(lengths), 0).tolist(),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    packed_seq_params = SimpleNamespace(
+        qkv_format="thd",
+        cu_seqlens_q=cu,
+        cu_seqlens_q_padded=cu,
+        max_seqlen_q=max(lengths),
+    )
+
+    qs = [
+        torch.randn(
+            total, num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+        ).requires_grad_()
+        for _ in range(num_passes)
+    ]
+    ks = [
+        torch.randn(
+            total, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+        ).requires_grad_()
+        for _ in range(num_passes)
+    ]
+    vs = [
+        torch.randn(
+            total, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+        ).requires_grad_()
+        for _ in range(num_passes)
+    ]
+
+    module = TTTDraftCoreAttention(_attn_config())
+    outs = []
+    for ttt_pass in range(1, num_passes + 1):
+        module.begin_pass(ttt_pass)
+        outs.append(
+            module(
+                qs[ttt_pass - 1],
+                ks[ttt_pass - 1],
+                vs[ttt_pass - 1],
+                None,
+                packed_seq_params=packed_seq_params,
+            )
+        )
+    module.reset()
+    assert outs[0].shape == (total, num_q_heads * head_dim)
+    douts = [torch.randn_like(o) for o in outs]
+    grads = torch.autograd.grad(outs, qs + ks + vs, douts)
+
+    # Reference: run each subsequence through its own module, unpacked
+    # ([L, 1, H, D] sbhd), and scatter outputs/grads back into packed rows.
+    outs_ref = [torch.zeros_like(o) for o in outs]
+    grads_ref = [torch.zeros_like(t) for t in qs + ks + vs]
+    for seq_idx, length in enumerate(lengths):
+        start, end = int(cu[seq_idx]), int(cu[seq_idx + 1])
+        seq_leaves = [
+            t[start:end].detach().clone().requires_grad_() for t in qs + ks + vs
+        ]
+        seq_qs = seq_leaves[:num_passes]
+        seq_ks = seq_leaves[num_passes : 2 * num_passes]
+        seq_vs = seq_leaves[2 * num_passes :]
+        ref_module = TTTDraftCoreAttention(_attn_config())
+        seq_outs = []
+        for ttt_pass in range(1, num_passes + 1):
+            ref_module.begin_pass(ttt_pass)
+            seq_outs.append(
+                ref_module(
+                    seq_qs[ttt_pass - 1].unsqueeze(1),
+                    seq_ks[ttt_pass - 1].unsqueeze(1),
+                    seq_vs[ttt_pass - 1].unsqueeze(1),
+                    None,
+                )
+            )
+        ref_module.reset()
+        seq_grads = torch.autograd.grad(
+            seq_outs,
+            seq_leaves,
+            [d[start:end].unsqueeze(1) for d in douts],
+        )
+        for out_ref, seq_out in zip(outs_ref, seq_outs):
+            out_ref[start:end] = seq_out.squeeze(1)
+        for acc, g in zip(grads_ref, seq_grads):
+            acc[start:end] = g
+
+    for out, out_ref in zip(outs, outs_ref):
+        _assert_close(out, out_ref, "packed pass output")
+    names = (
+        [f"dq{i}" for i in range(num_passes)]
+        + [f"dk{i}" for i in range(num_passes)]
+        + [f"dv{i}" for i in range(num_passes)]
+    )
+    for grad, grad_ref, name in zip(grads, grads_ref, names):
+        _assert_close(grad, grad_ref, f"packed {name}")
+
+
+@requires_flash_attn
 def test_two_part_matches_modelopt_multistep_mask_oracle():
     """External oracle: modelopt's own TTT mask must reproduce our attention.
 
@@ -262,11 +456,7 @@ def test_two_part_matches_modelopt_multistep_mask_oracle():
     vs = [torch.randn_like(qs[0]) for _ in range(num_passes)]
 
     # --- Our side: per-pass two-part attention -> [S, 1, H*D] per pass.
-    module = TTTDraftCoreAttention(
-        SimpleNamespace(
-            attention_dropout=0.0, context_parallel_size=1, softmax_scale=None
-        )
-    )
+    module = TTTDraftCoreAttention(_attn_config())
     ours = []
     for ttt_pass in range(1, num_passes + 1):
         module.begin_pass(ttt_pass)
@@ -324,11 +514,7 @@ def test_two_part_matches_modelopt_multistep_mask_oracle():
 
 
 def test_module_guards_do_not_require_gpu():
-    module = TTTDraftCoreAttention(
-        SimpleNamespace(
-            attention_dropout=0.0, context_parallel_size=1, softmax_scale=None
-        )
-    )
+    module = TTTDraftCoreAttention(_attn_config())
     q = torch.randn(4, 1, 2, 8)
 
     with pytest.raises(RuntimeError, match="begin_pass"):
@@ -338,17 +524,23 @@ def test_module_guards_do_not_require_gpu():
     with pytest.raises(RuntimeError, match="in order"):
         module.begin_pass(3)
 
+    with pytest.raises(NotImplementedError, match="thd"):
+        module(q, q, q, None, packed_seq_params=SimpleNamespace(qkv_format="bshd"))
+
+    # CP without packing has no zigzag metadata to ring over.
+    module.pg_collection = SimpleNamespace(cp=SimpleNamespace(size=lambda: 2))
     with pytest.raises(NotImplementedError, match="sequence packing"):
-        module(q, q, q, None, packed_seq_params=object())
+        module(q, q, q, None)
 
     with pytest.raises(ValueError, match="attention_mask"):
         module(q, q, q, torch.ones(1))
+
+    with pytest.raises(ValueError, match="attention_bias"):
+        module(q, q, q, None, attention_bias=torch.ones(1))
 
 
 def test_module_rejects_attention_dropout():
     with pytest.raises(ValueError, match="dropout"):
         TTTDraftCoreAttention(
-            SimpleNamespace(
-                attention_dropout=0.1, context_parallel_size=1, softmax_scale=None
-            )
+            SimpleNamespace(softmax_scale=None, attention_dropout=0.1)
         )

@@ -205,7 +205,9 @@ def test_draft_loss_wrapper_block_dispatch(mock_block_loss_cls):
     assert metrics["draft_loss"] == draft_loss.item()
     prepare_fn.assert_not_called()
     mock_block_loss_cls.assert_called_once_with(
-        vocab_parallel_group=None, slot_weights=[1.0, 0.5, 0.25]
+        vocab_parallel_group=None,
+        context_parallel_group=None,
+        slot_weights=[1.0, 0.5, 0.25],
     )
     call_kwargs = block_loss_fn.call_args.kwargs
     assert torch.equal(call_kwargs["student_block_logits"], block_logits)
@@ -385,11 +387,180 @@ def test_draft_loss_wrapper_dspark_dispatch(mock_dspark_loss_cls):
     mock_dspark_loss_cls.assert_called_once_with(
         vocab_parallel_group=None,
         vocab_parallel_rank=None,
+        context_parallel_group=None,
         slot_weights=[1.0, 0.5, 0.25],
         ce_loss_alpha=0.1,
         tv_loss_alpha=0.9,
         confidence_head_alpha=1.0,
     )
+
+
+def test_packed_zigzag_local_index_and_halo_cp1():
+    from nemo_rl.algorithms.loss.utils import (
+        packed_zigzag_local_index,
+        packed_zigzag_successor_halo,
+    )
+
+    # cp=2 arithmetic: seq of local len 8 (half 4). Rank 1 owns chunks 1 and 2
+    # (global positions 4..7 and 8..11) at local rows 0..3 and 4..7.
+    cu_local = torch.tensor([0, 8])
+    seq_idx = torch.tensor([0, 0, 0, 0])
+    pos = torch.tensor([4, 7, 8, 11])
+    rows = packed_zigzag_local_index(seq_idx, pos, cu_local, cp_rank=1, cp_size=2)
+    assert rows.tolist() == [0, 3, 4, 7]
+
+    # cp=1 halo: front chunk's successor is the own back chunk head, the back
+    # chunk's successor is past the sequence end (zeros).
+    tensor = torch.arange(24, dtype=torch.float32).reshape(12, 2)
+    cu = torch.tensor([0, 4, 12])
+    halo = packed_zigzag_successor_halo(tensor, cu, halo=2, cp_group=None)
+    assert halo.shape == (2, 2, 2, 2)
+    torch.testing.assert_close(halo[0, 0], tensor[2:4])  # seq 0 back head
+    torch.testing.assert_close(halo[1, 0], tensor[8:10])  # seq 1 back head
+    assert torch.all(halo[:, 1] == 0)
+
+    # Halo larger than the smallest chunk must refuse loudly.
+    try:
+        packed_zigzag_successor_halo(tensor, cu, halo=3, cp_group=None)
+    except ValueError as err:
+        assert "halo" in str(err)
+    else:
+        raise AssertionError("expected ValueError for oversized halo")
+
+
+def _packed_variant(anchors, anchor_valid, batch_size, seq_len):
+    """Flat-block coords + packed cu for a batch of equal-length rows."""
+    num_anchors = anchors.shape[1]
+    seq_idx = torch.arange(batch_size).unsqueeze(1).expand(-1, num_anchors).reshape(-1)
+    cu = torch.arange(0, batch_size + 1, dtype=torch.long) * seq_len
+    return seq_idx, anchors.reshape(-1), anchor_valid.reshape(-1), cu
+
+
+def test_block_draft_loss_packed_matches_unpacked():
+    """Packed (flat blocks + halo teacher gather) == unpacked, loss + metrics."""
+    torch.manual_seed(4)
+    batch_size, num_anchors, gamma, seq_len, vocab = 2, 3, 4, 16, 13
+    token_mask, sample_mask, anchors, anchor_valid = _make_block_data(
+        batch_size, num_anchors, gamma, seq_len
+    )
+    teacher_logits = torch.randn(batch_size, seq_len, vocab)
+    student = torch.randn(batch_size, num_anchors, gamma, vocab)
+    slot_weights = [1.0, 0.5, 0.25, 0.125]
+    counts = compute_block_draft_slot_valid_counts(
+        token_mask, sample_mask, anchors, anchor_valid, gamma=gamma
+    )
+
+    loss_fn = BlockDraftLossFn(vocab_parallel_group=None, slot_weights=slot_weights)
+    data = BatchedDataDict(
+        {
+            "draft_anchor_positions": anchors,
+            "draft_anchor_valid": anchor_valid,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+        }
+    )
+    loss_ref, metrics_ref = loss_fn(
+        teacher_logits=teacher_logits,
+        student_block_logits=student,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(1.0),
+        global_draft_pass_counts=counts,
+    )
+
+    seq_idx, anchors_flat, valid_flat, cu = _packed_variant(
+        anchors, anchor_valid, batch_size, seq_len
+    )
+    packed_data = BatchedDataDict(
+        {
+            "draft_anchor_positions": anchors_flat,
+            "draft_anchor_valid": valid_flat,
+            "draft_block_seq_idx": seq_idx,
+            "draft_packed_local_cu_seqlens": cu,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+        }
+    )
+    loss_packed, metrics_packed = loss_fn(
+        teacher_logits=teacher_logits.reshape(1, batch_size * seq_len, vocab),
+        student_block_logits=student.reshape(-1, gamma, vocab),
+        data=packed_data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(1.0),
+        global_draft_pass_counts=counts,
+    )
+
+    torch.testing.assert_close(loss_packed, loss_ref)
+    assert metrics_packed.keys() == metrics_ref.keys()
+    for key in metrics_ref:
+        assert math.isclose(metrics_packed[key], metrics_ref[key], rel_tol=1e-5), key
+
+
+def test_dspark_block_loss_packed_matches_unpacked():
+    """DSpark packed mode (halo teacher + flat labels/confidence) == unpacked."""
+    torch.manual_seed(6)
+    batch_size, num_anchors, gamma, seq_len, vocab = 2, 3, 4, 16, 13
+    token_mask, sample_mask, anchors, anchor_valid = _make_block_data(
+        batch_size, num_anchors, gamma, seq_len
+    )
+    input_ids = torch.randint(0, vocab, (batch_size, seq_len))
+    teacher_logits = torch.randn(batch_size, seq_len, vocab)
+    student = torch.randn(batch_size, num_anchors, gamma, vocab)
+    confidence_pred = torch.randn(batch_size, num_anchors, gamma)
+    counts = compute_block_draft_slot_valid_counts(
+        token_mask, sample_mask, anchors, anchor_valid, gamma=gamma
+    )
+
+    loss_fn = DSparkBlockLossFn(vocab_parallel_group=None, vocab_parallel_rank=0)
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "draft_anchor_positions": anchors,
+            "draft_anchor_valid": anchor_valid,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "draft_confidence_pred": confidence_pred,
+        }
+    )
+    loss_ref, metrics_ref = loss_fn(
+        teacher_logits=teacher_logits,
+        student_block_logits=student,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(1.0),
+        global_draft_pass_counts=counts,
+    )
+
+    seq_idx, anchors_flat, valid_flat, cu = _packed_variant(
+        anchors, anchor_valid, batch_size, seq_len
+    )
+    packed_data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "draft_anchor_positions": anchors_flat,
+            "draft_anchor_valid": valid_flat,
+            "draft_block_seq_idx": seq_idx,
+            "draft_packed_local_cu_seqlens": cu,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "draft_confidence_pred": confidence_pred.reshape(-1, gamma),
+        }
+    )
+    loss_packed, metrics_packed = loss_fn(
+        teacher_logits=teacher_logits.reshape(1, batch_size * seq_len, vocab),
+        student_block_logits=student.reshape(-1, gamma, vocab),
+        data=packed_data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(1.0),
+        global_draft_pass_counts=counts,
+    )
+
+    torch.testing.assert_close(loss_packed, loss_ref)
+    assert metrics_packed.keys() == metrics_ref.keys()
+    for key in metrics_ref:
+        assert math.isclose(
+            metrics_packed[key], metrics_ref[key], rel_tol=1e-5, abs_tol=1e-7
+        ), key
 
 
 def test_resolve_block_draft_slot_weights_schemes():

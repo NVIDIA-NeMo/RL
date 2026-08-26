@@ -85,10 +85,7 @@ class _EagleLayerLayout:
         return f"{self.model_prefix}.mlp.linear_fc2.weight"
 
 
-def _resolve_optional_key(
-    model_keys: set[str],
-    *candidates: str | None,
-) -> str | None:
+def _resolve_optional_key(model_keys: set[str], *candidates: str | None) -> str | None:
     for candidate in candidates:
         if candidate is not None and candidate in model_keys:
             return candidate
@@ -239,8 +236,7 @@ def _combine_or_shard_weight_parts(
         raise RuntimeError(incomplete_error)
 
     full_weight = torch.cat(
-        [weight for weight in component_weights if weight is not None],
-        dim=0,
+        [weight for weight in component_weights if weight is not None], dim=0
     ).contiguous()
     if target is None:
         return full_weight
@@ -367,8 +363,7 @@ def _all_gather_tp_shards(local_weight: Tensor) -> list[Tensor]:
 
 
 def _gather_tp_qkv_weight(
-    local_fused_weight: Tensor,
-    config: TransformerConfig,
+    local_fused_weight: Tensor, config: TransformerConfig
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Gather TP shards of the Megatron fused qkv weight and split into HF q/k/v.
 
@@ -378,17 +373,13 @@ def _gather_tp_qkv_weight(
     :func:`_interleave_qkv`).
     """
     shards = _all_gather_tp_shards(local_fused_weight)
-    full_fused = (
-        local_fused_weight
-        if len(shards) == 1
-        else torch.cat(shards, dim=0).contiguous()
-    )
-    return _deinterleave_qkv(full_fused, config)
+    if len(shards) > 1:
+        local_fused_weight = torch.cat(shards, dim=0).contiguous()
+    return _deinterleave_qkv(local_fused_weight, config)
 
 
 def _gather_tp_gate_up_weight(
-    local_fused_weight: Tensor,
-    ffn_hidden_size: int,
+    local_fused_weight: Tensor, ffn_hidden_size: int
 ) -> tuple[Tensor, Tensor]:
     shards = _all_gather_tp_shards(local_fused_weight)
     if len(shards) == 1 and local_fused_weight.shape[0] == 2 * ffn_hidden_size:
@@ -405,8 +396,7 @@ def _gather_tp_gate_up_weight(
     local_ffn_hidden_size = ffn_hidden_size // tp_world_size
     for shard in shards:
         gate_local, up_local = shard.split(
-            [local_ffn_hidden_size, local_ffn_hidden_size],
-            dim=0,
+            [local_ffn_hidden_size, local_ffn_hidden_size], dim=0
         )
         gate_shards.append(gate_local)
         up_shards.append(up_local)
@@ -482,23 +472,17 @@ def _load_safetensors_file(checkpoint_path: Path) -> StateDict:
     from safetensors.torch import load_file as load_safetensors
 
     return _extract_tensor_state_dict(
-        load_safetensors(str(checkpoint_path)),
-        checkpoint_path,
+        load_safetensors(str(checkpoint_path)), checkpoint_path
     )
 
 
 def _load_torch_file(checkpoint_path: Path) -> StateDict:
     try:
         checkpoint_obj = torch.load(
-            str(checkpoint_path),
-            map_location="cpu",
-            weights_only=True,
+            str(checkpoint_path), map_location="cpu", weights_only=True
         )
     except TypeError:
-        checkpoint_obj = torch.load(
-            str(checkpoint_path),
-            map_location="cpu",
-        )
+        checkpoint_obj = torch.load(str(checkpoint_path), map_location="cpu")
 
     return _extract_tensor_state_dict(checkpoint_obj, checkpoint_path)
 
@@ -548,11 +532,7 @@ def _load_index_checkpoint(index_path: Path) -> StateDict:
         )
 
     shard_names = sorted(
-        {
-            shard_name
-            for shard_name in weight_map.values()
-            if isinstance(shard_name, str)
-        }
+        {name for name in weight_map.values() if isinstance(name, str)}
     )
     if not shard_names:
         raise RuntimeError(
@@ -562,17 +542,11 @@ def _load_index_checkpoint(index_path: Path) -> StateDict:
 
     if index_path.name == "model.safetensors.index.json":
         return _merge_checkpoint_shards(
-            index_path.parent,
-            shard_names,
-            _load_safetensors_file,
-            index_path.name,
+            index_path.parent, shard_names, _load_safetensors_file, index_path.name
         )
     if index_path.name == "pytorch_model.bin.index.json":
         return _merge_checkpoint_shards(
-            index_path.parent,
-            shard_names,
-            _load_torch_file,
-            index_path.name,
+            index_path.parent, shard_names, _load_torch_file, index_path.name
         )
 
     raise RuntimeError(
@@ -656,10 +630,7 @@ def _load_checkpoint_from_directory(checkpoint_dir: Path) -> StateDict:
     )
     if torch_shards:
         return _merge_checkpoint_shards(
-            checkpoint_dir,
-            torch_shards,
-            _load_torch_file,
-            str(checkpoint_dir),
+            checkpoint_dir, torch_shards, _load_torch_file, str(checkpoint_dir)
         )
 
     raise FileNotFoundError(
@@ -724,9 +695,7 @@ def _get_tp_rank() -> int:
 
 
 def _build_split_axis_by_parameter(layout: _EagleModelLayout) -> dict[str, int]:
-    split_axis_by_parameter = {
-        "eagle_module.fc.weight": 0,
-    }
+    split_axis_by_parameter = {"eagle_module.fc.weight": 0}
     if layout.lm_head_key is not None:
         split_axis_by_parameter[layout.lm_head_key] = 0
     for layer in layout.layers:
@@ -773,26 +742,13 @@ def _shard_to_local_tp(
             f"(inferred_tp={inferred_tp})"
         )
 
-    local_shard = torch.chunk(tensor, inferred_tp, dim=split_axis)[tp_rank]
-    local_shard = local_shard.contiguous()
+    local_shard = tensor.chunk(inferred_tp, dim=split_axis)[tp_rank].contiguous()
     if local_shard.shape != target.shape:
         raise RuntimeError(
             f"[draft] Invalid TP shard shape for '{parameter_name}': "
             f"got={tuple(local_shard.shape)} expected={tuple(target.shape)}"
         )
     return local_shard.to(dtype=target.dtype)
-
-
-def _assign_optional_layer_weight(
-    *,
-    model_key: str | None,
-    hf_weight: Tensor,
-    mapped_state: StateDict,
-) -> bool:
-    if model_key is None:
-        return False
-    mapped_state[model_key] = hf_weight
-    return True
 
 
 def _map_layer_hf_weight(
@@ -823,23 +779,14 @@ def _map_layer_hf_weight(
     elif layer_key == "mlp.down_proj.weight":
         mapped_state[layer.fc2_weight_key] = hf_weight
     elif layer_key == "hidden_norm.weight":
-        _assign_optional_layer_weight(
-            model_key=layer.hidden_norm_key,
-            hf_weight=hf_weight,
-            mapped_state=mapped_state,
-        )
+        if layer.hidden_norm_key is not None:
+            mapped_state[layer.hidden_norm_key] = hf_weight
     elif layer_key == "input_layernorm.weight":
-        _assign_optional_layer_weight(
-            model_key=layer.input_layernorm_key,
-            hf_weight=hf_weight,
-            mapped_state=mapped_state,
-        )
+        if layer.input_layernorm_key is not None:
+            mapped_state[layer.input_layernorm_key] = hf_weight
     elif layer_key == "post_attention_layernorm.weight":
-        _assign_optional_layer_weight(
-            model_key=layer.post_attention_layernorm_key,
-            hf_weight=hf_weight,
-            mapped_state=mapped_state,
-        )
+        if layer.post_attention_layernorm_key is not None:
+            mapped_state[layer.post_attention_layernorm_key] = hf_weight
     else:
         raise RuntimeError(
             f"[draft] Unsupported Eagle checkpoint key '{checkpoint_key}'."
@@ -911,11 +858,7 @@ def _map_hf_state_to_eagle_state(
     tp_rank = _get_tp_rank()
     for layer in layout.layers:
         pending_weights_by_layer[layer.layer_index].apply_to(
-            mapped_state,
-            layer,
-            model_state=model_state,
-            tp_rank=tp_rank,
-            config=config,
+            mapped_state, layer, model_state, tp_rank, config
         )
 
     if not mapped_state:
@@ -962,8 +905,7 @@ def load_hf_weights_to_eagle(
 
 
 def _require_state_tensor(
-    source_state: Mapping[str, Tensor],
-    parameter_name: str,
+    source_state: Mapping[str, Tensor], parameter_name: str
 ) -> Tensor:
     if parameter_name not in source_state:
         raise RuntimeError(
@@ -1172,8 +1114,7 @@ def _get_draft_output_layer(draft_model: MegatronModule):
 
 
 def _get_draft_to_target_token_mapping(
-    draft_model: MegatronModule,
-    device: torch.device,
+    draft_model: MegatronModule, device: torch.device
 ) -> torch.Tensor:
     draft_vocab_size = int(draft_model.config.draft_vocab_size)
     reverse_mapping = torch.arange(draft_vocab_size, device=device, dtype=torch.long)
@@ -1184,9 +1125,7 @@ def _get_draft_to_target_token_mapping(
 
 
 def copy_policy_lm_head_to_draft(
-    *,
-    draft_model: MegatronModule,
-    policy_model_chunk: MegatronModule,
+    *, draft_model: MegatronModule, policy_model_chunk: MegatronModule
 ) -> None:
     """Initialize the draft LM head from the policy LM head shard."""
     draft_output_layer = _get_draft_output_layer(draft_model)
@@ -1196,8 +1135,7 @@ def copy_policy_lm_head_to_draft(
     policy_lm_head_weight = get_policy_lm_head_weight(policy_model_chunk).detach()
     policy_lm_head_weight = _gather_tp_weight_if_needed(policy_lm_head_weight, tp_group)
     draft_token_mapping = _get_draft_to_target_token_mapping(
-        draft_model,
-        device=policy_lm_head_weight.device,
+        draft_model, device=policy_lm_head_weight.device
     )
     if draft_token_mapping.numel() == 0:
         raise RuntimeError("[draft] Draft token mapping is empty.")
@@ -1219,9 +1157,7 @@ def copy_policy_lm_head_to_draft(
                 )
             tp_rank = dist.get_rank(tp_group)
             selected_policy_weight = torch.chunk(
-                selected_policy_weight,
-                tp_world_size,
-                dim=0,
+                selected_policy_weight, tp_world_size, dim=0
             )[tp_rank].contiguous()
 
     if draft_output_layer.weight.shape != selected_policy_weight.shape:
@@ -1370,6 +1306,30 @@ def build_draft_optimizer_override_provider(
     )
 
 
+def _resolve_layer_windows(hf_config: Mapping[str, Any], num_layers: int) -> list[int]:
+    """Per-layer sliding windows from the checkpoint's ``layer_types`` (0 = full).
+
+    Mirrors the z-lab reference modeling code: a layer slides iff its
+    ``layer_types`` entry is "sliding_attention", and all sliding layers share
+    the top-level ``sliding_window``. No ``layer_types`` (or a checkpoint-less
+    build) means every layer uses full attention.
+    """
+    layer_types = list(hf_config.get("layer_types") or [])[:num_layers]
+    if not layer_types:
+        return [0] * num_layers
+    unknown = sorted(set(layer_types) - {"full_attention", "sliding_attention"})
+    if unknown:
+        raise NotImplementedError(f"[draft] Unsupported draft layer_types: {unknown}.")
+    window = hf_config.get("sliding_window")
+    if "sliding_attention" in layer_types and not window:
+        raise ValueError(
+            "[draft] layer_types requests sliding_attention but the checkpoint "
+            "sets no sliding_window."
+        )
+    windows = [int(window) if t == "sliding_attention" else 0 for t in layer_types]
+    return windows + [0] * (num_layers - len(windows))
+
+
 def resolve_draft_aux_layer_ids(
     draft_config: Mapping[str, Any], num_layers: int
 ) -> tuple[int, ...]:
@@ -1378,10 +1338,11 @@ def resolve_draft_aux_layer_ids(
     Every PP stage must resolve the same list: the hidden-state capture posts
     one P2P send/recv per id, so stages disagreeing about it desync the
     pipeline — and only the last stage owns a draft model to read the resolved
-    value from. Sources, in order: the draft checkpoint's
-    ``eagle_aux_hidden_state_layer_ids`` when ``model_name`` is set (a config
-    read, identical on every rank), else ``policy.draft.aux_layer_indices``,
-    else modelopt's defaults (unless the checkpoint disables aux states).
+    value from. Sources, in order: the draft checkpoint's ids when
+    ``model_name`` is set (``dflash_config.target_layer_ids`` for block
+    drafts, ``eagle_aux_hidden_state_layer_ids`` for eagle3 — a config read,
+    identical on every rank), else ``policy.draft.aux_layer_indices``, else
+    modelopt's defaults (unless the checkpoint disables aux states).
     """
     from transformers import AutoConfig
 
@@ -1391,6 +1352,14 @@ def resolve_draft_aux_layer_ids(
 
     model_name = draft_config.get("model_name")
     hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
+    if (draft_config.get("speculator_type") or "eagle3") != "eagle3":
+        hf_drafter_config = dict(hf_config.get("dflash_config") or {})
+        ids = (
+            hf_drafter_config.get("target_layer_ids")
+            or draft_config.get("aux_layer_indices")
+            or get_eagle3_aux_hidden_state_layers(num_layers)
+        )
+        return tuple(int(i) for i in ids)
     if model_name is not None:
         ids = hf_config.get("eagle_aux_hidden_state_layer_ids", [])
     else:
@@ -1414,9 +1383,6 @@ def _build_block_draft_model(
     from transformers import AutoConfig
 
     from nemo_rl.models.megatron.draft.dflash import SUPPORTED_BLOCK_SPECULATOR_TYPES
-    from nemo_rl.models.megatron.draft.hidden_capture import (
-        get_eagle3_aux_hidden_state_layers,
-    )
 
     speculator_type = draft_config["speculator_type"]
     if speculator_type not in SUPPORTED_BLOCK_SPECULATOR_TYPES:
@@ -1430,15 +1396,9 @@ def _build_block_draft_model(
             "pipeline_model_parallel_size == 1 (the policy embedding row for "
             "the mask token must live on the draft owner rank)."
         )
-    if int(getattr(model_provider, "context_parallel_size", 1) or 1) != 1:
-        raise ValueError(
-            "policy.draft.speculator_type=dflash/dspark requires "
-            "context_parallel_size == 1."
-        )
     if bool(model_provider.sequence_parallel):
         raise ValueError(
-            "policy.draft.speculator_type=dflash/dspark requires "
-            "sequence_parallel == false."
+            "policy.draft.speculator_type=dflash/dspark requires sequence_parallel == false."
         )
 
     model_name = draft_config.get("model_name")
@@ -1455,21 +1415,19 @@ def _build_block_draft_model(
         if drafter_key not in hf_drafter_config and drafter_key in hf_config:
             hf_drafter_config[drafter_key] = hf_config[drafter_key]
 
-    # Training implements full non-causal block attention with no sliding
-    # window / attention sink and (DSpark) no bonus-anchor slot. A checkpoint
-    # requesting a different serving-side structure (vLLM resolves these
-    # fields in qwen3_dflash._resolve_layer_attention and the DSpark
-    # speculator) would silently train a mismatched draft — reject it.
+    # Sliding-window layers (top-level layer_types + sliding_window, the
+    # z-lab convention) are supported and resolved into layer_windows below.
+    # Any other serving-side structure vLLM can express (see
+    # qwen3_dflash._resolve_layer_attention and the DSpark speculator) but
+    # training does not implement would silently train a mismatched draft —
+    # reject it.
     unsupported_structure: list[str] = []
     if hf_drafter_config.get("causal"):
         unsupported_structure.append("dflash_config.causal=true")
-    layer_types = hf_config.get("layer_types")
-    if layer_types:
-        draft_layer_types = layer_types[: int(hf_config.get("num_hidden_layers", 1))]
-        if any(layer_type != "full_attention" for layer_type in draft_layer_types):
-            unsupported_structure.append(f"layer_types={draft_layer_types}")
-    if hf_drafter_config.get("swa_window_size") or hf_config.get("sliding_window"):
-        unsupported_structure.append("sliding-window attention")
+    if hf_drafter_config.get("use_swa"):
+        unsupported_structure.append("dflash_config.use_swa (all-layer non-causal SWA)")
+    if hf_drafter_config.get("swa_window_size"):
+        unsupported_structure.append("dflash_config.swa_window_size")
     if hf_drafter_config.get("add_swa_attention_sink_bias") or hf_config.get(
         "add_swa_attention_sink_bias"
     ):
@@ -1581,14 +1539,11 @@ def _build_block_draft_model(
             f"block_size={ckpt_block_size}."
         )
 
-    aux_layer_ids = [
-        int(i)
-        for i in (
-            hf_drafter_config.get("target_layer_ids")
-            or draft_config.get("aux_layer_indices")
-            or get_eagle3_aux_hidden_state_layers(model_provider.num_layers)
-        )
-    ]
+    # Shared with the worker's capture threading so every PP stage resolves
+    # the same list (see resolve_draft_aux_layer_ids).
+    aux_layer_ids = list(
+        resolve_draft_aux_layer_ids(draft_config, model_provider.num_layers)
+    )
     num_policy_layers = int(model_provider.num_layers)
     if (
         not aux_layer_ids
@@ -1605,6 +1560,7 @@ def _build_block_draft_model(
         )
     config.eagle_aux_hidden_state_layer_ids = list(aux_layer_ids)
 
+    layer_windows = _resolve_layer_windows(hf_config, int(config.num_layers))
     shared_kwargs = dict(
         config=config,
         gamma=gamma,
@@ -1612,6 +1568,7 @@ def _build_block_draft_model(
         num_aux_hidden_states=len(aux_layer_ids),
         target_hidden_size=model_provider.hidden_size,
         trunk_chunk=int(draft_config.get("trunk_chunk") or 1024),
+        layer_windows=layer_windows,
     )
     if speculator_type == "dflash":
         from nemo_rl.models.megatron.draft.dflash import DFlashDraftModel
@@ -1767,18 +1724,19 @@ def build_draft_model(
     config.use_mtp_layernorm = config.parallel_draft_heads_num_layers = None
     config.has_lm_head = True
 
-    raw_ttt_steps = draft_config.get("ttt_steps", 1)
-    ttt_steps = 1 if raw_ttt_steps is None else int(raw_ttt_steps)
-    if ttt_steps > 1:
-        # The TTT attention/loss path slices sequences locally and stashes
-        # per-pass KV; both require every rank to see the full sequence.
-        if int(getattr(model_provider, "context_parallel_size", 1) or 1) != 1:
-            raise ValueError(
-                "policy.draft.ttt_steps > 1 requires context_parallel_size == 1."
-            )
+    ttt_steps = int(draft_config.get("ttt_steps", 1) or 1)
+    cp_size = int(getattr(model_provider, "context_parallel_size", 1) or 1)
+    if ttt_steps > 1 or cp_size > 1:
+        # Both routes go through TTTDraftCoreAttention (multi-pass KV stash /
+        # zigzag ring), which owns its own sequence layout; MCore SP's
+        # scatter-gather around the attention has not been threaded through
+        # it. CP > 1 additionally requires sequence packing at runtime (the
+        # ring needs the THD zigzag layout) — the core attention enforces
+        # that per forward.
         if bool(model_provider.sequence_parallel):
             raise ValueError(
-                "policy.draft.ttt_steps > 1 requires sequence_parallel == false."
+                "policy.draft with ttt_steps > 1 or context_parallel_size > 1 "
+                "requires sequence_parallel == false."
             )
 
     draft_model = EagleModel(
@@ -1804,8 +1762,7 @@ def build_draft_model(
         draft_lm_head_key = "eagle_module.eagle_output_layer.weight"
         if draft_lm_head_key in missing_keys:
             copy_policy_lm_head_to_draft(
-                draft_model=draft_model,
-                policy_model_chunk=policy_model_chunk,
+                draft_model=draft_model, policy_model_chunk=policy_model_chunk
             )
             missing_keys = [key for key in missing_keys if key != draft_lm_head_key]
             print(
@@ -1818,8 +1775,7 @@ def build_draft_model(
             print(f"[draft] Unexpected keys after draft load: {unexpected_keys}")
     else:
         copy_policy_lm_head_to_draft(
-            draft_model=draft_model,
-            policy_model_chunk=policy_model_chunk,
+            draft_model=draft_model, policy_model_chunk=policy_model_chunk
         )
         print("[draft] Initialized draft LM head from the policy output layer.")
 

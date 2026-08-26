@@ -15,6 +15,7 @@
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+import torch.distributed
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -38,116 +39,6 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
         ContextParallelSharder,
     )
-
-
-def map_teacher_logits_to_draft_vocab(
-    teacher_logits: torch.Tensor,
-    d2t: Optional[torch.Tensor],
-    vocab_parallel_rank: Optional[int] = None,
-    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-    seq_chunk_size: Optional[int] = None,
-) -> torch.Tensor:
-    """Restrict full-vocab teacher logits to the draft vocabulary via ``d2t``.
-
-    ``d2t`` maps draft-vocab index ``i`` to target-vocab index ``i + d2t[i]``.
-    Under tensor parallelism the teacher logits arrive vocab-sharded, so they
-    are gathered to the full vocab and re-sliced to this rank's shard of the
-    draft vocabulary (the draft output layer is sharded the same way). No-op
-    when ``d2t`` is None (full-vocab drafts).
-
-    ``seq_chunk_size`` gathers and subsets in sequence chunks instead of all at
-    once: the full ``[B, S, V_full]`` gather peaks at several GiB at long
-    sequence lengths while only the ``[B, S, draft_vocab/tp]`` subset survives.
-    """
-    if d2t is None:
-        return teacher_logits
-    reverse_mapping = (
-        torch.arange(len(d2t), device=teacher_logits.device, dtype=d2t.dtype) + d2t
-    )
-    if vocab_parallel_group is not None:
-        from megatron.core.tensor_parallel import (
-            gather_from_tensor_model_parallel_region,
-        )
-
-        tp_size = torch.distributed.get_world_size(vocab_parallel_group)
-        local_draft_size = len(d2t) // tp_size
-        assert vocab_parallel_rank is not None
-        start_index = vocab_parallel_rank * local_draft_size
-        end_index = (vocab_parallel_rank + 1) * local_draft_size
-        reverse_mapping = reverse_mapping[start_index:end_index]
-
-        if seq_chunk_size is None:
-            teacher_logits = gather_from_tensor_model_parallel_region(
-                teacher_logits, vocab_parallel_group
-            )
-        else:
-            batch_size, seq_size = teacher_logits.shape[:2]
-            subset_teacher = torch.empty(
-                batch_size,
-                seq_size,
-                reverse_mapping.shape[0],
-                dtype=teacher_logits.dtype,
-                device=teacher_logits.device,
-            )
-            for chunk_start in range(0, seq_size, seq_chunk_size):
-                chunk_end = min(seq_size, chunk_start + seq_chunk_size)
-                gathered_chunk = gather_from_tensor_model_parallel_region(
-                    teacher_logits[:, chunk_start:chunk_end].contiguous(),
-                    vocab_parallel_group,
-                )
-                subset_teacher[:, chunk_start:chunk_end] = gathered_chunk[
-                    :, :, reverse_mapping
-                ]
-                del gathered_chunk
-            return subset_teacher
-    return teacher_logits[:, :, reverse_mapping]
-
-
-def roll_packed_seq_dim(
-    tensor: torch.Tensor,
-    cu_seqlens_padded: torch.Tensor,
-    seq_dim: int,
-) -> torch.Tensor:
-    """Left-shift a packed tensor by one along ``seq_dim`` within each segment.
-
-    Equivalent to a per-sequence ``torch.roll(shifts=-1)`` over the packed
-    layout: one global roll followed by zeroing each segment's final slot (the
-    only positions where the global roll would leak the next segment's first
-    row). Segment boundaries come from ``cu_seqlens_padded``, the physical
-    offsets of the packed layout.
-    """
-    rolled = torch.roll(tensor, shifts=-1, dims=seq_dim)
-    boundary_index = (cu_seqlens_padded[1:] - 1).to(
-        dtype=torch.long, device=rolled.device
-    )
-    index: list[Any] = [slice(None)] * rolled.dim()
-    index[seq_dim] = boundary_index
-    rolled[tuple(index)] = 0
-    return rolled
-
-
-def pack_rolled_draft_token_mask(
-    token_mask: torch.Tensor,
-    sample_mask: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_padded: torch.Tensor,
-) -> torch.Tensor:
-    """Build the packed draft-loss mask ``[1, T_packed]`` from unpacked masks.
-
-    Mirrors the non-packed DRAFT prepare (``token_mask`` left-shifted by one,
-    scaled by ``sample_mask``), laid out at each sequence's padded offset.
-    Each sequence's last real slot (whose shifted target would cross the
-    boundary) and all padding slots stay zero.
-
-    Reuses ``_pack_input_ids`` for the padded-offset layout (including its
-    clamp for bin-alignment padding absorbed into the last sequence's
-    effective length) and ``roll_packed_seq_dim`` for the boundary-safe
-    per-segment left shift.
-    """
-    packed = _pack_input_ids(
-        token_mask * sample_mask.unsqueeze(-1), cu_seqlens, cu_seqlens_padded
-    )
-    return roll_packed_seq_dim(packed, cu_seqlens_padded, seq_dim=1)
 
 
 def prepare_loss_input(
@@ -341,60 +232,303 @@ def prepare_loss_input(
                 ).contiguous(),
             )
     elif loss_fn.input_type == LossInputType.DRAFT:
-        from megatron.core.transformer.multi_token_prediction import roll_tensor
-
-        teacher_logits = roll_tensor(
-            logits.detach(),
-            shifts=-1,
-            dims=1,
-            cp_group=context_parallel_group,
-        )[0]
-        token_mask = roll_tensor(
-            data["token_mask"], shifts=-1, dims=1, cp_group=context_parallel_group
-        )[0]
-        teacher_logits = map_teacher_logits_to_draft_vocab(
-            teacher_logits,
-            d2t,
-            vocab_parallel_rank=vocab_parallel_rank,
-            vocab_parallel_group=vocab_parallel_group,
-        )
-        loss_input = {
-            "teacher_logits": teacher_logits,
-            "student_logits": data["student_logits"],
-            "token_mask": token_mask,
-        }
-
-    elif loss_fn.input_type == LossInputType.DRAFT_TTT:
-        # Multi-pass convention: pass-d student logits z^d_i predict x_{i+d+1},
-        # so the matching teacher is the policy's logits at position i+d. The
-        # teacher stays UNSHIFTED here — DraftTTTCrossEntropyLossFn slices it
-        # per pass (pure views) and builds the shifted masks with
-        # draft_pass_token_mask. Slicing replaces the CP-aware roll, so this
-        # path requires CP == 1.
+        # TTT convention: pass-d student logits z^d_i predict x_{i+d+1}; the
+        # matching teacher is the policy's logits at position i+d. The teacher
+        # stays UNSHIFTED here. In the unpacked path the loss fn slices per
+        # pass (pure views), which requires every rank to see the full
+        # sequence (CP == 1). In the packed path the loss fn instead rolls
+        # the teacher per subsequence with the CP-aware boundary exchange, so
+        # CP > 1 is allowed there (the train loop stashes the packed zigzag
+        # coords the loss needs).
         if (
             context_parallel_group is not None
             and torch.distributed.is_initialized()
             and torch.distributed.get_world_size(context_parallel_group) > 1
+            and "draft_packed_pos_in_seq" not in data
         ):
             raise NotImplementedError(
-                "Multi-pass draft distillation requires context_parallel_size == 1."
+                "Draft distillation loss requires context_parallel_size == 1 "
+                "unless sequence packing is enabled."
             )
-        teacher_logits = map_teacher_logits_to_draft_vocab(
-            logits.detach(),
-            d2t,
-            vocab_parallel_rank=vocab_parallel_rank,
-            vocab_parallel_group=vocab_parallel_group,
-            seq_chunk_size=loss_fn.seq_chunk_size,
-        )
+        teacher_logits = logits.detach()
+        if d2t is not None:
+            reverse_mapping = (
+                torch.arange(len(d2t), device=teacher_logits.device, dtype=d2t.dtype)
+                + d2t
+            )
+            if vocab_parallel_group is not None:
+                from megatron.core.tensor_parallel import (
+                    gather_from_tensor_model_parallel_region,
+                )
+
+                tp_size = torch.distributed.get_world_size(vocab_parallel_group)
+                local_draft_size = len(d2t) // tp_size
+                assert vocab_parallel_rank is not None
+                start_index = vocab_parallel_rank * local_draft_size
+                end_index = (vocab_parallel_rank + 1) * local_draft_size
+                reverse_mapping = reverse_mapping[start_index:end_index]
+
+                # Gather + d2t-subset in sequence chunks: gathering the whole
+                # [B, S, V_full] teacher at once peaks at several GiB at long
+                # sequence lengths, while only the [B, S, draft_vocab/tp]
+                # subset survives.
+                batch_size, seq_size = teacher_logits.shape[:2]
+                subset_teacher = torch.empty(
+                    batch_size,
+                    seq_size,
+                    reverse_mapping.shape[0],
+                    dtype=teacher_logits.dtype,
+                    device=teacher_logits.device,
+                )
+                for chunk_start in range(0, seq_size, loss_fn.seq_chunk_size):
+                    chunk_end = min(seq_size, chunk_start + loss_fn.seq_chunk_size)
+                    gathered_chunk = gather_from_tensor_model_parallel_region(
+                        teacher_logits[:, chunk_start:chunk_end].contiguous(),
+                        vocab_parallel_group,
+                    )
+                    subset_teacher[:, chunk_start:chunk_end] = gathered_chunk[
+                        :, :, reverse_mapping
+                    ]
+                    del gathered_chunk
+                teacher_logits = subset_teacher
+            else:
+                teacher_logits = teacher_logits[:, :, reverse_mapping]
+        if "student_logits_by_pass" in data:
+            student_logits_by_pass = list(data["student_logits_by_pass"])
+        else:
+            student_logits_by_pass = [data["student_logits"]]
         loss_input = {
             "teacher_logits": teacher_logits,
-            "student_logits_by_pass": list(data["student_logits_by_pass"]),
+            "student_logits_by_pass": student_logits_by_pass,
         }
 
     else:
         raise ValueError(f"Unknown loss function input type: {loss_fn.input_type}")
 
     return loss_input, data
+
+
+def roll_packed_left_cp(
+    tensor: torch.Tensor,
+    cu_seqlens_local: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Left-shift by one WITHIN each packed subsequence, zigzag-CP-aware.
+
+    ``tensor``'s dim 0 is the rank-local packed (THD) dimension and
+    ``cu_seqlens_local`` its subsequence boundaries. Without CP each
+    subsequence rolls independently with its tail zero-filled. Under CP the
+    local row of every subsequence is the zigzag pair ``[chunk_r,
+    chunk_{2cp-1-r}]`` (the ``_get_tokens_on_this_cp_rank`` layout), so each
+    chunk rolls locally and its tail element is the head of the globally NEXT
+    chunk: chunk ``r``'s successor lives on rank ``r+1`` (or is this rank's
+    own back chunk when ``r == cp-1``), chunk ``2cp-1-r``'s successor on rank
+    ``r-1`` (or is the global sequence tail, zero, when ``r == 0``). All
+    subsequences' boundary elements travel in ONE batched isend/irecv.
+    """
+    cp_size = 1 if cp_group is None else cp_group.size()
+    cu = cu_seqlens_local.to(dtype=torch.long)
+    seq_lens = cu[1:] - cu[:-1]
+
+    # Global roll first, then patch every chunk-tail row (which the global
+    # roll filled with the next chunk's head IN LOCAL LAYOUT — wrong across
+    # subsequence/zigzag boundaries).
+    rolled = torch.roll(tensor, shifts=-1, dims=0)
+
+    if cp_size == 1:
+        rolled[cu[1:] - 1] = 0
+        return rolled
+
+    cp_rank = cp_group.rank()
+    global_ranks = torch.distributed.get_process_group_ranks(cp_group)
+    next_rank = global_ranks[(cp_rank + 1) % cp_size]
+    prev_rank = global_ranks[(cp_rank - 1) % cp_size]
+
+    half = seq_lens // 2
+    front_head = cu[:-1]
+    back_head = cu[:-1] + half
+    front_tail = back_head - 1
+    back_tail = cu[1:] - 1
+
+    send_to_prev = tensor[front_head]  # prev's front-chunk tails need these
+    send_to_next = tensor[back_head]  # next's back-chunk tails need these
+    recv_from_next = torch.empty_like(send_to_prev)
+    recv_from_prev = torch.empty_like(send_to_next)
+
+    ops = []
+    if cp_rank > 0:
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, send_to_prev, prev_rank, cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, recv_from_prev, prev_rank, cp_group
+            )
+        )
+    if cp_rank < cp_size - 1:
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, send_to_next, next_rank, cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, recv_from_next, next_rank, cp_group
+            )
+        )
+    if ops:
+        for req in torch.distributed.batch_isend_irecv(ops):
+            req.wait()
+    if cp_rank == cp_size - 1:
+        # Chunk cp-1's global successor is chunk cp — this rank's own back chunk.
+        recv_from_next = tensor[back_head]
+    if cp_rank == 0:
+        # Chunk 2cp-1 is the global sequence tail.
+        recv_from_prev = torch.zeros_like(recv_from_prev)
+
+    rolled[front_tail] = recv_from_next
+    rolled[back_tail] = recv_from_prev
+    return rolled
+
+
+def packed_zigzag_token_coords(
+    cu_seqlens_global: torch.Tensor,
+    cp_rank: int,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map each rank-local packed token to ``(subseq index, global position)``.
+
+    ``cu_seqlens_global`` holds the PRE-CP padded boundaries. The local
+    layout is the per-subsequence zigzag (`_get_tokens_on_this_cp_rank`):
+    rank ``r`` holds chunks ``r`` and ``2*cp - 1 - r`` of every subsequence.
+    Returns two ``[T_local]`` int64 tensors: the packed subsequence index
+    (== the pre-packing batch row) and the token's position WITHIN its
+    subsequence in the original (un-sharded) order. Pure local arithmetic,
+    no communication — the basis for gathering per-token masks/labels from
+    unpacked ``[B, S]`` tensors.
+    """
+    cu = cu_seqlens_global.to(dtype=torch.long)
+    lens_local = (cu[1:] - cu[:-1]) // cp_size
+    num_seqs = lens_local.numel()
+    device = cu.device
+    cu_local = torch.zeros(num_seqs + 1, dtype=torch.long, device=device)
+    cu_local[1:] = torch.cumsum(lens_local, dim=0)
+    seq_index = torch.repeat_interleave(
+        torch.arange(num_seqs, device=device), lens_local
+    )
+    pos_local = (
+        torch.arange(int(cu_local[-1].item()), device=device) - cu_local[:-1][seq_index]
+    )
+    if cp_size == 1:
+        return seq_index, pos_local
+    half = (lens_local // 2)[seq_index]
+    is_front = pos_local < half
+    pos_global = torch.where(
+        is_front,
+        cp_rank * half + pos_local,
+        (2 * cp_size - 1 - cp_rank) * half + (pos_local - half),
+    )
+    return seq_index, pos_global
+
+
+def packed_zigzag_local_index(
+    seq_idx: torch.Tensor,
+    pos: torch.Tensor,
+    cu_seqlens_local: torch.Tensor,
+    cp_rank: int,
+    cp_size: int,
+) -> torch.Tensor:
+    """Rank-local THD row of ``(subseq, global in-seq position)``.
+
+    The caller guarantees this rank owns each position's zigzag chunk
+    (``pos // half in {cp_rank, 2*cp - 1 - cp_rank}``).
+    """
+    cu = cu_seqlens_local.to(dtype=torch.long)
+    half = ((cu[1:] - cu[:-1]) // 2)[seq_idx]
+    front_off = pos - cp_rank * half
+    is_front = (front_off >= 0) & (front_off < half)
+    back_off = pos - (2 * cp_size - 1 - cp_rank) * half
+    return cu[:-1][seq_idx] + torch.where(is_front, front_off, half + back_off)
+
+
+def packed_zigzag_successor_halo(
+    tensor: torch.Tensor,
+    cu_seqlens_local: torch.Tensor,
+    halo: int,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """First ``halo`` rows of each local chunk's globally NEXT chunk.
+
+    ``tensor``'s dim 0 is the rank-local zigzag THD row. Returns
+    ``[num_seqs, 2, halo, ...]`` (index 0 = front chunk's successor, 1 = back
+    chunk's). Same neighbor pattern as :func:`roll_packed_left_cp`: front
+    chunk ``r``'s successor is rank ``r+1``'s front chunk head (``r == cp-1``:
+    this rank's own back chunk), back chunk ``2cp-1-r``'s successor is rank
+    ``r-1``'s back chunk head (``r == 0``: past the sequence end, zeros).
+    Requires ``halo <= min(half)`` — a successor chunk must cover the halo.
+    """
+    cp_size = 1 if cp_group is None else cp_group.size()
+    cu = cu_seqlens_local.to(dtype=torch.long)
+    half = (cu[1:] - cu[:-1]) // 2
+    if halo > int(half.min().item()):
+        raise ValueError(
+            f"successor halo {halo} exceeds the smallest local chunk "
+            f"{int(half.min().item())}; shorten gamma or lower CP for this "
+            "sequence length."
+        )
+    num_seqs = half.numel()
+    row_shape = tensor.shape[1:]
+    head_index = torch.arange(halo, device=tensor.device).view(1, -1) + cu[:-1].view(
+        -1, 1
+    )
+    front_head = tensor[head_index.reshape(-1)].reshape(num_seqs, halo, *row_shape)
+    back_head = tensor[(head_index + half.view(-1, 1)).reshape(-1)].reshape(
+        num_seqs, halo, *row_shape
+    )
+
+    if cp_size == 1:
+        return torch.stack([back_head, torch.zeros_like(back_head)], dim=1)
+
+    cp_rank = cp_group.rank()
+    global_ranks = torch.distributed.get_process_group_ranks(cp_group)
+    next_rank = global_ranks[(cp_rank + 1) % cp_size]
+    prev_rank = global_ranks[(cp_rank - 1) % cp_size]
+
+    recv_front_halo = torch.empty_like(front_head)
+    recv_back_halo = torch.empty_like(back_head)
+    ops = []
+    if cp_rank > 0:
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, front_head.contiguous(), prev_rank, cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, recv_back_halo, prev_rank, cp_group
+            )
+        )
+    if cp_rank < cp_size - 1:
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, back_head.contiguous(), next_rank, cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, recv_front_halo, next_rank, cp_group
+            )
+        )
+    if ops:
+        for req in torch.distributed.batch_isend_irecv(ops):
+            req.wait()
+    if cp_rank == cp_size - 1:
+        recv_front_halo = back_head
+    if cp_rank == 0:
+        recv_back_halo = torch.zeros_like(back_head)
+    return torch.stack([recv_front_halo, recv_back_halo], dim=1)
 
 
 def draft_pass_token_mask(token_mask: torch.Tensor, ttt_pass: int) -> torch.Tensor:
@@ -459,23 +593,53 @@ def block_draft_slot_mask(
     not train the slots beyond it (multi-turn data would otherwise resurrect
     slots on the far side of the hole).
     """
-    batch_size, seq_len = token_mask.shape
-    num_anchors = anchors.shape[1]
+    batch_size, num_anchors = anchors.shape
+    seq_idx = (
+        torch.arange(batch_size, device=anchors.device)
+        .unsqueeze(1)
+        .expand(-1, num_anchors)
+        .reshape(-1)
+    )
+    return block_draft_slot_mask_packed(
+        token_mask,
+        sample_mask,
+        seq_idx,
+        anchors.reshape(-1),
+        anchor_valid.reshape(-1),
+        gamma=gamma,
+    ).reshape(batch_size, num_anchors, gamma)
+
+
+def block_draft_slot_mask_packed(
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    seq_idx: torch.Tensor,
+    anchors: torch.Tensor,
+    anchor_valid: torch.Tensor,
+    *,
+    gamma: int,
+) -> torch.Tensor:
+    """Flat-block variant of :func:`block_draft_slot_mask`.
+
+    ``seq_idx``/``anchors``/``anchor_valid`` are ``[NB]`` (one row per block,
+    e.g. this CP rank's owned subset of a packed microbatch); the masks stay
+    unpacked ``[B, S]``/``[B]``. Returns ``[NB, gamma]``.
+    """
+    seq_len = token_mask.shape[1]
     label_pos = (
         anchors.unsqueeze(-1)
         + 1
-        + torch.arange(gamma, device=anchors.device).view(1, 1, -1)
+        + torch.arange(gamma, device=anchors.device).view(1, -1)
     )
     in_bounds = label_pos < seq_len
-    label_pos_clamped = label_pos.clamp(max=seq_len - 1)
-    label_token_mask = torch.gather(
-        token_mask, 1, label_pos_clamped.reshape(batch_size, -1)
-    ).reshape(batch_size, num_anchors, gamma)
+    label_token_mask = token_mask[
+        seq_idx.unsqueeze(-1).expand(-1, gamma), label_pos.clamp(max=seq_len - 1)
+    ]
     slot_mask = (
         anchor_valid.unsqueeze(-1)
         & in_bounds
         & (label_token_mask > 0.5)
-        & (sample_mask.view(-1, 1, 1) > 0.5)
+        & (sample_mask[seq_idx].unsqueeze(-1) > 0.5)
     )
     return torch.cumprod(slot_mask.to(torch.int32), dim=-1).bool()
 

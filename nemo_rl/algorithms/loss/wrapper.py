@@ -22,7 +22,6 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import (
     BlockDraftLossFn,
     DraftCrossEntropyLossFn,
-    DraftTTTCrossEntropyLossFn,
     DSparkBlockLossFn,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -234,37 +233,23 @@ class SequencePackingFusionLossWrapper:
 
 
 class DraftLossWrapper:
-    """Combine policy loss with draft soft cross-entropy loss.
+    """Combine policy loss with the draft soft cross-entropy loss.
 
-    Two layouts are supported:
-
-    - Unpacked (default): ``prepare_fn`` (``prepare_loss_input`` with
-      ``LossInputType.DRAFT``) builds the shifted teacher logits and token mask
-      from the ``[B, S]`` batch, and the student logits come from
-      ``data["student_logits"]``.
-    - Packed (``cu_seqlens_q`` given): the draft cross-entropy is computed once
-      over the packed ``[1, T_packed]`` layout. The teacher logits are
-      left-shifted within each packed segment and restricted to the draft
-      vocabulary, and the token mask is packed with the same per-sequence
-      shift; ``student_logits`` must be passed explicitly (it is kept out of
-      the data dict so the packing loss wrappers never slice it).
-
-    ``ttt_steps > 1`` selects the multi-pass loss
-    (:class:`DraftTTTCrossEntropyLossFn`), which returns per-pass metrics
-    alongside the loss and needs ``global_draft_pass_counts``. Block drafts
-    are detected from the tensors the train loop stashed:
+    Block drafts are detected from the tensors the train loop stashed:
     ``data_dict["draft_block_logits"]`` selects :class:`BlockDraftLossFn`
     (soft CE), plus ``data_dict["draft_confidence_pred"]`` selects
-    :class:`DSparkBlockLossFn` (the official hard-CE + TV + confidence
-    loss). ``draft_loss_kwargs`` are the selected LossFn's remaining ctor
-    kwargs — ``slot_weights`` (+ dspark alphas) for block drafts,
-    ``pass_weights`` / ``seq_chunk_size`` for the multi-pass loss.
+    :class:`DSparkBlockLossFn` (the official hard-CE + TV + confidence loss);
+    otherwise the unified :class:`DraftCrossEntropyLossFn` covers single- and
+    multi-pass eagle3, packed or unpacked. ``draft_loss_kwargs`` are the
+    selected LossFn's remaining ctor kwargs — ``slot_weights`` (+ dspark
+    alphas) for block drafts, ``pass_weights`` / ``seq_chunk_size`` for
+    eagle3.
     """
 
     def __init__(
         self,
         loss_fn: Callable[..., tuple[torch.Tensor, dict[str, Any]]],
-        prepare_fn: Optional[Callable[Any, Any]],
+        prepare_fn: Callable[Any, Any],
         data_dict: BatchedDataDict[Any],
         loss_weight: float = 1.0,
         draft_loss_kwargs: Optional[dict[str, Any]] = None,
@@ -272,11 +257,6 @@ class DraftLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        cu_seqlens_q: Optional[torch.Tensor] = None,
-        cu_seqlens_q_padded: Optional[torch.Tensor] = None,
-        d2t: Optional[torch.Tensor] = None,
-        student_logits: Optional[torch.Tensor] = None,
-        ttt_steps: int = 1,
     ):
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
@@ -286,87 +266,27 @@ class DraftLossWrapper:
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
-        self.cu_seqlens_q = cu_seqlens_q
-        self.cu_seqlens_q_padded = (
-            cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
-        )
-        self.d2t = d2t
-        self.student_logits = student_logits
-        if cu_seqlens_q is not None and student_logits is None:
-            raise ValueError("student_logits must be passed explicitly in packed mode.")
-        if cu_seqlens_q is None and prepare_fn is None:
-            raise ValueError("prepare_fn is required in unpacked mode.")
-        self.multi_pass = ttt_steps > 1
         self.block_draft = "draft_block_logits" in data_dict
-        if cu_seqlens_q is not None and (self.multi_pass or self.block_draft):
-            raise ValueError(
-                "Only single-pass eagle3 draft training supports sequence "
-                "packing; the per-pass and per-slot slicing conventions need "
-                "the unpacked [B, S] layout."
-            )
         draft_loss_kwargs = draft_loss_kwargs or {}
         if self.block_draft and "draft_confidence_pred" in data_dict:
             self.draft_loss_fn: Any = DSparkBlockLossFn(
                 vocab_parallel_group=vocab_parallel_group,
                 vocab_parallel_rank=vocab_parallel_rank,
+                context_parallel_group=context_parallel_group,
                 **draft_loss_kwargs,
             )
         elif self.block_draft:
             self.draft_loss_fn = BlockDraftLossFn(
                 vocab_parallel_group=vocab_parallel_group,
-                **draft_loss_kwargs,
-            )
-        elif self.multi_pass:
-            self.draft_loss_fn = DraftTTTCrossEntropyLossFn(
-                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
                 **draft_loss_kwargs,
             )
         else:
             self.draft_loss_fn = DraftCrossEntropyLossFn(
                 vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
                 **draft_loss_kwargs,
             )
-
-    def _packed_draft_loss(
-        self,
-        next_token_logits: torch.Tensor,
-        data: BatchedDataDict[Any],
-        global_valid_seqs: torch.Tensor | None,
-        global_valid_toks: torch.Tensor,
-    ) -> torch.Tensor:
-        from nemo_rl.algorithms.loss.utils import (
-            map_teacher_logits_to_draft_vocab,
-            pack_rolled_draft_token_mask,
-            roll_packed_seq_dim,
-        )
-
-        teacher_logits = roll_packed_seq_dim(
-            next_token_logits.detach(), self.cu_seqlens_q_padded, seq_dim=1
-        )
-        teacher_logits = map_teacher_logits_to_draft_vocab(
-            teacher_logits,
-            self.d2t,
-            vocab_parallel_rank=self.vocab_parallel_rank,
-            vocab_parallel_group=self.vocab_parallel_group,
-        )
-        token_mask = pack_rolled_draft_token_mask(
-            data["token_mask"],
-            data["sample_mask"],
-            self.cu_seqlens_q,
-            self.cu_seqlens_q_padded,
-        )
-        # sample_mask is already folded into the packed token mask.
-        ones_sample_mask = torch.ones(
-            1, dtype=token_mask.dtype, device=token_mask.device
-        )
-        return self.draft_loss_fn(
-            teacher_logits=teacher_logits,
-            student_logits=self.student_logits,
-            token_mask=token_mask,
-            data=BatchedDataDict({"sample_mask": ones_sample_mask}),
-            global_valid_seqs=global_valid_seqs,
-            global_valid_toks=global_valid_toks,
-        )
 
     def __call__(
         self,
@@ -378,31 +298,45 @@ class DraftLossWrapper:
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if global_valid_toks is None:
             raise ValueError("global_valid_toks is required for DraftLossWrapper.")
+        # Every key the train loop stashes for the DRAFT loss. Their leading
+        # dim is blocks / local tokens / 1 — never the sequence count — so the
+        # inner packing wrapper, which slices data per sequence, must not see
+        # them; the draft loss below still gets the unfiltered `data`. Keep in
+        # lockstep with the data_dict writes in
+        # megatron/train.py::forward_with_post_processing_fn.
+        draft_only_keys = (
+            "draft_anchor_positions",
+            "draft_anchor_valid",
+            "draft_block_seq_idx",
+            "draft_packed_local_cu_seqlens",
+            "draft_block_logits",
+            "draft_confidence_pred",
+            "draft_packed_seq_index",
+            "draft_packed_pos_in_seq",
+            "student_logits",
+            "student_logits_by_pass",
+        )
+        policy_data = data
+        if any(k in data for k in draft_only_keys):
+            policy_data = BatchedDataDict(
+                {k: v for k, v in data.items() if k not in draft_only_keys}
+            )
         policy_loss, metrics = self.loss_fn(
             next_token_logits,
-            data,
+            policy_data,
             global_valid_seqs,
             global_valid_toks,
             **kwargs,
         )
 
-        draft_metrics: dict[str, Any] = {}
         if self.block_draft:
             # The block loss needs no prepare step: the teacher is the raw
             # (vocab-parallel) policy logits and the student block logits were
             # stashed by the train loop.
-            draft_loss, draft_metrics = self.draft_loss_fn(
-                data=data,
-                global_valid_seqs=global_valid_seqs,
-                global_valid_toks=global_valid_toks,
-                global_draft_pass_counts=self.global_draft_pass_counts,
-                teacher_logits=next_token_logits.detach(),
-                student_block_logits=data["draft_block_logits"],
-            )
-        elif self.cu_seqlens_q is not None:
-            draft_loss = self._packed_draft_loss(
-                next_token_logits, data, global_valid_seqs, global_valid_toks
-            )
+            loss_input = {
+                "teacher_logits": next_token_logits.detach(),
+                "student_block_logits": data["draft_block_logits"],
+            }
         else:
             loss_input, data = self.prepare_fn(
                 logits=next_token_logits,
@@ -412,23 +346,28 @@ class DraftLossWrapper:
                 vocab_parallel_group=self.vocab_parallel_group,
                 context_parallel_group=self.context_parallel_group,
             )
-            if self.multi_pass:
-                draft_loss, draft_metrics = self.draft_loss_fn(
-                    data=data,
-                    global_valid_seqs=global_valid_seqs,
-                    global_valid_toks=global_valid_toks,
-                    global_draft_pass_counts=self.global_draft_pass_counts,
-                    **loss_input,
-                )
-            else:
-                draft_loss = self.draft_loss_fn(
-                    data=data,
-                    global_valid_seqs=global_valid_seqs,
-                    global_valid_toks=global_valid_toks,
-                    **loss_input,
-                )
+        draft_loss, draft_metrics = self.draft_loss_fn(
+            data=data,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            global_draft_pass_counts=self.global_draft_pass_counts,
+            **loss_input,
+        )
         combined_loss = policy_loss + self.loss_weight * draft_loss
-        metrics["draft_loss"] = float(draft_loss.detach().item())
+        # Under CP each rank's draft_loss covers only its sequence shard over
+        # a global denominator; the metric must sum across CP explicitly (the
+        # gradient path does so implicitly via the grad all-reduce).
+        draft_loss_metric = draft_loss.detach()
+        if (
+            self.context_parallel_group is not None
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(self.context_parallel_group) > 1
+        ):
+            draft_loss_metric = draft_loss_metric.clone()
+            torch.distributed.all_reduce(
+                draft_loss_metric, group=self.context_parallel_group
+            )
+        metrics["draft_loss"] = float(draft_loss_metric.item())
         metrics.update(draft_metrics)
         return combined_loss, metrics
 

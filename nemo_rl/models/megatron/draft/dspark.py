@@ -32,7 +32,7 @@ come from :class:`~nemo_rl.models.megatron.draft.dflash.DFlashDraftModel`.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
@@ -66,6 +66,7 @@ class DSparkDraftModel(DFlashDraftModel):
         target_hidden_size: Optional[int] = None,
         markov_rank: int = 64,
         trunk_chunk: int = 1024,
+        layer_windows: Optional[list[int]] = None,
     ):
         super().__init__(
             config,
@@ -74,6 +75,7 @@ class DSparkDraftModel(DFlashDraftModel):
             num_aux_hidden_states=num_aux_hidden_states,
             target_hidden_size=target_hidden_size,
             trunk_chunk=trunk_chunk,
+            layer_windows=layer_windows,
             block_width=gamma,  # no bonus anchor slot
         )
         if markov_rank < 1:
@@ -107,11 +109,11 @@ class DSparkDraftModel(DFlashDraftModel):
 
         Args:
             prev_tokens: Token preceding each prediction, with shape
-                ``[B, N, gamma]``. For slot 0, this is the anchor token.
+                ``[..., gamma]``. For slot 0, this is the anchor token.
 
         Returns:
             Vocab-parallel logit bias with shape
-            ``[B, N, gamma, draft_vocab_local]``.
+            ``[..., gamma, draft_vocab_local]``.
         """
         embedded = self.markov_w1(prev_tokens)
         # ColumnParallelLinear expects sequence, batch, hidden dimensions.
@@ -122,11 +124,11 @@ class DSparkDraftModel(DFlashDraftModel):
         """Predict an acceptance logit for every draft slot.
 
         Args:
-            hidden: Decoder states with shape ``[B, N, gamma, h]``.
-            prev_tokens: Previous-token IDs with shape ``[B, N, gamma]``.
+            hidden: Decoder states with shape ``[..., gamma, h]``.
+            prev_tokens: Previous-token IDs with shape ``[..., gamma]``.
 
         Returns:
-            Pre-sigmoid fp32 logits with shape ``[B, N, gamma]``.
+            Pre-sigmoid fp32 logits with shape ``[..., gamma]``.
         """
         prev_embeddings = self.markov_w1(prev_tokens).to(dtype=hidden.dtype)
         features = torch.cat([hidden, prev_embeddings], dim=-1)
@@ -142,80 +144,95 @@ class DSparkDraftModel(DFlashDraftModel):
         lm_head_weight: Tensor,
         mask_embedding: Tensor,
         input_ids: Tensor,
+        packed_seq_params: Optional[Any] = None,
+        block_seq_idx: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor]:
         """Run the DSpark drafter and its two additional heads.
 
         For an anchor at ``p``, slot ``j`` predicts ``x_{p+j+1}``. Its Markov
-        and confidence inputs therefore use the ground-truth token ``x_{p+j}``,
-        which for slot 0 is the anchor token itself.
+        and confidence inputs therefore use the ground-truth token
+        ``x_{p+j}``. ``input_ids`` remains an unpacked, replicated ``[B, S]``
+        tensor even when the model trunk is packed, so these tokens can be
+        gathered locally without extra CP communication.
 
         The confidence head reads ``decoder_hidden`` before the LM-head TP
         gradient wrapper. Its loss is already computed in full on every TP
         rank; applying the wrapper would sum that complete gradient again.
 
         Args:
-            taps: Target auxiliary hidden states with shape ``[S, B, h_aux]``.
-            input_embeds: Unshifted target embeddings with shape ``[S, B, h]``.
-            anchors: Anchor positions with shape ``[B, N]``.
-            anchor_valid: Validity mask with shape ``[B, N]``. Invalid blocks
-                are ignored by the loss.
+            taps: Target auxiliary hidden states in padded or packed layout.
+            input_embeds: Unshifted target embeddings in the same layout as
+                ``taps``.
+            anchors: Anchor positions. Shape is ``[B, N]`` for padded input or
+                ``[NB]`` for packed blocks owned by this rank.
+            anchor_valid: Validity mask with the same layout as ``anchors``.
+                Invalid blocks are ignored by the loss.
             lm_head_weight: Detached target LM-head shard with shape
                 ``[V_local, h]``.
             mask_embedding: Detached target mask-token embedding with shape
                 ``[h]``.
-            input_ids: Ground-truth token IDs with shape ``[B, S]``.
+            input_ids: Replicated ground-truth token IDs with shape ``[B, S]``.
+            packed_seq_params: Global THD packing metadata, or ``None`` for
+                padded input.
+            block_seq_idx: For packed input, the subsequence index of each
+                local block, with shape ``[NB]``.
 
         Returns:
-            Markov-biased vocabulary logits with shape ``[B, N, W, V_local]``
-            and pre-sigmoid confidence logits with shape ``[B, N, W]``.
+            Markov-biased vocabulary logits and pre-sigmoid confidence logits.
+            Their padded shapes are ``[B, N, W, V_local]`` and ``[B, N, W]``;
+            packed shapes are ``[NB, W, V_local]`` and ``[NB, W]``.
         """
-        seq_len, batch = taps.shape[0], taps.shape[1]
-        num_anchors = anchors.shape[1]
-        num_blocks = batch * num_anchors
-        block_width = self.block_width
         device = taps.device
-
-        if anchors.shape[0] != batch:
-            raise ValueError(f"anchors batch {anchors.shape[0]} != taps batch {batch}.")
-        if int(anchors.max().item()) >= seq_len:
+        block_width = self.block_width
+        (
+            taps_flat,
+            embeds_flat,
+            block_seq,
+            anchors_flat,
+            cu_local,
+            pos_in_seq,
+            max_len,
+            cp_group,
+            out_shape,
+        ) = self._flatten_to_thd(
+            taps, input_embeds, anchors, packed_seq_params, block_seq_idx
+        )
+        num_blocks = block_seq.shape[0]
+        if int(anchors_flat.max().item()) >= max_len:
             raise ValueError("anchor position exceeds sequence length.")
 
         # Build the target-derived trunk K/V used by every draft block.
-        trunk_hidden = self.hidden_norm(self.fc(taps))
+        trunk_hidden = self.hidden_norm(self.fc(taps_flat))
         trunk_hidden = copy_to_tensor_model_parallel_region(trunk_hidden)
-        rotary_table = self.rotary_pos_emb(seq_len + block_width)
-        trunk_freqs = rotary_table[:seq_len]
+        # Build one full RoPE table and index it with explicit global positions;
+        # this avoids RotaryEmbedding slicing it a second time for CP.
+        rotary_table = self.rotary_pos_emb(max_len + block_width, packed_seq=True)
+        trunk_freqs = rotary_table[pos_in_seq]
 
-        block_row = torch.arange(batch, device=device).repeat_interleave(num_anchors)
-        anchors_flat = anchors.reshape(-1)
         vis_len = anchors_flat
 
         for layer, core in zip(self.decoder.layers, self._block_attn_modules):
             key, value = self._project_trunk_kv(layer.self_attention, trunk_hidden)
             key = apply_rotary_pos_emb(key, trunk_freqs, config=self.config)
             core.stage_trunk(
-                key.permute(1, 0, 2, 3).contiguous(),
-                value.permute(1, 0, 2, 3).contiguous(),
-                block_row,
+                key.squeeze(1).contiguous(),
+                value.squeeze(1).contiguous(),
+                block_seq,
                 vis_len,
+                cu_local,
                 block_width,
+                cp_group,
             )
 
         # Create each block from its anchor embedding followed by mask vectors.
-        embeds_flat = input_embeds.permute(1, 0, 2).reshape(batch * seq_len, -1)
-        anchor_embeds = embeds_flat[block_row * seq_len + anchors_flat]
-        hidden = (
-            mask_embedding.to(anchor_embeds.dtype)
-            .expand(num_blocks, block_width, -1)
-            .clone()
-        )
-        hidden[:, 0] = anchor_embeds
+        rows = self._anchor_embed_index(block_seq, anchors_flat, cu_local, cp_group)
+        mask_row = mask_embedding.to(embeds_flat.dtype)
+        hidden = mask_row.expand(num_blocks, block_width, -1).clone()
+        hidden[:, 0] = embeds_flat[rows]
         hidden = hidden.reshape(num_blocks * block_width, 1, -1)
 
-        positions = (
-            anchors_flat.unsqueeze(1)
-            + torch.arange(block_width, device=device).unsqueeze(0)
-        ).reshape(-1)
+        offsets = torch.arange(block_width, device=device)
+        positions = (anchors_flat.unsqueeze(1) + offsets).reshape(-1)
         block_freqs = rotary_table[positions]
 
         try:
@@ -230,17 +247,15 @@ class DSparkDraftModel(DFlashDraftModel):
 
         head_input = copy_to_tensor_model_parallel_region(decoder_hidden)
         logits = F.linear(head_input, lm_head_weight)
-        logits = logits.reshape(batch, num_anchors, block_width, -1)
-        hidden = decoder_hidden.reshape(batch, num_anchors, block_width, -1)
+        logits = logits.reshape(*out_shape)
+        hidden = decoder_hidden.reshape(*out_shape[:-1], -1)
 
         # Slot j uses the ground-truth token at p + j as its previous token.
-        prev_pos = (
-            anchors.unsqueeze(-1)
-            + torch.arange(block_width, device=device).view(1, 1, -1)
-        ).clamp(max=seq_len - 1)
-        prev_ids = torch.gather(input_ids, 1, prev_pos.reshape(batch, -1)).reshape(
-            batch, num_anchors, block_width
-        )
+        seq_len = input_ids.shape[1]
+        prev_pos = positions.reshape(num_blocks, block_width).clamp(max=seq_len - 1)
+        prev_ids = input_ids[
+            block_seq.unsqueeze(1).expand(-1, block_width), prev_pos
+        ].reshape(*out_shape[:-1])
         return (
             logits + self.markov_bias(prev_ids),
             self.confidence_logits(hidden, prev_ids),

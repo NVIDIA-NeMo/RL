@@ -21,7 +21,7 @@ mask is ``token_mask[i + d + 1] * sample_mask``.
 
 import torch
 
-from nemo_rl.algorithms.loss.loss_functions import DraftTTTCrossEntropyLossFn
+from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.algorithms.loss.utils import (
     compute_draft_pass_valid_counts,
     draft_pass_token_mask,
@@ -91,7 +91,7 @@ def test_single_pass_loss_matches_manual_soft_ce():
     sample_mask = torch.tensor([1.0, 1.0])
     pass_counts = compute_draft_pass_valid_counts(token_mask, sample_mask, ttt_steps=1)
 
-    loss_fn = DraftTTTCrossEntropyLossFn()
+    loss_fn = DraftCrossEntropyLossFn()
     loss, _ = loss_fn(
         teacher_logits=teacher,
         student_logits_by_pass=[student],
@@ -119,7 +119,7 @@ def test_multi_pass_loss_applies_weights_and_draft_denominator():
         w * c for w, c in zip(pass_weights, pass_counts.tolist(), strict=True)
     )
 
-    loss_fn = DraftTTTCrossEntropyLossFn(pass_weights=pass_weights)
+    loss_fn = DraftCrossEntropyLossFn(pass_weights=pass_weights)
     loss, metrics = loss_fn(
         teacher_logits=teacher,
         student_logits_by_pass=students,
@@ -159,7 +159,7 @@ def test_masked_positions_do_not_affect_loss():
     token_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0, 1.0, 0.0]])
     sample_mask = torch.tensor([1.0])
     data = BatchedDataDict({"token_mask": token_mask, "sample_mask": sample_mask})
-    loss_fn = DraftTTTCrossEntropyLossFn()
+    loss_fn = DraftCrossEntropyLossFn()
     kwargs = dict(
         global_valid_seqs=torch.tensor(1.0),
         global_valid_toks=torch.tensor(1.0),
@@ -192,7 +192,7 @@ def test_out_of_bounds_pass_is_skipped():
     token_mask = torch.ones(1, seq_len)
     sample_mask = torch.ones(1)
 
-    loss_fn = DraftTTTCrossEntropyLossFn()
+    loss_fn = DraftCrossEntropyLossFn()
     loss, metrics = loss_fn(
         teacher_logits=teacher,
         student_logits_by_pass=students,
@@ -234,7 +234,7 @@ def test_chunked_ce_matches_unchunked_loss_and_grads():
     )
 
     # Single chunk covers the whole sequence.
-    loss_a, _ = DraftTTTCrossEntropyLossFn(seq_chunk_size=seq_len)(
+    loss_a, _ = DraftCrossEntropyLossFn(seq_chunk_size=seq_len)(
         teacher_logits=teacher,
         student_logits_by_pass=list(students),
         data=data,
@@ -243,7 +243,7 @@ def test_chunked_ce_matches_unchunked_loss_and_grads():
     grads_a = torch.autograd.grad(loss_a, students, retain_graph=False)
 
     # Uneven multi-chunk split (11 = 3 + 3 + 3 + 2).
-    loss_b, _ = DraftTTTCrossEntropyLossFn(seq_chunk_size=3)(
+    loss_b, _ = DraftCrossEntropyLossFn(seq_chunk_size=3)(
         teacher_logits=teacher,
         student_logits_by_pass=list(students),
         data=data,
@@ -287,9 +287,26 @@ def test_prepare_loss_input_keeps_teacher_unshifted_and_detached():
             "sample_mask": torch.ones(1),
         }
     )
-    loss_fn = DraftTTTCrossEntropyLossFn()
+    loss_fn = DraftCrossEntropyLossFn()
     loss_input, _ = prepare_loss_input(logits=logits, data=data, loss_fn=loss_fn)
 
     assert torch.equal(loss_input["teacher_logits"], logits.detach())
     assert not loss_input["teacher_logits"].requires_grad
     assert len(loss_input["student_logits_by_pass"]) == 2
+
+
+def test_prepare_loss_input_falls_back_to_single_pass_key():
+    logits = torch.randn(1, 4, 6)
+    student = torch.randn(1, 4, 6)
+    data = BatchedDataDict(
+        {
+            "student_logits": student,
+            "token_mask": torch.ones(1, 4),
+            "sample_mask": torch.ones(1),
+        }
+    )
+    loss_fn = DraftCrossEntropyLossFn()
+    loss_input, _ = prepare_loss_input(logits=logits, data=data, loss_fn=loss_fn)
+
+    assert len(loss_input["student_logits_by_pass"]) == 1
+    assert loss_input["student_logits_by_pass"][0] is student

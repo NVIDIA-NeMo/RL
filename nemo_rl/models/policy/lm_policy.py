@@ -134,31 +134,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
                 "Set policy.megatron_cfg.enabled=true or disable policy.draft."
             )
-        if draft_enabled and config["megatron_cfg"]["context_parallel_size"] > 1:
-            # Sequence packing itself is supported with the draft; CP is not:
-            # the hidden-state capture and the per-segment shifts assume each
-            # packed sequence lives whole on one rank.
-            raise ValueError(
-                "policy.draft.enabled=true does not support context parallelism "
-                "yet. Set policy.megatron_cfg.context_parallel_size=1 or disable "
-                "policy.draft."
+        if draft_enabled:
+            packing_enabled = bool(
+                config.get("sequence_packing", {}).get("enabled", False)
             )
-        if (
-            draft_enabled
-            # sequence_packing is NotRequired in PolicyConfig, so tolerate its
-            # absence; the parallel sizes are required megatron_cfg keys.
-            and bool(config.get("sequence_packing", {}).get("enabled", False))
-            and config["megatron_cfg"]["pipeline_model_parallel_size"] > 1
-        ):
-            # The packed draft path re-embeds the per-segment-shifted token ids
-            # via the model's embedding, which MCore constructs only on the
-            # first pipeline stage while the draft runs on the last.
-            raise ValueError(
-                "policy.draft.enabled=true with sequence packing does not "
-                "support pipeline parallelism yet. Set "
-                "policy.megatron_cfg.pipeline_model_parallel_size=1, or disable "
-                "policy.sequence_packing or policy.draft."
+            draft_cp_size = int(
+                config.get("megatron_cfg", {}).get("context_parallel_size", 1) or 1
             )
+            if draft_cp_size > 1 and not packing_enabled:
+                raise ValueError(
+                    "policy.draft with context_parallel_size > 1 requires "
+                    "sequence packing (the trunk ring needs the THD zigzag "
+                    "layout). Enable policy.sequence_packing.enabled."
+                )
         if draft_enabled and bool(
             # use_fused_linear_logprobs is NotRequired in MegatronConfig.
             config["megatron_cfg"].get("use_fused_linear_logprobs", False)
@@ -174,7 +162,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "two."
             )
         if draft_enabled:
-            speculator_type = config["draft"].get("speculator_type") or "eagle3"
             raw_ttt_steps = config["draft"].get("ttt_steps", 1)
             draft_ttt_steps = 1 if raw_ttt_steps is None else int(raw_ttt_steps)
             if draft_ttt_steps < 1:
@@ -190,31 +177,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "policy.draft.ttt_pass_weights must have ttt_steps="
                     f"{draft_ttt_steps} entries, got {len(draft_pass_weights)}."
                 )
-            if bool(config.get("sequence_packing", {}).get("enabled", False)) and (
-                draft_ttt_steps > 1 or speculator_type != "eagle3"
-            ):
-                # Multi-pass TTT and block drafts slice the unshifted teacher
-                # per pass/slot to build their targets, which assumes the
-                # [B, S] layout; the packed draft loss pre-shifts and packs a
-                # single mask instead.
-                raise ValueError(
-                    "Only single-pass eagle3 draft training supports sequence "
-                    "packing. Set policy.draft.ttt_steps=1 and "
-                    "policy.draft.speculator_type=eagle3, or disable "
-                    "policy.sequence_packing."
-                )
-            # The TTT attention slices sequences locally and stashes per-pass
-            # KV; both need every rank to see the full sequence
-            # (build_draft_model re-checks on the worker).
-            if (
-                draft_ttt_steps > 1
-                and int(config["megatron_cfg"].get("context_parallel_size", 1) or 1)
-                != 1
-            ):
-                raise ValueError(
-                    "policy.draft.ttt_steps > 1 requires "
-                    "policy.megatron_cfg.context_parallel_size=1."
-                )
+            # The TTT attention stashes per-pass KV per full local (sub)row;
+            # SP would shard rows across TP ranks (build_draft_model re-checks
+            # on the worker).
             if draft_ttt_steps > 1 and bool(
                 config["megatron_cfg"].get("sequence_parallel")
             ):

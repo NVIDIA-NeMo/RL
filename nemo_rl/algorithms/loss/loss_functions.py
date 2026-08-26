@@ -26,7 +26,9 @@ from nemo_rl.algorithms.loss.interfaces import (
 )
 from nemo_rl.algorithms.loss.utils import (
     block_draft_slot_mask,
+    block_draft_slot_mask_packed,
     draft_pass_token_mask,
+    roll_packed_left_cp,
 )
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
@@ -45,7 +47,6 @@ from nemo_rl.algorithms.x_token.loss_utils import (
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedCrossEntropy,
-    DistributedCrossEntropy,
     cp_shift_next,
     group_all_reduce_sum,
     group_all_reduce_sum_with_grad,
@@ -64,14 +65,6 @@ class DraftCrossEntropyLossConfig(TypedDict):
 
 class DraftCrossEntropyLossDataDict(TypedDict):
     teacher_logits: Tensor
-    student_logits: Tensor
-    token_mask: Tensor
-    sample_mask: Tensor
-    student_vocab_indices: NotRequired[Tensor]
-
-
-class DraftTTTCrossEntropyLossDataDict(TypedDict):
-    teacher_logits: Tensor
     student_logits_by_pass: list[Tensor]
     token_mask: Tensor
     sample_mask: Tensor
@@ -79,57 +72,7 @@ class DraftTTTCrossEntropyLossDataDict(TypedDict):
 
 
 class DraftCrossEntropyLossFn(LossFunction):
-    """Compute the auxiliary soft-target cross-entropy used for draft-model training."""
-
-    loss_type = LossType.TOKEN_LEVEL
-    input_type = LossInputType.DRAFT
-
-    def __init__(
-        self,
-        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-    ):
-        self.vocab_parallel_group = vocab_parallel_group
-
-    def __call__(
-        self,
-        teacher_logits: Tensor,
-        student_logits: Tensor,
-        token_mask: Tensor,
-        data: BatchedDataDict[DraftCrossEntropyLossDataDict],
-        global_valid_seqs: torch.Tensor,
-        global_valid_toks: torch.Tensor,
-    ) -> torch.Tensor:
-        """Reduce the masked per-token draft loss to a scalar."""
-        if self.vocab_parallel_group is not None:
-            # Soft cross entropy matches the forward-KL student gradient.
-            per_token_loss = DistributedCrossEntropy.apply(
-                student_logits,
-                teacher_logits,
-                self.vocab_parallel_group,
-                False,
-            )
-        else:
-            # teacher_logits is already detached at the call site (utils.py);
-            # match DistributedCrossEntropy semantics.
-            teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
-            student_log_probs = torch.nn.functional.log_softmax(student_logits, dim=-1)
-            per_token_loss = -(teacher_probs * student_log_probs).sum(dim=-1)
-
-        mask = token_mask * data["sample_mask"].unsqueeze(-1)
-        return masked_mean(
-            per_token_loss,
-            mask,
-            global_normalization_factor=global_valid_toks,
-        )
-
-
-class DraftTTTCrossEntropyLossFn(LossFunction):
-    """Soft-target cross-entropy over several TTT draft passes.
-
-    The multi-pass sibling of :class:`DraftCrossEntropyLossFn`, selected when
-    ``policy.draft.ttt_steps > 1``. The single-pass class stays the loss for
-    ``ttt_steps == 1`` (including the packed layout), which is why the two live
-    side by side instead of behind a flag.
+    """Soft-target cross-entropy over one or more TTT draft passes.
 
     Pass ``d`` (1-indexed) student logits at position ``i`` predict token
     ``x_{i+d+1}``; the matching soft target is the (detached, unshifted)
@@ -150,20 +93,18 @@ class DraftTTTCrossEntropyLossFn(LossFunction):
     """
 
     loss_type = LossType.TOKEN_LEVEL
-    input_type = LossInputType.DRAFT_TTT
+    input_type = LossInputType.DRAFT
 
     def __init__(
         self,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         pass_weights: Optional[list[float]] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         seq_chunk_size: int = 4096,
     ):
         self.vocab_parallel_group = vocab_parallel_group
         self.pass_weights = pass_weights
-        # Sequence-dim tile for the loss internals: the fp32 soft-CE buffers
-        # here and the d2t full-vocab TP gather in prepare_loss_input. Trades
-        # a few extra TP collectives for peak memory; never affects results.
-        # Set via policy.draft.loss_seq_chunk_size.
+        self.context_parallel_group = context_parallel_group
         self.seq_chunk_size = seq_chunk_size
 
     def _per_token_soft_ce(
@@ -185,7 +126,7 @@ class DraftTTTCrossEntropyLossFn(LossFunction):
         self,
         teacher_logits: Tensor,
         student_logits_by_pass: list[Tensor],
-        data: BatchedDataDict[DraftTTTCrossEntropyLossDataDict],
+        data: BatchedDataDict[DraftCrossEntropyLossDataDict],
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
         global_draft_pass_counts: Optional[torch.Tensor] = None,
@@ -209,6 +150,24 @@ class DraftTTTCrossEntropyLossFn(LossFunction):
         token_mask = data["token_mask"]
         sample_mask = data["sample_mask"]
         seq_len = teacher_logits.shape[1]
+
+        # Packed (THD) mode: student/teacher are [1, T_local] over the packed
+        # (possibly CP-zigzag-sharded) row. The pass-d shift can no longer be
+        # a tensor-wide slice — it must stop at subsequence boundaries and, in
+        # the zigzag layout, cross chunk boundaries onto other CP ranks. The
+        # teacher (detached) is therefore ROLLED once per pass with the
+        # CP-aware per-subsequence roll, while the per-token mask is gathered
+        # locally from the unpacked [B, S] token_mask via the zigzag coords
+        # the train loop stashed (zero communication).
+        packed = "draft_packed_pos_in_seq" in data
+        if packed:
+            packed_seq_index = data["draft_packed_seq_index"]
+            packed_pos_in_seq = data["draft_packed_pos_in_seq"]
+            packed_cu_local = data["draft_packed_local_cu_seqlens"]
+            packed_input_lengths = data["input_lengths"].to(
+                device=packed_pos_in_seq.device, dtype=torch.long
+            )
+            teacher_rolled = teacher_logits
 
         if global_draft_pass_counts is not None:
             pass_counts = global_draft_pass_counts.float()
@@ -235,20 +194,46 @@ class DraftTTTCrossEntropyLossFn(LossFunction):
                 if self.pass_weights is None
                 else float(self.pass_weights[pass_index])
             )
-            valid_len = seq_len - ttt_pass - 1
-            if valid_len <= 0:
-                metrics[f"draft_loss_pass_{ttt_pass}"] = 0.0
-                continue
+            if packed:
+                # Advance the (detached) teacher one more per-subsequence
+                # step: after d rolls, position t holds the policy logits at
+                # its subsequence position pos+d. Rolled-past-the-end rows are
+                # zero (uniform soft target) and always masked below.
+                teacher_rolled = roll_packed_left_cp(
+                    teacher_rolled.squeeze(0),
+                    packed_cu_local,
+                    self.context_parallel_group,
+                ).unsqueeze(0)
+                per_token_loss = self._per_token_soft_ce(student_logits, teacher_rolled)
+                # Pass-d target x_{pos+d+1} is valid iff it exists in its
+                # subsequence AND is a trained (assistant) token; both come
+                # from the unpacked [B, S] masks via the local coords.
+                label_pos = packed_pos_in_seq + ttt_pass + 1
+                in_bounds = (label_pos < packed_input_lengths[packed_seq_index]) & (
+                    label_pos < token_mask.shape[1]
+                )
+                label_pos_clamped = label_pos.clamp(max=token_mask.shape[1] - 1)
+                pass_mask = (
+                    token_mask[packed_seq_index, label_pos_clamped]
+                    * in_bounds.to(token_mask.dtype)
+                    * sample_mask[packed_seq_index]
+                ).unsqueeze(0)
+            else:
+                valid_len = seq_len - ttt_pass - 1
+                if valid_len <= 0:
+                    metrics[f"draft_loss_pass_{ttt_pass}"] = 0.0
+                    continue
 
-            # Views into the unshifted tensors — the chunked CE makes its own
-            # per-chunk contiguous fp32 copies, so no full-pass copy here.
-            student_slice = student_logits[:, :valid_len]
-            teacher_slice = teacher_logits[:, ttt_pass : ttt_pass + valid_len]
-            per_token_loss = self._per_token_soft_ce(student_slice, teacher_slice)
+                # Views into the unshifted tensors — the chunked CE makes its
+                # own per-chunk contiguous fp32 copies, so no full-pass copy
+                # here.
+                student_slice = student_logits[:, :valid_len]
+                teacher_slice = teacher_logits[:, ttt_pass : ttt_pass + valid_len]
+                per_token_loss = self._per_token_soft_ce(student_slice, teacher_slice)
 
-            pass_mask = draft_pass_token_mask(
-                token_mask, ttt_pass
-            ) * sample_mask.unsqueeze(-1)
+                pass_mask = draft_pass_token_mask(
+                    token_mask, ttt_pass
+                ) * sample_mask.unsqueeze(-1)
             pass_sum = (per_token_loss.float() * pass_mask).sum()
             total = total + weight * pass_sum
 
@@ -261,10 +246,23 @@ class DraftTTTCrossEntropyLossFn(LossFunction):
                     if pass_counts is not None
                     else global_valid_toks.float()
                 )
+                # Under CP the local sum covers only this rank's sequence
+                # shard while the denominator is global; the GRADIENT path
+                # sums across CP implicitly (grad all-reduce), but the metric
+                # must reduce explicitly or it under-reports by cp_size.
+                metric_sum = pass_sum.detach()
+                if (
+                    self.context_parallel_group is not None
+                    and torch.distributed.is_initialized()
+                    and torch.distributed.get_world_size(self.context_parallel_group)
+                    > 1
+                ):
+                    metric_sum = metric_sum.clone()
+                    torch.distributed.all_reduce(
+                        metric_sum, group=self.context_parallel_group
+                    )
                 metrics[f"draft_loss_pass_{ttt_pass}"] = float(
-                    (
-                        pass_sum.detach() / torch.clamp(metric_denominator, min=1.0)
-                    ).item()
+                    (metric_sum / torch.clamp(metric_denominator, min=1.0)).item()
                 )
 
         loss = total / torch.clamp(denominator.float(), min=1.0)
@@ -322,11 +320,80 @@ def resolve_block_draft_slot_weights(scheme: Optional[str], gamma: int) -> list[
     return [math.exp(-j / gamma_d) for j in range(gamma)]
 
 
+def _cp_reduced_metric(value: Tensor, cp_group: Any) -> Tensor:
+    """Sum a detached metric numerator across CP ranks (no-op at CP == 1).
+
+    Under CP each rank's draft numerator covers only its owned blocks over a
+    global denominator; the GRADIENT path sums across CP implicitly (grad
+    all-reduce), but metrics must reduce explicitly or under-report.
+    """
+    if (
+        cp_group is None
+        or not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size(cp_group) <= 1
+    ):
+        return value
+    value = value.clone()
+    torch.distributed.all_reduce(value, group=cp_group)
+    return value
+
+
+def _packed_block_teacher_gather(
+    teacher: Tensor,
+    seq_idx: Tensor,
+    anchors: Tensor,
+    gamma: int,
+    cu_seqlens_local: Tensor,
+    cp_group: Any,
+) -> Tensor:
+    """Teacher rows at in-subsequence positions ``p + j`` per owned block.
+
+    ``teacher`` is the rank-local packed (zigzag) ``[T_local, V]`` policy
+    logits. Each block's anchor chunk is rank-local by ownership; slot
+    positions spill at most ``gamma - 1`` rows past its end, which a one-hop
+    successor-halo exchange covers (rows past the sequence end come back as
+    zeros and belong to invalid, masked slots). Returns ``[NB * gamma, V]``.
+    """
+    from nemo_rl.algorithms.loss.utils import packed_zigzag_successor_halo
+
+    total_local, vocab_local = teacher.shape
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+    cp_rank = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
+    cu = cu_seqlens_local.to(torch.long)
+    half_all = (cu[1:] - cu[:-1]) // 2
+    device = teacher.device
+
+    halo = gamma - 1
+    if halo > 0:
+        halo_rows = packed_zigzag_successor_halo(
+            teacher, cu, halo, cp_group if cp_size > 1 else None
+        )
+        extended = torch.cat([teacher, halo_rows.reshape(-1, vocab_local)], dim=0)
+    else:
+        extended = teacher
+
+    pos = anchors.unsqueeze(-1) + torch.arange(gamma, device=device).view(1, -1)
+    half = half_all[seq_idx].unsqueeze(-1)
+    anchor_chunk = (anchors // half_all[seq_idx]).unsqueeze(-1)
+    off = pos - anchor_chunk * half
+    is_front = anchor_chunk == cp_rank
+    local_row = cu[:-1][seq_idx].unsqueeze(-1) + torch.where(is_front, off, half + off)
+    halo_row = (
+        total_local
+        + (seq_idx.unsqueeze(-1) * 2 + torch.where(is_front, 0, 1)) * halo
+        + (off - half)
+    )
+    index = torch.where(off < half, local_row, halo_row)
+    return extended[index.reshape(-1)]
+
+
 class BlockDraftLossDataDict(TypedDict):
     draft_anchor_positions: Tensor
     draft_anchor_valid: Tensor
     token_mask: Tensor
     sample_mask: Tensor
+    draft_block_seq_idx: NotRequired[Tensor]
+    draft_packed_local_cu_seqlens: NotRequired[Tensor]
 
 
 class BlockDraftLossFn(LossFunction):
@@ -354,10 +421,12 @@ class BlockDraftLossFn(LossFunction):
         self,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         slot_weights: Optional[list[float]] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         seq_chunk_size: int = 4096,
     ):
         self.vocab_parallel_group = vocab_parallel_group
         self.slot_weights = slot_weights
+        self.context_parallel_group = context_parallel_group
         self.seq_chunk_size = seq_chunk_size
 
     def __call__(
@@ -369,8 +438,7 @@ class BlockDraftLossFn(LossFunction):
         global_valid_toks: torch.Tensor,
         global_draft_pass_counts: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        batch_size, num_anchors, gamma, _ = student_block_logits.shape
-        seq_len = teacher_logits.shape[1]
+        gamma = student_block_logits.shape[-2]
         device = student_block_logits.device
 
         if self.slot_weights is not None and len(self.slot_weights) != gamma:
@@ -392,34 +460,63 @@ class BlockDraftLossFn(LossFunction):
         token_mask = data["token_mask"]
         sample_mask = data["sample_mask"]
 
-        # Teacher for slot j sits at position p + j (it predicts x_{p+1+j}).
-        teacher_pos = (
-            anchors.unsqueeze(-1) + torch.arange(gamma, device=device).view(1, 1, -1)
-        ).clamp(max=seq_len - 1)
-        gather_index = teacher_pos.reshape(batch_size, num_anchors * gamma, 1).expand(
-            -1, -1, teacher_logits.shape[-1]
-        )
-        teacher_block = torch.gather(teacher_logits.detach(), 1, gather_index)
+        # Packed mode: the student is this rank's flat owned blocks
+        # [NB, gamma, V_local] and the teacher the rank-local packed row
+        # [1, T_local, V_local]; slot teachers gather via the successor-halo
+        # exchange. Unpacked mode flattens [B, N, ...] to the same [X, gamma]
+        # block-list core (teacher slots are plain [B, S] gathers).
+        packed = "draft_block_seq_idx" in data
+        if packed:
+            seq_idx = data["draft_block_seq_idx"]
+            teacher_block = _packed_block_teacher_gather(
+                teacher_logits.detach().squeeze(0),
+                seq_idx,
+                anchors,
+                gamma,
+                data["draft_packed_local_cu_seqlens"],
+                self.context_parallel_group,
+            )
+            num_blocks = anchors.shape[0]
+            slot_mask = block_draft_slot_mask_packed(
+                token_mask, sample_mask, seq_idx, anchors, anchor_valid, gamma=gamma
+            ).float()
+        else:
+            batch_size, num_anchors = anchors.shape
+            seq_len = teacher_logits.shape[1]
+            # Teacher for slot j sits at position p + j (it predicts x_{p+1+j}).
+            teacher_pos = (
+                anchors.unsqueeze(-1)
+                + torch.arange(gamma, device=device).view(1, 1, -1)
+            ).clamp(max=seq_len - 1)
+            gather_index = teacher_pos.reshape(
+                batch_size, num_anchors * gamma, 1
+            ).expand(-1, -1, teacher_logits.shape[-1])
+            teacher_block = torch.gather(teacher_logits.detach(), 1, gather_index)
+            num_blocks = batch_size * num_anchors
+            slot_mask = (
+                block_draft_slot_mask(
+                    token_mask, sample_mask, anchors, anchor_valid, gamma=gamma
+                )
+                .float()
+                .reshape(num_blocks, gamma)
+            )
 
-        student_flat = student_block_logits.reshape(batch_size, num_anchors * gamma, -1)
+        student_flat = student_block_logits.reshape(1, num_blocks * gamma, -1)
         per_token_loss = ChunkedDistributedCrossEntropy.apply(
             student_flat,
-            teacher_block,
+            teacher_block.reshape(1, num_blocks * gamma, -1),
             self.seq_chunk_size,
             self.vocab_parallel_group,
             False,
-        ).reshape(batch_size, num_anchors, gamma)
+        ).reshape(num_blocks, gamma)
 
-        slot_mask = block_draft_slot_mask(
-            token_mask, sample_mask, anchors, anchor_valid, gamma=gamma
-        ).float()
         weights = (
             torch.ones(gamma, device=device, dtype=torch.float32)
             if self.slot_weights is None
             else torch.tensor(self.slot_weights, device=device, dtype=torch.float32)
         )
 
-        per_slot_sum = (per_token_loss.float() * slot_mask).sum(dim=(0, 1))
+        per_slot_sum = (per_token_loss.float() * slot_mask).sum(dim=0)
         total = (per_slot_sum * weights).sum()
 
         if global_draft_pass_counts is not None:
@@ -431,6 +528,9 @@ class BlockDraftLossFn(LossFunction):
 
         metrics: dict[str, Any] = {}
         with torch.no_grad():
+            per_slot_metric = _cp_reduced_metric(
+                per_slot_sum.detach(), self.context_parallel_group
+            )
             for slot in range(gamma):
                 metric_denominator = (
                     slot_counts[slot]
@@ -439,8 +539,7 @@ class BlockDraftLossFn(LossFunction):
                 )
                 metrics[f"draft_loss_slot_{slot}"] = float(
                     (
-                        per_slot_sum[slot].detach()
-                        / torch.clamp(metric_denominator, min=1.0)
+                        per_slot_metric[slot] / torch.clamp(metric_denominator, min=1.0)
                     ).item()
                 )
 
@@ -455,6 +554,8 @@ class DSparkBlockLossDataDict(TypedDict):
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
     draft_confidence_pred: torch.Tensor
+    draft_block_seq_idx: NotRequired[torch.Tensor]
+    draft_packed_local_cu_seqlens: NotRequired[torch.Tensor]
 
 
 class DSparkBlockLossFn(LossFunction):
@@ -481,6 +582,7 @@ class DSparkBlockLossFn(LossFunction):
         ce_loss_alpha: float = 0.1,
         tv_loss_alpha: float = 0.9,
         confidence_head_alpha: float = 1.0,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         seq_chunk_size: int = 4096,
     ):
         self.vocab_parallel_group = vocab_parallel_group
@@ -489,6 +591,7 @@ class DSparkBlockLossFn(LossFunction):
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.tv_loss_alpha = float(tv_loss_alpha)
         self.confidence_head_alpha = float(confidence_head_alpha)
+        self.context_parallel_group = context_parallel_group
         self.seq_chunk_size = seq_chunk_size
 
     def __call__(
@@ -500,8 +603,7 @@ class DSparkBlockLossFn(LossFunction):
         global_valid_toks: torch.Tensor,
         global_draft_pass_counts: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        batch_size, num_anchors, gamma, vocab_local = student_block_logits.shape
-        seq_len = teacher_logits.shape[1]
+        gamma, vocab_local = student_block_logits.shape[-2:]
         device = student_block_logits.device
 
         if self.slot_weights is not None and len(self.slot_weights) != gamma:
@@ -523,18 +625,64 @@ class DSparkBlockLossFn(LossFunction):
         token_mask = data["token_mask"]
         sample_mask = data["sample_mask"]
         input_ids = data["input_ids"]
+        seq_len = input_ids.shape[1]
 
-        slot_offsets = torch.arange(gamma, device=device).view(1, 1, -1)
-        # Teacher for slot j sits at position p + j; its label is x_{p+1+j}.
-        teacher_pos = (anchors.unsqueeze(-1) + slot_offsets).clamp(max=seq_len - 1)
-        label_pos = (anchors.unsqueeze(-1) + 1 + slot_offsets).clamp(max=seq_len - 1)
-        gather_index = teacher_pos.reshape(batch_size, num_anchors * gamma, 1).expand(
-            -1, -1, vocab_local
-        )
-        teacher_block = torch.gather(teacher_logits.detach(), 1, gather_index)
-        labels = torch.gather(
-            input_ids, 1, label_pos.reshape(batch_size, num_anchors * gamma)
-        )
+        # Packed mode: flat owned blocks + halo teacher gather; unpacked
+        # flattens [B, N, ...] onto the same [X, gamma] block-list core (see
+        # BlockDraftLossFn). Labels always come from the unpacked input_ids.
+        packed = "draft_block_seq_idx" in data
+        if packed:
+            seq_idx = data["draft_block_seq_idx"]
+            num_blocks = anchors.shape[0]
+            anchors_flat = anchors
+            teacher_block = _packed_block_teacher_gather(
+                teacher_logits.detach().squeeze(0),
+                seq_idx,
+                anchors_flat,
+                gamma,
+                data["draft_packed_local_cu_seqlens"],
+                self.context_parallel_group,
+            )
+            slot_mask = block_draft_slot_mask_packed(
+                token_mask,
+                sample_mask,
+                seq_idx,
+                anchors_flat,
+                anchor_valid,
+                gamma=gamma,
+            ).float()
+        else:
+            batch_size, num_anchors = anchors.shape
+            num_blocks = batch_size * num_anchors
+            slot_offsets = torch.arange(gamma, device=device).view(1, 1, -1)
+            # Teacher for slot j sits at position p + j.
+            teacher_pos = (anchors.unsqueeze(-1) + slot_offsets).clamp(max=seq_len - 1)
+            gather_index = teacher_pos.reshape(
+                batch_size, num_anchors * gamma, 1
+            ).expand(-1, -1, vocab_local)
+            teacher_block = torch.gather(teacher_logits.detach(), 1, gather_index)
+            seq_idx = (
+                torch.arange(batch_size, device=device)
+                .unsqueeze(1)
+                .expand(-1, num_anchors)
+                .reshape(-1)
+            )
+            anchors_flat = anchors.reshape(-1)
+            slot_mask = (
+                block_draft_slot_mask(
+                    token_mask, sample_mask, anchors, anchor_valid, gamma=gamma
+                )
+                .float()
+                .reshape(num_blocks, gamma)
+            )
+
+        # Slot j's label is x_{p+1+j}, gathered from the unpacked ids.
+        label_pos = (
+            anchors_flat.reshape(-1).unsqueeze(-1)
+            + 1
+            + torch.arange(gamma, device=device).view(1, -1)
+        ).clamp(max=seq_len - 1)
+        labels = input_ids[seq_idx.unsqueeze(-1).expand(-1, gamma), label_pos]
 
         # Deferred import: dspark-path-only dependency.
         from nemo_rl.distributed.model_utils import ChunkedDistributedLabelCEAndTV
@@ -542,7 +690,7 @@ class DSparkBlockLossFn(LossFunction):
         # Flatten the batch dim into the chunked dim so the fp32 chunk
         # transients are bounded by chunk_size ROWS regardless of the
         # dynamic-batching batch size (the a512 OOM lesson).
-        total_rows = batch_size * num_anchors * gamma
+        total_rows = num_blocks * gamma
         per_token_ce, per_token_tv = ChunkedDistributedLabelCEAndTV.apply(
             student_block_logits.reshape(1, total_rows, vocab_local),
             teacher_block.reshape(1, total_rows, vocab_local),
@@ -552,12 +700,9 @@ class DSparkBlockLossFn(LossFunction):
             self.seq_chunk_size,
             self.vocab_parallel_group,
         )
-        per_token_ce = per_token_ce.reshape(batch_size, num_anchors, gamma)
-        per_token_tv = per_token_tv.reshape(batch_size, num_anchors, gamma)
+        per_token_ce = per_token_ce.reshape(num_blocks, gamma)
+        per_token_tv = per_token_tv.reshape(num_blocks, gamma)
 
-        slot_mask = block_draft_slot_mask(
-            token_mask, sample_mask, anchors, anchor_valid, gamma=gamma
-        ).float()
         weights = (
             torch.ones(gamma, device=device, dtype=torch.float32)
             if self.slot_weights is None
@@ -571,7 +716,7 @@ class DSparkBlockLossFn(LossFunction):
         # TV acceptance rate per slot; training target for the confidence head.
         accept_rate = (1.0 - 0.5 * per_token_tv.detach()).clamp_(0.0, 1.0)
 
-        confidence_pred = data["draft_confidence_pred"]
+        confidence_pred = data["draft_confidence_pred"].reshape(num_blocks, gamma)
         confidence_bce = torch.nn.functional.binary_cross_entropy_with_logits(
             confidence_pred.float(), accept_rate, reduction="none"
         )
@@ -593,24 +738,47 @@ class DSparkBlockLossFn(LossFunction):
 
         metrics: dict[str, Any] = {}
         with torch.no_grad():
-            metrics["dspark_ce_loss"] = float((ce_sum / denominator).item())
-            metrics["dspark_tv_loss"] = float((tv_sum / denominator).item())
-            metrics["dspark_confidence_loss"] = float(
-                (confidence_sum / denominator).item()
-            )
+            cp_group = self.context_parallel_group
             confidence_error = (
                 torch.sigmoid(confidence_pred.float()) - accept_rate
             ) * weighted_mask
-            metrics["dspark_confidence_abs_error"] = float(
-                (confidence_error.abs().sum() / denominator).item()
-            )
-            metrics["dspark_confidence_bias"] = float(
-                (confidence_error.sum() / denominator).item()
-            )
-
             valid_accept = accept_rate * slot_mask
-            per_slot_ce_sum = (per_token_ce.float() * slot_mask).sum(dim=(0, 1))
-            per_slot_accept_sum = valid_accept.sum(dim=(0, 1))
+            # Expected accepted tokens per block (+1 bonus token), the
+            # probabilistic tau of the DeepSpec logs. Invalid slots zero the
+            # cumprod tail, matching the official eval_mask semantics. Valid
+            # blocks == slot-0-valid blocks (anchor candidates require a
+            # trained first label).
+            tau_per_block = 1.0 + valid_accept.cumprod(dim=-1).sum(dim=-1)
+            sums = _cp_reduced_metric(
+                torch.stack(
+                    [
+                        ce_sum.detach(),
+                        tv_sum.detach(),
+                        confidence_sum.detach(),
+                        confidence_error.abs().sum(),
+                        confidence_error.sum(),
+                        (tau_per_block * slot_mask[:, 0]).sum(),
+                    ]
+                ),
+                cp_group,
+            )
+            metrics["dspark_ce_loss"] = float((sums[0] / denominator).item())
+            metrics["dspark_tv_loss"] = float((sums[1] / denominator).item())
+            metrics["dspark_confidence_loss"] = float((sums[2] / denominator).item())
+            metrics["dspark_confidence_abs_error"] = float(
+                (sums[3] / denominator).item()
+            )
+            metrics["dspark_confidence_bias"] = float((sums[4] / denominator).item())
+
+            per_slot = _cp_reduced_metric(
+                torch.stack(
+                    [
+                        (per_token_ce.float() * slot_mask).sum(dim=0),
+                        valid_accept.sum(dim=0),
+                    ]
+                ),
+                cp_group,
+            )
             for slot in range(gamma):
                 metric_denominator = torch.clamp(
                     slot_counts[slot]
@@ -619,26 +787,19 @@ class DSparkBlockLossFn(LossFunction):
                     min=1.0,
                 )
                 metrics[f"draft_loss_slot_{slot}"] = float(
-                    (per_slot_ce_sum[slot] / metric_denominator).item()
+                    (per_slot[0, slot] / metric_denominator).item()
                 )
                 metrics[f"accept_rate_slot_{slot}"] = float(
-                    (per_slot_accept_sum[slot] / metric_denominator).item()
+                    (per_slot[1, slot] / metric_denominator).item()
                 )
 
-            # Expected accepted tokens per block (+1 bonus token), the
-            # probabilistic tau of the DeepSpec logs. Invalid slots zero the
-            # cumprod tail, matching the official eval_mask semantics. Valid
-            # blocks == slot-0-valid blocks (anchor candidates require a
-            # trained first label).
-            tau_per_block = 1.0 + valid_accept.cumprod(dim=-1).sum(dim=-1)
-            tau_sum = (tau_per_block * slot_mask[:, :, 0]).sum()
             block_count = (
                 float(slot_counts[0].item())
                 if slot_counts is not None
                 else float(tau_per_block.numel())
             )
             metrics["dspark_tau_probabilistic"] = float(
-                (tau_sum / max(block_count, 1.0)).item()
+                (sums[5] / max(block_count, 1.0)).item()
             )
 
         return loss, metrics
