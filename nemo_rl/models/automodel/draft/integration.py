@@ -23,6 +23,7 @@ policy with a validated metadata record.
 import contextlib
 import json
 import os
+import re
 from typing import Any, Optional
 
 import torch
@@ -779,26 +780,29 @@ class DSparkRuntime(_DraftRuntimeBase):
     def _terms_to_metrics(terms: dict[str, torch.Tensor]) -> dict[str, float]:
         """Flatten the loss terms into shape-stable scalar metrics.
 
-        Ratios are formed per microbatch (num / den); the training-loop metric
-        aggregation then averages across microbatches and ranks. This is a
-        microbatch-weighted mean rather than an exact token-weighted global
-        ratio, which is sufficient for trend monitoring.
+        Ratios (tau, accept_rate) are emitted as raw ``*_num``/``*_den`` pairs,
+        NOT pre-divided: the training-loop metric aggregation
+        (``grpo.py``'s per-key reduction) sums every metric not on its small
+        mean-reduction allowlist across all microbatches and DP ranks, so a
+        pre-divided per-microbatch ratio would be summed into a meaningless
+        value (see ``finalize_draft_ratio_metrics``, which the training loop
+        calls after that reduction to turn the summed num/den pairs back into
+        the correct token-weighted global ratio).
         """
         metrics: dict[str, float] = {
             "draft_loss": float(terms["loss"].item()),
             "draft_ce_loss": float(terms["ce_loss"].item()),
             "draft_tv_loss": float(terms["l1_loss"].item()),
             "draft_conf_loss": float(terms["confidence_loss"].item()),
+            "draft_tau_num": float(terms["tau_num"].item()),
+            "draft_tau_den": float(terms["tau_den"].item()),
         }
-        tau_den = float(terms["tau_den"].item())
-        metrics["draft_tau"] = (
-            float(terms["tau_num"].item()) / tau_den if tau_den > 0 else 0.0
-        )
         # One host transfer per vector instead of one sync per position.
         pos_nums = terms["accept_rate_per_pos_num"].tolist()
         pos_dens = terms["accept_rate_per_pos_den"].tolist()
         for k, (num_k, den_k) in enumerate(zip(pos_nums, pos_dens)):
-            metrics[f"draft_accept_rate@{k + 1}"] = num_k / den_k if den_k > 0 else 0.0
+            metrics[f"draft_accept_rate_num@{k + 1}"] = num_k
+            metrics[f"draft_accept_rate_den@{k + 1}"] = den_k
         return metrics
 
 
@@ -960,15 +964,19 @@ class Eagle3Runtime(_DraftRuntimeBase):
             .tolist()
         )
         loss_nums, loss_dens, full_nums, full_dens, cond_nums, cond_dens = stats
+        # Raw num/den pairs, NOT pre-divided: see
+        # DSparkRuntime._terms_to_metrics / finalize_draft_ratio_metrics for
+        # why (grpo.py sums per-microbatch metrics across microbatches and DP
+        # ranks by default; a pre-divided ratio would be summed into a
+        # meaningless value).
         metrics: dict[str, float] = {}
         for step in range(len(loss_nums)):
-            metrics[f"draft_ttt_loss@{step}"] = loss_nums[step] / loss_dens[step]
-            metrics[f"draft_full_acc@{step}"] = (
-                full_nums[step] / full_dens[step] if full_dens[step] > 0 else 0.0
-            )
-            metrics[f"draft_cond_acc@{step}"] = (
-                cond_nums[step] / cond_dens[step] if cond_dens[step] > 0 else 0.0
-            )
+            metrics[f"draft_ttt_loss_num@{step}"] = loss_nums[step]
+            metrics[f"draft_ttt_loss_den@{step}"] = loss_dens[step]
+            metrics[f"draft_full_acc_num@{step}"] = full_nums[step]
+            metrics[f"draft_full_acc_den@{step}"] = full_dens[step]
+            metrics[f"draft_cond_acc_num@{step}"] = cond_nums[step]
+            metrics[f"draft_cond_acc_den@{step}"] = cond_dens[step]
         metrics["draft_loss"] = float(loss.item())
         # See DSparkRuntime.begin_global_batch: average across microbatch
         # slots so the summed backward keeps a global-mean gradient scale.
@@ -977,6 +985,35 @@ class Eagle3Runtime(_DraftRuntimeBase):
         self._teacher_logits = None
         self.capture.clear()
         return loss, metrics
+
+
+_RATIO_NUM_RE = re.compile(r"^(.*)_num(@\d+)?$")
+
+
+def finalize_draft_ratio_metrics(metrics: dict[str, Any]) -> None:
+    """Turn summed ``*_num``/``*_den`` metric pairs back into ratios, in place.
+
+    DSparkRuntime/Eagle3Runtime emit per-microbatch accuracy/rate metrics as
+    raw num/den pairs instead of pre-divided ratios, because the training
+    loop's default per-key metric reduction (``grpo.py``) sums every metric
+    not on its small mean-reduction allowlist across all microbatches and DP
+    ranks -- summing a pre-divided per-microbatch ratio would produce a
+    meaningless value (e.g. a "draft_full_acc@0" of 240 instead of a rate in
+    [0, 1]). Call this AFTER that per-key reduction has summed the raw num/den
+    pairs into global totals, so the ratio it computes is the correct
+    token-weighted global rate.
+    """
+    for key in list(metrics.keys()):
+        match = _RATIO_NUM_RE.match(key)
+        if match is None:
+            continue
+        base, suffix = match.group(1), match.group(2) or ""
+        den_key = f"{base}_den{suffix}"
+        if den_key not in metrics:
+            continue
+        num = metrics.pop(key)
+        den = metrics.pop(den_key)
+        metrics[f"{base}{suffix}"] = num / den if den > 0 else 0.0
 
 
 DSPARK_OPTIMIZER_GROUP_NAMES = ("policy", "draft")
