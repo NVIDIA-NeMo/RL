@@ -25,7 +25,7 @@ dependencies = [
   "setuptools",
   "pip",                                                                                                 # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",                                                                                               # for flash-attn parallel build
-  "torch==2.11.0",
+  "torch==2.13.0",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]>=2.55.1",
@@ -49,7 +49,7 @@ dependencies = [
   "plotly",
   "sympy>=1.14.0",
   "pillow>=12.3.0",                                                                                      # Address CVE (Pillow 12.3.0)
-  "torchvision==0.26.0",
+  "torchvision==0.28.0",
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range compatible with backend-specific pins while selecting 5.12.1
@@ -118,11 +118,9 @@ dependencies = [
 [project.optional-dependencies]
 fsdp = [
   "transformers==5.12.1",
-  # +cu13 wheels from GitHub match torch cu130; PyPI often resolves to +cu12 (libcudart.so.12).
-  # https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.1
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  # Built from sdist: the published cu13 wheels are linked against torch 2.10's
+  # C++ ABI, and no prebuilt wheel targets the torch 2.13 the vLLM source requires.
+  "flash-attn==2.8.1",
   "mamba-ssm",
   "causal-conv1d",
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -135,9 +133,9 @@ automodel = [
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  # Built from sdist: the published cu13 wheels are linked against torch 2.10's
+  # C++ ABI, and no prebuilt wheel targets the torch 2.13 the vLLM source requires.
+  "flash-attn==2.8.1",
   # Mirrors nemo-automodel's own `transformers==5.12.1` pin (Automodel r0.6.0).
   "transformers==5.12.1",
   "mistral-common>=1.11.0",
@@ -156,16 +154,20 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  # Default wheels on GitHub are cu130. See v0.25.1 release assets:
-  # https://github.com/vllm-project/vllm/releases/tag/v0.25.1
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "vllm==0.25.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  # Unpinned on purpose: vLLM is resolved from the local editable checkout at
+  # 3rdparty/vLLM-workspace/vllm (see [tool.uv.sources] below). Clone the
+  # Qwen3.8 FlashNext source there before running `uv sync`; an empty directory
+  # fails resolution. See docs/guides/models/qwen/qwen3-8-flash-next.md.
+  "vllm",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.13",
-  "flashinfer-cubin==0.6.13",
-  "flashinfer-jit-cache==0.6.13",
-  "nvidia-cutlass-dsl[cu13]==4.5.2",
+  # Versions mirror 3rdparty/vLLM-workspace/vllm/requirements/cuda.txt. Keep
+  # them in sync on every vLLM source bump.
+  "flashinfer-python==0.6.17",
+  # flashinfer-cubin is deliberately absent: releases newer than 0.6.13 are
+  # hosted only on FlashInfer's wheel index, and the vLLM source excludes the
+  # package from install_requires. FlashInfer falls back to its JIT cache.
+  "flashinfer-jit-cache==0.6.17",
+  "nvidia-cutlass-dsl[cu13]==4.6.2",
 ]
 sglang = [
   # sgl-project/sglang branch `sglang-miles` (based on v0.5.16). Needed for the
@@ -205,9 +207,9 @@ mcore = [
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  # Built from sdist: the published cu13 wheels are linked against torch 2.10's
+  # C++ ABI, and no prebuilt wheel targets the torch 2.13 the vLLM source requires.
+  "flash-attn==2.8.1",
   # mamba-ssm/causal-conv1d LOOK redundant (megatron-bridge[ssm] pulls them), but do not
   # remove them: [tool.uv.sources] git pins only attach to direct requirements, and the
   # conflicting extras resolve in separate forks — without these direct deps the mcore fork
@@ -244,7 +246,7 @@ nemo_gym = ["nemo_gym"]
 # This is a default group so that we install these even with bare `uv sync`
 build = [
   # Build requirement for TE
-  "torch==2.11.0",
+  "torch==2.13.0",
   # Build requirement for TE
   "setuptools",
   "packaging",
@@ -293,6 +295,7 @@ tensorrt-llm = { path = "3rdparty/TensorRT-LLM-workspace" }
 nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = true }
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge", editable = true }
 nemo_gym = { workspace = true }
+vllm = { path = "3rdparty/vLLM-workspace/vllm", editable = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # Must stay on the rev megatron-core pins for its dev/otel extras: the workspace
 # resolves a single nemo-lens, and PyPI's newest release (0.1.0) is older than
@@ -392,23 +395,25 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
+  # nemo-gym's conservative openai ceiling predates NamespaceTool, which this
+  # vLLM source imports at module scope.
+  "openai>=2.25.0",
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
-  # An override is required because torch 2.11.0+cu130 pins nvidia-nccl-cu13==2.28.9.
+  # An override is required because the torch+cu130 wheels pin an older NCCL.
   "nvidia-nccl-cu13==2.30.7",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
   "opencv-python-headless; sys_platform == 'never'",
   "timm<=1.0.22",
   "fastapi[standard]>=0.133.0,<0.137.0",
   "nvidia-modelopt[torch]>=0.44.0a0",
-  "torch==2.11.0",
-  # Floor only: trtllm (<1.4.0) and vllm (>=1.7.0) are incompatible, and the
-  # universal lock resolves 1.3.0 either way. Pre-existing on main.
-  "llguidance>=1.3.0",
+  "torch==2.13.0",
+  # Keep the global override compatible with the local vLLM source.
+  "llguidance>=1.7.0,<1.8.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
@@ -485,7 +490,7 @@ constraint-dependencies = [
 
 # Workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base
 # and libs-cu13 wheels overlap and race on shared paths. libs-cu13 is a
-# functional superset at 4.5.2, so drop libs-base to make installs deterministic.
+# functional superset at 4.6.2, so drop libs-base to make installs deterministic.
 exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
 
 conflicts = [

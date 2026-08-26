@@ -1,11 +1,12 @@
-# Qwen3.8 FlashNext
+# Qwen3.8-Flash-Next
 
-This page collects NeMo RL guidance for post-training Qwen3.8 FlashNext 180B,
-also known as BrightDelta. Use it to set up the environment, choose a starting
-recipe, and understand the settings that are specific to this model.
+This page collects NeMo RL guidance for post-training
+[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) 180B. Use
+it to set up the environment, choose a starting recipe, and understand the
+settings that are specific to this model.
 
 > [!IMPORTANT]
-> **Early access.** Qwen3.8 FlashNext 180B runs end-to-end in NeMo RL and short
+> **Early access.** Qwen3.8-Flash-Next 180B runs end-to-end in NeMo RL and short
 > GRPO runs have been numerically validated, but long-run convergence has not
 > been established.
 
@@ -18,13 +19,13 @@ Model support is tracked in two stages:
 | **Functionally Ready** | Runnable end-to-end and numerically validated with an initial training run. |
 | **Long-Run Convergence Validated** | Trains stably over a full-length run with a healthy, reproducible reward curve. |
 
-Qwen3.8 FlashNext 180B is **Functionally Ready**.
+Qwen3.8-Flash-Next 180B is **Functionally Ready**.
 
 ## What's Supported
 
 | Model | Modality | Training backend | Parallelism | Inference | Precision |
 | --- | --- | --- | --- | --- | --- |
-| Qwen3.8 FlashNext 180B | LLM (text-only path) | AutoModel (DTensor) | FSDP2 + EP | vLLM | BF16 |
+| Qwen3.8-Flash-Next 180B | LLM (text-only path) | AutoModel (DTensor) | FSDP2 + EP | vLLM | BF16 |
 
 Notes:
 
@@ -34,25 +35,33 @@ Notes:
 
 ## Build the Environment
 
-Published NeMo RL containers do not yet include the complete Qwen3.8 FlashNext
+Published NeMo RL containers do not yet include the complete Qwen3.8-Flash-Next
 runtime. Use the pinned AutoModel submodule together with a vLLM build that
-contains Qwen3.8 FlashNext support.
+contains Qwen3.8-Flash-Next support.
 
 ### 1. Clone the sources into `3rdparty/`
 
 Sources:
 
-- **AutoModel** — the revision pinned by this repository's AutoModel submodule.
-- **vLLM** — `<partner vLLM repository>`, branch `qwen38next`, or a container
-  with the same runtime baked in.
+- **AutoModel** — the `huiyingl/feat/qwen3-8-flash-next-rl` branch of
+  `NVIDIA-NeMo/Automodel`, pinned by this repository's AutoModel submodule.
+- **vLLM** — [main branch](https://github.com/vllm-project/vllm), where
+  Qwen3.8-Flash-Next support is merged.
+
+The root `pyproject.toml` resolves vLLM from the editable local path
+`3rdparty/vLLM-workspace/vllm`. Clone the source at that exact path before
+running `uv sync`; leaving it absent or empty makes dependency resolution fail.
 
 ```bash
 git submodule update --init 3rdparty/Automodel-workspace/Automodel
 
 mkdir -p 3rdparty/vLLM-workspace
-git clone <partner-vllm-repository-url> 3rdparty/vLLM-workspace/vllm
-git -C 3rdparty/vLLM-workspace/vllm checkout qwen38next
+git clone https://github.com/vllm-project/vllm.git 3rdparty/vLLM-workspace/vllm
 ```
+
+The vLLM environment uses FlashInfer 0.6.17. `flashinfer-cubin` is not an
+install requirement because its 0.6.17 release is hosted outside PyPI;
+FlashInfer uses the pinned 0.6.17 JIT cache instead.
 
 ### 2. Force a worker-venv rebuild
 
