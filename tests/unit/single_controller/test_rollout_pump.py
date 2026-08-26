@@ -1001,7 +1001,10 @@ def test_rollout_pump_writes_expected_tq_data(
     dp_adapter = _SyncDPAdapter(tq_actor)
 
     master_config = MasterConfig.model_construct(
-        policy={"train_global_batch_size": expected_samples},
+        policy={
+            "train_global_batch_size": expected_samples,
+            "generation": {"colocated": {"enabled": False}},
+        },
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=num_prompts,
             num_generations_per_prompt=num_generations,
