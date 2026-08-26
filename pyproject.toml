@@ -153,6 +153,8 @@ vllm = [
   "flashinfer-cubin==0.6.14",
   "flashinfer-jit-cache==0.6.14",
   "nvidia-cutlass-dsl[cu13]==4.6.0",
+  # Quack 0.6.1 uses the CUTLASS DSL 4.6 API required by vLLM 0.26.
+  "quack-kernels==0.6.1",
 ]
 sglang = [
   "sglang==0.5.12.post1",
