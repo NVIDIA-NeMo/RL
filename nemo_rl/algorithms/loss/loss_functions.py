@@ -401,11 +401,22 @@ class ClippedPGLossFn(LossFunction):
 
         # Positions whose ``curr_logprobs`` were filtered out carry a
         # substituted value, so every quantity derived from ``curr_logprobs``
-        # reduces over ``actor_mask`` instead. Everything else keeps the full
-        # mask: the reference-policy KL reads ``curr_logprobs_unfiltered`` and
-        # the mismatch diagnostics read only prev/generation logprobs, so
-        # narrowing them would drop real terms -- and drop them selectively,
-        # since a token is filtered precisely where the policies disagree.
+        # reduces over ``actor_mask`` instead.
+        #
+        # The reference-policy KL keeps the full mask and is genuinely clean
+        # there: it reads ``curr_logprobs_unfiltered``, which is finite at
+        # exactly those positions.
+        #
+        # The mismatch diagnostics keep the full mask for a weaker reason, and
+        # it is worth being precise about it. They read ``prev_logprobs``,
+        # which carries its OWN substitutions -- the same helper runs on the
+        # logprob-inference pass (see ``automodel/train.py``,
+        # ``megatron/train.py`` and ``dtensor_policy_worker.py``). So they are
+        # not clean; they simply cannot be narrowed here, because the keep mask
+        # published this step identifies the positions *this* forward filtered,
+        # not the ones the earlier forward did, and narrowing with it would
+        # drop the wrong ones. ``force_on_policy_ratio`` is the single case
+        # where the two sets coincide, since prev is then an alias of curr.
         keep_mask = data.get("curr_logprobs_keep_mask")
         actor_token_mask = token_mask if keep_mask is None else token_mask * keep_mask
         actor_mask = actor_token_mask * sample_mask.unsqueeze(-1)
