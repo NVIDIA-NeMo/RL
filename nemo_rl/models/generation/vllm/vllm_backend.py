@@ -281,7 +281,11 @@ class VllmInternalWorkerExtension:
             raise
         finally:
             try:
-                # Preserve deferred replay inputs before this buffer is reused.
+                # Native layerwise reload may defer weight_loader calls until all
+                # shards for a layer have arrived. NCCL/IPC weights are views into
+                # reusable receive buffers that subsequent transfers may overwrite,
+                # so clone any pending tensors that alias the current buffer and
+                # preserve them until deferred replay consumes them.
                 _detach_pending_layerwise_weights(
                     self.model_runner.model, source_storage_ptrs
                 )
@@ -971,7 +975,9 @@ class VllmInternalWorkerExtension:
                     group=self.model_update_group,
                     src=0,
                     post_unpack_func=self._load_weights,
-                    # One stream orders deferred clone/replay dependencies.
+                    # Double buffering (num_buffers > 1) causes a race condition
+                    # when using native_layerwise_refit: deferred weight_loader
+                    # replays may read a buffer while the other stream refills it.
                     num_buffers=1 if native_layerwise_refit else None,
                 )
                 finalize()
