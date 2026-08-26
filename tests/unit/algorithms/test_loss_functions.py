@@ -188,6 +188,10 @@ def test_student_topk_opd_loss_uses_head_and_sampled_tail():
     expected_metrics = {
         "loss",
         "kl_penalty",
+        "token_mult_prob_error",
+        "gen_kl_error",
+        "policy_kl_error",
+        "js_divergence_error",
         "num_valid_samples",
         "opd_topk_head_loss",
         "opd_topk_tail_loss",
