@@ -118,6 +118,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
         data_plane_checkpoint_metadata=None,
+        finalizer_actors=[],
     )
     args.update(overrides)
     return SimpleNamespace(**args)
