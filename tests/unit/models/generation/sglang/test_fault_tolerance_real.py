@@ -69,7 +69,6 @@ def _make_fault_tolerant_cfg(pad_token_id):
             "dp_size": 1,
             "pp_size": 1,
             "ep_size": 1,
-            "disable_piecewise_cuda_graph": True,
             "disable_cuda_graph": True,
             "mem_fraction_static": 0.3,
             "sglang_server_config": {
