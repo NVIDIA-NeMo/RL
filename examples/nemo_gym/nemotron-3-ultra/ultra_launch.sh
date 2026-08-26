@@ -753,14 +753,33 @@ if [[ -d "${OVERLAY_SOURCE}/nemo_rl" ]]; then
   _append_mount "${OVERLAY_SOURCE}/nemo_rl:/opt/nemo-rl/nemo_rl"
   echo "  Mount: nemo_rl → /opt/nemo-rl/nemo_rl"
 fi
+# The worktree's project files must ride along with the overlaid sources:
+# node-side venv rebuilds run `uv sync --locked` against /opt/nemo-rl, and a
+# mounted Gym/pyproject paired with the container's baked uv.lock fails the
+# lock check (job 6368547).
+for _project_file in pyproject.toml uv.lock .python-version; do
+  if [[ -f "${OVERLAY_SOURCE}/${_project_file}" ]]; then
+    _append_mount "${OVERLAY_SOURCE}/${_project_file}:/opt/nemo-rl/${_project_file}"
+    echo "  Mount: ${_project_file} → /opt/nemo-rl/${_project_file}"
+  fi
+done
 if [[ -d "${OVERLAY_SOURCE}/examples/configs" ]]; then
   _append_mount "${OVERLAY_SOURCE}/examples/configs:/opt/nemo-rl/examples/configs"
   echo "  Mount: configs → /opt/nemo-rl/examples/configs"
 fi
-if [[ -d "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
-  echo "  Mount: Gym → /opt/nemo-rl/3rdparty/Gym-workspace/Gym"
-fi
+_local_project_paths=(
+  "3rdparty/TensorRT-LLM-workspace"
+  "3rdparty/Automodel-workspace/Automodel"
+  "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
+  "3rdparty/Gym-workspace/Gym"
+  "research/template_project"
+)
+for _local_project_path in "${_local_project_paths[@]}"; do
+  if [[ -d "${OVERLAY_SOURCE}/${_local_project_path}" ]]; then
+    _append_mount "${OVERLAY_SOURCE}/${_local_project_path}:/opt/nemo-rl/${_local_project_path}"
+    echo "  Mount: ${_local_project_path} → /opt/nemo-rl/${_local_project_path}"
+  fi
+done
 
 if [[ "${USE_SNAPSHOT}" == "1" ]]; then
   _append_mount "${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"
@@ -855,7 +874,16 @@ export SETUP_COMMAND
 # learning rate, etc.) live in CONFIG_PATH. The launcher only passes the
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
+# A shared UV cache (e.g. prewarmed on Lustre) takes precedence; the /tmp
+# fallback expands ${SLURM_JOB_ID} at runtime, hence the single quotes.
+if [ -n "${UV_CACHE_DIR:-}" ]; then
+  _TRAIN_UV_CACHE_DIR="${UV_CACHE_DIR}"
+else
+  _TRAIN_UV_CACHE_DIR='/tmp/nemo-gym-uv-cache-${SLURM_JOB_ID:-default}'
+fi
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
+${NRL_DRIVER_PIP_INSTALL:+uv pip install --python /opt/nemo_rl_venv/bin/python ${NRL_DRIVER_PIP_INSTALL} ; }\
+${NRL_DRIVER_PYTHONPATH:+PYTHONPATH=${NRL_DRIVER_PYTHONPATH} }\
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
 WANDB_INIT_TIMEOUT=300 \
@@ -864,7 +892,7 @@ NRL_VLLM_CACHE_SEED_DIR=${NRL_VLLM_CACHE_SEED_DIR} \
 DG_JIT_CACHE_DIR=${NRL_VLLM_LOCAL_CACHE_DIR}/deep_gemm \
 TORCHINDUCTOR_CACHE_DIR=${INDUCTOR_CACHE_DIR} \
 TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
-UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-\${SLURM_JOB_ID:-default} \
+UV_CACHE_DIR=${_TRAIN_UV_CACHE_DIR} \
 UV_LOCK_TIMEOUT=1800 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
 UV_HTTP_TIMEOUT=10 \
@@ -875,7 +903,7 @@ NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
+uv run ${NRL_DRIVER_UV_RUN_FLAGS:-} ${NRL_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py} \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \
@@ -1086,7 +1114,7 @@ if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
     ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
     ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
     ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-    --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"other","description":"batch training run"}}' \
+    --comment="{\"OccupiedIdleGPUsJobReaper\":{\"exemptIdleTimeMins\":\"${JOB_REAPER_EXEMPT_MINS:-60}\",\"reason\":\"other\",\"description\":\"batch training run\"}}" \
     : \
     --nodes="${NUM_EXTERNAL_SERVICE_NODES}" \
     --account="${SLURM_ACCOUNT}" \
@@ -1118,7 +1146,7 @@ else
     ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
     ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
     ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-    --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"other","description":"batch training run"}}' \
+    --comment="{\"OccupiedIdleGPUsJobReaper\":{\"exemptIdleTimeMins\":\"${JOB_REAPER_EXEMPT_MINS:-60}\",\"reason\":\"other\",\"description\":\"batch training run\"}}" \
     "${BATCH_SCRIPT}")
 fi
 
