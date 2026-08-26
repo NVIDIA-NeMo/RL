@@ -20,7 +20,7 @@ loss_fn:
   ratio_clip_max: 0.28
   force_on_policy_ratio: true
 checkpointing:
-  checkpoint_dir: results/grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated
+  checkpoint_dir: results/grpo-glm5.2-72n8g-megatron-noncolocated
 policy:
   model_name: zai-org/GLM-5.2
   # TODO: Remove this workaround after upgrading Transformers to a version that
