@@ -390,9 +390,6 @@ override-dependencies = [
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
   "opencv-python-headless; sys_platform == 'never'",
   "timm<=1.0.22",
-  # Worker venvs start with a base uv sync. FastAPI is already transitive; request
-  # its standard extra so uvicorn[standard], including uvloop, is installed before
-  # backend extras are layered on. Preserve vLLM 0.25.1's supported FastAPI range.
   "fastapi[standard]>=0.133.0,<0.137.0",
   "nvidia-modelopt[torch]>=0.44.0a0",
   "torch==2.11.0",
