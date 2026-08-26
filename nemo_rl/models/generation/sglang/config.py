@@ -192,6 +192,10 @@ class SglangSpecificArgs(TypedDict):
     enable_multimodal: NotRequired[bool]
     # Sampling kernel backend (e.g. "flashinfer", "pytorch"); None = auto.
     sampling_backend: NotRequired[str | None]
+    # MoE runner implementation; "auto" lets SGLang select for the model/device.
+    moe_runner_backend: NotRequired[str]
+    # NVFP4 GEMM runner implementation; "auto" lets SGLang select for the device.
+    fp4_gemm_runner_backend: NotRequired[str]
     # Maximum context length; None = take from model config.json.
     context_length: NotRequired[int | None]
     # Fraction of GPU memory used for static allocation (weights + KV pool). Lower if OOM.

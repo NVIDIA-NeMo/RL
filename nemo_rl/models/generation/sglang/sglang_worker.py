@@ -511,6 +511,8 @@ class SGLangGenerationWorker:
             "cpu_offload_gb",
             "log_level",
             "mem_fraction_static",
+            "moe_runner_backend",
+            "fp4_gemm_runner_backend",
             "allow_auto_truncate",
             "disable_cuda_graph",
             "disable_cuda_graph_padding",
