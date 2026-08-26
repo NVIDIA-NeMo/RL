@@ -597,12 +597,12 @@ def setup_model_and_optimizer(
                 "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
             )
 
-        if model_config.model_type == "qwen3_5_moe":
+        if model_config.model_type in ("qwen3_5", "qwen3_5_moe"):
             try:
                 import fla  # noqa: F401
             except ImportError:
                 raise ImportError(
-                    "Qwen3.5 MoE requires flash-linear-attention for context parallel. "
+                    "Qwen3.5 requires flash-linear-attention for context parallel. "
                     "Please install it in your Automodel venv: pip install flash-linear-attention"
                 )
 
