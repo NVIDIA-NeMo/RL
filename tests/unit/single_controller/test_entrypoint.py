@@ -35,7 +35,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             "megatron_cfg": {"mtp_num_layers": 2},
         },
         env={},
-        data_plane={"enabled": True},
+        data_plane={"enabled": True, "impl": "transfer_queue", "backend": "simple"},
         logger={"log_dir": "/tmp/logs"},
         checkpointing={"enabled": False},
         async_rl=SimpleNamespace(
@@ -50,6 +50,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         env_handles={},
         gen_handle=SimpleNamespace(shutdown=MagicMock()),
         trainer_handle=SimpleNamespace(shutdown=MagicMock()),
+        value_handle=None,
     )
     ray_get = MagicMock(return_value={})
     # The driver now polls ping() around the run. Report the run as ready on the first

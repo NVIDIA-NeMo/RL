@@ -14,11 +14,14 @@
 
 import math
 from datetime import datetime
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from nemo_rl.algorithms.grpo import AsyncGRPOConfig, GRPOConfig, MasterConfig
+from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.utils import (
     EFFICIENCY_CATEGORIES,
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
@@ -144,6 +147,43 @@ def test_get_tokenizer_custom_jinja_template(conversation_messages):
     assert formatted == expected
 
 
+def test_get_tokenizer_forwards_tokenizer_kwargs():
+    """Test get_tokenizer unpacks tokenizer_kwargs into from_pretrained."""
+    config = {
+        "name": "meta-llama/Llama-3.2-1B-Instruct",
+        "tokenizer_kwargs": {"model_max_length": 123},
+    }
+    with patch("nemo_rl.algorithms.utils.AutoTokenizer") as mock_auto_tokenizer:
+        get_tokenizer(config)
+
+    mock_auto_tokenizer.from_pretrained.assert_called_once_with(
+        "meta-llama/Llama-3.2-1B-Instruct",
+        trust_remote_code=True,
+        model_max_length=123,
+    )
+
+
+def test_get_processor_forwards_tokenizer_kwargs():
+    """Test get_tokenizer forwards tokenizer_kwargs through AutoProcessor."""
+    config = {
+        "name": "Qwen/Qwen2.5-VL-3B-Instruct",
+        "tokenizer_kwargs": {"model_max_length": 123, "use_fast": False},
+    }
+    with patch("nemo_rl.algorithms.utils.AutoProcessor") as mock_auto_processor:
+        get_tokenizer(config, get_processor=True)
+
+    mock_auto_processor.from_pretrained.assert_called_once_with(
+        "Qwen/Qwen2.5-VL-3B-Instruct",
+        trust_remote_code=True,
+        use_fast=False,
+        model_max_length=123,
+    )
+    assert config["tokenizer_kwargs"] == {
+        "model_max_length": 123,
+        "use_fast": False,
+    }
+
+
 def test_maybe_pad_last_batch():
     """Test maybe_pad_last_batch function for various scenarios"""
     # Test case 1: No padding needed
@@ -247,6 +287,26 @@ def _base_master_config(colocated: bool):
     )
 
 
+def _base_ppo_master_config(colocated: bool):
+    return PPOMasterConfig.model_construct(
+        cluster={"num_nodes": 2, "gpus_per_node": 8},
+        policy={
+            "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
+                "colocated": {
+                    "enabled": colocated,
+                    "resources": {"num_nodes": 1, "gpus_per_node": 8},
+                },
+            }
+        },
+        ppo=PPOConfig.model_construct(
+            num_prompts_per_step=8, num_generations_per_prompt=10
+        ),
+    )
+
+
 def test_sync_colocated_throughput_flops_and_imbalance(capsys):
     master_config = _base_master_config(colocated=True)
 
@@ -274,7 +334,13 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
     }
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=False,
     )
 
     # Validate key throughput metrics
@@ -343,7 +409,13 @@ def test_train_elapsed_seconds_used_for_flops_calculation(capsys):
     }
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=False,
     )
 
     assert math.isclose(perf["train_flops_per_gpu"], 500.0 / 8, rel_tol=1e-6)
@@ -375,8 +447,16 @@ def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     train_results = {}
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=True,
     )
+
+    assert "training_worker_idle_time_ratio" in perf
 
     # Throughput checks
     assert math.isclose(perf["samples_per_sec_per_gpu"], 0.5, rel_tol=1e-6)
@@ -427,7 +507,13 @@ def test_minimal_inputs_no_counts_no_flops(capsys):
     train_results = {}
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=False,
     )
 
     # Core metrics exist
@@ -459,13 +545,45 @@ def test_empty_per_worker_token_counts_skips_imbalance(capsys):
         "per_worker_token_counts": {},
     }
 
-    perf = print_performance_metrics({}, metrics, timing_metrics, master_config)
+    perf = print_performance_metrics(
+        {},
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=False,
+    )
 
     assert "average_token_imbalance" not in perf
 
     out = capsys.readouterr().out
     assert "No per-worker generation load data available." in out
     assert "Throughputs (per GPU)" in out
+
+
+def test_async_ppo_metrics_use_async_flag_without_grpo_config():
+    master_config = _base_ppo_master_config(colocated=False)
+    timing_metrics = {
+        "policy_and_reference_logprobs": 2.0,
+        "policy_training": 4.0,
+        "total_step_time": 10.0,
+        "exposed_generation": 2.0,
+        "prepare_for_generation/total": 1.0,
+    }
+    metrics = {"total_num_tokens": 6050.0}
+
+    perf = print_performance_metrics(
+        {},
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=True,
+    )
+
+    assert "training_worker_idle_time_ratio" in perf
 
 
 # ============================================================================

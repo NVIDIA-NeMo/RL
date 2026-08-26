@@ -71,7 +71,13 @@ def create_mock_state_dict_info(params):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_packed_broadcast_producer_consumer_roundtrip():
+@pytest.mark.parametrize(
+    ("producer_num_buffers", "consumer_num_buffers"),
+    [(None, None), (2, 1)],
+)
+def test_packed_broadcast_producer_consumer_roundtrip(
+    producer_num_buffers, consumer_num_buffers
+):
     """Test that producer and consumer work together correctly."""
     # Create mock parameters
     params = create_mock_model_params()
@@ -97,6 +103,7 @@ def test_packed_broadcast_producer_consumer_roundtrip():
             group=producer_group,
             src=0,
             post_iter_func=post_iter_func,
+            num_buffers=producer_num_buffers,
         )
 
         # Now test consumer with the broadcasted tensors
@@ -124,6 +131,7 @@ def test_packed_broadcast_producer_consumer_roundtrip():
             group=consumer_group,
             src=0,
             post_unpack_func=post_unpack_func,
+            num_buffers=consumer_num_buffers,
         )
 
     # Verify all parameters were unpacked

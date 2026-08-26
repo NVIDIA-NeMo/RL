@@ -246,12 +246,8 @@ FP8 noise.
 
 ### Limitations
 
+- Grouped-MoE MXFP8 refit is supported but has not been validated end to end.
 - Dense Qwen3.5 MXFP8 rollout has not been validated end to end.
-- Grouped-MoE MXFP8 refit is implemented for both weight-transfer paths but has
-  not been validated end to end. NCCL Reshard uses the receiver-side conversion
-  added in [#3477](https://github.com/NVIDIA-NeMo/RL/pull/3477), while colocated
-  CUDA IPC and legacy reloads expand fused expert slabs before calling vLLM's
-  native per-expert loader.
 
 ## `flash-linear-attention` Performance
 

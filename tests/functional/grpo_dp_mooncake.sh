@@ -10,6 +10,15 @@ git config --global --add safe.directory $PROJECT_ROOT
 
 set -eou pipefail
 
+# mooncake_cpu is RDMA-only, so this needs an mlx5 device libibverbs can open
+# (either fabric). Skip rather than fail on hosts that have none.
+source "$SCRIPT_DIR/../scripts/detect_rdma.sh"
+if [[ -z "${MC_MOONCAKE_DEVICE:-}" ]] && ! rdma_device_available; then
+    echo "[SKIP] no usable mlx5 RDMA device; mooncake_cpu requires RDMA." \
+         "Set MC_MOONCAKE_DEVICE=<dev> to override."
+    exit 0
+fi
+
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
@@ -38,8 +47,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     data_plane.enabled=true \
     data_plane.impl=transfer_queue \
     data_plane.backend=mooncake_cpu \
-    data_plane.global_segment_size=4294967296 \
-    data_plane.local_buffer_size=1073741824 \
+    data_plane.mooncake_cpu.global_segment_size=4294967296 \
+    data_plane.mooncake_cpu.local_buffer_size=1073741824 \
     $@ \
     2>&1 | tee $RUN_LOG
 
