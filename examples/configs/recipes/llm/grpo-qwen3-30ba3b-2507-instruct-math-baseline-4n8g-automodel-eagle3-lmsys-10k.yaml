@@ -1,0 +1,44 @@
+defaults: grpo-qwen3-30ba3b-2507-instruct-math-baseline-4n8g-automodel-eagle3-10k.yaml
+# Apples-to-apples sibling of
+# grpo-qwen3-30ba3b-2507-instruct-math-baseline-4n8g-automodel-eagle3-10k.yaml:
+# ONLY the draft checkpoint changes, to isolate whether the accept_length
+# regression seen with RedHatAI/Qwen3-30B-A3B-Instruct-2507-speculator.eagle3
+# is specific to that checkpoint or to this repo's draft co-training path in
+# general. Swaps in the lmsys/SGLang-EAGLE3-Qwen3-30B-A3B-Instruct-2507-
+# SpecForge-Nex drafter, which held accept_length flat across training in
+# the old RL_dspark repo's
+# grpo-qwen3-30ba3b-4n8g-megatron-8k-dapo-eagle3-lmsys-packed run.
+#
+# This checkpoint needs a LOCAL copy: the published config.json ships
+# max_position_embeddings=2048 (its SpecForge training length), which makes
+# vLLM clamp the drafter RoPE and collapse acceptance past position 2048;
+# point at a local copy with that field raised to 40960 (weights untouched).
+#
+# It also ships no embed_tokens of its own (expects to share the target
+# model's embedding table) and uses the "midlayer." key prefix instead of
+# this repo's "layers.0." -- both handled by the native-flat eagle3 loading
+# path added for this checkpoint family (see
+# nemo_rl/models/automodel/draft/integration.py:
+# _adapt_native_flat_eagle3_config / _load_native_eagle3_weights). Verified
+# with a 1n8g smoke run: draft_loss finite and decreasing, and vLLM actually
+# ran eagle3 speculative decoding with this drafter
+# (spec_acceptance_length=2.74, per-position acceptance decaying
+# 0.71/0.57/0.46 -- the expected shape for a real, non-garbage drafter).
+#
+# norm_before_residual is NOT recorded in this checkpoint's config and could
+# not be independently verified against the SpecForge training source; it is
+# defaulted to False (classic EAGLE convention) in
+# _adapt_native_flat_eagle3_config -- the smoke run's sane accept-length
+# numbers are consistent with that guess but do not prove it outright.
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-2507-instruct-math-baseline-4n8g-automodel-eagle3-lmsys-10k
+policy:
+  draft:
+    model_name: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/speculative_rl/RL/results/lmsys-eagle3-qwen3-30ba3b-2507-specforge-maxpos40960
+  generation:
+    vllm_kwargs:
+      speculative_config:
+        model: ${policy.draft.model_name}
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-2507-instruct-math-baseline-4n8g-automodel-eagle3-lmsys-10k
