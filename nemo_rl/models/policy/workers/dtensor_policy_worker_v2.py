@@ -627,6 +627,14 @@ class DTensorPolicyWorkerV2Impl(
                     if mb_idx < iterator_len:
                         num_valid_samples = loss_metrics["num_valid_samples"]
                         loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                        if self.draft_model is not None:
+                            # param_groups[0] is "policy" (see
+                            # DSPARK_OPTIMIZER_GROUP_NAMES); the draft's own
+                            # lr is otherwise never logged anywhere, so its
+                            # schedule can't be verified from wandb/TB.
+                            loss_metrics["draft_lr"] = self.optimizer.param_groups[1][
+                                "lr"
+                            ]
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
 
