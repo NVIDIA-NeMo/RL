@@ -20,6 +20,7 @@ from nemo_rl.models.generation.sglang.quantization_utils import (
     get_dynamic_high_precision_substrings,
     get_sglang_quantization_scheme,
     prepare_sglang_quantized_generation,
+    validate_checkpoint_high_precision_layout,
     validate_sglang_quantized_refit_backend,
 )
 
@@ -164,6 +165,19 @@ def test_quantized_refit_rejects_a_non_megatron_backend(scheme: str) -> None:
     """
     with pytest.raises(NotImplementedError, match="requires a Megatron policy"):
         validate_sglang_quantized_refit_backend(scheme=scheme, use_megatron=False)
+
+
+def test_quantized_layout_requires_every_companion_scale() -> None:
+    weight = "model.layers.0.mlp.experts.0.down_proj.weight"
+
+    with pytest.raises(ValueError, match="no companion scale"):
+        validate_checkpoint_high_precision_layout(
+            checkpoint_path="/converted",
+            scheme="NVFP4",
+            weight_names=(weight, weight.removesuffix(".weight") + ".weight_scale"),
+            high_precision_substrings=(),
+            quantized_companion_suffixes=(".weight_scale", ".weight_scale_2"),
+        )
 
 
 @pytest.mark.parametrize(
