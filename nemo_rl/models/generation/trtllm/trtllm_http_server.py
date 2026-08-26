@@ -185,6 +185,123 @@ def _build_sampling_params(
     )
 
 
+def _tl_us(delta, offset_s: float) -> int | None:
+    """Convert a TRT-LLM steady-clock timedelta to epoch microseconds."""
+    try:
+        return int((delta.total_seconds() + offset_s) * 1_000_000)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _tl_timing_fields(gen, observed_wall_s: float) -> dict[str, int]:
+    """Best-effort per-request milestones for the timeline skill.
+
+    TRT-LLM reports RequestPerfMetrics.timing_metrics as steady_clock
+    timedeltas and exposes no steady_clock_now() to Python, so an epoch origin
+    has to be estimated. It is anchored PER REQUEST on that request's own
+    last_token_time: *observed_wall_s* is read immediately after this
+    request's generation returned, so it is the wall-clock instant just after
+    last_token.
+
+    Per request, not once globally, because a single global offset absorbs the
+    first request's post-generation latency and then reports every later
+    request's last_token that much too late. Any later request that
+    post-processes faster than the first then reports last_token AFTER
+    response_ready. That is not hypothetical: with a global offset, job 473111
+    inverted that pair on 3621 of 11520 model calls, by up to 1.5 ms.
+
+    Anchoring per request makes the whole chain ordered by construction --
+    arrival <= queued <= first_scheduled <= first_token <= last_token <=
+    response_ready -- because the frontend interval strictly contains the
+    engine interval that the offset is anchored inside.
+
+    The cost is that absolute cross-request alignment now carries each
+    request's own post-processing jitter (sub-millisecond here) instead of one
+    shared constant error. Intra-request deltas are unaffected and exact: all
+    four engine timestamps below share a single offset, so it cancels.
+
+    Field-name note: `queued_ts_us` is NOT a native TRT-LLM event -- TRT-LLM
+    has no separate "entered scheduler queue" milestone. It is mapped to
+    `arrival_time`, so `first_scheduled_ts_us - queued_ts_us` is the TRT-LLM
+    request queue interval. `arrival_ts_us` is this HTTP frontend's own
+    receipt time, which is a strictly earlier and different boundary than
+    vLLM's. Consumers must read the pair with that in mind.
+    """
+    out: dict[str, int] = {}
+    try:
+        metrics = getattr(gen, "request_perf_metrics", None)
+        timing = getattr(metrics, "timing_metrics", None)
+        if timing is None:
+            return out
+        off = observed_wall_s - timing.last_token_time.total_seconds()
+        pairs = (
+            ("nemo_vllm_queued_ts_us", timing.arrival_time),
+            ("nemo_vllm_first_scheduled_ts_us", timing.first_scheduled_time),
+            ("nemo_vllm_first_token_ts_us", timing.first_token_time),
+            ("nemo_vllm_last_token_ts_us", timing.last_token_time),
+        )
+        for key, delta in pairs:
+            value = _tl_us(delta, off)
+            if value is not None:
+                out[key] = value
+    except Exception:  # tracing is best effort and must never fail a request
+        return {}
+    return out
+
+
+def _tl_tokens_per_block(llm: Any) -> int:
+    """Resolve the KV pool's block size, needed to convert reuse to tokens."""
+    for path in (
+        ("args", "kv_cache_config", "tokens_per_block"),
+        ("llm_args", "kv_cache_config", "tokens_per_block"),
+        ("_kv_cache_config", "tokens_per_block"),
+    ):
+        obj: Any = llm
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if isinstance(obj, int) and not isinstance(obj, bool) and obj > 0:
+            return obj
+    return 32  # TRT-LLM's KvCacheConfig default
+
+
+def _tl_cached_tokens(gen: Any, tokens_per_block: int) -> int | None:
+    """Token-level prefix reuse for THIS request, or None if unavailable.
+
+    Unlike vLLM, TRT-LLM exposes no `cached_tokens` on the result object -- the
+    attribute does not exist anywhere in the package. Per-request reuse lives on
+    RequestPerfMetrics.kv_cache_metrics, and is counted in BLOCKS, so it has to
+    be scaled by the pool's tokens_per_block.
+
+    Reading the non-existent attribute instead is not a silent no-op: it makes
+    every request report zero reuse, which then reads downstream as "the prefix
+    cache is doing nothing" on a workload where each agentic turn re-sends the
+    whole conversation.
+    """
+    try:
+        metrics = getattr(gen, "request_perf_metrics", None)
+        if metrics is None:
+            return None
+        cache = getattr(metrics, "kv_cache_metrics", None)
+        if cache is None:
+            # Absent kv_cache_metrics means the engine recorded no cache
+            # activity for this request, i.e. zero reuse -- not "unknown".
+            # Returning None here would drop the field entirely, and the skill
+            # requires cache metrics on every successful model_call. Measured
+            # on job 475369: the field was present on 5987/11518 calls, and
+            # 5986 of those were non-zero, so presence tracked reuse rather
+            # than metric availability; timing_metrics came through on all
+            # 11518, so request_perf_metrics itself is never the missing piece.
+            return 0
+        reused = getattr(cache, "num_reused_blocks", None)
+        if not isinstance(reused, int) or isinstance(reused, bool) or reused < 0:
+            return 0
+        return reused * tokens_per_block
+    except Exception:  # tracing is best effort and must never fail a request
+        return None
+
+
 def create_app(
     llm: Any,
     tokenizer: Any,
@@ -220,6 +337,9 @@ def create_app(
     """
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
+
+    # Block size is fixed for the engine's lifetime; resolve it once.
+    _tl_tpb = _tl_tokens_per_block(llm)
 
     # Per-request template kwargs override these defaults.
     _server_template_kwargs: dict[str, Any] = {
@@ -272,6 +392,9 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
+        # Timeline: this frontend's own receipt boundary. Distinct from vLLM's
+        # arrival semantics -- see _tl_timing_fields.
+        _tl_arrival_ts_us = time.time_ns() // 1_000
         body: dict = await request.json()
         messages: list[dict] = body.get("messages", [])
         tools: list[dict] | None = body.get("tools")
@@ -415,6 +538,14 @@ def create_app(
             stop_token_ids=stop_token_ids,
             max_tokens=max_tokens,
         )
+
+        # Timeline: opt into per-request timing. Setting it on the instance
+        # keeps _build_sampling_params shared with the direct generate() path.
+        try:
+            sampling.return_perf_metrics = True
+        except Exception:
+            pass
+
         try:
             output = await llm.generate_async(
                 {"prompt_token_ids": adj_prompt},
@@ -541,6 +672,29 @@ def create_app(
             },
         }
 
+        # Timeline fields (skill: collect-training-timeline). Declared on
+        # NeMoGymChatCompletion in nemo_gym/openai_utils.py; anything not
+        # declared there is silently dropped by pydantic, so the key names
+        # must match exactly.
+        response["nemo_vllm_arrival_ts_us"] = _tl_arrival_ts_us
+        response.update(_tl_timing_fields(gen, time.time()))
+        cached = _tl_cached_tokens(gen, _tl_tpb)
+        if cached is not None:
+            # Token-level prefix reuse for THIS request -- not global KV
+            # occupancy. 0 is a valid reported miss and must be emitted.
+            #
+            # Clamp to the prompt length. Reuse is counted in BLOCKS, so
+            # blocks * tokens_per_block rounds up past the prompt whenever the
+            # tail block is partially reused, and the consumer drops the whole
+            # cache-metric group when cached_tokens > prompt_tokens
+            # (nemo_gym_timeline.py: `not 0 <= cached_prompt_tokens <=
+            # prompt_tokens`). That silently deleted the metric on precisely
+            # the highest-reuse requests: on job 475369 it survived on only
+            # 5987/11518 calls, and the survivors piled up against the ceiling
+            # (median ratio 0.974, max exactly 1.0000).
+            cached = min(cached, len(adj_prompt))
+            response["usage"]["prompt_tokens_details"] = {"cached_tokens": cached}
+
         if logprobs_requested and gen_logprobs:
             # `token` carries the id rather than the decoded text when asked.
             # ChatCompletionResponseChoice has no token-id field upstream yet, so
@@ -562,6 +716,7 @@ def create_app(
                 ]
             }
 
+        response["nemo_vllm_response_ready_ts_us"] = time.time_ns() // 1_000
         return JSONResponse(content=response)
 
     return app
