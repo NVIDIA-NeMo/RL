@@ -90,6 +90,7 @@ def mxfp8_e4m3_quantize_for_refit(
     # Match the receiver path's zero-scale clamp: an E8M0 byte of 0 (2^-127)
     # destabilizes the TRTLLM kernels, and pre-quantized tensors skip the
     # receiver-side quantize branch where the clamp normally runs.
+    # pyrefly: ignore  # no-matching-overload
     x_scales = x_scales.masked_fill(x_scales == 0, 1)
     return x_q, x_scales
 
