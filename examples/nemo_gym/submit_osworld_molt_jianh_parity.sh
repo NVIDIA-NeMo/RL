@@ -19,7 +19,10 @@ export MOLT_MAX_STEPS="${MOLT_MAX_STEPS:-300}"
 
 export OSWORLD_NUM_PROMPTS_PER_STEP="${OSWORLD_NUM_PROMPTS_PER_STEP:-8}"
 export OSWORLD_NUM_GENERATIONS="${OSWORLD_NUM_GENERATIONS:-8}"
-export GRPO_MAX_NUM_EPOCHS=1
+# Resumed async jobs must be able to cycle the finite 361-task prompt set.
+# One epoch can be exhausted before max_steps after changing the train-group
+# size or restoring the replay/dataloader cursor from a later checkpoint.
+export GRPO_MAX_NUM_EPOCHS="${GRPO_MAX_NUM_EPOCHS:-20}"
 export MOLT_ASYNC_QUEUE_SIZE="${MOLT_ASYNC_QUEUE_SIZE:-2}"
 export MOLT_VLLM_GENERATE_BATCH_SIZE="${MOLT_VLLM_GENERATE_BATCH_SIZE:-16}"
 export MOLT_MAX_STALENESS="${MOLT_MAX_STALENESS:-1}"
