@@ -555,6 +555,11 @@ Depending on your data shape, you may want to change these values."""
         # same rollout ids — the retry's calls would resolve against the
         # first attempt's ledger rows — so the NaN retry must be exactly 1.
         token_capture = self.cfg.get("token_capture") or None
+        generation_backend = (
+            token_capture.pop("generation_backend", "vllm")
+            if token_capture is not None
+            else "vllm"
+        )
         self._token_capture_enabled = bool(
             token_capture and token_capture.get("enabled")
         )
@@ -562,6 +567,7 @@ Depending on your data shape, you may want to change these values."""
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
         if self._token_capture_enabled:
+            assert token_capture is not None
             if self.rollout_max_attempts_to_avoid_lp_nan != 1:
                 raise ValueError(
                     "token_capture.enabled requires "
@@ -587,6 +593,9 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store": ("nemo_gym.token_id_capture.lineage:FileLineageStore"),
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
+                "external_staging_backend": (
+                    "megatron_ledger" if generation_backend == "megatron" else "worker"
+                ),
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep
@@ -844,9 +853,17 @@ Depending on your data shape, you may want to change these values."""
         and poisons.
         """
         records = [dict(record) for record in manifest.get("records") or []]
+        pending_records = [
+            dict(record) for record in manifest.get("pending_records") or []
+        ]
+        if records and pending_records:
+            raise ValueError(
+                "capture manifest cannot mix staged and pending call records"
+            )
+        receipt_records = pending_records or records
         failures = list(manifest.get("failures") or [])
         deduped: dict[str, dict] = {}
-        for record in records:
+        for record in receipt_records:
             deduped.setdefault(str(record.get("model_call_id")), record)
         terminal_record = None
         selection_reason = None
@@ -863,14 +880,18 @@ Depending on your data shape, you may want to change these values."""
         else:
             terminal_selection = "heuristic"
             # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-            from nemo_gym.token_id_capture.staging.records import CallRecord
+            from nemo_gym.token_id_capture.staging.records import (
+                CallRecord,
+                PendingCallRecord,
+            )
             from nemo_gym.token_id_capture.staging.terminal import (
                 select_terminal_call,
             )
 
             try:
+                record_type = PendingCallRecord if pending_records else CallRecord
                 selection = select_terminal_call(
-                    [CallRecord.model_validate(record) for record in deduped.values()]
+                    [record_type.model_validate(record) for record in deduped.values()]
                 )
             except ValueError:
                 selection_reason = "invalid_manifest_row"
@@ -891,7 +912,7 @@ Depending on your data shape, you may want to change these values."""
             )
         elif terminal_record is None:
             failure_reason = selection_reason or "missing_terminal_row"
-        return {
+        receipt = {
             "rollout_id": rollout_id,
             "reward": reward,
             "terminal_model_call_id": (
@@ -899,11 +920,14 @@ Depending on your data shape, you may want to change these values."""
                 if terminal_record is not None
                 else None
             ),
-            "manifest": list(deduped.values()),
+            "manifest": [] if pending_records else list(deduped.values()),
             "capture_poisoned": failure_reason is not None,
             "failure_reason": failure_reason,
             "terminal_selection": terminal_selection,
         }
+        if pending_records:
+            receipt["pending_manifest"] = list(deduped.values())
+        return receipt
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self,
@@ -1272,9 +1296,18 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
 
-    # Enable the http server. Requires both async engine and the expose_http_server flag
-    generation_config["vllm_cfg"]["async_engine"] = True
-    generation_config["vllm_cfg"]["expose_http_server"] = True
+    # Enable the backend's OpenAI-compatible server.
+    if generation_config["backend"] == "vllm":
+        generation_config["vllm_cfg"]["async_engine"] = True
+        generation_config["vllm_cfg"]["expose_http_server"] = True
+    elif generation_config["backend"] == "megatron":
+        generation_config["mcore_generation_config"]["async_engine"] = True
+        generation_config["mcore_generation_config"]["expose_http_server"] = True
+    else:
+        raise ValueError(
+            "NeMo-Gym setup supports vllm or megatron generation; got "
+            f"{generation_config['backend']!r}"
+        )
 
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None

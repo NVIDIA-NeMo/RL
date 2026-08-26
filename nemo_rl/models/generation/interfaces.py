@@ -399,6 +399,14 @@ class GenerationInterface(ABC):
     def invalidate_kv_cache(self) -> bool:
         return False
 
+    def flush_token_capture(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        """Make a deferred capture receipt durable before it is sealed."""
+        if receipt.get("pending_manifest"):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not implement deferred token capture"
+            )
+        return receipt
+
     def blocks_training(self) -> bool:
         """Whether this engine must stand down before a training step."""
         return False

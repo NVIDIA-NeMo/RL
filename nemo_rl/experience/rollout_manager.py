@@ -1274,6 +1274,7 @@ class RolloutManager:
             stats=self._stats,
         )
         self._tokenizer = tokenizer
+        self._policy_generation = policy_generation
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
         self._recovery_ledger = recovery_ledger
@@ -1775,24 +1776,36 @@ class RolloutManager:
                 raise ValueError(
                     "token-capture completion must contain its Gate rollout ID"
                 )
-            barrier = self._data_plane_checkpoint_barrier
-            if barrier is None:
+            typed_receipt: dict[str, Any] = receipt
+            typed_gate_rollout_id: str = gate_rollout_id
+
+            async def _flush_and_seal() -> None:
+                if typed_receipt.get("pending_manifest"):
+                    if self._policy_generation is None:
+                        raise RuntimeError(
+                            "deferred token capture requires a generation backend"
+                        )
+                    finalized = await asyncio.to_thread(
+                        self._policy_generation.flush_token_capture, typed_receipt
+                    )
+                    # The completion and recovery ledger retain this mapping.
+                    # Mutate it only after the whole ledger batch is durable.
+                    typed_receipt.clear()
+                    typed_receipt.update(finalized)
                 self._recovery_ledger.mark_sibling_sealed(
                     group_id,
                     generation_index=generation_index,
-                    gate_rollout_id=gate_rollout_id,
-                    receipt=receipt,
+                    gate_rollout_id=typed_gate_rollout_id,
+                    receipt=typed_receipt,
                     reward=completion.reward,
                 )
+
+            barrier = self._data_plane_checkpoint_barrier
+            if barrier is None:
+                await _flush_and_seal()
             else:
                 async with barrier.mutation("sibling_seals"):
-                    self._recovery_ledger.mark_sibling_sealed(
-                        group_id,
-                        generation_index=generation_index,
-                        gate_rollout_id=gate_rollout_id,
-                        receipt=receipt,
-                        reward=completion.reward,
-                    )
+                    await _flush_and_seal()
 
         try:
             if inflight_registry is not None:
