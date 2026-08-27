@@ -104,7 +104,7 @@ from nemo_rl.models.megatron.train import (
     aggregate_training_statistics,
     megatron_forward_backward,
 )
-from nemo_rl.models.policy import Fp4Config, PolicyConfig
+from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -557,22 +557,10 @@ class MegatronPolicyWorkerImpl(
             "defer_fp32_logits", None
         ) and (runtime_config.model_cfg.fp16 or runtime_config.model_cfg.bf16)
 
-        # Store FP8 config for later use.
+        # Store FP8 config for later use. NVTE recipe environment variables are
+        # import-time settings in Transformer Engine, so they must be supplied
+        # process-wide through megatron_cfg.env_vars before this actor imports TE.
         self.fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
-
-        # This FP4 backward mode is not valid for inference/logprob forwards.
-        # Keep it out of the process-wide environment and scope it to training.
-        raw_fp4_cfg = config["megatron_cfg"].get("fp4_cfg")
-        fp4_cfg = (
-            Fp4Config.model_validate(raw_fp4_cfg) if raw_fp4_cfg is not None else None
-        )
-        self._nvte_backward_override = None
-        if fp4_cfg is not None and fp4_cfg.enabled:
-            self._nvte_backward_override = (
-                config["megatron_cfg"].get("env_vars") or {}
-            ).get("NVTE_BACKWARD_OVERRIDE") or os.environ.get("NVTE_BACKWARD_OVERRIDE")
-        if self._nvte_backward_override is not None:
-            os.environ.pop("NVTE_BACKWARD_OVERRIDE", None)
 
         # Full-iteration CUDA graphs cannot be interrupted, so disable the
         # NaN-in-loss check that would otherwise require breaking out of the graph.
@@ -794,17 +782,6 @@ class MegatronPolicyWorkerImpl(
             return
         self.model.load_state_dict(extra_state, strict=False)
 
-    @contextmanager
-    def _nvte_backward_override_training_ctx(self) -> Iterator[None]:
-        """Apply NVTE_BACKWARD_OVERRIDE only to training computation."""
-        if self._nvte_backward_override is not None:
-            os.environ["NVTE_BACKWARD_OVERRIDE"] = self._nvte_backward_override
-        try:
-            yield
-        finally:
-            if self._nvte_backward_override is not None:
-                os.environ.pop("NVTE_BACKWARD_OVERRIDE", None)
-
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -963,10 +940,7 @@ class MegatronPolicyWorkerImpl(
                         stage="train",
                         require=True,
                     )
-                    with (
-                        self._nvte_backward_override_training_ctx(),
-                        maybe_r3_trace_stage("train", enabled=use_router_replay),
-                    ):
+                    with maybe_r3_trace_stage("train", enabled=use_router_replay):
                         losses_reduced = megatron_forward_backward(
                             model=self.model,
                             data_iterator=data_iterator,
@@ -1552,7 +1526,6 @@ class MegatronPolicyWorkerImpl(
         # The critical wrap: hooks fire (accumulate main_grad) but the
         # per-call reduce dispatch is gated off.
         with (
-            self._nvte_backward_override_training_ctx(),
             maybe_r3_trace_stage("train", enabled=use_router_replay),
             self.model.no_sync(),
         ):

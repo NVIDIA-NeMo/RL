@@ -1225,10 +1225,12 @@ def apply_te_precision_config(model_cfg: Any, config: PolicyConfig) -> None:
         or fp4_cfg.fp4_recipe != "nvfp4"
         or fp4_cfg.fp4_param is not False
         or config.get("precision") != "bfloat16"
+        or config.get("quant_cfg") is not None
     ):
         raise ValueError(
             "generation.nvfp4_pertoken_rollout requires policy.precision="
-            "bfloat16 and megatron_cfg.fp4_cfg={enabled: true, fp4: e2m1} "
+            "bfloat16, policy.quant_cfg=null (TE-only training), and "
+            "megatron_cfg.fp4_cfg={enabled: true, fp4: e2m1} "
             "with fp4_recipe=nvfp4 and fp4_param=false"
         )
     if fp8_on and fp4_on:

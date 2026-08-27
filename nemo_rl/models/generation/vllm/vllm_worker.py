@@ -199,6 +199,18 @@ def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -
     vllm_kwargs["hf_overrides"] = merged_hf_overrides
 
 
+def _validate_worker_extension_cls(
+    vllm_kwargs: dict[str, Any], required_worker_extension_cls: str
+) -> None:
+    """Reserve ``worker_extension_cls`` for NeMo-RL's refit protocol."""
+    if "worker_extension_cls" in vllm_kwargs:
+        raise ValueError(
+            "generation.vllm_kwargs.worker_extension_cls is not supported: "
+            "NeMo-RL's refit protocol requires "
+            f"{required_worker_extension_cls}."
+        )
+
+
 def _log_effective_quantization_ignore_patterns(
     vllm_cfg: dict[str, Any], vllm_kwargs: dict[str, Any]
 ) -> None:
@@ -463,6 +475,11 @@ class BaseVllmGenerationWorker:
         _apply_vllm_patches(
             self.py_executable,
             extra_env_vars=extra_env_vars,
+            require_moe_routed_experts_capture=bool(
+                (self.cfg.get("vllm_kwargs") or {}).get(
+                    "enable_return_routed_experts", False
+                )
+            ),
         )
 
         # Skip model loading if we're not the model owner
@@ -708,6 +725,7 @@ class BaseVllmGenerationWorker:
             else "nemo_rl.models.generation.vllm.vllm_backend."
             "VllmInternalWorkerExtension"
         )
+        _validate_worker_extension_cls(vllm_kwargs, default_worker_extension_cls)
         _log_effective_quantization_ignore_patterns(self.cfg["vllm_cfg"], vllm_kwargs)
         llm_kwargs = dict(
             model=self.model_name,

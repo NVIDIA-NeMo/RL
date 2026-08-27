@@ -119,10 +119,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
         draft_enabled = bool(config.get("draft", {}).get("enabled", False))
+        generation_config = config.get("generation") or {}
+        nvfp4_pertoken_rollout = generation_config.get("nvfp4_pertoken_rollout") or {}
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
+            )
+        if nvfp4_pertoken_rollout.get("enabled", False) and not megatron_enable:
+            raise ValueError(
+                "generation.nvfp4_pertoken_rollout requires the Megatron "
+                "training backend (policy.megatron_cfg.enabled=true); DTensor "
+                "does not implement TE NVFP4 training."
             )
         if reserved_http_server_port is not None and not megatron_enable:
             raise ValueError(

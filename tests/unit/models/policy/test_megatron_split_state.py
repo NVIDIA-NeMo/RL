@@ -141,7 +141,6 @@ def _make_worker(loss_type):
     w.sampling_params = None
     w.draft_model = None
     w.defer_fp32_logits = False
-    w._nvte_backward_override = None
     w.dtype = torch.float32
     w._is_reward_model = False
     w._router_replay_enabled = False
