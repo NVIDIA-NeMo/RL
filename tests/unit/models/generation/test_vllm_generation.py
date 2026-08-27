@@ -26,11 +26,12 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import orjson
 import pytest
 import ray
 import requests
 import torch
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.loss import NLLLossFn
@@ -50,6 +51,7 @@ from nemo_rl.models.generation.vllm.config import (
     normalize_vllm_refit_config,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    BaseVllmGenerationWorker,
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
@@ -57,6 +59,9 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
     _AsyncLLMHTTPClient,
+    _copy_vllm_chat_messages,
+    _orjson_response,
+    _parse_orjson_request,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
@@ -886,6 +891,96 @@ class _FakeFastAPIApp:
         return decorator
 
 
+def test_vllm_async_worker_applies_fastokens_before_base_init(monkeypatch):
+    events = []
+
+    def fake_base_init(worker, *args, **kwargs):
+        events.append("base-init")
+        worker.is_model_owner = False
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.maybe_patch_fastokens",
+        lambda enabled: events.append(("fastokens", enabled)),
+    )
+    monkeypatch.setattr(BaseVllmGenerationWorker, "__init__", fake_base_init)
+
+    VllmAsyncGenerationWorkerImpl(config={}, use_fastokens=True)
+
+    assert events == [("fastokens", True), "base-init"]
+
+
+def test_vllm_chat_message_copy_is_shallow_and_does_not_mutate_input():
+    nested_tool_call = {
+        "id": "call-1",
+        "function": {"name": "tool", "arguments": '{"value":1}'},
+    }
+    messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": (nested_tool_call,),
+        },
+    ]
+
+    copied = _copy_vllm_chat_messages(messages)
+
+    assert copied == [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [nested_tool_call],
+        },
+    ]
+    assert copied is not messages
+    assert copied[0] is not messages[0]
+    assert copied[1] is not messages[1]
+    assert copied[1]["tool_calls"] is not messages[1]["tool_calls"]
+    assert copied[1]["tool_calls"][0] is nested_tool_call
+    assert isinstance(messages[1]["tool_calls"], tuple)
+
+
+class _OrjsonRequest(BaseModel):
+    messages: list[dict]
+
+
+def test_vllm_orjson_request_and_response_preserve_fields():
+    body = orjson.dumps(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {
+                                "name": "tool",
+                                "arguments": '{"value":1}',
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    parsed = _parse_orjson_request(body, _OrjsonRequest)
+    response = _orjson_response(parsed.model_dump(), status_code=201)
+
+    assert response.status_code == 201
+    assert response.media_type == "application/json"
+    assert orjson.loads(response.body) == orjson.loads(body)
+
+
+def test_vllm_orjson_request_rejects_invalid_json_and_schema():
+    with pytest.raises(orjson.JSONDecodeError):
+        _parse_orjson_request(b"{", _OrjsonRequest)
+
+    with pytest.raises(ValidationError):
+        _parse_orjson_request(b'{"messages":"not-a-list"}', _OrjsonRequest)
+
+
 def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     (
         tool_parser_manager,
@@ -973,6 +1068,17 @@ def _fake_chat_request():
     )
 
 
+def _raw_chat_request(monkeypatch, request):
+    """Return a raw request whose body the orjson chat route parses to ``request``."""
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async._parse_orjson_request",
+        lambda _body, _request_type: request,
+    )
+    raw_request = MagicMock()
+    raw_request.body = AsyncMock(return_value=b"{}")
+    return raw_request
+
+
 def _track_request_capture(worker, request):
     """Register in-flight capture state for request; return the fake capture sink."""
     worker._capture_calls[id(request)] = types.SimpleNamespace(call="call")
@@ -994,7 +1100,7 @@ async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
         renderer._clamp_max_tokens(request, request.max_tokens, overflow_prompt)
 
     serving_chat.create_chat_completion = create_chat_completion
-    response = await chat_handler(_fake_chat_request(), MagicMock())
+    response = await chat_handler(_raw_chat_request(monkeypatch, _fake_chat_request()))
 
     response_content = response.body.decode()
     assert response.status_code == 400
@@ -1023,7 +1129,7 @@ async def test_plain_value_error_context_overflow_returns_http_400(monkeypatch):
     serving_chat.create_chat_completion = create_chat_completion
     request = _fake_chat_request()
     token_capture = _track_request_capture(worker, request)
-    response = await chat_handler(request, MagicMock())
+    response = await chat_handler(_raw_chat_request(monkeypatch, request))
 
     response_content = response.body.decode()
     assert response.status_code == 400
@@ -1052,7 +1158,7 @@ async def test_unrelated_value_error_is_reraised(monkeypatch):
     request = _fake_chat_request()
     token_capture = _track_request_capture(worker, request)
     with pytest.raises(ValueError, match="unexpected internal failure"):
-        await chat_handler(request, MagicMock())
+        await chat_handler(_raw_chat_request(monkeypatch, request))
     token_capture.fail_call.assert_called_once_with("call", reason="engine_error")
 
 
@@ -1067,7 +1173,7 @@ async def test_media_capture_rejected_keeps_its_own_code(monkeypatch):
         )
 
     serving_chat.create_chat_completion = create_chat_completion
-    response = await chat_handler(_fake_chat_request(), MagicMock())
+    response = await chat_handler(_raw_chat_request(monkeypatch, _fake_chat_request()))
 
     assert response.status_code == 400
     error = json.loads(response.body)["error"]

@@ -1314,7 +1314,11 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
         ]
 
     monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", preprocess, raising=False)
-    response = await handler(request, MagicMock())
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async._parse_orjson_request",
+        lambda _body, _request_type: request,
+    )
+    response = await handler(MagicMock(body=AsyncMock(return_value=b"{}")))
     assert response.status_code == 400
     assert json.loads(response.body)["error"]["code"] == "retained_media_changed"
     inference.assert_not_awaited()
