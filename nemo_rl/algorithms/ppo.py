@@ -282,6 +282,33 @@ class MasterConfig(BaseModel, extra="allow"):
 # ===============================================================================
 
 
+def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
+    """Reject configurations whose media transfer path is not qualified.
+
+    Mirrors grpo.py's guard of the same name. The knob is qualified only with
+    the vLLM generation backend and with the data plane off; without this, PPO
+    would accept it on exactly the configurations GRPO rejects and run
+    unqualified without saying so.
+    """
+    # ``getattr``: a hand-built PPO config -- the test doubles elsewhere in the
+    # suite build one -- need not carry every field. A missing knob is an off
+    # knob, which is the shipped default.
+    if not getattr(master_config.ppo, "deduplicate_multimodal_data", False):
+        return
+
+    generation_config = master_config.policy["generation"]
+    if generation_config.get("backend") != "vllm":
+        raise NotImplementedError(
+            "ppo.deduplicate_multimodal_data=true is currently qualified "
+            "only with policy.generation.backend=vllm."
+        )
+    if (master_config.data_plane or {}).get("enabled", False):
+        raise NotImplementedError(
+            "ppo.deduplicate_multimodal_data=true is currently supported "
+            "only when data_plane.enabled=false."
+        )
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -326,6 +353,8 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
     )
+
+    _validate_multimodal_dedup_capability(master_config)
     if generation_config["backend"] == "vllm":
         vllm_config = cast(VllmConfig, generation_config)
         normalize_vllm_refit_config(vllm_config)

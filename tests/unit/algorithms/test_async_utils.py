@@ -3609,3 +3609,60 @@ def test_turn_count_fallback_priority():
     assert f({"turns_per_sample/max": 5, "turns_per_sample/mean": 3}) == 5.0
     assert f({"turns_per_sample/mean": 6}) == 6.0
     assert f({"reward": 1.0}) is None
+
+
+class TestMultimodalDedupCapability:
+    """``ppo.deduplicate_multimodal_data`` is qualified only on the vLLM
+    backend with the data plane off.
+
+    ``grpo.py`` has rejected everything else at setup since the knob landed
+    (``_validate_multimodal_dedup_capability``). Adding the field to
+    ``PPOConfig`` without the guard would have let PPO accept exactly the
+    configurations GRPO refuses, and run unqualified without saying so.
+    """
+
+    @staticmethod
+    def _config(backend: str, *, dedup: bool, data_plane_enabled: bool):
+        return SimpleNamespace(
+            policy={"generation": {"backend": backend}},
+            value={},
+            env={},
+            loss_fn=SimpleNamespace(),
+            ppo=SimpleNamespace(deduplicate_multimodal_data=dedup),
+            data={},
+            logger={},
+            cluster={},
+            data_plane={"enabled": data_plane_enabled},
+        )
+
+    def _run(self, cfg):
+        from nemo_rl.algorithms.ppo import setup
+
+        setup(
+            master_config=cfg,
+            tokenizer=mock.MagicMock(),
+            dataset=mock.MagicMock(),
+            val_dataset=None,
+        )
+
+    def test_a_non_vllm_backend_with_dedup_is_rejected(self):
+        with pytest.raises(NotImplementedError, match="backend=vllm"):
+            self._run(self._config("sglang", dedup=True, data_plane_enabled=False))
+
+    def test_the_data_plane_with_dedup_is_rejected(self):
+        with pytest.raises(NotImplementedError, match=r"data_plane\.enabled=false"):
+            self._run(self._config("vllm", dedup=True, data_plane_enabled=True))
+
+    @pytest.mark.parametrize("backend", ["vllm", "sglang"])
+    def test_the_default_is_never_rejected(self, backend):
+        """The guard must not fire when the knob is off, which is the shipped
+        default. Setup fails later on the mocks -- that is what keeps this from
+        passing vacuously if the guard were made unconditional."""
+        with pytest.raises(Exception) as excinfo:
+            self._run(self._config(backend, dedup=False, data_plane_enabled=True))
+        assert "deduplicate_multimodal_data" not in str(excinfo.value)
+
+    def test_the_qualified_pairing_gets_past_the_guard(self):
+        with pytest.raises(Exception) as excinfo:
+            self._run(self._config("vllm", dedup=True, data_plane_enabled=False))
+        assert "deduplicate_multimodal_data" not in str(excinfo.value)
