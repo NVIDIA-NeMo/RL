@@ -490,7 +490,8 @@ class VllmAsyncGenerationWorkerImpl(
                 if remaining <= 0:
                     raise ValueError(
                         f"Prompt length ({len(prompt_token_ids)}) fills or exceeds "
-                        f"max_model_len ({self.model_config.max_model_len}). "
+                        "this model's maximum context length "
+                        f"(max_model_len={self.model_config.max_model_len}). "
                         f"No room for output tokens."
                     )
                 max_tokens = min(request_max_tokens, remaining)
@@ -882,11 +883,9 @@ class VllmAsyncGenerationWorkerImpl(
                     request, raw_request
                 )
             except (ValueError, VLLMValidationError) as e:
-                # vLLM raises VLLMValidationError for prompts exceeding
-                # max_model_len during tokenization. NeMo-RL's post-prefix
-                # clamp raises ValueError for the same condition. Convert only
-                # those context-length failures to HTTP 400 so the Gym proxy
-                # treats them as prompt-specific instead of retrying a 500.
+                # Preserve HTTP 400 handling for all typed vLLM validation
+                # failures. For plain ValueErrors, convert only recognized
+                # context-length failures so unrelated server bugs stay visible.
                 if (
                     not isinstance(e, VLLMValidationError)
                     and not _is_context_length_error(e)
