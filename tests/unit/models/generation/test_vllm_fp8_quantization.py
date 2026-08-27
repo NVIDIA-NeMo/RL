@@ -806,7 +806,7 @@ def test_process_mxfp8_moe_refit_rejects_non_flashinfer_backend(fp8_module):
 
     with pytest.raises(
         NotImplementedError,
-        match="MXFP8 MoE refit layout conversion only supports FLASHINFER_TRTLLM",
+        match="requires the monolithic FlashInfer TRTLLM backend",
     ):
         fp8_module.process_weights_after_loading_mxfp8_moe(quant_method, object())
 
