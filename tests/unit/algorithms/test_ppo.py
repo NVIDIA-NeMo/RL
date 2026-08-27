@@ -1463,6 +1463,9 @@ def _run_noncolocated_setup(monkeypatch, config):
     value_model = MagicMock()
     generation = MagicMock()
     generation.init_collective.return_value = ["generation-future"]
+    # No prequantize handshake: a truthy Mock return would drag setup into the
+    # refit-prequantize branch and a second prepare_refit_info call.
+    generation.prepare_refit_info.return_value = None
     policy_factory = MagicMock(return_value=policy)
     value_factory = MagicMock(return_value=value_model)
     generation_factory = MagicMock(return_value=generation)
