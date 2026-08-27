@@ -26,6 +26,9 @@ set -euo pipefail
 : "${SLURM_JOB_ACCOUNT:?SLURM_JOB_ACCOUNT is required}"
 : "${SLURM_JOB_PARTITION:?SLURM_JOB_PARTITION is required}"
 : "${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is required}"
+
+# Slurm records the submit host's physical cwd, which may not exist on workers.
+SLURM_WORKDIR="${SLURM_WORKDIR:-${SLURM_SUBMIT_DIR}}"
 : "${BASE_LOG_DIR:?BASE_LOG_DIR is required}"
 : "${CONTAINER:?CONTAINER is required}"
 : "${MOUNTS:?MOUNTS is required}"
@@ -38,7 +41,7 @@ if [[ "${SLURM_HET_SIZE}" != "2" ]]; then
   exit 1
 fi
 
-RAY_SUB="${RAY_SUB:-${SLURM_SUBMIT_DIR}/ray.sub}"
+RAY_SUB="${RAY_SUB:-${SLURM_WORKDIR}/ray.sub}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
 EXTERNAL_VLLM_SHARED_ROOT="${EXTERNAL_VLLM_SHARED_ROOT:-/lustre}"
@@ -553,11 +556,13 @@ else
     --no-container-mount-home \
     --container-image="${CONTAINER}" \
     --container-mounts="${lb_mounts}" \
-    --container-workdir="${SLURM_SUBMIT_DIR}" \
+    --container-workdir="${SLURM_WORKDIR}" \
     --mpi=pmix \
     -A "${SLURM_JOB_ACCOUNT}" \
     -p "${SLURM_JOB_PARTITION}" \
     --overlap \
+    --gres=gpu:0 \
+    --mem=16G \
     --kill-on-bad-exit=1 \
     --nodelist="${ray_head_node}" \
     --nodes=1 \
@@ -621,17 +626,21 @@ ray_head_ip=$(resolve_node_ip "${ray_head_node}")
 for pool in "${pool_names[@]}"; do
   pool_urls["${pool}"]="http://${ray_head_ip}:${lb_ports[${pool}]}/v1"
   echo "[INFO] Starting ${display_names[${pool}]} load balancer at ${pool_urls[${pool}]}"
+  # Without explicit --gres/--mem a step inherits the node's full GPU and
+  # memory allocation, which blocks the later ray-head step on this node.
   srun \
     --het-group=0 \
     --no-container-mount-home \
     --container-name="external-vllm-lb-${pool,,}-${SLURM_JOB_ID}" \
     --container-image="${CONTAINER}" \
     --container-mounts="${lb_mounts}" \
-    --container-workdir="${SLURM_SUBMIT_DIR}" \
+    --container-workdir="${SLURM_WORKDIR}" \
     --mpi=pmix \
     -A "${SLURM_JOB_ACCOUNT}" \
     -p "${SLURM_JOB_PARTITION}" \
     --overlap \
+    --gres=gpu:0 \
+    --mem=16G \
     --nodelist="${ray_head_node}" \
     --nodes=1 \
     --ntasks=1 \

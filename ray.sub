@@ -24,6 +24,9 @@
 
 set -eoux pipefail
 
+# Slurm records the submit host's physical cwd, which may not exist on workers.
+SLURM_WORKDIR="${SLURM_WORKDIR:-${SLURM_SUBMIT_DIR}}"
+
 # Record job-start epoch so Python can measure pre-Python overhead
 export NRL_JOB_START_EPOCH=$(date +%s.%N)
 
@@ -98,7 +101,7 @@ detect_cpus_per_node() {
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
 CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
-COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
+COMMAND=${COMMAND:-}  # This is a script relative to SLURM_WORKDIR. If left empty, it will leave the cluster idle after it's brought up.
 SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray.
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
@@ -190,7 +193,7 @@ fi
 # NOTE: LOG_DIR must be on a shared filesystem visible to both the submit host and
 # all compute nodes. File-based signaling between the submit host and the containers
 # (STARTED_RAY_HEAD, ray_worker_units, ENDED, sandbox readiness) relies on this.
-BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
+BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_WORKDIR}
 # On a Slurm requeue/restart, suffix the restart count so we don't clobber the
 # previous attempt's logs (and signal files) under the same job ID.
 if [[ -n "${SLURM_RESTART_COUNT:-}" ]]; then
@@ -249,7 +252,7 @@ COMMON_SRUN_ARGS+=" --no-container-mount-home"
 COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
-COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
+COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_WORKDIR"
 # Pass partition/account explicitly for overlapping srun calls.
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
@@ -264,6 +267,14 @@ else
   log_phase "auto-detecting CPUs per node (scontrol show node)"
   CPUS_PER_WORKER=$(detect_cpus_per_node)
   echo "[INFO] Auto-detected CPUS_PER_WORKER=$CPUS_PER_WORKER from SLURM (CPUTot of first allocated node)."
+fi
+# Clusters with reserved system cores (CoreSpecCount) allocate fewer CPUs than
+# the node physically has; a step asking for more than the allocation blocks
+# in "step creation temporarily disabled" retries forever.
+if [[ "${SLURM_CPUS_ON_NODE:-}" =~ ^[0-9]+$ ]] && (( SLURM_CPUS_ON_NODE > 0 )) \
+    && (( CPUS_PER_WORKER > SLURM_CPUS_ON_NODE )); then
+  echo "[INFO] Clamping CPUS_PER_WORKER=$CPUS_PER_WORKER to the allocation's $SLURM_CPUS_ON_NODE CPUs per node."
+  CPUS_PER_WORKER=$SLURM_CPUS_ON_NODE
 fi
 
 # ---------------------------------------------------------------------------
@@ -1057,7 +1068,7 @@ fi
 
 # Start the Ray head.
 log_phase "launching Ray head + worker sruns"
-srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
+srun $COMMON_SRUN_ARGS --container-name=ray-head --overlap --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
 SRUN_PIDS["ray-head"]=$!
 
 # Start the Ray workers (all nodes except the head) with a single batched srun, so
@@ -1140,7 +1151,7 @@ else
   log_phase "generating attach helper (scontrol show job)"
   CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
-  cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
+  cat <<EOF >$SLURM_WORKDIR/${SLURM_JOB_ID}-attach.sh
 # No args launches on the head node (node 0)
 # Args 1-N launch on worker nodes (nodes 1 through N-1)
 # Optional: set COMMAND='...' to run non-interactively instead of opening an interactive shell
@@ -1170,12 +1181,12 @@ else
   fi
 fi
 EOF
-  chmod +x $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
-  echo "     COMMAND='echo hello' bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh    # run a non-interactive command on head node"
-  echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh    # to attach to head node (i.e., 'worker 0')"
+  chmod +x $SLURM_WORKDIR/${SLURM_JOB_ID}-attach.sh
+  echo "     COMMAND='echo hello' bash $SLURM_WORKDIR/${SLURM_JOB_ID}-attach.sh    # run a non-interactive command on head node"
+  echo "     bash $SLURM_WORKDIR/${SLURM_JOB_ID}-attach.sh    # to attach to head node (i.e., 'worker 0')"
   if [[ $SLURM_JOB_NUM_NODES -gt 1 ]]; then
-    echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 1  # to attach to worker 1"
-    echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 2  # to attach to worker 2, etc."
+    echo "     bash $SLURM_WORKDIR/${SLURM_JOB_ID}-attach.sh 1  # to attach to worker 1"
+    echo "     bash $SLURM_WORKDIR/${SLURM_JOB_ID}-attach.sh 2  # to attach to worker 2, etc."
   fi
   sleep infinity
 fi

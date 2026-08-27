@@ -136,7 +136,21 @@ fi
 # =============================================================================
 # Project root and code root
 # =============================================================================
-PROJECT_ROOT=$(realpath "$PWD")
+if [[ -n "${PROJECT_ROOT_OVERRIDE:-}" ]]; then
+  if [[ "${PROJECT_ROOT_OVERRIDE}" != /* || "${PROJECT_ROOT_OVERRIDE}" == *[,[:space:]:]* ]]; then
+    echo "ERROR: PROJECT_ROOT_OVERRIDE must be a plain absolute path" >&2
+    exit 1
+  fi
+  PROJECT_ROOT="${PROJECT_ROOT_OVERRIDE}"
+else
+  PROJECT_ROOT=$(realpath "$PWD")
+fi
+SLURM_WORKDIR="${SLURM_WORKDIR:-${PROJECT_ROOT}}"
+if [[ "${SLURM_WORKDIR}" != /* || "${SLURM_WORKDIR}" == *[,[:space:]:]* ]]; then
+  echo "ERROR: SLURM_WORKDIR must be a plain absolute path" >&2
+  exit 1
+fi
+export SLURM_WORKDIR
 cd "${PROJECT_ROOT}"
 
 # =============================================================================
@@ -1003,6 +1017,7 @@ if [[ "${INTERACTIVE}" == "1" ]]; then
 
   SBATCH_OUTPUT=$(sbatch \
     --nodes="${NUM_TOTAL_NODES}" \
+    --chdir="${SLURM_WORKDIR}" \
     --account="${SLURM_ACCOUNT}" \
     --job-name="interactive-${JOB_NAME}" \
     --partition="${SLURM_PARTITION}" \
@@ -1066,6 +1081,7 @@ DEPENDENCY="singleton"
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
   SBATCH_OUTPUT=$(sbatch \
     --nodes="${NUM_RAY_NODES}" \
+    --chdir="${SLURM_WORKDIR}" \
     --account="${SLURM_ACCOUNT}" \
     --job-name="${JOB_NAME}" \
     --partition="${SLURM_PARTITION}" \
@@ -1083,6 +1099,7 @@ if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
     --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"other","description":"batch training run"}}' \
     : \
     --nodes="${NUM_EXTERNAL_SERVICE_NODES}" \
+    --chdir="${SLURM_WORKDIR}" \
     --account="${SLURM_ACCOUNT}" \
     --job-name="${JOB_NAME}-services" \
     --partition="${SLURM_PARTITION}" \
@@ -1098,6 +1115,7 @@ if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
 else
   SBATCH_OUTPUT=$(sbatch \
     --nodes="${NUM_TOTAL_NODES}" \
+    --chdir="${SLURM_WORKDIR}" \
     --account="${SLURM_ACCOUNT}" \
     --job-name="${JOB_NAME}" \
     --partition="${SLURM_PARTITION}" \

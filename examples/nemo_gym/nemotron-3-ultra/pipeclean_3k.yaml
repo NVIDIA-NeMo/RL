@@ -1,0 +1,36 @@
+# =============================================================================
+# Nemotron 3 Ultra — 3K-GPU pipeclean
+# =============================================================================
+# Half-scale sibling of pipeclean_6k.yaml. Model, parallelism, sequence length,
+# loss and the Gym blend are inherited unchanged; only the cohort size changes,
+# because the node split halves with it (see launch_3k_pipeclean.sh).
+#
+# Why the batch halves: training drops from 512 nodes to 256, so DP falls from
+# 16 to 8. Halving the cohort keeps per-rank work identical to the 6K run —
+# 8192 / 8 = 1024 microbatches per optimizer step, the same 1024 that 6K
+# accumulates at 16384 / 16 — so step time and activation memory behave as they
+# do at 6K. The optimization is NOT 6K's: an 8192-sample update is a different
+# update, so read convergence curves as their own experiment rather than as a
+# 6K reproduction.
+#
+# Parallelism is deliberately untouched (TP=8, EP=64, ETP=1, PP=1, CP=16), and
+# 1024 training GPUs satisfies both divisibility rules with room to spare: DP
+# needs world_size % (TP * CP * PP) == 0, i.e. 128-GPU (32-node) granularity,
+# giving DP=8; the expert grid needs world_size % (ETP * EP * PP) == 0, i.e. 64
+# GPUs, giving expert DP = 1024 / 64 = 16. CP does not enter the second rule —
+# Megatron sizes expert DP straight off world_size (parallel_state.py) — so it is
+# the 32-node step, not EP=64, that binds if training shrinks further. Lowering
+# CONTEXT_PARALLEL_SIZE relaxes that step.
+#
+# checkpointing.checkpoint_dir is inherited but inert: ultra_launch.sh always
+# overrides it from EXP_NAME, so 3K runs never land in the 6K results tree.
+# =============================================================================
+defaults: pipeclean_6k.yaml
+
+grpo:
+  num_prompts_per_step: 512
+
+policy:
+  # num_prompts_per_step * num_generations_per_prompt (512 * 16). Nothing
+  # interpolates this, so both keys have to move together.
+  train_global_batch_size: 8192

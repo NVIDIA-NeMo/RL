@@ -1,0 +1,62 @@
+# =============================================================================
+# NVCF-hosted judges — mergeable fragment
+# =============================================================================
+# Routes all three judge/reward models at NVCF instead of serving them on the
+# allocation. Translated from verified-working overrides (13 clean steps on the
+# reference run).
+#
+# The NVCF function routes are deployment-specific: export GENRM_NVCF_MODEL,
+# NL2BASH_NVCF_MODEL and SAFETY_NVCF_MODEL alongside NVIDIA_API_KEY.
+#
+# base_url is the ONLY switch. When it is truthy Gym skips the local vLLM launch
+# entirely (responses_api_models/local_vllm_model/app.py:194), and every
+# vllm_serve_kwargs / vllm_serve_env_vars setting on the block below it becomes
+# inert — inherited, but never read.
+#
+# This file has NO `defaults` key on purpose. It is a fragment, so a recipe can
+# list it as a second parent without dragging a base config in behind it and
+# clobbering the first parent's deltas.
+#
+# Four things that bite:
+#
+#  1. The nesting is asymmetric. GenRM's inner key repeats the outer name
+#     (genrm_model.responses_api_models.genrm_model); the other two use
+#     local_vllm_model. A wrong key silently creates an unused block instead of
+#     erroring — the only symptom is that the run serves a local vLLM anyway.
+#  2. No `_override_: true`. That directive replaces a block rather than merging
+#     into it, which would discard the judge's entrypoint,
+#     uses_reasoning_parser, ray_worker_py_executable and the rest. Default deep
+#     merge is what is wanted here. (Overlaying onto a base whose genrm_model
+#     block already carries _override_: true, such as rlvr_dolphin.yaml, merges
+#     into that already-replaced block instead of the Ultra base.)
+#  3. ${oc.env:NVIDIA_API_KEY} is written plainly, with no backslash. YAML is
+#     not shell-expanded. The escaping that a launcher needs — an earlier attempt died
+#     with "bad substitution" when bash tried to expand it inside
+#     driver_command.sh — would land in the literal string here and break it.
+#     The caller must export NVIDIA_API_KEY; it reaches the in-container driver
+#     the same way WANDB_API_KEY does.
+#  4. Shrink the Gym GPU allocation to match, or the freed nodes are wasted.
+#     That is the companion change this file cannot express: with the judges
+#     hosted, nothing on those GPUs is serving them. The 3K NVCF wrapper sets
+#     NUM_GYM_NODES=0 for exactly this reason.
+# =============================================================================
+env:
+  nemo_gym:
+    genrm_model:
+      responses_api_models:
+        genrm_model:                    # note: nested key repeats the block name
+          base_url: ["https://integrate.api.nvidia.com/v1"]
+          api_key: ${oc.env:NVIDIA_API_KEY}
+          model: ${oc.env:GENRM_NVCF_MODEL}
+    nl2bash_judge_model:
+      responses_api_models:
+        local_vllm_model:               # note: NOT nl2bash_judge_model
+          base_url: ["https://integrate.api.nvidia.com/v1"]
+          api_key: ${oc.env:NVIDIA_API_KEY}
+          model: ${oc.env:NL2BASH_NVCF_MODEL}
+    safety_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          base_url: ["https://integrate.api.nvidia.com/v1"]
+          api_key: ${oc.env:NVIDIA_API_KEY}
+          model: ${oc.env:SAFETY_NVCF_MODEL}

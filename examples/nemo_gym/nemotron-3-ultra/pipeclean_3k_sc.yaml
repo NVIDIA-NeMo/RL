@@ -1,0 +1,198 @@
+# =============================================================================
+# Nemotron 3 Ultra — 3K-GPU pipeclean on the SingleController path
+# =============================================================================
+# Overlay on pipeclean_3k.yaml that swaps the legacy async-GRPO driver for the
+# SingleController (SC) architecture: streaming forward/backward, the
+# TransferQueue data plane, gated in-order rollout sampling and shard-to-shard
+# weight refit. Model, parallelism, batch shape, sequence length and the Gym
+# blend come from pipeclean_3k.yaml, so a run of this config is comparable
+# against a pipeclean_3k.yaml run on the same node split.
+#
+# Entrypoint: examples/run_grpo_single_controller.py (NOT run_grpo_nemo_gym.py).
+# launch_3k_pipeclean_sc.sh sets that via TRAIN_ENTRYPOINT.
+#
+# Why the SC deltas are restated here instead of inheriting pipeclean_6k_sc.yaml:
+# `defaults` merges each parent's fully resolved tree in order, and every path to
+# a 3K batch runs back through pipeclean_6k.yaml. Listing pipeclean_6k_sc.yaml
+# alongside pipeclean_3k.yaml would therefore re-apply pipeclean_6k.yaml's
+# checkpointing.enabled: true and gpu_memory_utilization: 0.85 on top of the SC
+# deltas, silently re-enabling checkpointing (which SC rejects outright). The
+# disagg fragments can be merged that way only because disagg_overrides.yaml has
+# no parent of its own.
+#
+# Group vs sample units: async_rl counts PROMPT GROUPS, not generations. One
+# optimizer cohort here is 8192 / 16 = 512 groups, half of 6K's 1024.
+# =============================================================================
+defaults: pipeclean_3k.yaml
+
+# =============================================================================
+# Checkpointing — must be off
+# =============================================================================
+# setup_single_controller raises NotImplementedError when checkpointing.enabled
+# is true (single_controller_utils/setup.py). Saving is still a TODO on the SC
+# path, so the run cannot resume across the wall clock: size max_num_steps
+# (NRL_MAX_STEPS) to fit one allocation.
+# =============================================================================
+checkpointing:
+  enabled: false
+
+grpo:
+  # Required because loss_fn.reference_policy_kl_penalty is 0.0. No reference
+  # model is built, but SC still computes reference logprobs unless this is set,
+  # and then fails with AttributeError: 'MegatronPolicyWorker' has no
+  # 'reference_state_dict'.
+  skip_reference_policy_logprobs_calculation: true
+
+  # val_period=-1 / val_at_start=false / val_at_end=false are inherited and
+  # already satisfy the SC guard (it rejects val_period > 0).
+  #
+  # grpo.async_grpo is inherited and dead on this path — SC never reads it — but
+  # env.nemo_gym interpolates ${add:${grpo.async_grpo.max_trajectory_age_steps}, 1}
+  # for num_groups_nemo_rl, so removing the block would break config load.
+
+policy:
+  # ---------------------------------------------------------------------------
+  # Speculative-decoding draft head. run_grpo_single_controller.py reads
+  # config.policy["draft"]["enabled"] unconditionally, so omitting this block is
+  # a KeyError before Ray starts. The nemo_gym runner guards it with an `in`
+  # check, which is why pipeclean_3k.yaml does not need it.
+  # ---------------------------------------------------------------------------
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  generation:
+    # -------------------------------------------------------------------------
+    # Weight refit transport. The inherited default (null) broadcasts every full
+    # parameter tensor from training to all 1976 generation ranks. nccl_reshard
+    # instead moves each parameter shard-to-shard between the two parallelism
+    # layouts over NCCL's M2N reshard, so no rank ever materializes a full
+    # tensor. The bulk path covers the MoE FFN projections, which are 97-98% of
+    # the weights at EP=64.
+    #
+    # Declared here rather than passed with `+` because refit_transport is
+    # NotRequired in VllmConfig; with the key present, REFIT_TRANSPORT=null in
+    # launch_3k_pipeclean_sc.sh falls back to the broadcast path.
+    #
+    # It degrades quietly: if the container lacks the nccl4py M2N integration,
+    # xferdtensor.py logs "nccl.m2n.reshard not found" and uses a Python
+    # implementation instead. Check the first run's logs for that line.
+    #
+    # The config satisfies every constraint in
+    # docs/design-docs/nccl-reshard-refit.md: non-colocated, Megatron train,
+    # vLLM gen, ETP=1, PP=1 with no custom layout, BF16 end to end, and vLLM
+    # expert_parallel_size == tensor_parallel_size (8).
+    # -------------------------------------------------------------------------
+    refit_transport: nccl_reshard
+
+    vllm_cfg:
+      # 0.85 -> 0.80, matching pipeclean_6k_sc.yaml. The NCCL staging buffer for
+      # update_weights_from_collective grows with generation rank count; a
+      # smaller-scale run OOM'd there at 0.85 with 128 generation ranks after
+      # running fine at 32. This recipe has 1976. Costs KV cache, so watch
+      # generation throughput.
+      #
+      # This is the pressure refit_transport: nccl_reshard removes, so 0.85 may
+      # be recoverable once a reshard run is confirmed healthy. Left at 0.80 so
+      # the v1 and SC arms differ only in the transport.
+      gpu_memory_utilization: 0.80
+
+# =============================================================================
+# SingleController async RL — required by MasterConfig
+# =============================================================================
+# in_order stamps each dispatched cohort with its exact target optimizer step.
+# The lookahead is the ceiling on off-policyness: generation may start a cohort
+# at most this many optimizer steps before the step that trains on it, so the
+# reported `lag` settles there once generation is the bottleneck.
+#
+# 1, not the 4 the 6K recipe uses, and every 3K arm shares it so that lag is a
+# constant of this campaign rather than a per-arm variable: the NVCF and disagg
+# arms inherit this block untouched, and the ready_first arm restates the same
+# depth under its own key. It is also the depth validated at small scale, and the
+# shallowest that still overlaps generation with training.
+#
+# The loss does not correct what lag remains: force_on_policy_ratio is true here,
+# which pins the PPO ratio at 1.0 and leaves use_importance_sampling_correction
+# and truncated_importance_sampling_ratio inert. That is tolerable at a lookahead
+# of 1 and is the reason to prefer it, but it means token_mult_prob_error and
+# is_oob_ratio are not measuring a live correction on this arm.
+# =============================================================================
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  recompute_kv_cache_after_weight_updates: false
+
+  # Begin forward/backward once this many groups are ready rather than waiting
+  # for all 512; the remainder streams in behind it and accumulates into the
+  # single GBS=8192 optimizer step. 128 is 25% of the cohort, the same ratio the
+  # 6K recipe uses (256 of 1024), so a step dispatches in ~4 chunks.
+  min_groups_for_streaming_train: 128
+
+  # The current cohort plus its single lookahead cohort. The gate stops
+  # generation at trainer_version + 1, so anything above 512 * 2 is unreachable
+  # rather than merely generous. This is also the NemoGym actor's rollout fan-in,
+  # which its Ray max_concurrency is sized from.
+  max_inflight_prompts: 1024
+
+  # Hard floor, not a preference: validate_sampler_buffer_capacity raises if this
+  # is below num_prompts_per_step * (max_lookahead_versions + 1) = 512 * 2 =
+  # 1024, because the rollout pump would deadlock waiting for buffer slots. It
+  # scales with the lookahead, so raising one raises both.
+  max_buffered_rollouts: 1024
+
+  diagnostics: false
+
+# =============================================================================
+# TransferQueue data plane — mandatory for the SC path, over CPU RDMA
+# =============================================================================
+# run_grpo_single_controller.py refuses to start unless enabled is true.
+#
+# backend=mooncake_cpu moves rollout tensors over RDMA instead of through the
+# SimpleStorage Ray actors. There is no TCP mode and no fallback: if no usable
+# RDMA device is found the run raises at data-plane setup rather than quietly
+# degrading, so a misconfigured fabric fails in seconds instead of showing up
+# as unexplained step time. Set DP_BACKEND=simple on the launcher to go back.
+#
+# Sizing is PER CLIENT PROCESS (one per GPU), and under RDMA it is pinned and
+# resident from setup — not lazily faulted in. At 4 GPUs/node this recipe pins
+# 4 x (64 + 4) = 272 GiB of the 952 GiB these nodes carry. Under-sizing surfaces
+# as "batch_get_tensor returned None", so raise it if that appears rather than
+# guessing upward now.
+#
+# Storage-unit sharding does not apply to this backend: MooncakeStore has no
+# unit count and no sample cap, sizing itself entirely from the two values
+# below. num_storage_units and storage_capacity therefore live in the simple:
+# block, which is read only when that backend is selected.
+#
+# On this fleet each node exposes 4 InfiniBand rails and 2 Ethernet rails; the
+# adapter prefers InfiniBand and offers all 4, never mixing the two fabrics.
+# =============================================================================
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: "mooncake_cpu"
+  claim_meta_poll_interval_s: 0.5
+  # Read only under backend=simple, kept so falling back is a one-word change
+  # and keeps the sharding this recipe was tuned with.
+  simple:
+    storage_capacity: 1000000
+    # Half of the 6K recipe's 64, tracking the halved per-step volume (8192 rows
+    # instead of 16384, at the same 131072 tokens). Like that value it is
+    # proportional rather than measured — raise it first if the TQ storage actors
+    # bottleneck or OOM.
+    num_storage_units: 32
+  mooncake_cpu:
+    global_segment_size: 68719476736  # 64 GiB per client process
+    local_buffer_size:    4294967296  # 4 GiB per client process
+    # Keep RDMA-registered buffers alive across transfers instead of
+    # registering one per call. Set false to fall back to upstream's behavior.
+    reuse_registered_buffers: true
+    # Pooling threshold, not a cap: a larger payload still transfers, with a
+    # transient registration. Slots ratchet up to the largest payload admitted
+    # and never shrink, so raise this only if a single sample of a single field
+    # genuinely exceeds it.
+    staging_buffer_size:  268435456   # 256 MiB per pool slot
