@@ -41,6 +41,10 @@ from rich.panel import Panel
 from torch.utils.tensorboard import SummaryWriter
 
 from nemo_rl.data.interfaces import LLMMessageLogType
+from nemo_rl.data.train_data_artifacts import (
+    TrainDataArtifactPaths,
+    save_train_data_artifacts,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.metric_utils import is_histogram_metric
 
@@ -1127,6 +1131,23 @@ class Logger(LoggerInterface):
                 f.write(json.dumps({**sample, "idx": i}, default=str) + "\n")
 
         print(f"Logged data to {filepath}")
+
+    def log_train_data_artifacts(
+        self,
+        *,
+        step: int,
+        num_samples: int,
+        non_tensor_data: Mapping[str, Any],
+        tensors: Mapping[str, torch.Tensor],
+    ) -> TrainDataArtifactPaths:
+        """Log one train-data step as ``.pt`` plus a safetensors sidecar."""
+        return save_train_data_artifacts(
+            base_dir=self.base_log_dir,
+            step=step,
+            num_samples=num_samples,
+            non_tensor_data=non_tensor_data,
+            tensors=tensors,
+        )
 
     def log_string_list_as_jsonl(self, to_log: list[str], filename: str) -> None:
         """Log a list of strings to a JSONL file.

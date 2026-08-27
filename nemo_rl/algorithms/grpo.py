@@ -14,6 +14,7 @@
 import gc
 import json
 import os
+import sys
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -73,6 +74,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.train_data_artifacts import AsyncTrainDataArtifactWriter
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -2230,8 +2232,9 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     """Whether NeMo Gym is responsible for full response logging.
 
-    When **True**, skip the expensive per-step ``train_data_step*.jsonl`` dump.
-    When **False** (the default if unset), write the local JSONL file.
+    When **True**, skip the expensive local per-step train-data dump.  When
+    **False** (the default if unset), write the local train-data artifacts
+    (JSONL for synchronous GRPO; ``.pt`` plus safetensors for async GRPO).
 
     W&B full-result Tables are controlled independently by
     ``logger.wandb.log_nemo_gym_full_result_tables``.
@@ -4650,10 +4653,14 @@ def async_grpo_train(
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
+    train_data_writer = AsyncTrainDataArtifactWriter(logger.log_train_data_artifacts)
 
     # Main training loop
     try:
         while step < master_config.grpo.max_num_steps:
+            # Surface a completed background-save failure before doing more work.
+            # A still-running save is allowed to overlap the optimizer step.
+            train_data_writer.finish(wait=False)
             ray.get(trajectory_collector.check_health.remote())
             refit_metrics: dict[str, float] = {}
             early_stop_message: Optional[str] = None
@@ -5086,7 +5093,10 @@ def async_grpo_train(
                     and policy_generation.wake_carries_weight_updates()
                 )
 
-                print("🔄 Synchronizing policy weights to trajectory collector…", flush=True)
+                print(
+                    "🔄 Synchronizing policy weights to trajectory collector…",
+                    flush=True,
+                )
                 if defer_wake_for_save:
                     # Wake-deferral (checkpoint scheduling, which the backend
                     # cannot see): the engine is about to be saved, so leave it
@@ -5447,33 +5457,45 @@ def async_grpo_train(
                         ray.get(trajectory_collector.resume_after_refit.remote())
 
             # Logging
+            # Stage the training data before releasing train_data, but do not
+            # start filesystem I/O until the step's W&B metrics have been sent.
+            pending_train_data_save: Optional[
+                tuple[dict[str, Any], dict[str, torch.Tensor], int]
+            ] = None
             # Log training data (match sync GRPO logging payload for parity).
             # NeMo Gym responses can be very large and expensive to log; when
-            # env.should_log_nemo_gym_responses is true, skip this jsonl (see
+            # env.should_log_nemo_gym_responses is true, skip these artifacts (see
             # _should_log_nemo_gym_responses).
             if not _should_log_nemo_gym_responses(master_config):
-                log_data = {}
+                non_tensor_log_data: dict[str, Any] = {}
                 if "agent_ref" in repeated_batch:
-                    log_data["agent_ref"] = repeated_batch["agent_ref"]
-                log_data["content"] = flat_messages_content
-                log_data["rewards"] = rewards.tolist()
+                    non_tensor_log_data["agent_ref"] = repeated_batch["agent_ref"]
+                non_tensor_log_data["content"] = flat_messages_content
+                tensor_log_data = {
+                    # JSONL historically added this field while iterating rows.
+                    "idx": torch.arange(len(flat_messages_content), dtype=torch.int64),
+                    "rewards": rewards.detach().cpu(),
+                    "input_lengths": input_lengths.detach().cpu(),
+                    "token_ids": train_data["input_ids"].detach().cpu(),
+                    "token_loss_mask": train_data["token_mask"].detach().cpu(),
+                    "sample_loss_mask": train_data["sample_mask"].detach().cpu(),
+                    "advantages": train_data["advantages"].detach().cpu(),
+                    "generation_logprobs": train_data["generation_logprobs"]
+                    .detach()
+                    .cpu(),
+                    "prev_logprobs": train_data["prev_logprobs"].detach().cpu(),
+                }
                 if master_config.grpo.use_dynamic_sampling:
                     # In dynamic sampling, `rewards` corresponds to filtered rewards
-                    log_data["filtered_rewards"] = rewards.tolist()
-                    log_data["rewards"] = repeated_batch["total_reward"].tolist()
-                log_data["input_lengths"] = input_lengths.tolist()
-                log_data["token_ids"] = train_data["input_ids"].tolist()
-                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
-                log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
-                log_data["advantages"] = train_data["advantages"].tolist()
-                log_data["generation_logprobs"] = train_data[
-                    "generation_logprobs"
-                ].tolist()
-                log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-                logger.log_batched_dict_as_jsonl(
-                    log_data, f"train_data_step{step + 1}.jsonl"
+                    tensor_log_data["filtered_rewards"] = rewards.detach().cpu()
+                    tensor_log_data["rewards"] = (
+                        repeated_batch["total_reward"].detach().cpu()
+                    )
+                pending_train_data_save = (
+                    non_tensor_log_data,
+                    tensor_log_data,
+                    len(flat_messages_content),
                 )
-                del log_data
             del train_data
             del flat_messages_content
 
@@ -5582,6 +5604,23 @@ def async_grpo_train(
                 step_finished=True,
             )
 
+            if pending_train_data_save is not None:
+                non_tensor_log_data, tensor_log_data, num_log_samples = (
+                    pending_train_data_save
+                )
+                train_data_writer.start(
+                    step=step + 1,
+                    num_samples=num_log_samples,
+                    non_tensor_data=non_tensor_log_data,
+                    tensors=tensor_log_data,
+                )
+                del (
+                    pending_train_data_save,
+                    non_tensor_log_data,
+                    tensor_log_data,
+                    num_log_samples,
+                )
+
             timer.reset()
             step += 1
             if early_stop_message is not None:
@@ -5607,6 +5646,14 @@ def async_grpo_train(
         raise
 
     finally:
+        had_active_exception = sys.exc_info()[0] is not None
+        train_data_finalize_error: Optional[Exception] = None
+        try:
+            train_data_writer.finish(wait=True)
+        except Exception as e:
+            print(f"Error finalizing background train-data save: {e}", flush=True)
+            train_data_finalize_error = e
+
         # Finalize any pending async checkpoint before tearing down workers.
         try:
             checkpointer.shutdown()
@@ -5641,3 +5688,7 @@ def async_grpo_train(
                 print(f"Error shutting down policy workers: {e}")
 
         print("Async GRPO training complete!")
+        # Preserve an already-active training exception.  Otherwise surface a
+        # persistence failure only after all workers and checkpoints are clean.
+        if train_data_finalize_error is not None and not had_active_exception:
+            raise train_data_finalize_error
