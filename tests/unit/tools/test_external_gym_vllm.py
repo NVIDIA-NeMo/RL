@@ -867,3 +867,41 @@ def test_submission_validation_checks_placeholders_paths_and_node_total():
     assert (
         "skipping external hetgroup node-count validation" in missing_node_count.stderr
     )
+
+
+def test_slurm_workdir_controls_batch_host_paths():
+    ray_sub = (REPO_ROOT / "ray.sub").read_text()
+    wrapper = (REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh").read_text()
+    fallback = 'SLURM_WORKDIR="${SLURM_WORKDIR:-${SLURM_SUBMIT_DIR}}"'
+
+    assert fallback in ray_sub
+    assert "BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_WORKDIR}" in ray_sub
+    assert "--container-workdir=$SLURM_WORKDIR" in ray_sub
+    assert "$SLURM_WORKDIR/${SLURM_JOB_ID}-attach.sh" in ray_sub
+    assert fallback in wrapper
+    assert 'RAY_SUB="${RAY_SUB:-${SLURM_WORKDIR}/ray.sub}"' in wrapper
+    assert '--container-workdir="${SLURM_WORKDIR}"' in wrapper
+
+
+def test_service_steps_do_not_hold_ray_head_resources():
+    ray_sub = (REPO_ROOT / "ray.sub").read_text()
+    wrapper = (REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh").read_text()
+
+    head_line = next(
+        line
+        for line in ray_sub.splitlines()
+        if "--container-name=ray-head" in line and "$COMMON_SRUN_ARGS" in line
+    )
+    assert "--overlap" in head_line
+
+    lb_flags = wrapper.split('--container-name="external-vllm-lb-', 1)[1]
+    lb_flags = lb_flags.split("bash -lc", 1)[0]
+    assert "--overlap" in lb_flags
+    assert "--gres=gpu:0" in lb_flags
+    assert "--mem=16G" in lb_flags
+
+
+def test_cpus_per_worker_is_clamped_to_the_allocation():
+    ray_sub = (REPO_ROOT / "ray.sub").read_text()
+    assert "(( CPUS_PER_WORKER > SLURM_CPUS_ON_NODE ))" in ray_sub
+    assert "CPUS_PER_WORKER=$SLURM_CPUS_ON_NODE" in ray_sub
