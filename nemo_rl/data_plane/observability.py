@@ -382,72 +382,6 @@ def _td_bytes(td: TensorDict | None, max_nodes: int = 10_000) -> int:
     return total
 
 
-def fit_latency_bandwidth(s: dict[str, Any]) -> dict[str, Any]:
-    """Split an op's time into fixed per-request overhead vs transfer.
-
-    Least-squares fit of ``wall_ms ~ fixed_ms + n_bytes / bandwidth`` over the
-    op's successful calls, from the accumulated sufficient statistics.
-
-    The fit is only identifiable when request sizes actually vary: if every
-    request is the same size, infinitely many (overhead, bandwidth) pairs
-    reproduce the data, so ``regime`` reports ``"unidentifiable"`` rather
-    than an arbitrary split. That case is common in RL, where a step's
-    payloads are often uniform -- vary batch size to break the tie.
-    """
-    n = s["calls"] - s["errors"]  # successful calls; bytes/time pair only on those
-    sx, sy = float(s["n_bytes"]), s["ok_wall_ms"]
-    sxx, sxy = s["sum_bytes_sq"], s["sum_bytes_ms"]
-    if n < 3 or sx <= 0:
-        return {"regime": "insufficient-data"}
-    mean_x = sx / n
-    var_x = max(sxx / n - mean_x * mean_x, 0.0)
-    # Coefficient of variation: how much do request sizes actually differ?
-    if (var_x**0.5) / mean_x < 0.05:
-        return {
-            "regime": "unidentifiable",
-            "reason": "request sizes near-uniform; vary payload size to separate",
-            "mean_bytes": mean_x,
-            "mean_ms": sy / n,
-        }
-    denom = n * sxx - sx * sx
-    if denom <= 0:
-        return {"regime": "unidentifiable", "reason": "degenerate fit"}
-    slope = (n * sxy - sx * sy) / denom  # ms per byte
-    fixed_ms = (sy - slope * sx) / n
-    if slope <= 0:
-        return {"regime": "noise-dominated", "fixed_ms": fixed_ms}
-    transfer_ms_at_mean = slope * mean_x
-    # R^2: does an affine model actually fit? Low R^2 means the split below
-    # is not trustworthy regardless of how clean the numbers look.
-    syy = s["sum_ms_sq"]
-    ss_tot = syy - sy * sy / n
-    ss_res = syy - fixed_ms * sy - slope * sxy
-    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    return {
-        "fixed_ms": fixed_ms,
-        "bandwidth_mb_s": 1.0 / (slope * 1000.0),
-        "transfer_ms_at_mean": transfer_ms_at_mean,
-        "mean_bytes": mean_x,
-        "r_squared": r_squared,
-        # A high R^2 does NOT validate the model: a chunked step function or
-        # a quadratic both fit a line at R^2 > 0.93 while producing a
-        # meaningless split. A negative intercept is physically impossible
-        # (no request costs less than zero to issue) and catches exactly the
-        # misspecification R^2 misses, so both must hold.
-        "model_trustworthy": r_squared >= 0.8 and fixed_ms >= 0.0,
-        "regime": (
-            "overhead-dominated"
-            if fixed_ms > transfer_ms_at_mean
-            else "bandwidth-dominated"
-        ),
-        "overhead_frac_at_mean": (
-            fixed_ms / (fixed_ms + transfer_ms_at_mean)
-            if (fixed_ms + transfer_ms_at_mean) > 0
-            else 0.0
-        ),
-    }
-
-
 def _step_deltas(snap: dict[str, Any], prev: dict[str, Any]) -> dict[str, float]:
     """The three series both step-metric paths report, identically.
 
@@ -522,9 +456,6 @@ def _op_step_stats(
             )
         ]
         row.update(_clamped_percentiles(step_hist, row["max_ms"]))
-        split = _latency_split(st["fit"], calls, op_bytes)
-        if split:
-            row["overhead_ms"], row["transfer_ms"] = split
         out[op] = row
     return out
 
@@ -645,17 +576,8 @@ def _percent_of_dataplane(per_op: dict[str, dict[str, float]]) -> dict[str, floa
     the step's own wall clock. A workload can be 43% put and still not be
     worth touching.
 
-    Two decompositions of that one total, because either alone leaves the
-    next question unanswered:
-
-    - ``by_op`` -- which call is expensive. Sums to 100 by construction.
-    - ``by_cause`` -- whether that time is fixed per-request cost or moving
-      bytes. ``overhead_ms``/``transfer_ms`` are per call, so they are
-      multiplied back by the call count to compare against the same total.
-      Only ops with an identifiable affine fit can be split (an op whose
-      requests were all one size cannot be), so this sums to *at most* 100
-      and the remainder is time that could not be attributed -- not time
-      that did not happen.
+    ``by_op`` answers which call is expensive, and sums to 100 by
+    construction.
 
     On the cluster path ``wall_ms`` is summed over processes that ran
     concurrently, so these are percentages of aggregate process-time rather
@@ -666,8 +588,8 @@ def _percent_of_dataplane(per_op: dict[str, dict[str, float]]) -> dict[str, floa
         per_op: Per-op step detail from :func:`_op_step_stats`.
 
     Returns:
-        ``step/percent_of_dataplane/by_op/{op}`` and ``step/percent_of_dataplane/by_cause/{cause}``,
-        each in percent. Empty when no op ran.
+        ``step/percent_of_dataplane/by_op/{op}`` in percent. Empty when no
+        op ran.
     """
     total = sum(r["wall_ms"] for r in per_op.values())
     if total <= 0:
@@ -676,44 +598,7 @@ def _percent_of_dataplane(per_op: dict[str, dict[str, float]]) -> dict[str, floa
         f"step/percent_of_dataplane/by_op/{op}": 100.0 * r["wall_ms"] / total
         for op, r in per_op.items()
     }
-    for cause, field_name in (
-        ("fixed_overhead", "overhead_ms"),
-        ("transfer", "transfer_ms"),
-    ):
-        attributed = sum(
-            r[field_name] * r["calls"] for r in per_op.values() if field_name in r
-        )
-        if attributed > 0:
-            percent[f"step/percent_of_dataplane/by_cause/{cause}"] = (
-                100.0 * attributed / total
-            )
     return percent
-
-
-def _latency_split(
-    fit: dict[str, Any], calls: int, op_bytes: int
-) -> tuple[float, float] | None:
-    """One call's time split into fixed overhead and transfer, in ms.
-
-    Per call, like ``mean_ms``, and for the same reason: the extensive form
-    scales with DP degree and batch size and so describes the shape of the
-    run rather than the wire. Per call the overhead term *is* the fitted
-    per-request constant -- a property of the backend, comparable against a
-    hardware number -- and the transfer term is that bandwidth at this
-    step's mean request size.
-
-    The two stack to ``mean_ms``, so charting them against it shows the
-    split and how well the affine model holds, in the same units and the
-    same scale as everything else per-op.
-
-    ``None`` when the fit is not trustworthy, which includes the common RL
-    case of near-uniform request sizes where the split is mathematically
-    unrecoverable.
-    """
-    if not fit.get("model_trustworthy") or calls <= 0:
-        return None
-    ms_per_byte = 1.0 / (fit["bandwidth_mb_s"] * 1e3)
-    return fit["fixed_ms"], ms_per_byte * (op_bytes / calls)
 
 
 def _clamped_percentiles(hist: list[int], max_ms: float) -> dict[str, float]:
@@ -759,7 +644,6 @@ def _derive_op_metrics(by_op: dict[str, Any], total_wall_ms: float) -> None:
         stats["percent_of_total_ms"] = (
             100.0 * wall_ms / total_wall_ms if total_wall_ms else 0.0
         )
-        stats["fit"] = fit_latency_bandwidth(stats)
         hist = stats["latency_hist"]
         # Only what the sample supports; an absent key says "not enough
         # calls", which a zero would not.
@@ -786,10 +670,6 @@ _OP_SUM = (
     "wall_ms",
     "n_bytes",
     "n_keys",
-    "ok_wall_ms",
-    "sum_bytes_sq",
-    "sum_bytes_ms",
-    "sum_ms_sq",
 )
 _OP_MAX = ("max_ms", "step_max_ms")
 
@@ -798,11 +678,10 @@ def merge_snapshots(snapshots: "list[dict[str, Any]]") -> dict[str, Any]:
     """Combine per-process snapshots into one cluster-wide view.
 
     This is what the accumulators were shaped for. Latency lives in fixed
-    histogram buckets and the latency/bandwidth model lives in sufficient
-    statistics precisely so both *add*: summing 256 per-rank histograms
-    gives the true cluster distribution, which averaging 256 per-rank
-    percentiles cannot. Everything derived — percentiles, throughput, the
-    affine fit — is recomputed from the merged totals, never averaged.
+    histogram buckets precisely so they *add*: summing 256 per-rank
+    histograms gives the true cluster distribution, which averaging 256
+    per-rank percentiles cannot. Everything derived — percentiles,
+    throughput — is recomputed from the merged totals, never averaged.
 
     Counters sum. ``max_*`` fields take a maximum. ``peak_bytes_outstanding``
     is the one approximation: summing per-process peaks assumes they
@@ -958,10 +837,9 @@ def headline_series(metrics: dict[str, float]) -> dict[str, float]:
 
 
 # Per-op columns worth a row in the breakdown, in the order they read.
-# ``overhead_ms``/``transfer_ms`` are only present when the affine fit is
-# trustworthy, and ``p50_ms``/``p90_ms`` only above the sample gate, so a
-# row carries None where a series was withheld rather than a zero that
-# would read as a measurement.
+# ``p50_ms``/``p90_ms`` are present only above the sample gate, so a row
+# carries None where a series was withheld rather than a zero that would
+# read as a measurement.
 _BREAKDOWN_COLUMNS = (
     "percent_of_dataplane",
     "calls",
@@ -970,8 +848,6 @@ _BREAKDOWN_COLUMNS = (
     "max_ms",
     "p50_ms",
     "p90_ms",
-    "overhead_ms",
-    "transfer_ms",
     "mb",
 )
 
@@ -1045,19 +921,6 @@ class OpStats:
     wall_ms: float = 0.0
     n_bytes: int = 0
     n_keys: int = 0
-    # Sufficient statistics for the least-squares fit wall_ms ~ a + b*n_bytes,
-    # which separates fixed per-request overhead (a) from bandwidth (1/b).
-    # Successful calls only, so bytes and time refer to the same events.
-    # These are additive, so they can be summed across ranks and refit
-    # globally -- no need to ship per-event samples off each process.
-    ok_wall_ms: float = 0.0
-    sum_bytes_sq: float = 0.0
-    sum_bytes_ms: float = 0.0
-    # Also needed for R^2, which is what tells us whether the affine model
-    # describes the data at all -- chunking, retries and queueing all make
-    # wall_ms non-linear in n_bytes, and a low R^2 is the signal to stop
-    # trusting the overhead/bandwidth split.
-    sum_ms_sq: float = 0.0
     # Slowest single call, exact. The histogram below can only place a
     # call in a bucket, so at the handful of calls an op makes in one step
     # a percentile off it is bucket geometry rather than data -- a tail
@@ -1681,11 +1544,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         stats.total_ops += 1
         bucket.n_bytes += n_bytes
         bucket.n_keys += n_keys
-        bucket.ok_wall_ms += wall_ms
         bytes_f = float(n_bytes)
-        bucket.sum_bytes_sq += bytes_f * bytes_f
-        bucket.sum_bytes_ms += bytes_f * wall_ms
-        bucket.sum_ms_sq += wall_ms * wall_ms
         if op == "put" and n_keys:
             per_key = n_bytes // n_keys
             stats.last_put_bytes_per_key = per_key
