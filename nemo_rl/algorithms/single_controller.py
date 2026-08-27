@@ -1931,10 +1931,16 @@ class SingleControllerActor:
         # Before anything reads the rewards, matching grpo.py's ordering. A
         # no-op unless reward_scaling.enabled, and it is the same helper, so the
         # source-range clamp and the warning stay identical.
-        rewards = scale_rewards(
-            BatchedDataDict({"total_reward": rewards}),
-            self._algo_cfg.reward_scaling,
-        )["total_reward"]
+        # ``getattr``: not every algorithm block defines reward_scaling -- the
+        # OPD test doubles build a bare namespace, and DistillationConfig has
+        # no reward to scale. A missing block is a disabled one, which is the
+        # shipped default anyway.
+        reward_scaling_cfg = getattr(self._algo_cfg, "reward_scaling", None)
+        if reward_scaling_cfg is not None:
+            rewards = scale_rewards(
+                BatchedDataDict({"total_reward": rewards}),
+                reward_scaling_cfg,
+            )["total_reward"]
 
         seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,
