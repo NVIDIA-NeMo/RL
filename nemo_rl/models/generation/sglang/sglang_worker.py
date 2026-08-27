@@ -186,7 +186,13 @@ class SGLangGenerationWorker:
         except requests.exceptions.HTTPError as e:
             e.add_note(f"{response.text=}")
             raise
-        return response.json()
+        result = response.json()
+        if isinstance(result, dict) and result.get("success") is False:
+            raise RuntimeError(
+                f"SGLang endpoint {endpoint!r} reported failure: "
+                f"{result.get('message', result)}"
+            )
+        return result
 
     @staticmethod
     def _get_current_free_port(

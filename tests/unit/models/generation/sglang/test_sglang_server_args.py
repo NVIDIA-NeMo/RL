@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
+import pytest
+
+from nemo_rl.models.generation.sglang import sglang_worker
 from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
 
 
@@ -46,3 +51,21 @@ def test_quantized_runner_backends_are_forwarded(monkeypatch):
 
     assert server_args["moe_runner_backend"] == "flashinfer_cutedsl"
     assert server_args["fp4_gemm_runner_backend"] == "flashinfer_cutedsl"
+
+
+def test_make_request_rejects_semantic_failure(monkeypatch):
+    worker_cls = SGLangGenerationWorker.__ray_metadata__.modified_class
+    worker = worker_cls.__new__(worker_cls)
+    worker.node_rank = 0
+    worker.server_base_url = "http://sglang"
+
+    response = SimpleNamespace(
+        raise_for_status=lambda: None,
+        json=lambda: {"success": False, "message": "partial weight update"},
+    )
+    monkeypatch.setattr(
+        sglang_worker.requests, "post", lambda *args, **kwargs: response
+    )
+
+    with pytest.raises(RuntimeError, match="partial weight update"):
+        worker._make_request("update_weights_from_distributed")
