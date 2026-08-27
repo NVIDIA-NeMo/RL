@@ -49,6 +49,7 @@ The table below maps equivalent fields and highlights the differences.
 | Optimized kernels | `use_triton` | — |
 | Adapter dtype | _(follows base layer)_ | `lora_dtype` |
 | Experimental A2A comm | — | `a2a_experimental` |
+| Warm start from a donor adapter | `restore_from` (adapter directory) | `restore_from` (Megatron `iter_*` checkpoint) |
 
 The effective learning-rate multiplier for the adapter is `alpha / dim` on both backends.
 
@@ -71,6 +72,7 @@ policy:
       dropout_position: "post"  # Dropout position: "pre" or "post"
       lora_A_init: "xavier"     # Initialization method: "xavier" or "uniform"
       use_triton: true          # Use Triton-optimized kernels (DTensor v2 path)
+      restore_from: null        # Warm start from a donor adapter checkpoint (see below)
 ```
 
 ### DTensor Parameter Details
@@ -85,6 +87,7 @@ policy:
 - **`dropout_position`** (str): Apply dropout before (`"pre"`) or after (`"post"`) LoRA.
 - **`lora_A_init`** (str): Initialization method for the LoRA A matrix (`"xavier"` or `"uniform"`). The B matrix is always initialized to zero.
 - **`use_triton`** (bool): Use Triton-optimized kernels for better performance. Used for DTensor v2 only. **Note**: [Automodel does not support Triton for TP > 1](https://github.com/NVIDIA-NeMo/Automodel/blob/b2db55eee98dfe81a8bfe5e23ac4e57afd8ab261/nemo_automodel/recipes/llm/train_ft.py#L199). Set to `false` when `tensor_parallel_size > 1` to avoid compatibility issues.
+- **`restore_from`** (str, optional): Path to a donor PEFT adapter checkpoint (a directory containing `adapter_model.safetensors` + `adapter_config.json`, e.g. a previous run's `step_*/policy/weights`) whose adapter weights initialize this run's LoRA modules. See [Warm-Starting from a LoRA Checkpoint](#warm-starting-from-a-lora-checkpoint).
 
 ## Megatron Configuration
 
@@ -105,6 +108,7 @@ policy:
       lora_B_init_method: "zero"    # Initialization method for lora B: "zero"
       a2a_experimental: false       # Enables the experimental All-to-All (A2A) communication strategy
       lora_dtype: None              # Adapter weights dtype
+      restore_from: null            # Warm start from a donor PEFT checkpoint (see below)
 ```
 
 ### Megatron Parameter Details
@@ -126,6 +130,23 @@ policy:
 - **`lora_B_init_method`** (str): Initialization method for the low-rank matrix B. Defaults to `"zero"`.
 - **`a2a_experimental`** (bool): Enables the experimental All-to-All (A2A) communication strategy. Defaults to `False`.
 - **`lora_dtype`** (torch.dtype): Adapter weights dtype. By default it follows `orig_linear`'s dtype, but for quantized weights (e.g. 4-bit) it must be specified explicitly.
+- **`restore_from`** (str, optional): Path to a donor Megatron-Bridge PEFT checkpoint (an `iter_XXXXXXX` directory, or a checkpoint root resolving to one) whose adapter weights initialize this run's LoRA modules. See [Warm-Starting from a LoRA Checkpoint](#warm-starting-from-a-lora-checkpoint).
+
+## Warm-Starting from a LoRA Checkpoint
+
+`restore_from` initializes this run's adapters from a donor PEFT checkpoint, e.g. to carry an
+SFT LoRA into GRPO. The accepted path format differs by backend:
+
+- **DTensor (Automodel)**: `policy.dtensor_cfg.lora_cfg.restore_from` — a directory containing
+  `adapter_model.safetensors` + `adapter_config.json` (a previous run's `step_*/policy/weights`
+  or its `model/` subdirectory).
+- **Megatron Core**: `policy.megatron_cfg.peft.restore_from` — a native Megatron `iter_XXXXXXX`
+  directory, or a checkpoint root containing one.
+
+The donor's `dim`/`alpha` must match this run's; setup fails loudly otherwise. Optimizer, RNG,
+and train state always start fresh. `restore_from` requires `enabled: true`. When resuming from a
+NeMo RL training checkpoint, the resumed weights take precedence for the policy; the KL reference
+policy still anchors to the warm-started (donor) adapters, not to the bare base model.
 
 ## Usage by Algorithm
 
