@@ -629,3 +629,52 @@ def test_the_release_still_runs_without_cuda(monkeypatch):
     ran = []
     release_within(lambda: ran.append(True), 5.0, "the test communicator")
     assert ran == [True]
+
+
+class TestStandDown:
+    """The deadline is for a SILENT peer, not a dead one.
+
+    A dead peer closes its sockets and NCCL unblocks the survivors by itself -- job 6405953
+    recovered the reshard kill variant that way with RefitAborted appearing zero times,
+    before any deadline existed. Once it existed it started winning that race, and the
+    abort orphans kernels on the trainers' streams, so the rebuild that would have worked
+    cannot. The controller therefore stands the deadline down on a confirmed actor death.
+    """
+
+    def test_standing_down_cancels_the_deadline_without_firing_it(self):
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAbortWatchdog,
+            stand_down_armed_watchdogs,
+        )
+
+        group = _FakeGroup()
+        with RefitAbortWatchdog(group, 0.05) as guard:
+            assert stand_down_armed_watchdogs() == 1
+            time.sleep(0.3)  # well past the deadline it would otherwise have fired on
+            assert not guard.fired, (
+                "a stood-down watchdog must not fire; if it does, the abort still orphans "
+                "the trainers' streams and the rebuild it was meant to protect cannot run"
+            )
+        assert group.abort_calls == 0, (
+            f"a stood-down watchdog must not abort anything; saw {group.abort_calls}"
+        )
+
+    def test_a_watchdog_that_has_exited_is_no_longer_standable_down(self):
+        """The registry must not leak, or a later death would poke a finished guard."""
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAbortWatchdog,
+            stand_down_armed_watchdogs,
+        )
+
+        with RefitAbortWatchdog(_FakeGroup(), 10.0):
+            pass
+        assert stand_down_armed_watchdogs() == 0
+
+    def test_a_disarmed_watchdog_is_never_registered(self):
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAbortWatchdog,
+            stand_down_armed_watchdogs,
+        )
+
+        with RefitAbortWatchdog(_FakeGroup(), None):
+            assert stand_down_armed_watchdogs() == 0

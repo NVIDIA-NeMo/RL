@@ -1405,6 +1405,12 @@ class SingleControllerActor:
                 self._gen_fleet.record_actor_death(
                     shard_idx, error=f"{type(error).__name__}: {error}"
                 )
+                # A DEATH, not a silence -- so stand the trainers' refit deadline down.
+                # A dead peer closes its sockets and NCCL unblocks the survivors by
+                # itself; the deadline would abort first and orphan kernels on the
+                # trainers' streams, leaving a CUDA context no rebuild can use. See
+                # stand_down_armed_watchdogs.
+                self._stand_down_refit_deadline(shard_idx)
             except (Exception, asyncio.TimeoutError) as error:
                 self._gen_fleet.record_probe(
                     shard_idx, ok=False, error=f"{type(error).__name__}: {error}"
@@ -1480,6 +1486,33 @@ class SingleControllerActor:
                     shard_idx,
                     RuntimeError(f"router: {failures} failed request(s) to {url}"),
                 )
+
+    def _stand_down_refit_deadline(self, shard_idx: int) -> None:
+        """Tell every policy worker to cancel an in-flight refit deadline.
+
+        Fire-and-forget, and deliberately not awaited: this runs inside a probe whose job
+        is to keep the ledger current, and a worker that cannot answer is already the
+        larger problem. Reaching the worker at all depends on the refit running off its
+        event loop -- see await_off_loop.
+
+        Only ever called for a CONFIRMED actor death. A frozen rank never produces one, so
+        its deadline still fires and still ends the run attributably.
+        """
+        try:
+            for worker in self._trainer.worker_group.workers:
+                worker.stand_down_refit_watchdog.remote()
+        except Exception as error:  # noqa: BLE001 - the probe must not die of this
+            print(
+                f"  refit: could not stand the deadline down after shard {shard_idx} "
+                f"died: {type(error).__name__}: {error}",
+                flush=True,
+            )
+        else:
+            print(
+                f"  refit: shard {shard_idx} is confirmed gone; standing the trainers' "
+                "refit deadline down so NCCL's own dead-peer path can unblock them",
+                flush=True,
+            )
 
     async def _reconcile_refit_membership(self, force: bool = False) -> Optional[bool]:
         """Ask the weight transport to match the live fleet before the refit runs.

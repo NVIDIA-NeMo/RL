@@ -240,6 +240,23 @@ class TestGenerationFleetProbe:
             stats=RolloutStats(), inflight=0, stall_timeout_s=1000.0, **kwargs
         )
         ctrl._gen_fleet = monitor
+        # A confirmed death stands the trainers' refit deadline down, so the fixture has to
+        # carry the trainer handle it fans out over. Without it the probe's except clause
+        # would swallow an AttributeError and the feature would silently no-op -- which is
+        # how a wrong attribute name survived until a test looked for the calls.
+        ctrl._stood_down = []
+        ctrl._trainer = SimpleNamespace(
+            worker_group=SimpleNamespace(
+                workers=[
+                    SimpleNamespace(
+                        stand_down_refit_watchdog=SimpleNamespace(
+                            remote=(lambda i=i: ctrl._stood_down.append(i))
+                        )
+                    )
+                    for i in range(2)
+                ]
+            )
+        )
         ctrl._gen = SimpleNamespace(
             worker_group=SimpleNamespace(
                 get_dp_leader_worker_idx=lambda shard: shard,
@@ -290,6 +307,44 @@ class TestGenerationFleetProbe:
         asyncio.run(_run_probe_ticks(ctrl, 2))
         assert monitor.state_of(1) is ShardState.DEAD
         assert monitor.absent_shards() == [1]
+
+    def test_a_confirmed_death_stands_the_trainers_deadline_down(self):
+        """A dead peer needs NCCL's own error path, not the refit deadline.
+
+        Job 6405953 recovered the reshard kill variant with RefitAborted appearing zero
+        times, before any deadline existed. Once it existed it started winning that race:
+        it aborts, sync_stream_within orphans kernels on the trainers' streams, and the
+        rebuild that would have worked cannot. recovery-reshard-refit has failed
+        continuously since job 6512153 for exactly that reason.
+        """
+        monitor = GenerationFleetHealth(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=99)
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[True, False])
+        asyncio.run(_run_probe_ticks(ctrl, 1))
+        assert ctrl._stood_down == [0, 1], (
+            "every policy worker must be told to stand its refit deadline down once a "
+            f"generation shard is confirmed gone; saw {ctrl._stood_down}"
+        )
+
+    def test_a_timeout_leaves_the_deadline_armed(self):
+        """The frozen case, and the reason this is keyed on DEATH rather than silence.
+
+        A frozen rank is alive and simply stops answering. No death is ever recorded, the
+        deadline still fires, and the run still ends attributably -- which is the only
+        outcome available on the reshard transport once the bulk transfer has aborted.
+        """
+        monitor = GenerationFleetHealth(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=99)
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[True, True])
+        ctrl._async_cfg.generation_fleet_health.probe_timeout_s = 0.001
+        ctrl._gen.worker_group.workers[1].is_alive.remote = lambda: asyncio.sleep(10.0)
+        asyncio.run(_run_probe_ticks(ctrl, 2))
+        assert ctrl._stood_down == [], (
+            "a probe timeout is not proof of death; standing the deadline down on one "
+            "would leave a frozen rank able to wedge the run forever"
+        )
 
     def test_a_timeout_is_still_counted_rather_than_trusted(self):
         """The other half: an ambiguous failure must keep its benefit of the doubt.

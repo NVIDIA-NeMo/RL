@@ -235,6 +235,44 @@ def release_within(release, budget_s: float, what: str) -> None:
         )
 
 
+_ARMED_LOCK = threading.Lock()
+_ARMED: "set[RefitAbortWatchdog]" = set()
+
+
+def stand_down_armed_watchdogs() -> int:
+    """Disarm every refit deadline armed in this process, and say how many.
+
+    THE DEADLINE IS FOR A SILENT PEER, NOT A DEAD ONE, and firing it on a dead one is
+    strictly harmful. When a generation rank's process is gone its sockets close, NCCL's
+    own error path unblocks the survivors, and the run recovers off the pre-existing
+    actor-death route -- job 6405953 passed the reshard kill variant that way with
+    ``RefitAborted`` appearing zero times, before any deadline existed.
+
+    Once the deadline was added it started winning that race. It aborts at its timeout,
+    ``sync_stream_within`` gives up on kernels already enqueued on the trainers' streams,
+    and the CUDA context cannot be trusted afterwards -- so the rebuild that would have
+    succeeded now cannot. ``recovery-reshard-refit`` has failed continuously since job
+    6512153, which is the run where the deadline first began firing on that path, and jobs
+    6521181/6523731/6582457 each confirmed the abort never retires: not with the peer
+    SIGKILLed, not with the release pinned to the caller's device.
+
+    So the controller stands the deadline down the moment a probe reports an actor DEATH,
+    which is conclusive in a way a timeout is not. The frozen case is untouched: a frozen
+    rank is alive, no death is ever recorded, and the deadline still fires and still ends
+    the run attributably.
+
+    The controller can reach this at all only because the refit runs off the actor's event
+    loop (see ``await_off_loop``); a worker blocked in the loop could not service the call.
+
+    Idempotent, and safe to call when nothing is armed.
+    """
+    with _ARMED_LOCK:
+        guards = list(_ARMED)
+    for guard in guards:
+        guard.stand_down()
+    return len(guards)
+
+
 class RefitAbortWatchdog:
     """Abort the given group(s) if the guarded block outlives ``timeout_s``.
 
@@ -272,12 +310,24 @@ class RefitAbortWatchdog:
         self._done = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._fired = False
+        self._stood_down = False
 
     @property
     def armed(self) -> bool:
         return (
             bool(self._groups) and self._timeout_s is not None and self._timeout_s > 0
         )
+
+    def stand_down(self) -> None:
+        """Cancel this deadline without firing it; see stand_down_armed_watchdogs.
+
+        Sets the same event the guarded block sets on a clean exit, so the watch thread
+        returns without aborting anything and ``fired`` stays False. Racing a watch thread
+        that is already past its wait is harmless: ``_done`` is only ever set, never
+        cleared, and the abort it performs is idempotent.
+        """
+        self._stood_down = True
+        self._done.set()
 
     @property
     def fired(self) -> bool:
@@ -321,6 +371,10 @@ class RefitAbortWatchdog:
                 f"{len(self._groups)} communicator group(s)",
                 flush=True,
             )
+            # Registered before the thread starts, so a stand-down that arrives in the
+            # same instant cannot slip between arming and being reachable.
+            with _ARMED_LOCK:
+                _ARMED.add(self)
             self._thread = threading.Thread(
                 target=self._watch, name="refit-abort-watchdog", daemon=True
             )
@@ -348,6 +402,8 @@ class RefitAbortWatchdog:
     ) -> None:
         # Join, so a run that refits every step cannot accumulate one thread per step.
         self._done.set()
+        with _ARMED_LOCK:
+            _ARMED.discard(self)
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
