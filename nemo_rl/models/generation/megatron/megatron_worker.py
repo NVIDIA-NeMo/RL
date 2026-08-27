@@ -186,6 +186,16 @@ class MegatronGenerationMixin:
                 "generation, but no CUDA-graph manager could be created for this model."
             )
 
+            # When the model-level manager owns block-scope graphs,
+            # construction deletes the decoder's fallback manager.
+            decoder = getattr(lang_module, "decoder", None)
+            if (
+                hasattr(lang_module, "cudagraph_manager")
+                and decoder is not None
+                and hasattr(decoder, "cudagraph_manager")
+            ):
+                del decoder.cudagraph_manager
+
         # Detach for training; this caches the managers built above.
         toggle_cuda_graphs(lang_module, set_to="none")
 
