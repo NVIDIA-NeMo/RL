@@ -26,7 +26,7 @@ import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -875,6 +875,7 @@ class TQReplayBuffer:
                 sample_ids=list(sample_ids),
                 fields=list(fields.keys()),
                 sequence_lengths=[int(s) for s in lengths.tolist()],
+                extra_info={ROLLOUT_METRICS: [dict(record.rollout_metrics)]},
                 tags=[dict(t) for t in tags],
             )
 

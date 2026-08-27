@@ -55,6 +55,7 @@ from pydantic import BaseModel, Field, NonNegativeInt, model_validator
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 
 # Poll interval for the rollout-pump admission gate.
 _GATE_POLL_SECONDS = 0.005
@@ -231,11 +232,15 @@ class BaseSampler(abc.ABC):
         requested_groups = min(len(valid_idxs), max_prompt_groups)
         selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
+        selected_rollout_metrics = [
+            metrics
+            for meta in selected_metas
+            for metrics in meta.extra_info.get(ROLLOUT_METRICS, [])  # type: ignore[union-attr]
+        ]
+        selected_meta = selected_metas[0].concat(*selected_metas[1:])  # type: ignore[union-attr]
+        selected_meta.extra_info[ROLLOUT_METRICS] = selected_rollout_metrics
         await self._buffer.remove(selected_idxs, remove_in_dp=False)
-        return (
-            selected_metas[0].concat(*selected_metas[1:]),  # type: ignore
-            len(selected_idxs),
-        )
+        return selected_meta, len(selected_idxs)
 
 
 class WindowedSampler(BaseSampler):

@@ -30,6 +30,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayBuffer,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
 
@@ -144,7 +145,9 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _make_record() -> PromptGroupRecord:
+def _make_record(
+    rollout_metrics: dict[str, Any] | None = None,
+) -> PromptGroupRecord:
     """Opaque PromptGroupRecord — converter is stubbed, so contents are unused."""
     return PromptGroupRecord(
         prompt_idx=0,
@@ -152,7 +155,7 @@ def _make_record() -> PromptGroupRecord:
         extra_env_info=None,
         metadata={},
         completions=[],
-        rollout_metrics={},
+        rollout_metrics=dict(rollout_metrics or {}),
     )
 
 
@@ -174,6 +177,7 @@ def _add_group(
     weight: int,
     end_weight: int | None = None,
     target_step: int | None = None,
+    rollout_metrics: dict[str, Any] | None = None,
 ) -> KVBatchMeta:
     if end_weight is None:
         end_weight = weight
@@ -181,7 +185,7 @@ def _add_group(
     return _run(
         buf.commit(
             group_id,
-            _make_record(),
+            _make_record(rollout_metrics),
             start_weight_version=weight,
             end_weight_version=end_weight,
         )
@@ -230,6 +234,26 @@ class TestTQReplayBufferReserveCommit:
         assert dp.depth() == 0
         assert buf.ready_list == [False]
         assert buf.meta_list == [None]
+
+    def test_commit_retains_group_rollout_metrics(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        record = _make_record({"gen_tokens/min": 3, "total_turns": 2})
+        group_id = buf.reserve(weight_version=3)
+
+        meta = _run(
+            buf.commit(
+                group_id,
+                record,
+                start_weight_version=3,
+                end_weight_version=4,
+            )
+        )
+        record.rollout_metrics["gen_tokens/min"] = 99
+
+        assert meta.extra_info[ROLLOUT_METRICS] == [
+            {"gen_tokens/min": 3, "total_turns": 2}
+        ]
 
     def test_commit_clears_rows_when_put_raises_after_writing(self):
         dp = FailAfterPutDataPlaneClient()
@@ -661,7 +685,14 @@ class TestTQReplayBufferStateDict:
     def test_round_trip_restores_lists_and_rows(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
-        metas = [_add_group(buf, weight=w) for w in (1, 2)]
+        metas = [
+            _add_group(
+                buf,
+                weight=1,
+                rollout_metrics={"gen_tokens/min": 3, "total_turns": 2},
+            ),
+            _add_group(buf, weight=2),
+        ]
         state = _run(buf.state_dict(saved_capacity=8))
 
         dp2 = FakeDataPlaneClient()
@@ -679,6 +710,9 @@ class TestTQReplayBufferStateDict:
         assert [m.sample_ids for m in buf2.meta_list] == [
             list(metas[0].sample_ids),
             list(metas[1].sample_ids),
+        ]
+        assert buf2.meta_list[0].extra_info[ROLLOUT_METRICS] == [
+            {"gen_tokens/min": 3, "total_turns": 2}
         ]
         # Rows re-put with identical sample_ids / fields payload / tags.
         assert len(dp2.put_calls) == 2
