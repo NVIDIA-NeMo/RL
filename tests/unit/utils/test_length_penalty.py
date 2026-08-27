@@ -428,15 +428,17 @@ class TestPassRateLengthPenalty:
         apply_group_length_penalties(results, self.cfg(w=0.0))
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
 
-    def test_wrong_rollout_length_still_sets_normalizer(self):
-        # l_max comes from the whole group (longest is a wrong rollout with
-        # total 40): the correct rollout (total 20) loses w * rho * 20/40.
+    def test_wrong_rollout_length_does_not_set_normalizer(self):
+        # l_max comes from CORRECT rollouts only: the wrong rollout's total of
+        # 40 is ignored, the correct rollout (total 20) is its own max and
+        # loses exactly w * rho = 0.2 * 0.5. A long wrong ramble must not
+        # dilute the pressure on correct rollouts.
         results = [
             make_result("1234567890", "1234567890", 1.0),
             make_result("1" * 20, "1" * 20, 0.0),
         ]
         apply_group_length_penalties(results, self.cfg(w=0.2))
-        assert rewards_of(results) == pytest.approx([1.0 - 0.2 * 0.5 * 0.5, 0.0])
+        assert rewards_of(results) == pytest.approx([1.0 - 0.2 * 0.5, 0.0])
 
 
 class TestReviewFixes:

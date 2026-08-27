@@ -390,10 +390,18 @@ def apply_group_length_penalties(
                 1 for k in range(group_size) if original_rewards[g + k] > 0
             ) / float(group_size)
             if pass_rate > 0.0:
-                # l_max is the group's longest rollout, so the penalty is
-                # self-normalizing: the longest correct rollout loses exactly
-                # w * rho_q, shorter ones proportionally less.
-                l_max = float(max(group_total[:group_size]))
+                # l_max is the longest CORRECT rollout, so the penalty is
+                # self-normalizing over the set it applies to: the longest
+                # correct rollout loses exactly w * rho_q, shorter ones
+                # proportionally less — decoupled from wrong-rollout lengths
+                # (long wrong rambles must not dilute the pressure).
+                l_max = float(
+                    max(
+                        total_lengths[g + k]
+                        for k in range(group_size)
+                        if original_rewards[g + k] > 0
+                    )
+                )
                 if l_max > 0.0:
                     for k in range(group_size):
                         idx = g + k

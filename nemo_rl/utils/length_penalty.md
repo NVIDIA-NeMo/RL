@@ -546,8 +546,8 @@ R_len(y_i) = rho_q * |y_i| / l_max
 
 where `rho_q` is the prompt group's pass rate (fraction of rollouts with `reward > 0`),
 `|y_i|` is the rollout's total generated length (reasoning + answer, in `length_type` units),
-and `l_max` is the longest total length in the group (not a hyperparameter — the penalty is
-self-normalizing per group).
+and `l_max` is the longest total length among the group's CORRECT rollouts (not a hyperparameter —
+the penalty is self-normalizing over the set it applies to; long wrong rollouts do not dilute it).
 
 Properties:
 
