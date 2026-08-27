@@ -288,8 +288,10 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.instances.append(self)
 
-    class VLLMValidationError(Exception):
-        pass
+    class VLLMValidationError(ValueError):
+        def __init__(self, message="", parameter=None):
+            super().__init__(message)
+            self.parameter = parameter
 
     class ToolParserManager:
         import_tool_parser = MagicMock()
@@ -348,7 +350,12 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         ToolParserManager=ToolParserManager,
     )
     make_module("vllm.v1.engine.async_llm", logger=MagicMock())
-    return ToolParserManager, ReasoningParserManager, OpenAIServingChat
+    return (
+        ToolParserManager,
+        ReasoningParserManager,
+        OpenAIServingChat,
+        VLLMValidationError,
+    )
 
 
 class _FakeFastAPIApp:
@@ -368,6 +375,7 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
         tool_parser_manager,
         reasoning_parser_manager,
         openai_serving_chat,
+        _,
     ) = _install_fake_vllm_openai_modules(monkeypatch)
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
@@ -399,6 +407,102 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
     # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`
     assert "reasoning_parser_plugin" not in openai_serving_chat.instances[0].kwargs
+
+
+def _setup_fake_vllm_chat_handler(monkeypatch):
+    (
+        _,
+        _,
+        openai_serving_chat,
+        vllm_validation_error,
+    ) = _install_fake_vllm_openai_modules(monkeypatch)
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "val_temperature": 0.0,
+        "val_top_p": 1.0,
+        "vllm_cfg": {},
+    }
+    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    worker.llm_async_engine_args = MagicMock()
+    worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
+        served_model_name="served-model", model="model-path"
+    )
+
+    app = _FakeFastAPIApp()
+    worker._setup_vllm_openai_api_server(app)
+    serving_chat = openai_serving_chat.instances[0]
+    chat_handler = next(
+        handler for path, handler in app.routes if path == "/v1/chat/completions"
+    )
+    return serving_chat, chat_handler, vllm_validation_error
+
+
+def _fake_chat_request():
+    return types.SimpleNamespace(
+        top_k=-1,
+        top_p=1.0,
+        temperature=1.0,
+        max_tokens=1,
+        max_completion_tokens=None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Input length (196609) exceeds model's maximum context length (196608)",
+        "Prompt fills or exceeds max_model_len (196608)",
+    ],
+)
+async def test_vllm_http_server_maps_plain_context_overflow_to_400(
+    monkeypatch, message
+):
+    serving_chat, chat_handler, _ = _setup_fake_vllm_chat_handler(monkeypatch)
+
+    async def raise_context_overflow(_request, _raw_request):
+        raise ValueError(message)
+
+    serving_chat.create_chat_completion = raise_context_overflow
+    response = await chat_handler(_fake_chat_request(), MagicMock())
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"] == {
+        "message": message,
+        "type": "invalid_request_error",
+        "code": 400,
+    }
+
+
+@pytest.mark.asyncio
+async def test_vllm_http_server_preserves_typed_validation_errors(monkeypatch):
+    serving_chat, chat_handler, vllm_validation_error = _setup_fake_vllm_chat_handler(
+        monkeypatch
+    )
+
+    async def raise_validation_error(_request, _raw_request):
+        raise vllm_validation_error("invalid sampling parameter")
+
+    serving_chat.create_chat_completion = raise_validation_error
+    response = await chat_handler(_fake_chat_request(), MagicMock())
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]["message"] == "invalid sampling parameter"
+
+
+@pytest.mark.asyncio
+async def test_vllm_http_server_reraises_unrelated_value_error(monkeypatch):
+    serving_chat, chat_handler, _ = _setup_fake_vllm_chat_handler(monkeypatch)
+
+    async def raise_internal_error(_request, _raw_request):
+        raise ValueError("unexpected internal failure")
+
+    serving_chat.create_chat_completion = raise_internal_error
+    with pytest.raises(ValueError, match="unexpected internal failure"):
+        await chat_handler(_fake_chat_request(), MagicMock())
 
 
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(

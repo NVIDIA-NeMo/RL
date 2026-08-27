@@ -442,7 +442,8 @@ class VllmAsyncGenerationWorkerImpl(
                 if remaining <= 0:
                     raise ValueError(
                         f"Prompt length ({len(prompt_token_ids)}) fills or exceeds "
-                        f"max_model_len ({self.model_config.max_model_len}). "
+                        "this model's maximum context length "
+                        f"(max_model_len={self.model_config.max_model_len}). "
                         f"No room for output tokens."
                     )
                 max_tokens = min(request_max_tokens, remaining)
@@ -778,14 +779,34 @@ class VllmAsyncGenerationWorkerImpl(
                     request, raw_request
                 )
             except VLLMValidationError as e:
-                # vLLM raises VLLMValidationError for prompts exceeding
-                # max_model_len during tokenization, instead of returning an
-                # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
-                # detect context-length overflow and handle it gracefully.
+                # Preserve the existing behavior for all typed vLLM request
+                # validation failures. VLLMValidationError inherits ValueError,
+                # so this handler must precede the narrower plain-ValueError case.
                 return JSONResponse(
                     content={
                         "error": {
                             "message": str(e),
+                            "type": "invalid_request_error",
+                            "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
+            except ValueError as e:
+                # vLLM 0.25 can raise a plain ValueError for context overflow
+                # while preprocessing a chat request. Convert only that known
+                # request error to HTTP 400; unrelated ValueErrors are server
+                # bugs and must remain visible.
+                message = str(e)
+                if (
+                    "max_model_len" not in message
+                    and "maximum context length" not in message
+                ):
+                    raise
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": message,
                             "type": "invalid_request_error",
                             "code": 400,
                         }
