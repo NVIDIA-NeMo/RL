@@ -1273,6 +1273,31 @@ def setup(
         )
         return mg, time.perf_counter() - t0
 
+    def init_megatron_weight_synchronizer(
+        policy: ColocatablePolicyInterface,
+        policy_generation: MegatronGeneration,
+    ) -> None:
+        """Initialize Megatron refit and load non-colocated generation weights."""
+        t0 = time.perf_counter()
+        weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend="megatron",
+            colocated=colocated_inference,
+            train_cluster=train_cluster,
+            inference_cluster=None if colocated_inference else inference_cluster,
+        )
+        policy_generation.weight_synchronizer = weight_synchronizer
+        weight_synchronizer.init_communicator()
+        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
+        if not colocated_inference:
+            # The skip-load inference engine gets its final weight buffers here.
+            # Its first prepare_for_generation also starts the HTTP server only
+            # after the refit, so CUDA graphs capture those persistent buffers.
+            t0 = time.perf_counter()
+            weight_synchronizer.sync_weights()
+            setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
+
     def initialize_generation_with_policy(
         init_generation_fn,
         colocated_inference: bool,
@@ -1382,16 +1407,21 @@ def setup(
                     nemo_gym_future = executor.submit(init_nemo_gym)
                     policy, policy_time = policy_future.result()
                     policy_generation, megatron_gen_time = generation_future.result()
+                    if not colocated_inference:
+                        setup_timing_metrics.parallel_wall_time_s = (
+                            time.perf_counter() - init_tasks_t0
+                        )
+                        setup_timing_metrics.parallel_init_enabled = 1.0
+                        # NeMo Gym probes the pre-published endpoint before its
+                        # future completes. A skip-load Megatron endpoint starts
+                        # only during this initial refit, so it must happen while
+                        # Gym is waiting rather than after its future resolves.
+                        init_megatron_weight_synchronizer(policy, policy_generation)
                     nemo_gym_actor, nemo_gym_time = nemo_gym_future.result()
             finally:
                 ray.kill(port_holder)
 
-            if not colocated_inference:
-                setup_timing_metrics.parallel_wall_time_s = (
-                    time.perf_counter() - init_tasks_t0
-                )
-                setup_timing_metrics.parallel_init_enabled = 1.0
-            else:
+            if colocated_inference:
                 setup_timing_metrics.parallel_init_enabled = 0.0
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.generation_init_time_s = (
@@ -1659,22 +1689,8 @@ def setup(
         )
 
     if backend == "megatron":
-        t0 = time.perf_counter()
-        policy_generation.weight_synchronizer = create_weight_synchronizer(
-            policy=policy,
-            generation=policy_generation,
-            generation_backend=backend,
-            colocated=colocated_inference,
-            train_cluster=train_cluster,
-            inference_cluster=None if colocated_inference else inference_cluster,
-        )
-        policy_generation.weight_synchronizer.init_communicator()
-        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
-        if not colocated_inference:
-            # Load the model weights now.
-            t0 = time.perf_counter()
-            policy_generation.weight_synchronizer.sync_weights()
-            setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
+        if policy_generation.weight_synchronizer is None:
+            init_megatron_weight_synchronizer(policy, policy_generation)
         if enable_nemo_gym:
             served_urls = policy_generation.dp_openai_server_base_urls
             if served_urls != [reserved_url]:
