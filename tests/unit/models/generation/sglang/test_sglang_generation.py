@@ -93,6 +93,7 @@ def _make_sglang_generation_cfg(pad_token_id=PAD_TOKEN_ID, tp_size=1):
             "cuda_graph_backend_prefill": "disabled",
             "disable_cuda_graph": False,
             "mem_fraction_static": 0.3,
+            "quantization": {"scheme": "bf16"},
             "sglang_server_config": {
                 "num_gpus": 2,
                 "num_gpus_per_engine": tp_size,
