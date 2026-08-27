@@ -18,6 +18,8 @@ import importlib
 import inspect
 import json
 import os
+import shutil
+import tempfile
 from functools import partial
 from typing import Any, Optional, Union
 
@@ -53,6 +55,9 @@ else:
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components._peft.lora import PeftConfig
+from nemo_automodel.components.checkpoint.stateful_wrappers import (
+    _has_expert_parallelism,
+)
 from nemo_automodel.components.config.loader import _resolve_target
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
@@ -658,12 +663,15 @@ def _validate_lora_adapter_config(
 def _validate_lora_adapter_keys(adapter_dir: str, model: torch.nn.Module) -> None:
     """Fail closed if the donor adapter tensors don't cover this model's LoRA params.
 
-    Only enforced for models without a custom state-dict adapter: those save
-    adapter weights under HF key names that cannot be mapped back to model
-    parameter names cheaply, so their coverage guarantee comes from the
-    adapter_config.json checks in _validate_lora_adapter_config instead.
+    The underlying PEFT load is unconditionally non-strict (a key mismatch is
+    only a warning), so this check is the only guarantee that the donor covers
+    every LoRA parameter -- it must run for all models, including those with a
+    custom state_dict_adapter. The sole exception is expert-parallel models:
+    their LoRA params get custom state_dict key names (e.g.
+    ``gate_up_linear.weight0``) that do not appear in ``named_parameters()``,
+    so their coverage cannot be checked against parameter names.
     """
-    if getattr(model, "state_dict_adapter", None) is not None:
+    if _has_expert_parallelism(model):
         return
     with safe_open(
         os.path.join(adapter_dir, "adapter_model.safetensors"), framework="pt"
@@ -707,14 +715,26 @@ def _load_initial_lora_adapter(
 ) -> None:
     """Warm-start the model's LoRA adapters from a donor PEFT adapter checkpoint.
 
-    The load goes through the Automodel checkpointer's PEFT path (rank-0 read
-    of adapter_model.safetensors, broadcast, DTensor/EP-aware placement), the
-    same machinery used to resume NeMo RL PEFT checkpoints. Optimizer state is
-    not loaded: warm starts begin with a fresh optimizer.
+    The load goes through the Automodel checkpointer's PEFT path (each rank
+    reads adapter_model.safetensors, then
+    ``set_model_state_dict(broadcast_from_rank0=True)`` places it with
+    DTensor/EP awareness), the same machinery used to resume NeMo RL PEFT
+    checkpoints. Optimizer state is not loaded: warm starts begin with a
+    fresh optimizer.
     """
     adapter_dir = _resolve_lora_adapter_dir(restore_from)
     _validate_lora_adapter_config(adapter_dir, lora_cfg, model_name)
     _validate_lora_adapter_keys(adapter_dir, model)
+    staging_dir = None
+    load_dir = adapter_dir
+    if os.path.basename(adapter_dir.rstrip(os.sep)) != "model":
+        # Automodel's checkpointer selects its PEFT safetensors read by a
+        # substring test on the path ("/model" in path); a bare adapter
+        # directory would fall through to the DCP/HF-storage-reader branch
+        # instead. Expose it under a temporary "model" path component.
+        staging_dir = tempfile.mkdtemp(prefix="nrl_lora_warm_start_")
+        load_dir = os.path.join(staging_dir, "model")
+        os.symlink(adapter_dir, load_dir)
     assert checkpoint_manager.checkpointer is not None, (
         "Checkpointer must be initialized before warm starting LoRA adapters."
     )
@@ -725,9 +745,13 @@ def _load_initial_lora_adapter(
             # The donor checkpoint is already dequantized.
             "dequantize_base_checkpoint": False,
         },
-        checkpoint_root=os.path.dirname(adapter_dir.rstrip(os.sep)),
+        checkpoint_root=os.path.dirname(load_dir.rstrip(os.sep)),
     )
-    checkpoint_manager.checkpointer.load_model(model=model, model_path=adapter_dir)
+    try:
+        checkpoint_manager.checkpointer.load_model(model=model, model_path=load_dir)
+    finally:
+        if staging_dir is not None:
+            shutil.rmtree(staging_dir, ignore_errors=True)
     print(f"Warm-started LoRA adapters from {adapter_dir}")
 
 

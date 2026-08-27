@@ -251,7 +251,11 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
     validate_router_replay_config,
 )
-from nemo_rl.models.policy import MegatronConfig, PolicyConfig
+from nemo_rl.models.policy import (
+    MegatronConfig,
+    MegatronPeftConfig,
+    PolicyConfig,
+)
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_megatron_checkpoint_dir,
@@ -454,7 +458,11 @@ def _get_hf_config_overrides_hash(overrides: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
 
 
-def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
+def _resolve_iter_dir_from_root(
+    path: str,
+    not_found_msg: str,
+    config_key: str = "pretrained_checkpoint.path",
+) -> str:
     """Resolve the latest iteration directory under ``path``.
 
     Checks ``latest_checkpointed_iteration.txt`` first; falls back to scanning
@@ -470,7 +478,7 @@ def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
             return os.path.join(path, f"iter_{int(iteration_str):07d}")
         except ValueError:
             raise ValueError(
-                f"pretrained_checkpoint.path={path!r}: "
+                f"{config_key}={path!r}: "
                 f"latest_checkpointed_iteration.txt contains unexpected value "
                 f"{iteration_str!r}; expected an integer or 'release'."
             )
@@ -510,6 +518,7 @@ def _resolve_peft_restore_dir(restore_from: str) -> str:
         "subdirectories. It must point to a native Megatron-Bridge PEFT "
         "checkpoint (an iter_XXXXXXX directory or a checkpoint root containing "
         "one).",
+        config_key="megatron_cfg.peft.restore_from",
     )
     if not os.path.exists(os.path.join(resolved, "run_config.yaml")):
         raise FileNotFoundError(
@@ -521,16 +530,18 @@ def _resolve_peft_restore_dir(restore_from: str) -> str:
 
 
 def _validate_peft_restore_config(
-    restore_dir: str, peft_cfg: Mapping[str, Any]
+    restore_dir: str, peft_cfg: MegatronPeftConfig
 ) -> None:
     """Fail closed if the donor checkpoint's PEFT config is incompatible.
 
     Adapter tensors are loadable only when the rank (dim) matches, and only
     functionally equivalent when the scaling (alpha) matches, so both must
     agree with this run's ``megatron_cfg.peft`` before any weights are loaded.
-    Module-coverage mismatches are caught by the adapter-only distributed load
-    itself (donor keys missing from the checkpoint raise; extra donor keys are
-    ignored).
+    The targeted module sets must match as well: the adapter-only distributed
+    load only raises on donor keys missing from the checkpoint, while
+    unrequested donor keys are discarded silently (DCP's ASSUME_OK_UNEXPECTED
+    skips the mismatch check), so a superset donor would otherwise load with
+    no diagnostics and leave this run's extra adapters at fresh init.
     """
     run_config_path = os.path.join(restore_dir, "run_config.yaml")
     with open(run_config_path) as f:
@@ -555,6 +566,38 @@ def _validate_peft_restore_config(
                 f"checkpoint peft.{key}={saved_peft[key]} does not match this "
                 f"run's peft.{key}={peft_cfg[key]}. Warm starting requires the "
                 "same LoRA rank and scaling; train a new adapter instead."
+            )
+    for key in ("target_modules", "exclude_modules"):
+        if key not in saved_peft:
+            raise ValueError(
+                f"megatron_cfg.peft.restore_from={restore_dir!r}: the donor "
+                f"checkpoint's run_config.yaml peft section has no {key!r} key; "
+                "cannot verify compatibility with this run's peft config."
+            )
+        if set(saved_peft[key]) != set(peft_cfg[key]):
+            raise ValueError(
+                f"megatron_cfg.peft.restore_from={restore_dir!r}: donor "
+                f"checkpoint peft.{key}={saved_peft[key]} does not match this "
+                f"run's peft.{key}={peft_cfg[key]}. Warm starting requires the "
+                "donor to target the same modules; train a new adapter instead."
+            )
+    # These megatron-bridge LoRA fields change the adapter shape/key layout
+    # for MoE expert layers. NeMo RL never sets them (a run always uses the
+    # bridge defaults), but a native Megatron-Bridge donor checkpoint may
+    # have; a mismatch would restore onto a different adapter layout.
+    moe_shaping_defaults = {
+        "normalize_moe_lora": False,
+        "share_expert_adapters": True,
+        "experts_shared_outer_loras": False,
+    }
+    for key, default in moe_shaping_defaults.items():
+        if key in saved_peft and saved_peft[key] != peft_cfg.get(key, default):
+            raise ValueError(
+                f"megatron_cfg.peft.restore_from={restore_dir!r}: donor "
+                f"checkpoint peft.{key}={saved_peft[key]} does not match this "
+                f"run's peft.{key}={peft_cfg.get(key, default)}. Warm starting "
+                "requires the same MoE adapter layout; train a new adapter "
+                "instead."
             )
 
 
@@ -1850,9 +1893,7 @@ def setup_model_and_optimizer(
     pre_wrap_hook = []
 
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
-    if not use_peft and policy_cfg["megatron_cfg"].get("peft", {}).get(
-        "restore_from"
-    ):
+    if not use_peft and policy_cfg["megatron_cfg"].get("peft", {}).get("restore_from"):
         raise ValueError(
             "megatron_cfg.peft.restore_from is set but megatron_cfg.peft.enabled "
             "is False. Enable PEFT to warm start from an adapter checkpoint."
@@ -2298,9 +2339,7 @@ def setup_reference_model_state(
         # reference must include them too (zero-init adapters would anchor KL
         # to the bare base model). Unlike the policy model this runs on resumes
         # as well — the reference must stay anchored to the initial policy.
-        peft_restore_from = config["megatron_cfg"].get("peft", {}).get(
-            "restore_from"
-        )
+        peft_restore_from = config["megatron_cfg"].get("peft", {}).get("restore_from")
         if peft_restore_from is not None:
             ref_pre_wrap_hooks.append(
                 _create_peft_warm_start_hook(
