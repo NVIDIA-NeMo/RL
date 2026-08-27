@@ -386,33 +386,58 @@ class TestProfiledLengthPenalty:
 class TestReviewFixes:
     """Regression tests for review findings on PR #3852."""
 
-    def test_band_multiplier_skips_negative_base(self):
-        # A flat additive penalty pushes the correct-but-long rollout's base
-        # negative; the band multiplier must NOT scale it (base * m - base > 0
-        # for base < 0 would make longer rollouts score HIGHER).
-        band = {"total": {"a": 1, "b": 2, "f": 0.1}}  # length 20 -> m = 0.1
+    def test_flat_penalty_exceeding_reward_clamps_at_zero(self):
+        # Stacked/oversized flat penalties may wipe a correct rollout's reward
+        # out but never flip its sign: 1.0 - 1.5 clamps to 0.0, not -0.5.
+        results = [
+            make_result("1234", "1234", 1.0),  # len 8 < threshold 10: untouched
+            make_result("1234567890", "1234567890", 1.0),  # len 20 >= 10: clamped
+        ]
+        for r in results:
+            r["profiled_rewards"] = [1, 1]
+            r["profiled_output_lengths"] = [10, 10]
+        cfg = make_config(
+            default={"enabled": True, "profiled_length_penalty": 1.5}
+        )
+        apply_group_length_adjustments(results, cfg)
+        assert rewards_of(results) == pytest.approx([1.0, 0.0])
+
+    def test_negative_env_reward_not_raised_by_clamp(self):
+        # The clamp applies only to originally-positive rollouts: an env's own
+        # negative reward must pass through untouched.
+        cfg = make_config(
+            default={"enabled": True, "group_total_length_penalty_coeff": 0.1}
+        )
+        results = [
+            make_result("12345", "12345", -1.0),
+            make_result("1234567890", "1234567890", 1.0),
+        ]
+        apply_group_length_adjustments(results, cfg)
+        assert rewards_of(results)[0] == pytest.approx(-1.0)
+
+    def test_band_multiplier_never_rewards_length_on_penalized_base(self):
+        # Flat penalty exceeds the reward, so bases clamp to 0; the band phase
+        # must leave them at 0 (base * m - base > 0 for base < 0 would have
+        # made longer rollouts score HIGHER pre-clamp).
+        band = {"total": {"a": 1, "b": 2, "f": 0.1}}
         results = [
             make_result("12345", "12345", 1.0, band=band),
             make_result("1234567890", "1234567890", 1.0, band=band),
         ]
-        # zMAD-free setup: use profiled penalty to force one base negative.
-        results[1]["profiled_rewards"] = [1, 1]
-        results[1]["profiled_output_lengths"] = [5, 5]
-        results[0]["profiled_rewards"] = [1, 1]
-        results[0]["profiled_output_lengths"] = [5, 5]
+        for r in results:
+            r["profiled_rewards"] = [1, 1]
+            r["profiled_output_lengths"] = [5, 5]
         cfg = make_config(
             default={
                 "enabled": True,
-                "profiled_length_penalty": 1.5,  # threshold 5: len 20 -> base -0.5
+                "profiled_length_penalty": 1.5,  # threshold 5: both clamped to 0
                 "profile_band_total": True,
             }
         )
         apply_group_length_adjustments(results, cfg)
         r_short, r_long = rewards_of(results)
-        # Short rollout (len 10 >= 5) also penalized to -0.5; both bases are
-        # negative, so the band phase must leave both untouched.
-        assert r_short == pytest.approx(-0.5)
-        assert r_long == pytest.approx(-0.5)
+        assert r_short == pytest.approx(0.0)
+        assert r_long == pytest.approx(0.0)
         assert r_long <= r_short  # longer must never beat shorter
 
     def test_explicit_false_channel_not_overridden_by_global_defaults(self):

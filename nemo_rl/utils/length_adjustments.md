@@ -517,6 +517,10 @@ grpo:
 ## Practical Notes
 
 - Most length algorithms act only on positive rollouts (`reward > 0`).
+- Additive penalties can wipe a correct rollout's reward out but never flip its sign: the
+  adjusted reward is clamped at 0 for originally-positive rollouts (stacked flat penalties
+  exceeding the reward produce 0, not a negative value). Environments' own negative rewards
+  pass through untouched.
 - `profile_band_*` multipliers also apply only to originally correct rollouts.
 - Group-relative scaling can reduce average length aggressively because it gives dense per-group
   pressure.

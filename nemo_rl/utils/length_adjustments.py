@@ -462,6 +462,12 @@ def apply_group_length_adjustments(
         profiled_adj = all_profiled_length_adj[i] if all_adjustments[i] >= 0 else 0.0
         additive_delta = all_adjustments[i] + profiled_adj
         additive_base_rewards[i] = original_rewards[i] + additive_delta
+        # Stacked flat penalties can exceed the reward itself. Length penalties
+        # may wipe a correct rollout's reward out, but never flip its sign —
+        # clamp at 0. Only for originally-positive rollouts: an env's own
+        # negative reward must pass through untouched.
+        if original_rewards[i] > 0 and additive_base_rewards[i] < 0:
+            additive_base_rewards[i] = 0.0
         r["full_result"]["reward"] = additive_base_rewards[i]
 
     # Phase 4: apply per-prompt profile_band multipliers (correct rollouts only).
