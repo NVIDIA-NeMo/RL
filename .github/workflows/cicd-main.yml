@@ -468,7 +468,10 @@ jobs:
           enable-cache: true
 
       - name: Generate lockfile
-        run: uv lock
+        run: |
+          export TMS_CUDA_MAJOR="$(sed -nE 's/^ARG[[:space:]]+BASE_IMAGE=.*cuda([0-9]+)\..*/\1/p' docker/Dockerfile | head -1)"
+          test -n "$TMS_CUDA_MAJOR"
+          uv lock
 
       - name: Package lockfile
         id: package
