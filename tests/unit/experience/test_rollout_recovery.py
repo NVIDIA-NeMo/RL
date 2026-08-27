@@ -235,6 +235,35 @@ def test_prompt_fingerprint_is_stable_for_equivalent_tensor_content() -> None:
     assert prompt_payload_sha256(first) != prompt_payload_sha256(second)
 
 
+def test_prompt_fingerprint_ignores_batch_storage_and_derived_max_length() -> None:
+    batch_lengths = torch.tensor([3, 9])
+    batch_loss_multipliers = torch.tensor([1.0, 1.0])
+    dispatched = {
+        "idx": 7,
+        "length": batch_lengths[0],
+        "loss_multiplier": batch_loss_multipliers[0],
+        "batch_max_length": batch_lengths.max(),
+        "message_log": [{"role": "user", "token_ids": torch.tensor([1, 2, 3])}],
+    }
+
+    restored_lengths = torch.tensor([3])
+    restored_loss_multipliers = torch.tensor([1.0])
+    one_row_recollated = {
+        "idx": 7,
+        "length": restored_lengths[0],
+        "loss_multiplier": restored_loss_multipliers[0],
+        "batch_max_length": restored_lengths.max(),
+        "message_log": [{"role": "user", "token_ids": torch.tensor([1, 2, 3])}],
+    }
+
+    assert batch_lengths[0].untyped_storage().nbytes() != (
+        restored_lengths[0].untyped_storage().nbytes()
+    )
+    assert prompt_payload_sha256(dispatched) == prompt_payload_sha256(
+        one_row_recollated
+    )
+
+
 def test_prompt_ref_rehydrates_through_a_restored_shuffled_dataloader() -> None:
     """Shuffle position and prompt identity are independent recovery assets."""
 

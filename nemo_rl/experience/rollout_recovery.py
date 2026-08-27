@@ -29,7 +29,7 @@ import torch
 if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 4
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 
 
@@ -111,10 +111,32 @@ def _require_int(value: Any, *, field: str, minimum: int) -> int:
     return value
 
 
+def _clone_tensor_leaves(value: Any) -> Any:
+    """Detach tensor content from batch-sized backing storage before hashing."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _clone_tensor_leaves(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_tensor_leaves(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_tensor_leaves(item) for item in value)
+    return value
+
+
 def prompt_payload_sha256(prompt_payload: object) -> str:
-    """Fingerprint a prompt for recovery within the same software runtime."""
+    """Fingerprint stable prompt content within the same software runtime."""
+    if not isinstance(prompt_payload, dict):
+        raise TypeError("prompt payload fingerprint requires a dictionary")
+    canonical_payload = {
+        key: _clone_tensor_leaves(value)
+        for key, value in prompt_payload.items()
+        # Derived from the other prompts in the original dataloader batch and
+        # unused after collation; one-row recovery legitimately recomputes it.
+        if key != "batch_max_length"
+    }
     payload = io.BytesIO()
-    torch.save(prompt_payload, payload)
+    torch.save(canonical_payload, payload)
     return hashlib.sha256(payload.getbuffer()).hexdigest()
 
 

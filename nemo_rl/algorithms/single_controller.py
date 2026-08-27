@@ -748,8 +748,9 @@ class SingleControllerActor:
 
                 # The ledger fingerprints the prompt after dataloader collation,
                 # because that is the object actually dispatched to RolloutManager.
-                # Re-run the same one-row collation here so tensor scalars, optional
-                # fields, and multimodal wrappers match the original runtime shape.
+                # Re-run one-row collation here to reconstruct tensor scalars,
+                # optional fields, and multimodal wrappers. Batch-derived transport
+                # fields can legitimately differ and are excluded from the digest.
                 collate_fn = getattr(self._dataloader, "collate_fn", None)
                 if collate_fn is None:
                     prompt = dataset_prompt
