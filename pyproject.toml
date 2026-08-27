@@ -566,18 +566,6 @@ conflicts = [
     { extra = "trtllm" },
     { extra = "nemo_gym" },
   ],
-  [
-    { extra = "sglang" },
-    { extra = "modelopt" },
-  ],
-  [
-    { extra = "sglang" },
-    { extra = "nvrx" },
-  ],
-  [
-    { extra = "sglang" },
-    { extra = "nemo_gym" },
-  ],
 ]
 
 
