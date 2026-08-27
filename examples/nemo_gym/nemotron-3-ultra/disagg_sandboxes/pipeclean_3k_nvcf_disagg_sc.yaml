@@ -1,0 +1,25 @@
+# =============================================================================
+# Nemotron 3 Ultra — 3K pipeclean: SingleController + NVCF judges + DISAGG sandboxes
+# =============================================================================
+# The fully off-loaded arm: SC execution (streaming forward/backward,
+# TransferQueue data plane, checkpointing off), all three judge/reward models
+# served from NVCF, and tool execution on an external sandbox service. Nothing
+# but policy training and generation runs on the allocation.
+#
+# Model, parallelism, batch shape, sequence length and the Gym blend are
+# inherited unchanged from pipeclean_3k.yaml through the SC overlay, so reward
+# and loss curves stay comparable against the v1 baseline.
+#
+# Both fragments merge AFTER the SC overlay and touch disjoint keys: the NVCF
+# fragment rewrites judge base_url/api_key/model, the disagg fragment rewrites
+# the ns_tools and math_formal_lean backends. That ordering is safe only because
+# neither fragment declares a parent of its own — a second parent inheriting
+# pipeclean_6k.yaml would re-enable checkpointing and undo the SC deltas.
+#
+# Launch with launch_3k_nvcf_disagg_sc.sh, which requires NVIDIA_API_KEY plus
+# the sandbox service variables and carries the 752-node split.
+# =============================================================================
+defaults:
+  - ../pipeclean_3k_sc.yaml
+  - ../nvcf_judges.yaml
+  - disagg_overrides.yaml
