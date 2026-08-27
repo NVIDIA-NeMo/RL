@@ -37,6 +37,7 @@ def test_quantized_runner_backends_are_forwarded(monkeypatch):
             "pp_size": 1,
             "ep_size": 1,
             "skip_server_warmup": True,
+            "quantization": {"scheme": "nvfp4"},
             "moe_runner_backend": "flashinfer_cutedsl",
             "fp4_gemm_runner_backend": "flashinfer_cutedsl",
             "sglang_server_config": {
