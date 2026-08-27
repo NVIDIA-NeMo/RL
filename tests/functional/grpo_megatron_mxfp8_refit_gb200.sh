@@ -110,7 +110,7 @@ uv run tests/check_metrics.py "$JSON_METRICS" \
     'len(data["train/gen_kl_error"]) == 2' \
     'max(data["train/gen_kl_error"]) < 0.15' \
     'len(data["train/token_mult_prob_error"]) == 2' \
-    'max(data["train/token_mult_prob_error"]) < 2.0'
+    'max(data["train/token_mult_prob_error"]) < 1.5'
 
 assert_grep 'cuda graph warmup' "$RUN_LOG"
 
