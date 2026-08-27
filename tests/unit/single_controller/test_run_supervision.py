@@ -39,6 +39,9 @@ def _bare_actor():
     ctrl._weight_synchronizer = SimpleNamespace(shutdown=lambda: None)
     ctrl._logger = SimpleNamespace(finish=lambda: None)
     ctrl._checkpointer = SimpleNamespace(shutdown=lambda: None)
+    # run() stamps the rollout manager with the starting weight version before
+    # it launches any pump.
+    ctrl._rollout_manager = SimpleNamespace(set_weight_version=lambda _v: None)
 
     async def _noop():
         return None
