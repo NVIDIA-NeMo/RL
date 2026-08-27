@@ -13,7 +13,7 @@
 # limitations under the License.
 """Blackbox finalization: token-free receipts + staged deltas -> canonical rows.
 
-Orchestration only (docs/design-docs/token-capture-ledger.md):
+Orchestration only:
 per rollout, fetch the staged rows the receipt manifest names through the
 ``TokenSource``, re-verify them (digest recomputation over fetched values,
 shape/mask/finite-logprob checks, length chaining, weight-version tag

@@ -1006,9 +1006,9 @@ class TQReplayBuffer:
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
         self._include_message_violation_fields = include_message_violation_fields
-        # Token-capture mode only (docs/design-docs/token-capture-ledger.md):
-        # the staging partition whose per-call delta rows `remove` must clear
-        # alongside the canonical rows. None on the legacy path.
+        # Token-capture mode only: the staging partition whose per-call delta
+        # rows `remove` must clear alongside the canonical rows. None on the
+        # legacy path.
         self._staging_partition_id = staging_partition_id
         self._require_routed_experts = require_routed_experts
         self.meta_list: list[Optional[KVBatchMeta]] = []

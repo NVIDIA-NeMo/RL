@@ -597,8 +597,7 @@ class VllmGeneration(GenerationInterface):
 
         Called once at setup when ``token_capture.enabled``; each async worker
         builds its in-worker data-plane client + TQTokenSink and makes the
-        single Gym ``install_capture`` call (see
-        docs/design-docs/token-capture-ledger.md).
+        single Gym ``install_capture`` call.
         """
         assert self.cfg["vllm_cfg"]["async_engine"], (
             "token capture requires the async vLLM engine (the capture host "

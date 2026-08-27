@@ -592,8 +592,7 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
 
     Dormant by default: with ``enabled=False`` every legacy codepath behaves
     exactly as before — no staging partition is registered, no ledger is
-    installed, and rollouts ride the token-echo path. See
-    docs/design-docs/token-capture-ledger.md.
+    installed, and rollouts ride the token-echo path.
     """
 
     enabled: bool = False
