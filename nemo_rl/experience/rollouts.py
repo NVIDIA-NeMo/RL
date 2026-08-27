@@ -19,6 +19,7 @@ import asyncio
 import copy
 import json
 import statistics
+import uuid
 import warnings
 from collections import defaultdict
 from collections.abc import AsyncGenerator, Mapping, Sequence
@@ -58,7 +59,12 @@ from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
     get_pad_dynamic_image_shapes,
 )
-from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_GROUP_ATTEMPT_KEY,
+    NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
@@ -2329,9 +2335,53 @@ def _prepare_nemo_gym_rows(
     rows: list[dict],
     generation_config: GenerationConfig,
     sampling_params: GenerationSamplingParams,
+    num_generations: int,
 ) -> None:
     """Apply NeMo-RL sampling parameters and stable row indices in place."""
+    if num_generations <= 0 or len(rows) % num_generations != 0:
+        raise ValueError("NeMo-Gym rows must contain complete prompt groups")
+
+    group_ids: dict[int, str] = {}
+    group_attempts: dict[int, int] = {}
+    for group_index, group_start in enumerate(range(0, len(rows), num_generations)):
+        group_rows = rows[group_start : group_start + num_generations]
+        existing_group_ids = {
+            row[NEMO_GYM_GROUP_ID_KEY]
+            for row in group_rows
+            if row.get(NEMO_GYM_GROUP_ID_KEY)
+        }
+        if len(existing_group_ids) > 1:
+            raise ValueError(
+                f"NeMo-Gym prompt group {group_index} contains inconsistent {NEMO_GYM_GROUP_ID_KEY} values"
+            )
+        group_ids[group_index] = (
+            existing_group_ids.pop() if existing_group_ids else uuid.uuid4().hex
+        )
+        existing_group_attempt_values = [
+            row[NEMO_GYM_GROUP_ATTEMPT_KEY]
+            for row in group_rows
+            if NEMO_GYM_GROUP_ATTEMPT_KEY in row
+        ]
+        if any(
+            not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 0
+            for attempt in existing_group_attempt_values
+        ):
+            raise ValueError(
+                f"NeMo-Gym prompt group {group_index} contains an invalid {NEMO_GYM_GROUP_ATTEMPT_KEY}"
+            )
+        existing_group_attempts = set(existing_group_attempt_values)
+        if len(existing_group_attempts) > 1:
+            raise ValueError(
+                f"NeMo-Gym prompt group {group_index} contains inconsistent "
+                f"{NEMO_GYM_GROUP_ATTEMPT_KEY} values"
+            )
+        group_attempts[group_index] = (
+            existing_group_attempts.pop() if existing_group_attempts else 0
+        )
+
     for row_index, row in enumerate(rows):
+        group_index = row_index // num_generations
+        rollout_index = row_index % num_generations
         responses_create_params = row.get("responses_create_params")
         if not isinstance(responses_create_params, dict):
             raise TypeError(
@@ -2348,6 +2398,9 @@ def _prepare_nemo_gym_rows(
             else configured_max_tokens
         )
         row["_rowidx"] = row_index
+        row[NEMO_GYM_GROUP_ID_KEY] = group_ids[group_index]
+        row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempts[group_index]
+        row[NEMO_GYM_ROLLOUT_INDEX_KEY] = rollout_index
 
 
 def _tensorize_nemo_gym_result(result: dict) -> None:
@@ -2506,7 +2559,12 @@ async def run_async_nemo_gym_rollout(
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
     with timer.time(total_timer_label):
-        _prepare_nemo_gym_rows(nemo_gym_rows, generation_config, sampling_params)
+        _prepare_nemo_gym_rows(
+            nemo_gym_rows,
+            generation_config,
+            sampling_params,
+            num_generations,
+        )
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
             num_generations=num_generations,
