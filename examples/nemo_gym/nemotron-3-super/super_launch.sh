@@ -189,10 +189,6 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
     data.train.data_path=${TRAIN_PATH} \
     data.validation.data_path=${VAL_PATH}"
 
-if [[ -n "${RESULTS_DIR}" ]]; then
-    COMMAND="$COMMAND env.nemo_gym.nemo_gym_log_dir=${LOG_DIR}/nemo_gym"
-fi
-
 if [[ -n "$SIF_DIR" ]]; then
     COMMAND="$COMMAND sif_dir=${SIF_DIR}"
 fi
