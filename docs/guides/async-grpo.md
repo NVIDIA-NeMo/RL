@@ -207,7 +207,7 @@ If no `replay_buffer.pt` file is found in the latest checkpoint directory, train
 
 4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` to update engine weights during generation; with vLLM this requires `async_engine: true`, while the Megatron backend is always async-engine. This prevents stalling the training pipeline until the longest generation finishes and provides significant performance benefits.
 
-5. **Recompute KV Cache After Weight Updates**: A user can choose whether to invalidate and recompute KV caches after weight updates by setting the `recompute_kv_cache_after_weight_updates` configuration. This is applicable to async GRPO and independent of in-flight updates.
+5. **Recompute KV Cache After Weight Updates**: A user can choose whether to invalidate and recompute KV caches after weight updates by setting the `recompute_kv_cache_after_weight_updates` configuration. This is applicable to async GRPO and independent of in-flight updates. On the Megatron generation backend, this must agree with `policy.generation.mcore_generation_config.kv_cache_management_mode`; setup errors on a mismatch.
 
 ## Why Importance Sampling Correction Is Required for Async
 

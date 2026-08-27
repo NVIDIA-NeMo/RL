@@ -1180,18 +1180,26 @@ def setup(
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
-        # When the user opts into recompute-after-refit on the megatron side,
-        # override mcore's kv_cache_management_mode to "recompute" directly.
+    # Megatron generation expresses recompute-after-refit engine-side via
+    # `kv_cache_management_mode="recompute"`; the loop-level flag must agree.
+    if generation_config["backend"] == "megatron":
         async_grpo_config = grpo_config.async_grpo
-        if async_grpo_config.recompute_kv_cache_after_weight_updates:
-            mcore_cfg = policy_config["generation"]["mcore_generation_config"]
-            prior_mode = mcore_cfg.get("kv_cache_management_mode", "persist")
-            if prior_mode != "recompute":
-                print(
-                    f"kv_cache_management_mode overridden '{prior_mode}' -> 'recompute' by "
-                    f"grpo.async_grpo.recompute_kv_cache_after_weight_updates=True."
-                )
-            mcore_cfg["kv_cache_management_mode"] = "recompute"
+        recompute_kv_cache = bool(
+            async_grpo_config is not None
+            and async_grpo_config.recompute_kv_cache_after_weight_updates
+        )
+        kv_cache_mode = generation_config["mcore_generation_config"][
+            "kv_cache_management_mode"
+        ]
+        if recompute_kv_cache != (kv_cache_mode == "recompute"):
+            raise ValueError(
+                "grpo.async_grpo.recompute_kv_cache_after_weight_updates="
+                f"{recompute_kv_cache} conflicts with policy.generation."
+                f"mcore_generation_config.kv_cache_management_mode={kv_cache_mode!r}: "
+                "with policy.generation.backend='megatron' the two must agree. "
+                "Either set the flag to true with kv_cache_management_mode="
+                "'recompute', or leave the flag false with 'persist'/'offload'."
+            )
 
     # Define initialization functions that will be used in all paths
     init_reference_model = loss_config.reference_policy_kl_penalty > 0

@@ -56,11 +56,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # KV cache lifecycle across suspend/resume:
     # - "persist": cache stays allocated; CUDA graphs remain valid (default)
     # - "offload": cache is moved off-GPU between iterations
-    #
-    # The third mcore value, "recompute" (drop + rebuild on resume), must be set via
-    # `grpo.async_grpo.recompute_kv_cache_after_weight_updates=true`.
-    # TODO: Unify `kv_cache_management_mode` and `recompute_kv_cache_after_weight_updates`.
-    kv_cache_management_mode: Literal["persist", "offload"]
+    # - "recompute": cache is dropped and rebuilt on resume
+    kv_cache_management_mode: Literal["persist", "offload", "recompute"]
 
     logging_step_interval: NotRequired[int]
 

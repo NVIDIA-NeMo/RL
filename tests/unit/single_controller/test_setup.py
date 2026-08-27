@@ -71,7 +71,10 @@ def _make_master_config(
     }
     if backend == "megatron":
         # The megatron build path reads these before any generation factory runs.
-        generation_config["mcore_generation_config"] = {"expose_http_server": False}
+        generation_config["mcore_generation_config"] = {
+            "expose_http_server": False,
+            "kv_cache_management_mode": "persist",
+        }
         policy_config["model_name"] = "test-model"
     return MasterConfig.model_construct(
         data_plane={"enabled": dp_enabled, "impl": "transfer_queue"},
@@ -243,6 +246,7 @@ class TestSetup:
             ),
             ("buffer_capacity", ValueError, "required capacity"),
             ("megatron_dtensor_trainer", ValueError, "megatron_cfg.enabled"),
+            ("megatron_recompute_mismatch", ValueError, "kv_cache_management_mode"),
             ("megatron_gym_without_http_server", ValueError, "expose_http_server"),
             ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
         ],
@@ -268,6 +272,12 @@ class TestSetup:
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=False
             )
+        elif invalid_case == "megatron_recompute_mismatch":
+            # Flag says recompute; the engine mode (fixture default "persist") disagrees.
+            mc = _make_master_config(
+                colocated=False, backend="megatron", megatron_enabled=True
+            )
+            mc.async_rl.recompute_kv_cache_after_weight_updates = True
         elif invalid_case == "megatron_gym_without_http_server":
             mc = self._make_gym_megatron_config()
             mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = (
@@ -757,7 +767,6 @@ class TestSetup:
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=True
             )
-        mc.async_rl.recompute_kv_cache_after_weight_updates = True
         if scenario == "gym_router_failure":
             mc.async_rl.generation_router.enabled = True
         tokenizer = MagicMock(pad_token_id=0)
@@ -808,14 +817,8 @@ class TestSetup:
                     setup_single_controller(mc, tokenizer)
 
         inference_cluster = patched_factories["_build_clusters"].return_value[1]
-        # The megatron path never uses the generic generation factory and applies
-        # its config overrides before any build (_build_generation normally sets
-        # model_name; the kv-cache mode comes from the async_rl flag).
         patched_factories["_build_generation"].assert_not_called()
         assert mc.policy["generation"]["model_name"] == "test-model"
-        mcore_cfg = mc.policy["generation"]["mcore_generation_config"]
-        assert mcore_cfg["kv_cache_management_mode"] == "recompute"
-        assert mc.async_rl.recompute_kv_cache_after_weight_updates is False
         # Reservation + holder lifecycle exist on the gym legs only; every gym
         # leg — success or either failure — reaps the holder exactly once.
         if gym:

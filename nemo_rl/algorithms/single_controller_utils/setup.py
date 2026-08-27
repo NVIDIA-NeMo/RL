@@ -452,10 +452,10 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
         value_config["megatron_cfg"]["train_iters"] = train_iters  # type: ignore[index]
 
 
-def _maybe_apply_megatron_generation_overrides(
+def _validate_megatron_generation_config(
     master_config: MasterConfig, *, use_nemo_gym: bool
 ) -> None:
-    """Validate and adapt the config for the Megatron generation backend."""
+    """Validate the config for the Megatron generation backend."""
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     if generation_config["backend"] != "megatron":
@@ -479,20 +479,19 @@ def _maybe_apply_megatron_generation_overrides(
             "policy.generation.mcore_generation_config.expose_http_server=true"
         )
 
-    async_config = master_config.async_rl
-    if async_config.recompute_kv_cache_after_weight_updates:
-        # As in grpo.py, recompute-after-refit is expressed engine-side for Megatron.
-        # Unlike grpo.py, SC also clears the flag so the actor skips its loop-level
-        # invalidate_kv_cache (a base-class no-op for MegatronGeneration).
-        prior_mode = mcore_cfg.get("kv_cache_management_mode", "persist")
-        if prior_mode != "recompute":
-            print(
-                f"kv_cache_management_mode overridden '{prior_mode}' -> 'recompute' by "
-                f"async_rl.recompute_kv_cache_after_weight_updates=True."
-            )
-        # pyrefly: ignore[typed-dict-key-error]
-        mcore_cfg["kv_cache_management_mode"] = "recompute"
-        async_config.recompute_kv_cache_after_weight_updates = False
+    # Megatron generation expresses recompute-after-refit engine-side via
+    # `kv_cache_management_mode="recompute"`; the loop-level flag must agree.
+    recompute_kv_cache = master_config.async_rl.recompute_kv_cache_after_weight_updates
+    kv_cache_mode = mcore_cfg["kv_cache_management_mode"]
+    if recompute_kv_cache != (kv_cache_mode == "recompute"):
+        raise ValueError(
+            f"async_rl.recompute_kv_cache_after_weight_updates={recompute_kv_cache} "
+            "conflicts with policy.generation.mcore_generation_config."
+            f"kv_cache_management_mode={kv_cache_mode!r}: with "
+            "policy.generation.backend='megatron' the two must agree. Either set "
+            "the flag to true with kv_cache_management_mode='recompute', or leave "
+            "the flag false with 'persist'/'offload'."
+        )
 
 
 def _maybe_attach_fleet_health(
@@ -711,7 +710,7 @@ def setup_single_controller(
             f"{generation_config['backend']!r}"
         )
     # Megatron-generation checks are pure config: run them before the dataset download.
-    _maybe_apply_megatron_generation_overrides(master_config, use_nemo_gym=use_nemo_gym)
+    _validate_megatron_generation_config(master_config, use_nemo_gym=use_nemo_gym)
     if use_nemo_gym:
         # NeMo-Gym creates the env actor outside setup_response_data; we wire
         # it in after generation is up (it needs the OpenAI server URLs).
