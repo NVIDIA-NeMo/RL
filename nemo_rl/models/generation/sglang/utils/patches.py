@@ -246,6 +246,81 @@ def _patch_sglang_non_gated_fp8_moe() -> None:
     logger.info("Patched non-gated FP8 MoE weight sizing in %s.", file_to_patch)
 
 
+def _patch_sglang_mxfp8_moe_scale_layout() -> None:
+    """Pad canonical MXFP8 MoE scales before the Triton layout conversion.
+
+    The pinned SGLang revision reshapes serialized scales as though each
+    expert's row dimension were already padded to 128. Checkpoints and online
+    refits intentionally carry one scale per real row, so models such as
+    Nemotron-H fail when that dimension is not 128-aligned. The layout-only
+    rows must be added immediately before swizzling and removed again before a
+    subsequent weight update.
+    """
+    file_to_patch = _get_sglang_file("srt/layers/quantization/fp8.py")
+
+    with open(file_to_patch, "r") as f:
+        content = f.read()
+
+    pad_sentinel = "scale = scale.reshape(num_experts, m, k // 32)"
+    restore_sentinel = "Restore canonical MXFP8 MoE scales before hot reload."
+    if pad_sentinel in content and restore_sentinel in content:
+        return
+
+    swizzle_anchor = (
+        "            num_experts, m, k = weight_shape\n"
+        "            aligned_m = ((m + 127) // 128) * 128\n"
+        "            scale = scale.view(num_experts, aligned_m, k // 32)\n"
+    )
+    swizzle_replacement = (
+        "            num_experts, m, k = weight_shape\n"
+        "            aligned_m = ((m + 127) // 128) * 128\n"
+        f"            {pad_sentinel}\n"
+        "            if aligned_m != m:\n"
+        "                scale = torch.nn.functional.pad(\n"
+        "                    scale, (0, 0, 0, aligned_m - m)\n"
+        "                )\n"
+    )
+    restore_anchor = (
+        "            align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)\n\n"
+        "    def process_weights_after_loading(self, layer: Module) -> None:\n"
+    )
+    restore_replacement = (
+        "            align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)\n\n"
+        "    def restore_weights_before_loading(self, layer: Module) -> None:\n"
+        f"        # {restore_sentinel}\n"
+        "        if not self.use_mxfp8:\n"
+        "            return\n\n"
+        "        for scale_name, weight_name in (\n"
+        '            ("w13_weight_scale_inv", "w13_weight"),\n'
+        '            ("w2_weight_scale_inv", "w2_weight"),\n'
+        "        ):\n"
+        "            scale = getattr(layer, scale_name)\n"
+        "            weight = getattr(layer, weight_name)\n"
+        "            num_experts, m, k = weight.shape\n"
+        "            canonical_shape = (num_experts, m, k // 32)\n"
+        "            if scale.data.shape != canonical_shape:\n"
+        "                scale.data = scale.data.new_empty(canonical_shape)\n"
+        "            scale.format_ue8m0 = True\n\n"
+        "    def process_weights_after_loading(self, layer: Module) -> None:\n"
+    )
+
+    for anchor, replacement in (
+        (swizzle_anchor, swizzle_replacement),
+        (restore_anchor, restore_replacement),
+    ):
+        actual_count = content.count(anchor)
+        if actual_count != 1:
+            raise RuntimeError(
+                "SGLang MXFP8 MoE scale-layout compat-patch anchor mismatch in "
+                f"{file_to_patch}: expected 1, found {actual_count} for "
+                f"{anchor[:80]!r}."
+            )
+        content = content.replace(anchor, replacement, 1)
+
+    _write_and_verify(file_to_patch, content, (pad_sentinel, restore_sentinel))
+    logger.info("Patched MXFP8 MoE scale layout in %s.", file_to_patch)
+
+
 def _override_sglang_imbalance_check_env() -> None:
     """Force-disable sglang's per-GPU memory imbalance check.
 
@@ -337,6 +412,7 @@ def _patch_megatron_training_hook_mode() -> None:
 def _apply_sglang_compat_patches() -> None:
     _patch_sglang_safe_unpickler()
     _patch_sglang_non_gated_fp8_moe()
+    _patch_sglang_mxfp8_moe_scale_layout()
     _override_sglang_imbalance_check_env()
     _patch_megatron_dynamic_context_hook_mode()
     _patch_megatron_training_hook_mode()
