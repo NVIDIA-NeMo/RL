@@ -1233,12 +1233,37 @@ class MegatronPolicyWorkerImpl(
         model_config = self._get_model_config()
         mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
         mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
+        mtp_detach_heads = bool(getattr(model_config, "mtp_detach_heads", False))
+        mtp_loss_scaling_factor = getattr(model_config, "mtp_loss_scaling_factor", 0.1)
+        loss_type = getattr(loss_fn, "loss_type", LossType.TOKEN_LEVEL)
+
+        # MTP is a token-summed auxiliary loss and therefore always needs the
+        # valid-token denominator. Under a sequence-level main loss, the split
+        # path can apply that distinct denominator only when mcore has isolated
+        # and tagged the detached MTP parameters. Attached-head gradients are
+        # already mixed into the backbone and cannot be corrected after the
+        # global counts become available at finish.
+        if (
+            mtp_enabled
+            and mtp_loss_scaling_factor != 0
+            and loss_type != LossType.TOKEN_LEVEL
+            and not mtp_detach_heads
+        ):
+            raise ValueError(
+                "MTP with a nonzero loss weight and sequence-level loss requires "
+                "policy.megatron_cfg.mtp_detach_heads=True on the SingleController "
+                "split training path because the MTP auxiliary gradient must be "
+                "normalized by valid tokens independently of the main loss. "
+                f"Got loss_type={loss_type}, mtp_num_layers={mtp_num_layers}, "
+                f"mtp_loss_scaling_factor={mtp_loss_scaling_factor}."
+            )
 
         return {
             "loss_fn": loss_fn,
-            "loss_type": getattr(loss_fn, "loss_type", LossType.TOKEN_LEVEL),
+            "loss_type": loss_type,
             "metric_normalizations": metric_normalizations,
             "mtp_enabled": mtp_enabled,
+            "mtp_detach_heads": mtp_detach_heads,
             "gbs": gbs or self.cfg["train_global_batch_size"],
             "mbs": mbs or self.cfg["train_micro_batch_size"],
             "local_valid_seqs": torch.zeros((), dtype=torch.float64, device="cuda"),
@@ -1344,6 +1369,12 @@ class MegatronPolicyWorkerImpl(
         self.optimizer.zero_grad()
 
         state = self._split_step_state_init(loss_fn=loss_fn, gbs=gbs, mbs=mbs)
+
+        # Leave this unset so mcore falls back to config.grad_scale_func and
+        # inherits the optimizer's dynamic loss scale (especially for fp16).
+        # Also clear any transient callable left by an interrupted older step.
+        if state["mtp_enabled"]:
+            self._set_mtp_grad_scale_func(None)
 
         # Null the three mcore hooks that would fire a mid-step DP reduce:
         #   grad_sync_func — PP scheduler's direct call on last-MB boundaries
@@ -1517,13 +1548,6 @@ class MegatronPolicyWorkerImpl(
         # hooks. The 1/N rescale happens once at finish.
         placeholder_n = torch.tensor(1.0, device="cuda")
 
-        # MTP is an auxiliary autograd branch, so Megatron needs an explicit
-        # scale matching the main loss. Each streaming chunk accumulates raw
-        # summed gradients (N=1); finish_train_step applies the true 1/N once
-        # to the complete main_grad buffer, including the MTP parameters.
-        if state["mtp_enabled"]:
-            self._set_mtp_grad_scale_func(lambda: placeholder_n)
-
         draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
@@ -1638,6 +1662,14 @@ class MegatronPolicyWorkerImpl(
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
         self.model.scale_gradients(inv_n)
+        # The uniform rescale gives MTP the main loss's denominator. Correct
+        # detached, MTP-tagged parameters back to the valid-token denominator
+        # used by the synchronous path. For token-level loss the factor is 1.
+        # This runs before gradient reduction; scaling and reduction are linear.
+        if state["mtp_enabled"] and state["mtp_detach_heads"]:
+            self._scale_mtp_param_grads(
+                float((n_safe / global_valid_toks.clamp(min=1)).item())
+            )
         # No more forward/backward calls remain in this step. Clear the
         # callable before optimizer/scheduler/checkpoint state can serialize it.
         self._set_mtp_grad_scale_func(None)
@@ -2273,6 +2305,26 @@ class MegatronPolicyWorkerImpl(
         config = self._get_model_config()
         if config is not None:
             config.mtp_grad_scale_func = func
+
+    def _scale_mtp_param_grads(self, factor: float) -> None:
+        """Scale detached MTP parameters' gradients by ``factor``.
+
+        MCore tags every MTP parameter ``grad_norm_group='mtp'`` when
+        ``mtp_detach_heads`` is enabled. In that configuration the auxiliary
+        loss reaches no shared parameters, so its denominator can be corrected
+        independently. ``main_grad`` is a view into the DDP gradient buffer.
+
+        Args:
+            factor: Multiplier for MTP gradients. ``1.0`` is a no-op.
+        """
+        if factor == 1.0:
+            return
+        for param in self.model.parameters():
+            if getattr(param, "grad_norm_group", None) != "mtp":
+                continue
+            main_grad = getattr(param, "main_grad", None)
+            if main_grad is not None:
+                main_grad.mul_(factor)
 
     def _get_model_config(self):
         """Get the underlying model config (handle Float16Module wrapper)."""
