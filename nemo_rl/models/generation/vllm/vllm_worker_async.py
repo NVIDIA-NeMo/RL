@@ -490,7 +490,8 @@ class VllmAsyncGenerationWorkerImpl(
                 if remaining <= 0:
                     raise ValueError(
                         f"Prompt length ({len(prompt_token_ids)}) fills or exceeds "
-                        f"max_model_len ({self.model_config.max_model_len}). "
+                        "this model's maximum context length "
+                        f"(max_model_len={self.model_config.max_model_len}). "
                         f"No room for output tokens."
                     )
                 max_tokens = min(request_max_tokens, remaining)
@@ -881,21 +882,32 @@ class VllmAsyncGenerationWorkerImpl(
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
                 )
-            except (ValueError, VLLMValidationError) as e:
-                # vLLM raises VLLMValidationError for prompts exceeding
-                # max_model_len during tokenization. NeMo-RL's post-prefix
-                # clamp raises ValueError for the same condition. Convert only
-                # those context-length failures to HTTP 400 so the Gym proxy
-                # treats them as prompt-specific instead of retrying a 500.
-                if (
-                    not isinstance(e, VLLMValidationError)
-                    and not _is_context_length_error(e)
-                ):
-                    raise
+            except VLLMValidationError as e:
+                # Preserve the existing behavior for all typed vLLM request
+                # validation failures. VLLMValidationError inherits ValueError,
+                # so this handler must precede the narrower plain-ValueError case.
                 return JSONResponse(
                     content={
                         "error": {
                             "message": str(e),
+                            "type": "invalid_request_error",
+                            "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
+            except ValueError as e:
+                # vLLM 0.25 can raise a plain ValueError for context overflow
+                # while preprocessing a chat request. Convert only that known
+                # request error to HTTP 400; unrelated ValueErrors are server
+                # bugs and must remain visible.
+                message = str(e)
+                if not _is_context_length_error(e):
+                    raise
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": message,
                             "type": "invalid_request_error",
                             "code": 400,
                         }
