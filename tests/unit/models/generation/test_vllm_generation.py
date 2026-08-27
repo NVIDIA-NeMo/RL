@@ -21,10 +21,12 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import orjson
 import pytest
 import ray
 import requests
 import torch
+from pydantic import BaseModel, ValidationError
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.loss import NLLLossFn
@@ -38,12 +40,16 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    BaseVllmGenerationWorker,
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _copy_vllm_chat_messages,
+    _orjson_response,
+    _parse_orjson_request,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -426,6 +432,96 @@ class _FakeFastAPIApp:
             return func
 
         return decorator
+
+
+def test_vllm_async_worker_applies_fastokens_before_base_init(monkeypatch):
+    events = []
+
+    def fake_base_init(worker, *args, **kwargs):
+        events.append("base-init")
+        worker.is_model_owner = False
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.maybe_patch_fastokens",
+        lambda enabled: events.append(("fastokens", enabled)),
+    )
+    monkeypatch.setattr(BaseVllmGenerationWorker, "__init__", fake_base_init)
+
+    VllmAsyncGenerationWorkerImpl(config={}, use_fastokens=True)
+
+    assert events == [("fastokens", True), "base-init"]
+
+
+def test_vllm_chat_message_copy_is_shallow_and_does_not_mutate_input():
+    nested_tool_call = {
+        "id": "call-1",
+        "function": {"name": "tool", "arguments": '{"value":1}'},
+    }
+    messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": (nested_tool_call,),
+        },
+    ]
+
+    copied = _copy_vllm_chat_messages(messages)
+
+    assert copied == [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [nested_tool_call],
+        },
+    ]
+    assert copied is not messages
+    assert copied[0] is not messages[0]
+    assert copied[1] is not messages[1]
+    assert copied[1]["tool_calls"] is not messages[1]["tool_calls"]
+    assert copied[1]["tool_calls"][0] is nested_tool_call
+    assert isinstance(messages[1]["tool_calls"], tuple)
+
+
+class _OrjsonRequest(BaseModel):
+    messages: list[dict]
+
+
+def test_vllm_orjson_request_and_response_preserve_fields():
+    body = orjson.dumps(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {
+                                "name": "tool",
+                                "arguments": '{"value":1}',
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    parsed = _parse_orjson_request(body, _OrjsonRequest)
+    response = _orjson_response(parsed.model_dump(), status_code=201)
+
+    assert response.status_code == 201
+    assert response.media_type == "application/json"
+    assert orjson.loads(response.body) == orjson.loads(body)
+
+
+def test_vllm_orjson_request_rejects_invalid_json_and_schema():
+    with pytest.raises(orjson.JSONDecodeError):
+        _parse_orjson_request(b"{", _OrjsonRequest)
+
+    with pytest.raises(ValidationError):
+        _parse_orjson_request(b'{"messages":"not-a-list"}', _OrjsonRequest)
 
 
 def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
