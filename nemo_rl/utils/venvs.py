@@ -95,7 +95,7 @@ def create_local_venv(
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
     subprocess.run(
-        ["uv", "sync", "--locked", "--directory", git_root], env=env, check=True
+        ["uv", "sync", "--frozen", "--directory", git_root], env=env, check=True
     )
     subprocess.run(exec_cmd, env=env, check=True)
 
