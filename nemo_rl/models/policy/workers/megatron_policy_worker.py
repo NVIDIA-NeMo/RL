@@ -2299,15 +2299,19 @@ class MegatronPolicyWorkerImpl(
         emits a *pair* of tasks per FP8 weight (the FP8 data and a ``*_scale_inv``
         scale tensor).
         """
-        if self._is_fp8_export():
-            return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
-                self.megatron_bridge.hf_pretrained, [self.model]
-            )
-        return [
-            task
-            for task in self.megatron_bridge.get_conversion_tasks([self.model])
-            if task is not None
-        ]
+        # Deferred import to avoid circular import issues.
+        from nemo_rl.models.megatron.draft import draft_model_detached
+
+        with draft_model_detached([self.model]):
+            if self._is_fp8_export():
+                return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
+                    self.megatron_bridge.hf_pretrained, [self.model]
+                )
+            return [
+                task
+                for task in self.megatron_bridge.get_conversion_tasks([self.model])
+                if task is not None
+            ]
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
