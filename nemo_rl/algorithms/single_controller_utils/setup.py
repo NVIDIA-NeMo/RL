@@ -295,10 +295,14 @@ def _build_clusters(
                 gpus_per_instance = generation_config_dict["sglang_cfg"].get(
                     "gpus_per_server", 1
                 )
+            elif backend == "megatron":
+                gpus_per_instance = MegatronGeneration.nvlink_domain_span(
+                    master_config.policy
+                )
             else:
                 raise ValueError(
-                    "single_controller_utils.setup only supports vllm or sglang "
-                    f"generation; got {backend!r}"
+                    "single_controller_utils.setup only supports vllm, sglang, "
+                    f"or megatron generation; got {backend!r}"
                 )
             nodes_per_instance = (
                 gpus_per_instance + inference_gpus_per_node - 1
