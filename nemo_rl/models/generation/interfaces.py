@@ -13,12 +13,15 @@
 # limitations under the License.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, NotRequired, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 # Routed-expert index tensors ([seq, layers, topk]) are carried in the narrowest
 # signed dtype that fits ids 0..num_experts-1 plus the -1 missing-route sentinel:
@@ -393,15 +396,12 @@ class GenerationInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 
     @classmethod
-    def validate_settings(
-        cls,
-        policy_config: Any,
-        *,
-        use_nemo_gym: bool,
-        recompute_kv_cache_after_weight_updates: bool,
-        generation_fleet_health_enabled: bool,
-    ) -> None:
-        """Backend-specific pure-config validation, run before any build."""
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Backend-specific pure-config validation, run before any build.
+
+        Args:
+            master_config: The single-controller MasterConfig.
+        """
 
     @abstractmethod
     def init_collective(

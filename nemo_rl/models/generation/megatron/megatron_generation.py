@@ -36,6 +36,7 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
     from nemo_rl.distributed.worker_groups import RayWorkerGroup
     from nemo_rl.models.policy.lm_policy import Policy
 
@@ -141,15 +142,12 @@ class MegatronGeneration(GenerationInterface):
         return f"http://{node_ip}:{port}/v1", port, holder
 
     @classmethod
-    def validate_settings(
-        cls,
-        policy_config: PolicyConfig,
-        *,
-        use_nemo_gym: bool,
-        recompute_kv_cache_after_weight_updates: bool,
-        generation_fleet_health_enabled: bool,
-    ) -> None:
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
         """Reject config the Megatron generation backend cannot honor."""
+        policy_config: PolicyConfig = master_config.policy
+        recompute_kv_cache_after_weight_updates: bool = (
+            master_config.async_rl.recompute_kv_cache_after_weight_updates
+        )
         if not (
             "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
         ):
@@ -176,7 +174,7 @@ class MegatronGeneration(GenerationInterface):
                 "or leave the flag false with 'persist'/'offload'."
             )
 
-        if generation_fleet_health_enabled:
+        if master_config.async_rl.generation_fleet_health.enabled:
             raise NotImplementedError(
                 "async_rl.generation_fleet_health.enabled=true is not supported "
                 f"for the {cls.__name__} generation backend"

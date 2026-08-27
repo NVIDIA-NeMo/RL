@@ -808,16 +808,7 @@ def setup_single_controller(
             f"{generation_config['backend']!r}"
         )
     # Backend settings checks are pure config: run them before anything builds.
-    resolve_generation_class(generation_config).validate_settings(
-        policy_config,
-        use_nemo_gym=use_nemo_gym,
-        recompute_kv_cache_after_weight_updates=(
-            master_config.async_rl.recompute_kv_cache_after_weight_updates
-        ),
-        generation_fleet_health_enabled=(
-            master_config.async_rl.generation_fleet_health.enabled
-        ),
-    )
+    resolve_generation_class(generation_config).validate_settings(master_config)
     if use_nemo_gym:
         # NeMo-Gym creates the env actor outside setup_response_data; we wire
         # it in after generation is up (it needs the OpenAI server URLs).
