@@ -111,7 +111,13 @@ NRL_TQ_SKIP_RUNTIME_ENV_PIN=1
 NRL_VENV_SYNC_FROZEN=1
 NRL_WG_USE_RAY_REF=1
 NRL_REFIT_ERRORS_FATAL=1
-UV_CACHE_DIR=/lustre/fsw/portfolios/llmservice/users/pthombre/uv
+# Baked node-local cache, NOT the shared Lustre cache: uv revalidates and
+# rewrites the local project's (file:///opt/nemo-rl) cache entry on every
+# invocation, so a Lustre cache shared by 56 nodes x 2 builders races on
+# that one entry regardless of pre-warming (falsified by job 6596222's
+# serial pre-warm; jobs 6578674..6596222 all died here). Explicit because
+# ultra_launch.sh otherwise falls back to an EMPTY /tmp cache per job.
+UV_CACHE_DIR=/root/.cache/uv
 
 DRY_RUN="${_DRY_RUN_IN:-1}"
 set +a
