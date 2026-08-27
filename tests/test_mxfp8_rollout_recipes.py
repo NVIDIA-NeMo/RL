@@ -333,6 +333,21 @@ def test_qwen3_235b_mxfp8_recipes_keep_baseline_runtime_knobs() -> None:
         assert "max_val_samples" not in grpo_config
 
 
+@pytest.mark.parametrize(
+    "case_name",
+    (
+        "grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout",
+        "grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout",
+    ),
+)
+def test_qwen3_async_mxfp8_recipes_use_nccl_reshard(case_name: str) -> None:
+    config = _load_resolved_yaml(PERF_CONFIG_DIR / f"{case_name}.yaml")
+    generation_config = config["policy"]["generation"]
+
+    assert generation_config["refit_transport"] == "nccl_reshard"
+    assert "refit_prequantize" not in generation_config["vllm_cfg"]
+
+
 def test_deepseek_mxfp8_launchers_handle_unset_and_spaced_checkpoint_paths() -> None:
     for case_name in (
         "grpo-deepseek-v3-64n4g-mxfp8-rollout",
