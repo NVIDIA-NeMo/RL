@@ -134,6 +134,7 @@ def _make_master_config(
         },
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
+        cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=min_groups_for_streaming_train,
             max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
@@ -484,7 +485,11 @@ def patched_ppo_factories():
         patch.object(
             sc_setup_mod,
             "_build_clusters",
-            return_value=(MagicMock(name="train"), MagicMock(name="inference")),
+            return_value=(
+                MagicMock(name="train"),
+                MagicMock(name="inference"),
+                None,
+            ),
         ),
         patch.object(
             sc_setup_mod, "_build_generation", return_value=(MagicMock(), 0.0)
@@ -619,7 +624,7 @@ class TestTrainClusterSizesForTheCritic:
     ):
         mc = _cluster_config(make_config(), colocated=colocated, backend=backend)
 
-        train, inference = sc_setup_mod._build_clusters(mc)
+        train, inference, _teacher_topology = sc_setup_mod._build_clusters(mc)
 
         assert train.kwargs["max_colocated_worker_groups"] == expected_train_groups
         if colocated:

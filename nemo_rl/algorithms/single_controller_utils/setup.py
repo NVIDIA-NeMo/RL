@@ -34,6 +34,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
@@ -59,10 +60,15 @@ from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
+from nemo_rl.data_plane.schema import (
+    SC_ROLLOUT_SCHEMA_FIELDS,
+    fields_with_optional_routed_experts,
+)
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     _get_free_port_local,
     _get_node_ip_local,
+    prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
@@ -129,16 +135,49 @@ class SingleControllerActorArgs:
     # serving backend set to it. Parameterized with the Impl class because the decorated
     # GenerationRouterActor name is an ActorClass instance, not a type.
     generation_router: Optional[ray.actor.ActorHandle[GenerationRouterImpl]] = None
+    # Populated only for text MOPD. Aliases may outnumber worker groups when
+    # multiple agents share one deduplicated teacher checkpoint.
+    teacher_worker_groups: Optional[dict[str, Any]] = None
+    alias_to_group_alias: Optional[dict[str, str]] = None
     # None on a GRPO run. Both are set together on the PPO path: the critic and
     # the MSE loss it trains under.
     value_handle: Optional[TQValue] = None
     value_loss_fn: Optional[LossFunction] = None
 
 
+def _non_colocated_teacher_node_count(master_config: MasterConfig) -> int:
+    """Validate teacher GPU geometry and return its deduplicated node count."""
+    if not opd_module.is_non_colocated_teachers_enabled(master_config):
+        return 0
+
+    # Lazy to preserve teacher_worker_group's existing import cycle boundary:
+    # that module imports the OPD config schemas.
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    teacher_configs = create_teacher_configs_from_opd_config(
+        opd_module._opd_cfg(master_config)
+    )
+    cluster_gpus_per_node = master_config.cluster["gpus_per_node"]
+    for teacher_config in teacher_configs:
+        if teacher_config.gpus_per_node > cluster_gpus_per_node:
+            raise ValueError(
+                f"OPD teacher {teacher_config.alias!r} requests "
+                f"gpus_per_node={teacher_config.gpus_per_node}, which exceeds "
+                f"cluster.gpus_per_node={cluster_gpus_per_node}."
+            )
+    return sum(config.num_nodes for config in teacher_configs)
+
+
 def _build_clusters(
     master_config: MasterConfig,
-) -> tuple[RayVirtualCluster, RayVirtualCluster]:
-    """Allocate train + inference clusters; one shared cluster when colocated.
+) -> tuple[
+    RayVirtualCluster,
+    RayVirtualCluster,
+    Optional[dict[str, tuple[str, int]]],
+]:
+    """Allocate student clusters while leaving validated nodes for teachers.
 
     The colocated branch is unreachable on a real run -- validation rejects
     colocated.enabled=true -- and is kept for when SC can support that mode.
@@ -149,17 +188,37 @@ def _build_clusters(
     backend = generation_config["backend"]
     num_nodes = cluster_config["num_nodes"]
     gpus_per_node = cluster_config["gpus_per_node"]
+    segment_size = cluster_config.get("segment_size")
     port_range_low = cluster_config.get("master_port_range_low")
     port_range_high = cluster_config.get("master_port_range_high")
+    teacher_nodes = _non_colocated_teacher_node_count(master_config)
+    policy_nodes = num_nodes - teacher_nodes
+    if policy_nodes <= 0:
+        raise ValueError(
+            "cluster.num_nodes must leave at least one node for the student after "
+            f"reserving {teacher_nodes} non-colocated teacher node(s); got "
+            f"cluster.num_nodes={num_nodes}."
+        )
+
     # Worker groups sharing the training GPUs: the policy, plus the critic on
     # the PPO path.
     train_worker_groups = 2 if is_ppo_run(master_config) else 1
 
     if colocated:
         # Policy (+ critic) + generation share GPUs — one cluster.
+        node_constraints, remaining_ids, topology = prepare_segment_topology(
+            segment_size,
+            policy_nodes,
+            role="policy",
+        )
+        teacher_topology = (
+            {node_id: topology[node_id] for node_id in remaining_ids}
+            if segment_size is not None
+            else None
+        )
         cluster = RayVirtualCluster(
             name="sc_policy_cluster",
-            bundle_ct_per_node_list=[gpus_per_node] * num_nodes,
+            bundle_ct_per_node_list=[gpus_per_node] * policy_nodes,
             use_gpus=True,
             num_gpus_per_node=gpus_per_node,
             max_colocated_worker_groups=(
@@ -169,8 +228,10 @@ def _build_clusters(
             ),
             port_range_low=port_range_low,
             port_range_high=port_range_high,
+            segment_size=segment_size,
+            node_resource_constraints=node_constraints,
         )
-        return cluster, cluster
+        return cluster, cluster, teacher_topology
 
     # Non-colocated: split node into train + inference clusters.
     assert backend != "megatron", (
@@ -185,7 +246,7 @@ def _build_clusters(
             "policy.generation.colocated.resources.gpus_per_node."
         )
     inference_nodes = inference_resources["num_nodes"] or 1
-    if num_nodes == 1:
+    if policy_nodes == 1:
         train_gpus_per_node = gpus_per_node - inference_gpus_per_node
         train_nodes = 1
         assert train_gpus_per_node > 0, (
@@ -193,10 +254,80 @@ def _build_clusters(
         )
     else:
         train_gpus_per_node = gpus_per_node
-        train_nodes = num_nodes - inference_nodes
+        train_nodes = policy_nodes - inference_nodes
         assert train_nodes > 0, (
-            f"train_nodes must be > 0: {num_nodes} - {inference_nodes} = {train_nodes}"
+            f"train_nodes must be > 0: {policy_nodes} - {inference_nodes} = {train_nodes}"
         )
+
+    train_constraints = None
+    inference_constraints = None
+    train_segment_size = None
+    inference_segment_size = None
+    teacher_topology = None
+    if segment_size is not None:
+        if policy_nodes == 1:
+            # Train and inference intentionally split one physical node by GPU.
+            shared_constraints, remaining_ids, topology = prepare_segment_topology(
+                segment_size,
+                1,
+                role="student",
+            )
+            train_constraints = shared_constraints
+            inference_constraints = shared_constraints
+            train_segment_size = segment_size
+            inference_segment_size = segment_size
+            teacher_topology = {node_id: topology[node_id] for node_id in remaining_ids}
+        else:
+            train_constraints, remaining_ids, topology = prepare_segment_topology(
+                segment_size,
+                train_nodes,
+                role="training",
+            )
+            train_segment_size = segment_size
+            remaining_topology = {
+                node_id: topology[node_id] for node_id in remaining_ids
+            }
+            generation_config_dict = cast(dict[str, Any], generation_config)
+            if backend == "vllm":
+                vllm_cfg = generation_config_dict["vllm_cfg"]
+                gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
+                    "pipeline_parallel_size", 1
+                )
+            elif backend == "sglang":
+                gpus_per_instance = generation_config_dict["sglang_cfg"].get(
+                    "gpus_per_server", 1
+                )
+            else:
+                raise ValueError(
+                    "single_controller_utils.setup only supports vllm or sglang "
+                    f"generation; got {backend!r}"
+                )
+            nodes_per_instance = (
+                gpus_per_instance + inference_gpus_per_node - 1
+            ) // inference_gpus_per_node
+            if inference_nodes % nodes_per_instance == 0:
+                inference_segment_size = nodes_per_instance
+                (
+                    inference_constraints,
+                    inference_remaining_ids,
+                    _,
+                ) = prepare_segment_topology(
+                    inference_segment_size,
+                    inference_nodes,
+                    topology=remaining_topology,
+                    role="inference",
+                )
+                teacher_topology = {
+                    node_id: topology[node_id] for node_id in inference_remaining_ids
+                }
+            else:
+                print(
+                    f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
+                    f"nodes_per_instance={nodes_per_instance}; skipping inference "
+                    "topology constraints",
+                    flush=True,
+                )
+                teacher_topology = remaining_topology
 
     train_cluster = RayVirtualCluster(
         name="sc_train_cluster",
@@ -206,6 +337,8 @@ def _build_clusters(
         max_colocated_worker_groups=train_worker_groups,
         port_range_low=port_range_low,
         port_range_high=port_range_high,
+        segment_size=train_segment_size,
+        node_resource_constraints=train_constraints,
     )
     inference_cluster = RayVirtualCluster(
         name="sc_inference_cluster",
@@ -215,8 +348,10 @@ def _build_clusters(
         max_colocated_worker_groups=1,
         port_range_low=port_range_low,
         port_range_high=port_range_high,
+        segment_size=inference_segment_size,
+        node_resource_constraints=inference_constraints,
     )
-    return train_cluster, inference_cluster
+    return train_cluster, inference_cluster, teacher_topology
 
 
 def _build_generation(
@@ -632,6 +767,11 @@ def setup_single_controller(
             "single_controller_utils does not support "
             "data.use_multiple_dataloader=True yet."
         )
+    if opd_module.is_opd_enabled(master_config) and processor is not None:
+        raise NotImplementedError(
+            "SingleController MOPD currently supports text-only teacher inputs. "
+            "Use the legacy controller for multimodal MOPD."
+        )
 
     checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
@@ -699,8 +839,29 @@ def setup_single_controller(
     setup_timing_metrics = SetupTimingMetrics()
 
     # Create clusters
-    train_cluster, inference_cluster = _build_clusters(master_config)
+    train_cluster, inference_cluster, teacher_segment_topology = _build_clusters(
+        master_config
+    )
     colocated = generation_config["colocated"]["enabled"]
+    segment_size = getattr(master_config, "cluster", {}).get("segment_size")
+
+    # Claim constrained training nodes before unconstrained inference or Gym
+    # tasks can consume them. This matters when inference topology alignment
+    # falls back while the training cluster remains topology-constrained.
+    if not colocated and segment_size is not None:
+        train_cluster.get_placement_groups()
+
+    # Claim teacher placement groups before deferred generation starts NeMo-Gym,
+    # whose resource servers may otherwise opportunistically consume those GPUs.
+    teacher_clusters: dict[str, RayVirtualCluster] = {}
+    if opd_module.is_non_colocated_teachers_enabled(master_config):
+        t0 = time.perf_counter()
+        teacher_clusters = opd_module.reserve_teacher_clusters(
+            master_config,
+            segment_size=segment_size,
+            teacher_segment_topology=teacher_segment_topology,
+        )
+        setup_timing_metrics.teacher_reservation_time_s = time.perf_counter() - t0
 
     # Create build tasks for generation / trainer / (nemo-gym) workers
     build_tasks: dict[str, Callable[[], Any]] = {}
@@ -863,6 +1024,28 @@ def setup_single_controller(
         setup_timing_metrics.generation_init_reserve_time_s = gen_reserve_time
         setup_timing_metrics.generation_init_load_time_s = gen_load_time
 
+    # Loading a teacher with the same checkpoint as the student must happen only
+    # after student initialization finishes: both use the same HF-to-Megatron
+    # cache path, and concurrent conversion can expose a partial checkpoint.
+    teacher_worker_groups: dict[str, Any] = {}
+    alias_to_group_alias: dict[str, str] = {}
+    if teacher_clusters:
+        t0 = time.perf_counter()
+        teacher_worker_groups, alias_to_group_alias = (
+            opd_module.create_teacher_worker_groups(
+                master_config,
+                cast(dict[str, Any], policy_config),
+                tokenizer,
+                teacher_clusters=teacher_clusters,
+            )
+        )
+        for teacher in teacher_worker_groups.values():
+            teacher.setup_data_plane(dp_config)
+        setup_timing_metrics.teacher_model_init_time_s = time.perf_counter() - t0
+        setup_timing_metrics.teacher_init_time_s = (
+            setup_timing_metrics.teacher_reservation_time_s or 0.0
+        ) + setup_timing_metrics.teacher_model_init_time_s
+
     worker_setup_time = time.perf_counter() - setup_start_time
     setup_timing_metrics.worker_setup_time_s = worker_setup_time
 
@@ -875,6 +1058,22 @@ def setup_single_controller(
     # ==========================
     # Connect-only DP client; TQPolicy already bootstrapped the controller.
     dp_client = build_data_plane_client(dp_config, bootstrap=False)
+    # SingleController reuses one partition for the run. Warm every known
+    # tensor field before rollout, policy, and teacher writers become
+    # concurrent; TransferQueue otherwise registers field names lazily.
+    dp_client.register_partition(
+        partition_id=partition_id,
+        fields=fields_with_optional_routed_experts(
+            SC_ROLLOUT_SCHEMA_FIELDS,
+            enabled=router_replay_enabled(policy_config),
+        ),
+        num_samples=(
+            master_config.async_rl.max_buffered_rollouts
+            * algo_cfg.num_generations_per_prompt
+        ),
+        consumer_tasks=["prev_lp", "ref_lp", "train"],
+        grpo_group_size=algo_cfg.num_generations_per_prompt,
+    )
 
     t0 = time.perf_counter()
     weight_synchronizer = create_weight_synchronizer(
@@ -952,6 +1151,8 @@ def setup_single_controller(
         last_checkpoint_path=last_checkpoint_path,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,
+        teacher_worker_groups=teacher_worker_groups,
+        alias_to_group_alias=alias_to_group_alias,
         # PPO extras
         value_handle=value,
         value_loss_fn=value_loss_fn,

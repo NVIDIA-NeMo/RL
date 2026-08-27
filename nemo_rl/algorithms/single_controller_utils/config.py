@@ -28,6 +28,7 @@ from pydantic import (
     model_validator,
 )
 
+from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
@@ -37,6 +38,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
+from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
@@ -552,6 +554,7 @@ class MasterConfig(BaseModel, extra="allow"):
     checkpointing: CheckpointingConfig
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
+    on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
 
     @model_validator(mode="after")
     def validate_algorithm_block(self) -> "MasterConfig":
@@ -973,6 +976,46 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "loss_fn.reference_policy_kl_penalty=0."
         )
 
+    # ``env`` is required in production configs, but model_construct-based unit
+    # configs can omit it. Only apply rollout-path validation when it is present.
+    env_config = getattr(master_config, "env", None)
+
+    opd_enabled = opd_module.is_opd_enabled(master_config)
+    if opd_enabled and is_ppo_run(master_config):
+        raise ValueError(
+            "on_policy_distillation is only supported with the `grpo` algorithm block."
+        )
+    if algo_cfg.adv_estimator.name == "opd" and not opd_enabled:
+        raise ValueError(
+            "grpo.adv_estimator.name='opd' requires "
+            "on_policy_distillation.enabled=true."
+        )
+    if opd_enabled:
+        opd_config = master_config.on_policy_distillation
+        assert opd_config is not None
+        if algo_cfg.adv_estimator.name != "opd":
+            raise ValueError(
+                "on_policy_distillation.enabled=true requires "
+                "grpo.adv_estimator.name='opd'."
+            )
+        if not opd_module.is_non_colocated_teachers_enabled(master_config):
+            raise ValueError(
+                "SingleController MOPD currently requires "
+                "on_policy_distillation.non_colocated_teachers.enabled=true."
+            )
+        if env_config is not None and not bool(env_config.get("should_use_nemo_gym")):
+            raise ValueError(
+                "on_policy_distillation requires env.should_use_nemo_gym=true: "
+                "teacher routing keys off the gym rollout path's per-agent "
+                "agent_ref."
+            )
+        if not opd_config.teacher_model_by_agent_name:
+            raise ValueError(
+                "on_policy_distillation.teacher_model_by_agent_name must contain "
+                "at least one teacher mapping."
+            )
+        opd_module.assert_prev_logprobs_available(master_config)
+
     if (
         reference_policy_kl_penalty == 0
         and not algo_cfg.skip_reference_policy_logprobs_calculation
@@ -990,13 +1033,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     # wrong-path block is still a silent no-op, which is the failure this whole
     # restructure exists to remove. Only a check at setup actually closes it.
     #
-    # ``env`` is a required field, so a run built the production way -- through
-    # MasterConfig(**cfg), which validates -- always carries it. model_construct
-    # skips validation and only fills fields that have defaults, so a config
-    # assembled that way can genuinely lack the attribute, and without it the
-    # rollout path is unknowable. This check only reads it to decide which half of
-    # the block is inert, so skip rather than fail a construction over it.
-    env_config = getattr(master_config, "env", None)
     if env_config is not None:
         use_nemo_gym = bool(env_config.get("should_use_nemo_gym"))
         unused_name = "native" if use_nemo_gym else "nemo_gym"
@@ -1034,6 +1070,7 @@ class AdvantageConfig:
     policy_logprobs_field: str = "prev_logprobs"
     generation_logprobs_field: str = "generation_logprobs"
     reference_logprobs_field: str = "reference_policy_logprobs"
+    teacher_logprobs_field: str = "teacher_reference_logprobs"
     # PPO only: the critic's pre-update prediction (input) and GAE's
     # regression target for it (output).
     values_field: str = "values"

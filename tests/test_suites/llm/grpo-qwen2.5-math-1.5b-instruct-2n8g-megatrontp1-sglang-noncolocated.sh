@@ -3,11 +3,11 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=1
-STEPS_PER_RUN=450
-MAX_STEPS=450
+NUM_NODES=2
+STEPS_PER_RUN=90
+MAX_STEPS=90
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=150
+NUM_MINUTES=30
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

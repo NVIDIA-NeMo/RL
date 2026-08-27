@@ -87,6 +87,18 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.timer import Timer
 
 
+def _refit_tensor_dtype(
+    fqn: str, tensor: torch.Tensor, default_dtype: torch.dtype
+) -> torch.dtype:
+    """Preserve the FP32 dtype used by inference-critical MoE router state."""
+    is_router_correction_bias = fqn.rsplit(".", maxsplit=1)[-1] == (
+        "e_score_correction_bias"
+    )
+    if is_router_correction_bias and tensor.dtype == torch.float32:
+        return tensor.dtype
+    return default_dtype
+
+
 def dtensor_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -94,11 +106,12 @@ def dtensor_params_generator(
 
     Args:
         model: The model whose parameters to generate.
-        target_dtype: The dtype to convert tensors to.
-        peft_config: Optional LoRA config for filtering which layers to merge.
+        target_dtype: The default dtype for refit tensors. Source-FP32
+            ``e_score_correction_bias`` tensors retain FP32.
 
     Yields:
-        Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
+        Tuples of (fully_qualified_name, tensor) where tensors are converted to
+        the refit dtype and made contiguous.
     """
     module_map = dict(model.named_modules())
     for name, tensor in model.state_dict().items():
@@ -109,10 +122,10 @@ def dtensor_params_generator(
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            # Convert to target dtype
+            refit_dtype = _refit_tensor_dtype(adapted_fqn, adapted_tensor, target_dtype)
             yield (
                 adapted_fqn,
-                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
+                adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
             )
             del adapted_tensor
         del adapted_fqn_tensors
@@ -391,31 +404,11 @@ class DTensorPolicyWorkerV2Impl(
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
-        # Rollout topology constant for SGLang colocated refit: set once via
-        # ``set_rollout_num_gpus_per_engine`` after the SGLang generation
-        # handle exists and consumed by ``stream_weights_via_http`` on each
-        # refit. Only initialized on the SGLang colocated path since no other
-        # generation backend uses this attribute.
-        generation_backend = config.get("generation", {}).get("backend")
-        if generation_backend == "sglang":
-            from nemo_rl.models.generation.sglang.utils.train_utils import (
-                monkey_patch_torch_reductions,
-            )
-
-            monkey_patch_torch_reductions()
-            if self.is_generation_colocated:
-                self._rollout_num_gpus_per_engine: Optional[int] = None
-                self._ipc_worker_state: dict = {}
-
     def _update_moe_gate_bias_if_supported(self) -> None:
         """Update the non-gradient MoE routing bias after the optimizer step."""
         update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
         if update_moe_gate_bias is not None:
             update_moe_gate_bias()
-
-    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
-        """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
-        self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
@@ -1099,12 +1092,14 @@ class DTensorPolicyWorkerV2Impl(
             full_tensor = (
                 tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
             )
-            # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
             adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
                 self.model, name, full_tensor
             )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                state_dict_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
+                refit_dtype = _refit_tensor_dtype(
+                    adapted_fqn, adapted_tensor, self.dtype
+                )
+                state_dict_info[adapted_fqn] = (adapted_tensor.shape, refit_dtype)
 
         return state_dict_info
 
@@ -1152,45 +1147,46 @@ class DTensorPolicyWorkerV2Impl(
         )
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_http")
-    def stream_weights_via_http(
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/update_weights_to_sglang_colocated")
+    def update_weights_to_sglang_colocated(
         self,
-        rollout_engine_urls: list[str],
+        *,
+        rollout_engines: list,
         buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
+        """Send FSDP weights to colocated SGLang engines via Ray CUDA IPC.
 
-        Args:
-            rollout_engine_urls: ``http://host:port`` base URLs of each
-                engine's ``node_rank=0`` SGLang HTTP server. The driver
-                resolves these once via ``engine.get_base_url`` and passes
-                them down so every FSDP rank doesn't redo the Ray RPC.
-            buffer_size_bytes: Max bucket size in bytes before flushing.
-
-        ``num_gpus_per_engine`` is recorded once via
-        ``set_rollout_num_gpus_per_engine`` after the SGLang generation handle
-        is created, so the caller doesn't have to pass it on every refit.
+        Synchronous: each chunk is awaited via ``ray.get`` inside
+        :func:`send_hf_buckets_via_ipc_actor_impl` before the next chunk is
+        sent, so trainer-side IPC tensors stay alive until the engine has
+        copied them and per-chunk engine failures surface immediately.
         """
-        assert self._rollout_num_gpus_per_engine is not None, (
-            "stream_weights_via_http called before set_rollout_num_gpus_per_engine; "
-            "wire the rollout TP size on the policy after SGLangGeneration is built."
-        )
+        if target_precision != "bf16":
+            raise NotImplementedError(
+                "The FSDP/DTensor policy only supports BF16 SGLang refits; "
+                f"got target_precision={target_precision!r}."
+            )
+        del sglang_quantization_cfg  # accepted for dispatch parity, bf16-only
 
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             self.model = self.move_to_cuda(self.model)
 
-        from nemo_rl.models.policy.utils import stream_weights_via_http_impl
+        from nemo_rl.models.policy.utils import (
+            iter_named_tensor_buckets,
+            send_hf_buckets_via_ipc_actor_impl,
+        )
 
-        stream_weights_via_http_impl(
-            params_generator=dtensor_params_generator(self.model, self.dtype),
-            rollout_engine_urls=rollout_engine_urls,
-            num_gpus_per_engine=self._rollout_num_gpus_per_engine,
-            rank=self.rank,
-            world_size=torch.distributed.get_world_size(),
-            worker_name=str(self),
+        bucket_iter = iter_named_tensor_buckets(
+            dtensor_params_generator(self.model, self.dtype),
             buffer_size_bytes=buffer_size_bytes,
-            worker_state=self._ipc_worker_state,
+        )
+        send_hf_buckets_via_ipc_actor_impl(
+            bucket_iterator=bucket_iter,
+            rollout_engines=list(rollout_engines),
+            worker_state=self._refit_transport_state("sglang_ipc"),
         )
 
     def _checkpoint_engine_params(
