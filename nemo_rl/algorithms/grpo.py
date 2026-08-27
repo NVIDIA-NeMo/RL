@@ -1277,7 +1277,10 @@ def setup(
         policy: ColocatablePolicyInterface,
         policy_generation: MegatronGeneration,
     ) -> None:
-        """Initialize Megatron refit and load non-colocated generation weights."""
+        """Initialize Megatron weight synchronizer.
+
+        For non-colocated inference, also performs the initial weight sync.
+        """
         t0 = time.perf_counter()
         weight_synchronizer = create_weight_synchronizer(
             policy=policy,
