@@ -1,6 +1,4 @@
-# SingleController with the Megatron generation backend (colocated).
 defaults: grpo_math_1B_megatron_single_controller.yaml
-
 policy:
   generation:
     backend: megatron

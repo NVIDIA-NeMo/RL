@@ -1133,9 +1133,7 @@ def setup_single_controller(
             # Colocated Megatron generation serves from the trainer's workers,
             # so rank 0 of the trainer adopts the pre-published OpenAI socket.
             reserved_http_server_port=(
-                reserved_http_server_port
-                if megatron_backend and colocated
-                else None
+                reserved_http_server_port if megatron_backend and colocated else None
             ),
         )
         if not is_ppo_run(master_config):
