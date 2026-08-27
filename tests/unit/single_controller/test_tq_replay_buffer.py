@@ -25,7 +25,10 @@ import torch
 from tensordict import TensorDict
 
 import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    PostWriteEnrichmentError,
+    TQReplayBuffer,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
@@ -186,6 +189,48 @@ def _add_group(
 
 
 class TestTQReplayBufferReserveCommit:
+    def test_commit_enriches_after_put_before_slot_becomes_ready(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        observations = []
+
+        async def enrich(meta, record):
+            del record
+            observations.append((dp.depth(), list(buf.ready_list)))
+            return meta.with_fields(["teacher_reference_logprobs"])
+
+        buf.set_post_write_enricher(enrich)
+        meta = _add_group(buf, weight=3)
+
+        assert observations == [(_N_GENS, [False])]
+        assert "teacher_reference_logprobs" in meta.fields
+        assert buf.ready_list == [True]
+
+    def test_commit_rolls_back_when_post_write_enrichment_fails(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+
+        async def fail_enrichment(meta, record):
+            del meta, record
+            raise RuntimeError("teacher unavailable")
+
+        buf.set_post_write_enricher(fail_enrichment)
+        group_id = buf.reserve(weight_version=3)
+
+        with pytest.raises(PostWriteEnrichmentError, match="post-write enrichment"):
+            _run(
+                buf.commit(
+                    group_id,
+                    _make_record(),
+                    start_weight_version=3,
+                    end_weight_version=3,
+                )
+            )
+
+        assert dp.depth() == 0
+        assert buf.ready_list == [False]
+        assert buf.meta_list == [None]
+
     def test_commit_clears_rows_when_put_raises_after_writing(self):
         dp = FailAfterPutDataPlaneClient()
         buf = _make_buffer(dp)
@@ -438,6 +483,75 @@ class TestTQReplayBufferSize:
         assert buf.count_for_target_step(5) == 2
         assert buf.count_for_target_step(6) == 1
         assert buf.count_for_target_step(7) == 0
+
+
+class TestTQReplayBufferPromote:
+    """Borrowing inside on_dropped_prompt="replace".
+
+    A step fills a hole from a later step's already-finished work. Not a mode of its
+    own: "promote" is not a value on_dropped_prompt accepts.
+    """
+
+    def test_the_furthest_step_lends_because_it_has_the_most_slack(self):
+        # Both could lend, but 7 is due two steps later than 6, so it has the longer
+        # window to receive the repayment rollout before it is needed.
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=0, target_step=6)
+        _add_group(buf, weight=0, target_step=7)
+
+        assert buf.promote_ready_group(to_target_step=5) == 7
+        assert buf.target_step_list == [6, 5]
+
+    def test_an_unready_group_is_not_borrowed(self):
+        # Its rollout is still running, so moving the stamp would hand the dropped step
+        # exactly the wait that borrowing exists to avoid.
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        buf.reserve(weight_version=0, target_step=6)
+
+        assert buf.promote_ready_group(to_target_step=5) is None
+        assert buf.target_step_list == [6]
+
+    def test_only_later_steps_lend(self):
+        # A group stamped for this step is already counted toward it, and one stamped
+        # earlier belongs to a step the trainer has passed.
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=0, target_step=4)
+        _add_group(buf, weight=0, target_step=5)
+
+        assert buf.promote_ready_group(to_target_step=5) is None
+        assert buf.target_step_list == [4, 5]
+
+    def test_unstamped_groups_are_never_borrowed(self):
+        # A sampler that does not stamp cannot strand a step, so its groups belong to
+        # no step in particular and there is nothing to move them out of.
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=0, target_step=None)
+
+        assert buf.promote_ready_group(to_target_step=5) is None
+        assert buf.target_step_list == [None]
+
+    def test_an_empty_buffer_has_nothing_to_lend(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+
+        assert buf.promote_ready_group(to_target_step=5) is None
+
+    def test_borrowing_twice_takes_from_two_different_groups(self):
+        # Each borrow must move a distinct group: re-stamping the same one twice would
+        # report two groups gained where only one exists.
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=0, target_step=6)
+        _add_group(buf, weight=0, target_step=6)
+
+        assert buf.promote_ready_group(to_target_step=5) == 6
+        assert buf.promote_ready_group(to_target_step=5) == 6
+        assert buf.promote_ready_group(to_target_step=5) is None
+        assert buf.count_for_target_step(5) == 2
 
 
 # ── state_dict / load_state_dict (checkpointing) ─────────────────────────────

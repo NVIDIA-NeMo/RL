@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 from tempfile import TemporaryDirectory
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -28,6 +29,7 @@ from nemo_rl.utils.native_checkpoint import (
     convert_dcp_to_hf,
     load_checkpoint,
     save_checkpoint,
+    save_tokenizer_on_rank0,
 )
 from tests.unit.test_utils import SimpleLossFn
 
@@ -177,6 +179,68 @@ def assert_recursive_dict_different(dict1, dict2):
     except AssertionError:
         return
     raise AssertionError("Dictionaries are equal")
+
+
+class TestSaveTokenizerOnRank0:
+    """Tests for the rank-0 guard around tokenizer saving.
+
+    The tokenizer is replicated across ranks and ``save_pretrained`` writes
+    rank-independent filenames, so letting every rank write races on the same
+    file and can hang the job on a hard-mounted NFS share.
+    """
+
+    def test_saves_when_distributed_not_initialized(self):
+        tokenizer = MagicMock()
+        with patch("torch.distributed.is_initialized", return_value=False):
+            save_tokenizer_on_rank0(tokenizer, "/some/tokenizer/path")
+        tokenizer.save_pretrained.assert_called_once_with("/some/tokenizer/path")
+
+    def test_saves_on_rank0_and_barriers(self):
+        tokenizer = MagicMock()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.barrier") as mock_barrier,
+        ):
+            save_tokenizer_on_rank0(tokenizer, "/some/tokenizer/path")
+        tokenizer.save_pretrained.assert_called_once_with("/some/tokenizer/path")
+        mock_barrier.assert_called_once()
+
+    @pytest.mark.parametrize("rank", [1, 7, 31])
+    def test_skips_write_on_non_zero_ranks(self, rank):
+        tokenizer = MagicMock()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=rank),
+            patch("torch.distributed.barrier") as mock_barrier,
+        ):
+            save_tokenizer_on_rank0(tokenizer, "/some/tokenizer/path")
+        # Non-zero ranks must not write: concurrent save_pretrained() calls on
+        # the same path are what deadlocked on the NFS inode lock.
+        tokenizer.save_pretrained.assert_not_called()
+        # ...but they must still reach the barrier, otherwise rank 0 hangs.
+        mock_barrier.assert_called_once()
+
+    def test_save_checkpoint_routes_tokenizer_through_guard(self, tmp_path):
+        """save_checkpoint() must not call save_pretrained() unguarded."""
+        model = torch.nn.Linear(4, 4)
+        tokenizer = MagicMock()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=3),
+            patch("torch.distributed.barrier"),
+            patch("nemo_rl.utils.native_checkpoint.dcp.save") as mock_dcp_save,
+        ):
+            save_checkpoint(
+                model,
+                str(tmp_path / "weights"),
+                tokenizer=tokenizer,
+                tokenizer_path=str(tmp_path / "tokenizer"),
+            )
+        # Model save is collective and must run on every rank...
+        mock_dcp_save.assert_called_once()
+        # ...while the replicated tokenizer is skipped on rank 3.
+        tokenizer.save_pretrained.assert_not_called()
 
 
 def test_model_state(mock_experiment):
