@@ -827,6 +827,42 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     }
 
 
+def test_make_fp8_moe_kernel_compat_matches_vllm_signature(fp8_module):
+    """layer is forwarded on the 0.25 signature and dropped on the 0.28 one."""
+    fp8 = fp8_module
+    layer = object()
+    kernel = object()
+    calls = []
+
+    def vllm_025_style(
+        moe_quant_config, moe_config, experts_cls, fp8_backend, routing_tables, layer
+    ):
+        calls.append(("0.25", layer))
+        return kernel
+
+    def vllm_028_style(
+        moe_quant_config, moe_config, experts_cls, fp8_backend, routing_tables
+    ):
+        calls.append(("0.28", None))
+        return kernel
+
+    def var_kwargs_style(**kwargs):
+        calls.append(("kwargs", kwargs["layer"]))
+        return kernel
+
+    common = dict(
+        moe_quant_config=object(),
+        moe_config=object(),
+        experts_cls=object(),
+        fp8_backend=object(),
+        routing_tables=(None, None, None),
+    )
+    assert fp8._make_fp8_moe_kernel_compat(vllm_025_style, layer, **common) is kernel
+    assert fp8._make_fp8_moe_kernel_compat(vllm_028_style, layer, **common) is kernel
+    assert fp8._make_fp8_moe_kernel_compat(var_kwargs_style, layer, **common) is kernel
+    assert calls == [("0.25", layer), ("0.28", None), ("kwargs", layer)]
+
+
 @pytest.mark.parametrize(
     ("field", "error"),
     [

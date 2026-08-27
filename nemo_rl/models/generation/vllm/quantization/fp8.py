@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 import warnings
 from collections.abc import Sequence
@@ -1057,6 +1058,23 @@ def create_weights_mxfp8_moe(
     )
 
 
+def _make_fp8_moe_kernel_compat(make_fp8_moe_kernel, layer, **kwargs):
+    """Call vLLM's make_fp8_moe_kernel across the 0.25/0.28 signature change.
+
+    vLLM 0.25 accepts a ``layer`` kwarg, consumed only by the HUMMING backend;
+    vLLM 0.28 removed both the kwarg and that backend branch, so passing it
+    there raises TypeError. Forward ``layer`` only when the signature takes it.
+    """
+    parameters = inspect.signature(make_fp8_moe_kernel).parameters
+    accepts_layer = "layer" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if accepts_layer:
+        kwargs["layer"] = layer
+    return make_fp8_moe_kernel(**kwargs)
+
+
 def process_weights_after_loading_moe(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer.
 
@@ -1106,13 +1124,14 @@ def process_weights_after_loading_moe(self, layer) -> None:
         from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel
 
         assert self.experts_cls is not None
-        self.moe_kernel = make_fp8_moe_kernel(
+        self.moe_kernel = _make_fp8_moe_kernel_compat(
+            make_fp8_moe_kernel,
+            layer,
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
             fp8_backend=self.fp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
-            layer=layer,
         )
 
 
@@ -1354,13 +1373,14 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.moe_quant_config is not None
         assert self.experts_cls is not None
-        self.moe_kernel = make_fp8_moe_kernel(
+        self.moe_kernel = _make_fp8_moe_kernel_compat(
+            make_fp8_moe_kernel,
+            layer,
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
             fp8_backend=self.mxfp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
-            layer=layer,
         )
 
 
