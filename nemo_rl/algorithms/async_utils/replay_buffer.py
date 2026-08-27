@@ -93,6 +93,9 @@ class DataPlaneCheckpointMetadata(TypedDict):
     replay_metadata_schema_version: NotRequired[int]
     replay_manifest_digest: NotRequired[str]
     replay_group_count: NotRequired[int]
+    rollout_recovery_schema_version: NotRequired[int]
+    rollout_recovery_payload_sha256: NotRequired[str]
+    rollout_recovery_group_count: NotRequired[int]
 
 
 def _canonical_manifest_value(value: Any, *, path: str) -> Any:
@@ -982,7 +985,9 @@ class TQReplayBuffer:
         Args:
             weight_version: Weight version stamped on the slot.
             target_step: Training step this slot targets; only consulted by StalenessSampler.force_in_order.
-            group_id: Per-group sample_id prefix; defaults to a fresh uuid4.
+            group_id: Pre-minted logical group ID and sample-ID prefix. The
+                checkpoint-enabled lineage path always supplies this. ``None``
+                creates a fresh UUID only for untracked callers.
 
         Returns:
             group_id used by the matching commit.

@@ -56,6 +56,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 
 PARTITION = "rollout_data"
 ROLLOUTS_PER_GROUP = 2  # rollouts_per_prompt_group
@@ -132,7 +133,7 @@ class Scenario:
 
         Handed out, not trained, not deliberately evicted -- and below the
         cursor, so the dataloader will never produce them again. This is the
-        bar the feature should eventually meet, not the bar it meets today.
+        no-data-loss bar enforced by the recovery matrix.
         """
         return {
             _gid(g.gid)
@@ -162,7 +163,7 @@ class Case:
     Args:
         scenario: The buffer state at checkpoint time.
         sampler: Which sampler the run is configured with.
-        why: For a case that fails today, the line that drops the data.
+        why: Optional diagnostic context for an expected behavior gap.
     """
 
     scenario: Scenario
@@ -256,10 +257,10 @@ class RoundTrip:
 
     ``recovered`` is deliberately *presence*, not readiness: a group counts as
     recovered if the restored buffer knows about it at all. That keeps the
-    assertions independent of how a future partial-group restore is built. A
-    group could come back already committed (its missing rollouts regenerated
-    before the save), or as a reserved slot waiting to be finished -- either
-    way the run has not lost the prompt, and either way these tests notice.
+    assertions independent of whether recovery regenerates the whole group or
+    later resumes only missing siblings. A group could come back already
+    committed, or as a reserved slot waiting to be finished -- either way the
+    run has not lost the prompt, and either way these tests notice.
     ``ready`` and ``pending`` are reported separately for diagnosis only;
     nothing asserts on them.
     """
@@ -287,6 +288,25 @@ async def _round_trip(
         if sampler_a.supports_buffer_checkpoint
         else None
     )
+    recovery_ledger_a = RolloutRecoveryLedger()
+    for group in scenario.groups:
+        if (
+            group.evicted
+            or group.gid in scenario.trained
+            or group.done == ROLLOUTS_PER_GROUP
+        ):
+            continue
+        recovery_ledger_a.reserve_group(
+            group_id=_gid(group.gid),
+            admission_id=f"batch-{group.target}",
+            prompt_id=str(group.gid),
+            prompt_payload={"idx": group.gid, "message_log": []},
+            expected_generations=ROLLOUTS_PER_GROUP,
+            target_step=group.target,
+            start_weight_version=group.weight,
+            admitted=True,
+        )
+    recovery_sidecar = recovery_ledger_a.state_dict()
     rows_before = set(dp_a.list_sample_ids(PARTITION))
     dp_a.save_checkpoint(tmp_path / "data_plane")
 
@@ -305,6 +325,22 @@ async def _round_trip(
             expected_group_size=ROLLOUTS_PER_GROUP,
             expected_manifest_digest=sidecar["manifest_digest"],
         )
+        recovery_ledger_b = RolloutRecoveryLedger()
+        recovery_ledger_b.load_state_dict(recovery_sidecar)
+        recovery_ledger_b.discard_canonical_groups(set(buf_b._group_ids))
+        for group in recovery_ledger_b.groups():
+            group_id = buf_b.reserve(
+                weight_version=group.start_weight_version,
+                target_step=group.target_step,
+                group_id=group.group_id,
+            )
+            await buf_b.commit(
+                group_id,
+                _record(),
+                start_weight_version=group.start_weight_version,
+                end_weight_version=group.start_weight_version,
+            )
+            recovery_ledger_b.discard_group(group_id)
 
     ready = {
         gid for gid, is_ready in zip(buf_b._group_ids, buf_b.ready_list) if is_ready

@@ -29,7 +29,9 @@ without admitting it a second time.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +42,7 @@ import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_FILENAME,
+    DataPlaneCheckpointBarrier,
     TQReplayBuffer,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
@@ -47,8 +50,16 @@ from nemo_rl.algorithms.grpo import _initial_grpo_save_state
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutOutcome
+from nemo_rl.experience.rollout_recovery import (
+    ROLLOUT_RECOVERY_SCHEMA_VERSION,
+    ROLLOUT_RECOVERY_STATE_FILENAME,
+    PromptGroupPhase,
+    RolloutRecoveryLedger,
+    prompt_payload_sha256,
+)
 from tests.unit.single_controller._checkpoint_scenarios import (
     _record,
     patch_converter,
@@ -66,10 +77,15 @@ class _CountingInOrderSampler(InOrderSampler):
     def __init__(self) -> None:
         super().__init__(None, max_lookahead_versions=1)
         self.admit_calls = 0
+        self.admission_commits = 0
 
     async def admit(self, *, trainer_version_fn):
         self.admit_calls += 1
         return await super().admit(trainer_version_fn=trainer_version_fn)
+
+    def commit_admission(self):
+        self.admission_commits += 1
+        return super().commit_admission()
 
 
 class _BlockingBeforeAdmissionSampler(_CountingInOrderSampler):
@@ -80,10 +96,10 @@ class _BlockingBeforeAdmissionSampler(_CountingInOrderSampler):
         self.admission_entered = asyncio.Event()
         self.release_admission = asyncio.Event()
 
-    async def admit(self, *, trainer_version_fn):
+    async def wait_until_admissible(self, *, trainer_version_fn):
         self.admission_entered.set()
         await self.release_admission.wait()
-        return await super().admit(trainer_version_fn=trainer_version_fn)
+        await super().wait_until_admissible(trainer_version_fn=trainer_version_fn)
 
 
 @dataclass(frozen=True)
@@ -126,12 +142,21 @@ class _PendingLedger:
 
     def state_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
             "groups": [
                 {
                     "group_id": group.group_id,
+                    "admission_id": group.group_id,
+                    "prompt_id": str(group.prompt_payload.get("idx", "unknown")),
                     "target_step": group.target_step,
-                    "prompt_payload": group.prompt_payload,
+                    "prompt_ref": {
+                        "sample_id": str(group.prompt_payload.get("idx", "unknown")),
+                        "task_name": group.prompt_payload.get("task_name"),
+                        "payload_sha256": prompt_payload_sha256(group.prompt_payload),
+                    },
+                    "expected_generations": 2,
+                    "start_weight_version": 7,
+                    "phase": ("reserved" if group.target_step is None else "admitted"),
                 }
                 for group in self._groups
             ],
@@ -142,19 +167,26 @@ class _PendingLedger:
 
 
 class _RecoveryRolloutManager:
-    def __init__(self, ledger: _PendingLedger) -> None:
+    def __init__(self, ledger: RolloutRecoveryLedger) -> None:
         self.recovery_ledger = ledger
         self.recovered: list[tuple[str, int | None]] = []
 
-    async def recover_group(self, group_id: str) -> bool:
-        group = next(
-            group
-            for group in self.recovery_ledger.groups()
-            if group.group_id == group_id
-        )
+    async def complete_recovery(self, group_id: str) -> None:
+        group = self.recovery_ledger.get_group(group_id)
         self.recovered.append((group.group_id, group.target_step))
-        self.recovery_ledger.release(group_id)
-        return True
+        self.recovery_ledger.discard_group(group_id)
+
+    def mark_prompt_group_admitted(
+        self, group_id: str, *, target_step: int | None
+    ) -> None:
+        self.recovery_ledger.mark_group_admitted(
+            group_id,
+            target_step=target_step,
+            start_weight_version=7,
+        )
+
+    def discard_prompt_group(self, group_id: str) -> None:
+        self.recovery_ledger.discard_group(group_id)
 
 
 class _BlockingRolloutManager:
@@ -170,8 +202,14 @@ class _BlockingRolloutManager:
         self.weight_version = version
 
     def reserve_prompt_group(
-        self, prompt: dict[str, Any], *, target_step: int | None = None
+        self,
+        prompt: DatumSpec,
+        *,
+        target_step: int | None = None,
+        admitted: bool = True,
+        admission_id: str | None = None,
     ) -> str:
+        del admitted, admission_id
         batch_label = "fetched" if target_step is None else str(target_step)
         group_id = f"batch-{batch_label}-prompt-{prompt['idx']}"
         if not self.recovery_ledger.groups():
@@ -184,20 +222,27 @@ class _BlockingRolloutManager:
             )
         return group_id
 
-    def mark_prompt_group_admitted(self, group_id: str, *, target_step: int) -> None:
+    def mark_prompt_group_admitted(
+        self, group_id: str, *, target_step: int | None
+    ) -> None:
+        if target_step is None:
+            return
         self.recovery_ledger.assign_target_step(group_id, target_step)
+
+    def discard_prompt_group(self, group_id: str) -> None:
+        self.recovery_ledger.release(group_id)
 
     async def generate_and_push(
         self,
-        prompt: dict[str, Any],
+        prompt: DatumSpec,
         *,
         target_step: int | None = None,
         inflight_registry: dict[str, Any] | None = None,
-        recovery_group_id: str | None = None,
+        lineage_group_id: str | None = None,
     ) -> RolloutOutcome:
         del inflight_registry
-        if recovery_group_id is None:
-            recovery_group_id = self.reserve_prompt_group(
+        if lineage_group_id is None:
+            lineage_group_id = self.reserve_prompt_group(
                 prompt,
                 target_step=target_step,
             )
@@ -225,17 +270,71 @@ class _BlockingNoOpDataPlaneClient(NoOpDataPlaneClient):
         super().save_checkpoint(checkpoint_dir, metadata=metadata)
 
 
-def _enable_recovery_checkpoint_capture(controller: Any) -> None:
-    """Install the narrow recovery hooks expected by the future foundation."""
+class _LedgerFacade:
+    """Minimal RolloutManager ownership surface for reserve-pool cuts."""
 
-    async def _inventory_is_valid(**_: Any) -> None:
-        return None
+    def __init__(self) -> None:
+        self.recovery_ledger = RolloutRecoveryLedger()
 
-    controller._validate_rollout_recovery_inventory = _inventory_is_valid
-    controller._master_config.__dict__["token_capture"] = SimpleNamespace(
-        enabled=True,
-        staging_partition="rollout_staging",
+    def reserve_prompt_group(
+        self,
+        prompt: DatumSpec,
+        *,
+        target_step: int | None = None,
+        admitted: bool = True,
+        admission_id: str | None = None,
+    ) -> str:
+        record = self.recovery_ledger.reserve_group(
+            prompt_id=str(prompt["idx"]),
+            prompt_payload=prompt,
+            expected_generations=2,
+            target_step=target_step,
+            start_weight_version=7,
+            admitted=admitted,
+            admission_id=admission_id,
+        )
+        return record.group_id
+
+    def mark_prompt_group_admitted(
+        self, group_id: str, *, target_step: int | None
+    ) -> None:
+        self.recovery_ledger.mark_group_admitted(
+            group_id,
+            target_step=target_step,
+            start_weight_version=7,
+        )
+
+    def discard_prompt_group(self, group_id: str) -> None:
+        self.recovery_ledger.discard_group(group_id)
+
+
+def _reserve_prompt(idx: int) -> DatumSpec:
+    return {
+        "idx": idx,
+        "message_log": [{"role": "user", "content": f"prompt {idx}"}],
+        "length": 1,
+        "extra_env_info": None,
+        "loss_multiplier": 1.0,
+    }
+
+
+def _reserve_controller() -> Any:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    controller = object.__new__(controller_cls)
+    controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    controller._replacement_reserve = deque()
+    controller._sampler_stamps_target_steps = True
+    controller._rollout_recovery_enabled = True
+    controller._async_cfg = SimpleNamespace(
+        rollout_failure=SimpleNamespace(
+            on_dropped_prompt="replace",
+            replacement_reserve_prompts=2,
+            max_replacement_attempts=1,
+        )
     )
+    controller._algo_cfg = SimpleNamespace(num_prompts_per_step=2)
+    controller._rollout_manager = _LedgerFacade()
+    return controller
 
 
 def test_dispatch_cursor_alone_assigns_the_next_batch_to_step_8() -> None:
@@ -249,13 +348,6 @@ def test_dispatch_cursor_alone_assigns_the_next_batch_to_step_8() -> None:
     assert asyncio.run(exercise()) == 8
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "The dataloader cursor can advance before unfinished prompt ownership "
-        "is recorded in the checkpoint bundle."
-    ),
-)
 def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
     """A checkpoint cut inside admit retains the fetched batch for recovery."""
 
@@ -297,8 +389,6 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
         sampler = _BlockingBeforeAdmissionSampler()
         sampler.restore_dispatch_index(6)
         controller._sampler = sampler
-        _enable_recovery_checkpoint_capture(controller)
-
         pump = asyncio.create_task(controller._rollout_pump())
         await asyncio.wait_for(sampler.admission_entered.wait(), timeout=1.0)
         assert controller._sampler.dispatch_index == 6
@@ -322,7 +412,8 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
         )
         assert len(recovery_state["groups"]) == 1
         assert recovery_state["groups"][0]["target_step"] is None
-        assert recovery_state["groups"][0]["prompt_payload"]["idx"] == 70
+        assert recovery_state["groups"][0]["prompt_ref"]["sample_id"] == "70"
+        assert "prompt_payload" not in recovery_state["groups"][0]
         assert torch.load(
             checkpoint / "train_dataloader.pt",
             weights_only=False,
@@ -331,13 +422,6 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
     asyncio.run(exercise())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "An unfinished admitted batch is not yet persisted alongside the native "
-        "TQ checkpoint."
-    ),
-)
 def test_checkpoint_owns_batch_7_while_its_rollout_is_unfinished(tmp_path) -> None:
     """A finalized checkpoint cannot contain a cursor hole for target step 7."""
 
@@ -379,8 +463,6 @@ def test_checkpoint_owns_batch_7_while_its_rollout_is_unfinished(tmp_path) -> No
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = controller_cls(config, actor_args, SetupTimingMetrics())
 
-        _enable_recovery_checkpoint_capture(controller)
-
         pump = asyncio.create_task(controller._rollout_pump())
         await asyncio.wait_for(rollout_manager.started.wait(), timeout=1.0)
         assert controller._sampler.dispatch_index == 7
@@ -408,13 +490,6 @@ def test_checkpoint_owns_batch_7_while_its_rollout_is_unfinished(tmp_path) -> No
     asyncio.run(exercise())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A commit that loses the checkpoint-barrier race is not yet retained in "
-        "a durable unfinished-group ledger."
-    ),
-)
 def test_commit_contending_with_checkpoint_has_exactly_one_saved_owner(
     tmp_path,
     monkeypatch,
@@ -472,8 +547,6 @@ def test_commit_contending_with_checkpoint_has_exactly_one_saved_owner(
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = controller_cls(config, actor_args, SetupTimingMetrics())
-        _enable_recovery_checkpoint_capture(controller)
-
         save_task = asyncio.create_task(
             controller._save_checkpoint(
                 {"loss": 1.0},
@@ -509,12 +582,8 @@ def test_commit_contending_with_checkpoint_has_exactly_one_saved_owner(
             checkpoint / "rollout_recovery.pt",
             weights_only=False,
         )
-        canonical_ids = {
-            group["group_id"] for group in replay_state["groups"]
-        }
-        pending_ids = {
-            group["group_id"] for group in recovery_state["groups"]
-        }
+        canonical_ids = {group["group_id"] for group in replay_state["groups"]}
+        pending_ids = {group["group_id"] for group in recovery_state["groups"]}
 
         assert int(group_id in canonical_ids) + int(group_id in pending_ids) == 1
         assert group_id not in canonical_ids
@@ -524,13 +593,6 @@ def test_commit_contending_with_checkpoint_has_exactly_one_saved_owner(
     asyncio.run(exercise())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A canonical replay group is not yet filtered out of the checkpointed "
-        "unfinished-group ledger."
-    ),
-)
 def test_canonical_replay_wins_over_stale_ledger_entry(
     tmp_path,
     monkeypatch,
@@ -591,8 +653,6 @@ def test_canonical_replay_wins_over_stale_ledger_entry(
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = controller_cls(config, actor_args, SetupTimingMetrics())
-        _enable_recovery_checkpoint_capture(controller)
-
         await buffer.commit(
             group_id,
             _record(),
@@ -618,12 +678,8 @@ def test_canonical_replay_wins_over_stale_ledger_entry(
             checkpoint / "rollout_recovery.pt",
             weights_only=False,
         )
-        canonical_ids = {
-            group["group_id"] for group in replay_state["groups"]
-        }
-        pending_ids = {
-            group["group_id"] for group in recovery_state["groups"]
-        }
+        canonical_ids = {group["group_id"] for group in replay_state["groups"]}
+        pending_ids = {group["group_id"] for group in recovery_state["groups"]}
 
         assert group_id in canonical_ids
         assert group_id not in pending_ids
@@ -632,48 +688,393 @@ def test_canonical_replay_wins_over_stale_ledger_entry(
     asyncio.run(exercise())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "The controller does not yet persist and replay unfinished prompt-group "
-        "ownership alongside the TQ checkpoint."
-    ),
-)
-def test_recovery_replays_step_7_without_readmitting_the_batch() -> None:
+def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None:
     """An admitted batch keeps target_step=7 across a process restart."""
 
     async def exercise() -> None:
         sampler = _CountingInOrderSampler()
         sampler.restore_dispatch_index(7)
-        ledger = _PendingLedger(
-            _PendingGroup(
-                group_id="batch-7-prompt-0",
-                target_step=7,
-                prompt_payload={"idx": 70, "message_log": []},
-            )
+        saved_ledger = RolloutRecoveryLedger()
+        saved_ledger.reserve_group(
+            group_id="batch-7-prompt-0",
+            admission_id="batch-7",
+            prompt_id="70",
+            prompt_payload={"idx": 70, "message_log": []},
+            expected_generations=2,
+            target_step=7,
+            start_weight_version=7,
+            admitted=True,
         )
+        saved_state = saved_ledger.state_dict()
+        saved_state["batch_shortfall"] = {6: 1}
+        saved_state["sampler_stamps_target_steps"] = True
+        recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
+        torch.save(saved_state, recovery_path)
+        payload_sha256 = hashlib.sha256(recovery_path.read_bytes()).hexdigest()
+
+        ledger = RolloutRecoveryLedger()
         rollout_manager = _RecoveryRolloutManager(ledger)
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
+        controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
-            "rollout_recovery_payload_sha256": "checkpoint-cut-digest"
+            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "rollout_recovery_payload_sha256": payload_sha256,
+            "rollout_recovery_group_count": 1,
         }
-        controller._async_cfg = SimpleNamespace(max_buffered_rollouts=4)
+        controller._async_cfg = SimpleNamespace(
+            max_buffered_rollouts=4,
+            max_inflight_prompts=2,
+        )
         controller._buffer_capacity = asyncio.Semaphore(4)
+        controller._trainer_version = 7
+        controller._dataloader = SimpleNamespace(
+            dataset={70: {"idx": 70, "message_log": []}}
+        )
+        controller._buffer = SimpleNamespace(
+            count_for_target_step=lambda _target_step: 0,
+            metadata_state_dict=lambda *, saved_capacity: {
+                "groups": [],
+                "saved_capacity": saved_capacity,
+            },
+        )
 
-        async def _inventory_is_valid(*, clear_unreferenced: bool) -> None:
-            assert clear_unreferenced
-
-        controller._validate_rollout_recovery_inventory = _inventory_is_valid
+        async def _recover(
+            _prompt: dict[str, Any],
+            _target_step: int | None,
+            group_id: str,
+        ) -> None:
+            await rollout_manager.complete_recovery(group_id)
 
         await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        await controller._redispatch_restored_rollouts(_recover)
 
-        assert ledger.prepare_calls == 1
         assert rollout_manager.recovered == [("batch-7-prompt-0", 7)]
         assert sampler.admit_calls == 0
+        assert sampler.admission_commits == 0
         assert sampler.dispatch_index == 7
+        assert controller._batch_shortfall == {6: 1}
+        assert controller._sampler_stamps_target_steps is True
 
     asyncio.run(exercise())
+
+
+def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
+    """Two prompts fetched together consume one sampler admission on restart."""
+
+    async def exercise() -> None:
+        saved_ledger = RolloutRecoveryLedger()
+        for prompt_idx in (70, 71):
+            saved_ledger.reserve_group(
+                group_id=f"batch-7-prompt-{prompt_idx}",
+                admission_id="batch-7",
+                prompt_id=str(prompt_idx),
+                prompt_payload={"idx": prompt_idx, "message_log": []},
+                expected_generations=2,
+                target_step=None,
+                start_weight_version=7,
+                admitted=False,
+            )
+        recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
+        torch.save(saved_ledger.state_dict(), recovery_path)
+
+        sampler = _CountingInOrderSampler()
+        sampler.restore_dispatch_index(6)
+        rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        controller._sampler = sampler
+        controller._rollout_manager = rollout_manager
+        controller._last_checkpoint_path = str(tmp_path)
+        controller._data_plane_checkpoint_metadata = {
+            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "rollout_recovery_payload_sha256": hashlib.sha256(
+                recovery_path.read_bytes()
+            ).hexdigest(),
+            "rollout_recovery_group_count": 2,
+        }
+        controller._async_cfg = SimpleNamespace(
+            max_buffered_rollouts=4,
+            max_inflight_prompts=2,
+        )
+        controller._buffer_capacity = asyncio.Semaphore(4)
+        controller._trainer_version = 7
+        controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        controller._dataloader = SimpleNamespace(
+            dataset={
+                prompt_idx: {"idx": prompt_idx, "message_log": []}
+                for prompt_idx in (70, 71)
+            }
+        )
+        controller._buffer = SimpleNamespace(
+            count_for_target_step=lambda _target_step: 0,
+            metadata_state_dict=lambda *, saved_capacity: {
+                "groups": [],
+                "saved_capacity": saved_capacity,
+            },
+        )
+
+        async def _recover(
+            _prompt: dict[str, Any],
+            _target_step: int | None,
+            group_id: str,
+        ) -> None:
+            await rollout_manager.complete_recovery(group_id)
+
+        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        await controller._redispatch_restored_rollouts(_recover)
+
+        assert sampler.admit_calls == 0
+        assert sampler.admission_commits == 1
+        assert sampler.dispatch_index == 7
+        assert set(rollout_manager.recovered) == {
+            ("batch-7-prompt-70", 7),
+            ("batch-7-prompt-71", 7),
+        }
+
+    asyncio.run(exercise())
+
+
+def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
+    tmp_path,
+) -> None:
+    """The train pump may free replay slots while recovery is redispatching."""
+
+    async def exercise() -> None:
+        saved_ledger = RolloutRecoveryLedger()
+        for prompt_idx in (70, 71):
+            saved_ledger.reserve_group(
+                group_id=f"batch-7-prompt-{prompt_idx}",
+                admission_id="batch-7",
+                prompt_id=str(prompt_idx),
+                prompt_payload={"idx": prompt_idx, "message_log": []},
+                expected_generations=2,
+                target_step=7,
+                start_weight_version=7,
+                admitted=True,
+            )
+        recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
+        torch.save(saved_ledger.state_dict(), recovery_path)
+
+        rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        controller._rollout_manager = rollout_manager
+        controller._last_checkpoint_path = str(tmp_path)
+        controller._data_plane_checkpoint_metadata = {
+            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "rollout_recovery_payload_sha256": hashlib.sha256(
+                recovery_path.read_bytes()
+            ).hexdigest(),
+            "rollout_recovery_group_count": 2,
+        }
+        controller._async_cfg = SimpleNamespace(max_buffered_rollouts=4)
+        controller._dataloader = SimpleNamespace(
+            dataset={
+                prompt_idx: {"idx": prompt_idx, "message_log": []}
+                for prompt_idx in (70, 71)
+            }
+        )
+        controller._buffer = SimpleNamespace(
+            metadata_state_dict=lambda *, saved_capacity: {
+                "groups": [{"group_id": f"canonical-{idx}"} for idx in range(3)],
+                "saved_capacity": saved_capacity,
+            }
+        )
+
+        # Three canonical groups plus two unfinished groups exceed capacity four,
+        # but only the canonical groups occupy slots at restore time. Recovery is
+        # launched beside the train pump, which releases capacity as it consumes.
+        await controller._maybe_restore_rollout_recovery(restored_replay_groups=3)
+
+        assert len(rollout_manager.recovery_ledger) == 2
+
+    asyncio.run(exercise())
+
+
+def test_checkpoint_waits_for_replacement_reserve_refill() -> None:
+    """The dataloader-owned batch is visible in the pool after the mutation cut."""
+
+    async def exercise() -> None:
+        controller = _reserve_controller()
+        mutation_applied = asyncio.Event()
+        release_mutation = asyncio.Event()
+        checkpoint_entered = asyncio.Event()
+        batch = BatchedDataDict(
+            {
+                "idx": [20, 21],
+                "message_log": [
+                    [{"role": "user", "content": "prompt 20"}],
+                    [{"role": "user", "content": "prompt 21"}],
+                ],
+                "length": [1, 1],
+                "extra_env_info": [None, None],
+                "loss_multiplier": [1.0, 1.0],
+            }
+        )
+
+        async def refill() -> None:
+            async with controller._data_plane_checkpoint_barrier.mutation():
+                assert controller._divert_batch_to_reserve(batch)
+                mutation_applied.set()
+                await release_mutation.wait()
+
+        async def checkpoint_snapshot() -> list[int]:
+            async with controller._data_plane_checkpoint_barrier.checkpoint():
+                checkpoint_entered.set()
+                return [prompt["idx"] for prompt in controller._replacement_reserve]
+
+        refill_task = asyncio.create_task(refill())
+        await mutation_applied.wait()
+        checkpoint_task = asyncio.create_task(checkpoint_snapshot())
+        await asyncio.sleep(0)
+        assert not checkpoint_entered.is_set()
+
+        release_mutation.set()
+        assert await checkpoint_task == [20, 21]
+        await refill_task
+
+    asyncio.run(exercise())
+
+
+def test_checkpoint_waits_for_replacement_pop_and_reownership() -> None:
+    """A skipped owner becomes its replacement atomically at checkpoint time."""
+
+    async def exercise() -> None:
+        controller = _reserve_controller()
+        manager = controller._rollout_manager
+        old_group_id = manager.reserve_prompt_group(
+            _reserve_prompt(20),
+            target_step=7,
+        )
+        controller._replacement_reserve.append(_reserve_prompt(21))
+        mutation_applied = asyncio.Event()
+        release_mutation = asyncio.Event()
+        checkpoint_entered = asyncio.Event()
+
+        async def replace() -> None:
+            async with controller._data_plane_checkpoint_barrier.mutation():
+                replacement = controller._take_replacement(7, 0)
+                assert replacement is not None
+                manager.discard_prompt_group(old_group_id)
+                manager.reserve_prompt_group(replacement, target_step=7)
+                mutation_applied.set()
+                await release_mutation.wait()
+
+        async def checkpoint_snapshot() -> tuple[list[int], list[str]]:
+            async with controller._data_plane_checkpoint_barrier.checkpoint():
+                checkpoint_entered.set()
+                reserve_ids = [
+                    prompt["idx"] for prompt in controller._replacement_reserve
+                ]
+                ledger_prompt_ids = [
+                    group.prompt_id for group in manager.recovery_ledger.groups()
+                ]
+                return reserve_ids, ledger_prompt_ids
+
+        replace_task = asyncio.create_task(replace())
+        await mutation_applied.wait()
+        checkpoint_task = asyncio.create_task(checkpoint_snapshot())
+        await asyncio.sleep(0)
+        assert not checkpoint_entered.is_set()
+
+        release_mutation.set()
+        reserve_ids, ledger_prompt_ids = await checkpoint_task
+        await replace_task
+
+        assert reserve_ids == []
+        assert ledger_prompt_ids == ["21"]
+
+    asyncio.run(exercise())
+
+
+def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
+    """After pool removal, RESERVED ledger records own the whole batch."""
+
+    async def exercise() -> None:
+        controller = _reserve_controller()
+        controller._replacement_reserve.extend(
+            [_reserve_prompt(20), _reserve_prompt(21)]
+        )
+        admission_started = asyncio.Event()
+        release_admission = asyncio.Event()
+        launched: list[tuple[int, int | None, str | None]] = []
+
+        async def block_admission(
+            group_ids: list[str],
+        ) -> tuple[int, list[str], int]:
+            admission_started.set()
+            await release_admission.wait()
+            for group_id in group_ids:
+                controller._rollout_manager.mark_prompt_group_admitted(
+                    group_id,
+                    target_step=7,
+                )
+            return 7, group_ids, 0
+
+        async def launch(
+            prompt: DatumSpec,
+            target_step: int | None,
+            group_id: str | None,
+        ) -> None:
+            launched.append((prompt["idx"], target_step, group_id))
+
+        controller._admit_reserved_prompt_groups = block_admission
+        drain_task = asyncio.create_task(controller._drain_reserve_into_steps(launch))
+        await admission_started.wait()
+
+        async with controller._data_plane_checkpoint_barrier.checkpoint():
+            assert list(controller._replacement_reserve) == []
+            groups = controller._rollout_manager.recovery_ledger.groups()
+            assert [group.prompt_id for group in groups] == ["20", "21"]
+            assert all(group.phase is PromptGroupPhase.RESERVED for group in groups)
+            assert len({group.admission_id for group in groups}) == 1
+
+        release_admission.set()
+        await drain_task
+        assert {(idx, target_step) for idx, target_step, _ in launched} == {
+            (20, 7),
+            (21, 7),
+        }
+
+    asyncio.run(exercise())
+
+
+def test_recovery_rejects_a_corrupt_ledger_sidecar(tmp_path) -> None:
+    recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
+    recovery_path.write_bytes(b"corrupt checkpoint payload")
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    controller = object.__new__(controller_cls)
+    controller._last_checkpoint_path = str(tmp_path)
+    controller._data_plane_checkpoint_metadata = {
+        "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+        "rollout_recovery_payload_sha256": "0" * 64,
+        "rollout_recovery_group_count": 1,
+    }
+
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        asyncio.run(
+            controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        )
+
+
+def test_recovery_rejects_a_missing_advertised_ledger_sidecar(tmp_path) -> None:
+    """Do not combine an older/missing ledger with the restored trainer step."""
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    controller = object.__new__(controller_cls)
+    controller._last_checkpoint_path = str(tmp_path)
+    controller._data_plane_checkpoint_metadata = {
+        "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+        "rollout_recovery_payload_sha256": "0" * 64,
+        "rollout_recovery_group_count": 1,
+    }
+
+    with pytest.raises(FileNotFoundError, match="sidecar is missing"):
+        asyncio.run(
+            controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        )

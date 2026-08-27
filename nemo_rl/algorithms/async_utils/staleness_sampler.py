@@ -131,6 +131,21 @@ class PromptGroupSampler(Protocol):
         ...
 
 
+@runtime_checkable
+class TransactionalAdmissionSampler(Protocol):
+    """Sampler whose blocking wait is separate from its cursor mutation."""
+
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None:
+        """Wait until one admission can commit without mutating sampler state."""
+        ...
+
+    def commit_admission(self) -> Optional[int]:
+        """Advance the admission cursor and return the batch target-step stamp."""
+        ...
+
+
 class BaseSampler(abc.ABC):
     """Shared machinery for the built-in policies.
 
@@ -311,9 +326,19 @@ class WindowedSampler(BaseSampler):
         )
         return start_weight_version < min_valid_version
 
-    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
-        # Over-sampled: dispatch is bounded by buffer capacity, not by version.
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None:
+        """Return immediately because buffer capacity is this policy's gate."""
+        del trainer_version_fn
+
+    def commit_admission(self) -> Optional[int]:
+        """Return the unstamped admission result without changing a cursor."""
         return None
+
+    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
+        await self.wait_until_admissible(trainer_version_fn=trainer_version_fn)
+        return self.commit_admission()
 
     async def select(
         self,
@@ -378,11 +403,21 @@ class _GatedSampler(BaseSampler):
             gate_window=self._gate_window,
         )
 
-    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None:
+        """Wait for the gate without advancing the durable dispatch cursor."""
         while self._dispatch_index >= trainer_version_fn() + self._gate_window:
             await asyncio.sleep(_GATE_POLL_SECONDS)
+
+    def commit_admission(self) -> Optional[int]:
+        """Advance the cursor after the controller enters its mutation cut."""
         self._dispatch_index += 1
         return self._stamp()
+
+    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
+        await self.wait_until_admissible(trainer_version_fn=trainer_version_fn)
+        return self.commit_admission()
 
     def _stamp(self) -> Optional[int]:
         return None

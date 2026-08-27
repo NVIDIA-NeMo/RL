@@ -91,6 +91,7 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
     ctrl._replacement_reserve = deque()
+    ctrl._rollout_recovery_enabled = False
 
 
 class _RecordingBuffer:

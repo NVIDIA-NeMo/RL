@@ -148,6 +148,14 @@ class FailAfterPutDataPlaneClient(FakeDataPlaneClient):
         raise RuntimeError("injected put failure")
 
 
+class FailAfterPutAndClearDataPlaneClient(FailAfterPutDataPlaneClient):
+    """Fail both the canonical write and its deterministic-ID rollback."""
+
+    def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
+        del sample_ids, partition_id
+        raise OSError("injected rollback failure")
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -333,6 +341,29 @@ class TestTQReplayBufferReserveCommit:
         assert buf.size() == 1
         assert buf.ready_list == [False]
         assert buf.meta_list == [None]
+
+    def test_commit_reports_both_write_and_rollback_failures(self):
+        dp = FailAfterPutAndClearDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=3)
+
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            _run(
+                buf.commit(
+                    group_id,
+                    _make_record(),
+                    start_weight_version=3,
+                    end_weight_version=3,
+                )
+            )
+
+        assert exc_info.value.subgroup(RuntimeError) is not None
+        assert exc_info.value.subgroup(OSError) is not None
+        # The failed rollback leaves uncertain external rows and an unready local
+        # slot. Both failures must remain visible so callers abort instead of retrying
+        # the same stable group ID over potentially orphaned data.
+        assert dp.depth() == _N_GENS
+        assert buf.ready_list == [False]
 
     def test_reserve_appends_placeholder_unready(self):
         dp = FakeDataPlaneClient()

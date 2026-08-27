@@ -35,6 +35,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     ReadyFirstSampler,
     ReadyFirstSamplerConfig,
     SamplerConfig,
+    TransactionalAdmissionSampler,
     WeightFifoSampler,
     WeightFifoSamplerConfig,
     WindowedSampler,
@@ -105,9 +106,19 @@ class TestBuiltinsImplementInterface:
     )
     def test_isinstance_protocol(self, sampler):
         assert isinstance(sampler, PromptGroupSampler)
+        assert isinstance(sampler, TransactionalAdmissionSampler)
 
 
 class TestAdmission:
+    def test_wait_does_not_advance_gated_dispatch_cursor(self):
+        sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+
+        _run(sampler.wait_until_admissible(trainer_version_fn=lambda: 0))
+
+        assert sampler.dispatch_index == -1
+        assert sampler.commit_admission() == 0
+        assert sampler.dispatch_index == 0
+
     def test_windowed_never_gates_and_never_stamps(self):
         s = WindowedSampler(FakeBuffer(), max_staleness_versions=2)
         # trainer stuck at 0, but over-sampled admission returns immediately.

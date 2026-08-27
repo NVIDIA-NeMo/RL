@@ -35,6 +35,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import threading
@@ -79,6 +80,11 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
+from nemo_rl.experience.rollout_recovery import (
+    ROLLOUT_RECOVERY_SCHEMA_VERSION,
+    ROLLOUT_RECOVERY_STATE_FILENAME,
+    RolloutRecoveryLedger,
+)
 from nemo_rl.utils.checkpoint import CheckpointManager
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
@@ -351,6 +357,7 @@ class _FakeRolloutManager:
     def __init__(self) -> None:
         self.weight_versions: list[int] = []
         self._tq_buffer = None
+        self.recovery_ledger = RolloutRecoveryLedger()
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
@@ -1019,12 +1026,19 @@ class TestDataPlaneCheckpoint:
         assert save_call["checkpoint_dir"] == str(
             tmp_path / "checkpoints" / "tmp_step_1" / "data_plane"
         )
-        assert save_call["metadata"] == _data_plane_checkpoint_metadata(
+        expected_metadata = _data_plane_checkpoint_metadata(
             step=1,
             trainer_version=1,
             sampler_name="windowed",
             group_count=1,
         )
+        assert {
+            key: save_call["metadata"][key] for key in expected_metadata
+        } == expected_metadata
+        assert save_call["metadata"]["rollout_recovery_schema_version"] == (
+            ROLLOUT_RECOVERY_SCHEMA_VERSION
+        )
+        assert save_call["metadata"]["rollout_recovery_group_count"] == 0
         step_dir = tmp_path / "checkpoints" / "step_1"
         assert (step_dir / "data_plane" / "metadata.json").is_file()
         assert (
@@ -1032,6 +1046,15 @@ class TestDataPlaneCheckpoint:
             == replay_metadata
         )
         assert not (step_dir / "replay_buffer.pt").exists()
+        recovery_path = step_dir / ROLLOUT_RECOVERY_STATE_FILENAME
+        assert recovery_path.is_file()
+        recovery_state = torch.load(recovery_path, weights_only=False)
+        assert recovery_state["batch_shortfall"] == {}
+        assert recovery_state["sampler_stamps_target_steps"] is False
+        assert (
+            hashlib.sha256(recovery_path.read_bytes()).hexdigest()
+            == (save_call["metadata"]["rollout_recovery_payload_sha256"])
+        )
         assert buffer.metadata_state_dict_calls == [4]
 
     @pytest.mark.parametrize(
@@ -1186,6 +1209,27 @@ class TestDataPlaneCheckpoint:
 
 
 class TestAsyncSaveFinalization:
+    def test_missing_sidecar_before_finalization_falls_back_to_previous_step(
+        self, tmp_path
+    ):
+        """A failed sidecar write leaves tmp_step_N invisible to resume lookup."""
+
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=1)
+        checkpoint_dir = tmp_path / "checkpoints"
+        previous = checkpoint_dir / "step_1"
+        previous.mkdir(parents=True)
+        incomplete = checkpoint_dir / "tmp_step_2"
+        (incomplete / "data_plane").mkdir(parents=True)
+        # Model the cut after native TQ save but before rollout_recovery.pt is
+        # written and begin_finalization renames the bundle.
+        assert not (incomplete / ROLLOUT_RECOVERY_STATE_FILENAME).exists()
+
+        checkpointer = CheckpointManager(mc.checkpointing)
+        try:
+            assert checkpointer.get_latest_checkpoint_path() == str(previous)
+        finally:
+            checkpointer.shutdown()
+
     def test_rename_deferred_until_async_writes_finish(self, tmp_path):
         mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
         trainer = _GatedFinalizeTrainer()

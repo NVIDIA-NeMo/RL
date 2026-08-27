@@ -18,10 +18,8 @@ The six scenarios come from #3827. That PR covered windowed, weight_fifo, and
 in_order; ready_first is included here because it now advertises the same
 completed-buffer recovery capability.
 
-Normal test runs keep the unfinished-group rows as strict xfails so #3480 can
-land without claiming partial-rollout recovery. During development of the
-dispatch ledger, run this file with --runxfail: those rows become the red TDD
-contract and must all pass before the xfail marks are removed.
+Unfinished rows are regenerated as whole prompt groups from the group-level
+ledger. Sibling-level continuation remains outside this recovery foundation.
 """
 
 from __future__ import annotations
@@ -41,34 +39,14 @@ from tests.unit.single_controller._checkpoint_scenarios import (
 )
 
 ALL_CASES = [
-    Case(scenario, sampler)
-    for sampler in SAMPLERS
-    for scenario in ALL_SCENARIOS
+    Case(scenario, sampler) for sampler in SAMPLERS for scenario in ALL_SCENARIOS
 ]
 COMPLETED_CASES = [
-    Case(scenario, sampler)
-    for sampler in SAMPLERS
-    for scenario in FULLY_GENERATED
+    Case(scenario, sampler) for sampler in SAMPLERS for scenario in FULLY_GENERATED
 ]
 UNFINISHED_CASES = [
-    Case(
-        scenario,
-        sampler,
-        "The dataloader has advanced, but metadata_state_dict() omits every "
-        "ready=False reservation. A dispatch ledger and recovery pump must "
-        "redispatch the prompt group after restart.",
-    )
-    for sampler in SAMPLERS
-    for scenario in WITH_IN_FLIGHT
+    Case(scenario, sampler) for sampler in SAMPLERS for scenario in WITH_IN_FLIGHT
 ]
-
-
-def _known_gap(case: Case):
-    return pytest.param(
-        case,
-        id=case.id,
-        marks=pytest.mark.xfail(strict=True, reason=case.why),
-    )
 
 
 @pytest.fixture(autouse=True)
@@ -93,9 +71,9 @@ def test_fully_generated_scenarios_have_no_data_loss(case, tmp_path):
     assert result.recovered == case.scenario.must_survive()
 
 
-@pytest.mark.parametrize("case", [_known_gap(case) for case in UNFINISHED_CASES])
+@pytest.mark.parametrize("case", UNFINISHED_CASES, ids=lambda case: case.id)
 def test_unfinished_groups_are_owned_across_restart(case, tmp_path):
-    """Desired end state: handed-out unfinished groups remain recoverable."""
+    """Handed-out unfinished groups remain recoverable."""
     assert_no_data_loss(case.scenario, case.sampler, tmp_path)
 
 
