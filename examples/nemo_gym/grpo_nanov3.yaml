@@ -322,6 +322,10 @@ env:
     # RL (3000-4999) or vLLM (7000-8999). See ray.sub for the full port layout.
     port_range_low: 5000
     port_range_high: 5999
+    # Opt in to keeping the contiguous prefix when a later turn's token prefix
+    # diverges. The retained prefix uses the episode reward. Incompatible with
+    # policy.router_replay.enabled.
+    truncate_noncontiguous_episodes: false
     # Optional substrings/tags used to flag malformed assistant turns for advantage
     # penalties (see grpo.invalid_tool_call_advantage / malformed_thinking_advantage).
     # Omit to use the built-in defaults (DEFAULT_INVALID_TOOL_CALL_PATTERNS / DEFAULT_THINKING_TAGS).

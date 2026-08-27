@@ -44,6 +44,8 @@ from nemo_rl.environments.nemo_gym import (
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
+    spinup_nemo_gym_actor,
+    split_nemo_gym_runtime_options,
     validate_reward_components_match_scalar,
 )
 from nemo_rl.environments.nemo_gym_multimodal import (
@@ -89,6 +91,34 @@ def test_multimodal_content_types_cover_responses_media_aliases():
         "audio",
         "audio_url",
     } <= MULTIMODAL_CONTENT_TYPES
+
+
+def test_split_nemo_gym_runtime_options_centralizes_defaults():
+    options, gym_global_config = split_nemo_gym_runtime_options(
+        {
+            "num_servers": 2,
+            "invalid_tool_call_patterns": ["<tool>"],
+            "thinking_tags": ["<think>", "</think>"],
+        }
+    )
+
+    assert options.truncate_noncontiguous_episodes is False
+    assert options.invalid_tool_call_patterns == ["<tool>"]
+    assert options.thinking_tags == ["<think>", "</think>"]
+    assert gym_global_config == {"num_servers": 2}
+
+
+def test_spinup_nemo_gym_rejects_truncation_with_router_replay():
+    with pytest.raises(ValueError, match="not compatible with router replay"):
+        spinup_nemo_gym_actor(
+            {"nemo_gym": {"truncate_noncontiguous_episodes": True}},
+            ["http://127.0.0.1:30000/v1"],
+            "test-model",
+            tokenizer=object(),
+            enable_router_replay=True,
+            routed_experts_dtype="int16",
+            use_fastokens=False,
+        )
 
 
 def test_extract_static_video_message_resolves_local_file(tmp_path):
@@ -1092,6 +1122,7 @@ openai_model:
         model_name=nemo_gym_vllm_generation.cfg["model_name"],
         base_urls=nemo_gym_vllm_generation.dp_openai_server_base_urls,
         initial_global_config_dict=safe_load(yaml_str),
+        truncate_noncontiguous_episodes=False,
     )
     env = NemoGym.options(
         runtime_env={
@@ -1229,6 +1260,56 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
+
+
+def _make_noncontiguous_nemo_gym_result():
+    return {
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3],
+                    "generation_log_probs": [-0.1],
+                },
+                {
+                    "prompt_token_ids": [1, 99, 3, 4],
+                    "generation_token_ids": [6],
+                    "generation_log_probs": [-0.2],
+                },
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+
+class _JoinTokenizer:
+    def batch_decode(self, batch):
+        return [" ".join(map(str, token_ids)) for token_ids in batch]
+
+
+def test_nemo_gym_postprocess_noncontiguous_asserts_by_default():
+    class _MockSelf:
+        cfg = {}
+
+    with pytest.raises(AssertionError, match="Non-contiguous messages found"):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), {}, _make_noncontiguous_nemo_gym_result(), _JoinTokenizer()
+        )
+
+
+def test_nemo_gym_postprocess_noncontiguous_truncates_when_enabled():
+    class _MockSelf:
+        cfg = {"truncate_noncontiguous_episodes": True}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), {}, _make_noncontiguous_nemo_gym_result(), _JoinTokenizer()
+        )
+    )
+
+    assert len(result["message_log"]) == 2
+    assert result["message_log"][0]["token_ids"].tolist() == [1, 2]
+    assert result["message_log"][1]["token_ids"].tolist() == [3]
 
 
 @pytest.mark.parametrize("include_initial_multimodal_data", [False, True])
