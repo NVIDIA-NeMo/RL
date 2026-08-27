@@ -72,6 +72,7 @@ from nemo_rl.experience.rollout_manager import (
     RolloutTimeouts,
 )
 from nemo_rl.experience.rollouts import should_mask_flagged_samples
+from nemo_rl.models.generation import resolve_generation_class
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetHealth,
@@ -84,7 +85,6 @@ from nemo_rl.models.generation.generation_router import (
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
 )
-from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -452,48 +452,6 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
         value_config["megatron_cfg"]["train_iters"] = train_iters  # type: ignore[index]
 
 
-def _validate_megatron_generation_config(
-    master_config: MasterConfig, *, use_nemo_gym: bool
-) -> None:
-    """Validate the config for the Megatron generation backend."""
-    policy_config = master_config.policy
-    generation_config = policy_config["generation"]
-    if generation_config["backend"] != "megatron":
-        return
-
-    if not (
-        "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
-    ):
-        raise ValueError(
-            "policy.generation.backend='megatron' requires the Megatron trainer "
-            "(policy.megatron_cfg.enabled=true): refit transfers weights via Megatron's reshard "
-            "collective from the Megatron trainer."
-        )
-
-    mcore_cfg = cast(MCoreGenerationConfig, generation_config)[
-        "mcore_generation_config"
-    ]
-    if use_nemo_gym and not mcore_cfg["expose_http_server"]:
-        raise ValueError(
-            "NeMo Gym usage requires "
-            "policy.generation.mcore_generation_config.expose_http_server=true"
-        )
-
-    # Megatron generation expresses recompute-after-refit engine-side via
-    # `kv_cache_management_mode="recompute"`; the loop-level flag must agree.
-    recompute_kv_cache = master_config.async_rl.recompute_kv_cache_after_weight_updates
-    kv_cache_mode = mcore_cfg["kv_cache_management_mode"]
-    if recompute_kv_cache != (kv_cache_mode == "recompute"):
-        raise ValueError(
-            f"async_rl.recompute_kv_cache_after_weight_updates={recompute_kv_cache} "
-            "conflicts with policy.generation.mcore_generation_config."
-            f"kv_cache_management_mode={kv_cache_mode!r}: with "
-            "policy.generation.backend='megatron' the two must agree. Either set "
-            "the flag to true with kv_cache_management_mode='recompute', or leave "
-            "the flag false with 'persist'/'offload'."
-        )
-
-
 def _maybe_attach_fleet_health(
     generation: Any, master_config: MasterConfig
 ) -> Optional[GenerationFleetHealth]:
@@ -709,8 +667,17 @@ def setup_single_controller(
             "SC NeMo-Gym integration currently supports the vllm and megatron backends only; got "
             f"{generation_config['backend']!r}"
         )
-    # Megatron-generation checks are pure config: run them before the dataset download.
-    _validate_megatron_generation_config(master_config, use_nemo_gym=use_nemo_gym)
+    # Backend settings checks are pure config: run them before anything builds.
+    resolve_generation_class(generation_config).validate_settings(
+        policy_config,
+        use_nemo_gym=use_nemo_gym,
+        recompute_kv_cache_after_weight_updates=(
+            master_config.async_rl.recompute_kv_cache_after_weight_updates
+        ),
+        generation_fleet_health_enabled=(
+            master_config.async_rl.generation_fleet_health.enabled
+        ),
+    )
     if use_nemo_gym:
         # NeMo-Gym creates the env actor outside setup_response_data; we wire
         # it in after generation is up (it needs the OpenAI server URLs).

@@ -392,6 +392,17 @@ class CollectiveSenderSpec:
 class GenerationInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 
+    @classmethod
+    def validate_settings(
+        cls,
+        policy_config: Any,
+        *,
+        use_nemo_gym: bool,
+        recompute_kv_cache_after_weight_updates: bool,
+        generation_fleet_health_enabled: bool,
+    ) -> None:
+        """Backend-specific pure-config validation, run before any build."""
+
     @abstractmethod
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -139,6 +139,49 @@ class MegatronGeneration(GenerationInterface):
         ).remote()
         node_ip, port = ray.get(holder.address.remote())
         return f"http://{node_ip}:{port}/v1", port, holder
+
+    @classmethod
+    def validate_settings(
+        cls,
+        policy_config: PolicyConfig,
+        *,
+        use_nemo_gym: bool,
+        recompute_kv_cache_after_weight_updates: bool,
+        generation_fleet_health_enabled: bool,
+    ) -> None:
+        """Reject config the Megatron generation backend cannot honor."""
+        if not (
+            "megatron_cfg" in policy_config
+            and policy_config["megatron_cfg"]["enabled"]
+        ):
+            raise ValueError(
+                "policy.generation.backend='megatron' requires the Megatron trainer "
+                "(policy.megatron_cfg.enabled=true): refit transfers weights via Megatron reshard "
+                "collective from the Megatron trainer."
+            )
+
+        mcore_cfg = cast(MCoreGenerationConfig, policy_config["generation"])[
+            "mcore_generation_config"
+        ]
+        # Recompute-after-refit is implemented engine-side (kv_cache_management_mode="recompute");
+        # the loop-level flag must agree with that mode, and setup errors on a mismatch.
+        kv_cache_mode = mcore_cfg["kv_cache_management_mode"]
+        if recompute_kv_cache_after_weight_updates != (kv_cache_mode == "recompute"):
+            raise ValueError(
+                "async_rl.recompute_kv_cache_after_weight_updates="
+                f"{recompute_kv_cache_after_weight_updates} conflicts with "
+                "policy.generation.mcore_generation_config."
+                f"kv_cache_management_mode={kv_cache_mode!r}: with "
+                "policy.generation.backend='megatron' the two must agree. Either "
+                "set the flag to true with kv_cache_management_mode='recompute', "
+                "or leave the flag false with 'persist'/'offload'."
+            )
+
+        if generation_fleet_health_enabled:
+            raise NotImplementedError(
+                "async_rl.generation_fleet_health.enabled=true is not supported "
+                f"for the {cls.__name__} generation backend"
+            )
 
     @classmethod
     def verify_served_address(

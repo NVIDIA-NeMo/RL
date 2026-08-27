@@ -247,7 +247,7 @@ class TestSetup:
             ("buffer_capacity", ValueError, "required capacity"),
             ("megatron_dtensor_trainer", ValueError, "megatron_cfg.enabled"),
             ("megatron_recompute_mismatch", ValueError, "kv_cache_management_mode"),
-            ("megatron_gym_without_http_server", ValueError, "expose_http_server"),
+            ("megatron_fleet_health", NotImplementedError, "generation_fleet_health"),
             ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
         ],
     )
@@ -258,7 +258,7 @@ class TestSetup:
         match: str,
         patched_factories,
     ):
-        use_gym = invalid_case in ("megatron_gym_without_http_server", "gym_on_sglang")
+        use_gym = invalid_case == "gym_on_sglang"
         if invalid_case == "min_groups":
             mc = _make_master_config()
             mc.async_rl.min_groups_for_streaming_train = 5
@@ -278,11 +278,11 @@ class TestSetup:
                 colocated=False, backend="megatron", megatron_enabled=True
             )
             mc.async_rl.recompute_kv_cache_after_weight_updates = True
-        elif invalid_case == "megatron_gym_without_http_server":
-            mc = self._make_gym_megatron_config()
-            mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = (
-                False
+        elif invalid_case == "megatron_fleet_health":
+            mc = _make_master_config(
+                colocated=False, backend="megatron", megatron_enabled=True
             )
+            mc.async_rl.generation_fleet_health.enabled = True
         elif invalid_case == "gym_on_sglang":
             mc = _make_master_config(colocated=False, backend="sglang")
         else:  # pragma: no cover
