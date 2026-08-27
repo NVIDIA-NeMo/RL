@@ -1216,21 +1216,53 @@ def ppo_train(
         virtual_process_sort_index=1,
         enabled=trace_enabled,
     )
-    timer = Timer(context={"worker": "driver"}, trace=driver_trace)
-    trace_saved = False
-
-    def _save_sync_trace() -> None:
-        nonlocal trace_saved
-        if trace_saved:
-            return
-        trace_saved = True
-        driver_trace.finalize_open_spans()
+    try:
+        driver_trace.instant("ppo_training_start", args={"mode": "sync"})
+        _ppo_train_impl(
+            policy=policy,
+            policy_generation=policy_generation,
+            value_model=value_model,
+            dataloader=dataloader,
+            val_dataloader=val_dataloader,
+            tokenizer=tokenizer,
+            loss_fn=loss_fn,
+            value_loss_fn=value_loss_fn,
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=logger,
+            checkpointer=checkpointer,
+            ppo_save_state=ppo_save_state,
+            master_config=master_config,
+            driver_trace=driver_trace,
+        )
+    finally:
         try:
+            driver_trace.finalize_open_spans()
             save_trace(driver_trace.events(), output_path=trace_output_path)
         except Exception as error:
             warnings.warn(f"Could not save PPO Perfetto trace: {error}", stacklevel=2)
 
-    driver_trace.instant("ppo_training_start", args={"mode": "sync"})
+
+def _ppo_train_impl(
+    policy: ColocatablePolicyInterface,
+    policy_generation: Optional[GenerationInterface],
+    value_model: ValueInterface,
+    dataloader: StatefulDataLoader,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer: TokenizerType,
+    loss_fn: LossFunction,
+    value_loss_fn: LossFunction,
+    task_to_env: dict[str, EnvironmentInterface],
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    logger: Logger,
+    checkpointer: CheckpointManager,
+    ppo_save_state: PPOSaveState,
+    master_config: MasterConfig,
+    *,
+    driver_trace: Tracer,
+) -> None:
+    """Implement synchronous PPO using the caller-owned trace lifecycle."""
+    timer = Timer(context={"worker": "driver"}, trace=driver_trace)
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -2046,7 +2078,6 @@ def ppo_train(
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
-                _save_sync_trace()
                 return
             if total_steps >= max_num_steps:
                 checkpointer.shutdown()
@@ -2055,7 +2086,6 @@ def ppo_train(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
                 )
-                _save_sync_trace()
                 return
 
         current_epoch += 1
@@ -2067,7 +2097,6 @@ def ppo_train(
     # so without this the daemon finalization thread could be killed before the
     # final tmp_step_N is renamed.
     checkpointer.shutdown()
-    _save_sync_trace()
 
 
 def _async_ppo_generation_lead_steps(
@@ -2145,9 +2174,7 @@ def async_ppo_train(
     trace_enabled, trace_output_path = resolve_trace_config(master_config.logger)
     driver_trace = Tracer(
         "driver",
-        virtual_process_name="ppo_async_driver_events",
         process_sort_index=0,
-        virtual_process_sort_index=1,
         enabled=trace_enabled,
     )
     timer = Timer(context={"worker": "driver"}, trace=driver_trace)
@@ -2203,11 +2230,11 @@ def async_ppo_train(
 
         if not trace_saved:
             trace_saved = True
-            driver_trace.finalize_open_spans()
             trace_actors = (
                 (trajectory_collector,) if trajectory_collector is not None else ()
             )
             try:
+                driver_trace.finalize_open_spans()
                 save_trace(
                     driver_trace.events(),
                     actors=trace_actors,

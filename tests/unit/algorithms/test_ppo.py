@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -33,6 +34,44 @@ from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def test_sync_ppo_writes_trace_when_training_raises(monkeypatch, tmp_path):
+    from nemo_rl.algorithms import ppo
+
+    output_path = tmp_path / "failed_sync_ppo.json"
+    master_config = SimpleNamespace(
+        logger={
+            "log_dir": str(tmp_path),
+            "perfetto": {"enable": True, "name": str(output_path)},
+        }
+    )
+    monkeypatch.setattr(
+        ppo,
+        "_ppo_train_impl",
+        MagicMock(side_effect=RuntimeError("training failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        ppo.ppo_train(
+            policy=MagicMock(),
+            policy_generation=MagicMock(),
+            value_model=MagicMock(),
+            dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            value_loss_fn=MagicMock(),
+            task_to_env={},
+            val_task_to_env=None,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            ppo_save_state=ppo._default_ppo_save_state(),
+            master_config=master_config,
+        )
+
+    events = json.loads(output_path.read_text())
+    assert any(event.get("name") == "ppo_training_start" for event in events)
 
 
 def _make_loss_config(
@@ -931,6 +970,7 @@ def _run_mock_ppo_train(
             "save_period": 100,
             "metric_name": None,
         },
+        logger={"log_dir": "logs"},
         cluster={"num_nodes": 1, "gpus_per_node": 2},
     )
 
@@ -2114,6 +2154,7 @@ def _make_async_ppo_config() -> SimpleNamespace:
         ),
         data={"use_multiple_dataloader": False},
         env={},
+        logger={"log_dir": "logs"},
         checkpointing={"checkpoint_must_save_by": None},
     )
 
