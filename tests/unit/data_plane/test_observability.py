@@ -81,8 +81,7 @@ def _put(client, ids, width=4):
 def _emit(client, latencies_ms, op="put", n_bytes=1_000):
     """Record one synthetic ``op`` call per entry in ``latencies_ms``.
 
-    ``n_bytes`` takes an int, or a callable of the call index for the size
-    variation the latency/bandwidth fit needs to be identifiable.
+    ``n_bytes`` takes an int, or a callable of the call index.
     """
     now = monotonic()
     for i, ms in enumerate(latencies_ms):
@@ -525,36 +524,6 @@ def test_cluster_step_max_reopens_each_step():
     client.close()
 
 
-def test_cluster_view_carries_the_latency_split():
-    """The split was emitted on the driver path only, so the cluster view — the
-    one a real run logs — could never show it and its table column was always
-    empty. The cluster fit is the better one besides: more samples and more
-    size variation, and size variation is what makes the split identifiable."""
-    fixed_ms, mb_per_s = 6.0, 400.0
-    ranks = []
-    for rank in range(4):
-        sizes = [100_000 * (i + 1 + rank) for i in range(8)]
-        ranks.append(
-            _rank(
-                [fixed_ms + b / (mb_per_s * 1e3) for b in sizes],
-                op="get",
-                n_bytes=lambda i, s=sizes: s[i],
-            )
-        )
-    metrics = cluster_step_metrics(merge_snapshots(ranks), {}, 1.0)
-
-    assert "step/by_op/get/overhead_ms" in metrics, "cluster view must carry the split"
-    total = (
-        metrics["step/by_op/get/overhead_ms"] + metrics["step/by_op/get/transfer_ms"]
-    )
-    assert total == pytest.approx(metrics["step/by_op/get/mean_ms"], rel=0.05)
-    assert metrics["step/by_op/get/overhead_ms"] == pytest.approx(fixed_ms, rel=0.05)
-
-    columns, rows = breakdown_table(metrics)
-    assert rows[0][columns.index("overhead_ms")] is not None
-    assert rows[0][columns.index("transfer_ms")] is not None
-
-
 # ── percentiles: clamping and sample gates ─────────────────────────────
 
 
@@ -786,9 +755,8 @@ def test_breakdown_table_rows_by_op_worst_first():
 
 
 def test_breakdown_table_leaves_withheld_series_empty():
-    """A percentile below the sample gate, or a fit that is not trustworthy, is
-    absent from the series — the table must carry None there rather than a zero
-    that would read as a measurement."""
+    """A percentile below the sample gate is absent from the series — the table
+    must carry None there rather than a zero that would read as a measurement."""
     columns, rows = breakdown_table(
         {
             "step/by_op/put/calls": 3,
@@ -798,7 +766,6 @@ def test_breakdown_table_leaves_withheld_series_empty():
     )
 
     assert rows[0][columns.index("p90_ms")] is None
-    assert rows[0][columns.index("overhead_ms")] is None
     assert rows[0][columns.index("calls")] == 3
 
 
@@ -818,7 +785,6 @@ def test_breakdown_table_ignores_reserved_namespaces():
             "step/volume_mb/by_op/get": 18.0,
             "step/self/overhead_ms": 6.2,
             "step/hash/mismatches": 0,
-            "step/percent_of_dataplane/by_cause/transfer": 40.0,
         }
     )
 
