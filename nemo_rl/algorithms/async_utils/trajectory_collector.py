@@ -938,9 +938,10 @@ class AsyncTrajectoryCollector:
     def prepare_for_refit(self) -> None:
         """Pause new generation starts and optionally wait for pending generations.
 
-        Every async backend is asked to pause generation during an in-flight weight
-        update. vLLM preserves in-flight request state with its native keep-mode
-        pause. Backends without pause support warn and retain their existing behavior.
+        Every async backend configured for in-flight weight updates, except managed
+        Dynamo, is asked to pause generation. vLLM preserves in-flight request state
+        with its native keep-mode pause. Backends without pause support warn and
+        retain their existing behavior. Managed Dynamo drains active trajectories.
 
         For non-async engines, waits for all pending generations to complete before refit.
         """
@@ -1031,10 +1032,7 @@ class AsyncTrajectoryCollector:
                     )
             except Exception as e:
                 print(f"⚠️ Failed to invalidate generation backend KV caches: {e}")
-                if (
-                    "generation" in self.master_config.policy
-                    and self.master_config.policy["generation"]["backend"] == "dynamo"
-                ):
+                if self.master_config.policy["generation"]["backend"] == "dynamo":
                     raise RuntimeError(
                         "Managed Dynamo KV cache invalidation failed after refit"
                     ) from e

@@ -61,7 +61,10 @@ from nemo_rl.experience.interfaces import (
     PENDING_PROMPTS_KEY,
     RETAINED_TASK_INDICES_KEY,
 )
-from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.interfaces import (
+    GenerationInterface,
+    _warn_unsupported_in_flight_refit_pause_once,
+)
 
 
 @ray.remote(num_cpus=0)
@@ -2189,6 +2192,10 @@ class TestAsyncTrajectoryCollector:
             policy={
                 "max_total_sequence_length": 512,
                 "make_sequence_length_divisible_by": 1,
+                "generation": {
+                    "backend": "vllm",
+                    "vllm_cfg": {"async_engine": False},
+                },
             },
             env={"should_use_nemo_gym": False},
             logger={
@@ -2466,6 +2473,7 @@ class TestAsyncTrajectoryCollector:
     def test_non_vllm_async_backend_uses_pause_contract_and_legacy_fallback(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        _warn_unsupported_in_flight_refit_pause_once.cache_clear()
         collector = self.create_local_collector()
         collector.master_config.policy["generation"] = {"backend": "megatron"}
         async_cfg = collector.master_config.grpo.async_grpo
@@ -2486,8 +2494,8 @@ class TestAsyncTrajectoryCollector:
         assert collector.policy_generation.resume_generation_calls == 1
         assert collector._refit_pause_cleared.is_set()
         output = capsys.readouterr().out
-        assert "does not support pausing generation" in output
-        assert "does not support resuming generation" in output
+        assert output.count("has no native generation pause/resume support") == 1
+        _warn_unsupported_in_flight_refit_pause_once.cache_clear()
 
     def test_resume_failure_after_successful_pause_keeps_collection_paused(
         self,
