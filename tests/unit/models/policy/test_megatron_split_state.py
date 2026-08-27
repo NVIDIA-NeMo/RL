@@ -41,11 +41,14 @@ The bugs these catch:
   - ``prepare_for_lp_inference`` offloading grad buffers mid-step, which frees
     (not copies) every earlier chunk's gradients while the 1/N normalizer still
     counts them.
+  - MTP masks, auxiliary-gradient scaling, grad norms, and tracker metrics being
+    present only in the synchronous Megatron path.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -85,6 +88,11 @@ def _make_mock_model():
     # hook need to be able to clear it to a real None.
     model.config.finalize_model_grads_func = MagicMock(name="ORIGINAL_FINALIZE")
     model.config.num_moe_experts = None  # disable MoE branch
+    model.config.mtp_num_layers = None  # disable MTP unless a test opts in
+    model.config.mtp_grad_scale_func = None
+    # Prevent MagicMock's dynamic attributes from making _get_model_config
+    # mistake this bare model for a Float16Module wrapper.
+    model.module = None
     # no_sync() is a context manager — return a MagicMock that supports
     # __enter__/__exit__ so the `with self.model.no_sync():` block works.
     model.no_sync = MagicMock(
@@ -115,6 +123,7 @@ def _make_worker(loss_type):
     w.optimizer = MagicMock()
     # MegatronOptimizer.step returns (success, grad_norm, num_zeros)
     w.optimizer.step.return_value = (True, 0.5, 0)
+    w.optimizer.grad_norms_by_group = {}
     w.optimizer.param_groups = [{"lr": 1e-4, "weight_decay": 0.01}]
     w.scheduler = MagicMock()
     w.scheduler.get_lr.return_value = 1e-4
@@ -315,6 +324,14 @@ class TestBegin:
         assert w._train_step_state["gbs"] == w.cfg["train_global_batch_size"]
         assert w._train_step_state["mbs"] == w.cfg["train_micro_batch_size"]
 
+    def test_records_mtp_enabled_from_model_config(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        assert w._train_step_state["mtp_enabled"] is True
+
 
 # ── _assert_step_open ────────────────────────────────────────────────────
 
@@ -426,6 +443,31 @@ class TestTrainMicrobatch:
         w.train_microbatch(_fake_batch())
         w.train_microbatch(_fake_batch())
         w.optimizer.step.assert_not_called()
+
+    def test_builds_mtp_mask_and_sets_raw_gradient_scale(self, mock_module_symbols):
+        """MTP follows the split path's raw-sum-then-finish-normalize contract."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        batch = _fake_batch()
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(batch)
+
+        expected_mask = batch["token_mask"] * batch["sample_mask"].unsqueeze(-1)
+        torch.testing.assert_close(batch["mtp_loss_mask"], expected_mask)
+        mtp_scale = w.model.config.mtp_grad_scale_func()
+        assert float(mtp_scale.item()) == pytest.approx(1.0)
+
+    def test_skips_mtp_mask_and_scale_when_disabled(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        batch = _fake_batch()
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(batch)
+        assert "mtp_loss_mask" not in batch
+        assert w.model.config.mtp_grad_scale_func is None
 
 
 # ── finish_train_step ────────────────────────────────────────────────────
@@ -624,6 +666,37 @@ class TestFinish:
         kwargs = mock_module_symbols["moe"].call_args.kwargs
         assert kwargs["loss_scale"] == pytest.approx(1.0 / 6.0, rel=1e-6)
 
+    def test_collects_mtp_metrics_and_reduced_grad_norm(self, mock_module_symbols):
+        """Finish surfaces the same post-#3194 MTP payload as sync train()."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        w.optimizer.grad_norms_by_group = {"mtp": 1.25}
+
+        def _collect(
+            metrics: dict[str, Any],
+            total_num_microbatches: int,
+            mtp_grad_norm: float | None,
+        ) -> None:
+            assert total_num_microbatches == 2
+            metrics["mtp_metrics"] = {
+                "mtp_1_loss": 0.5,
+                "grad_norm": mtp_grad_norm,
+            }
+
+        w._collect_mtp_metrics = MagicMock(side_effect=_collect)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        metrics = w.finish_train_step()
+
+        args = w._collect_mtp_metrics.call_args.args
+        assert args[1] == 2  # fixture: two pipeline microbatches per chunk
+        assert args[2] == pytest.approx(1.25)
+        assert metrics["mtp_metrics"]["mtp_1_loss"] == pytest.approx(0.5)
+        assert metrics["mtp_metrics"]["grad_norm"] == pytest.approx(1.25)
+        assert w.model.config.mtp_grad_scale_func is None
+
     def test_loss_advertised_normalizers_applied(self, mock_module_symbols):
         """finish scales each metric by the denominator the loss advertised:
         TOKENS → 1/global_valid_toks, SEQUENCES → 1/global_valid_seqs,
@@ -774,6 +847,17 @@ class TestAbort:
         w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w._train_step_state is not None
         assert float(w._train_step_state["local_valid_seqs"].item()) == 0.0
+
+    def test_clears_mtp_gradient_scale(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 1
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        assert w.model.config.mtp_grad_scale_func is not None
+        w.abort_train_step()
+        assert w.model.config.mtp_grad_scale_func is None
 
 
 # ── grad_sync_func full lifecycle (integration of begin → finish/abort) ─
