@@ -116,14 +116,19 @@ def create_local_venv(
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
     #
     # Serialized per node: two builders (NemoGym + vLLM worker venvs) run
-    # concurrently on every node and race on the node-local uv cache. The
-    # loser reads a half-written nemo-rl metadata entry and fails with
-    # spurious "extra `vllm` is not defined" / stale-lock errors; the
-    # poisoned entry then makes plain retries fail deterministically
-    # (jobs 6581921/6583062/6584210 — a different node each run, while the
-    # same command passes 3/3 serially on a probe node). The flock makes
-    # the builds sequential; the `uv cache clean nemo-rl` before each retry
-    # repairs an already-poisoned entry.
+    # concurrently on every node and race on the uv cache. The loser reads
+    # a half-written nemo-rl metadata entry and fails with spurious
+    # "extra `vllm` is not defined" / stale-lock errors (jobs
+    # 6581921/6583062/6584210 — a different node each run, while the same
+    # command passes 3/3 serially on a probe node). The flock makes the
+    # two builds on a node sequential.
+    #
+    # Do NOT `uv cache clean` here on failure: with UV_CACHE_DIR on a
+    # shared filesystem the clean takes an exclusive lock on the whole
+    # cache (1800s stalls cluster-wide in job 6586163) and deletes entries
+    # other nodes are concurrently reading, re-poisoning the cache every
+    # retry. The cache must instead be warmed serially (single probe node)
+    # before a multi-node run whenever uv.lock changes.
     node_build_lock = os.path.join(NEMO_RL_VENV_DIR, ".uv_node_build.lock")
     with open(node_build_lock, "a") as lock_handle:
         fcntl.flock(lock_handle, fcntl.LOCK_EX)
@@ -139,9 +144,6 @@ def create_local_venv(
             except subprocess.CalledProcessError:
                 if attempt == 2:
                     raise
-                subprocess.run(
-                    ["uv", "cache", "clean", "nemo-rl"], env=env, check=False
-                )
                 time.sleep(15 * (attempt + 1))
 
     # Return the path to the python executable in the virtual environment
