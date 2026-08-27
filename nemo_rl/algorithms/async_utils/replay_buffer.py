@@ -19,7 +19,7 @@ import threading as _threading
 import uuid
 from collections import Counter
 from collections.abc import Mapping
-from typing import Any, Iterable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Optional
 
 import ray
 import torch
@@ -35,6 +35,10 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 from nemo_rl.utils.r3_trace import trace_rollout_payload
+
+
+class PostWriteEnrichmentError(RuntimeError):
+    """A rollout reached TQ but failed in required post-write processing."""
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -774,6 +778,16 @@ class TQReplayBuffer:
         self.target_step_list: list[Optional[int]] = []
         self.ready_list: list[bool] = []
         self._group_ids: list[str] = []
+        self._post_write_enricher: Optional[
+            Callable[[KVBatchMeta, PromptGroupRecord], Awaitable[KVBatchMeta]]
+        ] = None
+
+    def set_post_write_enricher(
+        self,
+        enricher: Callable[[KVBatchMeta, PromptGroupRecord], Awaitable[KVBatchMeta]],
+    ) -> None:
+        """Install the required enrichment stage run before slots become ready."""
+        self._post_write_enricher = enricher
 
     def reserve(
         self,
@@ -863,6 +877,14 @@ class TQReplayBuffer:
                 sequence_lengths=[int(s) for s in lengths.tolist()],
                 tags=[dict(t) for t in tags],
             )
+
+            if self._post_write_enricher is not None:
+                try:
+                    meta = await self._post_write_enricher(meta, record)
+                except Exception as error:
+                    raise PostWriteEnrichmentError(
+                        f"post-write enrichment failed for group_id={group_id!r}"
+                    ) from error
 
             idx = self._group_ids.index(group_id)
             self.meta_list[idx] = meta

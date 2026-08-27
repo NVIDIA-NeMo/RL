@@ -35,13 +35,14 @@ run_test() {
 }
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
+run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
 # Full mode only (~10 min): SIGKILLs a generation worker and asserts the job fails fast
 # and attributably instead of wedging. This is the ONLY end-to-end check of the
 # containment behaviour -- without it, a regression that restores the silent wedge is
 # caught by nothing, because a wedged job produces no exception and no failing assertion
 # anywhere else.
-run_test uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
 # Full mode only: the same Gym run, but with NeMo-Gym pointed at the NeMo-RL-owned router.
 # Without this the router has no functional coverage at all -- the default Gym run above
 # leaves it disabled, so a regression in the proxy would ship silently.
@@ -49,7 +50,7 @@ run_test uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chao
 # gen_kl_error is the assertion that earns its keep here: it compares vLLM's logprobs
 # against the trainer's recomputation, so a proxy that corrupts or truncates a response
 # blows it up. A run that merely completes would not prove the payload survived the hop.
-run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh \
+run_test      uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh \
     ++async_rl.generation_router.enabled=true \
     ++async_rl.generation_fleet_health.enabled=true
 
@@ -77,7 +78,7 @@ if (( _SC_GPUS < 3 )); then
     echo "::warning title=SingleController recovery tests skipped::Shard-death recovery and router failover need >= 3 GPUs; this runner has ${_SC_GPUS}. Those tests self-skipped and this lane proves nothing about them."
 fi
 
-run_test uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
 
 # ...and now the other half, which only this part of the stack can satisfy. Same kill,
 # but the run must CONTINUE: reconcile_communicator rebuilds the refit group over the
@@ -87,7 +88,7 @@ run_test uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
 #
 # The Gym-path counterpart of grpo_sc_generation_shard_recovery.sh, which covers the same
 # recovery on the native path.
-run_test env EXPECT=survival uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
+run_test      env EXPECT=survival uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
 # Full mode only: kills a generation shard and asserts the run carries on. Needs >= 3
 # GPUs so that losing a shard still leaves a fleet, and self-skips below that rather
 # than passing vacuously.
@@ -96,16 +97,16 @@ run_test env EXPECT=survival uv run --no-sync bash ./tests/functional/grpo_sc_gy
 # bounded FAILURE on a fleet with nothing to fall back to, this one asserts SURVIVAL when
 # a shard remains. Opposite behaviours, and a regression in either is invisible to the
 # other.
-run_test uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 # Same scenario on the reshard transport, which recovers by a different route: it also
 # rebuilds its per-PP-stage bulk groups and regenerates the refit plan. Only this path
 # has to keep a plan and a communicator agreeing about the fleet size.
-run_test env REFIT_TRANSPORT=nccl_reshard uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
+run_test      env REFIT_TRANSPORT=nccl_reshard uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 # The same scenario with the kill placed INSIDE the refit collective rather than at a step
 # boundary. That window is only ~10% of wall-clock, so the default variant reaches it by
 # chance -- it both passed and wedged on consecutive runs of identical code. This is the
 # only test that reliably exercises the abort-and-rebuild path.
-run_test env KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
+run_test      env KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 # ...and the same mid-refit kill on the RESHARD transport, which is a different abort.
 #
 # The two are not interchangeable. The collective path aborts one communicator; reshard
@@ -118,7 +119,7 @@ run_test env KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functional/grp
 # within milliseconds, so this recovers off the actor-death path and the deadline is never
 # reached -- job 6405953 passed it with RefitAborted appearing zero times. Only the frozen
 # reshard variant below makes a reshard refit actually abort.
-run_test env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
+run_test      env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 
 # The only variant that reaches the refit watchdog. The two above kill the victim, and a
 # killed actor produces ActorDiedError within milliseconds -- which recovers the run off
@@ -136,7 +137,7 @@ run_test env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true uv run --no-syn
 # gain being pinned is that the run ends attributably in seconds rather than wedging in
 # NCCL forever; actor-death-and-recover is what the two killed variants above cover, which
 # is a different route -- they never reach the deadline at all.
-run_test env KILL_DURING_REFIT=true FREEZE_VICTIM=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
+run_test      env KILL_DURING_REFIT=true FREEZE_VICTIM=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 
 # The reshard counterpart, and the fourth corner of {collective, nccl_reshard} x {kill,
 # freeze}. The other three were registered; this one was not, and it is the only one that
@@ -156,7 +157,7 @@ run_test env KILL_DURING_REFIT=true FREEZE_VICTIM=true uv run --no-sync bash ./t
 # measured both halves of that: the trainers wedge in init_nccl_communicator behind their own
 # half-aborted communicator, and killing the frozen victim first changes nothing, because the
 # orphaned work is local. See design_vllm_fault_tolerance.md section 8.5.7.
-run_test env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true FREEZE_VICTIM=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
+run_test      env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true FREEZE_VICTIM=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 
 # grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout
 # rather than between calls. Registered because pinning the victim state -- which is what
@@ -167,10 +168,10 @@ run_test env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true FREEZE_VICTIM=t
 # either is invisible to the other.
 #
 # Cheap to add: the serving path fails in seconds, so this is dominated by startup.
-run_test env VICTIM_STATE=serving uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
+run_test      env VICTIM_STATE=serving uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
 
 # Checkpoint save/restore (upstream #3429).
-run_test uv run --no-sync bash ./tests/functional/grpo_checkpoint_single_controller.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_checkpoint_single_controller.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

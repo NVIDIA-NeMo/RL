@@ -34,32 +34,41 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
-    _create_advantage_estimator,
     _get_effort_config,
     _get_grpo_save_state,
 )
-from nemo_rl.algorithms.grpo import MasterConfig as GrpoMasterConfig
+from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import MseValueLossFn
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
     print_setup_timing_summary,
 )
+from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
+    algo_config,
+    is_ppo_run,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
+from nemo_rl.data_plane.schema import (
+    SC_ROLLOUT_SCHEMA_FIELDS,
+    fields_with_optional_routed_experts,
+)
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     _get_free_port_local,
     _get_node_ip_local,
+    prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
@@ -90,6 +99,7 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
@@ -125,33 +135,103 @@ class SingleControllerActorArgs:
     # serving backend set to it. Parameterized with the Impl class because the decorated
     # GenerationRouterActor name is an ActorClass instance, not a type.
     generation_router: Optional[ray.actor.ActorHandle[GenerationRouterImpl]] = None
+    # Populated only for text MOPD. Aliases may outnumber worker groups when
+    # multiple agents share one deduplicated teacher checkpoint.
+    teacher_worker_groups: Optional[dict[str, Any]] = None
+    alias_to_group_alias: Optional[dict[str, str]] = None
+    # None on a GRPO run. Both are set together on the PPO path: the critic and
+    # the MSE loss it trains under.
+    value_handle: Optional[TQValue] = None
+    value_loss_fn: Optional[LossFunction] = None
+
+
+def _non_colocated_teacher_node_count(master_config: MasterConfig) -> int:
+    """Validate teacher GPU geometry and return its deduplicated node count."""
+    if not opd_module.is_non_colocated_teachers_enabled(master_config):
+        return 0
+
+    # Lazy to preserve teacher_worker_group's existing import cycle boundary:
+    # that module imports the OPD config schemas.
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    teacher_configs = create_teacher_configs_from_opd_config(
+        opd_module._opd_cfg(master_config)
+    )
+    cluster_gpus_per_node = master_config.cluster["gpus_per_node"]
+    for teacher_config in teacher_configs:
+        if teacher_config.gpus_per_node > cluster_gpus_per_node:
+            raise ValueError(
+                f"OPD teacher {teacher_config.alias!r} requests "
+                f"gpus_per_node={teacher_config.gpus_per_node}, which exceeds "
+                f"cluster.gpus_per_node={cluster_gpus_per_node}."
+            )
+    return sum(config.num_nodes for config in teacher_configs)
 
 
 def _build_clusters(
     master_config: MasterConfig,
-) -> tuple[RayVirtualCluster, RayVirtualCluster]:
-    """Allocate train + inference clusters; one shared cluster when colocated."""
+) -> tuple[
+    RayVirtualCluster,
+    RayVirtualCluster,
+    Optional[dict[str, tuple[str, int]]],
+]:
+    """Allocate student clusters while leaving validated nodes for teachers.
+
+    The colocated branch is unreachable on a real run -- validation rejects
+    colocated.enabled=true -- and is kept for when SC can support that mode.
+    """
     cluster_config = master_config.cluster
     generation_config = master_config.policy["generation"]
     colocated = generation_config["colocated"]["enabled"]
     backend = generation_config["backend"]
     num_nodes = cluster_config["num_nodes"]
     gpus_per_node = cluster_config["gpus_per_node"]
+    segment_size = cluster_config.get("segment_size")
     port_range_low = cluster_config.get("master_port_range_low")
     port_range_high = cluster_config.get("master_port_range_high")
+    teacher_nodes = _non_colocated_teacher_node_count(master_config)
+    policy_nodes = num_nodes - teacher_nodes
+    if policy_nodes <= 0:
+        raise ValueError(
+            "cluster.num_nodes must leave at least one node for the student after "
+            f"reserving {teacher_nodes} non-colocated teacher node(s); got "
+            f"cluster.num_nodes={num_nodes}."
+        )
+
+    # Worker groups sharing the training GPUs: the policy, plus the critic on
+    # the PPO path.
+    train_worker_groups = 2 if is_ppo_run(master_config) else 1
 
     if colocated:
-        # Policy + generation share GPUs — one cluster.
+        # Policy (+ critic) + generation share GPUs — one cluster.
+        node_constraints, remaining_ids, topology = prepare_segment_topology(
+            segment_size,
+            policy_nodes,
+            role="policy",
+        )
+        teacher_topology = (
+            {node_id: topology[node_id] for node_id in remaining_ids}
+            if segment_size is not None
+            else None
+        )
         cluster = RayVirtualCluster(
             name="sc_policy_cluster",
-            bundle_ct_per_node_list=[gpus_per_node] * num_nodes,
+            bundle_ct_per_node_list=[gpus_per_node] * policy_nodes,
             use_gpus=True,
             num_gpus_per_node=gpus_per_node,
-            max_colocated_worker_groups=1 if backend == "megatron" else 2,
+            max_colocated_worker_groups=(
+                train_worker_groups
+                if backend == "megatron"
+                else train_worker_groups + 1
+            ),
             port_range_low=port_range_low,
             port_range_high=port_range_high,
+            segment_size=segment_size,
+            node_resource_constraints=node_constraints,
         )
-        return cluster, cluster
+        return cluster, cluster, teacher_topology
 
     # Non-colocated: split node into train + inference clusters.
     assert backend != "megatron", (
@@ -166,7 +246,7 @@ def _build_clusters(
             "policy.generation.colocated.resources.gpus_per_node."
         )
     inference_nodes = inference_resources["num_nodes"] or 1
-    if num_nodes == 1:
+    if policy_nodes == 1:
         train_gpus_per_node = gpus_per_node - inference_gpus_per_node
         train_nodes = 1
         assert train_gpus_per_node > 0, (
@@ -174,19 +254,91 @@ def _build_clusters(
         )
     else:
         train_gpus_per_node = gpus_per_node
-        train_nodes = num_nodes - inference_nodes
+        train_nodes = policy_nodes - inference_nodes
         assert train_nodes > 0, (
-            f"train_nodes must be > 0: {num_nodes} - {inference_nodes} = {train_nodes}"
+            f"train_nodes must be > 0: {policy_nodes} - {inference_nodes} = {train_nodes}"
         )
+
+    train_constraints = None
+    inference_constraints = None
+    train_segment_size = None
+    inference_segment_size = None
+    teacher_topology = None
+    if segment_size is not None:
+        if policy_nodes == 1:
+            # Train and inference intentionally split one physical node by GPU.
+            shared_constraints, remaining_ids, topology = prepare_segment_topology(
+                segment_size,
+                1,
+                role="student",
+            )
+            train_constraints = shared_constraints
+            inference_constraints = shared_constraints
+            train_segment_size = segment_size
+            inference_segment_size = segment_size
+            teacher_topology = {node_id: topology[node_id] for node_id in remaining_ids}
+        else:
+            train_constraints, remaining_ids, topology = prepare_segment_topology(
+                segment_size,
+                train_nodes,
+                role="training",
+            )
+            train_segment_size = segment_size
+            remaining_topology = {
+                node_id: topology[node_id] for node_id in remaining_ids
+            }
+            generation_config_dict = cast(dict[str, Any], generation_config)
+            if backend == "vllm":
+                vllm_cfg = generation_config_dict["vllm_cfg"]
+                gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
+                    "pipeline_parallel_size", 1
+                )
+            elif backend == "sglang":
+                gpus_per_instance = generation_config_dict["sglang_cfg"].get(
+                    "gpus_per_server", 1
+                )
+            else:
+                raise ValueError(
+                    "single_controller_utils.setup only supports vllm or sglang "
+                    f"generation; got {backend!r}"
+                )
+            nodes_per_instance = (
+                gpus_per_instance + inference_gpus_per_node - 1
+            ) // inference_gpus_per_node
+            if inference_nodes % nodes_per_instance == 0:
+                inference_segment_size = nodes_per_instance
+                (
+                    inference_constraints,
+                    inference_remaining_ids,
+                    _,
+                ) = prepare_segment_topology(
+                    inference_segment_size,
+                    inference_nodes,
+                    topology=remaining_topology,
+                    role="inference",
+                )
+                teacher_topology = {
+                    node_id: topology[node_id] for node_id in inference_remaining_ids
+                }
+            else:
+                print(
+                    f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
+                    f"nodes_per_instance={nodes_per_instance}; skipping inference "
+                    "topology constraints",
+                    flush=True,
+                )
+                teacher_topology = remaining_topology
 
     train_cluster = RayVirtualCluster(
         name="sc_train_cluster",
         bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
         use_gpus=True,
         num_gpus_per_node=train_gpus_per_node,
-        max_colocated_worker_groups=1,
+        max_colocated_worker_groups=train_worker_groups,
         port_range_low=port_range_low,
         port_range_high=port_range_high,
+        segment_size=train_segment_size,
+        node_resource_constraints=train_constraints,
     )
     inference_cluster = RayVirtualCluster(
         name="sc_inference_cluster",
@@ -196,8 +348,10 @@ def _build_clusters(
         max_colocated_worker_groups=1,
         port_range_low=port_range_low,
         port_range_high=port_range_high,
+        segment_size=inference_segment_size,
+        node_resource_constraints=inference_constraints,
     )
-    return train_cluster, inference_cluster
+    return train_cluster, inference_cluster, teacher_topology
 
 
 def _build_generation(
@@ -312,6 +466,40 @@ def _build_trainer(
     return trainer, time.perf_counter() - t0
 
 
+def _build_value(
+    train_cluster: RayVirtualCluster,
+    master_config: MasterConfig,
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    weights_path: Optional[Path],
+    optimizer_path: Optional[Path],
+) -> tuple[TQValue, float]:
+    """Build the TQ-mediated PPO critic (driver-side TQValue).
+
+    Args:
+        train_cluster: Ray virtual cluster the critic shares with the trainer.
+        master_config: SC MasterConfig.
+        tokenizer: Tokenizer used by the value model.
+        weights_path: Checkpointed value weights to resume from, or None.
+        optimizer_path: Checkpointed value optimizer state to resume from, or None.
+
+    Returns:
+        A tuple of (TQValue critic, wall time spent in this call).
+    """
+    t0 = time.perf_counter()
+    value = TQValue(
+        cluster=train_cluster,
+        config=master_config.value,
+        tokenizer=tokenizer,
+        name_prefix="lm_value",
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
+        init_optimizer=True,
+        dp_cfg=master_config.data_plane,
+    )
+    return value, time.perf_counter() - t0
+
+
 def _spinup_gym(
     master_config: MasterConfig,
     base_urls: list[str],
@@ -369,24 +557,37 @@ def _generation_max_seq_len(generation_config) -> int:
 def _clamp_max_num_steps(
     master_config: MasterConfig, dataloader: StatefulDataLoader
 ) -> None:
-    """Clamp grpo.max_num_steps to max_num_epochs * len(dataloader)."""
-    grpo_config = master_config.grpo
-    max_num_epochs = grpo_config.max_num_epochs
-    if max_num_epochs is None:
+    """Clamp max_num_steps to max_num_epochs * len(dataloader)."""
+    algo_cfg = algo_config(master_config)
+    max_num_epochs = algo_cfg.max_num_epochs
+    if max_num_epochs is None or max_num_epochs <= 0:
         return
-    grpo_config.max_num_steps = min(
-        grpo_config.max_num_steps,
+    algo_cfg.max_num_steps = min(
+        algo_cfg.max_num_steps,
         max_num_epochs * len(dataloader),
     )
 
 
 def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     """Set train_iters from max_num_steps after its dataloader clamp."""
+    algo_cfg = algo_config(master_config)
+    is_ppo = is_ppo_run(master_config)
+    # train_iters is a scheduler-tick budget, and each PPO epoch steps both
+    # optimizers once, so the configured warmup/decay horizon has to be scaled.
+    ppo_epochs = algo_cfg.ppo_epochs if is_ppo else 1
+    train_iters = algo_cfg.max_num_steps * ppo_epochs
+
+    # policy
     policy_config = master_config.policy
-    if not policy_config.get("megatron_cfg", {}).get("enabled", False):
+    if policy_config.get("megatron_cfg", {}).get("enabled", False):
+        policy_config["megatron_cfg"]["train_iters"] = train_iters
+
+    # value
+    if not is_ppo:
         return
-    grpo_config = master_config.grpo
-    policy_config["megatron_cfg"]["train_iters"] = grpo_config.max_num_steps
+    value_config = master_config.value
+    if value_config.get("megatron_cfg", {}).get("enabled", False):
+        value_config["megatron_cfg"]["train_iters"] = train_iters  # type: ignore[index]
 
 
 def _maybe_attach_fleet_health(
@@ -489,6 +690,20 @@ def _maybe_start_generation_router(generation: Any, master_config: MasterConfig)
     return router
 
 
+def _build_advantage_estimator(master_config: MasterConfig) -> Any:
+    """Build the advantage estimator from whichever algorithm's factory applies."""
+    if is_ppo_run(master_config):
+        # TODO(#2625): raw_reward passes this factory but yields no returns, so
+        # the critic train would then fetch a column nobody wrote.
+        from nemo_rl.algorithms.ppo import _create_advantage_estimator
+
+        return _create_advantage_estimator(cast(PPOMasterConfig, master_config))
+    else:
+        from nemo_rl.algorithms.grpo import _create_advantage_estimator
+
+        return _create_advantage_estimator(cast(GRPOMasterConfig, master_config))
+
+
 def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
     """Translate ``async_rl.rollout_failure`` into the rollout layer's policy object."""
     failure_config = master_config.async_rl.rollout_failure
@@ -525,7 +740,7 @@ def setup_single_controller(
     validate_single_controller_config(master_config)
 
     # short names for config sections
-    grpo_config = master_config.grpo
+    algo_cfg = algo_config(master_config)
     dp_config = master_config.data_plane
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
@@ -549,10 +764,10 @@ def setup_single_controller(
 
         check_nccl_reshard_refit_support(master_config)
 
-    if grpo_config.val_period > 0 or grpo_config.val_at_start or grpo_config.val_at_end:
+    if algo_cfg.val_period > 0 or algo_cfg.val_at_start or algo_cfg.val_at_end:
         raise NotImplementedError(
             "SingleController doesn't support validation now, will support "
-            "later. Set grpo.val_period=0, val_at_start=false, val_at_end=false."
+            "later. Set val_period=0, val_at_start=false, val_at_end=false."
         )
     if dp_config is None or not dp_config.get("enabled", False):
         raise ValueError(
@@ -570,12 +785,17 @@ def setup_single_controller(
             "single_controller_utils does not support "
             "data.use_multiple_dataloader=True yet."
         )
+    if opd_module.is_opd_enabled(master_config) and processor is not None:
+        raise NotImplementedError(
+            "SingleController MOPD currently supports text-only teacher inputs. "
+            "Use the legacy controller for multimodal MOPD."
+        )
 
     checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
-    set_seed(grpo_config.seed)
+    set_seed(algo_cfg.seed)
 
     # ==========================
     # Checkpointing
@@ -587,6 +807,10 @@ def setup_single_controller(
     )
     save_state = _get_grpo_save_state(loaded_state)
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
+        last_checkpoint_path,
+        model_component="value",
+    )
 
     # ==========================
     # Setup Dataset & Environments
@@ -613,7 +837,7 @@ def setup_single_controller(
         dataset, _val_dataset, env_handles, _val_env_handles = response_data
     dataloader = StatefulDataLoader(
         dataset,
-        batch_size=grpo_config.num_prompts_per_step,
+        batch_size=algo_cfg.num_prompts_per_step,
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
@@ -633,8 +857,29 @@ def setup_single_controller(
     setup_timing_metrics = SetupTimingMetrics()
 
     # Create clusters
-    train_cluster, inference_cluster = _build_clusters(master_config)
+    train_cluster, inference_cluster, teacher_segment_topology = _build_clusters(
+        master_config
+    )
     colocated = generation_config["colocated"]["enabled"]
+    segment_size = getattr(master_config, "cluster", {}).get("segment_size")
+
+    # Claim constrained training nodes before unconstrained inference or Gym
+    # tasks can consume them. This matters when inference topology alignment
+    # falls back while the training cluster remains topology-constrained.
+    if not colocated and segment_size is not None:
+        train_cluster.get_placement_groups()
+
+    # Claim teacher placement groups before deferred generation starts NeMo-Gym,
+    # whose resource servers may otherwise opportunistically consume those GPUs.
+    teacher_clusters: dict[str, RayVirtualCluster] = {}
+    if opd_module.is_non_colocated_teachers_enabled(master_config):
+        t0 = time.perf_counter()
+        teacher_clusters = opd_module.reserve_teacher_clusters(
+            master_config,
+            segment_size=segment_size,
+            teacher_segment_topology=teacher_segment_topology,
+        )
+        setup_timing_metrics.teacher_reservation_time_s = time.perf_counter() - t0
 
     # Create build tasks for generation / trainer / (nemo-gym) workers
     build_tasks: dict[str, Callable[[], Any]] = {}
@@ -647,10 +892,47 @@ def setup_single_controller(
     # is disabled or NeMo-Gym is not in play -- it is Gym that needs one stable URL.
     generation_router = None
 
+    def _build_trainer_and_value() -> tuple[Any, Optional[TQValue], dict[str, float]]:
+        """Build the trainer, then the critic when this is a PPO run.
+
+        Serial, and with the trainer offloaded in between, because both worker
+        groups live on the same training GPUs: leaving the policy resident
+        while the critic loads is what OOMs a tight fit. The trainer comes back
+        to GPU before returning so callers see the same state GRPO leaves them.
+
+        Returns:
+            A tuple of (TQPolicy trainer, TQValue critic or None, per-phase wall
+            times keyed as "trainer_time" and "value_time").
+        """
+        time_metrics: dict[str, float] = {}
+        trainer, time_metrics["trainer_time"] = _build_trainer(
+            train_cluster,
+            master_config,
+            tokenizer,
+            processor,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+        )
+        if not is_ppo_run(master_config):
+            return trainer, None, time_metrics
+
+        trainer.offload_to_cpu()
+        value, time_metrics["value_time"] = _build_value(
+            train_cluster,
+            master_config,
+            tokenizer,
+            weights_path=value_weights_path,
+            optimizer_path=value_optimizer_path,
+        )
+        # Blocks on the critic's async Ray __init__, then parks it on CPU.
+        value.finish_training()
+        trainer.prepare_for_training()
+        return trainer, value, time_metrics
+
     def _build_generation_then_trainer(
         defer_generation_model_load: bool, generation=None
-    ) -> tuple[Any, Any, dict[str, float]]:
-        """Build generation then trainer serially.
+    ) -> tuple[Any, Any, Optional[TQValue], dict[str, float]]:
+        """Build generation then trainer (and critic) serially.
 
         Args:
             defer_generation_model_load: If True, generation is a pre-reserved handle and this call
@@ -658,8 +940,9 @@ def setup_single_controller(
             generation: Pre-reserved generation handle when defer_generation_model_load=True; None otherwise.
 
         Returns:
-            A tuple of (finalized generation object, TQPolicy trainer,
-            per-phase wall times keyed as "gen_time" and "trainer_time").
+            A tuple of (finalized generation object, TQPolicy trainer, TQValue
+            critic or None, per-phase wall times keyed as "gen_time",
+            "trainer_time" and "value_time").
         """
         time_metrics = {}
 
@@ -673,17 +956,11 @@ def setup_single_controller(
                 inference_cluster, master_config
             )
 
-        # trainer
-        trainer, time_metrics["trainer_time"] = _build_trainer(
-            train_cluster,
-            master_config,
-            tokenizer,
-            processor,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-        )
+        # trainer (+ critic when PPO)
+        trainer, value, train_side_metrics = _build_trainer_and_value()
+        time_metrics.update(train_side_metrics)
 
-        return generation, trainer, time_metrics
+        return generation, trainer, value, time_metrics
 
     if not use_nemo_gym and master_config.async_rl.generation_router.enabled:
         # The router exists to hand NeMo-Gym one URL; the native path calls generation
@@ -739,15 +1016,7 @@ def setup_single_controller(
                 inference_cluster=inference_cluster,
                 master_config=master_config,
             )
-        build_tasks["trainer"] = partial(
-            _build_trainer,
-            train_cluster=train_cluster,
-            master_config=master_config,
-            tokenizer=tokenizer,
-            processor=processor,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-        )
+        build_tasks["trainer"] = _build_trainer_and_value
 
     # Submit build tasks and get results
     with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
@@ -755,14 +1024,16 @@ def setup_single_controller(
         results = {k: f.result() for k, f in submitted.items()}
 
     if colocated:
-        generation, trainer, time_metrics = results["generation_trainer"]
+        generation, trainer, value, time_metrics = results["generation_trainer"]
         gen_load_time = time_metrics["gen_time"]
-        setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
     else:
         generation, gen_load_time = results["generation"]
-        trainer, trainer_time = results["trainer"]
-        setup_timing_metrics.policy_init_time_s = trainer_time
+        trainer, value, time_metrics = results["trainer"]
     setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
+
+    setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
+    if "value_time" in time_metrics:
+        setup_timing_metrics.value_init_time_s = time_metrics["value_time"]
 
     if use_nemo_gym:
         env_handles["nemo_gym"], gym_time = results["nemo_gym"]
@@ -770,6 +1041,28 @@ def setup_single_controller(
         # the two fields are only meaningful when use_nemo_gym enabled
         setup_timing_metrics.generation_init_reserve_time_s = gen_reserve_time
         setup_timing_metrics.generation_init_load_time_s = gen_load_time
+
+    # Loading a teacher with the same checkpoint as the student must happen only
+    # after student initialization finishes: both use the same HF-to-Megatron
+    # cache path, and concurrent conversion can expose a partial checkpoint.
+    teacher_worker_groups: dict[str, Any] = {}
+    alias_to_group_alias: dict[str, str] = {}
+    if teacher_clusters:
+        t0 = time.perf_counter()
+        teacher_worker_groups, alias_to_group_alias = (
+            opd_module.create_teacher_worker_groups(
+                master_config,
+                cast(dict[str, Any], policy_config),
+                tokenizer,
+                teacher_clusters=teacher_clusters,
+            )
+        )
+        for teacher in teacher_worker_groups.values():
+            teacher.setup_data_plane(dp_config)
+        setup_timing_metrics.teacher_model_init_time_s = time.perf_counter() - t0
+        setup_timing_metrics.teacher_init_time_s = (
+            setup_timing_metrics.teacher_reservation_time_s or 0.0
+        ) + setup_timing_metrics.teacher_model_init_time_s
 
     worker_setup_time = time.perf_counter() - setup_start_time
     setup_timing_metrics.worker_setup_time_s = worker_setup_time
@@ -783,6 +1076,22 @@ def setup_single_controller(
     # ==========================
     # Connect-only DP client; TQPolicy already bootstrapped the controller.
     dp_client = build_data_plane_client(dp_config, bootstrap=False)
+    # SingleController reuses one partition for the run. Warm every known
+    # tensor field before rollout, policy, and teacher writers become
+    # concurrent; TransferQueue otherwise registers field names lazily.
+    dp_client.register_partition(
+        partition_id=partition_id,
+        fields=fields_with_optional_routed_experts(
+            SC_ROLLOUT_SCHEMA_FIELDS,
+            enabled=router_replay_enabled(policy_config),
+        ),
+        num_samples=(
+            master_config.async_rl.max_buffered_rollouts
+            * algo_cfg.num_generations_per_prompt
+        ),
+        consumer_tasks=["prev_lp", "ref_lp", "train"],
+        grpo_group_size=algo_cfg.num_generations_per_prompt,
+    )
 
     t0 = time.perf_counter()
     weight_synchronizer = create_weight_synchronizer(
@@ -802,10 +1111,13 @@ def setup_single_controller(
     # ==========================
     # Setup Algorithm + Rollout Wiring
     # ==========================
-    advantage_estimator = _create_advantage_estimator(
-        cast(GrpoMasterConfig, master_config)
-    )
+    advantage_estimator = _build_advantage_estimator(master_config)
     loss_fn: LossFunction = ClippedPGLossFn(master_config.loss_fn)
+    value_loss_fn: Optional[LossFunction] = (
+        MseValueLossFn(master_config.value_loss_fn)  # type: ignore
+        if is_ppo_run(master_config)
+        else None
+    )
 
     pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
     tq_buffer = TQReplayBuffer(
@@ -817,9 +1129,9 @@ def setup_single_controller(
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
-        num_generations_per_prompt=grpo_config.num_generations_per_prompt,
+        num_generations_per_prompt=algo_cfg.num_generations_per_prompt,
         max_seq_len=_generation_max_seq_len(generation_config),
-        max_rollout_turns=grpo_config.max_rollout_turns,
+        max_rollout_turns=algo_cfg.max_rollout_turns,
         policy_generation=generation,
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
@@ -831,7 +1143,7 @@ def setup_single_controller(
             env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
         ),
         retry_policy=_build_retry_policy(master_config),
-        effort_config=_get_effort_config(cast(GrpoMasterConfig, master_config)),
+        effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
     )
 
     # Print setup timing metrics
@@ -859,5 +1171,10 @@ def setup_single_controller(
         last_checkpoint_path=last_checkpoint_path,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,
+        teacher_worker_groups=teacher_worker_groups,
+        alias_to_group_alias=alias_to_group_alias,
+        # PPO extras
+        value_handle=value,
+        value_loss_fn=value_loss_fn,
     )
     return actor_args, setup_timing_metrics
