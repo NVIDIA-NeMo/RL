@@ -13,8 +13,9 @@
 # limitations under the License.
 
 from functools import partial
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
+from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import load_dataset_from_path
 from nemo_rl.data.megatron_sft_packed import (
@@ -29,7 +30,7 @@ class MegatronSFTPackedDataset(RawDataset):
     def __init__(
         self,
         data_path: str,
-        chat_key: str = "messages",
+        chat_key: str,
         subset: Optional[str] = None,
         split: Optional[str] = None,
         split_validation_size: float = 0,
@@ -59,9 +60,10 @@ class MegatronSFTPackedDataset(RawDataset):
         return {"packed_messages": messages, "task_name": self.task_name}
 
     def set_processor(self) -> None:
-        prompt_format: Any = self.data_config["megatron_sft_prompt_format"]
+        data_config = cast(ResponseDatasetConfig, self.data_config)
+        prompt_format = data_config["megatron_sft_prompt_format"]
         validate_megatron_sft_prompt_format(str(prompt_format))
-        configured_prefix_len: Any = self.data_config.get(
+        configured_prefix_len = data_config.get(
             "megatron_sft_assistant_prefix_len", None
         )
         assistant_prefix_len = (
@@ -73,7 +75,7 @@ class MegatronSFTPackedDataset(RawDataset):
             raise ValueError(
                 "identity prompt format does not support assistant_prefix_len"
             )
-        configured_context_parallel_size: Any = self.data_config[
+        configured_context_parallel_size = data_config[
             "megatron_sft_context_parallel_size"
         ]
         context_parallel_size = int(configured_context_parallel_size)
@@ -82,7 +84,7 @@ class MegatronSFTPackedDataset(RawDataset):
         self.processor = partial(
             megatron_sft_packed_preprocessor,
             prompt_format=str(prompt_format),
-            pad_token=self.data_config.get("megatron_sft_pad_token", None),
+            pad_token=data_config.get("megatron_sft_pad_token", None),
             assistant_prefix_len=assistant_prefix_len,
             context_parallel_size=context_parallel_size,
         )

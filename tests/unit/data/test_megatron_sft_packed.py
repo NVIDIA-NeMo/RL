@@ -19,10 +19,6 @@ from nemo_rl.data.megatron_sft_packed import (
     split_megatron_sft_conversations,
 )
 
-# megatron.training is only importable in the mcore CI shard; the differential
-# test lazy-imports SFTDataset so collection never pulls it in elsewhere.
-pytestmark = pytest.mark.mcore
-
 
 class _DummyTokenizer:
     pad_token_id = 99
@@ -176,6 +172,7 @@ def _megatron_preprocess(
     max_seq_length: int,
     context_parallel_size: int = 1,
 ) -> dict[str, torch.Tensor]:
+    # Megatron is optional and only available in the mcore test shard.
     from megatron.training.datasets.sft_dataset import SFTDataset
 
     dataset = SFTDataset.__new__(SFTDataset)
@@ -247,6 +244,7 @@ def test_dataset_parser_rejects_invalid_packed_rows(
         _dataset_parser().format_data({"messages": messages})
 
 
+@pytest.mark.mcore
 def test_packed_preprocessor_matches_megatron_without_appending_eod() -> None:
     messages = [
         {"role": "system", "content": "s"},

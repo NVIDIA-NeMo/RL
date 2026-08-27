@@ -544,9 +544,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "Direct packed SFT batch is missing required fields: "
                     f"{sorted(missing)}"
                 )
-            if not self.cfg.get("megatron_cfg", {}).get("enabled", False):
+            if (
+                "megatron_cfg" not in self.cfg
+                or not self.cfg["megatron_cfg"]["enabled"]
+            ):
                 raise ValueError("Direct packed SFT rows require the Megatron backend")
-            if self.cfg.get("draft", {}).get("enabled", False):
+            if "draft" in self.cfg and self.cfg["draft"]["enabled"]:
                 raise NotImplementedError(
                     "Direct packed SFT rows do not support draft training"
                 )

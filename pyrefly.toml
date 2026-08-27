@@ -97,6 +97,7 @@ project-includes = [
   "nemo_rl/data/datasets/response_datasets/geometry3k.py",
   "nemo_rl/data/datasets/response_datasets/gsm8k.py",
   "nemo_rl/data/datasets/response_datasets/helpsteer3.py",
+  "nemo_rl/data/datasets/response_datasets/megatron_sft_packed.py",
   "nemo_rl/data/datasets/response_datasets/mmpr_tiny.py",
   "nemo_rl/data/datasets/response_datasets/nemogym_dataset.py",
   "nemo_rl/data/datasets/response_datasets/nemotron_cascade2_sft.py",

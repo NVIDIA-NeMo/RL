@@ -256,6 +256,7 @@ data:
     prompt_file: null
     system_prompt_file: null
     processor: "sft_processor"
+    chat_key: "messages" # Key containing the ordered conversation messages.
     # Megatron-LM offline-packed SFT settings. These are ignored by other datasets.
     megatron_sft_prompt_format: "identity"
     megatron_sft_pad_token: null
