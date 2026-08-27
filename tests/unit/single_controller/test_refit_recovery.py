@@ -38,7 +38,11 @@ import pytest
 import ray.exceptions
 
 from nemo_rl.algorithms.single_controller import SingleControllerActor
-from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
+from nemo_rl.distributed.refit_watchdog import (
+    RefitAborted,
+    is_refit_abort,
+    is_refit_context_lost,
+)
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetHealth,
@@ -600,3 +604,56 @@ class TestAWedgedButAliveEngineIsAttributed:
 
         with pytest.raises(RuntimeError, match=r"already suspect"):
             asyncio.run(ctrl._sync_weights())
+
+
+CONTEXT_LOST = RefitAborted(
+    "[refit-context-lost] refit: the bulk parameter transfer did not retire within 60.0s"
+)
+
+
+class TestContextLostIsNotRecoverable:
+    """The known limitation: detected and ended fast, never recovered from.
+
+    nccl_reshard only, and only when the fault lands while the bulk transfer is in flight.
+    sync_stream_within gives up on kernels already enqueued on the trainers' streams, and
+    aborting a communicator does not retire them -- so those CUDA contexts are unusable,
+    ncclCommAbort never returns and no rebuild on that device can bootstrap. Entering the
+    recovery does not fail there, it WEDGES: jobs 6521181, 6523731, 6582457 and 6584636 all
+    ran to the 1800s harness deadline with no attribution.
+    """
+
+    def test_the_failure_propagates_instead_of_being_recovered(self):
+        ctrl, _, _ = _make_controller(CONTEXT_LOST)
+        with pytest.raises(RefitAborted) as caught:
+            asyncio.run(ctrl._sync_weights())
+        assert is_refit_context_lost(caught.value)
+
+    def test_no_rebuild_is_attempted(self):
+        """The rebuild is the wedge, so not attempting it is the entire fix."""
+        ctrl, _, sync = _make_controller(CONTEXT_LOST)
+        with pytest.raises(RefitAborted):
+            asyncio.run(ctrl._sync_weights())
+        # force=True is the recovery's marker: it tells the transport the communicator is
+        # gone rather than merely unchanged. The False entries are the ordinary reconciles
+        # that run before every refit and are not the path under test.
+        assert True not in sync.forced, (
+            "a forced reconcile is the recovery path; on a lost context it cannot "
+            f"complete and wedges the run. Saw forced={sync.forced}"
+        )
+
+    def test_no_retry_is_attempted(self):
+        ctrl, _, sync = _make_controller(CONTEXT_LOST)
+        with pytest.raises(RefitAborted):
+            asyncio.run(ctrl._sync_weights())
+        assert sync.sync_calls == 1
+
+    def test_an_ordinary_abort_still_recovers(self):
+        """The scope guard, from the other side.
+
+        The packed-broadcast transport raises plain RefitAborted here and recovers from it
+        -- job 6584636 measured null-refit and null-refit-frozen doing exactly that. If
+        this ever fails, the fail-fast path has widened past its one scenario.
+        """
+        ctrl, _, sync = _make_controller(ABORTED)
+        asyncio.run(ctrl._sync_weights())
+        assert sync.sync_calls == 2 and sync.forced != []
