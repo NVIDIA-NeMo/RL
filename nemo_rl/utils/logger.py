@@ -79,6 +79,11 @@ class GPUMonitoringConfig(TypedDict):
     flush_interval: int | float
 
 
+class PerfettoConfig(TypedDict):
+    enable: bool
+    name: str
+
+
 class LoggerConfig(TypedDict):
     log_dir: str
     wandb_enabled: bool
@@ -91,6 +96,7 @@ class LoggerConfig(TypedDict):
     mlflow: NotRequired[MLflowConfig]
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
+    perfetto: NotRequired[PerfettoConfig]
     num_val_samples_to_print: NotRequired[int]
 
 

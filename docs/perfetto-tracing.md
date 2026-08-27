@@ -11,29 +11,37 @@ you need GPU kernels, CUDA streams, or NCCL detail.
 
 ## Enable tracing
 
-Set both environment variables on the PPO driver:
+Enable the optional Perfetto logger in the PPO master config:
 
-```bash
-export NEMORL_TRACE_ENABLED=1
-export NEMORL_TRACE_FILE=/shared/path/ppo_trace.json
-
-uv run examples/run_ppo.py --config <ppo-recipe.yaml>
+```yaml
+logger:
+  perfetto:
+    enable: true
+    name: ppo_trace.json
 ```
 
-`NEMORL_TRACE_FILE` defaults to `nemo_rl_perfetto_trace.json` in the driver's
-working directory. For Slurm runs, choose a path on shared persistent storage:
+`name` may be a filename or an absolute path. Relative names are written under
+the resolved experiment `logger.log_dir`; absolute paths can target shared
+persistent storage directly. The PPO base config defaults to:
+
+```yaml
+logger:
+  perfetto:
+    enable: false
+    name: ppo_perfetto.json
+```
+
+This also makes command-line enablement available without adding new keys:
 
 ```bash
-NEMORL_TRACE_ENABLED=1 \
-NEMORL_TRACE_FILE=/lustre/my-run/ppo_trace.json \
-COMMAND="uv run examples/run_ppo.py --config <ppo-recipe.yaml>" \
-CONTAINER=<container.sqsh> \
-MOUNTS=/lustre:/lustre \
-sbatch --time=00:20:00 ray.sub
+uv run examples/run_ppo.py --config <ppo-recipe.yaml> \
+  logger.perfetto.enable=true \
+  logger.perfetto.name=profile.json
 ```
 
 Tracing is disabled by default. When disabled, the tracer stores no events and
-the existing timer behavior is unchanged.
+the existing timer behavior is unchanged. The resolved logger configuration is
+passed to the async collector actor, so sync and async PPO use the same switch.
 
 ## Read the trace
 

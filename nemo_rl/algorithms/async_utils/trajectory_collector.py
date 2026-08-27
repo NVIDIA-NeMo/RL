@@ -66,7 +66,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.timer import ThreadSafeTimer
-from nemo_rl.utils.trace import Tracer
+from nemo_rl.utils.trace import Tracer, resolve_trace_config
 
 TokenizerType = PreTrainedTokenizerBase
 _MAX_NEMO_GYM_STREAM_RETRIES = 3
@@ -252,11 +252,13 @@ class AsyncTrajectoryCollector:
         self._outstanding_task_indices: set[int] = set()
 
         # Timer for efficiency metrics
+        trace_enabled, _ = resolve_trace_config(master_config.logger)
         self._trace = Tracer(
             "trajectory_collector_actor",
             virtual_process_name=f"{algorithm_name}_async_rollouts",
             process_sort_index=10,
             virtual_process_sort_index=11,
+            enabled=trace_enabled,
         )
         self._efficiency_timer = ThreadSafeTimer(
             context={"worker": "collector"}, trace=self._trace

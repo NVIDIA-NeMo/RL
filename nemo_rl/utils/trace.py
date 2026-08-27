@@ -15,8 +15,8 @@
 """Opt-in Perfetto trace event collection for NeMo RL workloads.
 
 The trace uses Chrome's JSON trace-event format, which can be opened directly at
-https://ui.perfetto.dev. Tracing is disabled unless ``NEMORL_TRACE_ENABLED`` is
-set to a truthy value. ``NEMORL_TRACE_FILE`` controls the output path.
+https://ui.perfetto.dev. PPO enables tracing through ``logger.perfetto`` in the
+master configuration.
 """
 
 from __future__ import annotations
@@ -28,20 +28,34 @@ import socket
 import threading
 import time
 import warnings
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
-_TRACE_ENABLED_ENV = "NEMORL_TRACE_ENABLED"
-_TRACE_FILE_ENV = "NEMORL_TRACE_FILE"
-_DEFAULT_TRACE_FILE = "nemo_rl_perfetto_trace.json"
-_TRUTHY = {"1", "true", "yes", "on"}
+_DEFAULT_TRACE_NAME = "nemo_rl_perfetto_trace.json"
 
 
-def trace_enabled() -> bool:
-    """Return whether Perfetto tracing is enabled for this process."""
-    return os.getenv(_TRACE_ENABLED_ENV, "0").lower() in _TRUTHY
+def resolve_trace_config(logger_config: Mapping[str, Any]) -> tuple[bool, Path]:
+    """Resolve Perfetto enablement and output path from a logger config.
+
+    Relative trace names live under the run's resolved ``logger.log_dir``.
+    Absolute names are preserved so shared filesystem destinations remain
+    available for cluster runs.
+    """
+    perfetto_config = logger_config.get("perfetto")
+    if not isinstance(perfetto_config, Mapping):
+        return False, Path(logger_config.get("log_dir", ".")) / _DEFAULT_TRACE_NAME
+
+    enabled = bool(perfetto_config.get("enable", False))
+    name = str(perfetto_config.get("name", _DEFAULT_TRACE_NAME))
+    if enabled and not name:
+        raise ValueError("logger.perfetto.name must be non-empty when enabled")
+
+    output_path = Path(name)
+    if not output_path.is_absolute():
+        output_path = Path(logger_config.get("log_dir", ".")) / output_path
+    return enabled, output_path
 
 
 def _timestamp_us() -> int:
@@ -66,7 +80,7 @@ class Tracer:
         virtual_process_name: Optional display name for virtual async lanes.
         process_sort_index: Sort order for the regular process.
         virtual_process_sort_index: Sort order for the virtual process.
-        enabled: Explicit enable override. By default, reads the environment.
+        enabled: Whether this tracer should collect events.
     """
 
     def __init__(
@@ -76,9 +90,9 @@ class Tracer:
         virtual_process_name: Optional[str] = None,
         process_sort_index: int = 0,
         virtual_process_sort_index: int = 1,
-        enabled: Optional[bool] = None,
+        enabled: bool = False,
     ) -> None:
-        self.enabled = trace_enabled() if enabled is None else enabled
+        self.enabled = enabled
         self.process_name = process_name
         self.virtual_process_name = virtual_process_name
         identity = f"{socket.gethostname()}:{os.getpid()}:{process_name}"
@@ -401,7 +415,7 @@ def save_trace(
     driver's. Actor collection is best effort so a failed actor cannot hide the
     useful driver-side portion of the trace.
     """
-    if not trace_enabled():
+    if not local_events:
         return None
 
     merged = [dict(event) for event in local_events]
@@ -427,7 +441,7 @@ def save_trace(
                 )
 
     merged.sort(key=lambda event: (event.get("ts", -1), event.get("ph", "")))
-    path = Path(output_path or os.getenv(_TRACE_FILE_ENV, _DEFAULT_TRACE_FILE))
+    path = Path(output_path or _DEFAULT_TRACE_NAME)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_suffix(f"{path.suffix}.tmp")
     with temporary_path.open("w", encoding="utf-8") as trace_file:
