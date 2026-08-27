@@ -11,10 +11,11 @@
 # ⚠️  CAVEAT — model scale: this is Qwen3-8B, and the paper's Fig. 11 shows the
 # GRPO+SDPO hybrid *slightly hurts strong models* (Qwen3-8B), where "the signal
 # of GRPO, only informed by a scalar reward, can be actively harmful with a
-# strong initial model." For an 8B model, pure SDPO (sdpo_livecodebench_8B.yaml,
-# or loss_fn.grpo_weight: 0.0 here) is the safer default. The GRPO term is kept
-# a *minority* signal (grpo_weight: 0.3) and KL-anchored to the base model to
-# avoid the entropy/repetition collapse seen on the 1.5B GSM8K run (job 42426).
+# strong initial model." For the best 8B checkpoint use pure SDPO
+# (sdpo_livecodebench_8B.yaml). This config is the paper-faithful §4.5
+# reproduction: λ = 0.9, plain unnormalized group-mean advantages (§2.1 fn. 3),
+# Table 13 GRPO leg (eps-high 0.28, TIS clip 2, KL coeff 0), Table 12 §4
+# batching (mini batch 1 → 32 off-policy updates/step + SDPO IS clip 2).
 
 sdpo:
   num_prompts_per_step: 32           # paper Table 12: question batch size 32
@@ -23,7 +24,7 @@ sdpo:
   max_num_epochs: 100                # epochs over the 131-problem set
   max_num_steps: 90                  # paper trains ~80-90 steps
   val_period: 10
-  val_at_start: false
+  val_at_start: true             # step-0 baseline: measures the base model on this harness before any update
   val_at_end: true
   max_val_samples: 131
   val_batch_size: 64
@@ -41,38 +42,44 @@ sdpo:
   log_sample_every_n_steps: 1        # dump one fail + one pass per step (stdout + W&B Table)
   log_sample_max_chars: 8000         # raise for inspection so it doesn't trail behind env's 12K max_feedback_chars
   # GRPO advantage estimator for the hybrid's policy-gradient term.
+  # Paper §2.1 (footnote 3): A_GRPO = r_i - mean{r} — plain group mean
+  # (NOT leave-one-out), "without normalization" (no std division).
   adv_estimator:
     name: "grpo"
-    use_leave_one_out_baseline: true
-    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    normalize_rewards: false
 
 loss_fn:
-  grpo_weight: 0.0                   # λ ∈ [0,1]; 0 = pure SDPO, 1 = pure GRPO. Kept a minority
-                                     # signal so SDPO stays the low-variance stabilizer (paper §4.5).
-                                     # For 8B, consider 0.0 (pure SDPO) — see header caveat.
+  grpo_weight: 0.0                   # λ ∈ [0,1]; 0 = pure SDPO, 1 = pure GRPO. Paper §4.5 /
+                                     # Fig. 11 use λ = 0.9. NOTE Fig. 11's expected result at
+                                     # Qwen3-8B: the hybrid SLIGHTLY UNDERPERFORMS pure SDPO —
+                                     # a small deficit vs sdpo_livecodebench_8B.yaml is
+                                     # reproduction success, not failure.
   sdpo:
     success_reward_threshold: 1.0
     kl_type: "reverse"               # paper Table 12 (Section 4 / LCBv6): Reverse-KL
     mixed_kl_weight: 0.5             # unused when kl_type="reverse"
     zero_outside_topk: true          # ignored when tail_mode="k_plus_one" (the bucket replaces the tail correction)
     tail_mode: "k_plus_one"          # paper A.3 / ref core_algos: log(1-sum p) remainder buckets on BOTH true-log-prob distributions
+    rollout_importance_sampling_clip: 2  # paper Table 12: required with mini-batch (off-policy) updates — pairs with train_global_batch_size: 8
     reference_policy_kl_penalty: 0.0 # student-side ref-KL off (not in paper Table 12); the teacher anchor is sdpo.teacher_regularization
     reference_policy_kl_type: "k3"
   grpo:
-    reference_policy_kl_penalty: 0.01 # GRPO KL penalty to frozen-init reference. Non-zero anchors
-                                      # the policy to the base model and prevents the unregularized
-                                      # GRPO entropy/repetition collapse (job 42426). Try 0.005–0.02.
+    reference_policy_kl_penalty: 0.0 # paper Table 13: KL coefficient 0. The old 0.01 was the
+                                      # anti-collapse guard (job 42426); at λ=0.9 the trust-region
+                                      # SDPO leg is the paper's intended stabilizer — watch entropy
+                                      # in the first ~20 steps and restore 0.01 if it dives.
     reference_policy_kl_type: "k3"
     kl_input_clamp_value: 20.0
     kl_output_clamp_value: 10.0
     ratio_clip_min: 0.2
-    ratio_clip_max: 0.2
+    ratio_clip_max: 0.28             # paper Table 13: eps-high 0.28 (asymmetric clip-higher)
     ratio_clip_c: null
     use_on_policy_kl_approximation: false
-    use_importance_sampling_correction: false
-    truncated_importance_sampling_ratio: null
+    use_importance_sampling_correction: true    # required by truncated_importance_sampling_type (loss asserts it)
+    truncated_importance_sampling_ratio: 2      # paper Table 13: rollout IS clip 2 (vLLM-vs-train correction)
     truncated_importance_sampling_ratio_min: null
-    truncated_importance_sampling_type: null
+    truncated_importance_sampling_type: "tis"   # clamp IS weights to [0, ratio]
     sequence_level_importance_ratios: false
     token_level_loss: true
     force_on_policy_ratio: false     # SDPO does one update per rollout; set true for strictly on-policy
@@ -96,7 +103,7 @@ policy:
     name: ${policy.model_name}
     chat_template_kwargs: {"enable_thinking": false}   # paper Table 12: Thinking off
   hf_config_overrides: {}
-  train_global_batch_size: 256       # 32 prompts × 8 gens (paper Table 12)
+  train_global_batch_size: 8         # paper Table 12 (Section 4): mini batch size 1 question × 8 rollouts → 32 sequential (off-policy) updates per rollout step; pairs with the SDPO leg's rollout_importance_sampling_clip and the GRPO leg's PPO ratio
   train_micro_batch_size: 1
   generation_batch_size: 16
   logprob_batch_size: ${policy.train_micro_batch_size}

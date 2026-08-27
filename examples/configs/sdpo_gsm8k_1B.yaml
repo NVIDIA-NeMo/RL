@@ -15,7 +15,7 @@ sdpo:
   max_num_epochs: 1
   max_num_steps: 1000000
   val_period: 10
-  val_at_start: false
+  val_at_start: true             # step-0 baseline: measures the base model on this harness before any update
   val_at_end: false
   max_val_samples: 256
   val_batch_size: 256

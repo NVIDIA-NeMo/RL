@@ -16,7 +16,7 @@ sdpo:
   max_num_epochs: 100                # epochs over the 131-problem set
   max_num_steps: 90                  # paper trains ~80-90 steps
   val_period: 10
-  val_at_start: false
+  val_at_start: true             # step-0 baseline: measures the base model on this harness before any update
   val_at_end: true
   max_val_samples: 131
   val_batch_size: 64
