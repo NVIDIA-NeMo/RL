@@ -1061,9 +1061,18 @@ def create_weights_mxfp8_moe(
 def _make_fp8_moe_kernel_compat(make_fp8_moe_kernel, layer, **kwargs):
     """Call vLLM's make_fp8_moe_kernel across the 0.25/0.28 signature change.
 
-    vLLM 0.25 accepts a ``layer`` kwarg, consumed only by the HUMMING backend;
-    vLLM 0.28 removed both the kwarg and that backend branch, so passing it
-    there raises TypeError. Forward ``layer`` only when the signature takes it.
+    vLLM 0.25 accepts a ``layer`` kwarg, consumed only when fp8_backend is
+    HUMMING; vLLM 0.28 removed both the kwarg and that backend branch, so
+    passing ``layer`` there raises TypeError. Forwarding it conditionally
+    reproduces each version's own upstream call site exactly: with ``layer``
+    on 0.25 (keeping HUMMING working) and without it on 0.28+ (where nothing
+    consumes it).
+
+    Signature inspection is deliberate over ``try/except TypeError``: a broad
+    except would also swallow unrelated argument mismatches from future vLLM
+    signature changes, hiding real breakage instead of failing loud. A
+    ``**kwargs``-style callee (e.g. a test double) counts as accepting
+    ``layer``.
     """
     parameters = inspect.signature(make_fp8_moe_kernel).parameters
     accepts_layer = "layer" in parameters or any(
