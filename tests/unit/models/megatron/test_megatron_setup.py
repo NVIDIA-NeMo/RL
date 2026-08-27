@@ -32,6 +32,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import yaml
 
 
 @dataclass
@@ -3625,3 +3626,203 @@ class TestForceSyncOptimizerFp32FromModel:
                 f"DistributedOptimizer no longer references {name!r}; "
                 "_force_sync_optimizer_fp32_from_model's level-1 sync is now a silent no-op."
             )
+
+
+@pytest.mark.mcore
+class TestPeftWarmStart:
+    """Tests for the megatron_cfg.peft.restore_from warm-start path."""
+
+    def _make_donor_iter_dir(self, tmp_path, peft_section=None):
+        """Create a donor iteration directory with a run_config.yaml."""
+        iter_dir = tmp_path / "donor" / "iter_0000005"
+        iter_dir.mkdir(parents=True)
+        run_config = {"peft": peft_section} if peft_section is not None else {}
+        with open(iter_dir / "run_config.yaml", "w") as f:
+            yaml.dump(run_config, f)
+        return iter_dir
+
+    def test_resolve_iter_dir_directly(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _resolve_peft_restore_dir
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, {"dim": 8, "alpha": 32})
+        assert _resolve_peft_restore_dir(str(iter_dir)) == str(iter_dir)
+
+    def test_resolve_root_with_tracker_file(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _resolve_peft_restore_dir
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, {"dim": 8, "alpha": 32})
+        with open(
+            tmp_path / "donor" / "latest_checkpointed_iteration.txt", "w"
+        ) as f:
+            f.write("5")
+        assert _resolve_peft_restore_dir(str(tmp_path / "donor")) == str(iter_dir)
+
+    def test_resolve_root_with_iter_subdirs_fallback(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _resolve_peft_restore_dir
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, {"dim": 8, "alpha": 32})
+        # No tracker file: falls back to scanning iter_* subdirectories.
+        assert _resolve_peft_restore_dir(str(tmp_path / "donor")) == str(iter_dir)
+
+    def test_resolve_missing_path_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _resolve_peft_restore_dir
+
+        with pytest.raises(FileNotFoundError, match="does not exist"):
+            _resolve_peft_restore_dir(str(tmp_path / "nonexistent"))
+
+    def test_resolve_root_without_iterations_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _resolve_peft_restore_dir
+
+        empty_root = tmp_path / "donor"
+        empty_root.mkdir()
+        with pytest.raises(FileNotFoundError, match="iter_"):
+            _resolve_peft_restore_dir(str(empty_root))
+
+    def test_resolve_iter_dir_missing_run_config_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _resolve_peft_restore_dir
+
+        iter_dir = tmp_path / "donor" / "iter_0000005"
+        iter_dir.mkdir(parents=True)
+        with pytest.raises(FileNotFoundError, match="run_config.yaml"):
+            _resolve_peft_restore_dir(str(tmp_path / "donor"))
+
+    def test_validate_config_match_passes(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, {"dim": 8, "alpha": 32})
+        _validate_peft_restore_config(
+            str(iter_dir), {"dim": 8, "alpha": 32}
+        )  # should not raise
+
+    def test_validate_config_dim_mismatch_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, {"dim": 16, "alpha": 32})
+        with pytest.raises(ValueError, match="dim"):
+            _validate_peft_restore_config(str(iter_dir), {"dim": 8, "alpha": 32})
+
+    def test_validate_config_alpha_mismatch_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, {"dim": 8, "alpha": 64})
+        with pytest.raises(ValueError, match="alpha"):
+            _validate_peft_restore_config(str(iter_dir), {"dim": 8, "alpha": 32})
+
+    def test_validate_config_missing_peft_section_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, peft_section=None)
+        with pytest.raises(ValueError, match="no 'peft' section"):
+            _validate_peft_restore_config(str(iter_dir), {"dim": 8, "alpha": 32})
+
+    def test_validate_config_missing_dim_key_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, {"alpha": 32})
+        with pytest.raises(ValueError, match="'dim'"):
+            _validate_peft_restore_config(str(iter_dir), {"dim": 8, "alpha": 32})
+
+    def test_warm_start_hook_loads_adapter_only_and_restores_cfg(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _create_peft_warm_start_hook
+
+        ckpt_cfg = SimpleNamespace(
+            load="/runs/current/policy/weights",
+            finetune=True,  # left over from the PEFT base-weights hook
+            load_optim=True,
+            load_rng=True,
+        )
+        megatron_cfg = SimpleNamespace(checkpoint=ckpt_cfg)
+
+        from megatron.bridge.training.state import GlobalState
+
+        state = GlobalState()
+        state.train_state.step = 0
+
+        captured = {}
+
+        def fake_load(**kwargs):
+            # Capture the checkpoint config as seen mid-load.
+            captured["load"] = ckpt_cfg.load
+            captured["finetune"] = ckpt_cfg.finetune
+            captured["load_optim"] = ckpt_cfg.load_optim
+            captured["load_rng"] = ckpt_cfg.load_rng
+            captured["load_dir"] = kwargs["load_dir"]
+            captured["optimizer"] = kwargs["optimizer"]
+            captured["opt_param_scheduler"] = kwargs["opt_param_scheduler"]
+            captured["skip_load_to_model_and_opt"] = kwargs[
+                "skip_load_to_model_and_opt"
+            ]
+            return 0, 0
+
+        model = [MagicMock()]
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._load_checkpoint_from_path",
+                side_effect=fake_load,
+            ),
+            patch(
+                "nemo_rl.models.megatron.setup.update_num_microbatches"
+            ) as mock_update_microbatches,
+        ):
+            hook = _create_peft_warm_start_hook(
+                megatron_cfg, state, "/donor/iter_0000005"
+            )
+            result = hook(model)
+
+        assert result is model
+        # The load was routed through the PEFT-resume path: checkpoint.load
+        # pointed at the donor with finetune=False (adapter-only, non-strict
+        # load) but optimizer/RNG state disabled.
+        assert captured["load_dir"] == "/donor/iter_0000005"
+        assert captured["load"] == "/donor/iter_0000005"
+        assert captured["finetune"] is False
+        assert captured["load_optim"] is False
+        assert captured["load_rng"] is False
+        assert captured["optimizer"] is None
+        assert captured["opt_param_scheduler"] is None
+        assert captured["skip_load_to_model_and_opt"] is False
+        # Config restored after the load.
+        assert ckpt_cfg.load == "/runs/current/policy/weights"
+        assert ckpt_cfg.finetune is True
+        assert ckpt_cfg.load_optim is True
+        assert ckpt_cfg.load_rng is True
+        # Train state reset so the run starts at step 0.
+        assert state.train_state.step == 0
+        assert state.train_state.consumed_train_samples == 0
+        mock_update_microbatches.assert_called_once_with(
+            consumed_samples=0, verbose=False
+        )
+
+    def test_warm_start_hook_restores_cfg_on_load_failure(self):
+        from nemo_rl.models.megatron.setup import _create_peft_warm_start_hook
+
+        ckpt_cfg = SimpleNamespace(
+            load="/runs/current/policy/weights",
+            finetune=True,
+            load_optim=True,
+            load_rng=True,
+        )
+        megatron_cfg = SimpleNamespace(checkpoint=ckpt_cfg)
+
+        from megatron.bridge.training.state import GlobalState
+
+        state = GlobalState()
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._load_checkpoint_from_path",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch("nemo_rl.models.megatron.setup.update_num_microbatches"),
+        ):
+            hook = _create_peft_warm_start_hook(
+                megatron_cfg, state, "/donor/iter_0000005"
+            )
+            with pytest.raises(RuntimeError, match="boom"):
+                hook([MagicMock()])
+
+        # Even on failure the run's own checkpoint config is restored.
+        assert ckpt_cfg.load == "/runs/current/policy/weights"
+        assert ckpt_cfg.finetune is True
+        assert ckpt_cfg.load_optim is True
+        assert ckpt_cfg.load_rng is True

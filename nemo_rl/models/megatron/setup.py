@@ -24,6 +24,7 @@ from dataclasses import fields, is_dataclass, replace
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
+import yaml
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import ModelProviderMixin, get_model
 from megatron.bridge.peft.lora import LoRA
@@ -55,13 +56,14 @@ from megatron.bridge.training.setup import (
     _create_peft_pre_wrap_hook,
     _update_model_config_funcs,
 )
-from megatron.bridge.training.state import GlobalState
+from megatron.bridge.training.state import GlobalState, TrainState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.inference.shards import build_inference_pg_collection
+from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
@@ -483,6 +485,135 @@ def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
     if not iter_subdirs:
         raise FileNotFoundError(not_found_msg)
     return os.path.join(path, iter_subdirs[-1])
+
+
+def _resolve_peft_restore_dir(restore_from: str) -> str:
+    """Resolve a ``megatron_cfg.peft.restore_from`` path to an iteration directory.
+
+    Accepts either a specific iteration directory (containing run_config.yaml)
+    or a checkpoint root with a latest_checkpointed_iteration.txt tracker file /
+    iter_* subdirectories.
+    """
+    if not os.path.isdir(restore_from):
+        raise FileNotFoundError(
+            f"megatron_cfg.peft.restore_from={restore_from!r} does not exist or is "
+            "not a directory. It must point to a native Megatron-Bridge PEFT "
+            "checkpoint (an iter_XXXXXXX directory or a checkpoint root "
+            "containing one)."
+        )
+    if os.path.exists(os.path.join(restore_from, "run_config.yaml")):
+        return restore_from
+    resolved = _resolve_iter_dir_from_root(
+        restore_from,
+        f"megatron_cfg.peft.restore_from={restore_from!r} does not contain "
+        "run_config.yaml, latest_checkpointed_iteration.txt, or any iter_* "
+        "subdirectories. It must point to a native Megatron-Bridge PEFT "
+        "checkpoint (an iter_XXXXXXX directory or a checkpoint root containing "
+        "one).",
+    )
+    if not os.path.exists(os.path.join(resolved, "run_config.yaml")):
+        raise FileNotFoundError(
+            f"megatron_cfg.peft.restore_from={restore_from!r}: resolved to "
+            f"iteration directory {resolved!r} but it does not contain "
+            "run_config.yaml."
+        )
+    return resolved
+
+
+def _validate_peft_restore_config(
+    restore_dir: str, peft_cfg: Mapping[str, Any]
+) -> None:
+    """Fail closed if the donor checkpoint's PEFT config is incompatible.
+
+    Adapter tensors are loadable only when the rank (dim) matches, and only
+    functionally equivalent when the scaling (alpha) matches, so both must
+    agree with this run's ``megatron_cfg.peft`` before any weights are loaded.
+    Module-coverage mismatches are caught by the adapter-only distributed load
+    itself (donor keys missing from the checkpoint raise; extra donor keys are
+    ignored).
+    """
+    run_config_path = os.path.join(restore_dir, "run_config.yaml")
+    with open(run_config_path) as f:
+        run_config = yaml.safe_load(f)
+    saved_peft = run_config.get("peft") if isinstance(run_config, dict) else None
+    if not isinstance(saved_peft, dict):
+        raise ValueError(
+            f"megatron_cfg.peft.restore_from={restore_dir!r}: {run_config_path} "
+            "has no 'peft' section. restore_from requires a checkpoint saved "
+            "with PEFT enabled."
+        )
+    for key in ("dim", "alpha"):
+        if key not in saved_peft:
+            raise ValueError(
+                f"megatron_cfg.peft.restore_from={restore_dir!r}: the donor "
+                f"checkpoint's run_config.yaml peft section has no {key!r} key; "
+                "cannot verify compatibility with this run's peft config."
+            )
+        if int(saved_peft[key]) != int(peft_cfg[key]):
+            raise ValueError(
+                f"megatron_cfg.peft.restore_from={restore_dir!r}: donor "
+                f"checkpoint peft.{key}={saved_peft[key]} does not match this "
+                f"run's peft.{key}={peft_cfg[key]}. Warm starting requires the "
+                "same LoRA rank and scaling; train a new adapter instead."
+            )
+
+
+def _create_peft_warm_start_hook(
+    megatron_cfg: ConfigContainer,
+    state: GlobalState,
+    restore_dir: str,
+) -> Callable[[list[MegatronModule]], list[MegatronModule]]:
+    """Create a pre-wrap hook that warm-starts LoRA adapters from a donor checkpoint.
+
+    The hook must run immediately after the PEFT pre-wrap hook (which loads the
+    pretrained base weights and attaches fresh adapters). It routes the donor
+    load through Megatron-Bridge's PEFT-resume path: loading from
+    ``checkpoint.load`` with PEFT configured and ``finetune=False`` filters the
+    generated sharded state dict to adapter keys and drops to a non-strict
+    load, so an adapter-only donor checkpoint restores cleanly onto the fresh
+    base with distributed resharding handled by the torch_dist loader.
+    """
+
+    def peft_warm_start_hook(model: list[MegatronModule]) -> list[MegatronModule]:
+        ckpt_cfg = megatron_cfg.checkpoint
+        original_load = ckpt_cfg.load
+        original_finetune = ckpt_cfg.finetune
+        original_load_optim = ckpt_cfg.load_optim
+        original_load_rng = ckpt_cfg.load_rng
+        ckpt_cfg.load = restore_dir
+        # finetune=False is required for the adapter-only filter, but
+        # optimizer/RNG state must not come from the donor run.
+        ckpt_cfg.finetune = False
+        ckpt_cfg.load_optim = False
+        ckpt_cfg.load_rng = False
+        try:
+            _load_checkpoint_from_path(
+                load_dir=restore_dir,
+                state=state,
+                model=model,
+                optimizer=None,
+                opt_param_scheduler=None,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+                ignore_ckpt_step=True,
+            )
+        finally:
+            ckpt_cfg.load = original_load
+            ckpt_cfg.finetune = original_finetune
+            ckpt_cfg.load_optim = original_load_optim
+            ckpt_cfg.load_rng = original_load_rng
+        # finetune=False also pulled the donor run's train state (step, consumed
+        # samples) and fed it to the global microbatch calculator. This is a
+        # warm start, not a resume: reset both so the new run starts at step 0.
+        state.train_state = TrainState()
+        update_num_microbatches(consumed_samples=0, verbose=False)
+        print(
+            f"Warm-started PEFT adapters from {restore_dir} "
+            "(optimizer, RNG, and train state start fresh)."
+        )
+        return model
+
+    return peft_warm_start_hook
 
 
 def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
@@ -1719,6 +1850,13 @@ def setup_model_and_optimizer(
     pre_wrap_hook = []
 
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
+    if not use_peft and policy_cfg["megatron_cfg"].get("peft", {}).get(
+        "restore_from"
+    ):
+        raise ValueError(
+            "megatron_cfg.peft.restore_from is set but megatron_cfg.peft.enabled "
+            "is False. Enable PEFT to warm start from an adapter checkpoint."
+        )
     draft_enabled = "draft" in policy_cfg and policy_cfg["draft"]["enabled"]
     resume_checkpoint_exists = (
         megatron_cfg.checkpoint.load is not None
@@ -1815,8 +1953,15 @@ def setup_model_and_optimizer(
             a2a_experimental=peft_cfg["a2a_experimental"],
             lora_dtype=peft_cfg["lora_dtype"],
         )
+        # Resolve and validate the warm-start donor checkpoint up front so a
+        # bad path or mismatched donor fails before any model construction.
+        peft_restore_dir = None
+        if peft_cfg.get("restore_from") is not None:
+            peft_restore_dir = _resolve_peft_restore_dir(peft_cfg["restore_from"])
+            _validate_peft_restore_config(peft_restore_dir, peft_cfg)
     else:
         peft = None
+        peft_restore_dir = None
 
     megatron_cfg.peft = peft
 
@@ -1867,6 +2012,14 @@ def setup_model_and_optimizer(
             return model
 
         pre_wrap_hook.extend([composed_peft_hook])
+
+        # Warm start the adapters from the donor checkpoint after the base
+        # weights are loaded and fresh adapters are attached. Skipped when
+        # resuming: the resume checkpoint already carries this run's adapters.
+        if peft_restore_dir is not None and not resume_checkpoint_exists:
+            pre_wrap_hook.append(
+                _create_peft_warm_start_hook(megatron_cfg, state, peft_restore_dir)
+            )
 
     if draft_enabled:
         draft_pre_wrap_hook = _create_draft_pre_wrap_hook(
@@ -2139,6 +2292,23 @@ def setup_reference_model_state(
             return model
 
         ref_pre_wrap_hooks.extend([composed_peft_hook])
+
+        # Anchor the reference policy to the warm-started initial policy: with
+        # restore_from set, the policy starts from the donor adapters, so the
+        # reference must include them too (zero-init adapters would anchor KL
+        # to the bare base model). Unlike the policy model this runs on resumes
+        # as well — the reference must stay anchored to the initial policy.
+        peft_restore_from = config["megatron_cfg"].get("peft", {}).get(
+            "restore_from"
+        )
+        if peft_restore_from is not None:
+            ref_pre_wrap_hooks.append(
+                _create_peft_warm_start_hook(
+                    ref_megatron_cfg,
+                    ref_state,
+                    _resolve_peft_restore_dir(peft_restore_from),
+                )
+            )
 
     try:
         reference_model = get_model(

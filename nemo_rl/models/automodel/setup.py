@@ -16,6 +16,7 @@
 
 import importlib
 import inspect
+import json
 import os
 from functools import partial
 from typing import Any, Optional, Union
@@ -23,6 +24,7 @@ from typing import Any, Optional, Union
 import torch
 from hydra.utils import get_class
 from nemo_automodel import NeMoAutoModelForSequenceClassification
+from safetensors import safe_open
 
 try:
     from nemo_automodel import NeMoAutoModelForTokenClassification
@@ -71,7 +73,7 @@ from nemo_rl.models.automodel.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
-from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
+from nemo_rl.models.policy import LoRAConfig, PolicyConfig, TokenizerConfig
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
 
 STRING_TO_DTYPE = {
@@ -586,6 +588,149 @@ def _disable_automodel_checkpoint_dtype_restore() -> None:
     _model_init._restore_loaded_model_dtype = _noop
 
 
+def _resolve_lora_adapter_dir(restore_from: str) -> str:
+    """Resolve a ``lora_cfg.restore_from`` path to the directory holding the adapter files.
+
+    Accepts a NeMo RL checkpoint weights directory (``step_*/policy/weights``),
+    its ``model`` subdirectory, or any directory directly containing
+    ``adapter_model.safetensors`` + ``adapter_config.json`` (HF PEFT layout).
+    """
+    for candidate in (restore_from, os.path.join(restore_from, "model")):
+        if os.path.isfile(os.path.join(candidate, "adapter_model.safetensors")):
+            return candidate
+    raise FileNotFoundError(
+        f"dtensor_cfg.lora_cfg.restore_from={restore_from!r}: no "
+        "adapter_model.safetensors found there or in its 'model' subdirectory. "
+        "restore_from must point to a PEFT adapter checkpoint (a directory "
+        "containing adapter_model.safetensors + adapter_config.json, e.g. a "
+        "previous run's step_*/policy/weights directory)."
+    )
+
+
+def _validate_lora_adapter_config(
+    adapter_dir: str, lora_cfg: LoRAConfig, model_name: str
+) -> None:
+    """Fail closed if the donor adapter's metadata is incompatible with this run.
+
+    Checks the standard HF PEFT ``adapter_config.json`` fields: the adapter must
+    be a LoRA adapter with the same rank (r) and scaling (lora_alpha) as this
+    run's ``lora_cfg``, and must have been trained on the same base model.
+    """
+    config_path = os.path.join(adapter_dir, "adapter_config.json")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(
+            f"dtensor_cfg.lora_cfg.restore_from: {config_path} not found. The "
+            "donor checkpoint must carry an adapter_config.json so its "
+            "provenance can be validated."
+        )
+    with open(config_path) as f:
+        adapter_config = json.load(f)
+    if adapter_config.get("peft_type") != "LORA":
+        raise ValueError(
+            f"dtensor_cfg.lora_cfg.restore_from: {config_path} has "
+            f"peft_type={adapter_config.get('peft_type')!r}; only 'LORA' "
+            "adapters can be warm-started from."
+        )
+    for config_key, lora_key in (("r", "dim"), ("lora_alpha", "alpha")):
+        if config_key not in adapter_config:
+            raise ValueError(
+                f"dtensor_cfg.lora_cfg.restore_from: {config_path} has no "
+                f"{config_key!r} field; cannot verify compatibility with this "
+                "run's lora_cfg."
+            )
+        if int(adapter_config[config_key]) != int(lora_cfg[lora_key]):
+            raise ValueError(
+                f"dtensor_cfg.lora_cfg.restore_from: donor adapter "
+                f"{config_key}={adapter_config[config_key]} does not match this "
+                f"run's lora_cfg.{lora_key}={lora_cfg[lora_key]}. Warm starting "
+                "requires the same LoRA rank and scaling; train a new adapter "
+                "instead."
+            )
+    donor_base = adapter_config.get("base_model_name_or_path")
+    if donor_base and donor_base != "N/A" and donor_base != model_name:
+        raise ValueError(
+            f"dtensor_cfg.lora_cfg.restore_from: donor adapter was trained on "
+            f"base model {donor_base!r} but this run uses model_name="
+            f"{model_name!r}."
+        )
+
+
+def _validate_lora_adapter_keys(adapter_dir: str, model: torch.nn.Module) -> None:
+    """Fail closed if the donor adapter tensors don't cover this model's LoRA params.
+
+    Only enforced for models without a custom state-dict adapter: those save
+    adapter weights under HF key names that cannot be mapped back to model
+    parameter names cheaply, so their coverage guarantee comes from the
+    adapter_config.json checks in _validate_lora_adapter_config instead.
+    """
+    if getattr(model, "state_dict_adapter", None) is not None:
+        return
+    with safe_open(
+        os.path.join(adapter_dir, "adapter_model.safetensors"), framework="pt"
+    ) as f:
+        donor_keys = set(f.keys())
+    if not donor_keys:
+        raise ValueError(
+            f"dtensor_cfg.lora_cfg.restore_from: {adapter_dir}/"
+            "adapter_model.safetensors contains no tensors."
+        )
+    # HF PEFT exports prefix keys with "base_model.model."; the loader strips
+    # the prefix when present, so accept either form here.
+    prefix = "base_model.model."
+    stripped_donor_keys = {
+        key[len(prefix) :] if key.startswith(prefix) else key for key in donor_keys
+    }
+    expected_keys = {
+        name.replace("_checkpoint_wrapped_module.", "")
+        for name, _ in model.named_parameters()
+        if "lora_" in name
+    }
+    missing = sorted(expected_keys - stripped_donor_keys)
+    unexpected = sorted(stripped_donor_keys - expected_keys)
+    if missing or unexpected:
+        raise ValueError(
+            "dtensor_cfg.lora_cfg.restore_from: donor adapter key mismatch "
+            f"against this run's LoRA parameters. Missing from donor: "
+            f"{missing[:5]}{' ...' if len(missing) > 5 else ''}; unexpected in "
+            f"donor: {unexpected[:5]}{' ...' if len(unexpected) > 5 else ''}. "
+            "The donor adapter must target the same modules as this run's "
+            "lora_cfg."
+        )
+
+
+def _load_initial_lora_adapter(
+    model: torch.nn.Module,
+    checkpoint_manager: Any,
+    restore_from: str,
+    lora_cfg: LoRAConfig,
+    model_name: str,
+) -> None:
+    """Warm-start the model's LoRA adapters from a donor PEFT adapter checkpoint.
+
+    The load goes through the Automodel checkpointer's PEFT path (rank-0 read
+    of adapter_model.safetensors, broadcast, DTensor/EP-aware placement), the
+    same machinery used to resume NeMo RL PEFT checkpoints. Optimizer state is
+    not loaded: warm starts begin with a fresh optimizer.
+    """
+    adapter_dir = _resolve_lora_adapter_dir(restore_from)
+    _validate_lora_adapter_config(adapter_dir, lora_cfg, model_name)
+    _validate_lora_adapter_keys(adapter_dir, model)
+    assert checkpoint_manager.checkpointer is not None, (
+        "Checkpointer must be initialized before warm starting LoRA adapters."
+    )
+    checkpoint_manager.update_checkpointer_config(
+        config_updates={
+            "model_save_format": "safetensors",
+            "is_peft": True,
+            # The donor checkpoint is already dequantized.
+            "dequantize_base_checkpoint": False,
+        },
+        checkpoint_root=os.path.dirname(adapter_dir.rstrip(os.sep)),
+    )
+    checkpoint_manager.checkpointer.load_model(model=model, model_path=adapter_dir)
+    print(f"Warm-started LoRA adapters from {adapter_dir}")
+
+
 def setup_model_and_optimizer(
     config: PolicyConfig,
     tokenizer: AutoTokenizer,
@@ -676,6 +821,12 @@ def setup_model_and_optimizer(
     lora_cfg = config["dtensor_cfg"].get("lora_cfg", None)
     peft_config = None
     lora_enabled = lora_cfg is not None and lora_cfg["enabled"]
+    if not lora_enabled and (lora_cfg or {}).get("restore_from"):
+        raise ValueError(
+            "dtensor_cfg.lora_cfg.restore_from is set but "
+            "dtensor_cfg.lora_cfg.enabled is False. Enable LoRA to warm start "
+            "from an adapter checkpoint."
+        )
     if lora_enabled:
         if tp_size > 1:
             assert not lora_cfg["use_triton"], (
@@ -871,6 +1022,20 @@ def setup_model_and_optimizer(
             optimizer=optimizer,
             optimizer_path=optimizer_path,
             scheduler=scheduler,
+        )
+    elif lora_enabled and lora_cfg.get("restore_from") is not None:
+        # Warm start: base weights were already loaded by from_pretrained above;
+        # restore only the donor adapter weights. This runs before the worker
+        # captures the KL reference state dict, so the reference policy is the
+        # warm-started initial policy. When this setup call is part of a
+        # deferred resume (weights_path temporarily None), the resumed
+        # checkpoint is loaded afterwards and overwrites these weights.
+        _load_initial_lora_adapter(
+            model=model,
+            checkpoint_manager=checkpoint_manager,
+            restore_from=lora_cfg["restore_from"],
+            lora_cfg=lora_cfg,
+            model_name=config["model_name"],
         )
     else:
         print(
