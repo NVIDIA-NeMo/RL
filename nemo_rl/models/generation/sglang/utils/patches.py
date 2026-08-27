@@ -558,6 +558,315 @@ def _patch_sglang_mxfp8_moe_hidden_size() -> None:
         logger.info("Patched MXFP8 MoE hidden-size refit loading in %s.", loader_file)
 
 
+def _patch_sglang_nvfp4_cutedsl_refit_padding() -> None:
+    """Backport padded MoE shard loading from SGLang ``abddb1c7``.
+
+    CuteDSL pads non-gated MoE intermediate dimensions after checkpoint load.
+    During online refit, the pinned SGLang loader incorrectly treats that padded
+    local dimension as the logical TP shard size, so the last TP rank slices past
+    the end of the canonical global tensor. Keep the existing padded allocation,
+    but derive the load slice from the unpadded global tensor and clear its tail.
+    """
+    file_to_patch = _get_sglang_file("srt/layers/moe/fused_moe_triton/layer.py")
+
+    with open(file_to_patch, "r") as f:
+        content = f.read()
+
+    sentinel = "_logical_nvfp4_cutedsl_shard_size_for_load"
+    if sentinel in content:
+        return
+
+    helper_anchor = "    def _load_w13(\n"
+    helper = (
+        "    def _logical_nvfp4_cutedsl_shard_size_for_load(\n"
+        "        self,\n"
+        "        expert_data: torch.Tensor,\n"
+        "        loaded_weight: torch.Tensor,\n"
+        "        shard_dim: int,\n"
+        "        shard_size: int,\n"
+        "    ) -> tuple[torch.Tensor, int]:\n"
+        '        """Return the loadable view and logical NVFP4 shard size."""\n'
+        "        if (\n"
+        "            self.use_presharded_weights\n"
+        "            or not isinstance(\n"
+        "                self.quant_method, ModelOptNvFp4FusedMoEMethod\n"
+        "            )\n"
+        "            or not self.quant_method.enable_flashinfer_cutedsl_moe\n"
+        "            or self.moe_runner_config.is_gated\n"
+        "        ):\n"
+        "            return expert_data, shard_size\n\n"
+        "        global_size = loaded_weight.shape[shard_dim]\n"
+        "        logical_shard_size, remainder = divmod(\n"
+        "            global_size, self.moe_tp_size\n"
+        "        )\n"
+        "        if remainder or logical_shard_size >= shard_size:\n"
+        "            return expert_data, shard_size\n\n"
+        "        padded_size = expert_data.shape[shard_dim] - logical_shard_size\n"
+        "        if padded_size <= 0:\n"
+        "            return expert_data, shard_size\n"
+        "        expert_data.narrow(\n"
+        "            shard_dim, logical_shard_size, padded_size\n"
+        "        ).zero_()\n"
+        "        return (\n"
+        "            expert_data.narrow(shard_dim, 0, logical_shard_size),\n"
+        "            logical_shard_size,\n"
+        "        )\n\n" + helper_anchor
+    )
+    if content.count(helper_anchor) != 1:
+        raise RuntimeError(
+            "SGLang NVFP4 CuteDSL refit compat-patch helper anchor mismatch in "
+            f"{file_to_patch}: expected 1, found {content.count(helper_anchor)}."
+        )
+    content = content.replace(helper_anchor, helper, 1)
+
+    load_anchors = (
+        (
+            "                if not is_bias and self.use_triton_kernels:\n"
+            "                    # do not transpose for bias\n"
+            "                    loaded_weight = loaded_weight.transpose(-2, -1)\n"
+            "                loaded_weight = loaded_weight.narrow(\n",
+            "                if not is_bias and self.use_triton_kernels:\n"
+            "                    # do not transpose for bias\n"
+            "                    loaded_weight = loaded_weight.transpose(-2, -1)\n"
+            "                expert_data, shard_size = (\n"
+            "                    self._logical_nvfp4_cutedsl_shard_size_for_load(\n"
+            "                        expert_data, loaded_weight, shard_dim, shard_size\n"
+            "                    )\n"
+            "                )\n"
+            "                loaded_weight = loaded_weight.narrow(\n",
+        ),
+        (
+            "                if self.use_triton_kernels:\n"
+            "                    loaded_weight = loaded_weight.transpose(-2, -1)\n"
+            "                loaded_weight = loaded_weight.narrow(\n",
+            "                if self.use_triton_kernels:\n"
+            "                    loaded_weight = loaded_weight.transpose(-2, -1)\n"
+            "                expert_data, shard_size = (\n"
+            "                    self._logical_nvfp4_cutedsl_shard_size_for_load(\n"
+            "                        expert_data, loaded_weight, shard_dim, shard_size\n"
+            "                    )\n"
+            "                )\n"
+            "                loaded_weight = loaded_weight.narrow(\n",
+        ),
+    )
+    for anchor, replacement in load_anchors:
+        actual_count = content.count(anchor)
+        if actual_count != 1:
+            raise RuntimeError(
+                "SGLang NVFP4 CuteDSL refit compat-patch load anchor mismatch in "
+                f"{file_to_patch}: expected 1, found {actual_count} for "
+                f"{anchor[:80]!r}."
+            )
+        content = content.replace(anchor, replacement, 1)
+
+    _write_and_verify(file_to_patch, content, sentinel)
+    logger.info("Patched NVFP4 CuteDSL refit padding in %s.", file_to_patch)
+
+
+def _patch_sglang_nvfp4_cutedsl_refit_scales() -> None:
+    """Backport the static-scale refit portion of SGLang ``9d34c280``.
+
+    Decode CUDA graphs capture the CuteDSL MMA blockscale and derived scale
+    tensor addresses. Preserve those parameter identities across refits and
+    refresh cached scale values in place after post-load processing.
+    """
+    runner_file = _get_sglang_file("srt/layers/moe/moe_runner/flashinfer_cutedsl.py")
+    modelopt_file = _get_sglang_file("srt/layers/quantization/modelopt_quant.py")
+
+    with open(runner_file, "r") as f:
+        runner_content = f.read()
+
+    runner_sentinel = "def refresh_cutedsl_standard_scales_for_weight_update("
+    if runner_sentinel not in runner_content:
+        runner_anchor = "def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:\n"
+        runner_helper = (
+            "def refresh_cutedsl_standard_scales_for_weight_update(\n"
+            "    layer: torch.nn.Module,\n"
+            ") -> None:\n"
+            "    w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (\n"
+            "        resolve_cutedsl_standard_scales(layer)\n"
+            "    )\n"
+            "    new_scales = (w1_alpha, fc2_input_scale, w2_alpha)\n"
+            "    current_scales = layer._cutedsl_scales\n"
+            "    current_input_scale = layer._cutedsl_input_scale\n\n"
+            "    if (\n"
+            "        not isinstance(current_scales, tuple)\n"
+            "        or len(current_scales) != len(new_scales)\n"
+            "        or not isinstance(current_input_scale, torch.Tensor)\n"
+            "    ):\n"
+            "        raise RuntimeError(\n"
+            '            "CuteDSL scale metadata changed during weight reload; "\n'
+            '            "CUDA graph recapture is required."\n'
+            "        )\n"
+            "    scale_pairs = (\n"
+            "        *zip(current_scales, new_scales),\n"
+            "        (current_input_scale, used_input_scale),\n"
+            "    )\n"
+            "    for current, new in scale_pairs:\n"
+            "        if (\n"
+            "            not isinstance(current, torch.Tensor)\n"
+            "            or current.shape != new.shape\n"
+            "            or current.dtype != new.dtype\n"
+            "            or current.device != new.device\n"
+            "        ):\n"
+            "            raise RuntimeError(\n"
+            '                "CuteDSL scale metadata changed during weight reload; "\n'
+            '                "CUDA graph recapture is required."\n'
+            "            )\n\n"
+            "    with torch.no_grad():\n"
+            "        for current, new in scale_pairs:\n"
+            "            current.copy_(new)\n\n\n" + runner_anchor
+        )
+        if runner_content.count(runner_anchor) != 1:
+            raise RuntimeError(
+                "SGLang NVFP4 CuteDSL refit scale helper anchor mismatch in "
+                f"{runner_file}: expected 1, found "
+                f"{runner_content.count(runner_anchor)}."
+            )
+        runner_content = runner_content.replace(runner_anchor, runner_helper, 1)
+
+        inference_scale_anchor = (
+            "        )\n\n"
+            "    w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (\n"
+            "        resolve_cutedsl_standard_scales(layer)\n"
+            "    )\n"
+        )
+        inference_scale_replacement = (
+            "        )\n\n"
+            "        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (\n"
+            "            resolve_cutedsl_standard_scales(layer)\n"
+            "        )\n"
+        )
+        if runner_content.count(inference_scale_anchor) != 1:
+            raise RuntimeError(
+                "SGLang NVFP4 CuteDSL refit scale inference-mode anchor mismatch in "
+                f"{runner_file}: expected 1, found "
+                f"{runner_content.count(inference_scale_anchor)}."
+            )
+        runner_content = runner_content.replace(
+            inference_scale_anchor, inference_scale_replacement, 1
+        )
+        _write_and_verify(runner_file, runner_content, runner_sentinel)
+        logger.info("Patched NVFP4 CuteDSL refit scale refresh in %s.", runner_file)
+
+    with open(modelopt_file, "r") as f:
+        modelopt_content = f.read()
+
+    modelopt_sentinel = "refresh_cutedsl_standard_scales_for_weight_update(layer)"
+    if modelopt_sentinel in modelopt_content:
+        return
+
+    replacements = (
+        (
+            "                from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (\n"
+            "                    _FP4_SF_VEC_SIZE,\n"
+            "                )\n",
+            "                from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (\n"
+            "                    _FP4_SF_VEC_SIZE,\n"
+            "                    refresh_cutedsl_standard_scales_for_weight_update,\n"
+            "                )\n",
+        ),
+        (
+            "                layer.w13_weight = Parameter(\n"
+            "                    interleave_w13_halves(\n"
+            "                        layer.w13_weight.view(torch.uint8), group_size=64, dim=1\n"
+            "                    ).contiguous(),\n"
+            "                    requires_grad=False,\n"
+            "                )\n",
+            "                copy_or_rebind_param(\n"
+            "                    layer,\n"
+            '                    "w13_weight",\n'
+            "                    interleave_w13_halves(\n"
+            "                        layer.w13_weight.view(torch.uint8), group_size=64, dim=1\n"
+            "                    ).contiguous(),\n"
+            "                )\n",
+        ),
+        (
+            "                layer.w13_weight_scale = Parameter(\n"
+            "                    interleave_w13_halves(\n"
+            "                        layer.w13_weight_scale, group_size=64, dim=1\n"
+            "                    ).contiguous(),\n"
+            "                    requires_grad=False,\n"
+            "                )\n",
+            "                copy_or_rebind_param(\n"
+            "                    layer,\n"
+            '                    "w13_weight_scale",\n'
+            "                    interleave_w13_halves(\n"
+            "                        layer.w13_weight_scale, group_size=64, dim=1\n"
+            "                    ).contiguous(),\n"
+            "                )\n",
+        ),
+        (
+            "                layer.w13_blockscale_mma = Parameter(\n"
+            "                    convert_sf_to_mma_layout(\n"
+            "                        layer.w13_blockscale_swizzled.contiguous()\n"
+            "                        .view(torch.uint8)\n"
+            "                        .reshape(-1),\n"
+            "                        m=w13_m,\n"
+            "                        k=w13_k,\n"
+            "                        num_groups=num_local_experts,\n"
+            "                        sf_vec_size=sf_vec_size,\n"
+            "                    ),\n"
+            "                    requires_grad=False,\n"
+            "                )\n",
+            "                copy_or_rebind_param(\n"
+            "                    layer,\n"
+            '                    "w13_blockscale_mma",\n'
+            "                    convert_sf_to_mma_layout(\n"
+            "                        layer.w13_blockscale_swizzled.contiguous()\n"
+            "                        .view(torch.uint8)\n"
+            "                        .reshape(-1),\n"
+            "                        m=w13_m,\n"
+            "                        k=w13_k,\n"
+            "                        num_groups=num_local_experts,\n"
+            "                        sf_vec_size=sf_vec_size,\n"
+            "                    ),\n"
+            "                )\n",
+        ),
+        (
+            "                layer.w2_blockscale_mma = Parameter(\n"
+            "                    convert_sf_to_mma_layout(\n"
+            "                        layer.w2_blockscale_swizzled.contiguous()\n"
+            "                        .view(torch.uint8)\n"
+            "                        .reshape(-1),\n"
+            "                        m=w2_m,\n"
+            "                        k=w2_k,\n"
+            "                        num_groups=num_local_experts,\n"
+            "                        sf_vec_size=sf_vec_size,\n"
+            "                    ),\n"
+            "                    requires_grad=False,\n"
+            "                )\n",
+            "                copy_or_rebind_param(\n"
+            "                    layer,\n"
+            '                    "w2_blockscale_mma",\n'
+            "                    convert_sf_to_mma_layout(\n"
+            "                        layer.w2_blockscale_swizzled.contiguous()\n"
+            "                        .view(torch.uint8)\n"
+            "                        .reshape(-1),\n"
+            "                        m=w2_m,\n"
+            "                        k=w2_k,\n"
+            "                        num_groups=num_local_experts,\n"
+            "                        sf_vec_size=sf_vec_size,\n"
+            "                    ),\n"
+            "                )\n"
+            '                if getattr(layer, "_cutedsl_wrapper", None) is not None:\n'
+            "                    refresh_cutedsl_standard_scales_for_weight_update(layer)\n",
+        ),
+    )
+    for anchor, replacement in replacements:
+        actual_count = modelopt_content.count(anchor)
+        if actual_count != 1:
+            raise RuntimeError(
+                "SGLang NVFP4 CuteDSL refit scale anchor mismatch in "
+                f"{modelopt_file}: expected 1, found {actual_count} for "
+                f"{anchor[:80]!r}."
+            )
+        modelopt_content = modelopt_content.replace(anchor, replacement, 1)
+
+    _write_and_verify(modelopt_file, modelopt_content, modelopt_sentinel)
+    logger.info("Patched NVFP4 CuteDSL refit scale identities in %s.", modelopt_file)
+
+
 def _override_sglang_imbalance_check_env() -> None:
     """Force-disable sglang's per-GPU memory imbalance check.
 
@@ -651,6 +960,8 @@ def _apply_sglang_compat_patches() -> None:
     _patch_sglang_non_gated_fp8_moe()
     _patch_sglang_mxfp8_moe_scale_layout()
     _patch_sglang_mxfp8_moe_hidden_size()
+    _patch_sglang_nvfp4_cutedsl_refit_padding()
+    _patch_sglang_nvfp4_cutedsl_refit_scales()
     _override_sglang_imbalance_check_env()
     _patch_megatron_dynamic_context_hook_mode()
     _patch_megatron_training_hook_mode()
