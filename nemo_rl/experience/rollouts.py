@@ -1324,30 +1324,37 @@ async def run_sample_multi_turn_rollout(
                 turn_multimodal_data = dict(sample_multimodal_data)
                 turn_multimodal_data["vllm_content"] = None
 
+            if tracer is None:
+                generation_result = await async_generate_response_for_sample_turn(
+                    policy_generation,
+                    current_message_log,
+                    current_stop_strings,
+                    tokenizer,
+                    max_seq_len,
+                    greedy=greedy,
+                    sample_multimodal_data=turn_multimodal_data,
+                    deduplicate_multimodal_data=deduplicate_multimodal_data,
+                )
+            else:
+                generation_result = await async_generate_response_for_sample_turn(
+                    policy_generation,
+                    current_message_log,
+                    current_stop_strings,
+                    tokenizer,
+                    max_seq_len,
+                    greedy=greedy,
+                    sample_multimodal_data=turn_multimodal_data,
+                    deduplicate_multimodal_data=deduplicate_multimodal_data,
+                    tracer=tracer,
+                    trace_sample_id=trace_sample_id,
+                    turn=turn,
+                )
             (
                 updated_message_log,
                 generated_tokens,
                 input_lengths,
                 gen_metrics,
-            ) = await async_generate_response_for_sample_turn(
-                policy_generation,
-                current_message_log,
-                current_stop_strings,
-                tokenizer,
-                max_seq_len,
-                greedy=greedy,
-                sample_multimodal_data=turn_multimodal_data,
-                deduplicate_multimodal_data=deduplicate_multimodal_data,
-                **(
-                    {
-                        "tracer": tracer,
-                        "trace_sample_id": trace_sample_id,
-                        "turn": turn,
-                    }
-                    if tracer is not None
-                    else {}
-                ),
-            )
+            ) = generation_result
             current_message_log = updated_message_log
 
             # Check if response was truncated (hit max_tokens without stop token)
