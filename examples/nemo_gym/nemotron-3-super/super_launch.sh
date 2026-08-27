@@ -252,6 +252,13 @@ fi
 if [[ -n "${SLURM_LOG_DIR}" ]]; then
     SBATCH_CMD=("${SBATCH_CMD[@]:0:1}" --output="${SLURM_LOG_DIR}/%j.out" --error="${SLURM_LOG_DIR}/%j.err" "${SBATCH_CMD[@]:1}")
 fi
+if [[ -n "${SLURM_SEGMENT:-}" ]]; then
+    if (( SBATCH_NUM_NODES % SLURM_SEGMENT != 0 )); then
+        echo "Error: SBATCH_NUM_NODES=${SBATCH_NUM_NODES} not divisible by SLURM_SEGMENT=${SLURM_SEGMENT}" >&2
+        exit 1
+    fi
+    SBATCH_CMD=("${SBATCH_CMD[@]:0:1}" --segment="${SLURM_SEGMENT}" "${SBATCH_CMD[@]:1}")
+fi
 
 if [[ "$DRY_RUN" == true ]]; then
     echo ""
