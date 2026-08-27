@@ -313,6 +313,80 @@ class _MaskRecordingAdvantageEstimator:
         return rewards.unsqueeze(-1).expand_as(mask).clone()
 
 
+class _PromptRecordingAdvantageEstimator(_MaskRecordingAdvantageEstimator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prompt_ids: torch.Tensor | None = None
+
+    def compute_advantage(self, *, prompt_ids, **kwargs) -> torch.Tensor:
+        self.prompt_ids = prompt_ids.clone()
+        return super().compute_advantage(**kwargs)
+
+
+def _two_rollouts_per_group_sample_ids(batch_size: int) -> list[str]:
+    assert batch_size % 2 == 0
+    return [
+        f"prompt-{group_index}_g{generation_index}"
+        for group_index in range(batch_size // 2)
+        for generation_index in range(2)
+    ]
+
+
+def test_advantage_stage_uses_rollout_group_identity_not_prompt_tokens() -> None:
+    batch_size, sequence_length = 4, 5
+    data = TensorDict(
+        {
+            # Simulate two media-conditioned prompts with identical text tokens.
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([1.0, 1.0, 0.0, 0.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _PromptRecordingAdvantageEstimator()
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=SimpleNamespace(
+            seq_logprob_error_threshold=None,
+            num_generations_per_prompt=2,
+        )
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=_two_rollouts_per_group_sample_ids(batch_size),
+        fields=list(data.keys()),
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    assert estimator.prompt_ids is not None
+    assert torch.equal(
+        estimator.prompt_ids,
+        torch.tensor([[0], [0], [1], [1]]),
+    )
+    assert data_plane.selected_fields is not None
+    assert "prompt_ids_for_adv" not in data_plane.selected_fields
+
+
 def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -345,8 +419,12 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
+        grpo=SimpleNamespace(
+            seq_logprob_error_threshold=2.0,
+            num_generations_per_prompt=2,
+        )
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -356,7 +434,7 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
-        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        sample_ids=_two_rollouts_per_group_sample_ids(batch_size),
         fields=list(data.keys()),
     )
 
@@ -411,8 +489,12 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+        grpo=SimpleNamespace(
+            seq_logprob_error_threshold=None,
+            num_generations_per_prompt=2,
+        )
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -422,7 +504,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
-        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        sample_ids=_two_rollouts_per_group_sample_ids(batch_size),
         fields=list(data.keys()),
     )
 
@@ -471,8 +553,12 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
+        grpo=SimpleNamespace(
+            seq_logprob_error_threshold=2.0,
+            num_generations_per_prompt=2,
+        )
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -482,7 +568,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
-        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        sample_ids=_two_rollouts_per_group_sample_ids(batch_size),
         fields=list(data.keys()),
     )
 
@@ -524,8 +610,12 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+        grpo=SimpleNamespace(
+            seq_logprob_error_threshold=None,
+            num_generations_per_prompt=2,
+        )
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -535,7 +625,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
-        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        sample_ids=_two_rollouts_per_group_sample_ids(batch_size),
         fields=list(data.keys()),
     )
 

@@ -66,6 +66,7 @@ from nemo_rl.algorithms.loss import (
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
+    build_rollout_group_ids_from_sample_ids,
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
@@ -228,6 +229,14 @@ def _apply_dynamic_sampling(
         ds_metrics["dynamic_sampling_num_discarded_valid_samples"] = (
             n - train_prompts_size
         )
+
+    # Each generation batch initially assigns dense group IDs starting at zero.
+    # Rebuild them after cache concatenation so groups from different generation
+    # batches cannot collide. Dynamic sampling may retain only part of a group,
+    # so validate the sample-ID format without requiring a complete group here.
+    pending_carry["prompt_ids_for_adv"] = (
+        build_rollout_group_ids_from_sample_ids(pending_meta.sample_ids)
+    )
 
     unfiltered_for_log = torch.cat(pending_unfiltered_rewards)[:train_prompts_size]
     return pending_meta, pending_carry, [], True, ds_metrics, unfiltered_for_log
@@ -688,6 +697,14 @@ def grpo_train_sync(
                 # now back on the driver where they belong (no bulk
                 # touched by any of these ops).
                 with timer.time("reward_calculation"):
+                    # TQ sample IDs encode the rollout-group UUID. Use that
+                    # explicit identity instead of media-blind prompt tokens.
+                    driver_carry["prompt_ids_for_adv"] = (
+                        build_rollout_group_ids_from_sample_ids(
+                            meta.sample_ids,
+                            expected_group_size=master_config.grpo.num_generations_per_prompt,
+                        )
+                    )
                     driver_carry = scale_rewards(
                         driver_carry,
                         master_config.grpo.reward_scaling,
