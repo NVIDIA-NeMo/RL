@@ -42,7 +42,13 @@ from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_GROUP_ATTEMPT_KEY,
+    NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    Completion,
+    PromptGroupRecord,
+)
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutManager,
@@ -165,11 +171,8 @@ def _make_manager(
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = 1
     mgr._tq_buffer = buffer
-<<<<<<< HEAD
     mgr._recovery_ledger = RolloutRecoveryLedger()
-=======
     mgr._env_handles = {}
->>>>>>> bf0a75312 (test(sc): unit coverage for token capture and rebased SC fixtures)
     mgr._weight_version = 0
     mgr._retry_policy = (
         retry_policy
@@ -633,6 +636,9 @@ def _nemo_gym_impl(mask_env_flagged_samples, reward_penalty_config=None):
         max_seq_len=100,
         max_rollout_turns=1,
         generation_config={
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_new_tokens": 100,
             "stop_strings": None,
             "stop_token_ids": None,
             "top_k": None,
@@ -779,6 +785,40 @@ def test_nemo_gym_reward_penalty_metrics_compute_fractional_rate():
     )
 
     assert metrics == {"empty_final_answer_rate": 1 / 3}
+
+
+def test_nemo_gym_build_inputs_stamps_logical_group_coordinates():
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 3
+    input_sample = {"extra_env_info": {"responses_create_params": {}}}
+
+    rows = impl._build_inputs(input_sample)
+
+    assert len({row[NEMO_GYM_GROUP_ID_KEY] for row in rows}) == 1
+    assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0]
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2]
+    assert [row["_rowidx"] for row in rows] == [0, 1, 2]
+
+
+def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 2
+    input_sample = {
+        "extra_env_info": {
+            NEMO_GYM_GROUP_ATTEMPT_KEY: 2,
+            NEMO_GYM_GROUP_ID_KEY: "stable-group",
+            "responses_create_params": {},
+        }
+    }
+
+    rows = impl._build_inputs(input_sample)
+
+    assert [row[NEMO_GYM_GROUP_ID_KEY] for row in rows] == [
+        "stable-group",
+        "stable-group",
+    ]
+    assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [2, 2]
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1]
 
 
 # ---------------------------------------------------------------------------

@@ -1385,6 +1385,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
+    ctrl._finalizer_metrics_by_group = {}
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
