@@ -26,6 +26,7 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_PORT_RANGE_LOW,
     _get_free_consecutive_ports_local,
 )
+from nemo_rl.models.generation.sglang.config import get_sglang_quantization_scheme
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import _format_v6_uri
 from nemo_rl.models.generation.sglang.utils.patches import _apply_sglang_compat_patches
 from nemo_rl.models.generation.sglang.utils.ray_utils import get_current_node_ip
@@ -450,6 +451,9 @@ class SGLangGenerationWorker:
     ):
         sglang_cfg_inner = self.sglang_cfg["sglang_cfg"]
         sglang_server_cfg = sglang_cfg_inner["sglang_server_config"]
+        quantization_scheme = get_sglang_quantization_scheme(
+            sglang_cfg_inner["quantization"]
+        )
         _gpus_per_engine = (
             self.num_gpus_per_engine or sglang_server_cfg["num_gpus_per_engine"]
         )
@@ -488,6 +492,12 @@ class SGLangGenerationWorker:
             # always enable draft weights cpu backup so that we run training without mtp weights.
             "enable_draft_weights_cpu_backup": True,
         }
+        if quantization_scheme == "mxfp8":
+            # SGLang discovers checkpoint quantization after resolving its GEMM
+            # backend. Pass it explicitly so MXFP8 selects the Blackwell
+            # FlashInfer path instead of the ragged-shape-incompatible Triton
+            # fallback.
+            kwargs["quantization"] = quantization_scheme
 
         for key in [
             "dtype",
