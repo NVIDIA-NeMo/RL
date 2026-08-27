@@ -392,11 +392,8 @@ def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
     assert teacher_topology is None
 
 
-def test_single_controller_mopd_recipe_resolves_to_runtime_contract(
-    tmp_path, monkeypatch
-):
+def test_single_controller_mopd_recipe_resolves_to_runtime_contract():
     """The inherited recipe resolves exactly as the SC entrypoint consumes it."""
-    monkeypatch.setenv("HF_HOME", str(tmp_path / "huggingface"))
     register_omegaconf_resolvers()
     repo_root = Path(__file__).resolve().parents[3]
     recipe = repo_root / (
