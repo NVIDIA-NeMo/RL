@@ -5056,12 +5056,12 @@ def async_grpo_train(
                         train_data["advantages"], master_config.grpo
                     )
 
-                print("▶ Preparing for training...")
+                print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
                     policy.prepare_for_training()
                     POLICY_GENERATION_STALE = True
 
-                print("▶ Training policy...")
+                print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
                     train_results = policy.train(
                         train_data,
@@ -5090,7 +5090,7 @@ def async_grpo_train(
                     and policy_generation.wake_carries_weight_updates()
                 )
 
-                print("🔄 Synchronizing policy weights to trajectory collector…")
+                print("🔄 Synchronizing policy weights to trajectory collector…", flush=True)
                 if defer_wake_for_save:
                     # Wake-deferral (checkpoint scheduling, which the backend
                     # cannot see): the engine is about to be saved, so leave it
@@ -5504,7 +5504,8 @@ def async_grpo_train(
                     logger,
                 )
 
-            print("\n📊 Training Results:")
+            print("\n📊 Training Results:", flush=True)
+            print(f"  • Step: {step + 1}")
             print(f"  • Loss: {metrics['loss']:.4f}")
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
