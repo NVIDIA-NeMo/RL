@@ -585,3 +585,47 @@ class TestTheRefitRunsOffTheActorsEventLoop:
             asyncio.run(await_off_loop(lambda: None))
 
         assert seen and all(t.daemon for t in seen)
+
+
+def test_the_release_runs_on_the_callers_cuda_device(monkeypatch):
+    """The CUDA device is thread-local, and a fresh thread starts on device 0.
+
+    Job 6524733 is the regression this pins. recovery-reshard-refit went from passing to a
+    1800s wedge, and its victim was SIGKILLed -- ActorDiedError, genuinely gone -- so the
+    abort had no peer to wait on and still did not return within 30s. The same trap cost
+    job 6510914 a run when the refit first moved off the event loop, which is why
+    megatron_policy_worker asserts against device drift after setup.
+    """
+    import torch
+
+    from nemo_rl.distributed.refit_watchdog import release_within
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    device_when_released = []
+    current = []
+    monkeypatch.setattr(torch.cuda, "set_device", lambda d: current.append(d))
+
+    release_within(
+        lambda: device_when_released.append(current[-1] if current else None),
+        5.0,
+        "the test communicator",
+    )
+
+    assert device_when_released == [3], (
+        "release_within must set the caller's device inside the release thread; "
+        f"saw {device_when_released}. ncclCommAbort has to run against the "
+        "communicator's own device or it does not retire."
+    )
+
+
+def test_the_release_still_runs_without_cuda(monkeypatch):
+    """Unit tests and CPU-only deployments must not trip over the device pinning."""
+    import torch
+
+    from nemo_rl.distributed.refit_watchdog import release_within
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    ran = []
+    release_within(lambda: ran.append(True), 5.0, "the test communicator")
+    assert ran == [True]

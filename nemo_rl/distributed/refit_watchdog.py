@@ -201,10 +201,24 @@ def release_within(release, budget_s: float, what: str) -> None:
     reads a result: the release exists to stop resources accumulating across rebuilds, so
     a release that never finishes costs one stuck thread, while waiting on it costs the run.
     """
+    import torch
+
+    # THE CUDA DEVICE IS THREAD-LOCAL, and a fresh thread starts on device 0. Job 6510914
+    # cost a run to exactly this when the refit first moved off the event loop, and
+    # megatron_policy_worker asserts against the same "device drift" after setup. Captured
+    # here, on the caller's thread, and re-set inside the release -- ncclCommAbort has to
+    # run against the communicator's own device or it does not retire.
+    #
+    # Job 6524733 is what happens without it: recovery-reshard-refit regressed from passing
+    # to a wedge, and its victim was SIGKILLed -- ActorDiedError, genuinely gone -- so the
+    # abort had nothing to wait for and still did not return in 30s.
+    device = torch.cuda.current_device() if torch.cuda.is_available() else None
     finished = threading.Event()
 
     def _release() -> None:
         try:
+            if device is not None:
+                torch.cuda.set_device(device)
             release()
         except Exception:  # noqa: BLE001 - a failed release must not mask the rebuild
             pass
