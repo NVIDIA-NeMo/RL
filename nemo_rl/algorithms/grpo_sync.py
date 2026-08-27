@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -86,6 +86,7 @@ from nemo_rl.utils.logger import Logger, print_message_log_samples
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.trace import Tracer, resolve_trace_config, save_trace
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
 
@@ -404,7 +405,35 @@ def grpo_train_sync(
     Parity with the legacy path is verified by running the same config
     against both entrypoints and diffing the wandb runs.
     """
-    timer = Timer()
+    trace_enabled, trace_output_path = resolve_trace_config(master_config.logger)
+    driver_trace = Tracer(
+        "driver",
+        virtual_process_name="grpo_sync_driver_events",
+        process_sort_index=0,
+        virtual_process_sort_index=1,
+        enabled=trace_enabled,
+    )
+    timer = Timer(context={"worker": "driver"}, trace=driver_trace)
+    trace_saved = False
+    rollout_actor: Any = None
+
+    def _save_sync_trace() -> None:
+        nonlocal trace_saved
+        if trace_saved:
+            return
+        trace_saved = True
+        driver_trace.finalize_open_spans()
+        trace_actors = (rollout_actor,) if rollout_actor is not None else ()
+        try:
+            save_trace(
+                driver_trace.events(),
+                actors=trace_actors,
+                output_path=trace_output_path,
+            )
+        except Exception as error:
+            warnings.warn(f"Could not save GRPO Perfetto trace: {error}", stacklevel=2)
+
+    driver_trace.instant("grpo_training_start", args={"mode": "sync_tq"})
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -529,6 +558,7 @@ def grpo_train_sync(
             print(stop_message, flush=True)
             # Flush pending checkpoint finalization, like the other early returns.
             checkpointer.shutdown()
+            _save_sync_trace()
             return
 
     if master_config.data["use_multiple_dataloader"]:
@@ -570,6 +600,15 @@ def grpo_train_sync(
                     flush=True,
                 )
 
+            driver_trace.instant(
+                "grpo_step_start",
+                args={
+                    "mode": "sync_tq",
+                    "step": total_steps + 1,
+                    "epoch": current_epoch + 1,
+                },
+            )
+            driver_trace.counter("grpo_training_step", {"step": total_steps + 1})
             maybe_gpu_profile_step(policy, total_steps + 1)
             maybe_gpu_profile_step(policy_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
@@ -1344,6 +1383,14 @@ def grpo_train_sync(
                 prefix="timing/train",
                 step_finished=True,
             )
+            driver_trace.instant(
+                "grpo_step_complete",
+                args={
+                    "mode": "sync_tq",
+                    "step": total_steps + 1,
+                    "reward": float(np.mean(rewards.numpy())),
+                },
+            )
 
             dynamic_sampling_num_gen_batches = 0
 
@@ -1361,11 +1408,13 @@ def grpo_train_sync(
             if early_stop_message is not None:
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
+                _save_sync_trace()
                 return
             if should_save_by_timeout:
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
+                _save_sync_trace()
                 return
             if total_steps >= max_num_steps:
                 checkpointer.shutdown()
@@ -1374,6 +1423,7 @@ def grpo_train_sync(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
                 )
+                _save_sync_trace()
                 return
 
         current_epoch += 1
@@ -1385,3 +1435,4 @@ def grpo_train_sync(
     # so without this the daemon finalization thread could be killed before the
     # final tmp_step_N is renamed.
     checkpointer.shutdown()
+    _save_sync_trace()

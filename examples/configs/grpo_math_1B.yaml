@@ -508,6 +508,9 @@ logger:
   mlflow_enabled: false  # Disable MLflow logging
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  perfetto:
+    enable: false
+    name: "grpo_perfetto.json"
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-logger"

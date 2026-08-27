@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -58,6 +58,7 @@ from nemo_rl.experience.rollouts import (
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.r3_trace import trace_rollout_payload
+from nemo_rl.utils.trace import Tracer, resolve_trace_config
 
 # Carry keys producible by the rollout actor only when the caller opts in.
 # These are np.ndarray(object) per-row arrays from decompose_message_log; the
@@ -130,6 +131,15 @@ class SyncRolloutActor:
         self.tokenizer = tokenizer
         self.task_to_env = task_to_env
         self.master_config = master_config
+        trace_enabled, _ = resolve_trace_config(master_config.logger)
+        self._trace = Tracer(
+            "sync_rollout_actor",
+            virtual_process_name="grpo_sync_rollouts",
+            process_sort_index=10,
+            virtual_process_sort_index=11,
+            enabled=trace_enabled,
+        )
+        self._trace_batch_counter = 0
 
         from nemo_rl.data_plane import build_data_plane_client
 
@@ -241,6 +251,8 @@ class SyncRolloutActor:
             task_to_env=task_to_env,
             greedy=False,
         )
+        self._trace_batch_counter += 1
+        trace_prefix = f"batch {self._trace_batch_counter}"
 
         # Rollout dispatch (mirrors grpo_sync.py:294-349).
         if should_use_nemo_gym(cfg):
@@ -265,13 +277,17 @@ class SyncRolloutActor:
                 debug_payload_metrics=cfg.grpo.debug_payload_metrics,
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
-        else:
-            runner = (
-                run_async_multi_turn_rollout
-                if should_use_async_rollouts(cfg.policy["generation"])
-                else run_multi_turn_rollout
+        elif should_use_async_rollouts(cfg.policy["generation"]):
+            final_batch, rollout_metrics = run_async_multi_turn_rollout(
+                **common,
+                max_seq_len=cfg.policy["max_total_sequence_length"],
+                max_rollout_turns=cfg.grpo.max_rollout_turns,
+                deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
+                tracer=self._trace,
+                trace_prefix=trace_prefix,
             )
-            final_batch, rollout_metrics = runner(
+        else:
+            final_batch, rollout_metrics = run_multi_turn_rollout(
                 **common,
                 max_seq_len=cfg.policy["max_total_sequence_length"],
                 max_rollout_turns=cfg.grpo.max_rollout_turns,
@@ -417,6 +433,10 @@ class SyncRolloutActor:
         else:
             gen_metrics = None
         return meta, BatchedDataDict(driver_carry), rollout_metrics, gen_metrics
+
+    def collect_trace(self, timing: bool = False) -> int | list[dict[str, Any]]:
+        """Return actor-local Perfetto events for driver-side trace merging."""
+        return self._trace.collect_trace(timing=timing)
 
     def shutdown(self) -> None:
         try:

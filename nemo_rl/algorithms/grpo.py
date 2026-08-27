@@ -146,6 +146,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.trace import Tracer, resolve_trace_config, save_trace
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
@@ -2827,7 +2828,29 @@ def grpo_train(
     processor: Optional[AutoProcessor] = None,
 ) -> None:
     """Run GRPO training algorithm."""
-    timer = Timer(context={"worker": "driver"})
+    trace_enabled, trace_output_path = resolve_trace_config(master_config.logger)
+    driver_trace = Tracer(
+        "driver",
+        virtual_process_name="grpo_sync_rollouts",
+        process_sort_index=0,
+        virtual_process_sort_index=1,
+        enabled=trace_enabled,
+    )
+    timer = Timer(context={"worker": "driver"}, trace=driver_trace)
+    trace_saved = False
+
+    def _save_sync_trace() -> None:
+        nonlocal trace_saved
+        if trace_saved:
+            return
+        trace_saved = True
+        driver_trace.finalize_open_spans()
+        try:
+            save_trace(driver_trace.events(), output_path=trace_output_path)
+        except Exception as error:
+            warnings.warn(f"Could not save GRPO Perfetto trace: {error}", stacklevel=2)
+
+    driver_trace.instant("grpo_training_start", args={"mode": "sync"})
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -2919,6 +2942,7 @@ def grpo_train(
             print(stop_message, flush=True)
             # Flush pending checkpoint finalization, like the other early returns.
             checkpointer.shutdown()
+            _save_sync_trace()
             return
 
     if master_config.data["use_multiple_dataloader"]:
@@ -2956,6 +2980,15 @@ def grpo_train(
                     flush=True,
                 )
 
+            driver_trace.instant(
+                "grpo_step_start",
+                args={
+                    "mode": "sync",
+                    "step": total_steps + 1,
+                    "epoch": current_epoch + 1,
+                },
+            )
+            driver_trace.counter("grpo_training_step", {"step": total_steps + 1})
             maybe_gpu_profile_step(policy, total_steps + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
@@ -3124,6 +3157,8 @@ def grpo_train(
                             deduplicate_multimodal_data=(
                                 master_config.grpo.deduplicate_multimodal_data
                             ),
+                            tracer=driver_trace,
+                            trace_prefix=f"step {total_steps + 1}",
                         )
                     else:
                         repeated_batch, rollout_metrics = run_multi_turn_rollout(
@@ -3888,6 +3923,14 @@ def grpo_train(
                 prefix="timing/train",
                 step_finished=True,
             )
+            driver_trace.instant(
+                "grpo_step_complete",
+                args={
+                    "mode": "sync",
+                    "step": total_steps + 1,
+                    "reward": float(np.mean(rewards.numpy())),
+                },
+            )
 
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
@@ -3911,11 +3954,13 @@ def grpo_train(
             if early_stop_message is not None:
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
+                _save_sync_trace()
                 return
             if should_save_by_timeout:
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
+                _save_sync_trace()
                 return
             if total_steps >= max_num_steps:
                 checkpointer.shutdown()
@@ -3924,6 +3969,7 @@ def grpo_train(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
                 )
+                _save_sync_trace()
                 return
 
         current_epoch += 1
@@ -3935,6 +3981,7 @@ def grpo_train(
     # so without this the daemon finalization thread would be killed before the
     # final tmp_step_N is renamed.
     checkpointer.shutdown()
+    _save_sync_trace()
 
 
 def validate(
@@ -4272,7 +4319,38 @@ def async_grpo_train(
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
-    timer = Timer(context={"worker": "driver"})
+    trace_enabled, trace_output_path = resolve_trace_config(master_config.logger)
+    driver_trace = Tracer(
+        "driver",
+        virtual_process_name="grpo_async_driver_events",
+        process_sort_index=0,
+        virtual_process_sort_index=1,
+        enabled=trace_enabled,
+    )
+    timer = Timer(context={"worker": "driver"}, trace=driver_trace)
+    trace_saved = False
+    replay_buffer: Any = None
+    trajectory_collector: Any = None
+
+    def _save_async_trace() -> None:
+        nonlocal trace_saved
+        if trace_saved:
+            return
+        trace_saved = True
+        driver_trace.finalize_open_spans()
+        trace_actors = (
+            (trajectory_collector,) if trajectory_collector is not None else ()
+        )
+        try:
+            save_trace(
+                driver_trace.events(),
+                actors=trace_actors,
+                output_path=trace_output_path,
+            )
+        except Exception as error:
+            warnings.warn(f"Could not save GRPO Perfetto trace: {error}", stacklevel=2)
+
+    driver_trace.instant("grpo_training_start", args={"mode": "async"})
     training_wall_start = time.perf_counter()
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
@@ -4507,6 +4585,7 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
+            _save_async_trace()
             return
     else:
         print("🔄 Preparing policy generation for inference...")
@@ -4518,6 +4597,7 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
+            _save_async_trace()
             return
 
     # Generation must hold the policy's real weights before any backend starts
@@ -4589,6 +4669,7 @@ def async_grpo_train(
             # exits right after this return.
             checkpointer.shutdown()
             try:
+                _save_async_trace()
                 ray.kill(trajectory_collector)
             except Exception as e:
                 print(f"Error stopping trajectory collector: {e}")
@@ -4694,6 +4775,15 @@ def async_grpo_train(
             print(
                 f"\n{'=' * 25} Step {step + 1}/{master_config.grpo.max_num_steps} {'=' * 25}"
             )
+            driver_trace.instant(
+                "grpo_step_start",
+                args={
+                    "mode": "async",
+                    "step": step + 1,
+                    "weight_version": weight_version,
+                },
+            )
+            driver_trace.counter("grpo_training_step", {"step": step + 1})
             maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
@@ -5608,6 +5698,16 @@ def async_grpo_train(
                 prefix="timing/train",
                 step_finished=True,
             )
+            driver_trace.instant(
+                "grpo_step_complete",
+                args={
+                    "mode": "async",
+                    "step": step + 1,
+                    "weight_version": weight_version,
+                    "avg_trajectory_age": float(avg_trajectory_age),
+                    "buffer_size": int(buffer_size_current),
+                },
+            )
 
             timer.reset()
             step += 1
@@ -5639,6 +5739,8 @@ def async_grpo_train(
             checkpointer.shutdown()
         except Exception as e:
             print(f"Error finalizing pending checkpoint: {e}")
+
+        _save_async_trace()
 
         print("🛑 Stopping trajectory collection...")
         try:
