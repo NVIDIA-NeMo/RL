@@ -481,6 +481,7 @@ def test_get_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
         # SingleController-only fields; None for every other algorithm.
         "sampler_name": None,
         "trainer_version": None,
+        "sampler_dispatch_index": None,
     }
     assert "total_valid_tokens" not in loaded_state
     assert not hasattr(save_state, "val:accuracy")
