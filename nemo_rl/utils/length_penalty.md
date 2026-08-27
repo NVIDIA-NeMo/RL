@@ -123,6 +123,7 @@ grpo:
 | `profiled_length_penalty` | Flat penalty for rollouts longer than a per-prompt profiled-length threshold. |
 | `profiled_length_n_std` | Number of standard deviations used in `mean + n_std * std` for profiled-length thresholding. |
 | `profiled_length_min_samples` | Minimum PASSING profiled rollouts required; below this no profiled penalty is applied. |
+| `pass_rate_length_penalty_weight` | Weight of the pass-rate-scaled (MAI-style) dense length penalty; 0 disables. |
 | `profile_band_total` | Enables per-prompt `{a,b,f}` multiplier on total length for correct rollouts. |
 | `profile_band_reasoning` | Enables per-prompt `{a,b,f}` multiplier on reasoning length for correct rollouts. |
 | `profile_band_answer` | Enables per-prompt `{a,b,f}` multiplier on answer length for correct rollouts. |
@@ -529,6 +530,44 @@ grpo:
       group_length_penalty_profile_gate_channel: total
       group_length_penalty_profile_gate_field: a
       group_length_penalty_profile_gate_positive_only: true
+```
+
+### 8. Pass-Rate-Scaled Length Penalty (MAI-style)
+
+Config keys:
+
+- `pass_rate_length_penalty_weight`
+
+Implements the MAI-paper length penalty `- w_len * R_len(y_i)` with
+
+```text
+R_len(y_i) = rho_q * |y_i| / l_max
+```
+
+where `rho_q` is the prompt group's pass rate (fraction of rollouts with `reward > 0`),
+`|y_i|` is the rollout's total generated length (reasoning + answer, in `length_type` units),
+and `l_max` is the longest total length in the group (not a hyperparameter — the penalty is
+self-normalizing per group).
+
+Properties:
+
+- Dense pressure scaled by difficulty: easy prompts (high pass rate) get strong shortening
+  pressure; hard prompts (low pass rate) get little.
+- All-wrong groups (`rho_q = 0`) receive exactly zero penalty by construction, preserving the
+  no-gradient-without-correctness-signal invariant.
+- Applied to correct rollouts only (consistent with the rest of this module; under binary
+  rewards plus the 0-clamp this matches the paper's behavior for wrong rollouts).
+- The longest correct rollout in a group loses exactly `w_len * rho_q`; shorter ones lose
+  proportionally less.
+
+Example:
+
+```yaml
+grpo:
+  length_penalty:
+    default:
+      enabled: true
+      pass_rate_length_penalty_weight: 0.2
 ```
 
 ## Practical Notes

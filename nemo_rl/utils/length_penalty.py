@@ -62,6 +62,7 @@ _PARAM_KEYS = (
     "profiled_length_penalty",
     "profiled_length_n_std",
     "profiled_length_min_samples",
+    "pass_rate_length_penalty_weight",
     "profile_band_total",
     "profile_band_reasoning",
     "profile_band_answer",
@@ -253,6 +254,7 @@ def apply_group_length_penalties(
     all_zmad_answer_adj = [0.0] * n
     all_zmad_total_adj = [0.0] * n
     all_profiled_length_adj = [0.0] * n
+    all_pass_rate_len_adj = [0.0] * n
     reasoning_lengths = [0] * n
     answer_lengths = [0] * n
     total_lengths = [0] * n
@@ -378,6 +380,29 @@ def apply_group_length_penalties(
                         if total_lengths[idx] >= threshold:
                             all_profiled_length_adj[idx] = -plp
 
+        # Pass-rate-scaled length penalty (MAI): -w * rho_q * |y_i| / l_max on
+        # correct rollouts, where rho_q is the group's pass rate. Easy prompts
+        # (high pass rate) get strong shortening pressure; hard prompts get
+        # little; all-wrong groups (rho_q = 0) get exactly none.
+        prlp_w = params.get("pass_rate_length_penalty_weight", 0.0)
+        if prlp_w > 0.0:
+            pass_rate = sum(
+                1 for k in range(group_size) if original_rewards[g + k] > 0
+            ) / float(group_size)
+            if pass_rate > 0.0:
+                # l_max is the group's longest rollout, so the penalty is
+                # self-normalizing: the longest correct rollout loses exactly
+                # w * rho_q, shorter ones proportionally less.
+                l_max = float(max(group_total[:group_size]))
+                if l_max > 0.0:
+                    for k in range(group_size):
+                        idx = g + k
+                        if original_rewards[idx] <= 0:
+                            continue
+                        all_pass_rate_len_adj[idx] = (
+                            -prlp_w * pass_rate * total_lengths[idx] / l_max
+                        )
+
     # Phase 2: debug print (only when verbose flag is set)
     if verbose:
         num_groups = n // num_gens if num_gens > 0 else 0
@@ -457,7 +482,13 @@ def apply_group_length_penalties(
                 idx = g + k
                 orig = original_rewards[idx]
                 profiled_adj = all_profiled_length_adj[idx] if all_adjustments[idx] >= 0 else 0.0
-                final = orig + all_adjustments[idx] + profiled_adj
+                final = max(
+                    0.0,
+                    orig
+                    + all_adjustments[idx]
+                    + profiled_adj
+                    + all_pass_rate_len_adj[idx],
+                )
                 print(
                     f"    [{k}] reward={orig:.4f}"
                     f" reasoning_len={reasoning_lengths[idx]}"
@@ -476,6 +507,7 @@ def apply_group_length_penalties(
                     f" zmad_a={all_zmad_answer_adj[idx]:+.4f}"
                     f" zmad_t={all_zmad_total_adj[idx]:+.4f}"
                     f" profiled_len_adj={all_profiled_length_adj[idx]:+.4f}"
+                    f" pass_rate_len_adj={all_pass_rate_len_adj[idx]:+.4f}"
                     f" final_reward={final:.4f}",
                     flush=True,
                 )
@@ -492,7 +524,7 @@ def apply_group_length_penalties(
         # group-relative channels should not be double-penalized for the same
         # excess length.
         profiled_adj = all_profiled_length_adj[i] if all_adjustments[i] >= 0 else 0.0
-        additive_delta = all_adjustments[i] + profiled_adj
+        additive_delta = all_adjustments[i] + profiled_adj + all_pass_rate_len_adj[i]
         additive_base_rewards[i] = original_rewards[i] + additive_delta
         # Rewards here are binary, so any negative value is penalty-created.
         # Length penalties may wipe a reward out but never flip its sign; this

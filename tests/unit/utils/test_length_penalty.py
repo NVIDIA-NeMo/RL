@@ -383,6 +383,62 @@ class TestProfiledLengthPenalty:
         assert rewards_of(results) == pytest.approx([1.0, 0.7])
 
 
+class TestPassRateLengthPenalty:
+    """MAI-style penalty: -w * rho_q * |y_i| / l_max on correct rollouts."""
+
+    def cfg(self, w=0.2, num_gens=2):
+        return make_config(
+            default={"enabled": True, "pass_rate_length_penalty_weight": w},
+            num_gens=num_gens,
+        )
+
+    def test_all_correct_group_scales_by_relative_length(self):
+        # rho_q = 1.0, l_max = 20: penalties are w*10/20 and w*20/20.
+        results = [
+            make_result("12345", "12345", 1.0),  # total 10 -> -0.1
+            make_result("1234567890", "1234567890", 1.0),  # total 20 -> -0.2
+        ]
+        apply_group_length_penalties(results, self.cfg(w=0.2))
+        assert rewards_of(results) == pytest.approx([0.9, 0.8])
+
+    def test_pass_rate_scales_penalty(self):
+        # 1 of 2 correct -> rho_q = 0.5; only the correct rollout is penalized:
+        # 1.0 - 0.2 * 0.5 * 20/20 = 0.9. The wrong rollout stays at 0.
+        results = [
+            make_result("1234567890", "1234567890", 1.0),  # l_max contributor
+            make_result("12345", "12345", 0.0),
+        ]
+        apply_group_length_penalties(results, self.cfg(w=0.2))
+        assert rewards_of(results) == pytest.approx([0.9, 0.0])
+
+    def test_all_wrong_group_gets_zero_penalty(self):
+        # rho_q = 0 -> no penalty at all, group stays variance-free.
+        results = [
+            make_result("12345", "12345", 0.0),
+            make_result("1234567890", "1234567890", 0.0),
+        ]
+        apply_group_length_penalties(results, self.cfg(w=0.2))
+        assert rewards_of(results) == pytest.approx([0.0, 0.0])
+
+    def test_zero_weight_is_noop(self):
+        results = [
+            make_result("12345", "12345", 1.0),
+            make_result("1234567890", "1234567890", 1.0),
+        ]
+        apply_group_length_penalties(results, self.cfg(w=0.0))
+        assert rewards_of(results) == pytest.approx([1.0, 1.0])
+
+    def test_wrong_rollout_length_still_sets_normalizer(self):
+        # l_max comes from the whole group (longest is a wrong rollout with
+        # total 40): the correct rollout (total 20) loses w * rho * 20/40.
+        results = [
+            make_result("1234567890", "1234567890", 1.0),
+            make_result("1" * 20, "1" * 20, 0.0),
+        ]
+        apply_group_length_penalties(results, self.cfg(w=0.2))
+        assert rewards_of(results) == pytest.approx([1.0 - 0.2 * 0.5 * 0.5, 0.0])
+
+
 class TestReviewFixes:
     """Regression tests for review findings on PR #3852."""
 
