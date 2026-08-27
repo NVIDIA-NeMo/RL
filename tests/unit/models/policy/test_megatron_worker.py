@@ -826,6 +826,7 @@ def test_offload_after_refit_routes_cleanup_by_mode(
     worker.offload_optimizer_for_refit = offload_optimizer
     worker.move_optimizer = MagicMock()
     worker.offload_before_refit = MagicMock()
+    worker.finalize_async_save = MagicMock()
     collect = MagicMock()
     empty_cache = MagicMock()
     monkeypatch.setattr(
@@ -845,6 +846,7 @@ def test_offload_after_refit_routes_cleanup_by_mode(
 
     worker.offload_after_refit()
 
+    worker.finalize_async_save.assert_called_once_with()
     worker.move_model.assert_called_once_with(model, "cpu")
     model.eval.assert_called_once_with()
     if slim:
