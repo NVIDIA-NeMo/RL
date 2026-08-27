@@ -136,9 +136,7 @@ class AsyncTrajectoryCollector:
         async_config: AsyncGRPOConfig | AsyncPPOConfig
         if isinstance(master_config, GRPOMasterConfig):
             algorithm_config = master_config.grpo
-            grpo_async_config = algorithm_config.async_grpo
-            assert grpo_async_config is not None
-            async_config = grpo_async_config
+            async_config = algorithm_config.async_grpo  # type: ignore
             self._deduplicate_multimodal_data = (
                 algorithm_config.deduplicate_multimodal_data
             )
@@ -146,7 +144,7 @@ class AsyncTrajectoryCollector:
             self._max_generation_failures = async_config.max_generation_failures
         elif isinstance(master_config, PPOMasterConfig):
             algorithm_config = master_config.ppo
-            async_config = algorithm_config.async_ppo
+            async_config = algorithm_config.async_ppo  # type: ignore
             self._deduplicate_multimodal_data = False
             self._debug_payload_metrics = False
             self._max_generation_failures = 0

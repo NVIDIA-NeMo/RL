@@ -8,8 +8,8 @@ topology first, then select one non-colocated transport with
 
 | Topology | `refit_transport` | Transport | Use when |
 |---|---|---|---|
-| `colocated.enabled: true` | `null` | CUDA IPC or HTTP | Policy and rollout workers share GPUs; vLLM uses IPC and SGLang uses HTTP. |
-| `colocated.enabled: false` | `null` | NCCL broadcast | You want the default full-weight path without extra dependencies. |
+| `colocated.enabled: true` | `null` | CUDA IPC | Policy and rollout workers share GPUs; vLLM uses ZMQ plus CUDA IPC handles and SGLang uses Ray CUDA IPC. |
+| `colocated.enabled: false` | `null` | NCCL broadcast | vLLM uses the default full-weight collective; SGLang uses its own weight-update group. |
 | `colocated.enabled: false` | `nccl_reshard` | NCCL reshard | Provides the best performance for large models (>100s B models). |
 | `colocated.enabled: false` | `vllm_zmq_sparse` | Sparse delta over ZeroMQ | The link is bandwidth-limited and workers can reach a relay over TCP. |
 | `colocated.enabled: false` | `vllm_s3_sparse` | Sparse delta through S3 | Workers communicate through shared object storage. |
@@ -23,17 +23,20 @@ delta and NIXL cannot both be active.
 
 | Transport | Generation backend | Policy backend | Quantization and MoE |
 |---|---|---|---|
-| Colocated IPC/HTTP | vLLM or SGLang | DTensor or Megatron | Uses the generation backend's standard loader. |
+| Colocated CUDA IPC | vLLM or SGLang | DTensor or Megatron | Uses the generation backend's standard loader. |
 | NCCL | vLLM or Megatron | DTensor or Megatron | Uses the standard full-weight loader. |
+| SGLang NCCL weight-update group | SGLang | Megatron | Trainer rank 0 broadcasts finalized HF tensors to the engine leaders. |
 | NCCL reshard | vLLM | Megatron | Requires matching BF16 or blockwise FP8 precision; Megatron ETP must be 1. Currently supporting Megatron+vLLM backends. |
 | Sparse delta | vLLM | Megatron | BF16/FP16, unquantized rollout only. |
 | NIXL, full weights | vLLM | DTensor or Megatron | Supports the standard full-weight FP8 loader. DTensor FP8 KV-cache scale transfer is not yet supported. |
 | NIXL, sharded experts | vLLM | DTensor or Megatron | Unquantized BF16/FP16 Triton MoE only; FP8/MXFP8 and dynamic expert placement are rejected. |
 
-Non-colocated SGLang generation is not supported. The NIXL restrictions are on
-the generation backend; both Megatron and DTensor policy workers can send
-weights. Sparse delta is currently limited to GRPO. NIXL is initialized by the
-GRPO and distillation setup paths; PPO currently requires colocated generation.
+Non-colocated SGLang generation is supported with a Megatron policy and
+`refit_transport: null`; it creates its own NCCL weight-update group. The NIXL
+restrictions are on the generation backend; both Megatron and DTensor policy
+workers can send weights. Sparse delta is currently limited to GRPO. NIXL is
+initialized by the GRPO and distillation setup paths; PPO currently requires
+colocated generation.
 
 ## Minimal Configuration
 

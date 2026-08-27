@@ -1158,11 +1158,6 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
-    gen_init_time_key = (
-        "megatron_generation_init_time_s"
-        if backend == "megatron"
-        else f"{backend}_init_time_s"
-    )
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
     generation_config["_debug_payload_metrics"] = grpo_config.debug_payload_metrics
     remote_transport = None
@@ -1218,9 +1213,13 @@ def setup(
     # plane exists. Default is the plain Policy class — legacy behavior.
     _make_policy = policy_factory if policy_factory is not None else Policy
 
-    def init_policy():
+    def init_policy(reserved_http_server_port: Optional[int] = None):
         """Initialize policy training workers."""
         t0 = time.perf_counter()
+        extra_policy_kwargs = {}
+        if reserved_http_server_port is not None:
+            # Colocated Megatron generation serves HTTP from the training workers.
+            extra_policy_kwargs["reserved_http_server_port"] = reserved_http_server_port
         p = _make_policy(
             cluster=train_cluster,
             config=policy_config,
@@ -1230,6 +1229,7 @@ def setup(
             optimizer_path=optimizer_path,
             init_optimizer=True,
             init_reference_model=init_reference_model,
+            **extra_policy_kwargs,
         )
         # Keep custom policy_factory call signatures backward compatible.
         p.debug_payload_metrics = grpo_config.debug_payload_metrics
@@ -1257,7 +1257,9 @@ def setup(
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
-    def init_megatron_generation(policy=None):
+    def init_megatron_generation(
+        policy=None, reserved_http_server_port: Optional[int] = None
+    ):
         """Initialize Megatron generation."""
         t0 = time.perf_counter()
         mg = MegatronGeneration(
@@ -1268,6 +1270,7 @@ def setup(
             processor=processor,
             weights_path=weights_path,
             skip_weight_load=not colocated_inference,
+            reserved_http_server_port=reserved_http_server_port,
         )
         return mg, time.perf_counter() - t0
 
@@ -1306,7 +1309,7 @@ def setup(
             parallel_wall_time = time.perf_counter() - parallel_start_time
 
             # Store timing metrics
-            setattr(setup_timing_metrics, gen_init_time_key, generation_time)
+            setup_timing_metrics.generation_init_time_s = generation_time
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.parallel_wall_time_s = parallel_wall_time
             setup_timing_metrics.parallel_init_enabled = 1.0
@@ -1320,7 +1323,7 @@ def setup(
 
             # Initialize generation engine first (clean GPU memory), then policy
             policy_generation, generation_time = init_generation_fn()
-            setattr(setup_timing_metrics, gen_init_time_key, generation_time)
+            setup_timing_metrics.generation_init_time_s = generation_time
 
             policy, policy_time = init_policy()
             setup_timing_metrics.policy_init_time_s = policy_time
@@ -1330,21 +1333,72 @@ def setup(
 
     # Handle generation-specific setup
     if backend == "megatron":
-        # Initialize training first so checkpoint conversion completes before inference starts.
-        policy, policy_time = init_policy()
-        setup_timing_metrics.policy_init_time_s = policy_time
-
-        # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
-        policy_generation, megatron_gen_time = init_megatron_generation(policy)
-        setup_timing_metrics.megatron_generation_init_time_s = megatron_gen_time
-
         if enable_nemo_gym:
-            # The Megatron inference engine must be up before its server URLs exist.
-            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
-                policy_generation.dp_openai_server_base_urls,
-                generation_config["model_name"],
+            print(
+                "  ⚡ Reserving the Megatron server address for overlapped NeMo Gym init",
+                flush=True,
             )
+            reserve_t0 = time.perf_counter()
+            reserved_url, reserved_http_server_port, port_holder = (
+                MegatronGeneration.reserve_http_server_address(
+                    train_cluster if colocated_inference else inference_cluster,
+                    policy_config,
+                )
+            )
+            reserve_time = time.perf_counter() - reserve_t0
+            setup_timing_metrics.generation_init_reserve_time_s = reserve_time
+            print(f"  ✓ Reserved Megatron server URL: {reserved_url}", flush=True)
+
+            def init_megatron_stack():
+                """Init policy then generation; rank 0 holds the reserved port."""
+                p, policy_t = init_policy(
+                    reserved_http_server_port=reserved_http_server_port
+                    if colocated_inference
+                    else None
+                )
+                pg, gen_t = init_megatron_generation(
+                    p,
+                    reserved_http_server_port=None
+                    if colocated_inference
+                    else reserved_http_server_port,
+                )
+                return p, policy_t, pg, gen_t
+
+            def init_nemo_gym():
+                """Spin up NeMo Gym servers against the reserved URL."""
+                return _spinup_nemo_gym([reserved_url], generation_config["model_name"])
+
+            init_tasks = {
+                "megatron": init_megatron_stack,
+                "nemo_gym": init_nemo_gym,
+            }
+            print(f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}", flush=True)
+            try:
+                with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                    submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
+                    results = {k: f.result() for k, f in submitted.items()}
+            finally:
+                ray.kill(port_holder)
+
+            policy, policy_time, policy_generation, megatron_gen_time = results[
+                "megatron"
+            ]
+            nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
+            setup_timing_metrics.policy_init_time_s = policy_time
+            setup_timing_metrics.generation_init_time_s = (
+                reserve_time + megatron_gen_time
+            )
+            setup_timing_metrics.generation_init_load_time_s = megatron_gen_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
+
+        else:
+            # Initialize training first so checkpoint conversion completes before inference starts.
+            policy, policy_time = init_policy()
+            setup_timing_metrics.policy_init_time_s = policy_time
+
+            # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
+            policy_generation, megatron_gen_time = init_megatron_generation(policy)
+            setup_timing_metrics.generation_init_time_s = megatron_gen_time
 
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
@@ -1467,7 +1521,11 @@ def setup(
                 policy_generation, vllm_load_time = results["vllm"]
                 policy, policy_time = results["policy"]
             nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
-            setup_timing_metrics.vllm_init_time_s = vllm_reserve_time + vllm_load_time
+            setup_timing_metrics.generation_init_time_s = (
+                vllm_reserve_time + vllm_load_time
+            )
+            setup_timing_metrics.generation_init_reserve_time_s = vllm_reserve_time
+            setup_timing_metrics.generation_init_load_time_s = vllm_load_time
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
         else:
@@ -1494,9 +1552,6 @@ def setup(
             colocated_inference=colocated_inference,
             setup_timing_metrics=setup_timing_metrics,
         )
-
-        # Capture rollout TP size on the policy once; refit calls no longer need it.
-        policy.set_rollout_num_gpus_per_engine(policy_generation.num_gpus_per_engine)
 
         print(
             f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
@@ -1603,10 +1658,18 @@ def setup(
             # Load the model weights now.
             t0 = time.perf_counter()
             policy_generation.weight_synchronizer.sync_weights()
-            setup_timing_metrics.generation_init_load_time_s = time.perf_counter() - t0
+            setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
+        if enable_nemo_gym:
+            served_urls = policy_generation.dp_openai_server_base_urls
+            if served_urls != [reserved_url]:
+                raise RuntimeError(
+                    "Megatron server came up at a different address than the one "
+                    f"pre-published to NeMo Gym: reserved {reserved_url}, serving {served_urls}."
+                )
     # if it is not colocated inference, initialize collective communication for update weights
     elif (
         not colocated_inference
+        and backend != "sglang"
         and remote_transport is None
         and checkpoint_engine_config is None
     ):
@@ -1679,6 +1742,21 @@ def setup(
             f"Using checkpoint-engine refit backend: {checkpoint_engine_config['backend']}",
             flush=True,
         )
+    elif backend == "sglang":
+        t0 = time.perf_counter()
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+        )
+        # Only exchanges refit metadata. SGLang's own weight-update group is
+        # established lazily on the first refit.
+        policy_generation.weight_synchronizer.init_communicator()
+        setup_timing_metrics.extras["sglang_weight_sync_init_time_s"] = (
+            time.perf_counter() - t0
+        )
     else:
         if getattr(
             policy_generation, "weight_synchronizer", None
@@ -1721,7 +1799,7 @@ def setup(
     )
 
     # Log worker initialization timing metrics to logger
-    print_setup_timing_summary(setup_timing_metrics, gen_init_time_key)
+    print_setup_timing_summary(setup_timing_metrics)
     logger.log_metrics(
         setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
     )
@@ -2391,9 +2469,21 @@ def refit_policy_generation(
     Returns:
         Scalar metrics reported by the selected weight synchronizer.
     """
+    # Every SGLang deployment reaches its refit through this hook: `setup`
+    # attaches an SGLang synchronizer that owns the whole lifecycle (phase
+    # transitions, engine recovery, pause/flush, transport), so SGLang never
+    # touches the branches below.
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
+
+    if isinstance(policy_generation, SGLangGeneration):
+        # Fail loudly rather than falling through to the vLLM branches, which
+        # would call methods the SGLang path does not implement.
+        raise RuntimeError(
+            "SGLang refits require policy_generation.weight_synchronizer to be "
+            "set. Attach one with create_weight_synchronizer(...) during setup."
+        )
 
     if colocated_inference:
         policy.offload_before_refit()
@@ -2420,36 +2510,21 @@ def refit_policy_generation(
                     policy.get_free_memory_bytes() * float(memory_ratio)
                 )
 
-            if isinstance(policy_generation, SGLangGeneration):
-                # Stream weights to colocated SGLang engines via CUDA IPC over HTTP.
-                futures_train = policy.stream_weights_via_http(
-                    rollout_engine_urls=policy_generation.get_rollout_engine_urls(),
-                    buffer_size_bytes=buffer_size_bytes,
-                )
-                # Wait for all workers to complete
-                ray.get(futures_train)
-                update_success = True
-            else:
-                # ZMQ IPC path: shared by vLLM and TRT-LLM colocated. Trainer
-                # streams CUDA IPC handles in chunks; receiver reconstructs
-                # tensors in-place and feeds them into the inference engine's
-                # loader.
-                futures_train = policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes,
-                    kv_scales=kv_scales,
-                )
-                futures_inference = policy_generation.update_weights_via_ipc_zmq()
-                # wait for all futures to complete
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
-                update_success = all(result for result in results if result is not None)
+            # ZMQ IPC path: shared by vLLM and TRT-LLM colocated. Trainer
+            # streams CUDA IPC handles in chunks; receiver reconstructs
+            # tensors in-place and feeds them into the inference engine's
+            # loader.
+            futures_train = policy.stream_weights_via_ipc_zmq(
+                buffer_size_bytes=buffer_size_bytes,
+                kv_scales=kv_scales,
+            )
+            futures_inference = policy_generation.update_weights_via_ipc_zmq()
+            # wait for all futures to complete
+            ray.get(futures_train)
+            results = ray.get(futures_inference)
+            update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl (vLLM) or megatron reshard
-            # SGLang haven't implemented non-colocated inference mode.
-            if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
-                )
+            # update weights through nccl (vLLM)
             futures_train = policy.broadcast_weights_for_collective(
                 kv_scales=kv_scales,
             )
