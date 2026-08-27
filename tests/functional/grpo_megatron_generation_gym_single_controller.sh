@@ -1,7 +1,9 @@
 #!/bin/bash
 # SingleController + NeMo-Gym + Megatron generation e2e smoke.
-# Mirrors grpo_async_gym_single_controller.sh
-# with the generation backend swapped to non-colocated Megatron Inference.
+# Mirrors grpo_async_gym_single_controller.sh with the generation backend
+# swapped to non-colocated Megatron Inference. The config is loaded from the
+# exemplar YAML, which resolves value-equal to that test's CLI monolith
+# everywhere but the generation backend.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath $SCRIPT_DIR/../..)
@@ -57,52 +59,15 @@ jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/da
 
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo_single_controller.py \
-    --config $PROJECT_ROOT/examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml \
-    policy.model_name=Qwen/Qwen3-0.6B \
-    policy.dtensor_cfg.enabled=false \
-    policy.megatron_cfg.enabled=true \
-    policy.megatron_cfg.tensor_model_parallel_size=1 \
-    policy.megatron_cfg.pipeline_model_parallel_size=1 \
-    policy.megatron_cfg.expert_model_parallel_size=1 \
-    policy.megatron_cfg.context_parallel_size=1 \
-    policy.megatron_cfg.sequence_parallel=false \
-    policy.generation.backend=megatron \
-    policy.generation.mcore_generation_config.expose_http_server=true \
+    --config $PROJECT_ROOT/examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml \
     policy.generation.max_new_tokens=128 \
     policy.max_total_sequence_length=512 \
-    policy.generation.colocated.enabled=false \
-    policy.generation.colocated.resources.num_nodes=1 \
-    policy.generation.colocated.resources.gpus_per_node=1 \
-    grpo.num_prompts_per_step=4 \
-    grpo.num_generations_per_prompt=2 \
-    grpo.max_num_steps=10 \
-    grpo.val_period=-1 \
-    grpo.val_at_start=false \
-    grpo.async_grpo=null \
-    policy.train_global_batch_size=8 \
-    policy.train_micro_batch_size=1 \
-    cluster.gpus_per_node=2 \
-    loss_fn.reference_policy_kl_penalty=0.01 \
-    grpo.skip_reference_policy_logprobs_calculation=false \
-    loss_fn.use_importance_sampling_correction=true \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
-    checkpointing.enabled=false \
     data.train.data_path=$TRAIN_PATH \
     data.validation.data_path=$VALIDATION_PATH \
-    ++data_plane.enabled=true \
-    ++data_plane.impl=transfer_queue \
-    ++data_plane.backend=simple \
-    ++data_plane.simple.storage_capacity=1000000 \
-    ++data_plane.simple.num_storage_units=2 \
-    ++data_plane.claim_meta_poll_interval_s=0.5 \
-    ++async_rl.sampler.name=in_order \
-    ++async_rl.sampler.max_lookahead_versions=0 \
-    ++async_rl.min_groups_for_streaming_train=4 \
-    ++async_rl.max_inflight_prompts=4 \
-    ++async_rl.max_buffered_rollouts=4 \
     $@ \
     2>&1 | tee $RUN_LOG
 
