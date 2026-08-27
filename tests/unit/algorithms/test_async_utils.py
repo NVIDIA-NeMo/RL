@@ -61,6 +61,7 @@ from nemo_rl.experience.interfaces import (
     PENDING_PROMPTS_KEY,
     RETAINED_TASK_INDICES_KEY,
 )
+from nemo_rl.experience.rollouts import EffortLevelsConfig
 
 
 @ray.remote(num_cpus=0)
@@ -2836,8 +2837,10 @@ class TestAsyncTrajectoryCollector:
         assert exc.value.__cause__ is not None
         assert "unexpected add status" in str(exc.value.__cause__)
 
-    def test_nemo_gym_batch_retry_does_not_duplicate_buffered_groups(self, monkeypatch):
-        """A partial stream retry only enqueues prompt groups not already buffered."""
+    def test_nemo_gym_batch_retry_forwards_effort_config_without_duplicates(
+        self, monkeypatch
+    ):
+        """Retries preserve effort shaping and do not re-enqueue buffered groups."""
 
         class _ReadyResult:
             def __init__(self, value):
@@ -2868,6 +2871,14 @@ class TestAsyncTrajectoryCollector:
             "stop_token_ids": [1],
             "stop_strings": ["stop"],
         }
+        collector.master_config.env["nemo_gym"] = {
+            "effort_levels": {
+                "low_weight": 0.1,
+                "low_penalty": 1.0,
+                "low_ub": 15_000,
+                "low_string": "{reasoning effort: efficient}",
+            }
+        }
         target_weight = 15
         collector._generating_targets.add(target_weight)
         repeated_batch = BatchedDataDict(
@@ -2895,6 +2906,12 @@ class TestAsyncTrajectoryCollector:
             assert kwargs["generation_config"]["stop_token_ids"] is None
             assert kwargs["generation_config"]["stop_strings"] is None
             assert kwargs["log_full_result_tables"] is False
+            assert kwargs["effort_config"] == EffortLevelsConfig(
+                low_weight=0.1,
+                low_penalty=1.0,
+                low_ub=15_000,
+                low_string="{reasoning effort: efficient}",
+            )
             rollout_calls += 1
             yield _rollout_result(7)
             if rollout_calls == 1:
