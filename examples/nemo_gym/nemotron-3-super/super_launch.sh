@@ -178,8 +178,8 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
     PYTHONPATH=${SNAPSHOT_DIR}:\${PYTHONPATH:-} \
     python ./examples/nemo_gym/run_grpo_nemo_gym.py \
     --config ${CONFIG_PATH} \
-    env.nemo_gym.uv_venv_dir=${GYM_VENV_DIR} \
-    env.nemo_gym.skip_venv_if_present=true \
+    ++env.nemo_gym.uv_venv_dir=${GYM_VENV_DIR} \
+    ++env.nemo_gym.skip_venv_if_present=true \
     policy.model_name=${MODEL_PATH} \
     checkpointing.checkpoint_dir=${CHECKPOINT_DIR} \
     logger.log_dir=${LOG_DIR} \
