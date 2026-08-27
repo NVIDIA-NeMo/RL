@@ -973,8 +973,10 @@ class AsyncTrajectoryCollector:
             clear_cache = self.async_config.recompute_kv_cache_after_weight_updates
             self._generation_pause_requested_for_refit = True
             print(f"⏸️ Requesting {backend} generation pause before refit")
-            self._generation_paused_for_refit = self.policy_generation.pause_generation(
-                clear_cache=clear_cache
+            self._generation_paused_for_refit = (
+                self.policy_generation.pause_generation_for_refit(
+                    clear_cache=clear_cache
+                )
             )
             if self._generation_paused_for_refit:
                 print(
@@ -1001,7 +1003,7 @@ class AsyncTrajectoryCollector:
         if self._generation_pause_requested_for_refit:
             backend = self.master_config.policy["generation"]["backend"]
             print(f"▶️ Requesting {backend} generation resume after refit")
-            resumed = self.policy_generation.resume_generation()
+            resumed = self.policy_generation.resume_generation_after_refit()
             if self._generation_paused_for_refit and not resumed:
                 raise RuntimeError(
                     f"Failed to resume {backend} generation after successful pause"

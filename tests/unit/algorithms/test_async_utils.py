@@ -107,10 +107,10 @@ class MockGenerationInterface:
     def __init__(self):
         self.prepare_calls = 0
         self.finish_calls = 0
-        self.pause_generation_calls: list[bool] = []
-        self.resume_generation_calls = 0
-        self.pause_generation_supported = True
-        self.resume_generation_supported = True
+        self.pause_generation_for_refit_calls: list[bool] = []
+        self.resume_generation_after_refit_calls = 0
+        self.pause_generation_for_refit_supported = True
+        self.resume_generation_after_refit_supported = True
 
     def prepare_for_generation(self, **kwargs):
         self.prepare_calls += 1
@@ -118,17 +118,19 @@ class MockGenerationInterface:
     def finish_generation(self):
         self.finish_calls += 1
 
-    def pause_generation(self, *, clear_cache: bool) -> bool:
-        self.pause_generation_calls.append(clear_cache)
-        if self.pause_generation_supported:
+    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
+        self.pause_generation_for_refit_calls.append(clear_cache)
+        if self.pause_generation_for_refit_supported:
             return True
-        return GenerationInterface.pause_generation(self, clear_cache=clear_cache)
+        return GenerationInterface.pause_generation_for_refit(
+            self, clear_cache=clear_cache
+        )
 
-    def resume_generation(self) -> bool:
-        self.resume_generation_calls += 1
-        if self.resume_generation_supported:
+    def resume_generation_after_refit(self) -> bool:
+        self.resume_generation_after_refit_calls += 1
+        if self.resume_generation_after_refit_supported:
             return True
-        return GenerationInterface.resume_generation(self)
+        return GenerationInterface.resume_generation_after_refit(self)
 
 
 class TestReplayBufferImplCheckpointing:
@@ -2424,7 +2426,7 @@ class TestAsyncTrajectoryCollector:
 
         collector.prepare_for_refit()
 
-        assert collector.policy_generation.pause_generation_calls == [
+        assert collector.policy_generation.pause_generation_for_refit_calls == [
             recompute_kv_cache
         ]
         collector.wait_for_pending_generations.assert_not_called()
@@ -2432,7 +2434,7 @@ class TestAsyncTrajectoryCollector:
 
         collector.resume_after_refit()
 
-        assert collector.policy_generation.resume_generation_calls == 1
+        assert collector.policy_generation.resume_generation_after_refit_calls == 1
         collector.policy_generation.invalidate_kv_cache.assert_not_called()
         assert collector._refit_pause_cleared.is_set()
 
@@ -2443,7 +2445,7 @@ class TestAsyncTrajectoryCollector:
             "vllm_cfg": {"async_engine": True},
         }
         collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
-        collector.policy_generation.pause_generation = mock.Mock(
+        collector.policy_generation.pause_generation_for_refit = mock.Mock(
             side_effect=RuntimeError("worker pause failed")
         )
         collector.wait_for_pending_generations = mock.Mock()
@@ -2467,7 +2469,7 @@ class TestAsyncTrajectoryCollector:
 
         collector.prepare_for_refit()
 
-        assert collector.policy_generation.pause_generation_calls == []
+        assert collector.policy_generation.pause_generation_for_refit_calls == []
         collector.wait_for_pending_generations.assert_called_once_with()
 
     def test_non_vllm_async_backend_uses_pause_contract_and_legacy_fallback(
@@ -2479,19 +2481,19 @@ class TestAsyncTrajectoryCollector:
         async_cfg = collector.master_config.grpo.async_grpo
         async_cfg.in_flight_weight_updates = True
         async_cfg.recompute_kv_cache_after_weight_updates = False
-        collector.policy_generation.pause_generation_supported = False
-        collector.policy_generation.resume_generation_supported = False
+        collector.policy_generation.pause_generation_for_refit_supported = False
+        collector.policy_generation.resume_generation_after_refit_supported = False
         collector.wait_for_pending_generations = mock.Mock()
 
         collector.prepare_for_refit()
 
-        assert collector.policy_generation.pause_generation_calls == [False]
+        assert collector.policy_generation.pause_generation_for_refit_calls == [False]
         collector.wait_for_pending_generations.assert_not_called()
         assert not collector._refit_pause_cleared.is_set()
 
         collector.resume_after_refit()
 
-        assert collector.policy_generation.resume_generation_calls == 1
+        assert collector.policy_generation.resume_generation_after_refit_calls == 1
         assert collector._refit_pause_cleared.is_set()
         output = capsys.readouterr().out
         assert output.count("has no native generation pause/resume support") == 1
@@ -2507,7 +2509,9 @@ class TestAsyncTrajectoryCollector:
         }
         collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
         collector.prepare_for_refit()
-        collector.policy_generation.resume_generation = mock.Mock(return_value=False)
+        collector.policy_generation.resume_generation_after_refit = mock.Mock(
+            return_value=False
+        )
 
         with pytest.raises(RuntimeError, match="after successful pause"):
             collector.resume_after_refit()

@@ -184,7 +184,7 @@ async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
     worker.llm.resume_generation.assert_awaited_once_with()
 
 
-def test_vllm_generation_broadcasts_native_pause_and_resume(
+def test_vllm_generation_broadcasts_native_refit_pause_and_resume(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     generation = VllmGeneration.__new__(VllmGeneration)
@@ -196,8 +196,8 @@ def test_vllm_generation_broadcasts_native_pause_and_resume(
     ray_get = MagicMock(side_effect=[[True, True], [True, True]])
     monkeypatch.setattr(ray, "get", ray_get)
 
-    assert generation.pause_generation(clear_cache=True)
-    assert generation.resume_generation()
+    assert generation.pause_generation_for_refit(clear_cache=True)
+    assert generation.resume_generation_after_refit()
 
     generation.worker_group.run_all_workers_single_data.assert_any_call(
         "pause_generation_async",
@@ -210,7 +210,7 @@ def test_vllm_generation_broadcasts_native_pause_and_resume(
     )
 
 
-def test_vllm_generation_rejects_partial_pause_and_resume(
+def test_vllm_generation_rejects_partial_refit_pause_and_resume(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     generation = VllmGeneration.__new__(VllmGeneration)
@@ -228,9 +228,9 @@ def test_vllm_generation_rejects_partial_pause_and_resume(
     )
 
     with pytest.raises(RuntimeError, match="pause every async vLLM engine"):
-        generation.pause_generation(clear_cache=False)
+        generation.pause_generation_for_refit(clear_cache=False)
     with pytest.raises(RuntimeError, match="resume every async vLLM engine"):
-        generation.resume_generation()
+        generation.resume_generation_after_refit()
 
 
 def test_sampling_params_preserve_bad_words():

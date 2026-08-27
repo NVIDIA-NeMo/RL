@@ -1279,10 +1279,10 @@ class VllmGeneration(GenerationInterface):
             print(f"Error invalidating vLLM caches: {e}")
             return False
 
-    def pause_generation(self, *, clear_cache: bool) -> bool:
+    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
         """Pause every async vLLM engine while preserving in-flight requests."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError("pause_generation requires async_engine=True")
+            raise RuntimeError("pause_generation_for_refit requires async_engine=True")
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
@@ -1295,10 +1295,12 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError("Failed to pause every async vLLM engine")
         return True
 
-    def resume_generation(self) -> bool:
+    def resume_generation_after_refit(self) -> bool:
         """Resume every async vLLM engine paused for refit."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError("resume_generation requires async_engine=True")
+            raise RuntimeError(
+                "resume_generation_after_refit requires async_engine=True"
+            )
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
