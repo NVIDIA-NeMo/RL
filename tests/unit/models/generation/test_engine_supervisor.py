@@ -311,3 +311,42 @@ class TestPromotionIsWiredUp:
     def test_promotion_is_inert_without_fleet_health(self):
         ctrl = self._controller(None)
         ctrl._promote_refit_shards()  # must not raise
+
+
+def test_every_supervised_backend_can_restart_a_shard():
+    """The supervisor calls restart_shard by name, so a backend missing it degrades silently.
+
+    That is not hypothetical. restart_shard was written in a47e2032e and deleted on
+    2026-08-17 by merge b18740f73, which resolved a conflict in the same region of
+    vllm_generation.py by taking one side wholesale. The call site here and the fake below
+    both survived, so nothing looked broken -- and _restart catches the AttributeError,
+    counts a failure, and retries until the attempt budget retires the shard. Restart never
+    worked and never said so.
+
+    Parsed rather than imported: VllmGeneration pulls in vllm, which is not installed in the
+    default test venv, and the point is the method's existence rather than its behaviour.
+    """
+    import ast
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[4]
+    called = "restart_shard"
+
+    supervisor = ast.parse(
+        (repo_root / "nemo_rl/models/generation/engine_supervisor.py").read_text()
+    )
+    assert any(
+        isinstance(n, ast.Attribute) and n.attr == called for n in ast.walk(supervisor)
+    ), "the supervisor no longer calls restart_shard; this test is guarding nothing"
+
+    backend = repo_root / "nemo_rl/models/generation/vllm/vllm_generation.py"
+    defined = {
+        n.name
+        for n in ast.walk(ast.parse(backend.read_text()))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert called in defined, (
+        f"{backend.name} does not define {called}, but EngineSupervisor calls it on every "
+        "restart. The failure is silent: _restart swallows the AttributeError and the "
+        "shard is retried until its attempt budget retires it."
+    )

@@ -643,6 +643,54 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    # RESTORED. This method was written in a47e2032e and silently deleted on 2026-08-17 by
+    # merge b18740f73, which resolved a conflict in this region -- PR3's _refit_membership
+    # declaration landed on the same lines -- by taking one side wholesale. The call site in
+    # engine_supervisor.py and the unit-test fake both survived, and the supervisor catches
+    # the resulting AttributeError, marks the shard restart-failed and retries until the
+    # attempt budget retires it. So restart never worked and never said so. See
+    # test_every_supervised_backend_can_restart_a_shard, which now fails if it goes missing
+    # again.
+    def restart_shard(self, shard_idx: int) -> Optional[str]:
+        """Rebuild one data-parallel shard's workers and bring its engine back up.
+
+        Blocking and slow -- it reloads the model -- so callers run it off the control
+        loop. Only this shard's workers are touched; the rest of the fleet keeps serving
+        throughout.
+
+        Mirrors the startup sequence (`create workers -> load_model -> post_init ->
+        report URL`) rather than inventing a shorter one, because anything the deferred-
+        load path does at startup is equally required for a replacement.
+
+        Returns:
+            The replacement's OpenAI base URL, or None for a sync engine that exposes no
+            HTTP server. **The URL is expected to differ from the old one**: the new
+            engine binds its own port, so callers must publish it rather than assume the
+            fleet's URL list is still accurate.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        leader_idx = self.worker_group.get_dp_leader_worker_idx(shard_idx)
+        # A shard is model_parallel_size workers; all of them died with the engine.
+        worker_indices = range(leader_idx, leader_idx + self.model_parallel_size)
+        for worker_idx in worker_indices:
+            self.worker_group.recreate_worker(worker_idx)
+
+        leader = self.worker_group.workers[leader_idx]
+        ray.get(leader.load_model.remote())
+        method_name = (
+            "post_init_async" if self.cfg["vllm_cfg"]["async_engine"] else "post_init"
+        )
+        ray.get(getattr(leader, method_name).remote())
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            return None
+        url = ray.get(leader.report_dp_openai_server_base_url.remote())
+        if shard_idx < len(self.dp_openai_server_base_urls):
+            self.dp_openai_server_base_urls[shard_idx] = url
+        return url
+
     def set_refit_membership(self, membership: "RefitMembership") -> None:
         """Record which shards take part in refits from now on.
 
