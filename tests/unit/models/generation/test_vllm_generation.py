@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -19,7 +20,8 @@ import sys
 import types
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import MagicMock
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
@@ -35,15 +37,20 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
-from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
-from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.openai_server_utils import (
+    CompleteTokenInjectionError,
+    replace_prefix_tokens,
+)
+from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration, vllm_worker_async
 from nemo_rl.models.generation.vllm.vllm_worker import (
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    COMPLETE_TOKEN_INJECTION_VLLM_VERSION,
     VllmAsyncGenerationWorkerImpl,
+    _complete_token_injection_eligibility,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -143,6 +150,254 @@ basic_dtensor_test_config: PolicyConfig = {
 }
 
 
+def _complete_token_request(**updates):
+    values = {
+        "stream": False,
+        "n": 1,
+        "continue_final_message": False,
+        "echo": False,
+        "return_assistant_tokens_mask": False,
+        "add_special_tokens": False,
+        "return_prompt_text": False,
+        "required_prefix_token_ids": [10, 11, 12, 13, 14],
+    }
+    values.update(updates)
+    return types.SimpleNamespace(**values)
+
+
+def _tokenized_assistant_messages():
+    return [
+        {"role": "user", "content": "question one"},
+        {
+            "role": "assistant",
+            "content": "answer one",
+            "prompt_token_ids": [1],
+            "generation_token_ids": [2],
+        },
+        {"role": "user", "content": "question two"},
+        {
+            "role": "assistant",
+            "content": "answer two",
+            "prompt_token_ids": [10, 11],
+            "generation_token_ids": [12, 13, 14],
+        },
+    ]
+
+
+def test_complete_token_injection_eligibility_returns_latest_assistant() -> None:
+    ordinal, reason = _complete_token_injection_eligibility(
+        _complete_token_request(),
+        _tokenized_assistant_messages(),
+        prompt_embeds_enabled=False,
+        renderer_supported=True,
+        vllm_version_supported=True,
+    )
+
+    assert ordinal == 1
+    assert reason is None
+
+
+@pytest.mark.parametrize("role", ["system", "user", "assistant", "tool"])
+def test_complete_token_injection_eligibility_accepts_supported_roles(role) -> None:
+    messages = [{"role": role, "content": "text"}, *_tokenized_assistant_messages()]
+
+    _, reason = _complete_token_injection_eligibility(
+        _complete_token_request(),
+        messages,
+        prompt_embeds_enabled=False,
+        renderer_supported=True,
+        vllm_version_supported=True,
+    )
+
+    assert reason is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_reason"),
+    [
+        pytest.param("stream", True, "streaming request", id="stream"),
+        pytest.param("n", 2, "multiple response choices", id="multiple_choices"),
+        pytest.param(
+            "continue_final_message",
+            True,
+            "continue_final_message request",
+            id="continue_final_message",
+        ),
+        pytest.param("echo", True, "echo request", id="echo"),
+        pytest.param(
+            "return_assistant_tokens_mask",
+            True,
+            "assistant token mask request",
+            id="assistant_token_mask",
+        ),
+        pytest.param(
+            "add_special_tokens",
+            True,
+            "add_special_tokens request",
+            id="add_special_tokens",
+        ),
+        pytest.param(
+            "return_prompt_text",
+            True,
+            "return_prompt_text request",
+            id="return_prompt_text",
+        ),
+    ],
+)
+def test_complete_token_injection_eligibility_rejects_request_options(
+    field, value, expected_reason
+) -> None:
+    ordinal, reason = _complete_token_injection_eligibility(
+        _complete_token_request(**{field: value}),
+        _tokenized_assistant_messages(),
+        prompt_embeds_enabled=False,
+        renderer_supported=True,
+        vllm_version_supported=True,
+    )
+
+    assert ordinal is None
+    assert reason == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("helper_updates", "expected_reason"),
+    [
+        pytest.param(
+            {"prompt_embeds_enabled": True},
+            "prompt embeddings enabled",
+            id="prompt_embeds",
+        ),
+        pytest.param(
+            {"renderer_supported": False},
+            "unsupported renderer",
+            id="renderer",
+        ),
+        pytest.param(
+            {"vllm_version_supported": False},
+            "unsupported vLLM version",
+            id="vllm_version",
+        ),
+    ],
+)
+def test_complete_token_injection_eligibility_rejects_model_options(
+    helper_updates, expected_reason
+) -> None:
+    helper_args = {
+        "prompt_embeds_enabled": False,
+        "renderer_supported": True,
+        "vllm_version_supported": True,
+    }
+    helper_args.update(helper_updates)
+
+    ordinal, reason = _complete_token_injection_eligibility(
+        _complete_token_request(),
+        _tokenized_assistant_messages(),
+        **helper_args,
+    )
+
+    assert ordinal is None
+    assert reason == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected_reason"),
+    [
+        pytest.param(["invalid"], "non-object message", id="non_object"),
+        pytest.param(
+            [{"role": "developer", "content": "text"}],
+            "unsupported message role",
+            id="unsupported_role",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "question"}],
+                }
+            ],
+            "non-text message content",
+            id="responses_text_parts",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": "partial",
+                    "prompt_token_ids": [1],
+                }
+            ],
+            "no fully tokenized assistant",
+            id="partial_metadata",
+        ),
+    ],
+)
+def test_complete_token_injection_eligibility_rejects_messages(
+    messages, expected_reason
+) -> None:
+    ordinal, reason = _complete_token_injection_eligibility(
+        _complete_token_request(),
+        messages,
+        prompt_embeds_enabled=False,
+        renderer_supported=True,
+        vllm_version_supported=True,
+    )
+
+    assert ordinal is None
+    assert reason == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("required_prefix_token_ids", "message_updates"),
+    [
+        pytest.param(None, {}, id="none"),
+        pytest.param([], {}, id="empty"),
+        pytest.param((10, 11, 12, 13, 14), {}, id="non_list"),
+        pytest.param([10, 11, 12, 13, True], {}, id="boolean_token"),
+        pytest.param(
+            [10, 11, 12, 13, 14],
+            {"generation_token_ids": [12, 13, "14"]},
+            id="invalid_message_token",
+        ),
+        pytest.param([1, 2], {}, id="different_tokens"),
+    ],
+)
+def test_complete_token_injection_eligibility_rejects_mismatched_prefix(
+    required_prefix_token_ids, message_updates
+) -> None:
+    messages = _tokenized_assistant_messages()
+    messages[-1].update(message_updates)
+    ordinal, reason = _complete_token_injection_eligibility(
+        _complete_token_request(required_prefix_token_ids=required_prefix_token_ids),
+        messages,
+        prompt_embeds_enabled=False,
+        renderer_supported=True,
+        vllm_version_supported=True,
+    )
+
+    assert ordinal is None
+    assert reason == "client-supplied prefix does not match message token metadata"
+
+
+def test_complete_token_injection_eligibility_rejects_slot_swapped_prefix() -> None:
+    ordinal, reason = _complete_token_injection_eligibility(
+        _complete_token_request(required_prefix_token_ids=[12, 13, 14, 10, 11]),
+        _tokenized_assistant_messages(),
+        prompt_embeds_enabled=False,
+        renderer_supported=True,
+        vllm_version_supported=True,
+    )
+
+    assert ordinal is None
+    assert reason == "client-supplied prefix does not match message token metadata"
+
+
+@pytest.mark.vllm
+def test_complete_token_injection_vllm_version_matches_installed_package() -> None:
+    import vllm
+
+    assert vllm.__version__ == COMPLETE_TOKEN_INJECTION_VLLM_VERSION
+
+
 def test_context_capped_max_new_tokens():
     assert (
         _context_capped_max_new_tokens(
@@ -239,6 +494,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     for module_name in (
         "vllm",
         "vllm.entrypoints",
+        "vllm.entrypoints.chat_utils",
         "vllm.entrypoints.openai",
         "vllm.entrypoints.openai.chat_completion",
         "vllm.entrypoints.openai.engine",
@@ -250,8 +506,10 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.tool_parsers",
         "vllm.v1",
         "vllm.v1.engine",
+        "vllm.utils",
     ):
         monkeypatch.setitem(sys.modules, module_name, types.ModuleType(module_name))
+    sys.modules["vllm"].__version__ = COMPLETE_TOKEN_INJECTION_VLLM_VERSION
 
     def make_module(name: str, **attrs):
         module = types.ModuleType(name)
@@ -269,10 +527,33 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.registry = "registry"
 
+    class ChatCompletionRequest:
+        def model_post_init(self, context):
+            return context
+
+        def model_copy(self, *, update):
+            copied_request = type(self)()
+            vars(copied_request).update(vars(self) | update)
+            return copied_request
+
     class OnlineRenderer:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            self.model_config = kwargs["model_config"]
             self.renderer = kwargs["renderer"]
+
+        async def preprocess_chat(self, request, messages, **kwargs):
+            if getattr(request, "raise_context_error", False):
+                raise VLLMValidationError(
+                    "This model's maximum context length is 128 tokens. However, "
+                    f"you requested {request.max_completion_tokens} output tokens "
+                    "and your prompt contains at least 128 input tokens, for a total "
+                    f"of at least {128 + request.max_completion_tokens} tokens.",
+                    parameter="input_tokens",
+                    value=128,
+                )
+            request.required_prefix_token_ids = None
+            return messages, [{"prompt_token_ids": [7]}]
 
     class OpenAIServingChat:
         instances = []
@@ -289,7 +570,10 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.instances.append(self)
 
     class VLLMValidationError(Exception):
-        pass
+        def __init__(self, message, *, parameter=None, value=None):
+            super().__init__(message)
+            self.parameter = parameter
+            self.value = value
 
     class ToolParserManager:
         import_tool_parser = MagicMock()
@@ -302,10 +586,11 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     make_module(
         "vllm.entrypoints.chat_utils",
         load_chat_template=MagicMock(return_value=None),
+        parse_chat_messages_async=AsyncMock(),
     )
     make_module(
         "vllm.entrypoints.openai.chat_completion.protocol",
-        ChatCompletionRequest=type("ChatCompletionRequest", (), {}),
+        ChatCompletionRequest=ChatCompletionRequest,
         ChatCompletionResponse=type("ChatCompletionResponse", (), {}),
     )
     make_module(
@@ -334,6 +619,14 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.renderers.online_renderer",
         OnlineRenderer=OnlineRenderer,
     )
+    sys.modules["vllm.renderers"].merge_kwargs = MagicMock()
+    hf_renderer = type("HfRenderer", (), {})
+    make_module(
+        "vllm.renderers.hf",
+        HfRenderer=hf_renderer,
+        resolve_chat_template_content_format=MagicMock(),
+        safe_apply_chat_template=MagicMock(),
+    )
     make_module(
         "vllm.entrypoints.serve.tokenize.serving",
         ServingTokenization=ServingTokenization,
@@ -347,8 +640,13 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.tool_parsers.abstract_tool_parser",
         ToolParserManager=ToolParserManager,
     )
+    make_module(
+        "vllm.utils.mistral",
+        is_mistral_tokenizer=MagicMock(return_value=False),
+        is_mistral_tool_parser=MagicMock(return_value=False),
+    )
     make_module("vllm.v1.engine.async_llm", logger=MagicMock())
-    return ToolParserManager, ReasoningParserManager, OpenAIServingChat
+    return ToolParserManager, ReasoningParserManager, OpenAIServingChat, hf_renderer
 
 
 class _FakeFastAPIApp:
@@ -363,11 +661,13 @@ class _FakeFastAPIApp:
         return decorator
 
 
-def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
+def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch, caplog):
+    caplog.set_level("INFO", logger="nemo_rl.models.generation.vllm.vllm_worker_async")
     (
         tool_parser_manager,
         reasoning_parser_manager,
         openai_serving_chat,
+        hf_renderer,
     ) = _install_fake_vllm_openai_modules(monkeypatch)
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
@@ -382,12 +682,28 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
             },
         },
     }
-    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
-    model_config = MagicMock(served_model_name="served-model", model="model-path")
+    worker._online_renderer = None
+    assert worker._get_complete_token_injection_stats() == {
+        "attempts": 0,
+        "successes": 0,
+        "fallbacks": {},
+    }
+
+    model_config = MagicMock(
+        served_model_name="served-model",
+        model="model-path",
+        max_model_len=128,
+        # A VLM-capable model can use injection when this request has no media.
+        multimodal_config=object(),
+        enable_prompt_embeds=False,
+    )
+    worker.llm = MagicMock(model_config=model_config, renderer=hf_renderer())
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = model_config
 
     app = _FakeFastAPIApp()
+    # Ray may omit globals used only in annotations when it serializes the worker.
+    monkeypatch.delattr(vllm_worker_async, "Any")
     assert worker._setup_vllm_openai_api_server(app) is app
 
     tool_parser_manager.import_tool_parser.assert_called_once_with(
@@ -399,6 +715,310 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
     # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`
     assert "reasoning_parser_plugin" not in openai_serving_chat.instances[0].kwargs
+
+    renderer = worker._online_renderer
+    renderer._record_complete_token_injection_fallback("test fallback")
+    renderer._record_complete_token_injection_fallback("test fallback")
+    assert (
+        caplog.messages.count(
+            "Complete-token injection fell back to native preprocessing: "
+            "test fallback; statistics: "
+            '{"attempts": 0, "fallbacks": {"test fallback": 1}, "successes": 0}'
+        )
+        == 1
+    )
+    renderer._complete_token_injection_attempts = 1
+    renderer._maybe_log_complete_token_injection_stats()
+    renderer._complete_token_injection_attempts = 2
+    renderer._maybe_log_complete_token_injection_stats()
+    renderer._complete_token_injection_attempts = 1000
+    renderer._maybe_log_complete_token_injection_stats()
+    assert (
+        len(
+            [
+                message
+                for message in caplog.messages
+                if message.startswith("Complete-token injection statistics:")
+            ]
+        )
+        == 2
+    )
+    renderer._complete_token_injection_attempts = 0
+
+    tokenizer = object()
+    worker.llm.renderer.get_tokenizer = MagicMock(return_value=tokenizer)
+    worker.llm.renderer.tokenize_prompt_async = AsyncMock(
+        return_value={"prompt_token_ids": [3, 4, 5]}
+    )
+    worker.llm.renderer.process_for_engine_async = AsyncMock(
+        return_value={"prompt_token_ids": [3, 4, 5]}
+    )
+    sys.modules["vllm.renderers"].merge_kwargs.side_effect = (
+        lambda defaults, extras: defaults | extras
+    )
+    sys.modules[
+        "vllm.entrypoints.chat_utils"
+    ].parse_chat_messages_async.return_value = (
+        _tokenized_assistant_messages(),
+        None,
+        None,
+    )
+    sys.modules[
+        "vllm.renderers.hf"
+    ].resolve_chat_template_content_format.return_value = "string"
+    sys.modules["vllm.renderers.hf"].safe_apply_chat_template.side_effect = [
+        "marked prompt",
+        "assistant close",
+    ]
+
+    def build_prompt_token_ids(**kwargs):
+        assert kwargs["tokenizer"] is tokenizer
+        assert kwargs["render_prompt_text"](kwargs["conversation"]) == "marked prompt"
+        assert (
+            kwargs["render_assistant_close_text"](kwargs["conversation"])
+            == "assistant close"
+        )
+        return [3, 4, 5]
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.build_complete_prompt_token_ids",
+        build_prompt_token_ids,
+    )
+
+    chat_params = MagicMock(
+        return_assistant_tokens_mask=False,
+        chat_template="template",
+        chat_template_content_format="auto",
+        chat_template_kwargs={},
+        media_io_kwargs=None,
+        mm_processor_kwargs=None,
+    )
+    chat_params.with_defaults.return_value = chat_params
+    chat_params.get_apply_chat_template_kwargs.return_value = {"tokenize": True}
+    direct_request = _complete_token_request()
+    direct_request.build_tok_params = MagicMock(return_value={})
+    direct_request.build_chat_params = MagicMock(return_value=chat_params)
+    direct_request.mm_processor_kwargs = {"size": 1}
+    direct_request.cache_salt = "salt"
+    direct_request.tool_choice = "none"
+    direct_request.tools = []
+    parser = MagicMock(tool_parser_cls=None, reasoning_parser_cls=object())
+
+    direct_result = asyncio.run(
+        renderer._preprocess_chat_with_complete_token_ids(
+            request=direct_request,
+            messages=_tokenized_assistant_messages(),
+            default_template=None,
+            default_template_content_format="auto",
+            default_template_kwargs={},
+            tool_dicts=[],
+            parser=parser,
+            assistant_ordinal=1,
+            skip_mm_cache=False,
+        )
+    )
+
+    assert direct_result[1][0]["prompt_token_ids"] == [3, 4, 5]
+    parser.return_value.adjust_request.assert_called_once_with(request=direct_request)
+    close_render_call = sys.modules[
+        "vllm.renderers.hf"
+    ].safe_apply_chat_template.call_args_list[-1]
+    assert close_render_call.kwargs["add_generation_prompt"] is False
+    assert close_render_call.kwargs["tokenize"] is False
+
+    chat_route = dict(app.routes)["/v1/chat/completions"]
+    request_type = chat_route.__annotations__["request"]
+
+    auto_prefix_request = request_type()
+    auto_prefix_request.required_prefix_token_ids = None
+    auto_prefix_request.messages = _tokenized_assistant_messages()
+    assert auto_prefix_request.model_post_init("context") == "context"
+    assert auto_prefix_request.required_prefix_token_ids == [10, 11, 12, 13, 14]
+
+    def make_request(**updates):
+        request = request_type()
+        for name, value in vars(_complete_token_request(**updates)).items():
+            setattr(request, name, value)
+        request.max_completion_tokens = 10
+        request.max_tokens = None
+        return request
+
+    def make_renderer_request(**updates):
+        request = make_request(**updates)
+        request.build_tok_params = MagicMock(return_value={})
+        request.build_chat_params = MagicMock(return_value=chat_params)
+        request.mm_processor_kwargs = None
+        request.cache_salt = None
+        request.tool_choice = "none"
+        request.tools = []
+        return request
+
+    parse_chat_messages = sys.modules[
+        "vllm.entrypoints.chat_utils"
+    ].parse_chat_messages_async
+    for mm_data, mm_uuids in (
+        ({"image": [object()]}, None),
+        (None, {"image": ["image-uuid"]}),
+    ):
+        parse_chat_messages.return_value = (
+            _tokenized_assistant_messages(),
+            mm_data,
+            mm_uuids,
+        )
+        multimodal_result = asyncio.run(
+            renderer.preprocess_chat(
+                request=make_renderer_request(),
+                messages=_tokenized_assistant_messages(),
+                default_template=None,
+                default_template_content_format="auto",
+                default_template_kwargs={},
+            )
+        )
+        assert multimodal_result[1][0]["prompt_token_ids"] == [7]
+    parse_chat_messages.return_value = (
+        _tokenized_assistant_messages(),
+        None,
+        None,
+    )
+
+    request = make_request()
+    renderer._preprocess_chat_with_complete_token_ids = AsyncMock(
+        return_value=(
+            _tokenized_assistant_messages(),
+            [{"prompt_token_ids": [3, 4, 5]}],
+        )
+    )
+
+    result = asyncio.run(
+        renderer.preprocess_chat(
+            request=request,
+            messages=_tokenized_assistant_messages(),
+            default_template=None,
+            default_template_content_format="auto",
+            default_template_kwargs={},
+        )
+    )
+
+    assert result[1][0]["prompt_token_ids"] == [3, 4, 5]
+    assert request.max_completion_tokens == 10
+    renderer._preprocess_chat_with_complete_token_ids.assert_awaited_once()
+
+    media_messages = [
+        *_tokenized_assistant_messages(),
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/image.png"},
+                }
+            ],
+        },
+    ]
+    media_request = make_request()
+    media_result = asyncio.run(
+        renderer.preprocess_chat(
+            request=media_request,
+            messages=media_messages,
+            default_template=None,
+            default_template_content_format="auto",
+            default_template_kwargs={},
+        )
+    )
+    assert media_result[1][0]["prompt_token_ids"] == [7]
+    assert media_request.max_completion_tokens == 10
+    renderer._preprocess_chat_with_complete_token_ids.assert_awaited_once()
+
+    error_request = make_request(
+        required_prefix_token_ids=None, raise_context_error=True
+    )
+    with pytest.raises(
+        sys.modules["vllm.exceptions"].VLLMValidationError,
+        match="requested 10 output tokens",
+    ):
+        asyncio.run(
+            renderer.preprocess_chat(
+                request=error_request,
+                messages=_tokenized_assistant_messages(),
+                default_template=None,
+                default_template_content_format="auto",
+                default_template_kwargs={},
+            )
+        )
+    assert error_request.max_completion_tokens == 10
+
+    streaming_request = make_request(stream=True)
+    asyncio.run(
+        renderer.preprocess_chat(
+            request=streaming_request,
+            messages=_tokenized_assistant_messages(),
+            default_template=None,
+            default_template_content_format="auto",
+            default_template_kwargs={},
+        )
+    )
+    assert streaming_request.max_completion_tokens == 10
+    renderer._preprocess_chat_with_complete_token_ids = AsyncMock(
+        side_effect=CompleteTokenInjectionError("test injection error")
+    )
+    injection_fallback_request = make_request()
+    asyncio.run(
+        renderer.preprocess_chat(
+            request=injection_fallback_request,
+            messages=_tokenized_assistant_messages(),
+            default_template=None,
+            default_template_content_format="auto",
+            default_template_kwargs={},
+        )
+    )
+    assert injection_fallback_request.max_completion_tokens == 10
+    renderer._preprocess_chat_with_complete_token_ids = AsyncMock(
+        side_effect=RuntimeError("unexpected injection error")
+    )
+    unexpected_error_request = make_request()
+    with pytest.raises(RuntimeError, match="unexpected injection error"):
+        asyncio.run(
+            renderer.preprocess_chat(
+                request=unexpected_error_request,
+                messages=_tokenized_assistant_messages(),
+                default_template=None,
+                default_template_content_format="auto",
+                default_template_kwargs={},
+            )
+        )
+    assert unexpected_error_request.max_completion_tokens == 10
+
+    version_request = make_request()
+    sys.modules["vllm"].__version__ = "0.25.1+local"
+    asyncio.run(
+        renderer.preprocess_chat(
+            request=version_request,
+            messages=_tokenized_assistant_messages(),
+            default_template=None,
+            default_template_content_format="auto",
+            default_template_kwargs={},
+        )
+    )
+    assert version_request.max_completion_tokens == 10
+    sys.modules["vllm"].__version__ = COMPLETE_TOKEN_INJECTION_VLLM_VERSION
+    assert any(
+        "unsupported vLLM version "
+        "(detected '0.25.1+local', expected '0.25.1')" in message
+        for message in caplog.messages
+    )
+
+    assert worker._get_complete_token_injection_stats() == {
+        "attempts": 8,
+        "successes": 1,
+        "fallbacks": {
+            "Multimodal chat data requires native preprocessing.": 2,
+            "non-text message content": 1,
+            "streaming request": 1,
+            "test fallback": 2,
+            "test injection error": 1,
+            "unsupported vLLM version": 1,
+        },
+    }
 
 
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
@@ -1672,6 +2292,25 @@ def _wait_for_vllm_http_server_spinup(base_url: str):
             pass
 
 
+def _get_complete_token_injection_stats(
+    vllm_generation: VllmGeneration,
+) -> dict[str, Any]:
+    futures = vllm_generation.worker_group.run_all_workers_single_data(
+        "_get_complete_token_injection_stats",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+    worker_stats = ray.get(futures)
+    fallback_counts: dict[str, int] = {}
+    for stats in worker_stats:
+        for reason, count in stats["fallbacks"].items():
+            fallback_counts[reason] = fallback_counts.get(reason, 0) + count
+    return {
+        "attempts": sum(stats["attempts"] for stats in worker_stats),
+        "successes": sum(stats["successes"] for stats in worker_stats),
+        "fallbacks": fallback_counts,
+    }
+
+
 def test_vllm_http_server(cluster, tokenizer):
     """Test that vLLM http server works."""
 
@@ -2137,6 +2776,50 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
     vllm_http_server_generated_token_id = int(
         vllm_http_server_generated_token["token"].removeprefix("token_id:")
     )
+
+    # Compare the injected continuation prompt with the legacy /tokenize
+    # prefix-replacement path.
+    first_message = vllm_http_server_result["choices"][0]["message"]
+    continuation_messages = [
+        body["messages"][0],
+        {
+            "role": "assistant",
+            "content": first_message["content"],
+            "prompt_token_ids": first_message["prompt_token_ids"],
+            "generation_token_ids": first_message["generation_token_ids"],
+            "generation_log_probs": first_message["generation_log_probs"],
+        },
+        {
+            "role": "user",
+            "content": " next",
+            # Non-assistant metadata must not replace the assistant prefix.
+            "prompt_token_ids": [12345],
+            "generation_token_ids": [67890],
+        },
+    ]
+    continuation_body = body | {"messages": continuation_messages}
+    expected_required_prefix_token_ids = [
+        *first_message["prompt_token_ids"],
+        *first_message["generation_token_ids"],
+    ]
+    native_body = continuation_body | {
+        "required_prefix_token_ids": expected_required_prefix_token_ids
+    }
+    native_response = requests.post(url=f"{base_urls[0]}/../tokenize", json=native_body)
+    native_response.raise_for_status()
+    stats_before_injection = _get_complete_token_injection_stats(vllm_generation)
+    injected_response = requests.post(
+        url=f"{base_urls[0]}/chat/completions", json=continuation_body
+    )
+    injected_response.raise_for_status()
+    assert (
+        injected_response.json()["choices"][0]["message"]["prompt_token_ids"]
+        == native_response.json()["tokens"]
+    )
+    stats_after_injection = _get_complete_token_injection_stats(vllm_generation)
+    assert stats_after_injection["attempts"] == stats_before_injection["attempts"] + 1
+    assert stats_after_injection["successes"] == stats_before_injection["successes"] + 1
+    assert stats_after_injection["fallbacks"] == stats_before_injection["fallbacks"]
 
     async for _, generate_result in vllm_generation.generate_async(
         BatchedDataDict[GenerationDatumSpec](
