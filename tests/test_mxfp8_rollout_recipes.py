@@ -334,14 +334,12 @@ def test_qwen3_235b_mxfp8_recipes_keep_baseline_runtime_knobs() -> None:
 
 
 @pytest.mark.parametrize(
-    "case_name",
-    (
-        "grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout",
-        "grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout",
-    ),
+    "config_path",
+    sorted(PERF_CONFIG_DIR.glob("*-async-1off-mxfp8-rollout.yaml")),
+    ids=lambda path: path.stem,
 )
-def test_qwen3_async_mxfp8_recipes_use_nccl_reshard(case_name: str) -> None:
-    config = _load_resolved_yaml(PERF_CONFIG_DIR / f"{case_name}.yaml")
+def test_async_mxfp8_recipes_use_nccl_reshard(config_path: Path) -> None:
+    config = _load_resolved_yaml(config_path)
     generation_config = config["policy"]["generation"]
 
     assert generation_config["refit_transport"] == "nccl_reshard"
