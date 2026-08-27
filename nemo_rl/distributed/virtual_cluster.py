@@ -56,32 +56,32 @@ class PY_EXECUTABLES:
     SYSTEM = sys.executable
 
     # Use NeMo-RL direct dependencies.
-    BASE = f"uv run --locked --directory {git_root}"
+    BASE = f"uv run --frozen --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and vllm.
-    VLLM = f"uv run --locked --extra vllm --directory {git_root}"
+    VLLM = f"uv run --frozen --extra vllm --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and fsdp.
-    FSDP = f"uv run --locked --extra fsdp --directory {git_root}"
+    FSDP = f"uv run --frozen --extra fsdp --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and nemo-automodel.
-    AUTOMODEL = f"uv run --locked --extra automodel --directory {git_root}"
+    AUTOMODEL = f"uv run --frozen --extra automodel --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and Megatron.
-    MCORE = f"uv run --locked --extra mcore --directory {git_root}"
+    MCORE = f"uv run --frozen --extra mcore --directory {git_root}"
 
     # Use NeMo-Gym dependencies
-    NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
+    NEMO_GYM = f"uv run --frozen --extra nemo_gym --directory {git_root}"
 
     # vLLM worker hosting Gym's token capture (token_capture.enabled): the
     # worker imports nemo_gym's dependency-free capture core + vLLM adapter.
-    VLLM_GYM = f"uv run --locked --extra vllm --extra nemo_gym --directory {git_root}"
+    VLLM_GYM = f"uv run --frozen --extra vllm --extra nemo_gym --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and SGLang.
-    SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
+    SGLANG = f"uv run --frozen --extra sglang --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and TRT-LLM.
-    TRTLLM = f"uv run --locked --extra trtllm --directory {git_root}"
+    TRTLLM = f"uv run --frozen --extra trtllm --directory {git_root}"
 
 
 # Default port ranges — kept below the OS ephemeral range.  On some DGX/GB200
