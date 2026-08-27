@@ -48,6 +48,7 @@ def _collect_nvfp4_entries(
     *,
     quantization_config: dict[str, Any] | None = None,
     num_hidden_layers: int = 4,
+    require_gate_up_pairs: bool = True,
 ) -> list[tuple[str, torch.Tensor]]:
     skip_weight_substrings = build_dynamic_skip_substrings(
         quantization_config=dict(quantization_config or {}),
@@ -56,6 +57,7 @@ def _collect_nvfp4_entries(
     groups = nvfp4_core.iter_nvfp4_quantized_tensor_groups(
         weights,
         skip_weight_substrings=skip_weight_substrings,
+        require_gate_up_pairs=require_gate_up_pairs,
     )
     return [entry for group in groups for entry in group]
 
@@ -200,6 +202,36 @@ def test_nvfp4_live_pair_has_shared_scale_and_no_input_scale(monkeypatch) -> Non
     )
 
 
+def test_nvfp4_live_non_gated_experts_quantize_without_gate_up_pairs(
+    monkeypatch,
+) -> None:
+    up_name = "backbone.layers.1.mixer.experts.0.up_proj.weight"
+    down_name = "backbone.layers.1.mixer.experts.0.down_proj.weight"
+    up = torch.ones((3, 32), dtype=torch.bfloat16)
+    down = torch.ones((5, 32), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(nvfp4_core, "quantize_nvfp4", _fake_nvfp4_output)
+    monkeypatch.setattr(
+        nvfp4_core,
+        "quantize_nvfp4_pair",
+        lambda *_args: pytest.fail("non-gated experts must not use pair quantization"),
+    )
+
+    entries = _collect_nvfp4_entries(
+        [(up_name, up), (down_name, down)],
+        require_gate_up_pairs=False,
+    )
+    names = {name for name, _ in entries}
+
+    for weight_name in (up_name, down_name):
+        base = weight_name.removesuffix(".weight")
+        assert {
+            weight_name,
+            f"{base}.weight_scale",
+            f"{base}.weight_scale_2",
+        } <= names
+
+
 def test_nvfp4_single_side_skip_keeps_whole_gate_up_pair_in_bf16(
     monkeypatch,
 ) -> None:
@@ -229,12 +261,18 @@ def test_nvfp4_single_side_skip_keeps_whole_gate_up_pair_in_bf16(
     assert tensors[up_name] is up
 
 
-def test_nvfp4_iterator_rejects_incomplete_gate_up_pair() -> None:
-    gate_name = "model.layers.1.mlp.experts.0.gate_proj.weight"
-    gate = torch.ones((3, 32), dtype=torch.bfloat16)
+@pytest.mark.parametrize(
+    "weight_name",
+    [
+        "model.layers.1.mlp.experts.0.gate_proj.weight",
+        "model.layers.1.mlp.experts.0.up_proj.weight",
+    ],
+)
+def test_nvfp4_iterator_rejects_incomplete_gate_up_pair(weight_name: str) -> None:
+    weight = torch.ones((3, 32), dtype=torch.bfloat16)
 
     with pytest.raises(ValueError, match="incomplete pairs"):
-        _collect_nvfp4_entries([(gate_name, gate)])
+        _collect_nvfp4_entries([(weight_name, weight)])
 
 
 def test_nvfp4_iterator_rejects_duplicate_pair_role() -> None:

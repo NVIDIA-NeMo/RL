@@ -214,12 +214,13 @@ def _build_conversion_policy(
     *,
     weight_map: dict[str, str],
     skip_weight_substrings: tuple[str, ...],
+    require_gate_up_pairs: bool,
 ) -> tuple[
     set[str],
     set[str],
     dict[str, tuple[str, str]],
 ]:
-    """Select quantized expert tensors and complete gate/up pairs atomically."""
+    """Select quantized expert tensors and complete gated pairs atomically."""
     skipped_containers: set[str] = set()
     expert_keys_by_container: dict[str, list[str]] = {}
 
@@ -241,6 +242,9 @@ def _build_conversion_policy(
         if container not in skipped_containers
         for key in keys
     }
+
+    if not require_gate_up_pairs:
+        return quantized_keys, skipped_containers, {}
 
     pair_roles: dict[str, dict[str, str]] = {}
     for key in sorted(quantized_keys):
@@ -578,6 +582,7 @@ def convert_nvfp4(
     quantized_keys, skipped_containers, pair_by_key = _build_conversion_policy(
         weight_map=weight_map,
         skip_weight_substrings=skip_weight_substrings,
+        require_gate_up_pairs=config.get("model_type") != "nemotron_h",
     )
     if not quantized_keys:
         raise ValueError(
