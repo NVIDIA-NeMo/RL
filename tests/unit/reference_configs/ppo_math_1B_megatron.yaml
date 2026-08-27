@@ -21,11 +21,17 @@ ppo:
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
   skip_reference_policy_logprobs_calculation: true  # No KL, so skip ref logprobs
+  # Share and compact immutable image/video/audio payload segments across
+  # logical PPO rows. Prompt identity is never used as proof of equality.
+  deduplicate_multimodal_data: false
+  # Emit exact-boundary and logical-vs-physical payload metrics.
+  debug_payload_metrics: false
 
   async_ppo:
     enabled: false
     max_trajectory_age_steps: 1
     warmup_generation_lead_steps: null
+    max_generation_failures: 0
     in_flight_weight_updates: false
     recompute_kv_cache_after_weight_updates: false
     drop_incomplete_targets_on_restore: false
