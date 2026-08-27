@@ -1,0 +1,206 @@
+# SingleController variant of ppo_math_1B_megatron.yaml.
+defaults: ppo_math_1B_megatron.yaml
+
+ppo:
+  # Null out the legacy async_ppo block inherited from ppo_math_1B.yaml: SC reads
+  # async_rl instead, and the entrypoint raises if this block is set. It defaults
+  # to a non-null AsyncPPOConfig, so omitting it is not the same as nulling it.
+  async_ppo: null
+  # SC does not support validation yet.
+  val_period: 0
+  val_at_start: false
+  # SC implements neither, so leaving them enabled would describe shaping this
+  # run does not do.
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+
+async_rl:
+  sampler:
+    name: in_order
+    # How far generation may run ahead of the trainer.
+    max_lookahead_versions: 1
+    # Widened while the policy is frozen by policy_training_start_step, so critic
+    # warmup is not also a generation stall. null keeps the value above
+    # throughout. Buffer capacity below must cover the wider of the two.
+    warmup_lookahead_versions: null
+  # Recompute generation KV caches after each weight update.
+  recompute_kv_cache_after_weight_updates: false
+  # Min ready groups the streaming trainer waits for before dispatching a batch.
+  min_groups_for_streaming_train: ${ppo.num_prompts_per_step}
+  # Cap on in-flight generate_and_push calls in the rollout pump.
+  max_inflight_prompts: ${ppo.num_prompts_per_step}
+  # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
+  max_buffered_rollouts: 64
+  # Enable per-rollout diagnostic prints (prompt content / completion previews).
+  diagnostics: false
+
+  # ── Resiliency ─────────────────────────────────────────────────────────────
+  # What happens to a prompt whose rollout fails. Infrastructure failures are
+  # re-dispatched (the retry re-enters shard selection, so it lands elsewhere);
+  # deterministic per-prompt failures get a much smaller budget because another
+  # shard would fail identically.
+  #
+  # The budgets here govern BOTH rollout paths -- the retry loop sits above the
+  # native/NeMo-Gym split. Anything path-specific lives in the sub-blocks below,
+  # so the structure says which knob applies where. Filling in the block for the
+  # path a run is not taking is rejected at setup rather than silently ignored.
+  rollout_failure:
+    max_infra_attempts_per_prompt: 5  # infra budget; exhausting it drops the prompt
+    max_data_attempts_per_prompt: 2   # data budget; 1 retry separates transient from deterministic
+    backoff_base_s: 1.0
+    max_backoff_s: 30.0
+    # Prompts allowed to exhaust their data budget and be dropped. 0 fails the run
+    # on the first one, propagating the original error. The two budgets above are
+    # INDEPENDENT counters, so one prompt can consume up to their sum minus one.
+    max_skipped_prompts: 0
+    # CONSECUTIVE prompts allowed to exhaust their infra budget and be dropped; any
+    # committed rollout resets the count. Must stay 0 on a PPO run: a drop shortens the
+    # step, and the critic shards it against the configured value.train_global_batch_size
+    # rather than its actual size, so _validate_algo_settings rejects a non-zero budget.
+    # (On GRPO you may raise it on a large fleet where losing the odd shard is expected.)
+    max_consecutive_dropped_prompts: 0
+    # Smallest batch a step may train on, as a fraction of num_prompts_per_step.
+    # The budgets above are run-scoped and cannot bound how short one step gets, so
+    # this is what guarantees the gradient is computed from most of a batch. The floor
+    # is ceil(fraction * num_prompts_per_step), so small batches tolerate no drops.
+    min_step_batch_fraction: 0.9
+    # What happens to the step a dropped prompt was stamped for (in_order sampler only;
+    # an unstamped sampler strands nothing). "shrink" trains the step on fewer groups,
+    # bounded by the floor above. "replace" substitutes a fresh prompt so the step keeps
+    # its configured batch size -- what the v1 stack does -- and still shrinks if the
+    # attempts or spares below run out. When a later step already has a finished group,
+    # replace borrows it to close the dropped step immediately and sends the fresh
+    # prompt to repay that step instead, so the trainer does not idle waiting on a new
+    # rollout; promoted_prompt_groups reports when that happened.
+    on_dropped_prompt: shrink         # shrink | replace
+    max_replacement_attempts: 1       # fresh prompts tried per lost group
+    # Low-water mark for the spare-prompt pool. Refilled by diverting one whole batch
+    # from the dataloader before it is admitted, so a refill yields a batch of spares.
+    replacement_reserve_prompts: 1
+
+    # Deadlines. null disables, which is the default and reproduces the historical
+    # behaviour of waiting forever. Set them in any run that matters: without one a
+    # wedged generation engine parks a rollout permanently, holding a
+    # max_inflight_prompts slot for the rest of the job.
+    native:                           # AsyncRolloutImpl only
+      generation_timeout_s: null      # one generate_async turn
+      env_timeout_s: null             # one environment step
+    nemo_gym:                         # AsyncNemoGymRolloutImpl only
+      rollout_timeout_s: null         # the whole prompt-group rollout, retries included
+      # Re-send just the rows that never arrived before retrying the whole group.
+      # Gym's stream dies on its first failing row, so one bad row loses every later
+      # one; recovering those individually beats redoing all N.
+      max_row_attempts: 3
+
+  # Last-resort stall detection. stall_timeout_s must exceed interval_s and every
+  # deadline above, so a merely-slow rollout is not reported as a stall.
+  stall_watchdog:
+    interval_s: 30.0
+    stall_timeout_s: 600.0
+    stall_action: warn                # warn | abort
+    gym_subprocess_check: true        # polls NeMo-Gym's RunHelper for dead servers
+
+  # Per-shard liveness for the generation fleet. Off by default, in which case shard
+  # selection keeps its historical health-blind round-robin. On, a shard that fails
+  # probes or real requests is quarantined instead of keeping its 1/N of traffic, and
+  # the run aborts with an attributable error once too few shards remain.
+  generation_fleet_health:
+    enabled: false
+    probe_interval_s: 5.0             # must exceed probe_timeout_s
+    probe_timeout_s: 2.0
+    unhealthy_threshold: 3            # ~15s to quarantine at the default interval
+    healthy_threshold: 2              # successes before a suspect shard is trusted again
+    selection: least_outstanding      # steers away from a slow shard without diagnosing it
+    on_dead_shard: fail_fast          # recovery modes arrive with the communicator rebuild
+    max_restart_attempts_per_shard: 5
+    min_healthy_shards: 1             # below this the run aborts
+
+  # NeMo-Gym-facing router in front of the generation fleet. Gym picks an endpoint by
+  # round-robin over a list fixed at process start and never fails over, so it is handed
+  # one NeMo-RL-owned URL instead and the routing decision moves next to generation_fleet_health.
+  # Only meaningful on the NeMo-Gym path; the native path calls generation over Ray.
+  generation_router:
+    enabled: false
+    port_range_low: 6000              # distinct from Gym (5000-5999) and vLLM (7000-8999)
+    port_range_high: 6099
+    backend_timeout_s: 600.0          # covers a whole generation; Gym sets none at all
+    connect_timeout_s: 5.0            # a local handshake is ms-or-never
+    no_healthy_backend_status: 409    # must stay outside Gym's retry set
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/ppo-single-controller
+  metric_name: null
+
+policy:
+  tokenizer:
+    # Opt-in Rust-backed BPE tokenizer (~10x faster encode); requires the
+    # fastokens-b10 wheel. NRL_USE_FASTOKENS overrides at runtime.
+    use_fastokens: false
+  # The only thing on the SC path that takes the policy optimizer off the GPU.
+  # Without it the critic's forward and train stages run on top of it.
+  offload_optimizer_for_logprob: true
+
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  generation:
+    port_range_low: 11001
+    port_range_high: 15000
+    mcore_generation_config:
+      unified_memory_level: 0
+    vllm_cfg:
+      async_engine: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 1
+
+logger:
+  wandb:
+    name: ppo-single-controller-dev
+  swanlab:
+    name: ppo-single-controller-dev
+  mlflow:
+    run_name: ppo-single-controller-dev
+
+# TransferQueue data plane is mandatory for the SingleController path. The whole
+# block is spelled out because the PPO config chain has none; the fields have no
+# defaults. Values are grpo_math_1B.yaml's except default enabled.
+# See nemo_rl/data_plane/README.md for more details.
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: "simple"                  # TQ storage backend ('simple' or 'mooncake_cpu')
+  claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
+  # Backend-specific blocks: only the one named by `backend` is read, and an
+  # absent block means that backend's defaults (see SimpleStorageConfig /
+  # MooncakeCpuConfig in nemo_rl/data_plane/interfaces.py).
+  simple:
+    storage_capacity: 1000000        # max samples retained per partition
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
+  mooncake_cpu:
+    # Per client process — see MooncakeCpuConfig before raising these.
+    global_segment_size: 68719476736 # 64 GiB/process
+    local_buffer_size:    4294967296 # 4 GiB/process
+    reuse_registered_buffers: true   # reuse RDMA-registered buffers
+    staging_buffer_size:   268435456 # 256 MiB/pool slot; bigger transfers bypass the pool
+  # observability:                    # NotRequired
+  #   enabled: false
+
+cluster:
+  gpus_per_node: 2
+  master_port_range_low: 25000
+  master_port_range_high: 28000

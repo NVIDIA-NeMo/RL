@@ -697,6 +697,7 @@ def get_basic_megatron_test_config(
         "sequence_packing": {
             "enabled": False,
         },
+        "make_sequence_length_divisible_by": 1,
         "megatron_cfg": {
             "enabled": True,
             "empty_unused_memory_level": empty_unused_memory_level,

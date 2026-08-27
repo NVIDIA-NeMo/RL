@@ -110,6 +110,12 @@ def main() -> None:
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 
+    if config.ppo.async_ppo is None:
+        raise ValueError(
+            "ppo.async_ppo: null is only supported by run_grpo_single_controller.py; "
+            "the legacy PPO entrypoint requires the block."
+        )
+
     # Print config
     print("Final config:")
     pprint.pprint(config)

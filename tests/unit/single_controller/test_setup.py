@@ -16,31 +16,37 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from omegaconf import OmegaConf
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
+from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     ReadyFirstSamplerConfig,
     SamplerConfig,
 )
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
     SingleControllerActorArgs,
     setup_single_controller,
 )
+from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
 from nemo_rl.experience.rollouts import EffortLevelsConfig
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 
 def _make_master_config(
     *,
     dp_enabled: bool = True,
     use_multiple_dataloader: bool = False,
-    colocated: bool = True,
+    colocated: bool = False,
     backend: str = "vllm",
     megatron_enabled: bool = False,
     env: dict | None = None,
@@ -97,6 +103,7 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
+        cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
         env=env if env is not None else {},
         async_rl=AsyncRLConfig(
@@ -140,6 +147,7 @@ def patched_factories():
             return_value=(
                 MagicMock(name="train_cluster"),
                 MagicMock(name="inference_cluster"),
+                None,
             ),
         ) as mock_clusters,
         patch.object(
@@ -158,9 +166,8 @@ def patched_factories():
             "create_weight_synchronizer",
             return_value=MagicMock(name="weight_sync"),
         ) as mock_weight_sync,
-        patch.object(
-            sc_setup_mod,
-            "_create_advantage_estimator",
+        patch(
+            "nemo_rl.algorithms.grpo._create_advantage_estimator",
             return_value=MagicMock(name="adv"),
         ) as mock_adv,
         patch.object(
@@ -224,6 +231,131 @@ def test_build_clusters_rejects_non_colocated_megatron_generation():
         sc_setup_mod._build_clusters(master_config)
 
 
+def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
+    """Topology planning reports the supported SC backends instead of KeyError."""
+    master_config = _make_master_config(colocated=False, backend="trtllm")
+    master_config.cluster = {"num_nodes": 2, "gpus_per_node": 8, "segment_size": 1}
+    master_config.policy["generation"]["colocated"]["resources"] = {
+        "gpus_per_node": 8,
+        "num_nodes": 1,
+    }
+    monkeypatch.setattr(
+        sc_setup_mod,
+        "prepare_segment_topology",
+        lambda *args, **kwargs: (
+            [{"nvlink_domain": 0.001}],
+            ["inference"],
+            {
+                "training": ("nvlink_domain", 0),
+                "inference": ("nvlink_domain", 1),
+            },
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="only supports vllm or sglang generation; got 'trtllm'",
+    ):
+        sc_setup_mod._build_clusters(master_config)
+
+
+def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
+    """Teacher nodes are removed before the student train/inference split."""
+    master_config = _make_master_config(colocated=False)
+    master_config.cluster = {"num_nodes": 3, "gpus_per_node": 8}
+    master_config.policy["generation"]["colocated"]["resources"] = {
+        "gpus_per_node": 8,
+        "num_nodes": 1,
+    }
+    master_config.on_policy_distillation = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"default_teacher": "Qwen/Qwen3-1.7B"},
+        default_teacher_alias="default_teacher",
+        non_colocated_teachers={"enabled": True},
+    )
+    constructed = []
+
+    class FakeCluster:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            constructed.append(kwargs)
+
+    monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", FakeCluster)
+
+    _, _, teacher_topology = sc_setup_mod._build_clusters(master_config)
+
+    assert constructed[0]["bundle_ct_per_node_list"] == [8]
+    assert constructed[1]["bundle_ct_per_node_list"] == [8]
+    assert teacher_topology is None
+
+
+def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
+    """One student node can split train/inference while node two hosts teacher."""
+    master_config = _make_master_config(colocated=False)
+    master_config.cluster = {"num_nodes": 2, "gpus_per_node": 8}
+    master_config.policy["generation"]["colocated"]["resources"] = {
+        "gpus_per_node": 4,
+        "num_nodes": 1,
+    }
+    master_config.on_policy_distillation = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"default": "/ckpt/teacher"},
+        default_teacher_alias="default",
+        non_colocated_teachers={
+            "enabled": True,
+            "default_teacher_cfg": {"num_nodes": 1, "gpus_per_node": 8},
+        },
+    )
+    constructed = []
+
+    class FakeCluster:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            constructed.append(self)
+
+    monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", FakeCluster)
+
+    train_cluster, inference_cluster, teacher_topology = sc_setup_mod._build_clusters(
+        master_config
+    )
+
+    assert train_cluster.kwargs["bundle_ct_per_node_list"] == [4]
+    assert inference_cluster.kwargs["bundle_ct_per_node_list"] == [4]
+    assert teacher_topology is None
+
+
+def test_single_controller_mopd_recipe_resolves_to_runtime_contract():
+    """The inherited recipe resolves exactly as the SC entrypoint consumes it."""
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    recipe = repo_root / (
+        "examples/configs/recipes/llm/"
+        "mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller.yaml"
+    )
+    resolved = OmegaConf.to_container(load_config(recipe), resolve=True)
+
+    assert isinstance(resolved, dict)
+    config = MasterConfig.model_validate(resolved)
+    assert config.grpo.async_grpo is None
+    assert config.grpo.adv_estimator.name == "opd"
+    assert config.grpo.skip_reference_policy_logprobs_calculation is True
+    assert config.async_rl.min_groups_for_streaming_train == (
+        config.grpo.num_prompts_per_step
+    )
+    assert config.policy["train_global_batch_size"] == (
+        config.grpo.num_prompts_per_step * config.grpo.num_generations_per_prompt
+    )
+    assert config.data_plane["enabled"] is True
+    assert config.env["should_use_nemo_gym"] is True
+    assert config.on_policy_distillation.enabled is True
+    assert config.on_policy_distillation.non_colocated_teachers is not None
+    assert config.on_policy_distillation.non_colocated_teachers.enabled is True
+    assert (
+        config.on_policy_distillation.teacher_model_by_agent_name["default_teacher"]
+        == config.policy["model_name"]
+    )
+
+
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
@@ -236,6 +368,123 @@ class TestSetup:
         mc = _make_master_config(use_multiple_dataloader=True)
         with pytest.raises(NotImplementedError, match="use_multiple_dataloader"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    @pytest.mark.parametrize(
+        (
+            "opd_enabled",
+            "teacher_enabled",
+            "adv_name",
+            "use_nemo_gym",
+            "match",
+        ),
+        [
+            (
+                False,
+                False,
+                "opd",
+                True,
+                "requires on_policy_distillation.enabled=true",
+            ),
+            (
+                True,
+                True,
+                "grpo",
+                True,
+                "requires grpo.adv_estimator.name='opd'",
+            ),
+            (True, False, "opd", True, "non_colocated_teachers.enabled=true"),
+            (True, True, "opd", False, "requires env.should_use_nemo_gym=true"),
+        ],
+    )
+    def test_invalid_mopd_config_fails_before_allocating_resources(
+        self,
+        opd_enabled: bool,
+        teacher_enabled: bool,
+        adv_name: str,
+        use_nemo_gym: bool,
+        match: str,
+        patched_factories,
+    ):
+        mc = _make_master_config()
+        mc.env["should_use_nemo_gym"] = use_nemo_gym
+        mc.grpo.adv_estimator = AdvEstimatorConfig(name=adv_name)
+        mc.on_policy_distillation = OnPolicyDistillationConfig(
+            enabled=opd_enabled,
+            teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+            non_colocated_teachers={"enabled": teacher_enabled},
+        )
+
+        with pytest.raises(ValueError, match=match):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_mopd_reserves_before_models_and_initializes_teacher_last(
+        self, patched_factories, monkeypatch
+    ):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.cluster = {"num_nodes": 3, "gpus_per_node": 8}
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
+        mc.policy["generation"].update(
+            {"stop_strings": None, "stop_token_ids": None, "top_k": None}
+        )
+        mc.grpo.adv_estimator = AdvEstimatorConfig(name="opd")
+        mc.on_policy_distillation = OnPolicyDistillationConfig(
+            enabled=True,
+            teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+            default_teacher_alias="teacher",
+            non_colocated_teachers={"enabled": True},
+        )
+        events = []
+        teacher_cluster = MagicMock(name="teacher_cluster")
+        teacher_group = MagicMock(name="teacher_group")
+
+        def reserve_teachers(*args, **kwargs):
+            del args, kwargs
+            events.append("reserve_teacher")
+            return {"teacher": teacher_cluster}
+
+        original_build_generation = patched_factories["_build_generation"].return_value
+
+        def build_generation(*args, **kwargs):
+            del args, kwargs
+            events.append("build_generation")
+            return original_build_generation
+
+        def create_teachers(*args, **kwargs):
+            del args, kwargs
+            events.append("create_teacher")
+            return {"teacher": teacher_group}, {"teacher": "teacher"}
+
+        patched_factories["_build_generation"].side_effect = build_generation
+        monkeypatch.setattr(
+            sc_setup_mod.opd_module,
+            "reserve_teacher_clusters",
+            reserve_teachers,
+        )
+        monkeypatch.setattr(
+            sc_setup_mod.opd_module,
+            "create_teacher_worker_groups",
+            create_teachers,
+        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        monkeypatch.setattr(
+            sc_setup_mod,
+            "_spinup_gym",
+            lambda **_kwargs: (MagicMock(name="nemo_gym_actor"), 0.0),
+        )
+
+        actor_args, timings = setup_single_controller(mc, MagicMock(pad_token_id=17))
+
+        assert events == ["reserve_teacher", "build_generation", "create_teacher"]
+        assert actor_args.teacher_worker_groups == {"teacher": teacher_group}
+        assert actor_args.alias_to_group_alias == {"teacher": "teacher"}
+        teacher_group.setup_data_plane.assert_called_once_with(mc.data_plane)
+        assert timings.teacher_reservation_time_s is not None
+        assert timings.teacher_model_init_time_s is not None
 
     @pytest.mark.parametrize(
         ("invalid_case", "match"),
@@ -307,7 +556,7 @@ class TestSetup:
         patched_factories["_build_clusters"].assert_not_called()
 
     def test_returns_actor_args(self, patched_factories):
-        mc = _make_master_config(colocated=True)
+        mc = _make_master_config()
         tokenizer = MagicMock(pad_token_id=0)
 
         actor_args, _ = setup_single_controller(mc, tokenizer)
@@ -340,6 +589,41 @@ class TestSetup:
         assert actor_args.partition_id == "rollout_data"
         assert actor_args.tq_buffer._partition_id == "rollout_data"
         assert actor_args.tq_buffer._require_routed_experts is False
+        actor_args.dp_client.register_partition.assert_called_once()
+        warmup = actor_args.dp_client.register_partition.call_args.kwargs
+        assert warmup["partition_id"] == "rollout_data"
+        assert set(SC_ROLLOUT_SCHEMA_FIELDS) <= set(warmup["fields"])
+        assert "teacher_reference_logprobs" in warmup["fields"]
+        assert warmup["num_samples"] == 16
+        assert warmup["grpo_group_size"] == 2
+
+    def test_reserves_topology_constrained_training_before_builds(
+        self, patched_factories
+    ):
+        mc = _make_master_config(colocated=False)
+        mc.cluster = {"num_nodes": 2, "gpus_per_node": 8, "segment_size": 1}
+        mc.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 4,
+            "num_nodes": 1,
+        }
+        train_cluster = patched_factories["_build_clusters"].return_value[0]
+        events = []
+        train_cluster.get_placement_groups.side_effect = lambda: events.append(
+            "reserve_train"
+        )
+        original_build = patched_factories["_build_generation"].return_value
+
+        def build_generation(*args, **kwargs):
+            del args, kwargs
+            events.append("build_generation")
+            return original_build
+
+        patched_factories["_build_generation"].side_effect = build_generation
+
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert events[0] == "reserve_train"
+        train_cluster.get_placement_groups.assert_called_once_with()
 
     def test_effort_levels_reach_the_rollout_manager(self, patched_factories):
         """env.nemo_gym.effort_levels is resolved into RolloutManager's kwarg.
@@ -388,7 +672,7 @@ class TestSetup:
         assert call_kwargs["effort_config"] is None
 
     def test_router_replay_requires_routes_in_tq_buffer(self, patched_factories):
-        mc = _make_master_config(colocated=True)
+        mc = _make_master_config()
         mc.policy["router_replay"] = {"enabled": True}
 
         actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -502,7 +786,7 @@ class TestSetup:
 
     def test_nemo_gym_wires_env_handle(self, patched_factories):
         """When should_use_nemo_gym is True the nemo-gym actor is spun up and stored."""
-        mc = _make_master_config(colocated=True, backend="vllm")
+        mc = _make_master_config(backend="vllm")
         mc.policy["generation"]["model_name"] = "test-model"
         mc.policy["generation"]["stop_strings"] = None
         mc.policy["generation"]["stop_token_ids"] = None
@@ -536,9 +820,9 @@ class TestSetup:
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 
-    def test_setup_timing_populated_for_colocated_vllm(self, patched_factories):
-        """Colocated vLLM records gen+policy+collective+total+worker fields."""
-        mc = _make_master_config(colocated=True, backend="vllm")
+    def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
+        """Non-colocated vLLM records every per-phase field."""
+        mc = _make_master_config(colocated=False, backend="vllm")
 
         _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -553,23 +837,6 @@ class TestSetup:
             value = getattr(metrics, field)
             assert value is not None, f"missing {field} on {metrics}"
             assert value >= 0
-        # parallel_wall_time_s / parallel_init_enabled are grpo.py-only in the
-        # shared SetupTimingMetrics — SC does not emit them.
-        assert metrics.parallel_wall_time_s is None
-        assert metrics.parallel_init_enabled is None
-        # Reserve/load split is populated on the gym-on path only.
-        assert metrics.generation_init_reserve_time_s is None
-        assert metrics.generation_init_load_time_s is None
-
-    def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
-        """Non-colocated vLLM records the same per-phase fields as colocated."""
-        mc = _make_master_config(colocated=False, backend="vllm")
-
-        _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
-
-        assert metrics.generation_init_time_s is not None
-        assert metrics.policy_init_time_s is not None
-        assert metrics.worker_setup_time_s is not None
         # parallel_wall_time_s / parallel_init_enabled are grpo.py-only.
         assert metrics.parallel_wall_time_s is None
         assert metrics.parallel_init_enabled is None
@@ -579,7 +846,7 @@ class TestSetup:
 
     def test_setup_timing_backend_agnostic_for_sglang(self, patched_factories):
         """SC uses the backend-agnostic generation_init_time_s regardless of backend."""
-        mc = _make_master_config(colocated=True, backend="sglang")
+        mc = _make_master_config(backend="sglang")
 
         _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -587,7 +854,7 @@ class TestSetup:
 
     def test_nemo_gym_uses_deferred_vllm_load(self, patched_factories):
         """NeMo-Gym path reserves vLLM ports up-front and finishes the load afterwards."""
-        mc = _make_master_config(colocated=True, backend="vllm")
+        mc = _make_master_config(backend="vllm")
         mc.policy["generation"]["model_name"] = "test-model"
         mc.policy["generation"]["stop_strings"] = None
         mc.policy["generation"]["stop_token_ids"] = None
@@ -613,7 +880,7 @@ class TestSetup:
 
     def test_nemo_gym_records_timing_metrics(self, patched_factories):
         """NeMo-Gym path records per-phase timings (vllm/policy/gym/worker)."""
-        mc = _make_master_config(colocated=True, backend="vllm")
+        mc = _make_master_config(backend="vllm")
         mc.policy["generation"]["model_name"] = "test-model"
         mc.policy["generation"]["stop_strings"] = None
         mc.policy["generation"]["stop_token_ids"] = None
@@ -666,9 +933,8 @@ class TestSetup:
         assert metrics.generation_init_time_s is not None
         assert metrics.policy_init_time_s is not None
 
-    @pytest.mark.parametrize("colocated", [True, False])
     def test_nemo_gym_generation_init_time_includes_reserve_time(
-        self, patched_factories, colocated
+        self, patched_factories
     ):
         """generation_init_time_s folds in the deferred-VllmGeneration reserve time.
 
@@ -678,7 +944,7 @@ class TestSetup:
         gym-on runs undercount generation setup by the worker-group span. The
         reserve/load split is also exposed for overlap analysis.
         """
-        mc = _make_master_config(colocated=colocated, backend="vllm")
+        mc = _make_master_config(colocated=False, backend="vllm")
         mc.policy["generation"]["model_name"] = "test-model"
         mc.policy["generation"]["stop_strings"] = None
         mc.policy["generation"]["stop_token_ids"] = None
@@ -709,7 +975,7 @@ class TestSetup:
     @pytest.mark.parametrize("backend", ["sglang", "megatron"])
     def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):
         """SC nemo-gym wiring only supports vLLM; every other backend must raise."""
-        mc = _make_master_config(colocated=True, backend=backend)
+        mc = _make_master_config(backend=backend)
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,

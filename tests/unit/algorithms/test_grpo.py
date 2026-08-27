@@ -2925,9 +2925,6 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         def prepare_refit_info(self):
             return {}
 
-        def set_rollout_num_gpus_per_engine(self, _num_gpus_per_engine):
-            pass
-
     def legacy_policy_factory(
         *,
         cluster,
@@ -2953,6 +2950,9 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
 
     class DummySGLangGeneration:
         num_gpus_per_engine = 1
+        pause_generation_mode = "retract"
+        cfg: dict = {}
+        weight_synchronizer = None
 
         def finish_generation(self):
             pass
@@ -2992,10 +2992,12 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         "resources": {"gpus_per_node": None, "num_nodes": None},
     }
     master_config.policy["generation"]["sglang_cfg"] = {
+        "quantization": {"scheme": "bf16"},
         "gpus_per_server": 1,
         "dp_size": 1,
         "pp_size": 1,
         "ep_size": 1,
+        "sglang_server_config": {},
     }
     master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
     master_config.grpo.val_period = 0

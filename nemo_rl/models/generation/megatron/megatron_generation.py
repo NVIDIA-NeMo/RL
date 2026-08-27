@@ -220,8 +220,12 @@ class MegatronGeneration(GenerationInterface):
             reserved_http_server_port=reserved_http_server_port,
         )
 
-        # Start the persistent inference engine + HTTP server during construction.
-        self.prepare_for_generation()
+        # MXFP8 inference re-quantizes weights at the first refit, so CUDA graphs must
+        # capture the post-refit buffers (#3731). Everything else starts the engine +
+        # HTTP server now: the NeMo-Gym overlap blocks on the server URL in setup (#3569).
+        gen_fp8_cfg = self.cfg["mcore_generation_config"].get("fp8_cfg")
+        if not (skip_weight_load and gen_fp8_cfg and gen_fp8_cfg["enabled"]):
+            self.prepare_for_generation()
 
     def init_collective(
         self,
@@ -357,7 +361,7 @@ class MegatronGeneration(GenerationInterface):
         )
 
     def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
-        """Pre-initialize NVShmem collectively after CUDA graph capture.
+        """Pre-initialize NVShmem collectively outside CUDA graph capture.
 
         Must be called simultaneously on both training and inference workers.
         """
