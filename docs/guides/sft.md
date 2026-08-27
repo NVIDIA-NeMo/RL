@@ -231,7 +231,9 @@ match. A direct-packed training or validation split cannot be mixed with
 regular datasets, and direct-packed SFT does not support dynamic batching,
 draft training, router replay, `sft.only_unmask_final=true`, or fused linear
 log-probability loss. The relevant training or validation micro batch size must
-be 1. Online `policy.sequence_packing.enabled` is not required for this mode.
+be 1. At context-parallel size 1, online `policy.sequence_packing.enabled` is
+not required. For context-parallel size greater than 1, set it to `true` as
+required by the MCore context-parallel path.
 
 ### OpenAI Format Datasets (with Tool Calling Support)
 
