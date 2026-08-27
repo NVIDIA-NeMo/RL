@@ -2627,29 +2627,26 @@ def _postprocess_single_nemo_gym_group(
     )
     penalty_counts = apply_reward_penalties(results, resolved_reward_penalty_config)
 
-    for nemo_gym_row, result in zip(nemo_gym_rows, results):
-        result["agent_ref"] = nemo_gym_row["agent_ref"]
-        result["profiled_rewards"] = nemo_gym_row.get("profiled_rewards")
-        result["profiled_output_lengths"] = nemo_gym_row.get(
-            "profiled_output_lengths"
-        )
-        result["profiled_reasoning_lengths"] = nemo_gym_row.get(
-            "profiled_reasoning_lengths"
-        )
-        result["profiled_answer_lengths"] = nemo_gym_row.get(
-            "profiled_answer_lengths"
-        )
-        result["profile_band"] = nemo_gym_row.get("profile_band")
-
     if length_adjustment_config is not None:
         grpo_config = (
             length_adjustment_config.model_dump()
             if isinstance(length_adjustment_config, BaseModel)
             else dict(length_adjustment_config)
         )
-        apply_group_length_adjustments(
-            results, {"grpo": grpo_config}, tokenizer=tokenizer
-        )
+        # Callers pass the whole grpo config block; runs without a
+        # grpo.length_bonus section are untouched by this block.
+        if grpo_config.get("length_bonus"):
+            # Copy the per-row fields the length adjustments consume.
+            for nemo_gym_row, result in zip(nemo_gym_rows, results):
+                result["agent_ref"] = nemo_gym_row["agent_ref"]
+                result["profiled_rewards"] = nemo_gym_row.get("profiled_rewards")
+                result["profiled_output_lengths"] = nemo_gym_row.get(
+                    "profiled_output_lengths"
+                )
+                result["profile_band"] = nemo_gym_row.get("profile_band")
+            apply_group_length_adjustments(
+                results, {"grpo": grpo_config}, tokenizer=tokenizer
+            )
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
