@@ -2583,6 +2583,9 @@ class MegatronPolicyWorkerImpl(
             quantized_tensor_groups = iter_nvfp4_quantized_tensor_groups(
                 named_tensors,
                 skip_weight_substrings=skip_weight_substrings,
+                require_gate_up_pairs=(
+                    self.megatron_bridge.transformer_config.gated_linear_unit
+                ),
             )
 
         return iter_named_tensor_group_buckets(
