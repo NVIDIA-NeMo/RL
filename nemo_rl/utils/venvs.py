@@ -113,10 +113,22 @@ def create_local_venv(
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run(
-        ["uv", "sync", "--frozen", "--directory", git_root], env=env, check=True
-    )
-    subprocess.run(exec_cmd, env=env, check=True)
+    # Retried because individual nodes transiently misread the Lustre-mounted
+    # project files (observed as spurious "extra not defined" / stale-lock
+    # errors on 1-2 of 56 nodes per run); one flaky read must not kill the job.
+    for attempt in range(3):
+        try:
+            subprocess.run(
+                ["uv", "sync", "--frozen", "--directory", git_root],
+                env=env,
+                check=True,
+            )
+            subprocess.run(exec_cmd, env=env, check=True)
+            break
+        except subprocess.CalledProcessError:
+            if attempt == 2:
+                raise
+            time.sleep(15 * (attempt + 1))
 
     # Return the path to the python executable in the virtual environment
     python_path = os.path.join(venv_path, "bin", "python")
