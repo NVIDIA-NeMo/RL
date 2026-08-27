@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import threading
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -26,6 +27,10 @@ from nemo_gym.token_id_capture.adapters.megatron import (  # noqa: E402
 )
 from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
     RolloutTokenCapture,
+)
+from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
+    compute_chain_hash,
+    hash_token_ids,
 )
 from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StagedCallRecord,
@@ -54,6 +59,32 @@ class _MemorySink:
         return StageResult(ok=True, staging_key=record.staging_key)
 
 
+class _DeferredAdapter:
+    """Structural deferred adapter that is deliberately not the MInf concrete type."""
+
+    def __init__(self) -> None:
+        self._adapter = MegatronCaptureAdapter()
+
+    def enter_prefix(
+        self, request_payload: dict[str, Any], prefix_ids: list[int]
+    ) -> dict[str, Any]:
+        return self._adapter.enter_prefix(request_payload, prefix_ids)
+
+    def extract_prompt_ids(self, response_payload: dict[str, Any]) -> list[int]:
+        return self._adapter.extract_prompt_ids(response_payload)
+
+    def extract_generation(
+        self, response_payload: dict[str, Any]
+    ) -> tuple[list[int], list[float]]:
+        return self._adapter.extract_generation(response_payload)
+
+    def extract_extras(self, response_payload: dict[str, Any]) -> dict[str, Any] | None:
+        return self._adapter.extract_extras(response_payload)
+
+    def extract_weight_version(self, response_payload: dict[str, Any]) -> int:
+        return self._adapter.extract_weight_version(response_payload)
+
+
 class _WorkerGroup:
     def __init__(self, ledger: dict[str, dict]) -> None:
         self.ledger = ledger
@@ -77,13 +108,18 @@ class _WorkerGroup:
         return [True, True]
 
 
-def _generation(monkeypatch, sink: _MemorySink, ledger: dict[str, dict]):
+def _generation(
+    monkeypatch: pytest.MonkeyPatch,
+    sink: _MemorySink,
+    ledger: dict[str, dict],
+    adapter: Any | None = None,
+) -> MegatronGeneration:
     generation = object.__new__(MegatronGeneration)
     generation._policy = SimpleNamespace(worker_group=_WorkerGroup(ledger))
     generation._token_capture = RolloutTokenCapture(
         sink=sink,
         weight_version_fn=lambda: 0,
-        adapter=MegatronCaptureAdapter(),
+        adapter=adapter or MegatronCaptureAdapter(),
     )
     generation._token_capture_flush_lock = threading.Lock()
     monkeypatch.setattr(
@@ -94,6 +130,7 @@ def _generation(monkeypatch, sink: _MemorySink, ledger: dict[str, dict]):
 
 
 def _receipt() -> dict:
+    token_ids = [10, 11, 12]
     return {
         "rollout_id": "r0",
         "reward": 1.0,
@@ -108,6 +145,9 @@ def _receipt() -> dict:
                 "cum_len": 3,
                 "mode": "text",
                 "ledger_request_uid": "minf-1",
+                "chain_hash": compute_chain_hash(None, token_ids),
+                "cumulative_hash": hash_token_ids(token_ids),
+                "response_id": "minf-1",
                 "logical_request_id": "lr-1",
             }
         ],
@@ -140,12 +180,71 @@ def test_rollout_flush_stages_whole_ledger_batch_then_discards(monkeypatch):
     assert "pending_manifest" not in finalized
     assert finalized["manifest"][0]["weight_version"] == 7
     assert finalized["manifest"][0]["staging_key"] == "r0/c1"
+    assert finalized["manifest"][0]["response_id"] == "minf-1"
     assert sink.records[0].token_ids_delta == [10, 11, 12]
     assert ledger == {}
     assert [call[0] for call in generation._policy.worker_group.calls] == [
         "fetch_token_capture_records",
         "discard_token_capture_records",
     ]
+
+
+def test_rollout_flush_accepts_a_structural_deferred_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = _MemorySink()
+    ledger = {"minf-1": _ledger_record()}
+    generation = _generation(monkeypatch, sink, ledger, adapter=_DeferredAdapter())
+
+    finalized = generation.flush_token_capture(_receipt())
+
+    assert finalized["manifest"][0]["weight_version"] == 7
+    assert sink.records[0].token_ids_delta == [10, 11, 12]
+
+
+def test_rollout_flush_preserves_multiturn_chain_custody(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root_tokens = [10, 11, 12]
+    child_delta = [13, 14]
+    root_chain_hash = compute_chain_hash(None, root_tokens)
+    child_chain_hash = compute_chain_hash(root_chain_hash, child_delta)
+    receipt = _receipt()
+    receipt["terminal_model_call_id"] = "c2"
+    receipt["pending_manifest"].append(
+        {
+            "model_call_id": "c2",
+            "parent_call_id": "c1",
+            "prev_len": len(root_tokens),
+            "delta_len": len(child_delta),
+            "cum_len": len(root_tokens) + len(child_delta),
+            "mode": "token_in",
+            "ledger_request_uid": "minf-2",
+            "chain_hash": child_chain_hash,
+            "cumulative_hash": hash_token_ids(root_tokens + child_delta),
+            "response_id": "minf-2",
+            "logical_request_id": "lr-2",
+        }
+    )
+    child_ledger_record = _ledger_record()
+    child_ledger_record["prompt_token_ids"] = root_tokens + [13]
+    child_ledger_record["generated_token_ids"] = [14]
+    child_ledger_record["generated_log_probs"] = [-0.5]
+    sink = _MemorySink()
+    generation = _generation(
+        monkeypatch,
+        sink,
+        {"minf-1": _ledger_record(), "minf-2": child_ledger_record},
+    )
+
+    finalized = generation.flush_token_capture(receipt)
+
+    assert [record["response_id"] for record in finalized["manifest"]] == [
+        "minf-1",
+        "minf-2",
+    ]
+    assert finalized["manifest"][1]["chain_hash"] == child_chain_hash
+    assert sink.records[1].token_ids_delta == child_delta
 
 
 def test_rollout_flush_keeps_ledger_when_staging_fails(monkeypatch):

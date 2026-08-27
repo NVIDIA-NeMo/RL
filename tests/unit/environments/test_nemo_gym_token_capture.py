@@ -51,9 +51,10 @@ def _manifest_record(
         "extras_digest": "b" * 64,
         "staging_key": f"r0/{call_id}",
         "mode": "text" if parent is None else "token_in",
+        "chain_hash": "c" * 64,
+        "cumulative_hash": cumulative_hash or "d" * 64,
         "response_id": response_id or f"resp-{call_id}",
         "logical_request_id": logical_request_id,
-        "cumulative_hash": cumulative_hash,
     }
 
 
