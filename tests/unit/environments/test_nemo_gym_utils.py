@@ -282,6 +282,7 @@ def test_an_unsharded_job_gets_the_registry_runtime_env(
             _env_configs(num_gpu_nodes=num_gpu_nodes),
             base_urls=["http://vllm-0"],
             model_name="test-model",
+            generation_backend="vllm",
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=True,
