@@ -542,6 +542,36 @@ class TestReviewFixes:
         apply_group_length_penalties(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
 
+    def test_default_block_without_enabled_is_active(self):
+        # `enabled` defaults True consistently: a default: block that omits it
+        # applies its penalties (previously the early return used default False
+        # and silently no-oped).
+        cfg = make_config(default={"group_total_length_penalty_coeff": 0.2})
+        results = [
+            make_result("12345", "12345", 1.0),
+            make_result("1234567890123456789012345", "12345", 1.0),
+        ]
+        apply_group_length_penalties(results, cfg)
+        assert rewards_of(results) == pytest.approx([1.1, 0.9])
+
+    def test_behavior_independent_of_empty_agent_overrides(self):
+        # The same default: block must behave identically with or without an
+        # unrelated empty agent_overrides entry (previously it flipped the
+        # early return and changed behavior).
+        base = {"group_total_length_penalty_coeff": 0.2}
+        outs = []
+        for extra_overrides in (None, {"some_agent": {}}):
+            cfg = make_config(default=dict(base))
+            if extra_overrides is not None:
+                cfg["grpo"]["length_penalty"]["agent_overrides"] = extra_overrides
+            results = [
+                make_result("12345", "12345", 1.0),
+                make_result("1234567890123456789012345", "12345", 1.0),
+            ]
+            apply_group_length_penalties(results, cfg)
+            outs.append(rewards_of(results))
+        assert outs[0] == pytest.approx(outs[1])
+
     def test_unknown_key_raises(self):
         cfg = make_config(default={"enabled": True, "group_total_length_coeff": 0.1})
         results = [make_result("12345", "12345", 1.0), make_result("123", "123", 1.0)]

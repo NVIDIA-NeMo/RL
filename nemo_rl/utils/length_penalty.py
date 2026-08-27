@@ -218,7 +218,10 @@ def apply_group_length_penalties(
     agents_cfg = length_cfg.get("agent_overrides")
     global_band = _resolve_global_profile_band(length_cfg.get("profile_band"))
     verbose = bool(length_cfg.get("verbose", False))
-    if not default_cfg.get("enabled", False) and not agents_cfg and not global_band:
+    # `enabled` defaults True here AND in the per-group param resolution: a
+    # configured `default:` block is intent-to-enable; omitting `enabled` must
+    # not silently no-op (and must not depend on unrelated keys being present).
+    if not default_cfg.get("enabled", True) and not agents_cfg and not global_band:
         return
 
     num_gens = master_config["grpo"]["num_generations_per_prompt"]
