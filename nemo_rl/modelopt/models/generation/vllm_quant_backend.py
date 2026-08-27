@@ -532,10 +532,12 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         super()._synchronize_before_ipc_data_ack()
 
     def prepare_refit_info(
-        self, state_dict_info: dict[str, Any]
+        self,
+        state_dict_info: dict[str, Any],
+        serialized_fp8_config: Optional[dict[str, Any]] = None,
     ) -> Optional[list[str]]:
         if not self._is_real_quant_model():
-            return super().prepare_refit_info(state_dict_info)
+            return super().prepare_refit_info(state_dict_info, serialized_fp8_config)
 
         # Real quantization owns a separate refit handshake and must not import
         # the legacy FP8 quantization path.

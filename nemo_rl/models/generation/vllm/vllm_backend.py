@@ -582,7 +582,15 @@ class VllmInternalWorkerExtension:
         self._validate_native_layerwise_refit()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
-        from nemo_rl.models.generation.vllm.quantization import fp8
+        try:
+            from nemo_rl.models.generation.vllm.quantization import fp8
+        except ImportError:
+            # The FP8 module needs a full vLLM install; without an FP8 config
+            # there is nothing to negotiate, so tolerate partial/stubbed vLLM
+            # environments (unit tests) instead of failing the BF16 handshake.
+            if serialized_fp8_config is not None:
+                raise
+            return None
 
         fp8.install_fp8_config(serialized_fp8_config)
         if not (
