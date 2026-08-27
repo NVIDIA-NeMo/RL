@@ -40,7 +40,8 @@ class SetupTimingMetrics:
     parallel_wall_time_s: Optional[float] = None
     parallel_init_enabled: Optional[float] = None
 
-    # grpo-only phases (non-colocated OPD teachers, sparse refit, checkpoint-engine).
+    # Optional setup phases. OPD teacher timings are shared by legacy GRPO and SC;
+    # sparse refit and checkpoint-engine timings remain legacy-GRPO-only.
     teacher_reservation_time_s: Optional[float] = None
     teacher_model_init_time_s: Optional[float] = None
     teacher_init_time_s: Optional[float] = None

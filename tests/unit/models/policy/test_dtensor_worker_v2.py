@@ -734,6 +734,24 @@ class TestDTensorParamsGenerator:
                 f"Tensor {name} should be converted to {target_dtype}"
             )
 
+    def test_preserves_fp32_router_correction_bias(self):
+        """FP32 MoE router state must not be downcast during refit."""
+
+        class RouterModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer(
+                    "e_score_correction_bias", torch.arange(4, dtype=torch.float32)
+                )
+                self.register_buffer(
+                    "ordinary_buffer", torch.arange(4, dtype=torch.float32)
+                )
+
+        results = dict(dtensor_params_generator(RouterModel(), torch.bfloat16))
+
+        assert results["e_score_correction_bias"].dtype == torch.float32
+        assert results["ordinary_buffer"].dtype == torch.bfloat16
+
     def test_contiguous_output(self):
         """Test that output tensors are contiguous."""
         # Arrange
@@ -824,6 +842,31 @@ class TestDTensorParamsGenerator:
         for name, tensor in results:
             assert tensor.dtype == target_dtype
             assert tensor.is_contiguous()
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_prepare_refit_info_preserves_fp32_router_correction_bias():
+    """Refit metadata must match the FP32 router-bias payload dtype."""
+
+    class RouterModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer(
+                "e_score_correction_bias", torch.arange(4, dtype=torch.float32)
+            )
+            self.register_buffer(
+                "ordinary_buffer", torch.arange(4, dtype=torch.float32)
+            )
+
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.model = RouterModel()
+    worker.dtype = torch.bfloat16
+
+    refit_info = DTensorPolicyWorkerV2Impl.prepare_refit_info(worker)
+
+    assert refit_info["e_score_correction_bias"][1] == torch.float32
+    assert refit_info["ordinary_buffer"][1] == torch.bfloat16
 
 
 @pytest.mark.automodel

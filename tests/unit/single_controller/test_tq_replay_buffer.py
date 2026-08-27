@@ -28,6 +28,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     REPLAY_BUFFER_METADATA_STORAGE,
     DataPlaneCheckpointBarrier,
+    PostWriteEnrichmentError,
     TQReplayBuffer,
     replay_manifest_digest,
 )
@@ -318,6 +319,48 @@ class TestTQReplayBufferReserveCommit:
             assert buf.ready_list == [True]
 
         asyncio.run(exercise())
+
+    def test_commit_enriches_after_put_before_slot_becomes_ready(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        observations = []
+
+        async def enrich(meta, record):
+            del record
+            observations.append((dp.depth(), list(buf.ready_list)))
+            return meta.with_fields(["teacher_reference_logprobs"])
+
+        buf.set_post_write_enricher(enrich)
+        meta = _add_group(buf, weight=3)
+
+        assert observations == [(_N_GENS, [False])]
+        assert "teacher_reference_logprobs" in meta.fields
+        assert buf.ready_list == [True]
+
+    def test_commit_rolls_back_when_post_write_enrichment_fails(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+
+        async def fail_enrichment(meta, record):
+            del meta, record
+            raise RuntimeError("teacher unavailable")
+
+        buf.set_post_write_enricher(fail_enrichment)
+        group_id = buf.reserve(weight_version=3)
+
+        with pytest.raises(PostWriteEnrichmentError, match="post-write enrichment"):
+            _run(
+                buf.commit(
+                    group_id,
+                    _make_record(),
+                    start_weight_version=3,
+                    end_weight_version=3,
+                )
+            )
+
+        assert dp.depth() == 0
+        assert buf.ready_list == [False]
+        assert buf.meta_list == [None]
 
     def test_commit_clears_rows_when_put_raises_after_writing(self):
         dp = FailAfterPutDataPlaneClient()

@@ -24,7 +24,16 @@ from collections import Counter
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from numbers import Integral, Real
-from typing import Any, Iterable, Literal, NotRequired, Optional, TypedDict
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Iterable,
+    Literal,
+    NotRequired,
+    Optional,
+    TypedDict,
+)
 
 import ray
 import torch
@@ -219,6 +228,10 @@ class DataPlaneCheckpointBarrier:
             async with self._condition:
                 self._checkpoint_active = False
                 self._condition.notify_all()
+
+
+class PostWriteEnrichmentError(RuntimeError):
+    """A rollout reached TQ but failed in required post-write processing."""
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -959,6 +972,9 @@ class TQReplayBuffer:
         self.ready_list: list[bool] = []
         self._group_ids: list[str] = []
         self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
+        self._post_write_enricher: Optional[
+            Callable[[KVBatchMeta, PromptGroupRecord], Awaitable[KVBatchMeta]]
+        ] = None
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier
@@ -972,6 +988,13 @@ class TQReplayBuffer:
         if self._data_plane_checkpoint_barrier is not None:
             raise RuntimeError("data-plane checkpoint barrier is already configured")
         self._data_plane_checkpoint_barrier = barrier
+
+    def set_post_write_enricher(
+        self,
+        enricher: Callable[[KVBatchMeta, PromptGroupRecord], Awaitable[KVBatchMeta]],
+    ) -> None:
+        """Install the required enrichment stage run before slots become ready."""
+        self._post_write_enricher = enricher
 
     def reserve(
         self,
@@ -1073,6 +1096,14 @@ class TQReplayBuffer:
                     sequence_lengths=[int(s) for s in lengths.tolist()],
                     tags=[dict(t) for t in tags],
                 )
+
+                if self._post_write_enricher is not None:
+                    try:
+                        meta = await self._post_write_enricher(meta, record)
+                    except Exception as error:
+                        raise PostWriteEnrichmentError(
+                            f"post-write enrichment failed for group_id={group_id!r}"
+                        ) from error
 
                 idx = self._group_ids.index(group_id)
                 self.meta_list[idx] = meta

@@ -96,13 +96,54 @@ def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -
     user-supplied ``hf_overrides``. We pop ``hf_overrides`` before the shallow
     update and merge it separately so that fp8's ``quantization_config`` is the
     base while user overrides (e.g. ``max_position_embeddings``) survive and take
-    precedence. This regression was reintroduced once already; see #1413/#2904.
+    precedence. Required FP8 ignore entries are combined with user-provided ignore
+    entries so generated safety exclusions cannot be removed. This regression was
+    reintroduced once already; see #1413/#2904.
     """
     fp8_kwargs = dict(fp8_kwargs)
     fp8_hf_overrides = fp8_kwargs.pop("hf_overrides", {})
     vllm_kwargs.update(fp8_kwargs)
     existing_hf_overrides = vllm_kwargs.get("hf_overrides") or {}
-    vllm_kwargs["hf_overrides"] = {**fp8_hf_overrides, **existing_hf_overrides}
+    merged_hf_overrides = {**fp8_hf_overrides, **existing_hf_overrides}
+
+    fp8_quantization_config = fp8_hf_overrides.get("quantization_config")
+    existing_quantization_config = existing_hf_overrides.get("quantization_config")
+    if existing_quantization_config is None:
+        if fp8_quantization_config is not None:
+            merged_hf_overrides["quantization_config"] = fp8_quantization_config
+    elif not isinstance(existing_quantization_config, dict):
+        raise ValueError("hf_overrides.quantization_config must be a mapping")
+    elif isinstance(fp8_quantization_config, dict):
+        merged_quantization_config = {
+            **fp8_quantization_config,
+            **existing_quantization_config,
+        }
+        for key in ("ignore", "ignored_layers"):
+            generated_values = fp8_quantization_config.get(key, [])
+            user_values = existing_quantization_config.get(key, [])
+            if not isinstance(generated_values, list) or not isinstance(
+                user_values, list
+            ):
+                raise ValueError(f"quantization_config.{key} must be a list")
+            if generated_values or user_values:
+                merged_quantization_config[key] = list(
+                    dict.fromkeys([*generated_values, *user_values])
+                )
+        merged_hf_overrides["quantization_config"] = merged_quantization_config
+
+    vllm_kwargs["hf_overrides"] = merged_hf_overrides
+
+
+def _log_effective_quantization_ignore_patterns(
+    vllm_cfg: dict[str, Any], vllm_kwargs: dict[str, Any]
+) -> None:
+    if not vllm_cfg.get("quantization_ignore_patterns"):
+        return
+
+    effective_ignore = vllm_kwargs["hf_overrides"]["quantization_config"].get(
+        "ignore", []
+    )
+    print(f"NRL_MXFP8_EFFECTIVE_IGNORE={effective_ignore}")
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -566,6 +607,8 @@ class BaseVllmGenerationWorker:
 
             # Text-only runs additionally set generation.vllm_kwargs.language_model_only
             # in the recipe YAML to skip vLLM's multimodal preflight.
+
+        _log_effective_quantization_ignore_patterns(self.cfg["vllm_cfg"], vllm_kwargs)
 
         llm_kwargs = dict(
             model=self.model_name,
