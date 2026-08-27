@@ -1184,6 +1184,7 @@ def test_main_worker_configures_nvfp4_pertoken_engine_kwargs(monkeypatch):
     assert llm_kwargs["quantization"] == "nvfp4_pertoken"
 
 
+@pytest.mark.vllm
 def test_main_worker_accepts_nvfp4_pertoken_over_framework_defaults():
     """Framework defaults must not look like explicit user conflicts."""
     pytest.importorskip("vllm")
@@ -1217,6 +1218,7 @@ def test_main_worker_accepts_nvfp4_pertoken_over_framework_defaults():
     assert llm_kwargs["hf_overrides"]["max_position_embeddings"] == 4096
 
 
+@pytest.mark.vllm
 def test_main_worker_rejects_explicit_quantization_for_nvfp4_pertoken():
     pytest.importorskip("vllm")
     from nemo_rl.models.generation.vllm import vllm_worker
@@ -1240,6 +1242,7 @@ def test_main_worker_rejects_explicit_quantization_for_nvfp4_pertoken():
         {"hf_overrides": {"quantization_config": {}}},
     ],
 )
+@pytest.mark.vllm
 def test_nvfp4_pertoken_rejects_conflicting_engine_kwargs(llm_kwargs):
     pytest.importorskip("vllm")
     from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
@@ -1266,6 +1269,16 @@ def test_main_worker_without_nvfp4_pertoken_keeps_engine_kwargs():
     vllm_worker._configure_nvfp4_pertoken_engine_kwargs({}, llm_kwargs)
 
     assert llm_kwargs == expected
+
+
+def test_main_worker_rejects_custom_worker_extension():
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    with pytest.raises(ValueError, match="worker_extension_cls is not supported"):
+        vllm_worker._validate_worker_extension_cls(
+            {"worker_extension_cls": "pkg.CustomExtension"},
+            "pkg.NemoInternalExtension",
+        )
 
 
 def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refit():
