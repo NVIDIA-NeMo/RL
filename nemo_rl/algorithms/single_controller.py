@@ -1468,7 +1468,9 @@ class SingleControllerActor:
                         f"{type(error).__name__}: {error}",
                         flush=True,
                     )
-            self._logger.log_metrics(metrics, step=self._train_steps)
+            self._logger.log_metrics(
+                metrics, step=self._train_steps, step_metric="rollout/train_steps"
+            )
 
             if watchdog_cfg.gym_subprocess_check:
                 # Bounded by one tick so a wedged environment cannot stop the pump, and
