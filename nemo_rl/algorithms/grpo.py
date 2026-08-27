@@ -1292,8 +1292,8 @@ def setup(
         setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
         if not colocated_inference:
             # The skip-load inference engine gets its final weight buffers here.
-            # Its first prepare_for_generation also starts the HTTP server only
-            # after the refit, so CUDA graphs capture those persistent buffers.
+            # Its first prepare_for_generation also starts the HTTP server only after the refit,
+            # so CUDA graphs can capture those persistent buffers.
             t0 = time.perf_counter()
             weight_synchronizer.sync_weights()
             setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
@@ -1412,10 +1412,9 @@ def setup(
                             time.perf_counter() - init_tasks_t0
                         )
                         setup_timing_metrics.parallel_init_enabled = 1.0
-                        # NeMo Gym probes the pre-published endpoint before its
-                        # future completes. A skip-load Megatron endpoint starts
-                        # only during this initial refit, so it must happen while
-                        # Gym is waiting rather than after its future resolves.
+                        # NeMo Gym probes the pre-published endpoint before its future completes.
+                        # A skip-load Megatron endpoint starts only during this initial refit,
+                        # so it must happen while Gym is waiting rather than after it resolves.
                         init_megatron_weight_synchronizer(policy, policy_generation)
                     nemo_gym_actor, nemo_gym_time = nemo_gym_future.result()
             finally:

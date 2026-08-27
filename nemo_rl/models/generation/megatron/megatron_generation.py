@@ -216,11 +216,10 @@ class MegatronGeneration(GenerationInterface):
             reserved_http_server_port=reserved_http_server_port,
         )
 
-        # MXFP8 inference re-quantizes weights at the first refit, so CUDA graphs must
-        # capture the post-refit buffers (#3731). Everything else starts the engine +
-        # HTTP server now: the NeMo-Gym overlap blocks on the server URL in setup (#3569).
-        gen_fp8_cfg = self.cfg["mcore_generation_config"].get("fp8_cfg")
-        if not (skip_weight_load and gen_fp8_cfg and gen_fp8_cfg["enabled"]):
+        # Skip-load models do not have their final refit weight buffers yet.
+        # Defer engine initialization so CUDA graphs capture the persistent buffers.
+        # The engine + HTTP server then first come up at the initial refit.
+        if not skip_weight_load:
             self.prepare_for_generation()
 
     def init_collective(
