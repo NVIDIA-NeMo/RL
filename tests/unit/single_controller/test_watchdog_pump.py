@@ -44,10 +44,14 @@ from nemo_rl.models.generation.fleet_health import (
 class _RecordingLogger:
     def __init__(self) -> None:
         self.metrics: list[dict] = []
+        self.step_metrics: list[str | None] = []
 
-    def log_metrics(self, metrics, step=0, prefix="", **kwargs) -> None:
+    def log_metrics(
+        self, metrics, step=0, prefix="", step_metric=None, **kwargs
+    ) -> None:
         del step, prefix, kwargs
         self.metrics.append(dict(metrics))
+        self.step_metrics.append(step_metric)
 
 
 def _make_controller(
@@ -225,6 +229,19 @@ class TestMetrics:
         assert published["rollout/inflight"] == 2.0
         # The leading indicator: idle time rises before a wedge becomes a stall.
         assert "rollout/idle_s" in published
+
+    def test_ticks_never_name_the_committed_step(self):
+        """A tick naming _train_steps is dropped: _train_pump already committed it."""
+        ctrl = _make_controller(
+            stats=RolloutStats(), inflight=0, stall_timeout_s=1000.0
+        )
+
+        asyncio.run(_run_ticks(ctrl, 2))
+
+        assert ctrl._logger.step_metrics, "the watchdog never ticked"
+        assert set(ctrl._logger.step_metrics) == {"rollout/train_steps"}
+        # The no-step branch needs the key in the payload too, not just the argument.
+        assert all("rollout/train_steps" in m for m in ctrl._logger.metrics)
 
 
 class TestGenerationFleetProbe:
