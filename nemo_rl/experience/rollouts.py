@@ -2220,146 +2220,6 @@ def apply_reward_penalties(
     return counts
 
 
-def _as_token_id_list(token_ids: Any) -> list[int]:
-    if token_ids is None:
-        return []
-    if isinstance(token_ids, torch.Tensor):
-        return [int(x) for x in token_ids.detach().cpu().flatten().tolist()]
-    if isinstance(token_ids, (list, tuple)):
-        return [int(x) for x in token_ids]
-    return []
-
-
-def _assistant_generated_token_ids(result: dict) -> list[int]:
-    ids: list[int] = []
-    for msg in result.get("message_log", []):
-        if msg.get("role") == "assistant":
-            ids.extend(_as_token_id_list(msg.get("token_ids")))
-    return ids
-
-
-def _output_generation_text(result: dict) -> str:
-    chunks: list[str] = []
-    output_items = result["full_result"].get("response", {}).get("output", [])
-    for item in output_items:
-        gen_str = item.get("generation_str", "")
-        if isinstance(gen_str, str) and gen_str:
-            chunks.append(gen_str)
-    return "".join(chunks)
-
-
-def _count_close_think_tags(
-    result: dict,
-    reward_penalty_config: dict[str, Any] | BaseModel | None,
-    tokenizer: TokenizerType | None = None,
-) -> dict[str, Any]:
-    # Token-based counting requires an explicit think_close token id from the
-    # reward-penalty config. Token ids are tokenizer-specific, so guessing a
-    # default here would count unrelated tokens (e.g. newlines) on other
-    # tokenizers and silently inject large spurious penalties.
-    think_close_token_id = _get_reward_penalty_token_id(
-        reward_penalty_config or {}, "think_close"
-    )
-
-    assistant_ids = _assistant_generated_token_ids(result)
-    token_count = (
-        sum(1 for token_id in assistant_ids if token_id == think_close_token_id)
-        if think_close_token_id is not None
-        else None
-    )
-
-    decoded_count = None
-    if tokenizer is not None and assistant_ids:
-        try:
-            decoded = tokenizer.decode(assistant_ids, skip_special_tokens=False)
-            decoded_count = decoded.count("</think>")
-        except Exception:
-            decoded_count = None
-
-    generation_text = _output_generation_text(result)
-    generation_str_count = generation_text.count("</think>") if generation_text else 0
-
-    if decoded_count is not None:
-        close_count = decoded_count
-        source = "decoded_assistant_tokens"
-    elif generation_text:
-        close_count = (
-            max(token_count, generation_str_count)
-            if token_count is not None
-            else generation_str_count
-        )
-        source = "max_token_or_generation_str"
-    elif token_count is not None:
-        close_count = token_count
-        source = "assistant_token_ids"
-    else:
-        # No way to count: no tokenizer decode, no generation text, and no
-        # configured think_close token id. Report one close tag so the
-        # think_count_delta feature stays neutral rather than penalizing.
-        close_count = 1
-        source = "unavailable"
-
-    return {
-        "count": int(close_count),
-        "source": source,
-        "token_count": int(token_count) if token_count is not None else None,
-        "generation_str_count": int(generation_str_count),
-        "decoded_count": decoded_count,
-    }
-
-
-def _record_gdpo_think_count_features(
-    results: list[dict],
-    reward_penalty_config: dict[str, Any] | BaseModel | None,
-    tokenizer: TokenizerType | None = None,
-) -> None:
-    for result in results:
-        close_info = _count_close_think_tags(result, reward_penalty_config, tokenizer)
-        close_count = close_info["count"]
-        features = result["full_result"].setdefault("gdpo_reward_features", {})
-        features["think_count_delta"] = {
-            "reward": float(-abs(close_count - 1)),
-            "adjustment": "format",
-            "num_close_think_tags": close_count,
-            "count_source": close_info["source"],
-            "token_close_think_tags": close_info["token_count"],
-            "generation_str_close_think_tags": close_info["generation_str_count"],
-            "decoded_close_think_tags": close_info["decoded_count"],
-        }
-
-
-def _record_gdpo_env_reward_features(results: list[dict]) -> None:
-    for result in results:
-        features = result["full_result"].setdefault("gdpo_reward_features", {})
-        reward = float(result["full_result"]["reward"])
-        features["env_reward"] = {"reward": reward, "adjustment": None}
-        features.setdefault(
-            "length_adjusted_reward",
-            {"reward": reward, "adjustment": "combined"},
-        )
-
-
-def _calculate_gdpo_reward_feature_metrics(results: list[dict]) -> dict[str, float]:
-    values_by_feature: dict[str, list[float]] = defaultdict(list)
-    for result in results:
-        features = result["full_result"].get("gdpo_reward_features", {})
-        if not isinstance(features, dict):
-            continue
-        for name, entry in features.items():
-            if isinstance(entry, dict) and "reward" in entry:
-                values_by_feature[name].append(float(entry["reward"]))
-
-    metrics: dict[str, float] = {}
-    for name, values in values_by_feature.items():
-        if not values:
-            continue
-        metric_prefix = f"gdpo_{name}"
-        metrics[f"{metric_prefix}/mean"] = sum(values) / len(values)
-        metrics[f"{metric_prefix}/min"] = min(values)
-        metrics[f"{metric_prefix}/max"] = max(values)
-    return metrics
-
-
 def _prepare_nemo_gym_rows(
     rows: list[dict],
     generation_config: GenerationConfig,
@@ -2765,11 +2625,7 @@ def _postprocess_single_nemo_gym_group(
     resolved_reward_penalty_config = resolve_reward_penalty_config(
         reward_penalty_config, tokenizer, thinking_tags=thinking_tags
     )
-    _record_gdpo_think_count_features(
-        results, resolved_reward_penalty_config, tokenizer
-    )
     penalty_counts = apply_reward_penalties(results, resolved_reward_penalty_config)
-    _record_gdpo_env_reward_features(results)
 
     for nemo_gym_row, result in zip(nemo_gym_rows, results):
         result["agent_ref"] = nemo_gym_row["agent_ref"]
@@ -2923,7 +2779,6 @@ def _postprocess_single_nemo_gym_group(
                 )
 
         rollout_metrics.update(per_agent_metrics)
-        rollout_metrics.update(_calculate_gdpo_reward_feature_metrics(results))
 
     # Necessary for downstream nemo rl logging/printing.
     rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
@@ -2958,9 +2813,6 @@ def _postprocess_single_nemo_gym_group(
             # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
             # Extra information not in the DatumSpec used by the GRPO algorithm
             "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
-            "gdpo_reward_features": [
-                r["full_result"].get("gdpo_reward_features", {}) for r in results
-            ],
             # Add truncated field to match other rollout paths (reusing hit_max_tokens logic)
             "truncated": torch.tensor(
                 [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool

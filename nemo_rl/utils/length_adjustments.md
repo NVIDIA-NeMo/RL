@@ -4,16 +4,8 @@ This file documents the length-penalty and length-bonus algorithms implemented i
 
 `nemo_rl/utils/length_adjustments.py`
 
-The code supports two usage modes:
-
-1. **Reward mutation mode**
-   Configure `grpo.length_bonus`. The length adjustment mutates `full_result["reward"]`.
-
-2. **GDPO feature mode**
-   Configure `grpo.adv_estimator.name: gdpo` and put length feature knobs under
-   `grpo.adv_estimator.reward_features`. The same calculations are recorded in
-   `full_result["gdpo_reward_features"]` and consumed by GDPO without mutating the scalar
-   environment reward.
+Configure `grpo.length_bonus`. The length adjustments mutate `full_result["reward"]` in
+place during rollout postprocessing.
 
 All algorithms are resolved per prompt group. Unless otherwise stated, only rollouts with
 `reward > 0` participate in length comparisons and receive length-based adjustments.
@@ -121,45 +113,6 @@ grpo:
 | `group_length_penalty_profile_gate_channel` | Selects which profile-band channel to gate on: `reasoning`, `answer`, or `total`. |
 | `group_length_penalty_profile_gate_field` | Selects which field from the chosen profile-band channel to use as the gate threshold, usually `a`. |
 | `group_length_penalty_profile_gate_positive_only` | If true, computes the gate mean using only `reward > 0` rollouts; if false, uses all rollouts. |
-
-## GDPO Feature Mode
-
-In GDPO feature mode, the same feature names can be selected under `reward_features`.
-
-```yaml
-grpo:
-  adv_estimator:
-    name: gdpo
-    reward_features:
-      default:
-        env_reward: 1.0
-        length_adjusted_reward:
-          group_total_length_penalty_coeff: 0.1
-        think_count_delta: 1.0
-```
-
-Feature entries can also be weighted:
-
-```yaml
-grpo:
-  adv_estimator:
-    name: gdpo
-    reward_features:
-      default:
-        env_reward: 1.0
-        length_adjusted_reward:
-          group_total_length_penalty_coeff: 0.1
-        think_count_delta: 0.5
-```
-
-The rollout code records feature metrics to WandB using names like:
-
-```text
-train/gdpo_length_adjusted_reward/mean
-train/gdpo_length_adjusted_reward/min
-train/gdpo_length_adjusted_reward/max
-train/gdpo_think_count_delta/mean
-```
 
 ## Per-Prompt Data Format
 
@@ -561,82 +514,6 @@ grpo:
       group_length_penalty_profile_gate_positive_only: true
 ```
 
-## Recorded GDPO Feature Names
-
-The implementation records these feature names in `full_result["gdpo_reward_features"]`:
-
-- `env_reward`
-- `reasoning_bonus`
-- `answer_bonus`
-- `total_bonus`
-- `longest_reasoning_penalty`
-- `longest_answer_penalty`
-- `longest_total_penalty`
-- `group_reasoning_length_penalty_coeff`
-- `group_answer_length_penalty_coeff`
-- `group_total_length_penalty_coeff`
-- `reasoning_zmad_penalty`
-- `answer_zmad_penalty`
-- `total_zmad_penalty`
-- `profiled_length_penalty`
-- `profile_band_total`
-- `profile_band_reasoning`
-- `profile_band_answer`
-- `profile_band_delta`
-- `length_additive_delta`
-- `length_total_delta`
-- `length_adjusted_reward`
-
-`length_adjusted_reward` is the combined length-adjusted scalar that GDPO can use as one reward
-feature. `length_additive_delta`, `profile_band_delta`, and `length_total_delta` are derived
-summary features.
-
-## Formatting Feature: think_count_delta
-
-The GDPO branch also supports a formatting feature:
-
-```text
-think_count_delta = -abs(num_close_think_tags - 1)
-```
-
-This is not a length-penalty algorithm, but it can be selected alongside length features in GDPO:
-
-```yaml
-grpo:
-  adv_estimator:
-    name: gdpo
-    reward_features:
-      default:
-        env_reward: 1.0
-        length_adjusted_reward:
-          group_total_length_penalty_coeff: 0.1
-        think_count_delta: 1.0
-```
-
-For a format-only GDPO setup, use only the environment reward and the malformed-format feature:
-
-```yaml
-grpo:
-  adv_estimator:
-    name: gdpo
-    reward_features:
-      default:
-        env_reward: 1.0
-        think_count_delta: 1.0
-```
-
-To make the malformed-format feature weaker than the task reward, lower its weight:
-
-```yaml
-grpo:
-  adv_estimator:
-    name: gdpo
-    reward_features:
-      default:
-        env_reward: 1.0
-        think_count_delta: 0.5
-```
-
 ## Practical Notes
 
 - Most length algorithms act only on positive rollouts (`reward > 0`).
@@ -644,8 +521,6 @@ grpo:
 - Group-relative scaling can reduce average length aggressively because it gives dense per-group
   pressure.
 - zMAD is more selective: it only hits high-side outliers.
-- GDPO feature mode is useful when you want length or formatting behavior to be represented as a
-  separate feature instead of mixing it into the scalar environment reward.
 
 ## Final Recommendations
 

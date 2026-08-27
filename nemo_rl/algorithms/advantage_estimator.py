@@ -28,8 +28,6 @@ Reference papers:
 - MOPD: https://arxiv.org/abs/2601.02780
 """
 
-from typing import Any
-
 import torch
 from pydantic import BaseModel
 
@@ -52,87 +50,8 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     use_leave_one_out_baseline: bool = True
     # GDPO specific: optional per-component weights w_n for the aggregation.
     reward_weights: list[float] | None = None
-    reward_features: list[str] | dict[str, Any] | None = None
-    verbose: bool = False
     # Reinforce++ specific
     minus_baseline: bool = True
-
-
-def _feature_reward(feature_entry: Any) -> float:
-    if feature_entry is None:
-        return 0.0
-    if isinstance(feature_entry, dict):
-        return float(feature_entry.get("reward", 0.0))
-    return float(feature_entry)
-
-
-def _format_gdpo_feature_for_log(
-    name: str, feature_entry: Any, feature_weight: float = 1.0
-) -> str:
-    if feature_entry is None:
-        return f"{name}=MISSING"
-    if not isinstance(feature_entry, dict):
-        return f"{name}={float(feature_entry):+.4f}"
-
-    details = []
-    adjustment = feature_entry.get("adjustment")
-    if adjustment is not None:
-        details.append(str(adjustment))
-    multiplier = feature_entry.get("multiplier")
-    if multiplier is not None:
-        details.append(f"mult={float(multiplier):.4f}")
-    close_thinks = feature_entry.get("num_close_think_tags")
-    if close_thinks is not None:
-        details.append(f"close_thinks={int(close_thinks)}")
-    if feature_weight != 1.0:
-        details.append(f"weight={feature_weight:.4f}")
-
-    suffix = f"({','.join(details)})" if details else ""
-    return f"{name}={_feature_reward(feature_entry):+.4f}{suffix}"
-
-
-def _resolve_gdpo_reward_feature_selection(
-    estimator_config: AdvEstimatorConfig, agent_name: str | None
-) -> list[str] | dict[str, Any]:
-    cfg = estimator_config.reward_features or ["env_reward"]
-    if isinstance(cfg, (list, tuple)):
-        return list(cfg)
-    if not isinstance(cfg, dict):
-        raise TypeError("gdpo reward_features must be a list or a dict")
-
-    if "default" not in cfg and "agent_overrides" not in cfg:
-        return cfg
-
-    default = cfg.get("default", ["env_reward"])
-    overrides = cfg.get("agent_overrides", {})
-    return overrides.get(agent_name, default)
-
-
-def _resolve_gdpo_reward_features(
-    estimator_config: AdvEstimatorConfig, agent_name: str | None
-) -> list[str]:
-    selected = _resolve_gdpo_reward_feature_selection(estimator_config, agent_name)
-    if isinstance(selected, dict):
-        return list(selected)
-    return list(selected)
-
-
-def _resolve_gdpo_reward_feature_weights(
-    estimator_config: AdvEstimatorConfig, agent_name: str | None
-) -> dict[str, float]:
-    selected = _resolve_gdpo_reward_feature_selection(estimator_config, agent_name)
-    if not isinstance(selected, dict):
-        return {name: 1.0 for name in selected}
-
-    weights = {}
-    for name, feature_cfg in selected.items():
-        if isinstance(feature_cfg, dict):
-            weights[name] = float(feature_cfg.get("weight", 1.0))
-        elif isinstance(feature_cfg, (int, float)):
-            weights[name] = float(feature_cfg)
-        else:
-            weights[name] = 1.0
-    return weights
 
 
 class GRPOAdvantageEstimator:
@@ -193,8 +112,6 @@ class GDPOAdvantageEstimator:
         # Optional per-reward weights w_n for the aggregation A = sum_n w_n * A_n
         # (paper: https://arxiv.org/abs/2601.05242). None => equal weights (all 1.0).
         self.reward_weights = estimator_config.reward_weights
-        self.estimator_config = estimator_config
-        self.verbose = estimator_config.verbose
 
     def compute_advantage(
         self,
@@ -216,14 +133,6 @@ class GDPOAdvantageEstimator:
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
-        if "gdpo_reward_features" in repeated_batch:
-            return self._compute_feature_advantage(
-                prompt_ids=prompt_ids,
-                rewards=rewards,
-                mask=mask,
-                repeated_batch=repeated_batch,
-            )
-
         reward_component_keys = get_gdpo_reward_component_keys(repeated_batch)
         if len(reward_component_keys) < 2:
             raise ValueError(
@@ -279,161 +188,6 @@ class GDPOAdvantageEstimator:
             advantages = advantages - advantages.mean()
 
         return advantages.expand(mask.shape)
-
-    def _compute_feature_advantage(
-        self,
-        prompt_ids,
-        rewards,
-        mask,
-        repeated_batch,
-    ):
-        gdpo_features = repeated_batch["gdpo_reward_features"]
-        agent_refs = repeated_batch.get("agent_ref", [{} for _ in gdpo_features])
-        if len(gdpo_features) != prompt_ids.shape[0]:
-            raise ValueError(
-                "gdpo_reward_features must match batch size; "
-                f"got {len(gdpo_features)} vs {prompt_ids.shape[0]}"
-            )
-
-        resolved_features: list[list[str]] = []
-        resolved_feature_weights: list[dict[str, float]] = []
-        for agent_ref in agent_refs:
-            agent_name = agent_ref.get("name") if isinstance(agent_ref, dict) else None
-            resolved_features.append(
-                _resolve_gdpo_reward_features(self.estimator_config, agent_name)
-            )
-            resolved_feature_weights.append(
-                _resolve_gdpo_reward_feature_weights(
-                    self.estimator_config, agent_name
-                )
-            )
-        self._validate_prompt_group_features(
-            prompt_ids, resolved_features, resolved_feature_weights
-        )
-
-        feature_names: list[str] = []
-        seen = set()
-        for features in resolved_features:
-            for name in features:
-                if name not in seen:
-                    seen.add(name)
-                    feature_names.append(name)
-        if not feature_names:
-            raise ValueError("GDPO requires at least one reward feature")
-
-        if self.verbose:
-            self._print_reward_feature_summary(
-                prompt_ids=prompt_ids,
-                rewards=rewards,
-                gdpo_features=gdpo_features,
-                resolved_features=resolved_features,
-                resolved_feature_weights=resolved_feature_weights,
-            )
-
-        advantage_parts = []
-        reward_device = prompt_ids.device
-        reward_dtype = rewards.dtype if rewards.is_floating_point() else torch.float32
-        for name in feature_names:
-            vals = []
-            weights = []
-            for selected, feature_dict, feature_weight_dict in zip(
-                resolved_features, gdpo_features, resolved_feature_weights
-            ):
-                if name not in selected:
-                    vals.append(0.0)
-                    weights.append(0.0)
-                    continue
-
-                entry = feature_dict.get(name) if isinstance(feature_dict, dict) else None
-                vals.append(_feature_reward(entry))
-                weights.append(feature_weight_dict.get(name, 1.0))
-
-            feature_rewards = torch.tensor(
-                vals, dtype=reward_dtype, device=reward_device
-            )
-            feature_weights = torch.tensor(
-                weights, dtype=reward_dtype, device=reward_device
-            )
-            baseline, std = calculate_baseline_and_std_per_prompt(
-                prompt_ids,
-                feature_rewards,
-                torch.ones_like(feature_rewards),
-                leave_one_out_baseline=self.use_leave_one_out_baseline,
-            )
-            adv = (feature_rewards - baseline).unsqueeze(-1)
-
-            if self.normalize_rewards:
-                epsilon = 1e-6
-                non_zero_std_mask = std > 0
-                adv[non_zero_std_mask] = adv[non_zero_std_mask] / (
-                    std.unsqueeze(-1)[non_zero_std_mask] + epsilon
-                )
-            adv = adv * feature_weights.unsqueeze(-1)
-            advantage_parts.append(adv)
-
-        advantages = sum(advantage_parts)
-        adv_std = advantages.std()
-        if adv_std > 0:
-            advantages = (advantages - advantages.mean()) / adv_std
-        else:
-            advantages = advantages - advantages.mean()
-
-        return advantages.to(mask.device).expand(mask.shape)
-
-    @staticmethod
-    def _validate_prompt_group_features(
-        prompt_ids,
-        resolved_features: list[list[str]],
-        resolved_feature_weights: list[dict[str, float]],
-    ) -> None:
-        _, inverse = torch.unique(prompt_ids, dim=0, return_inverse=True)
-        for group_idx in torch.unique(inverse).cpu().tolist():
-            indices = (inverse == group_idx).nonzero(as_tuple=True)[0].cpu().tolist()
-            group_feature_lists = {
-                tuple(
-                    (name, resolved_feature_weights[i].get(name, 1.0))
-                    for name in resolved_features[i]
-                )
-                for i in indices
-            }
-            if len(group_feature_lists) > 1:
-                raise ValueError(
-                    "GDPO reward_features must resolve to one feature spec per prompt group; "
-                    f"got {sorted(group_feature_lists)}"
-                )
-
-    @staticmethod
-    def _print_reward_feature_summary(
-        prompt_ids,
-        rewards,
-        gdpo_features,
-        resolved_features: list[list[str]],
-        resolved_feature_weights: list[dict[str, float]],
-    ) -> None:
-        print(f"\n{'=' * 70}", flush=True)
-        print("[Advantage] GDPO reward features", flush=True)
-        _, inverse = torch.unique(prompt_ids, dim=0, return_inverse=True)
-        scalar_rewards = rewards.detach().cpu().tolist()
-        for group_idx in torch.unique(inverse).cpu().tolist():
-            indices = (inverse == group_idx).nonzero(as_tuple=True)[0].cpu().tolist()
-            print(f"\n  group {group_idx}", flush=True)
-            for local_idx, batch_idx in enumerate(indices):
-                feature_dict = gdpo_features[batch_idx]
-                if not isinstance(feature_dict, dict):
-                    feature_dict = {}
-                parts = [
-                    f"    [{local_idx}] scalar_reward={float(scalar_rewards[batch_idx]):.4f}"
-                ]
-                for name in resolved_features[batch_idx]:
-                    parts.append(
-                        _format_gdpo_feature_for_log(
-                            name,
-                            feature_dict.get(name),
-                            resolved_feature_weights[batch_idx].get(name, 1.0),
-                        )
-                    )
-                print(" ".join(parts), flush=True)
-        print(f"{'=' * 70}\n", flush=True)
 
 
 class ReinforcePlusPlusAdvantageEstimator:

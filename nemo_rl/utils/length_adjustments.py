@@ -87,64 +87,6 @@ _STR_PARAM_KEYS = frozenset({
     "group_length_penalty_profile_gate_field",
 })
 
-_GDPO_LENGTH_FEATURE_PARAM_KEYS = frozenset({
-    "reasoning_bonus",
-    "answer_bonus",
-    "total_bonus",
-    "longest_reasoning_penalty",
-    "longest_answer_penalty",
-    "longest_total_penalty",
-    "group_reasoning_length_penalty_coeff",
-    "group_answer_length_penalty_coeff",
-    "group_total_length_penalty_coeff",
-    "reasoning_zmad_penalty",
-    "answer_zmad_penalty",
-    "total_zmad_penalty",
-    "profiled_length_penalty",
-    "profile_band_total",
-    "profile_band_reasoning",
-    "profile_band_answer",
-    "group_length_penalty_profile_gate",
-    "group_length_penalty_profile_gate_channel",
-    "group_length_penalty_profile_gate_field",
-    "group_length_penalty_profile_gate_positive_only",
-})
-
-
-def _resolve_gdpo_feature_log_names_for_agent(
-    adv_cfg: dict[str, Any], agent_name: str
-) -> list[str]:
-    reward_features = adv_cfg.get("reward_features", ["env_reward"])
-    if isinstance(reward_features, (list, tuple)):
-        return list(reward_features)
-    if not isinstance(reward_features, dict):
-        return ["env_reward"]
-    if "default" not in reward_features and "agent_overrides" not in reward_features:
-        return list(reward_features)
-
-    selected = reward_features.get("agent_overrides", {}).get(
-        agent_name, reward_features.get("default", ["env_reward"])
-    )
-    if isinstance(selected, dict):
-        return list(selected)
-    if isinstance(selected, (list, tuple)):
-        return list(selected)
-    return ["env_reward"]
-
-
-def _set_gdpo_reward_feature(
-    result: dict[str, Any],
-    name: str,
-    reward: float,
-    adjustment: str | None,
-    **metadata: Any,
-) -> None:
-    features = result["full_result"].setdefault("gdpo_reward_features", {})
-    entry = {"reward": float(reward), "adjustment": adjustment}
-    entry.update(metadata)
-    features[name] = entry
-
-
 def _extract_reasoning_and_answer_text(result: dict[str, Any]) -> tuple[str, str]:
     """Extract reasoning and answer text from the Response API output items."""
     fr = result.get("full_result", {})
@@ -176,78 +118,6 @@ def _extract_reasoning_and_answer_text(result: dict[str, Any]) -> tuple[str, str
     return reasoning_text, answer_text
 
 
-def _extract_gdpo_length_feature_params(feature_cfg: Any) -> dict[str, Any]:
-    if not isinstance(feature_cfg, dict):
-        return {}
-    params = {}
-    for key, value in feature_cfg.items():
-        if key not in _GDPO_LENGTH_FEATURE_PARAM_KEYS:
-            continue
-        if key in _BOOL_PARAM_KEYS:
-            if isinstance(value, bool):
-                params[key] = value
-            continue
-        if key in _STR_PARAM_KEYS:
-            if isinstance(value, str):
-                params[key] = value
-            continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            continue
-        params[key] = float(value)
-    return params
-
-
-def _merge_gdpo_reward_features_into_length_cfg(
-    grpo_config: dict[str, Any],
-) -> dict[str, Any]:
-    length_cfg = dict(grpo_config.get("length_bonus", {}) or {})
-    has_explicit_length_cfg = bool(length_cfg)
-    adv_cfg = grpo_config.get("adv_estimator", {}) or {}
-    if adv_cfg.get("name") != "gdpo":
-        return length_cfg
-
-    reward_features = adv_cfg.get("reward_features")
-    if not isinstance(reward_features, dict):
-        return length_cfg
-
-    if "default" in reward_features or "agent_overrides" in reward_features:
-        default_features = reward_features.get("default", {})
-        agent_features = reward_features.get("agent_overrides", {})
-    else:
-        default_features = reward_features
-        agent_features = {}
-
-    default_params = _extract_gdpo_length_feature_params(default_features)
-    agent_params = {
-        agent_name: _extract_gdpo_length_feature_params(features)
-        for agent_name, features in agent_features.items()
-    }
-    agent_params = {k: v for k, v in agent_params.items() if v}
-    if not default_params and not agent_params:
-        return length_cfg
-
-    if not has_explicit_length_cfg:
-        length_cfg["_gdpo_feature_only"] = True
-
-    default_cfg = dict(length_cfg.get("default", {}) or {})
-    default_cfg.update(default_params)
-    default_cfg.setdefault("enabled", True)
-    length_cfg["default"] = default_cfg
-
-    overrides = dict(length_cfg.get("agent_overrides", {}) or {})
-    for agent_name, params in agent_params.items():
-        agent_cfg = dict(overrides.get(agent_name, {}) or {})
-        agent_cfg.update(params)
-        agent_cfg.setdefault("enabled", True)
-        overrides[agent_name] = agent_cfg
-    if overrides:
-        length_cfg["agent_overrides"] = overrides
-
-    if adv_cfg.get("verbose", False):
-        length_cfg["_gdpo_feature_verbose"] = True
-    return length_cfg
-
-
 def apply_group_length_adjustments(
     results: list[dict[str, Any]],
     master_config: dict[str, Any],
@@ -255,12 +125,9 @@ def apply_group_length_adjustments(
 ) -> None:
     """Apply per-prompt-group length bonuses/penalties.
 
-    Reads ``grpo.length_bonus`` and GDPO ``reward_features`` for configuration.
-    No-ops when no length-adjustment feature is enabled.
-
-    Calculates all adjustments first and records GDPO reward features. Explicit
-    ``grpo.length_bonus`` configs mutate scalar rewards; GDPO-only feature
-    configs do not.
+    Reads ``grpo.length_bonus`` for configuration and mutates
+    ``full_result["reward"]`` in place. No-ops when no length-adjustment
+    feature is enabled.
 
     Args:
         results: List of per-generation result dicts.
@@ -268,20 +135,14 @@ def apply_group_length_adjustments(
         tokenizer: Tokenizer for computing reasoning/answer token counts.
     """
     grpo_config = master_config.get("grpo", {})
-    length_cfg = _merge_gdpo_reward_features_into_length_cfg(grpo_config)
+    length_cfg = dict(grpo_config.get("length_bonus", {}) or {})
     if not length_cfg:
         return
 
     default_cfg = length_cfg.get("default", {})
     agents_cfg = length_cfg.get("agent_overrides")
     global_band = _resolve_global_profile_band(length_cfg.get("profile_band"))
-    gdpo_feature_only = bool(length_cfg.get("_gdpo_feature_only", False))
-    verbose = bool(length_cfg.get("verbose", False)) and not gdpo_feature_only
-    gdpo_feature_verbose = bool(
-        length_cfg.get("_gdpo_feature_verbose", False)
-        or (length_cfg.get("verbose", False) and gdpo_feature_only)
-    )
-    should_mutate_reward = not gdpo_feature_only
+    verbose = bool(length_cfg.get("verbose", False))
     if not default_cfg.get("enabled", False) and not agents_cfg and not global_band:
         return
 
@@ -546,7 +407,7 @@ def apply_group_length_adjustments(
 
         print(f"{'=' * 70}\n", flush=True)
 
-    # Phase 3: apply additive adjustments and record GDPO reward features
+    # Phase 3: apply additive adjustments
     additive_base_rewards = [0.0] * n
     for i, r in enumerate(results):
         # The profiled-length penalty stacks only on rollouts whose group
@@ -556,48 +417,7 @@ def apply_group_length_adjustments(
         profiled_adj = all_profiled_length_adj[i] if all_adjustments[i] >= 0 else 0.0
         additive_delta = all_adjustments[i] + profiled_adj
         additive_base_rewards[i] = original_rewards[i] + additive_delta
-        if "env_reward" not in r["full_result"].setdefault(
-            "gdpo_reward_features", {}
-        ):
-            _set_gdpo_reward_feature(r, "env_reward", original_rewards[i], None)
-
-        for name, value in (
-            ("reasoning_bonus", all_reasoning_bonus[i]),
-            ("answer_bonus", all_answer_bonus[i]),
-            ("total_bonus", all_total_bonus[i]),
-            ("longest_reasoning_penalty", all_reasoning_longest_pen[i]),
-            ("longest_answer_penalty", all_answer_longest_pen[i]),
-            ("longest_total_penalty", all_total_longest_pen[i]),
-            ("group_reasoning_length_penalty_coeff", all_reasoning_adj[i]),
-            ("group_answer_length_penalty_coeff", all_answer_adj[i]),
-            ("group_total_length_penalty_coeff", all_total_adj[i]),
-            ("reasoning_zmad_penalty", all_zmad_reasoning_adj[i]),
-            ("answer_zmad_penalty", all_zmad_answer_adj[i]),
-            ("total_zmad_penalty", all_zmad_total_adj[i]),
-            ("profiled_length_penalty", profiled_adj),
-        ):
-            _set_gdpo_reward_feature(r, name, value, "additive")
-
-        _set_gdpo_reward_feature(
-            r, "profile_band_total", 0.0, "multiplicative", multiplier=1.0
-        )
-        _set_gdpo_reward_feature(
-            r, "profile_band_reasoning", 0.0, "multiplicative", multiplier=1.0
-        )
-        _set_gdpo_reward_feature(
-            r, "profile_band_answer", 0.0, "multiplicative", multiplier=1.0
-        )
-        _set_gdpo_reward_feature(r, "profile_band_delta", 0.0, "derived_sum")
-        _set_gdpo_reward_feature(
-            r, "length_additive_delta", additive_delta, "derived_sum"
-        )
-        _set_gdpo_reward_feature(r, "length_total_delta", additive_delta, "derived_sum")
-        _set_gdpo_reward_feature(
-            r, "length_adjusted_reward", additive_base_rewards[i], "combined"
-        )
-
-        if should_mutate_reward:
-            r["full_result"]["reward"] = additive_base_rewards[i]
+        r["full_result"]["reward"] = additive_base_rewards[i]
 
     # Phase 4: apply per-prompt profile_band multipliers (correct rollouts only).
     _apply_profile_band_multipliers(
@@ -611,64 +431,9 @@ def apply_group_length_adjustments(
         agents_cfg=agents_cfg,
         defaults=defaults,
         num_gens=num_gens,
-        should_mutate_reward=should_mutate_reward,
         global_band=global_band,
     )
 
-    if verbose or gdpo_feature_verbose:
-        _print_gdpo_reward_feature_summary(
-            results=results,
-            agent_names=agent_names,
-            original_rewards=original_rewards,
-            num_gens=num_gens,
-            adv_cfg=grpo_config.get("adv_estimator", {}) or {},
-        )
-
-
-def _print_gdpo_reward_feature_summary(
-    results: list[dict[str, Any]],
-    agent_names: list[str],
-    original_rewards: list[float],
-    num_gens: int,
-    adv_cfg: dict[str, Any],
-) -> None:
-    print(f"\n{'=' * 70}", flush=True)
-    print("[Rollout] GDPO reward features", flush=True)
-    n = len(results)
-    for g in range(0, n, num_gens):
-        group_size = min(num_gens, n - g)
-        agent_name = agent_names[g]
-        print(
-            f"\n  group {g // num_gens} agent={agent_name}",
-            flush=True,
-        )
-        feature_names = _resolve_gdpo_feature_log_names_for_agent(adv_cfg, agent_name)
-        for k in range(group_size):
-            idx = g + k
-            fr = results[idx]["full_result"]
-            features = fr.get("gdpo_reward_features", {})
-            parts = [
-                f"    [{k}] original_reward={float(original_rewards[idx]):.4f}",
-                f"final_reward={float(fr['reward']):.4f}",
-            ]
-            for name in feature_names:
-                entry = features.get(name)
-                if not isinstance(entry, dict):
-                    continue
-                reward = float(entry.get("reward", 0.0))
-                adjustment = entry.get("adjustment")
-                multiplier = entry.get("multiplier")
-                suffix = (
-                    f":{float(multiplier):.4f}"
-                    if multiplier is not None
-                    else ""
-                )
-                parts.append(
-                    f"{name}={reward:+.4f}"
-                    f"({adjustment}{suffix})"
-                )
-            print(" ".join(parts), flush=True)
-    print(f"{'=' * 70}\n", flush=True)
 
 
 def _resolve_global_profile_band(pb_cfg: Any) -> dict[str, dict[str, Any]]:
@@ -724,16 +489,13 @@ def _apply_profile_band_multipliers(
     agents_cfg: dict[str, Any] | None,
     defaults: dict[str, Any],
     num_gens: int,
-    should_mutate_reward: bool,
     global_band: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """Apply per-channel profile_band multipliers to correct rollouts.
 
     Each enabled channel contributes a multiplier in [0.0, 1.0] derived from the
     per-row {a, b, f} block, falling back to ``length_bonus.profile_band.defaults``
-    for channels the row does not provide. Records multiplicative deltas as
-    additive-equivalent GDPO reward features, and mutates scalar rewards for
-    length-bonus configs.
+    for channels the row does not provide. Mutates scalar rewards in place.
 
     Skips any group where the low-effort bypass already replaced the reward
     (parity with Phase 1 of ``apply_group_length_adjustments``).
@@ -778,42 +540,7 @@ def _apply_profile_band_multipliers(
             answer_delta = current_reward * answer_m - current_reward
             current_reward += answer_delta
 
-            profile_band_delta = current_reward - base_rewards[idx]
-            _set_gdpo_reward_feature(
-                results[idx],
-                "profile_band_total",
-                total_delta,
-                "multiplicative",
-                multiplier=total_m,
-            )
-            _set_gdpo_reward_feature(
-                results[idx],
-                "profile_band_reasoning",
-                reasoning_delta,
-                "multiplicative",
-                multiplier=reasoning_m,
-            )
-            _set_gdpo_reward_feature(
-                results[idx],
-                "profile_band_answer",
-                answer_delta,
-                "multiplicative",
-                multiplier=answer_m,
-            )
-            _set_gdpo_reward_feature(
-                results[idx], "profile_band_delta", profile_band_delta, "derived_sum"
-            )
-            _set_gdpo_reward_feature(
-                results[idx],
-                "length_total_delta",
-                current_reward - original_rewards[idx],
-                "derived_sum",
-            )
-            _set_gdpo_reward_feature(
-                results[idx], "length_adjusted_reward", current_reward, "combined"
-            )
-            if should_mutate_reward:
-                results[idx]["full_result"]["reward"] = current_reward
+            results[idx]["full_result"]["reward"] = current_reward
 
 
 def _band_multiplier(rl: int, ch: dict[str, Any] | None) -> float:
