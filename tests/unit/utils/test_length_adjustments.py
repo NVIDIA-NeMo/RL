@@ -402,9 +402,9 @@ class TestReviewFixes:
         apply_group_length_adjustments(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 0.0])
 
-    def test_negative_env_reward_not_raised_by_clamp(self):
-        # The clamp applies only to originally-positive rollouts: an env's own
-        # negative reward must pass through untouched.
+    def test_negative_env_reward_group_skipped(self):
+        # Length adjustments require binary rewards: a group containing a
+        # negative env reward is skipped wholesale — no adjustment, no clamp.
         cfg = make_config(
             default={"enabled": True, "group_total_length_penalty_coeff": 0.1}
         )
@@ -413,7 +413,36 @@ class TestReviewFixes:
             make_result("1234567890", "1234567890", 1.0),
         ]
         apply_group_length_adjustments(results, cfg)
-        assert rewards_of(results)[0] == pytest.approx(-1.0)
+        assert rewards_of(results) == pytest.approx([-1.0, 1.0])
+
+    def test_graded_rewards_group_skipped(self):
+        # Graded (non-binary) rewards also skip the group untouched.
+        cfg = make_config(
+            default={"enabled": True, "group_total_length_penalty_coeff": 0.1}
+        )
+        results = [
+            make_result("12345", "12345", 0.5),
+            make_result("1234567890", "1234567890", 1.0),
+        ]
+        apply_group_length_adjustments(results, cfg)
+        assert rewards_of(results) == pytest.approx([0.5, 1.0])
+
+    def test_all_wrong_group_stays_variance_free(self):
+        # profiled_length_penalty has no positive-reward gate, but the binary
+        # clamp floors penalty-created negatives at 0: an all-wrong group must
+        # stay all-zero (no within-group variance -> no GRPO gradient).
+        results = [
+            make_result("1234", "1234", 0.0),  # len 8, under threshold
+            make_result("1234567890", "1234567890", 0.0),  # len 20, over
+        ]
+        for r in results:
+            r["profiled_rewards"] = [1, 1]
+            r["profiled_output_lengths"] = [10, 10]
+        cfg = make_config(
+            default={"enabled": True, "profiled_length_penalty": 0.3}
+        )
+        apply_group_length_adjustments(results, cfg)
+        assert rewards_of(results) == pytest.approx([0.0, 0.0])
 
     def test_band_multiplier_never_rewards_length_on_penalized_base(self):
         # Flat penalty exceeds the reward, so bases clamp to 0; the band phase
@@ -465,18 +494,16 @@ class TestReviewFixes:
         else:
             raise AssertionError("expected ValueError for unknown config key")
 
-    def test_top_percentile_default_is_half(self):
-        # With 2 positive scorers (rewards 1.0 and 0.9) and default
-        # top_percentile=0.5, only the best scorer is a "top scorer" — the
-        # longest-total penalty needs >= 2 eligible top scorers, so it no-ops.
-        # With the old effective default of 0.0 the behavior was the same, but
-        # an explicit 1.0 must include both and penalize the longer one.
+    def test_longest_penalty_under_binary_rewards(self):
+        # Under binary rewards all correct rollouts tie at the top score, so
+        # top_percentile is inert and both rollouts are eligible top scorers;
+        # the longest one takes the flat penalty (default top_percentile 0.5).
         results = [
             make_result("12345", "12345", 1.0),
-            make_result("1234567890", "1234567890", 0.9),
+            make_result("1234567890", "1234567890", 1.0),
         ]
         cfg = make_config(
-            default={"enabled": True, "longest_total_penalty": 0.2, "top_percentile": 1.0}
+            default={"enabled": True, "longest_total_penalty": 0.2}
         )
         apply_group_length_adjustments(results, cfg)
-        assert rewards_of(results) == pytest.approx([1.0, 0.7])
+        assert rewards_of(results) == pytest.approx([1.0, 0.8])

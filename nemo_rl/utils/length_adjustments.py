@@ -87,6 +87,17 @@ _STR_PARAM_KEYS = frozenset({
     "group_length_penalty_profile_gate_field",
 })
 
+# Length adjustments are defined for binary (0/1) env rewards only. Agents
+# already warned about non-binary rewards (warn once per agent, then skip
+# their prompt groups).
+_NON_BINARY_WARNED_AGENTS: set[str] = set()
+_BINARY_REWARD_TOL = 1e-6
+
+
+def _is_binary_reward(value: float) -> bool:
+    v = float(value)
+    return abs(v) <= _BINARY_REWARD_TOL or abs(v - 1.0) <= _BINARY_REWARD_TOL
+
 def _extract_reasoning_and_answer_text(result: dict[str, Any]) -> tuple[str, str]:
     """Extract reasoning and answer text from the Response API output items."""
     fr = result.get("full_result", {})
@@ -247,10 +258,29 @@ def apply_group_length_adjustments(
     total_lengths = [0] * n
     groups_adjusted = 0
     group_gate_infos: dict[int, dict[str, Any]] = {}
+    # Rows whose group passed the binary-rewards check; all other rows are
+    # left completely untouched (no adjustment, no clamp, no reward writeback).
+    binary_ok = [False] * n
 
     for g in range(0, n, num_gens):
         agent_name = agent_names[g]
         group_size = min(num_gens, n - g)
+        # Length adjustments are defined for binary (0/1) env rewards only:
+        # every algorithm and the phase-3 clamp assume it. Skip (and warn once
+        # per agent) on graded or negative rewards.
+        if any(
+            not _is_binary_reward(original_rewards[g + k]) for k in range(group_size)
+        ):
+            if agent_name not in _NON_BINARY_WARNED_AGENTS:
+                _NON_BINARY_WARNED_AGENTS.add(agent_name)
+                logger.warning(
+                    f"length adjustments require binary (0/1) env rewards; agent "
+                    f"{agent_name} produced non-binary rewards — skipping length "
+                    f"adjustments for its prompt groups"
+                )
+            continue
+        for k in range(group_size):
+            binary_ok[g + k] = True
         if any(results[g + k].get("low_effort_applied") for k in range(group_size)):
             continue
         params = _resolve_agent_params(agent_name, agents_cfg, defaults)
@@ -452,9 +482,11 @@ def apply_group_length_adjustments(
 
         print(f"{'=' * 70}\n", flush=True)
 
-    # Phase 3: apply additive adjustments
+    # Phase 3: apply additive adjustments (binary-verified rows only)
     additive_base_rewards = [0.0] * n
     for i, r in enumerate(results):
+        if not binary_ok[i]:
+            continue
         # The profiled-length penalty stacks only on rollouts whose group
         # adjustments are non-negative: a rollout already penalized by the
         # group-relative channels should not be double-penalized for the same
@@ -462,11 +494,11 @@ def apply_group_length_adjustments(
         profiled_adj = all_profiled_length_adj[i] if all_adjustments[i] >= 0 else 0.0
         additive_delta = all_adjustments[i] + profiled_adj
         additive_base_rewards[i] = original_rewards[i] + additive_delta
-        # Stacked flat penalties can exceed the reward itself. Length penalties
-        # may wipe a correct rollout's reward out, but never flip its sign —
-        # clamp at 0. Only for originally-positive rollouts: an env's own
-        # negative reward must pass through untouched.
-        if original_rewards[i] > 0 and additive_base_rewards[i] < 0:
+        # Rewards here are binary, so any negative value is penalty-created.
+        # Length penalties may wipe a reward out but never flip its sign; this
+        # also keeps all-wrong groups variance-free (no gradient from a group
+        # with no correctness signal).
+        if additive_base_rewards[i] < 0:
             additive_base_rewards[i] = 0.0
         r["full_result"]["reward"] = additive_base_rewards[i]
 
@@ -483,6 +515,7 @@ def apply_group_length_adjustments(
         defaults=defaults,
         num_gens=num_gens,
         global_band=global_band,
+        binary_ok=binary_ok,
     )
 
 
@@ -541,6 +574,7 @@ def _apply_profile_band_multipliers(
     defaults: dict[str, Any],
     num_gens: int,
     global_band: dict[str, dict[str, Any]] | None = None,
+    binary_ok: list[bool] | None = None,
 ) -> None:
     """Apply per-channel profile_band multipliers to correct rollouts.
 
@@ -574,12 +608,15 @@ def _apply_profile_band_multipliers(
         ch_ans = band.get("answer") if use_ans else None
         for k in range(group_size):
             idx = g + k
+            # Only rows whose group passed the binary-rewards check.
+            if binary_ok is not None and not binary_ok[idx]:
+                continue
             # Gate on the env reward (correct rollouts only).
             if original_rewards[idx] <= 0:
                 continue
-            # Additive penalties can push the base below zero; multiplying a
-            # negative base by m < 1 would RAISE the reward for longer
-            # rollouts. Scale only the non-negative part.
+            # The phase-3 clamp floors the base at 0; multiplying a negative
+            # base by m < 1 would RAISE the reward for longer rollouts, so
+            # scale only strictly-positive bases.
             if base_rewards[idx] <= 0:
                 continue
             current_reward = base_rewards[idx]

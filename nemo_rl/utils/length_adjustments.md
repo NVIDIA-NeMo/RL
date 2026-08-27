@@ -10,6 +10,23 @@ place during rollout postprocessing.
 All algorithms are resolved per prompt group. Unless otherwise stated, only rollouts with
 `reward > 0` participate in length comparisons and receive length-based adjustments.
 
+## Binary Rewards Requirement
+
+Length adjustments are defined for **binary (0/1) environment rewards** only. Every algorithm
+and the final clamp assume it. At rollout time each prompt group's rewards are checked: a group
+containing any graded or negative reward is skipped entirely — no adjustment, no clamp, rewards
+pass through untouched — and a warning is logged once per agent. To silence the warning for a
+deliberately graded agent (e.g. a genrm judge), disable it explicitly under `agent_overrides`
+with `enabled: false`.
+
+Consequences of binariness worth knowing:
+
+- The adjusted reward is clamped at 0, so penalties can wipe a correct rollout's reward out but
+  never flip its sign — and an all-wrong group stays all-zero (no within-group variance, hence
+  no GRPO gradient, matching vanilla behavior on groups with no correctness signal).
+- `top_percentile` is effectively inert: all correct rollouts tie at the top score, so every
+  positive rollout is always a "top scorer".
+
 ## Common Config
 
 ```yaml
@@ -517,10 +534,10 @@ grpo:
 ## Practical Notes
 
 - Most length algorithms act only on positive rollouts (`reward > 0`).
-- Additive penalties can wipe a correct rollout's reward out but never flip its sign: the
-  adjusted reward is clamped at 0 for originally-positive rollouts (stacked flat penalties
-  exceeding the reward produce 0, not a negative value). Environments' own negative rewards
-  pass through untouched.
+- Additive penalties can wipe a rollout's reward out but never flip its sign: the adjusted
+  reward is clamped at 0 (stacked flat penalties exceeding the reward produce 0, not a negative
+  value). Non-binary rewards never reach the clamp — their groups are skipped wholesale (see
+  Binary Rewards Requirement).
 - `profile_band_*` multipliers also apply only to originally correct rollouts.
 - Group-relative scaling can reduce average length aggressively because it gives dense per-group
   pressure.
