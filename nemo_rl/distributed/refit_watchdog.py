@@ -55,6 +55,18 @@ class _Abortable(Protocol):
 # can configure changes that, so the signal has to travel in the text.
 REFIT_ABORTED_TOKEN = "[refit-aborted]"
 
+# A SECOND, NARROWER MARKER: the abort left this trainer's CUDA context unusable, so the
+# run cannot be recovered and must end. Carried in the message for the same reason as the
+# token above -- vLLM's EngineCore RPC preserves the text and drops the type.
+#
+# Only sync_stream_within raises with this, and it is reachable only from
+# _nccl_reshard_refit. That is the whole scope of the limitation: the packed-broadcast
+# transport takes the same fault, fires the same deadline, aborts, rebuilds and recovers
+# with zero stuck aborts (job 6584636: null-refit and null-refit-frozen, deadline fired 4x,
+# RefitAborted 10x, not one release timeout). Reshard recovers too when the fault lands at
+# a step boundary rather than inside the bulk transfer.
+REFIT_CONTEXT_LOST_TOKEN = "[refit-context-lost]"
+
 
 class RefitAborted(RuntimeError):
     """A refit was cut short because a peer stopped participating.
@@ -71,6 +83,24 @@ class RefitAborted(RuntimeError):
         if args and isinstance(args[0], str) and REFIT_ABORTED_TOKEN not in args[0]:
             args = (f"{REFIT_ABORTED_TOKEN} {args[0]}", *args[1:])
         super().__init__(*args)
+
+
+def is_refit_context_lost(error: BaseException) -> bool:
+    """True when the abort orphaned GPU work and no rebuild on that device can succeed.
+
+    Recovery after this is not merely unlikely, it is impossible in-process, and four runs
+    established that by elimination rather than argument. Job 6521181's py-spy dump caught
+    both trainers in ``init_nccl_communicator`` with frame-less ``ncclCommAbort`` threads 25
+    minutes on. Job 6523731 killed the frozen victim before the rebuild, closing its
+    sockets, and they wedged identically. Job 6582457 pinned the release to the caller's
+    CUDA device, with a SIGKILLed peer, and it still did not return. Job 6584636 stood the
+    deadline down on confirmed death and lost the race to Ray's own detection.
+
+    So the controller stops trying. Detecting this and ending the run in seconds is the
+    supported behaviour; recovering from it is left to a future change -- see
+    design_vllm_fault_tolerance.md section 8.5.7.
+    """
+    return REFIT_CONTEXT_LOST_TOKEN in str(error)
 
 
 def is_refit_abort(error: BaseException) -> bool:
@@ -164,10 +194,13 @@ def sync_stream_within(stream, budget_s: Optional[float], what: str) -> None:
     while not event.query():
         if time.monotonic() >= deadline:
             raise RefitAborted(
-                f"refit: {what} did not retire within {budget_s}s. A peer most likely "
-                "stopped receiving; aborting the communicator does not retire work "
-                "already enqueued on the stream, so this gives up rather than blocking "
-                "in cudaDeviceSynchronize forever."
+                f"{REFIT_CONTEXT_LOST_TOKEN} refit: {what} did not retire within "
+                f"{budget_s}s. A peer most likely stopped receiving; aborting the "
+                "communicator does not retire work already enqueued on the stream, so "
+                "this gives up rather than blocking in cudaDeviceSynchronize forever. "
+                "The orphaned kernels are on THIS trainer's device, so its CUDA context "
+                "cannot be trusted and no communicator rebuild on it can succeed -- the "
+                "run ends here rather than wedging in the recovery."
             )
         time.sleep(0.05)
     torch.cuda.synchronize()

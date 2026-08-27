@@ -75,7 +75,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.refit_watchdog import RefitAborted
+from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutOutcome
@@ -2028,6 +2028,29 @@ class SingleControllerActor:
         try:
             await self._sync_weights_within(kv_scales, "first")
         except (RefitAborted, RayActorError) as failure:
+            # DETECT AND FAIL FAST, because this one cannot be recovered from.
+            #
+            # sync_stream_within gives up on kernels already enqueued on THIS trainer's
+            # stream, and aborting a communicator does not retire them. Its CUDA context is
+            # unusable afterwards: ncclCommAbort never returns and no rebuild on that device
+            # can bootstrap, so entering the recovery here does not fail -- it wedges, for
+            # the full harness deadline, with no attribution. Jobs 6521181, 6523731, 6582457
+            # and 6584636 each eliminated one candidate explanation and left this one.
+            #
+            # Narrow by construction: the token is applied only by sync_stream_within, which
+            # is reachable only from _nccl_reshard_refit. The packed-broadcast transport
+            # takes the same fault, fires the same deadline, aborts and recovers, and so
+            # does reshard when the fault lands at a step boundary. Recovering this last
+            # case is deliberately left to a future change; see the design doc, 8.5.7.
+            if is_refit_context_lost(failure):
+                print(
+                    "  _sync_weights: the refit aborted mid-transfer on the nccl_reshard "
+                    "bulk path, which orphans GPU work on the trainers and leaves their "
+                    "CUDA contexts unusable. Recovery is not possible from here, so the "
+                    "run ends now rather than wedging in a rebuild that cannot complete.",
+                    flush=True,
+                )
+                raise
             with self._recovery_window():
                 await self._recover_from_failed_refit(failure)
                 # Once only: a second failure is a real fault, not a membership problem,

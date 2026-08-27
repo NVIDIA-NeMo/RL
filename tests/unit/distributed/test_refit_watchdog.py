@@ -678,3 +678,58 @@ class TestStandDown:
 
         with RefitAbortWatchdog(_FakeGroup(), None):
             assert stand_down_armed_watchdogs() == 0
+
+
+class TestContextLost:
+    """The one fault this stack detects but cannot recover from, and its exact scope.
+
+    nccl_reshard + a fault while the bulk transfer is in flight. Nothing else: job 6584636
+    measured the packed-broadcast transport taking the same fault, firing the same deadline
+    4x, raising RefitAborted 10x, rebuilding and recovering with zero stuck aborts -- and
+    reshard recovering too when the fault lands at a step boundary.
+    """
+
+    def test_a_stream_that_never_drains_is_marked_unrecoverable(self):
+        import torch
+
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            is_refit_context_lost,
+            sync_stream_within,
+        )
+
+        never = mock.Mock()
+        never.query.return_value = False
+        with mock.patch.object(torch.cuda, "Event", return_value=never):
+            with pytest.raises(RefitAborted) as caught:
+                sync_stream_within(mock.Mock(), 0.01, "the bulk parameter transfer")
+        assert is_refit_context_lost(caught.value), (
+            "an abort that orphans enqueued kernels must be marked unrecoverable, or the "
+            "controller enters a rebuild that cannot complete and wedges instead of failing"
+        )
+
+    def test_an_ordinary_abort_is_not_marked_unrecoverable(self):
+        """The scope guard. A plain RefitAborted is recoverable and must stay so.
+
+        The packed-broadcast transport raises these and recovers from them; marking them
+        would turn four passing variants into fail-fast.
+        """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            is_refit_context_lost,
+        )
+
+        assert not is_refit_context_lost(RefitAborted("a peer stopped participating"))
+
+    def test_the_marker_survives_a_boundary_that_drops_the_type(self):
+        """vLLM's EngineCore RPC stringifies and re-raises as a bare Exception."""
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            is_refit_context_lost,
+        )
+
+        original = RefitAborted(
+            "[refit-context-lost] the bulk parameter transfer did not retire"
+        )
+        flattened = Exception(f"Call to nccl_reshard_refit method failed: {original}")
+        assert is_refit_context_lost(flattened)

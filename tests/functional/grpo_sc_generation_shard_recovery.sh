@@ -563,7 +563,7 @@ echo "[recovery] job exited $EXIT_CODE, ${ELAPSED}s after the kill"
 # the run ends attributably in seconds instead of wedging in NCCL for 33 minutes (job
 # 6258553) -- and asserting recovery here would assert a property the design explicitly
 # places out of scope.
-if [[ "$FREEZE_VICTIM" == "true" && "$REFIT_TRANSPORT" == "nccl_reshard" ]]; then
+if [[ "$KILL_DURING_REFIT" == "true" && "$REFIT_TRANSPORT" == "nccl_reshard" ]]; then
     if (( EXIT_CODE == 0 )); then
         echo "[recovery] FAIL: the run completed. On nccl_reshard an aborted bulk transfer"
         echo "[recovery] orphans kernels on the trainers, so completing means the abort"
@@ -583,15 +583,25 @@ if [[ "$FREEZE_VICTIM" == "true" && "$REFIT_TRANSPORT" == "nccl_reshard" ]]; the
         echo "[recovery] exist to make this fast; something is waiting that should not be."
         exit 1
     fi
-    if [[ "$(awk '{print $3}' "/proc/$VICTIM/stat" 2>/dev/null || echo gone)" == "gone" ]]; then
+    if [[ "$FREEZE_VICTIM" == "true" ]] && \
+       [[ "$(awk '{print $3}' "/proc/$VICTIM/stat" 2>/dev/null || echo gone)" == "gone" ]]; then
         echo "[recovery] FAIL: the frozen victim disappeared; it was not the frozen-rank"
         echo "[recovery] scenario that failed, so the result does not mean what it says."
         exit 1
     fi
+    # The guard has to be REACHED, not merely consistent with the exit code. Without this
+    # a run that died of anything else in under 900s would read as a pass.
+    if ! grep -q "Recovery is not possible from here" "$RUN_LOG"; then
+        echo "[recovery] FAIL: the run failed attributably but never reported the"
+        echo "[recovery] context-lost guard, so it did not fail for the reason this pins."
+        grep -E "refit-context-lost|_sync_weights:" "$RUN_LOG" | tail -10
+        exit 1
+    fi
     echo "[recovery] abort observed:"; grep -m3 "RefitAborted" "$RUN_LOG"
-    echo "[recovery] PASS: a frozen rank on nccl_reshard ended the run attributably in"
-    echo "[recovery] ${ELAPSED}s rather than wedging in NCCL (recovery on this transport is"
-    echo "[recovery] out of scope -- see sync_stream_within)"
+    echo "[recovery] guard observed:"; grep -m1 "Recovery is not possible from here" "$RUN_LOG"
+    echo "[recovery] PASS: a mid-refit fault on nccl_reshard was detected and ended the run"
+    echo "[recovery] in ${ELAPSED}s rather than wedging (recovery on this path is a known"
+    echo "[recovery] limitation -- see sync_stream_within and design doc 8.5.7)"
     exit 0
 fi
 
