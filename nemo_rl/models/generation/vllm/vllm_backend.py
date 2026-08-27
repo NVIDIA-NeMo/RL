@@ -382,6 +382,56 @@ class VllmInternalWorkerExtension:
             group.init_nccl_communicator(device=self.device)
             self.pp_comm_groups[stage] = group
 
+    def init_mx_reshard_comm_group(
+        self,
+        rank_prefix: int,
+        mx_server_url: str,
+        model_name: str,
+        trainer_slots: list,
+        generator_slots: list,
+        source_partition_count: int,
+        plan_digest: str = "",
+        phase: object = "all",
+    ) -> None:
+        """Bootstrap this gen worker's comm groups through ModelExpress.
+
+        Phased for the same reason the trainer side is: one lane at a time,
+        cluster-wide, with the driver barriering between them.
+        """
+        from nemo_rl.weight_sync.mx_collective_bootstrap import (
+            mx_init_lane,
+            mx_rendezvous,
+        )
+
+        if phase == "rendezvous":
+            import uuid
+
+            local_rank = torch.distributed.get_rank()
+            index_in_role = rank_prefix + local_rank
+            if not hasattr(self, "_mx_worker_id"):
+                self._mx_worker_id = (  # pyrefly: ignore[implicitly-defined-attribute]
+                    f"gen-{index_in_role}-{uuid.uuid4().hex}"
+                )
+            self._mx_state = mx_rendezvous(
+                mx_server_url=mx_server_url,
+                model_name=model_name,
+                role="GENERATOR",
+                index_in_role=index_in_role,
+                slot_id=f"gen/{index_in_role}",
+                worker_id=self._mx_worker_id,
+                trainer_slots=trainer_slots,
+                generator_slots=generator_slots,
+                source_partition_count=source_partition_count,
+                plan_digest=plan_digest,
+                device=self.device,
+            )
+            return
+        if phase == "finish":
+            self.pp_comm_groups = self._mx_state.reshard_groups
+            self.model_update_group = self._mx_state.broadcast_group
+            return
+        mx_init_lane(self._mx_state, int(phase))
+
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""
         from nemo_rl.utils.nvml import get_device_uuid

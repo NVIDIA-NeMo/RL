@@ -1143,6 +1143,47 @@ class VllmGeneration(GenerationInterface):
         # co-works with lm_policy; wait for all futures to complete outside
         return futures
 
+    def init_mx_reshard_comm_group(
+        self,
+        mx_server_url: str,
+        model_name: str,
+        trainer_slots: list,
+        generator_slots: list,
+        source_partition_count: int,
+        plan_digest: str = "",
+        phase: object = "all",
+    ) -> list[ray.ObjectRef]:
+        """Initialize the ModelExpress-brokered comm groups on all gen workers."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        method_name = (
+            "init_mx_reshard_comm_group_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "init_mx_reshard_comm_group"
+        )
+
+        total_workers = len(self.worker_group.workers)
+        workers_per_group = total_workers // self.dp_size
+        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+
+        futures = self.worker_group.run_all_workers_multiple_data(
+            method_name,
+            rank_prefix=rank_prefix_list,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            common_kwargs={
+                "mx_server_url": mx_server_url,
+                "model_name": model_name,
+                "trainer_slots": trainer_slots,
+                "generator_slots": generator_slots,
+                "source_partition_count": source_partition_count,
+                "plan_digest": plan_digest,
+                "phase": phase,
+            },
+        )
+        # co-works with lm_policy; wait for all futures to complete outside
+        return futures
+
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Forward per-layer param metadata to vLLM workers for nccl_reshard refit."""
         method_name = (

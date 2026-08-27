@@ -17,6 +17,7 @@ import os
 import pprint
 import time
 
+import ray
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.grpo import (
@@ -53,6 +54,44 @@ def _select_trainer(master_config: MasterConfig):
         return grpo_train_sync
     print("🚀 Running synchronous GRPO training (legacy)")
     return grpo_train
+
+
+def _shutdown_runtime(
+    policy,
+    policy_generation,
+    cluster,
+    teacher_worker_groups,
+) -> None:
+    """Drain every Ray owner before disconnecting the driver.
+
+    Leaving policy or cluster cleanup to ``__del__`` races Ray's atexit hook:
+    a late ``ray.get``/``ray.kill`` then auto-initializes a second CoreWorker
+    while Python is finalizing. Explicit, idempotent shutdown keeps teardown
+    ordered and gives the launcher a truthful zero exit after a successful run.
+    """
+    resources = [("generation", policy_generation)]
+    resources.extend(
+        (f"teacher {name}", worker_group)
+        for name, worker_group in (teacher_worker_groups or {}).items()
+    )
+    resources.append(("policy", policy))
+    resources.extend(
+        (f"cluster {index}", virtual_cluster)
+        for index, virtual_cluster in enumerate(cluster or ())
+    )
+
+    seen = set()
+    for label, resource in resources:
+        if resource is None or id(resource) in seen:
+            continue
+        seen.add(id(resource))
+        try:
+            resource.shutdown()
+        except Exception as error:
+            print(f"Error shutting down {label}: {error}", flush=True)
+
+    if ray.is_initialized():
+        ray.shutdown()
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -250,11 +289,15 @@ def main() -> None:
                     master_config,
                 )
     finally:
-        shutdown_environments(task_to_env, val_task_to_env)
         try:
-            policy_generation.shutdown()
-        except Exception as error:
-            print(f"Error shutting down generation: {error}", flush=True)
+            shutdown_environments(task_to_env, val_task_to_env)
+        finally:
+            _shutdown_runtime(
+                policy,
+                policy_generation,
+                cluster,
+                teacher_worker_groups,
+            )
 
 
 if __name__ == "__main__":

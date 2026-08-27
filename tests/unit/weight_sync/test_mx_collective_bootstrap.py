@@ -1,0 +1,389 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import sys
+from contextlib import nullcontext
+from types import ModuleType, SimpleNamespace
+
+import pytest
+
+from nemo_rl.weight_sync import mx_collective_bootstrap as bootstrap
+
+
+def rendezvous_kwargs(**overrides):
+    kwargs = {
+        "mx_server_url": "mx:8001",
+        "model_name": "model",
+        "role": "TRAINER",
+        "index_in_role": 0,
+        "slot_id": "train/0",
+        "worker_id": "worker-0",
+        "trainer_slots": ["train/0"],
+        "generator_slots": ["gen/0"],
+        "source_partition_count": 1,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def bootstrap_state(*, rank=0, epoch=7):
+    lane = SimpleNamespace(lane_id=1, rank_in_lane=rank, world_size=2, kind="BROADCAST")
+    membership = SimpleNamespace(group_id="group", epoch=epoch, lanes=(lane,))
+    return bootstrap.MxBootstrapState(
+        membership, {}, device=0, worker_id=f"worker-{rank}"
+    )
+
+
+class FakeRendezvous:
+    def __init__(self):
+        self.published = []
+        self.closed = False
+
+    def publish_bootstrap(self, **kwargs):
+        self.published.append(kwargs)
+
+    def close(self):
+        self.closed = True
+
+
+class RootUniqueId:
+    def __init__(self, raw):
+        self.as_bytes = raw
+
+
+def install_unique_id_module(monkeypatch, unique_id):
+    utils = ModuleType("nccl.core.utils")
+    utils.get_unique_id = lambda: unique_id
+    core = ModuleType("nccl.core")
+    nccl = ModuleType("nccl")
+    monkeypatch.setitem(sys.modules, "nccl", nccl)
+    monkeypatch.setitem(sys.modules, "nccl.core", core)
+    monkeypatch.setitem(sys.modules, "nccl.core.utils", utils)
+
+
+def test_rendezvous_rejects_an_unknown_role_before_joining():
+    with pytest.raises(ValueError, match="unsupported MX collective role"):
+        bootstrap.mx_rendezvous(**rendezvous_kwargs(role="OBSERVER"))
+
+
+def test_rendezvous_rejects_nccl_comm_id_override(monkeypatch):
+    monkeypatch.setenv("NCCL_COMM_ID", "10.0.0.1:1234")
+    with pytest.raises(RuntimeError, match="must be unset"):
+        bootstrap.mx_rendezvous(**rendezvous_kwargs())
+
+
+def test_lane_root_rejects_a_uid_different_from_what_it_published(monkeypatch):
+    minted = b"a" * 128
+    install_unique_id_module(monkeypatch, RootUniqueId(minted))
+    state = bootstrap_state()
+    rendezvous = FakeRendezvous()
+    state.rz = rendezvous
+    monkeypatch.setattr(bootstrap, "_await_lane_id", lambda *_: b"b" * 128)
+
+    with pytest.raises(RuntimeError, match="different ncclUniqueId"):
+        bootstrap.mx_init_lane(state, 1)
+    assert rendezvous.published[0]["nccl_unique_id"] == minted
+    assert rendezvous.closed
+    assert state.rz is None
+
+
+def test_lane_root_keeps_the_minted_uid_object_through_communicator_init(monkeypatch):
+    minted = b"a" * 128
+    root_unique_id = RootUniqueId(minted)
+    install_unique_id_module(monkeypatch, root_unique_id)
+    state = bootstrap_state()
+    state.rz = FakeRendezvous()
+    monkeypatch.setattr(bootstrap, "_await_lane_id", lambda *_: minted)
+    observed = {}
+
+    class FakeProcessGroup:
+        def __init__(self, **kwargs):
+            observed.update(kwargs)
+
+        def init_nccl_communicator(self, device):
+            observed["device"] = device
+
+    monkeypatch.setattr(bootstrap, "MxProcessGroup", FakeProcessGroup)
+    bootstrap.mx_init_lane(state, 1)
+
+    assert observed["root_unique_id"] is root_unique_id
+    assert observed["unique_id"] == minted
+    assert state.ids[1] == minted
+
+
+def test_lane_fetch_requires_a_bootstrap_stamp_from_the_current_epoch(monkeypatch):
+    from modelexpress_rl import refit_collective_pb2_grpc as pb_grpc
+
+    stale = SimpleNamespace(lane_id=1, bootstrap_epoch=6, nccl_unique_id=b"s" * 128)
+    current = SimpleNamespace(lane_id=1, bootstrap_epoch=7, nccl_unique_id=b"c" * 128)
+
+    class Stub:
+        def __init__(self):
+            self.responses = [
+                SimpleNamespace(epoch=7, lanes=[stale]),
+                SimpleNamespace(epoch=7, lanes=[current]),
+            ]
+
+        def GetCollectiveGroup(self, request, timeout):
+            return self.responses.pop(0)
+
+    stub = Stub()
+    monkeypatch.setattr(pb_grpc, "RefitCollectiveServiceStub", lambda channel: stub)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    state = bootstrap_state()
+    state.channel = object()
+    state.timeout_s = 1.0
+
+    assert bootstrap._await_lane_id(state, 1) == b"c" * 128
+
+
+def test_process_group_uses_root_uid_and_warms_up_the_communicator(monkeypatch):
+    root_unique_id = object()
+    events = []
+
+    class FakeTensor:
+        def __init__(self, value):
+            self.value = value
+
+    class FakeStream:
+        cuda_stream = 17
+
+        def synchronize(self):
+            events.append("sync")
+
+    class FakeCommunicator:
+        def __init__(self, kind):
+            self.kind = kind
+
+        @staticmethod
+        def init(*, nranks, rank, unique_id, config):
+            assert config.blocking is False
+            events.append(("init", nranks, rank, unique_id))
+            return FakeCommunicator("bootstrap")
+
+        def split(self, *, color, key, config):
+            assert config.blocking is True
+            events.append(("split", color, key))
+            return FakeCommunicator("blocking")
+
+        def get_async_error(self):
+            return 0
+
+        def broadcast(self, *, sendbuf, recvbuf, root, stream):
+            assert self.kind == "blocking"
+            recvbuf.value = 1
+            events.append(("broadcast", root, stream))
+
+        def abort(self):
+            events.append(f"abort-{self.kind}")
+
+    class FakeConfig:
+        def __init__(self, *, blocking):
+            self.blocking = blocking
+
+    class FakeUniqueId:
+        @staticmethod
+        def from_bytes(raw):
+            raise AssertionError("rank zero must use the original unique-id object")
+
+    communicator = ModuleType("nccl.core.communicator")
+    communicator.Communicator = FakeCommunicator
+    communicator.NCCLConfig = FakeConfig
+    utils = ModuleType("nccl.core.utils")
+    utils.UniqueId = FakeUniqueId
+    bindings = ModuleType("nccl.bindings.nccl")
+    bindings.Result = SimpleNamespace(Success=0, InProgress=7)
+    monkeypatch.setitem(sys.modules, "nccl", ModuleType("nccl"))
+    monkeypatch.setitem(sys.modules, "nccl.core", ModuleType("nccl.core"))
+    monkeypatch.setitem(sys.modules, "nccl.bindings", ModuleType("nccl.bindings"))
+    monkeypatch.setitem(sys.modules, "nccl.bindings.nccl", bindings)
+    monkeypatch.setitem(sys.modules, "nccl.core.communicator", communicator)
+    monkeypatch.setitem(sys.modules, "nccl.core.utils", utils)
+    monkeypatch.setattr(bootstrap.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(bootstrap.torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(bootstrap.torch.cuda, "current_stream", FakeStream)
+    monkeypatch.setattr(bootstrap.torch, "ones", lambda *args, **kwargs: FakeTensor(1))
+    monkeypatch.setattr(bootstrap.torch, "zeros", lambda *args, **kwargs: FakeTensor(0))
+    monkeypatch.setattr(
+        bootstrap.torch, "allclose", lambda left, right: left.value == right.value
+    )
+
+    group = bootstrap.MxProcessGroup(
+        unique_id=b"u" * 128,
+        rank=0,
+        world_size=2,
+        root_unique_id=root_unique_id,
+    )
+    group.init_nccl_communicator(device=0)
+    group.abort()
+
+    assert events == [
+        ("init", 2, 0, root_unique_id),
+        ("split", 0, 0),
+        ("broadcast", 0, 17),
+        "sync",
+        "abort-blocking",
+        "abort-bootstrap",
+    ]
+
+
+def test_process_group_waits_for_nonblocking_broadcast_before_reading(monkeypatch):
+    events = []
+    statuses = iter((0, 7, 0, 0, 7, 0))
+
+    class FakeTensor:
+        def __init__(self, value):
+            self.value = value
+
+    class FakeStream:
+        cuda_stream = 17
+
+        def synchronize(self):
+            events.append("sync")
+
+    class FakeCommunicator:
+        def __init__(self, kind):
+            self.kind = kind
+            self.recvbuf = None
+
+        @staticmethod
+        def init(**kwargs):
+            events.append("init")
+            return FakeCommunicator("bootstrap")
+
+        def split(self, **kwargs):
+            events.append("split")
+            return FakeCommunicator("blocking")
+
+        def get_async_error(self):
+            status = next(statuses)
+            events.append(("status", status))
+            if status == 0 and self.recvbuf is not None:
+                self.recvbuf.value = 1
+            return status
+
+        def broadcast(self, *, sendbuf, recvbuf, root, stream):
+            self.recvbuf = recvbuf
+            events.append("broadcast")
+
+        def abort(self):
+            events.append("abort")
+
+    class FakeConfig:
+        def __init__(self, *, blocking):
+            self.blocking = blocking
+
+    class FakeUniqueId:
+        @staticmethod
+        def from_bytes(raw):
+            return raw
+
+    communicator = ModuleType("nccl.core.communicator")
+    communicator.Communicator = FakeCommunicator
+    communicator.NCCLConfig = FakeConfig
+    utils = ModuleType("nccl.core.utils")
+    utils.UniqueId = FakeUniqueId
+    bindings = ModuleType("nccl.bindings.nccl")
+    bindings.Result = SimpleNamespace(Success=0, InProgress=7)
+    monkeypatch.setitem(sys.modules, "nccl", ModuleType("nccl"))
+    monkeypatch.setitem(sys.modules, "nccl.core", ModuleType("nccl.core"))
+    monkeypatch.setitem(sys.modules, "nccl.bindings", ModuleType("nccl.bindings"))
+    monkeypatch.setitem(sys.modules, "nccl.bindings.nccl", bindings)
+    monkeypatch.setitem(sys.modules, "nccl.core.communicator", communicator)
+    monkeypatch.setitem(sys.modules, "nccl.core.utils", utils)
+    monkeypatch.setattr(bootstrap.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(bootstrap.torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(bootstrap.torch.cuda, "current_stream", FakeStream)
+    monkeypatch.setattr(bootstrap.torch, "ones", lambda *args, **kwargs: FakeTensor(1))
+    monkeypatch.setattr(bootstrap.torch, "zeros", lambda *args, **kwargs: FakeTensor(0))
+    monkeypatch.setattr(
+        bootstrap.torch, "allclose", lambda left, right: left.value == right.value
+    )
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _: events.append("sleep"))
+
+    group = bootstrap.MxProcessGroup(
+        unique_id=b"u" * 128,
+        rank=1,
+        world_size=2,
+    )
+    group.init_nccl_communicator(device=0)
+
+    assert events == [
+        "init",
+        ("status", 0),
+        "split",
+        ("status", 7),
+        "sleep",
+        ("status", 0),
+        ("status", 0),
+        "broadcast",
+        ("status", 7),
+        "sleep",
+        ("status", 0),
+        "sync",
+    ]
+
+
+def test_process_group_aborts_a_nonblocking_init_that_times_out(monkeypatch):
+    events = []
+
+    class FakeCommunicator:
+        @staticmethod
+        def init(**kwargs):
+            return FakeCommunicator()
+
+        def get_async_error(self):
+            return 7
+
+        def abort(self):
+            events.append("abort")
+
+    class FakeConfig:
+        def __init__(self, *, blocking):
+            self.blocking = blocking
+
+    class FakeUniqueId:
+        @staticmethod
+        def from_bytes(raw):
+            return raw
+
+    communicator = ModuleType("nccl.core.communicator")
+    communicator.Communicator = FakeCommunicator
+    communicator.NCCLConfig = FakeConfig
+    utils = ModuleType("nccl.core.utils")
+    utils.UniqueId = FakeUniqueId
+    bindings = ModuleType("nccl.bindings.nccl")
+    bindings.Result = SimpleNamespace(Success=0, InProgress=7)
+    monkeypatch.setitem(sys.modules, "nccl", ModuleType("nccl"))
+    monkeypatch.setitem(sys.modules, "nccl.core", ModuleType("nccl.core"))
+    monkeypatch.setitem(sys.modules, "nccl.bindings", ModuleType("nccl.bindings"))
+    monkeypatch.setitem(sys.modules, "nccl.bindings.nccl", bindings)
+    monkeypatch.setitem(sys.modules, "nccl.core.communicator", communicator)
+    monkeypatch.setitem(sys.modules, "nccl.core.utils", utils)
+    monkeypatch.setattr(bootstrap.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(bootstrap.torch.cuda, "device", lambda device: nullcontext())
+    ticks = iter((0.0, 0.0, 0.2))
+    monkeypatch.setattr(bootstrap.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _: None)
+
+    group = bootstrap.MxProcessGroup(
+        unique_id=b"u" * 128,
+        rank=1,
+        world_size=2,
+        timeout_s=0.1,
+    )
+    with pytest.raises(TimeoutError, match="did not complete"):
+        group.init_nccl_communicator(device=0)
+
+    assert events == ["abort"]

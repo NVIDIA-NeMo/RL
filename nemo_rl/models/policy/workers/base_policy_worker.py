@@ -83,6 +83,65 @@ class AbstractPolicyWorker:
         self.pp_comm_group.init_nccl_communicator(device=device)
         self.my_pp_stage = my_pp_stage
 
+    def init_mx_reshard_comm_group(
+        self,
+        mx_server_url: str,
+        model_name: str,
+        trainer_slots: list,
+        generator_slots: list,
+        source_partition_count: int,
+        my_pp_stage: int = 0,
+        plan_digest: str = "",
+        phase: object = "all",
+    ) -> None:
+        """Bootstrap this train worker's comm groups through ModelExpress.
+
+        Same groups the TCPStore path produces, same downstream refit loop; only
+        the ncclUniqueId's provenance differs.
+
+        Driven in phases: ``"rendezvous"``, then one call per lane id, then
+        ``"finish"``. The driver barriers between them because creating two
+        different communicators concurrently across overlapping rank sets
+        deadlocks NCCL -- the same reason the TCPStore path separates its
+        all-ranks group from its per-stage groups.
+        """
+        from nemo_rl.weight_sync.mx_collective_bootstrap import (
+            mx_init_lane,
+            mx_rendezvous,
+        )
+
+        if phase == "rendezvous":
+            import uuid
+
+            if not hasattr(self, "_mx_worker_id"):
+                self._mx_worker_id = (  # pyrefly: ignore[implicitly-defined-attribute]
+                    f"train-{self.rank}-{uuid.uuid4().hex}"
+                )
+            self._mx_state = mx_rendezvous(
+                mx_server_url=mx_server_url,
+                model_name=model_name,
+                role="TRAINER",
+                index_in_role=self.rank,
+                slot_id=f"train/{self.rank}",
+                worker_id=self._mx_worker_id,
+                trainer_slots=trainer_slots,
+                generator_slots=generator_slots,
+                source_partition_count=source_partition_count,
+                source_partition=my_pp_stage,
+                plan_digest=plan_digest,
+                device=torch.cuda.current_device(),
+            )
+            return
+        if phase == "finish":
+            state = self._mx_state
+            # A trainer belongs to exactly one source partition, so it holds one
+            # reshard lane; generators hold all of them.
+            self.pp_comm_group = state.reshard_groups[my_pp_stage]
+            self.model_update_group = state.broadcast_group
+            self.my_pp_stage = my_pp_stage
+            return
+        mx_init_lane(self._mx_state, int(phase))
+
     def prepare_nccl_reshard_refit_info(
         self,
         train_parallelism: dict[str, int],

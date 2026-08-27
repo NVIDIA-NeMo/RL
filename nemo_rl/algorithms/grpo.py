@@ -1423,7 +1423,10 @@ def setup(
             )
             assert remote_transport is not None
             remote_synchronizer_cls = VllmRemoteSparseWeightSynchronizer
-        elif refit_transport is not None and refit_transport != "nccl_reshard":
+        elif refit_transport is not None and refit_transport not in (
+            "nccl_reshard",
+            "mx_nccl_reshard",
+        ):
             # nccl_reshard is handled below via nccl_reshard_refit_enabled,
             # not via checkpoint-engine.
             checkpoint_engine_config = checkpoint_engine_refit_config(generation_config)
@@ -1624,7 +1627,8 @@ def setup(
     policy.print_node_ip_and_gpu_id()
 
     nccl_reshard_refit_enabled = (
-        generation_config.get("refit_transport") == "nccl_reshard"
+        generation_config.get("refit_transport")
+        in ("nccl_reshard", "mx_nccl_reshard")
     )
     if nccl_reshard_refit_enabled:
         from nemo_rl.weight_sync.nccl_reshard_utils import (

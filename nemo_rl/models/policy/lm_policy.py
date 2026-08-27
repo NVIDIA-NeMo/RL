@@ -1205,6 +1205,34 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # co-works with vllm; wait for all futures to complete outside
         return futures
 
+    def init_mx_reshard_comm_group(
+        self,
+        mx_server_url: str,
+        model_name: str,
+        trainer_slots: list,
+        generator_slots: list,
+        source_partition_count: int,
+        pp_stages: list,
+        plan_digest: str = "",
+        phase: object = "all",
+    ) -> list[ray.ObjectRef]:
+        """Initialize the ModelExpress-brokered comm groups on all train workers."""
+        futures = self.worker_group.run_all_workers_multiple_data(
+            "init_mx_reshard_comm_group",
+            my_pp_stage=pp_stages,
+            common_kwargs={
+                "mx_server_url": mx_server_url,
+                "model_name": model_name,
+                "trainer_slots": trainer_slots,
+                "generator_slots": generator_slots,
+                "source_partition_count": source_partition_count,
+                "plan_digest": plan_digest,
+                "phase": phase,
+            },
+        )
+        # co-works with vllm; wait for all futures to complete outside
+        return futures
+
     def prepare_nccl_reshard_refit_info(
         self,
         train_parallelism,

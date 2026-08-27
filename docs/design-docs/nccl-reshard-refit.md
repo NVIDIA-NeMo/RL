@@ -233,6 +233,43 @@ names/attributes change):
    contracts, never your layout.
 4. The misc producer/consumer — reuses the conventional packed-broadcast path.
 
+## ModelExpress-brokered rendezvous (optional)
+
+`refit_transport=mx_nccl_reshard` keeps everything above unchanged and replaces only
+how the NCCL communicators are bootstrapped. The bulk path still ends in
+`nccl.m2n.reshard` with the same meshes and placements, and the misc path still rides
+the packed broadcast, so the two transports move identical bytes and can be compared
+directly.
+
+What changes is the rendezvous. The native path uses `StatelessProcessGroup`, a
+`TCPStore` whose only job is to move 128 bytes of `ncclUniqueId` from rank 0 to
+everyone else, at an IP and port the driver allocates per PP stage. Routing that
+through a ModelExpress server adds three things that store cannot provide:
+
+* **Admission** against an expected participant set, so a worker that never joins
+  becomes a bounded failure naming the missing slot rather than a hang.
+* **Fencing** of worker generations, so a worker that dies and restarts is admitted as
+  a new generation instead of silently rejoining a formed group.
+* **Observable readiness**, so the trainer can confirm the generators it is about to
+  push into have prepared their destinations before it enters the collective.
+
+It also removes the per-stage port allocation from the driver, and lets a refit target
+a *subset* of the generators rather than all of them, because membership is explicit.
+
+Configuration:
+
+```bash
+uv run ./examples/run_grpo.py \
+  --config <your_config>.yaml \
+  policy.generation.colocated.enabled=false \
+  policy.generation.refit_transport=mx_nccl_reshard \
+  policy.generation.mx_server_url=<modelexpress-server>:8001
+```
+
+Requires the ModelExpress collective client (`modelexpress_rl.collective`). Every worker
+on both sides must be given the same server address; two different addresses form two
+groups, neither of which reaches READY.
+
 ## `xferdtensor` Transports
 
 `xferdtensor()` (in `nemo_rl/weight_sync/xferdtensor.py`) is the single entry point both
