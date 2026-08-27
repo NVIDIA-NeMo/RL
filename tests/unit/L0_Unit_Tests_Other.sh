@@ -27,7 +27,7 @@ IGNORE=(
     "--ignore=unit/distributed/"
 )
 
-uv run --no-sync bash -x ./tests/run_unit.sh "unit/" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
+uv run --no-sync bash -x ./tests/run_unit.sh "unit/" "test_mxfp8_rollout_recipes.py" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
 
 # Skip research tests in fast mode
 if [[ "${FAST:-0}" != "1" ]]; then

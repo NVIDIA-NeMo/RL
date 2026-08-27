@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,7 +26,13 @@ class AbstractPolicyWorker:
     """Base class for policy workers with shared functionality."""
 
     def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+        nccl_peer: str = "nemo",
     ) -> None:
         """Initialize the collective communication.
 
@@ -35,6 +41,7 @@ class AbstractPolicyWorker:
             port: Port for the process group
             world_size: Total world size (train_world_size + inference_world_size)
             train_world_size: Number of training workers (used in inference cluster)
+            nccl_peer: NCCL initialization protocol used by the inference workers
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
@@ -45,7 +52,7 @@ class AbstractPolicyWorker:
         # Release unused cached allocator blocks before NCCL communicator
         # initialization so transport buffers have sufficient device-memory headroom.
         torch.cuda.empty_cache()
-        self.model_update_group.init_nccl_communicator(device=device)
+        self.model_update_group.init_nccl_communicator(device=device, peer=nccl_peer)
 
     def init_nccl_reshard_comm_group(
         self,
@@ -96,6 +103,50 @@ class AbstractPolicyWorker:
         # Implementation should be located in each policy worker implementation.
         raise NotImplementedError(
             "nccl_reshard_refit is not implemented for this policy worker"
+        )
+
+    def _refit_transport_state(self, key: str) -> dict:
+        """Return the mutable state dict for one refit transport, e.g. ``"sglang_ipc"``.
+
+        Transports stash their bookkeeping here (gather groups, engine handles,
+        weight versions) instead of each backend adding fields to the worker
+        constructors. Created on first use because this base class has no
+        ``__init__`` — the same lazy shape as ``maybe_init_zmq`` on the ZMQ path.
+        """
+        if not hasattr(self, "_refit_state"):
+            self._refit_state: dict[str, dict] = {}
+        return self._refit_state.setdefault(key, {})
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("policy_worker/connect_sglang_rollout_engines")
+    def connect_sglang_rollout_engines(
+        self,
+        *,
+        engine_gpu_counts: list[int],
+        engine_gpu_offsets: Optional[list[int]] = None,
+    ) -> None:
+        """Set up the colocate Gloo gather topology for SGLang weight refit.
+
+        Must be called collectively by every trainer rank when SGLang engines
+        are added or recovered. Subsequent calls with the same layout are
+        no-ops.
+        """
+        from nemo_rl.models.generation.sglang.utils.train_utils import (
+            monkey_patch_torch_reductions,
+        )
+        from nemo_rl.models.policy.utils import connect_colocate_topology
+
+        # Colocate refit serializes CUDA-IPC tensor handles for SGLang; the
+        # torch reductions monkey patch must be in place before any tensor is
+        # serialized. Idempotent, so installing on every connect is safe.
+        monkey_patch_torch_reductions()
+
+        connect_colocate_topology(
+            engine_gpu_counts=list(engine_gpu_counts),
+            engine_gpu_offsets=(
+                list(engine_gpu_offsets) if engine_gpu_offsets is not None else None
+            ),
+            worker_state=self._refit_transport_state("sglang_ipc"),
         )
 
     def is_alive(self) -> bool:

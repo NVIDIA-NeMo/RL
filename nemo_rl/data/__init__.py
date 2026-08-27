@@ -42,6 +42,13 @@ class ResponseDatasetConfig(TypedDict):
     megatron_sft_assistant_prefix_len: NotRequired[int | None]
     # Context-parallel size used when padding every packed segment.
     megatron_sft_context_parallel_size: NotRequired[int]
+    # TODO(rohitrango): Move model-specific media controls to ProcessorInterface.
+    num_frames: NotRequired[int]
+    video_sampling_style: NotRequired[Literal["nemotron_vl"]]
+    video_target_num_patches: NotRequired[int | None]
+    video_temporal_patch_size: NotRequired[int]
+    video_maintain_aspect_ratio: NotRequired[bool]
+    min_generation_tokens: NotRequired[int]
 
 
 class PreferenceDatasetConfig(TypedDict):
@@ -54,6 +61,13 @@ class PreferenceDatasetConfig(TypedDict):
     split: NotRequired[str]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
+    # TODO(rohitrango): Move model-specific media controls to ProcessorInterface.
+    num_frames: NotRequired[int]
+    video_sampling_style: NotRequired[Literal["nemotron_vl"]]
+    video_target_num_patches: NotRequired[int | None]
+    video_temporal_patch_size: NotRequired[int]
+    video_maintain_aspect_ratio: NotRequired[bool]
+    min_generation_tokens: NotRequired[int]
 
 
 class DataConfig(TypedDict):
