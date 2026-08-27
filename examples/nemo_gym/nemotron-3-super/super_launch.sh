@@ -70,8 +70,26 @@ fi
 # ---- Derived paths ----
 CODE_DIR=$(realpath "$PWD")
 WANDB_NAME="${EXP_NAME}"
-CHECKPOINT_DIR="results/${EXP_NAME}"
-LOG_DIR="logs/${EXP_NAME}"
+# Optional stable results layout: set RESULTS_DIR to get
+#   $RESULTS_DIR/checkpoints             (stable -> singleton auto-resume)
+#   $RESULTS_DIR/runs/<ts>/{logs,slurm}  (per-submission; runs/latest symlink)
+#   $RESULTS_DIR/ray_logs/<jobid>-logs   (ray.sub infra logs via BASE_LOG_DIR)
+# Unset: legacy snapshot-relative results/ and logs/ dirs.
+RESULTS_DIR="${RESULTS_DIR:-}"
+if [[ -n "${RESULTS_DIR}" ]]; then
+    CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RESULTS_DIR}/checkpoints}"
+    RUN_DIR="${RESULTS_DIR}/runs/$(date +%Y%m%d-%H%M)"
+    LOG_DIR="${RUN_DIR}/logs"
+    SLURM_LOG_DIR="${RUN_DIR}/slurm"
+    mkdir -p "${CHECKPOINT_DIR}" "${LOG_DIR}" "${SLURM_LOG_DIR}"
+    ln -sfn "$(realpath "${RUN_DIR}")" "${RESULTS_DIR}/runs/latest"
+    export BASE_LOG_DIR="${BASE_LOG_DIR:-${RESULTS_DIR}/ray_logs}"
+    mkdir -p "${BASE_LOG_DIR}"
+else
+    CHECKPOINT_DIR="results/${EXP_NAME}"
+    LOG_DIR="logs/${EXP_NAME}"
+    SLURM_LOG_DIR=""
+fi
 
 VLLM_CACHE_DIR="${PERSISTENT_CACHE}/vllm_compile_cache"
 FLASHINFER_CUBIN_CACHE="${PERSISTENT_CACHE}/flashinfer_cubins"
@@ -171,6 +189,10 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
     data.train.data_path=${TRAIN_PATH} \
     data.validation.data_path=${VAL_PATH}"
 
+if [[ -n "${RESULTS_DIR}" ]]; then
+    COMMAND="$COMMAND env.nemo_gym.nemo_gym_log_dir=${LOG_DIR}/nemo_gym"
+fi
+
 if [[ -n "$SIF_DIR" ]]; then
     COMMAND="$COMMAND sif_dir=${SIF_DIR}"
 fi
@@ -226,6 +248,9 @@ if [[ -n "${SLURM_QOS:-}" ]]; then
 fi
 if [[ -n "${SLURM_COMMENT:-}" ]]; then
     SBATCH_CMD=("${SBATCH_CMD[@]:0:1}" --comment="${SLURM_COMMENT}" "${SBATCH_CMD[@]:1}")
+fi
+if [[ -n "${SLURM_LOG_DIR}" ]]; then
+    SBATCH_CMD=("${SBATCH_CMD[@]:0:1}" --output="${SLURM_LOG_DIR}/%j.out" --error="${SLURM_LOG_DIR}/%j.err" "${SBATCH_CMD[@]:1}")
 fi
 
 if [[ "$DRY_RUN" == true ]]; then
