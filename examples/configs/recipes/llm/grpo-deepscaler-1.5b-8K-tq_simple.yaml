@@ -2,4 +2,4 @@ defaults: grpo-deepscaler-1.5b-8K.yaml
 data_plane:
   enabled: true
   observability:
-    verify_tensor_hash: true  # wire guard; gated to 0 by the wrapper script
+    verify_tensor_hash: true
