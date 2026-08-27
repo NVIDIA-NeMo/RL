@@ -172,6 +172,97 @@ def create_megatron_config(
 
 
 @pytest.mark.parametrize(
+    ("configured_extension_fqn", "explicit_extension_fqn"),
+    [
+        ("tests.extensions.CustomPolicyWorker", None),
+        (None, "tests.extensions.CustomPolicyWorker"),
+        (
+            "tests.extensions.CustomPolicyWorker",
+            "tests.extensions.CustomPolicyWorker",
+        ),
+    ],
+)
+def test_policy_selects_worker_extension_from_config_or_constructor(
+    tiny_llama_model_path,
+    configured_extension_fqn,
+    explicit_extension_fqn,
+) -> None:
+    config = create_dtensor_config(tiny_llama_model_path, tp=1)
+    if configured_extension_fqn is not None:
+        config["worker_extension_cls_fqn"] = configured_extension_fqn
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn=explicit_extension_fqn,
+        )
+
+    assert worker_builder.call_args.args[0] == "tests.extensions.CustomPolicyWorker"
+
+
+def test_policy_constructor_worker_extension_allows_quantization() -> None:
+    """The constructor argument may extend the quant-resolved worker; the config field may not."""
+    config = create_dtensor_config("test-model", tp=1)
+    config["quant_cfg"] = "NVFP4"
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
+        patch("nemo_rl.models.policy.lm_policy.get_default_hf_config"),
+        patch("nemo_rl.models.policy.lm_policy.FLOPTracker"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn="tests.extensions.CustomPolicyWorker",
+        )
+
+    assert worker_builder.call_args.args[0] == "tests.extensions.CustomPolicyWorker"
+
+
+@pytest.mark.parametrize(
+    ("config_updates", "explicit_extension_fqn", "error_match"),
+    [
+        (
+            {
+                "worker_extension_cls_fqn": "tests.extensions.CustomPolicyWorker",
+                "quant_cfg": "NVFP4",
+            },
+            None,
+            "worker_extension_cls_fqn and quant_cfg are mutually exclusive",
+        ),
+        (
+            {"worker_extension_cls_fqn": "tests.extensions.ConfigWorker"},
+            "tests.extensions.ArgumentWorker",
+            "different values",
+        ),
+    ],
+)
+def test_policy_rejects_invalid_worker_extension_config(
+    config_updates,
+    explicit_extension_fqn,
+    error_match,
+) -> None:
+    config = create_dtensor_config("test-model", tp=1)
+    config.update(config_updates)
+
+    with pytest.raises(ValueError, match=error_match):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn=explicit_extension_fqn,
+        )
+
+
+@pytest.mark.parametrize(
     "world_size,tp,cp,should_pass,expected_error_type,description",
     [
         # Valid cases - DTensor backend (PP is always 1 for DTensor)

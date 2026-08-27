@@ -190,6 +190,12 @@ class VllmConfig(GenerationConfig):
     real_quant_export_cpu_offload: NotRequired[bool]
     real_quant_ignore: NotRequired[list[str]]
 
+    # FQN of a worker extension class to use instead of the resolved default
+    # generation worker. Must be a subclass of the resolved worker and cannot
+    # be combined with quant_cfg. Its runtime environment must already be in
+    # ACTOR_ENVIRONMENT_REGISTRY.
+    worker_extension_cls_fqn: NotRequired[str | None]
+
 
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:
     """Validate and return the optional vLLM video sampling contract."""

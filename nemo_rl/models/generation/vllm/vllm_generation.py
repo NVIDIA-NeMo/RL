@@ -172,6 +172,13 @@ class VllmGeneration(GenerationInterface):
             f"Please update your configuration to include all required VLLM parameters."
         )
 
+        extension_fqn = self.cfg.get("worker_extension_cls_fqn")
+        if extension_fqn is not None and self.cfg.get("quant_cfg") is not None:
+            raise ValueError(
+                "worker_extension_cls_fqn and quant_cfg are mutually exclusive: "
+                "a custom generation worker cannot be combined with ModelOpt "
+                "quantization"
+            )
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
                 self.dp_size, self.pp_size, self.tp_size
@@ -203,6 +210,8 @@ class VllmGeneration(GenerationInterface):
                 "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
             )
         worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
+        if extension_fqn is not None:
+            worker_cls = extension_fqn
         if self.cfg["vllm_cfg"]["async_engine"]:
             worker_builder = RayWorkerBuilder(
                 worker_cls, config, defer_model_load=defer_model_load

@@ -142,6 +142,7 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
+  worker_extension_cls_fqn: null # optional registered policy-worker subclass; mutually exclusive with quant_cfg
 
   dtensor_cfg:
     _v2: true
@@ -385,6 +386,9 @@ policy:
     # null = topology default (IPC colocated, NCCL non-colocated).
     # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
     refit_transport: null
+    # vLLM backend only - sglang/trtllm/dynamo inherit this exemplar and ignore it.
+    # Selects the NeMo-RL Ray actor class, NOT vLLM's own `worker_extension_cls`.
+    worker_extension_cls_fqn: null # optional registered vLLM generation-worker subclass; mutually exclusive with quant_cfg
     # Keep real-quant export tensors on CPU by default. Set false only for
     # colocated CUDA-IPC refit to avoid a GPU -> CPU -> GPU round trip.
     real_quant_export_cpu_offload: true
