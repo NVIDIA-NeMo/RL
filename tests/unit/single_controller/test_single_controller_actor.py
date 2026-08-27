@@ -24,6 +24,7 @@ import torch
 from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
+from nemo_rl.algorithms.advantage_estimator import AdvantageResult
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -540,10 +541,10 @@ class _MaskRecordingAdvantageEstimator:
     def __init__(self) -> None:
         self.mask: torch.Tensor | None = None
 
-    def compute_advantage(self, *, rewards, mask, **kwargs) -> torch.Tensor:
+    def compute_advantage(self, *, rewards, mask, **kwargs) -> AdvantageResult:
         del kwargs
         self.mask = mask.clone()
-        return rewards.unsqueeze(-1).expand_as(mask).clone()
+        return AdvantageResult(advantages=rewards.unsqueeze(-1).expand_as(mask).clone())
 
 
 def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
@@ -809,7 +810,9 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     class FakeEstimator:
         def compute_advantage(self, **kwargs):
             captured_kwargs.update(kwargs)
-            return kwargs["teacher_logprobs"] - kwargs["prev_logprobs"]
+            return AdvantageResult(
+                advantages=kwargs["teacher_logprobs"] - kwargs["prev_logprobs"]
+            )
 
     class FakeDataPlane:
         def __init__(self):
@@ -1739,7 +1742,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
         def compute_advantage(self, *, rewards, mask, **kwargs):
             self.kwargs = kwargs
             adv = rewards.unsqueeze(-1).expand_as(mask).clone()
-            return adv, adv + 1.0
+            return AdvantageResult(advantages=adv, returns=adv + 1.0)
 
     estimator = _GaeLikeEstimator()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
