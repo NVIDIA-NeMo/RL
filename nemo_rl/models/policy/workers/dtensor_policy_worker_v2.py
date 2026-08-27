@@ -87,6 +87,18 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.timer import Timer
 
 
+def _refit_tensor_dtype(
+    fqn: str, tensor: torch.Tensor, default_dtype: torch.dtype
+) -> torch.dtype:
+    """Preserve the FP32 dtype used by inference-critical MoE router state."""
+    is_router_correction_bias = fqn.rsplit(".", maxsplit=1)[-1] == (
+        "e_score_correction_bias"
+    )
+    if is_router_correction_bias and tensor.dtype == torch.float32:
+        return tensor.dtype
+    return default_dtype
+
+
 def dtensor_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -94,11 +106,12 @@ def dtensor_params_generator(
 
     Args:
         model: The model whose parameters to generate.
-        target_dtype: The dtype to convert tensors to.
-        peft_config: Optional LoRA config for filtering which layers to merge.
+        target_dtype: The default dtype for refit tensors. Source-FP32
+            ``e_score_correction_bias`` tensors retain FP32.
 
     Yields:
-        Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
+        Tuples of (fully_qualified_name, tensor) where tensors are converted to
+        the refit dtype and made contiguous.
     """
     module_map = dict(model.named_modules())
     for name, tensor in model.state_dict().items():
@@ -109,10 +122,10 @@ def dtensor_params_generator(
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            # Convert to target dtype
+            refit_dtype = _refit_tensor_dtype(adapted_fqn, adapted_tensor, target_dtype)
             yield (
                 adapted_fqn,
-                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
+                adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
             )
             del adapted_tensor
         del adapted_fqn_tensors
@@ -1079,12 +1092,14 @@ class DTensorPolicyWorkerV2Impl(
             full_tensor = (
                 tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
             )
-            # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
             adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
                 self.model, name, full_tensor
             )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                state_dict_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
+                refit_dtype = _refit_tensor_dtype(
+                    adapted_fqn, adapted_tensor, self.dtype
+                )
+                state_dict_info[adapted_fqn] = (adapted_tensor.shape, refit_dtype)
 
         return state_dict_info
 

@@ -29,7 +29,10 @@ from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
-from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller import (
+    SingleControllerActor,
+    _pooled_opd_metrics,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
@@ -574,6 +577,7 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
@@ -642,6 +646,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=None)
@@ -704,6 +709,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
@@ -759,6 +765,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=None)
@@ -791,6 +798,111 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
         torch.zeros(batch_size, sequence_length),
     )
     assert "advantages" in (result_meta.fields or [])
+
+
+def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
+    """SC passes the TQ teacher column under OPD's estimator contract."""
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    captured_kwargs = {}
+
+    class FakeEstimator:
+        def compute_advantage(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return kwargs["teacher_logprobs"] - kwargs["prev_logprobs"]
+
+    class FakeDataPlane:
+        def __init__(self):
+            self.put_fields = None
+
+        def get_samples(self, sample_ids, partition_id, select_fields):
+            del sample_ids, partition_id
+            assert "teacher_reference_logprobs" in select_fields
+            assert "generation_logprobs" in select_fields
+            return TensorDict(
+                {
+                    "prompt_ids_for_adv": torch.zeros(2, 3, dtype=torch.long),
+                    "total_reward": torch.zeros(2),
+                    "token_mask": torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.0, 0.0]]),
+                    "sample_mask": torch.ones(2),
+                    "generation_logprobs": torch.full((2, 3), 0.5),
+                    "prev_logprobs": torch.full((2, 3), 0.5),
+                    "teacher_reference_logprobs": torch.full((2, 3), 0.75),
+                },
+                batch_size=(2,),
+            )
+
+        def put_samples(self, sample_ids, partition_id, fields):
+            del sample_ids, partition_id
+            self.put_fields = fields
+
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = FakeEstimator()
+    ctrl._policy_logprobs_required = True
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = True
+    ctrl._is_ppo = False
+    ctrl._dp_client = FakeDataPlane()
+    ctrl._master_config = SimpleNamespace(
+        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    ctrl._opd_stat_sum = 0.0
+    ctrl._opd_stat_sumsq = 0.0
+    ctrl._opd_stat_count = 0
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["a", "b"],
+        fields=[],
+        sequence_lengths=[3, 3],
+    )
+
+    enriched, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert has_valid_training_tokens
+    assert set(captured_kwargs) >= {
+        "teacher_logprobs",
+        "prev_logprobs",
+        "prompt_ids",
+        "rewards",
+        "mask",
+        "repeated_batch",
+    }
+    assert "logprobs_policy" not in captured_kwargs
+    assert torch.allclose(
+        captured_kwargs["teacher_logprobs"] - captured_kwargs["prev_logprobs"],
+        torch.full((2, 3), 0.25),
+    )
+    assert "advantages" in (enriched.fields or [])
+    assert ctrl._opd_stat_sum == pytest.approx(1.0)
+    assert ctrl._opd_stat_sumsq == pytest.approx(0.25)
+    assert ctrl._opd_stat_count == 4
+
+
+def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None:
+    """A small streaming chunk cannot receive the same weight as a large one."""
+    # Chunk 1 has values [0, 2]; chunk 2 has [4]. Averaging chunk means
+    # would incorrectly produce 2.5. Exact pooling produces mean=2, std=2.
+    metrics = _pooled_opd_metrics(
+        stat_sum=6.0,
+        stat_sumsq=20.0,
+        count=3,
+    )
+
+    assert metrics == pytest.approx(
+        {
+            "on_policy_distillation/teacher_student_logprob_gap_mean": 2.0,
+            "on_policy_distillation/adv_mean": 2.0,
+            "on_policy_distillation/adv_std": 2.0,
+        }
+    )
 
 
 class _EmptySampler:
@@ -974,6 +1086,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._advantage_estimator = None
     ctrl._partition_id = "rollout_data"
     ctrl._sampler = sampler
@@ -1000,7 +1113,12 @@ def _train_pump_controller(*, sampler) -> object:
         "rewards": [],
         "masked_advantages": [],
         "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
     }
+    ctrl._opd_stat_sum = 0.0
+    ctrl._opd_stat_sumsq = 0.0
+    ctrl._opd_stat_count = 0
+    ctrl._teacher_coordinator = None
     return ctrl
 
 
@@ -1631,6 +1749,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = True
     ctrl._master_config = SimpleNamespace(
         ppo=SimpleNamespace(seq_logprob_error_threshold=None)
