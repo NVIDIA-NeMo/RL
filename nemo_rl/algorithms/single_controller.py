@@ -849,9 +849,23 @@ class SingleControllerActor:
         if not groups_to_recover:
             return
 
+        # ADMITTED groups may be the only work capable of advancing the trainer and
+        # opening the sampler gate. Launch them before waiting to re-admit RESERVED
+        # groups, or restore can deadlock with the trainer waiting for recovered work
+        # that this method has not launched yet.
+        redispatched = 0
+        for group in groups_to_recover:
+            if group.phase is PromptGroupPhase.ADMITTED:
+                await launch(
+                    group.prompt_payload,
+                    group.target_step,
+                    group.group_id,
+                )
+                redispatched += 1
+
         # A checkpoint may land after dataloader ownership is recorded but before
-        # sampler admission commits. Re-admit each original dataloader batch once;
-        # ADMITTED groups retain their original target step and cursor position.
+        # sampler admission commits. Re-admit each original dataloader batch once and
+        # launch it immediately; do not wait for every reserved batch to pass its gate.
         reserved_admissions: dict[str, list[str]] = {}
         for group in groups_to_recover:
             if group.phase is PromptGroupPhase.RESERVED:
@@ -859,18 +873,20 @@ class SingleControllerActor:
                     group.group_id
                 )
         for group_ids in reserved_admissions.values():
-            await self._admit_reserved_prompt_groups(group_ids)
-
-        refreshed_groups = recovery_ledger.groups()
-        for group in refreshed_groups:
-            await launch(
-                group.prompt_payload,
-                group.target_step,
-                group.group_id,
+            _, dispatch_group_ids, _ = await self._admit_reserved_prompt_groups(
+                group_ids
             )
+            for group_id in dispatch_group_ids:
+                group = recovery_ledger.get_group(group_id)
+                await launch(
+                    group.prompt_payload,
+                    group.target_step,
+                    group.group_id,
+                )
+                redispatched += 1
 
         print(
-            f"📦 Redispatched {len(refreshed_groups)} unfinished rollout "
+            f"📦 Redispatched {redispatched} unfinished rollout "
             "group(s) before new dataloader work",
             flush=True,
         )
@@ -2362,20 +2378,38 @@ class SingleControllerActor:
 
     async def _abort_stale_inflight(self) -> int:
         """Abort in-flight rollouts that the sampler can no longer select."""
-        stale_tasks = [
-            task
-            for task, start_version in self._inflight_by_group_id.values()
-            if self._sampler.should_abort_inflight(
-                start_weight_version=start_version,
-                current_train_weight=self._trainer_version,
-            )
-        ]
-        if not stale_tasks:
+        def _stale_groups() -> list[tuple[str, asyncio.Task[None]]]:
+            stale_groups: list[tuple[str, asyncio.Task[None]]] = []
+            for group_id, inflight in self._inflight_by_group_id.items():
+                task, start_version = inflight
+                if self._sampler.should_abort_inflight(
+                    start_weight_version=start_version,
+                    current_train_weight=self._trainer_version,
+                ):
+                    stale_groups.append((group_id, task))
+            return stale_groups
+
+        if self._rollout_recovery_enabled:
+            async with self._data_plane_checkpoint_barrier.mutation():
+                # Re-evaluate after acquiring the cut: a rollout may have completed
+                # while a checkpoint holder delayed this mutation.
+                stale_groups = _stale_groups()
+                for group_id, _ in stale_groups:
+                    # This is an intentional live abort, not a process failure. Remove
+                    # durable ownership before cancellation cleanup removes the unready
+                    # TQ slot, so a concurrent checkpoint cannot resurrect the prompt.
+                    self._rollout_manager.discard_prompt_group(group_id)
+                for _, task in stale_groups:
+                    task.cancel()
+        else:
+            stale_groups = _stale_groups()
+            for _, task in stale_groups:
+                task.cancel()
+
+        if not stale_groups:
             return 0
 
-        for task in stale_tasks:
-            task.cancel()
-
+        stale_tasks = [task for _, task in stale_groups]
         results = await asyncio.gather(*stale_tasks, return_exceptions=True)
         failures = [
             result

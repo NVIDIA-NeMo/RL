@@ -876,6 +876,75 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
     asyncio.run(exercise())
 
 
+def test_recovery_launches_admitted_groups_before_waiting_to_readmit() -> None:
+    """Recovered work can open the gate that a reserved batch is waiting on."""
+
+    async def exercise() -> None:
+        sampler = _CountingInOrderSampler()
+        sampler.restore_dispatch_index(7)
+        ledger = RolloutRecoveryLedger()
+        ledger.reserve_group(
+            group_id="admitted-step-7",
+            admission_id="batch-7",
+            prompt_id="70",
+            prompt_payload={"idx": 70, "message_log": []},
+            expected_generations=2,
+            target_step=7,
+            start_weight_version=7,
+            admitted=True,
+        )
+        ledger.reserve_group(
+            group_id="reserved-step-8",
+            admission_id="batch-8",
+            prompt_id="80",
+            prompt_payload={"idx": 80, "message_log": []},
+            expected_generations=2,
+            target_step=None,
+            start_weight_version=7,
+            admitted=False,
+        )
+        rollout_manager = _RecoveryRolloutManager(ledger)
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        controller._sampler = sampler
+        controller._rollout_manager = rollout_manager
+        controller._trainer_version = 6
+        controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        controller._buffer = SimpleNamespace(
+            count_for_target_step=lambda _target_step: 0,
+        )
+
+        launched: list[tuple[str, int | None]] = []
+
+        async def _recover(
+            _prompt: dict[str, Any],
+            target_step: int | None,
+            group_id: str,
+        ) -> None:
+            launched.append((group_id, target_step))
+            await rollout_manager.complete_recovery(group_id)
+            if group_id == "admitted-step-7":
+                # Model the concurrent train pump consuming recovered step 7. This
+                # opens the in-order gate so the reserved batch can become step 8.
+                controller._trainer_version = 7
+
+        await asyncio.wait_for(
+            controller._redispatch_restored_rollouts(_recover),
+            timeout=1.0,
+        )
+
+        assert launched == [
+            ("admitted-step-7", 7),
+            ("reserved-step-8", 8),
+        ]
+        assert sampler.admission_commits == 1
+        assert sampler.dispatch_index == 8
+        assert len(ledger) == 0
+
+    asyncio.run(exercise())
+
+
 def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
     tmp_path,
 ) -> None:

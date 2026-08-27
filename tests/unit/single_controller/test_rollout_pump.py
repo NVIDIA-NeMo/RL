@@ -25,7 +25,10 @@ import pytest
 import ray
 import torch
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+    TQReplayBuffer,
+)
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSampler,
     WeightFifoSampler,
@@ -43,6 +46,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
+from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
 from tests.unit.experience.test_rollout_manager import (
@@ -772,17 +776,39 @@ def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
         stale = asyncio.create_task(asyncio.Event().wait())
         await asyncio.sleep(0)
 
+        ledger = RolloutRecoveryLedger()
+        for group_id, prompt_idx, start_weight_version in (
+            ("fresh", 50, 5),
+            ("stale", 10, 1),
+        ):
+            ledger.reserve_group(
+                group_id=group_id,
+                prompt_id=str(prompt_idx),
+                prompt_payload={"idx": prompt_idx, "message_log": []},
+                expected_generations=2,
+                target_step=None,
+                start_weight_version=start_weight_version,
+                admitted=True,
+            )
+
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"fresh": (fresh, 5), "stale": (stale, 1)}
+        ctrl._rollout_recovery_enabled = True
+        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        ctrl._rollout_manager = SimpleNamespace(
+            recovery_ledger=ledger,
+            discard_prompt_group=ledger.discard_group,
+        )
 
         aborted = await ctrl._abort_stale_inflight()
 
         assert aborted == 1
         assert stale.cancelled()
         assert not fresh.cancelled()
+        assert [group.group_id for group in ledger.groups()] == ["fresh"]
 
         fresh.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -807,6 +833,7 @@ def test_abort_stale_inflight_aggregates_cleanup_failures() -> None:
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=0)
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"g": (task, 0)}
+        ctrl._rollout_recovery_enabled = False
 
         with pytest.raises(BaseExceptionGroup) as exc_info:
             await ctrl._abort_stale_inflight()
