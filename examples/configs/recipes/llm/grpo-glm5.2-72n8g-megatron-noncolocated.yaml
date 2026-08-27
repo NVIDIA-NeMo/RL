@@ -113,12 +113,12 @@ env:
     num_workers: 16
     math_verify_impl: dapo_math_verify
 logger:
-  log_dir: logs/grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated
+  log_dir: logs/grpo-glm5.2-72n8g-megatron-noncolocated
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemo-rl-glm-perf
-    name: grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated
+    name: grpo-glm5.2-72n8g-megatron-noncolocated
 cluster:
   gpus_per_node: 8
   num_nodes: 72
