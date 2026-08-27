@@ -594,7 +594,9 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
                 "external_staging_backend": (
-                    "megatron_ledger" if generation_backend == "megatron" else "worker"
+                    "megatron_ledger"
+                    if generation_backend == "megatron"
+                    else "vllm_worker"
                 ),
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }

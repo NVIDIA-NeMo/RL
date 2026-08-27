@@ -374,7 +374,7 @@ class MegatronGeneration(GenerationInterface):
 
     def flush_token_capture(self, receipt: dict[str, Any]) -> dict[str, Any]:
         """Batch-convert one rollout's MInf ledger rows into durable TQ rows."""
-        from nemo_gym.token_id_capture.adapters.megatron import MegatronCaptureAdapter
+        from nemo_gym.token_id_capture.staging.protocols import DeferredCaptureAdapter
         from nemo_gym.token_id_capture.staging.records import (
             CaptureAdmission,
             CallRecord,
@@ -418,8 +418,9 @@ class MegatronGeneration(GenerationInterface):
 
             committed_records: list[CallRecord] = []
             adapter = capture.adapter
-            if not isinstance(adapter, MegatronCaptureAdapter):
-                raise RuntimeError("Megatron token capture adapter is not installed")
+            if not isinstance(adapter, DeferredCaptureAdapter):
+                raise RuntimeError("a deferred token capture adapter is not installed")
+            pending_by_call_id = {record.model_call_id: record for record in pending}
             prepared_calls = []
             for record in pending:
                 ledger_payload = records_by_uid[record.ledger_request_uid]
@@ -441,6 +442,15 @@ class MegatronGeneration(GenerationInterface):
                         f"MInf request {record.ledger_request_uid!r} differs from "
                         "the HTTP lineage lengths"
                     )
+                parent_chain_hash = None
+                if record.parent_call_id is not None:
+                    parent = pending_by_call_id.get(record.parent_call_id)
+                    if parent is None:
+                        raise RuntimeError(
+                            f"MInf call {record.model_call_id!r} references missing "
+                            f"parent {record.parent_call_id!r}"
+                        )
+                    parent_chain_hash = parent.chain_hash
                 admission = CaptureAdmission(
                     rollout_id=str(receipt["rollout_id"]),
                     model_call_id=record.model_call_id,
@@ -452,6 +462,7 @@ class MegatronGeneration(GenerationInterface):
                         if record.mode == "token_in"
                         else []
                     ),
+                    parent_chain_hash=parent_chain_hash,
                 )
                 weight_version = adapter.extract_weight_version(ledger_payload)
                 prepared_calls.append(
@@ -477,6 +488,9 @@ class MegatronGeneration(GenerationInterface):
                         extras_digest=coords.extras_digest,
                         staging_key=coords.staging_key,
                         mode=record.mode,
+                        chain_hash=coords.chain_hash,
+                        cumulative_hash=coords.cumulative_hash,
+                        response_id=record.response_id,
                         logical_request_id=record.logical_request_id,
                         admitted_at=record.admitted_at,
                     )
