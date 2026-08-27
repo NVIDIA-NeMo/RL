@@ -119,7 +119,6 @@ dependencies = [
   "plotly",
   "matplotlib",
   "openai",
-  # New in hchings/TensorRT-LLM@a57b321 requirements.txt.
   "jinja2",
   "lazy_loader~=0.5",
   "msgspec",
@@ -150,4 +149,4 @@ backend-path = ["."]
 # never committed, and the cache key uses this raw string, not the expanded one).
 # The ref is user/zongfeij/rl @ 1.3.0rc23: 
 url = "https://oauth2:${GITLAB_CLONE_ACCESS_TOKEN}@gitlab-master.nvidia.com/ftp/tekit.git"
-ref = "300f2d852bc2ee44d4d460e2a4501565aa06f0bb"   # pragma: allowlist secret
+ref = "7035705878c31d3ed64d224e46c6e1fddff9aefc"   # pragma: allowlist secret
