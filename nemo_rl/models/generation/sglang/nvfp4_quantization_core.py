@@ -435,14 +435,14 @@ def iter_nvfp4_quantized_tensor_groups(
     named_tensors: Iterable[tuple[str, torch.Tensor]],
     *,
     skip_weight_substrings: tuple[str, ...],
+    require_gate_up_pairs: bool = True,
 ) -> Iterator[list[tuple[str, torch.Tensor]]]:
-    """Yield NVFP4 expert tensors, buffering complete gate/up pairs."""
+    """Yield NVFP4 expert tensors, buffering complete gated pairs when required."""
     pending_pairs: dict[str, dict[str, tuple[str, torch.Tensor]]] = {}
 
     for name, tensor in named_tensors:
-        if should_skip_nvfp4_gated_pair(
-            name,
-            skip_weight_substrings=skip_weight_substrings,
+        if require_gate_up_pairs and should_skip_nvfp4_gated_pair(
+            name, skip_weight_substrings=skip_weight_substrings
         ):
             yield [(name, tensor)]
             continue
@@ -455,7 +455,9 @@ def iter_nvfp4_quantized_tensor_groups(
             yield [(name, tensor)]
             continue
 
-        pair_base, pair_role = split_gated_pair_name(name)
+        pair_base, pair_role = (
+            split_gated_pair_name(name) if require_gate_up_pairs else (None, None)
+        )
         if pair_base is None or pair_role is None:
             yield nvfp4_quantized_entries(
                 name,

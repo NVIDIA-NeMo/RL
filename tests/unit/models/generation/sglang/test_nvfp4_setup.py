@@ -231,6 +231,48 @@ def test_same_shard_pair_writes_modelopt_fields_and_metadata(
     assert output_index["metadata"]["total_size"] == expected_total_size
 
 
+def test_nemotron_h_non_gated_experts_quantize_without_gate_up_pairs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "source"
+    save_dir = tmp_path / "converted"
+    up_name = "backbone.layers.1.mixer.experts.0.up_proj.weight"
+    down_name = "backbone.layers.1.mixer.experts.0.down_proj.weight"
+    _write_source_checkpoint(
+        model_dir,
+        {
+            "model.safetensors": {
+                up_name: _weight(1.0),
+                down_name: _weight(2.0),
+            }
+        },
+        num_hidden_layers=2,
+        config_extra={
+            "architectures": ["NemotronHForCausalLM"],
+            "model_type": "nemotron_h",
+        },
+    )
+
+    monkeypatch.setattr(
+        nvfp4_setup,
+        "quantize_nvfp4",
+        lambda weight: _fake_quantized(weight, qvalue=7, global_scale=0.25),
+    )
+    monkeypatch.setattr(
+        nvfp4_setup,
+        "quantize_nvfp4_pair",
+        lambda *_args: pytest.fail("non-gated experts must not use pair quantization"),
+    )
+
+    nvfp4_setup.convert_nvfp4(str(model_dir), str(save_dir), device="cpu")
+
+    output = _load_shard(save_dir / "model.safetensors")
+    assert _quantized_names(up_name) | _quantized_names(down_name) == set(output)
+    assert output[up_name].dtype == torch.uint8
+    assert output[down_name].dtype == torch.uint8
+
+
 def test_cross_shard_pair_is_quantized_once_and_written_to_source_shards(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -429,14 +471,16 @@ def test_first_and_last_layers_remain_bf16(
         assert _quantized_names(name) <= set(output)
 
 
+@pytest.mark.parametrize("weight_name", [_gate(0), _up(0)])
 def test_incomplete_gate_up_pair_fails_before_writing_output(
     tmp_path: Path,
+    weight_name: str,
 ) -> None:
     model_dir = tmp_path / "source"
     save_dir = tmp_path / "converted"
     _write_source_checkpoint(
         model_dir,
-        {"model.safetensors": {_gate(0): _weight(1.0)}},
+        {"model.safetensors": {weight_name: _weight(1.0)}},
         num_hidden_layers=1,
     )
 
