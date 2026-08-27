@@ -526,6 +526,7 @@ class TestSetup:
             env_configs=mc.env,
             base_urls=patched_factories["fake_gen"].dp_openai_server_base_urls,
             model_name="test-model",
+            generation_backend="vllm",
             # Reaches the actor once, at spinup, rather than riding along with every
             # run_rollouts call.
             tokenizer=tokenizer,

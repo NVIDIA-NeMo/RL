@@ -806,6 +806,7 @@ def setup(
             env_configs=env_configs,
             base_urls=base_urls,
             model_name=model_name,
+            generation_backend=backend,
             tokenizer=tokenizer,
             enable_router_replay=enable_router_replay,
             routed_experts_dtype=routed_experts_dtype,

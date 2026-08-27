@@ -40,6 +40,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    _normalize_nemo_gym_base_urls,
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
@@ -986,6 +987,20 @@ def test_setup_nemo_gym_config_selects_sglang_without_mutating_vllm():
     }
     assert config.policy["generation"]["stop_strings"] is None
     assert config.policy["generation"]["stop_token_ids"] is None
+
+
+def test_normalize_nemo_gym_sglang_base_urls_for_openai_chat():
+    assert _normalize_nemo_gym_base_urls(
+        ["http://host:30000", "http://host:30001/", "http://host:30002/v1"],
+        generation_backend="sglang",
+    ) == [
+        "http://host:30000/v1",
+        "http://host:30001/v1",
+        "http://host:30002/v1",
+    ]
+    assert _normalize_nemo_gym_base_urls(
+        ["http://host:8000/v1"], generation_backend="vllm"
+    ) == ["http://host:8000/v1"]
 
 
 def test_should_use_nemo_gym_accepts_sglang_native_http_server():

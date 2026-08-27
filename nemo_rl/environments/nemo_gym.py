@@ -1143,11 +1143,28 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         env_cfg.setdefault("tokenizer_config", dict(config.policy["tokenizer"]))
 
 
+def _normalize_nemo_gym_base_urls(
+    base_urls: list[str], *, generation_backend: str
+) -> list[str]:
+    """Return generation URLs in the form expected by NeMo Gym."""
+    if generation_backend != "sglang":
+        return list(base_urls)
+
+    normalized_urls: list[str] = []
+    for base_url in base_urls:
+        base_url = base_url.rstrip("/")
+        normalized_urls.append(
+            base_url if base_url.endswith("/v1") else f"{base_url}/v1"
+        )
+    return normalized_urls
+
+
 def spinup_nemo_gym_actor(
     env_configs: dict[str, Any],
     base_urls: list[str],
     model_name: str,
     *,
+    generation_backend: str,
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     routed_experts_dtype: str,
@@ -1165,6 +1182,7 @@ def spinup_nemo_gym_actor(
             thinking_tags, num_gpu_nodes).
         base_urls: Per-DP-rank OpenAI-compatible server base URLs from the generation backend.
         model_name: Served model name the Gym rollouts should target.
+        generation_backend: Generation backend that produced ``base_urls``.
         tokenizer: Installed on the actor once, here, rather than passed per
             rollout call. See NemoGym.set_tokenizer for why that distinction is
             the difference between a working run and a stalled one.
@@ -1204,7 +1222,9 @@ def spinup_nemo_gym_actor(
 
     nemo_gym_cfg = NemoGymConfig(
         model_name=model_name,
-        base_urls=base_urls,
+        base_urls=_normalize_nemo_gym_base_urls(
+            base_urls, generation_backend=generation_backend
+        ),
         invalid_tool_call_patterns=invalid_tool_call_patterns,
         thinking_tags=thinking_tags,
         tokenizer_config=tokenizer_config,
