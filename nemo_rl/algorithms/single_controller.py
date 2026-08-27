@@ -2035,7 +2035,10 @@ class SingleControllerActor:
         # write. A no-op unless advantage_clip_low/high are set, and GRPO-only:
         # _clip_grpo_advantages has no counterpart in ppo.py, and PPOConfig
         # carries neither knob, so a PPO run must not reach for them.
-        if not self._is_ppo:
+        # ``hasattr``: only GRPOConfig carries the two knobs. PPOConfig does
+        # not, DistillationConfig does not, and the OPD test doubles build a
+        # bare namespace -- all of which mean "no clipping configured".
+        if not self._is_ppo and hasattr(self._algo_cfg, "advantage_clip_low"):
             advantages = _clip_grpo_advantages(advantages, self._algo_cfg)
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
