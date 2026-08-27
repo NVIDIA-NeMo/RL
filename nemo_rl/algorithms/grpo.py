@@ -14,6 +14,7 @@
 import gc
 import json
 import os
+import sys
 import time
 import warnings
 from collections.abc import Mapping
@@ -2395,8 +2396,9 @@ def _take_nemo_gym_training_samples_for_log(
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     """Whether NeMo Gym is responsible for full response logging.
 
-    When **True**, skip the expensive per-step ``train_data_step*.jsonl`` dump.
-    When **False** (the default if unset), write the local JSONL file.
+    When **True**, skip the expensive local per-step train-data dump.  When
+    **False** (the default if unset), write the local train-data artifacts
+    (JSONL for synchronous GRPO; ``.pt`` plus safetensors for async GRPO).
 
     W&B full-result Tables are controlled independently by
     ``logger.wandb.log_nemo_gym_full_result_tables``.
@@ -5415,7 +5417,10 @@ def async_grpo_train(
                     and policy_generation.wake_carries_weight_updates()
                 )
 
-                print("🔄 Synchronizing policy weights to trajectory collector…")
+                print(
+                    "🔄 Synchronizing policy weights to trajectory collector…",
+                    flush=True,
+                )
                 if defer_wake_for_save:
                     # Wake-deferral (checkpoint scheduling, which the backend
                     # cannot see): the engine is about to be saved, so leave it
@@ -5776,33 +5781,45 @@ def async_grpo_train(
                         ray.get(trajectory_collector.resume_after_refit.remote())
 
             # Logging
+            # Stage the training data before releasing train_data, but do not
+            # start filesystem I/O until the step's W&B metrics have been sent.
+            pending_train_data_save: Optional[
+                tuple[dict[str, Any], dict[str, torch.Tensor], int]
+            ] = None
             # Log training data (match sync GRPO logging payload for parity).
             # NeMo Gym responses can be very large and expensive to log; when
-            # env.should_log_nemo_gym_responses is true, skip this jsonl (see
+            # env.should_log_nemo_gym_responses is true, skip these artifacts (see
             # _should_log_nemo_gym_responses).
             if not _should_log_nemo_gym_responses(master_config):
-                log_data = {}
+                non_tensor_log_data: dict[str, Any] = {}
                 if "agent_ref" in repeated_batch:
-                    log_data["agent_ref"] = repeated_batch["agent_ref"]
-                log_data["content"] = flat_messages_content
-                log_data["rewards"] = rewards.tolist()
+                    non_tensor_log_data["agent_ref"] = repeated_batch["agent_ref"]
+                non_tensor_log_data["content"] = flat_messages_content
+                tensor_log_data = {
+                    # JSONL historically added this field while iterating rows.
+                    "idx": torch.arange(len(flat_messages_content), dtype=torch.int64),
+                    "rewards": rewards.detach().cpu(),
+                    "input_lengths": input_lengths.detach().cpu(),
+                    "token_ids": train_data["input_ids"].detach().cpu(),
+                    "token_loss_mask": train_data["token_mask"].detach().cpu(),
+                    "sample_loss_mask": train_data["sample_mask"].detach().cpu(),
+                    "advantages": train_data["advantages"].detach().cpu(),
+                    "generation_logprobs": train_data["generation_logprobs"]
+                    .detach()
+                    .cpu(),
+                    "prev_logprobs": train_data["prev_logprobs"].detach().cpu(),
+                }
                 if master_config.grpo.use_dynamic_sampling:
                     # In dynamic sampling, `rewards` corresponds to filtered rewards
-                    log_data["filtered_rewards"] = rewards.tolist()
-                    log_data["rewards"] = repeated_batch["total_reward"].tolist()
-                log_data["input_lengths"] = input_lengths.tolist()
-                log_data["token_ids"] = train_data["input_ids"].tolist()
-                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
-                log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
-                log_data["advantages"] = train_data["advantages"].tolist()
-                log_data["generation_logprobs"] = train_data[
-                    "generation_logprobs"
-                ].tolist()
-                log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-                logger.log_batched_dict_as_jsonl(
-                    log_data, f"train_data_step{step + 1}.jsonl"
+                    tensor_log_data["filtered_rewards"] = rewards.detach().cpu()
+                    tensor_log_data["rewards"] = (
+                        repeated_batch["total_reward"].detach().cpu()
+                    )
+                pending_train_data_save = (
+                    non_tensor_log_data,
+                    tensor_log_data,
+                    len(flat_messages_content),
                 )
-                del log_data
             del train_data
             del flat_messages_content
 
@@ -5909,6 +5926,23 @@ def async_grpo_train(
                 prefix="timing/train",
                 step_finished=True,
             )
+
+            if pending_train_data_save is not None:
+                non_tensor_log_data, tensor_log_data, num_log_samples = (
+                    pending_train_data_save
+                )
+                train_data_writer.start(
+                    step=step + 1,
+                    num_samples=num_log_samples,
+                    non_tensor_data=non_tensor_log_data,
+                    tensors=tensor_log_data,
+                )
+                del (
+                    pending_train_data_save,
+                    non_tensor_log_data,
+                    tensor_log_data,
+                    num_log_samples,
+                )
 
             timer.reset()
             step += 1
