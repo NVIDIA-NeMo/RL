@@ -30,6 +30,16 @@ def test_tracer_disabled_by_default():
     assert tracer.events() == []
 
 
+def test_disabled_tracer_async_spans_are_noop():
+    tracer = Tracer("driver", virtual_process_name="rollouts")
+
+    tracer.start_async_span("rollout", "sample", track_name="sample 0")
+    tracer.end_async_span("sample", args={"total_reward": 1.0})
+    tracer.finalize_open_spans()
+
+    assert tracer.events() == []
+
+
 def test_timer_and_async_sample_spans():
     tracer = Tracer("driver", virtual_process_name="ppo_rollouts", enabled=True)
     timer = Timer(trace=tracer)
@@ -95,6 +105,26 @@ def test_save_trace_writes_perfetto_json(tmp_path: Path):
     assert all(isinstance(event, dict) for event in events)
 
 
+def test_save_trace_preserves_equal_timestamp_order(tmp_path: Path):
+    output_path = tmp_path / "trace.json"
+    events = [
+        {"ph": "E", "ts": 1, "pid": 1, "tid": 1},
+        {"name": "next", "ph": "B", "ts": 1, "pid": 1, "tid": 1},
+    ]
+
+    save_trace(events, output_path=output_path)
+
+    written_events = json.loads(output_path.read_text())
+    assert [event["ph"] for event in written_events] == ["E", "B"]
+
+
+def test_save_trace_skips_empty_event_list(tmp_path: Path):
+    output_path = tmp_path / "trace.json"
+
+    assert save_trace([], output_path=output_path) is None
+    assert not output_path.exists()
+
+
 def test_resolve_trace_config_uses_run_log_dir(tmp_path: Path):
     enabled, output_path = resolve_trace_config(
         {
@@ -105,6 +135,26 @@ def test_resolve_trace_config_uses_run_log_dir(tmp_path: Path):
 
     assert enabled is True
     assert output_path == tmp_path / "exp_001" / "ppo_trace.json"
+
+
+def test_resolve_trace_config_preserves_absolute_name(tmp_path: Path):
+    absolute_name = tmp_path / "shared" / "trace.json"
+    enabled, output_path = resolve_trace_config(
+        {
+            "log_dir": str(tmp_path / "exp_001"),
+            "perfetto": {"enable": True, "name": str(absolute_name)},
+        }
+    )
+
+    assert enabled is True
+    assert output_path == absolute_name
+
+
+def test_resolve_trace_config_rejects_empty_name_when_enabled():
+    with pytest.raises(ValueError, match="non-empty"):
+        resolve_trace_config(
+            {"log_dir": "logs", "perfetto": {"enable": True, "name": ""}}
+        )
 
 
 def test_resolve_trace_config_disabled_when_block_is_missing(tmp_path: Path):

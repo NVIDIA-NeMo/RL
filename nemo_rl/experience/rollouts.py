@@ -1262,10 +1262,10 @@ async def run_sample_multi_turn_rollout(
     current_stop_strings = initial_sample_state.get("stop_strings", None)
     task_name = initial_sample_state["task_name"]
     trace_sample_id = f"{trace_prefix} / sample {sample_idx}"
-    initial_input_tokens = sum(
-        len(message.get("token_ids", [])) for message in current_message_log
-    )
     if tracer is not None:
+        initial_input_tokens = sum(
+            len(message.get("token_ids", [])) for message in current_message_log
+        )
         tracer.start_async_span(
             "sample_rollout",
             f"{trace_sample_id}:rollout",

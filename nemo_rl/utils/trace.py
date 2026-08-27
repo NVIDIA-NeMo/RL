@@ -45,16 +45,16 @@ def resolve_trace_config(logger_config: Mapping[str, Any]) -> tuple[bool, Path]:
     """
     perfetto_config = logger_config.get("perfetto")
     if not isinstance(perfetto_config, Mapping):
-        return False, Path(logger_config.get("log_dir", ".")) / _DEFAULT_TRACE_NAME
+        return False, Path(logger_config["log_dir"]) / _DEFAULT_TRACE_NAME
 
-    enabled = bool(perfetto_config.get("enable", False))
-    name = str(perfetto_config.get("name", _DEFAULT_TRACE_NAME))
+    enabled = bool(perfetto_config["enable"])
+    name = str(perfetto_config["name"])
     if enabled and not name:
         raise ValueError("logger.perfetto.name must be non-empty when enabled")
 
     output_path = Path(name)
     if not output_path.is_absolute():
-        output_path = Path(logger_config.get("log_dir", ".")) / output_path
+        output_path = Path(logger_config["log_dir"]) / output_path
     return enabled, output_path
 
 
@@ -389,13 +389,6 @@ class Tracer:
         with self._lock:
             return [dict(event) for event in self._events]
 
-    def collect_trace(self, timing: bool = False) -> int | list[dict[str, Any]]:
-        """Ray-friendly endpoint used by the driver during trace merge."""
-        if timing:
-            return _timestamp_us()
-        self.finalize_open_spans()
-        return self.events()
-
 
 def _shift_timestamps(events: Sequence[dict[str, Any]], offset_us: int) -> None:
     for event in events:
@@ -440,7 +433,10 @@ def save_trace(
                     stacklevel=2,
                 )
 
-    merged.sort(key=lambda event: (event.get("ts", -1), event.get("ph", "")))
+    # Sorting is stable, so equal-timestamp events retain the append order of
+    # their source stream. This matters for an E followed immediately by a B on
+    # the same track: phase-name sorting would incorrectly put B before E.
+    merged.sort(key=lambda event: event.get("ts", -1))
     path = Path(output_path or _DEFAULT_TRACE_NAME)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_suffix(f"{path.suffix}.tmp")

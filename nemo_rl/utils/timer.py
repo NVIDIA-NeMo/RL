@@ -155,6 +155,9 @@ class Timer:
     def stop(self, label: str, should_log: bool = True) -> float:
         """Stop timing for the given label and return the elapsed time.
 
+        When Perfetto tracing is attached, nested timers must be stopped in
+        last-in, first-out order so the trace span stack remains well-formed.
+
         Args:
             label: The label to stop timing for
 
