@@ -255,25 +255,34 @@ def test_build_hf_to_local_param_map_specs_and_roundtrip():
                 {
                     "name": "model.layers.0.mlp.gate_proj.weight",
                     "global_shape": [256, H],
+                    "dtype": "torch.float32",
                 },
-                {"name": "model.layers.0.mlp.up_proj.weight", "global_shape": [256, H]},
+                {
+                    "name": "model.layers.0.mlp.up_proj.weight",
+                    "global_shape": [256, H],
+                    "dtype": "torch.float32",
+                },
                 {
                     "name": "model.layers.0.mlp.down_proj.weight",
                     "global_shape": [H, 256],
+                    "dtype": "torch.float32",
                 },
                 {
                     "name": "model.layers.0.mlp.experts.gate_proj.weight",
                     "global_shape": [E, 128, H],
+                    "dtype": "torch.float32",
                     "grouped_expert_proj": "gate_proj",
                 },
                 {
                     "name": "model.layers.0.mlp.experts.up_proj.weight",
                     "global_shape": [E, 128, H],
+                    "dtype": "torch.float32",
                     "grouped_expert_proj": "up_proj",
                 },
                 {
                     "name": "model.layers.0.mlp.experts.down_proj.weight",
                     "global_shape": [E, H, 128],
+                    "dtype": "torch.float32",
                     "grouped_expert_proj": "down_proj",
                 },
             ]
@@ -357,7 +366,9 @@ def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
     ext.device = torch.device("cpu")
     ext.pp_comm_groups = {0: SimpleNamespace(rank=9)}
     ext._uses_unquantized_flashinfer_trtllm = lambda: True
-    ext._load_full_hf_weights = MagicMock()
+    ext._load_full_hf_weights = MagicMock(
+        side_effect=lambda weights: [name for name, _ in weights]
+    )
 
     spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
     assert spec is not None and spec.pre is not None and spec.post is not None
