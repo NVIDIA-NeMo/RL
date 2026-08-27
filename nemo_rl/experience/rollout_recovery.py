@@ -18,16 +18,13 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import os
+import io
 import uuid
-from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
-import numpy as np
 import torch
-from PIL import Image
 
 if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
@@ -114,135 +111,11 @@ def _require_int(value: Any, *, field: str, minimum: int) -> int:
     return value
 
 
-def _update_fingerprint_bytes(
-    digest: Any,
-    kind: bytes,
-    payload: bytes,
-) -> None:
-    """Add one length-delimited value to a prompt fingerprint."""
-    digest.update(len(kind).to_bytes(4, "big"))
-    digest.update(kind)
-    digest.update(len(payload).to_bytes(8, "big"))
-    digest.update(payload)
-
-
-def _update_prompt_fingerprint(digest: Any, value: object, *, path: str) -> None:
-    """Hash supported prompt values by content rather than object identity."""
-    if value is None:
-        _update_fingerprint_bytes(digest, b"none", b"")
-    elif isinstance(value, bool):
-        _update_fingerprint_bytes(digest, b"bool", b"1" if value else b"0")
-    elif isinstance(value, int):
-        _update_fingerprint_bytes(digest, b"int", str(value).encode())
-    elif isinstance(value, float):
-        _update_fingerprint_bytes(digest, b"float", value.hex().encode())
-    elif isinstance(value, str):
-        _update_fingerprint_bytes(digest, b"str", value.encode("utf-8"))
-    elif isinstance(value, (bytes, bytearray, memoryview)):
-        _update_fingerprint_bytes(digest, b"bytes", bytes(value))
-    elif isinstance(value, os.PathLike):
-        _update_fingerprint_bytes(
-            digest,
-            b"path",
-            os.fsencode(value),
-        )
-    elif isinstance(value, torch.Tensor):
-        if value.layout is not torch.strided:
-            raise TypeError(
-                f"prompt fingerprint at {path} does not support tensor layout "
-                f"{value.layout}"
-            )
-        tensor = value.detach().cpu().contiguous()
-        _update_fingerprint_bytes(digest, b"tensor-dtype", str(tensor.dtype).encode())
-        _update_fingerprint_bytes(
-            digest,
-            b"tensor-shape",
-            ",".join(str(dimension) for dimension in tensor.shape).encode(),
-        )
-        _update_fingerprint_bytes(
-            digest,
-            b"tensor-data",
-            tensor.reshape(-1).view(torch.uint8).numpy().tobytes(),
-        )
-    elif isinstance(value, np.ndarray):
-        _update_fingerprint_bytes(digest, b"ndarray-dtype", value.dtype.str.encode())
-        _update_fingerprint_bytes(
-            digest,
-            b"ndarray-shape",
-            ",".join(str(dimension) for dimension in value.shape).encode(),
-        )
-        if value.dtype.hasobject:
-            _update_prompt_fingerprint(digest, value.tolist(), path=f"{path}.tolist")
-        else:
-            _update_fingerprint_bytes(
-                digest,
-                b"ndarray-data",
-                np.ascontiguousarray(value).tobytes(),
-            )
-    elif isinstance(value, np.generic):
-        _update_fingerprint_bytes(digest, b"numpy-dtype", value.dtype.str.encode())
-        _update_prompt_fingerprint(digest, value.item(), path=f"{path}.item")
-    elif isinstance(value, Image.Image):
-        _update_fingerprint_bytes(digest, b"image-mode", value.mode.encode())
-        _update_fingerprint_bytes(
-            digest,
-            b"image-size",
-            f"{value.width},{value.height}".encode(),
-        )
-        _update_fingerprint_bytes(digest, b"image-data", value.tobytes())
-    elif isinstance(value, Mapping):
-        keys = list(value)
-        if any(not isinstance(key, str) for key in keys):
-            raise TypeError(
-                f"prompt fingerprint at {path} requires string mapping keys"
-            )
-        _update_fingerprint_bytes(digest, b"mapping-size", str(len(keys)).encode())
-        for key in sorted(keys):
-            _update_fingerprint_bytes(digest, b"mapping-key", key.encode("utf-8"))
-            _update_prompt_fingerprint(
-                digest,
-                value[key],
-                path=f"{path}.{key}",
-            )
-    elif isinstance(value, (list, tuple)):
-        kind = b"list-size" if isinstance(value, list) else b"tuple-size"
-        _update_fingerprint_bytes(digest, kind, str(len(value)).encode())
-        for index, item in enumerate(value):
-            _update_prompt_fingerprint(digest, item, path=f"{path}[{index}]")
-    elif (
-        type(value).__module__ == "nemo_rl.data.multimodal_utils"
-        and type(value).__name__ == "PackedTensor"
-    ):
-        _update_fingerprint_bytes(digest, b"packed-tensor", b"")
-        for attribute in (
-            "tensors",
-            "dim_to_pack",
-            "pad_to_max_shape",
-            "_row_offsets",
-            "_segment_indices",
-        ):
-            _update_fingerprint_bytes(
-                digest,
-                b"packed-tensor-attribute",
-                attribute.encode(),
-            )
-            _update_prompt_fingerprint(
-                digest,
-                getattr(value, attribute),
-                path=f"{path}.{attribute}",
-            )
-    else:
-        raise TypeError(
-            f"prompt fingerprint at {path} does not support "
-            f"{type(value).__module__}.{type(value).__qualname__}"
-        )
-
-
 def prompt_payload_sha256(prompt_payload: object) -> str:
-    """Fingerprint prompt content so dataset rehydration detects real changes."""
-    digest = hashlib.sha256()
-    _update_prompt_fingerprint(digest, prompt_payload, path="prompt")
-    return digest.hexdigest()
+    """Fingerprint a prompt for recovery within the same software runtime."""
+    payload = io.BytesIO()
+    torch.save(prompt_payload, payload)
+    return hashlib.sha256(payload.getbuffer()).hexdigest()
 
 
 def _prompt_task_name(prompt_payload: DatumSpec) -> str | None:

@@ -224,9 +224,9 @@ def test_bind_runtime_prompt_rejects_the_wrong_dataset_sample() -> None:
 def test_prompt_fingerprint_is_stable_for_equivalent_tensor_content() -> None:
     first = {"idx": 7, "length": torch.tensor(3), "tokens": torch.tensor([1, 2, 3])}
     second = {
-        "tokens": torch.tensor([1, 2, 3]),
-        "length": torch.tensor(3),
         "idx": 7,
+        "length": torch.tensor(3),
+        "tokens": torch.tensor([1, 2, 3]),
     }
 
     assert prompt_payload_sha256(first) == prompt_payload_sha256(second)
