@@ -491,6 +491,17 @@ ELAPSED=$(( $(date +%s) - KILLED_AT ))
 
 if (( FINISHED == 0 )); then
     echo "[recovery] FAIL: still running ${ELAPSED}s after the kill -- this is a wedge."
+    if [[ "$FREEZE_VICTIM" == "true" && "$REFIT_TRANSPORT" == "nccl_reshard" ]]; then
+        # This variant's PASS is a bounded attributable FAILURE, so a wedge is the one
+        # outcome that looks superficially similar and means the opposite. Named here
+        # because the generic message above reads as "did not recover", which is not the
+        # point: recovery is out of scope on this transport (see sync_stream_within), and
+        # what regressed is that the run no longer ENDS. Check the release_within lines --
+        # an abort that never retires leaves the rebuild unable to bootstrap NCCL.
+        echo "[recovery] This variant expects a bounded attributable failure, not recovery."
+        echo "[recovery] A wedge means the abort never retired; look for 'did not release'."
+        grep -E "did not release within|did not retire" "$RUN_LOG" | tail -5
+    fi
     # Dump stacks BEFORE tearing anything down. The chaos test has done this for a while;
     # this one did not, and job 5893807 cost a whole cycle to a wedge whose location could
     # only be guessed at. "0 rollouts in flight" says the pump stopped, not where.
@@ -600,10 +611,22 @@ if [[ "$FREEZE_VICTIM" == "true" ]]; then
         grep -E "watchdog|deadline" "$RUN_LOG" | tail -20
         exit 1
     fi
-    if ! grep -q "condemning it as the silent participant" "$RUN_LOG"; then
-        echo "[recovery] FAIL: RefitAborted fired and the run survived, but no shard was"
-        echo "[recovery] condemned as the silent participant -- so it recovered by some"
-        echo "[recovery] other route and this variant is no longer testing attribution."
+    # EITHER attribution route, because both are correct and which one runs is a race.
+    #
+    # The condemn is only needed when the shard never becomes absent on its own. But the
+    # frozen shard's generations also time out, and if the probe drives it to DEAD before
+    # the refit aborts, the ordinary absent-shard path handles it and the condemn is never
+    # reached. Job 6524733 recovered that way -- exit 0, 420s, "shard 0 suspect -> dead
+    # (TimeoutError)" -- and failed a check that demanded the other route's log line.
+    #
+    # What must be pinned is that the shard was attributed FROM THE LEDGER rather than by
+    # dying, which both of these are and neither an actor death nor a silent stall is.
+    ATTRIBUTION_RE="condemning it as the silent participant|-> dead \\(TimeoutError"
+    if ! grep -Eq "$ATTRIBUTION_RE" "$RUN_LOG"; then
+        echo "[recovery] FAIL: RefitAborted fired and the run survived, but the frozen shard"
+        echo "[recovery] was never attributed -- neither condemned as the silent participant"
+        echo "[recovery] nor driven to DEAD by its own probe. It recovered by some other"
+        echo "[recovery] route, so this variant is no longer testing attribution."
         grep -E "already suspect|identified as absent|gen_fleet: shard" "$RUN_LOG" | tail -20
         exit 1
     fi
@@ -615,7 +638,7 @@ if [[ "$FREEZE_VICTIM" == "true" ]]; then
         exit 1
     fi
     echo "[recovery] abort observed:"; grep -m3 "RefitAborted" "$RUN_LOG"
-    echo "[recovery] attribution observed:"; grep -m1 "condemning it as the silent participant" "$RUN_LOG"
+    echo "[recovery] attribution observed:"; grep -Em1 "$ATTRIBUTION_RE" "$RUN_LOG"
     echo "[recovery] PASS: a frozen rank was attributed from the ledger and the run carried"
     echo "[recovery] on, ${ELAPSED}s after the freeze (refit_transport=$REFIT_TRANSPORT)"
     exit 0
