@@ -1059,7 +1059,11 @@ class AsyncTrajectoryCollector:
         # Check if we're using async engine
         generation_cfg = self.master_config.policy["generation"]
         backend = generation_cfg["backend"]
-        if backend == "dynamo":
+        if backend == "sglang":
+            # SGLang collects asynchronously, but its refit protocol pauses the
+            # rollout engines and cannot overlap pending generation requests.
+            is_async_engine = False
+        elif backend == "dynamo":
             # Dynamo's native layerwise reload temporarily materializes model
             # parameters while the NCCL update is in progress.  It is not safe
             # to execute an already-issued vLLM request concurrently with that
