@@ -221,6 +221,20 @@ def test_bind_runtime_prompt_rejects_the_wrong_dataset_sample() -> None:
         restored.bind_runtime_prompt("g7", _prompt(8))
 
 
+def test_prompt_fingerprint_is_stable_for_equivalent_tensor_content() -> None:
+    first = {"idx": 7, "length": torch.tensor(3), "tokens": torch.tensor([1, 2, 3])}
+    second = {
+        "tokens": torch.tensor([1, 2, 3]),
+        "length": torch.tensor(3),
+        "idx": 7,
+    }
+
+    assert prompt_payload_sha256(first) == prompt_payload_sha256(second)
+
+    second["tokens"] = torch.tensor([1, 2, 4])
+    assert prompt_payload_sha256(first) != prompt_payload_sha256(second)
+
+
 def test_prompt_ref_rehydrates_through_a_restored_shuffled_dataloader() -> None:
     """Shuffle position and prompt identity are independent recovery assets."""
 

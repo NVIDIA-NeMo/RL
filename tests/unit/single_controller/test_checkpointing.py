@@ -395,6 +395,13 @@ class _FakeTQBuffer:
         self.metadata_state_dict_calls.append(saved_capacity)
         return dict(self._metadata_state)
 
+    def count_for_target_step(self, target_step: int) -> int:
+        """Return the number of ready fake groups owned by one gated step."""
+        return sum(
+            group["target_step"] == target_step
+            for group in self._metadata_state["groups"]
+        )
+
     async def load_state_dict(
         self,
         state: dict[str, Any],

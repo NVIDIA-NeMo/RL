@@ -35,7 +35,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -49,6 +49,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.grpo import _initial_grpo_save_state
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -720,12 +721,24 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
     async def exercise() -> None:
         sampler = _CountingInOrderSampler()
         sampler.restore_dispatch_index(7)
+        dataset_prompt: DatumSpec = {
+            "idx": 70,
+            "message_log": [],
+            "length": 1,
+            "extra_env_info": None,
+            "loss_multiplier": 1.0,
+        }
+        prompt_batch = rl_collate_fn([dataset_prompt])
+        dispatched_prompt = cast(
+            DatumSpec,
+            {key: value[0] for key, value in prompt_batch.items()},
+        )
         saved_ledger = RolloutRecoveryLedger()
         saved_ledger.reserve_group(
             group_id="batch-7-prompt-0",
             admission_id="batch-7",
             prompt_id="70",
-            prompt_payload={"idx": 70, "message_log": []},
+            prompt_payload=dispatched_prompt,
             expected_generations=2,
             target_step=7,
             start_weight_version=7,
@@ -758,7 +771,8 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         controller._buffer_capacity = asyncio.Semaphore(4)
         controller._trainer_version = 7
         controller._dataloader = SimpleNamespace(
-            dataset={70: {"idx": 70, "message_log": []}}
+            dataset={70: dataset_prompt},
+            collate_fn=rl_collate_fn,
         )
         controller._buffer = SimpleNamespace(
             count_for_target_step=lambda _target_step: 0,

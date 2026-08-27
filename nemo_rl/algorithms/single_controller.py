@@ -731,19 +731,55 @@ class SingleControllerActor:
             prompt = resolved_prompts.get(sample_id)
             if prompt is None:
                 try:
-                    prompt = await asyncio.to_thread(dataset.__getitem__, sample_index)
+                    dataset_prompt = await asyncio.to_thread(
+                        dataset.__getitem__, sample_index
+                    )
                 except (IndexError, KeyError) as error:
                     raise RuntimeError(
                         f"cannot rehydrate recovery group {group.group_id!r}: "
                         f"dataset sample_id={sample_id!r} is unavailable"
                     ) from error
-                if not isinstance(prompt, dict):
+                if not isinstance(dataset_prompt, dict):
                     raise TypeError(
                         f"dataset sample_id={sample_id!r} resolved to "
-                        f"{type(prompt).__name__}, expected a DatumSpec dictionary"
+                        f"{type(dataset_prompt).__name__}, expected a DatumSpec "
+                        "dictionary"
                     )
+
+                # The ledger fingerprints the prompt after dataloader collation,
+                # because that is the object actually dispatched to RolloutManager.
+                # Re-run the same one-row collation here so tensor scalars, optional
+                # fields, and multimodal wrappers match the original runtime shape.
+                collate_fn = getattr(self._dataloader, "collate_fn", None)
+                if collate_fn is None:
+                    prompt = dataset_prompt
+                else:
+                    prompt_batch = await asyncio.to_thread(
+                        collate_fn,
+                        [dataset_prompt],
+                    )
+                    if isinstance(prompt_batch, BatchedDataDict):
+                        if prompt_batch.size != 1:
+                            raise ValueError(
+                                "recovery collation must return exactly one prompt; "
+                                f"sample_id={sample_id!r}, size={prompt_batch.size}"
+                            )
+                        prompt = {key: value[0] for key, value in prompt_batch.items()}
+                    elif isinstance(prompt_batch, dict):
+                        # Identity-style collators used by lightweight/custom
+                        # dataloaders may return the DatumSpec directly.
+                        prompt = prompt_batch
+                    else:
+                        raise TypeError(
+                            "recovery collation for "
+                            f"sample_id={sample_id!r} returned "
+                            f"{type(prompt_batch).__name__}, expected a mapping"
+                        )
                 resolved_prompts[sample_id] = cast(DatumSpec, prompt)
-            recovery_ledger.bind_runtime_prompt(group.group_id, prompt)
+            recovery_ledger.bind_runtime_prompt(
+                group.group_id,
+                cast(DatumSpec, prompt),
+            )
 
     async def _admit_reserved_prompt_groups(
         self,
