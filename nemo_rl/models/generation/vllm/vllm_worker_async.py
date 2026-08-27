@@ -105,8 +105,7 @@ class VllmAsyncGenerationWorkerImpl(
         self.http_server = None
 
         # Ledger-authoritative token capture (dormant until the
-        # setup_token_capture fan-out runs; see
-        # docs/design-docs/token-capture-ledger.md). The weight
+        # setup_token_capture fan-out runs). The weight
         # version is stamped per model call at begin_call time and rotated by
         # the set_rollout_weight_version fan-out from the SC's _sync_weights.
         self.token_capture = None
