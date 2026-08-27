@@ -435,6 +435,7 @@ def mock_grpo_components():
                 "gpus_per_node": 2,
             },
             "logger": {
+                "log_dir": "logs",
                 "num_val_samples_to_print": 5,
             },
             "data": {

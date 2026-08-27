@@ -2844,8 +2844,8 @@ def grpo_train(
         if trace_saved:
             return
         trace_saved = True
-        driver_trace.finalize_open_spans()
         try:
+            driver_trace.finalize_open_spans()
             save_trace(driver_trace.events(), output_path=trace_output_path)
         except Exception as error:
             warnings.warn(f"Could not save GRPO Perfetto trace: {error}", stacklevel=2)
@@ -4322,9 +4322,7 @@ def async_grpo_train(
     trace_enabled, trace_output_path = resolve_trace_config(master_config.logger)
     driver_trace = Tracer(
         "driver",
-        virtual_process_name="grpo_async_driver_events",
         process_sort_index=0,
-        virtual_process_sort_index=1,
         enabled=trace_enabled,
     )
     timer = Timer(context={"worker": "driver"}, trace=driver_trace)
@@ -4337,11 +4335,11 @@ def async_grpo_train(
         if trace_saved:
             return
         trace_saved = True
-        driver_trace.finalize_open_spans()
         trace_actors = (
             (trajectory_collector,) if trajectory_collector is not None else ()
         )
         try:
+            driver_trace.finalize_open_spans()
             save_trace(
                 driver_trace.events(),
                 actors=trace_actors,

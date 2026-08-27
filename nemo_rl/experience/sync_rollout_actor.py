@@ -36,6 +36,7 @@ step batch in one call.
 
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Any, Optional
 
@@ -436,7 +437,10 @@ class SyncRolloutActor:
 
     def collect_trace(self, timing: bool = False) -> int | list[dict[str, Any]]:
         """Return actor-local Perfetto events for driver-side trace merging."""
-        return self._trace.collect_trace(timing=timing)
+        if timing:
+            return time.monotonic_ns() // 1_000
+        self._trace.finalize_open_spans()
+        return self._trace.events()
 
     def shutdown(self) -> None:
         try:

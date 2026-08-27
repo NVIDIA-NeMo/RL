@@ -408,9 +408,7 @@ def grpo_train_sync(
     trace_enabled, trace_output_path = resolve_trace_config(master_config.logger)
     driver_trace = Tracer(
         "driver",
-        virtual_process_name="grpo_sync_driver_events",
         process_sort_index=0,
-        virtual_process_sort_index=1,
         enabled=trace_enabled,
     )
     timer = Timer(context={"worker": "driver"}, trace=driver_trace)
@@ -422,9 +420,9 @@ def grpo_train_sync(
         if trace_saved:
             return
         trace_saved = True
-        driver_trace.finalize_open_spans()
         trace_actors = (rollout_actor,) if rollout_actor is not None else ()
         try:
+            driver_trace.finalize_open_spans()
             save_trace(
                 driver_trace.events(),
                 actors=trace_actors,
