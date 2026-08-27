@@ -3505,7 +3505,7 @@ class MegatronPolicyWorkerImpl(
         )
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
-        if self.cfg["megatron_cfg"].get("refit_slim_offload_after"):
+        if self.cfg.get("megatron_cfg", {}).get("refit_slim_offload_after"):
             # Grad buffers were already offloaded by offload_before_refit at
             # the start of the refit, so skip the full rerun (grad-buffer moves
             # and a second gc/empty_cache pair). Cache clears must still honor
