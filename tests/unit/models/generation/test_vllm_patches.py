@@ -50,6 +50,9 @@ _RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
 _GLM_DSA_SOURCE = "model_executor/models/deepseek_v2.py"
 _GLM_DSA_PATCH_FN = "_patch_vllm_glm_decoder_sequence_parallel_moe"
 _GLM_DSA_MARKER = 'getattr(config, "model_type", None) != "glm_moe_dsa"'
+_MOE_SOURCE = "model_executor/layers/fused_moe/runner/moe_runner.py"
+_MOE_PATCH_FN = "_patch_vllm_moe_routed_experts_capture"
+_MOE_MARKER = "NeMo-RL patch (routed-experts capture for router replay)"
 
 
 @pytest.fixture
@@ -78,6 +81,19 @@ def patched_glm_dsa_source(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
     patches._patch_vllm_glm_decoder_sequence_parallel_moe(logging.getLogger(__name__))
+    return copied
+
+
+@pytest.fixture
+def patched_moe_source(tmp_path, monkeypatch):
+    """The installed monolithic MoE runner, unpatched then patched in tmp."""
+    copied = write_unpatched_copy(
+        _MOE_SOURCE, _MOE_PATCH_FN, tmp_path / "moe_runner.py"
+    )
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    assert patches._patch_vllm_moe_routed_experts_capture(
+        logging.getLogger(__name__), required=True
+    )
     return copied
 
 
@@ -185,6 +201,17 @@ def test_glm_decoder_sp_moe_patch_anchor_still_matches_installed_vllm(
 
 
 @pytest.mark.vllm
+def test_moe_routed_experts_patch_anchor_still_matches_installed_vllm(
+    patched_moe_source,
+):
+    content = patched_moe_source.read_text()
+    assert _MOE_MARKER in content
+    assert "self.router.select_experts(" in content
+    assert 'getattr(self.router, "capture_fn", None)' in content
+    ast.parse(content)
+
+
+@pytest.mark.vllm
 def test_glm_decoder_sp_moe_patch_is_idempotent(patched_glm_dsa_source, monkeypatch):
     before = patched_glm_dsa_source.read_text()
     monkeypatch.setattr(
@@ -210,6 +237,30 @@ def test_glm_decoder_sp_moe_patch_warns_on_unknown_source(
 
     assert model_source.read_text() == "class DeepseekV2DecoderLayer:\n    pass\n"
     assert "vLLM 0.25.1 source shape was not found" in caplog.text
+
+
+@pytest.mark.vllm
+def test_moe_routed_experts_patch_is_idempotent(patched_moe_source, monkeypatch):
+    before = patched_moe_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_moe_source)
+    )
+
+    assert patches._patch_vllm_moe_routed_experts_capture(
+        logging.getLogger(__name__), required=True
+    )
+    assert patched_moe_source.read_text() == before
+
+
+def test_moe_routed_experts_patch_fails_closed_when_required(monkeypatch, tmp_path):
+    moe_source = tmp_path / "moe_runner.py"
+    moe_source.write_text("class MoERunner:\n    pass\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(moe_source))
+
+    with pytest.raises(RuntimeError, match="expected code snippet not found"):
+        patches._patch_vllm_moe_routed_experts_capture(
+            logging.getLogger(__name__), required=True
+        )
 
 
 @pytest.mark.parametrize(
