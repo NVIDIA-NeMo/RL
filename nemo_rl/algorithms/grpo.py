@@ -4129,10 +4129,13 @@ def _startup_pipeline_ready(
 ) -> bool:
     """Return whether async training can overlap safely with lookahead generation.
 
-    A complete current step is sufficient only after the collector has either
-    completed or claimed the next target. The claim preserves the same
-    training/generation overlap used by steady-state async training without
-    allowing an unrelated reservation to open the startup barrier.
+    A restored buffer may already contain ``step``, letting startup consume it
+    before the collector generates ``step + 1``. After the refit that follows
+    ``step``, the collector's target window advances to ``step + 2``, so an
+    unclaimed ``step + 1`` would then be permanently missing. Requiring the
+    next target to be complete *or* actively claimed keeps that gap closed
+    while preserving the training/generation overlap used by steady-state async
+    training, and without letting an unrelated reservation open the barrier.
     """
     if not current_step_ready:
         return False
@@ -4756,11 +4759,22 @@ def async_grpo_train(
                             and not collector_status["running"]
                             and collector_status["inflight_workers"] == 0
                         ):
+                            stop_reason = (
+                                "dataloader exhausted"
+                                if collector_status["data_exhausted"]
+                                else "collector errored"
+                            )
+                            recovery_advice = (
+                                "Increase data.train.max_num_epochs or use a larger dataset."
+                                if collector_status["data_exhausted"]
+                                else "Inspect the preceding trajectory collector error."
+                            )
                             raise RuntimeError(
-                                f"Trajectory collector stopped: dataloader exhausted at training_step={step}. "
-                                f"The dataset ran out of data before training could complete. "
+                                f"Trajectory collector stopped ({stop_reason}) while waiting "
+                                f"for a full batch at training_step={step}. "
+                                f"Training cannot continue without the required trajectories. "
                                 f"Collector status: {collector_status}. "
-                                f"Increase data.train.max_num_epochs or use a larger dataset."
+                                f"{recovery_advice}"
                             )
 
                         with timer.time("idle/buffer_starvation"):

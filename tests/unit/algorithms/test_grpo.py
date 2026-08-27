@@ -1454,6 +1454,168 @@ def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components)
     mock_grpo_components["policy"].shutdown.assert_called_once()
 
 
+def test_async_grpo_startup_aborts_when_lookahead_never_claimed(
+    mock_grpo_components, tmp_path
+):
+    """Startup raises instead of spinning when the lookahead can never be claimed.
+
+    The pre-fix startup loop skipped the exhausted/errored check whenever the
+    lookahead was missing, leaving the driver waiting on a target no producer
+    would ever claim.
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 2
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.checkpoint_dir = tmp_path
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+
+    # Restored buffer: step 0 is complete, step 1 is absent.
+    complete_batch = MagicMock()
+    complete_batch.remote = MagicMock(
+        side_effect=lambda target_step, *_args, **_kwargs: target_step == 0
+    )
+
+    # First poll: collector alive but has not claimed step 1 -> keep waiting.
+    # Second poll: collector stopped with the dataset exhausted -> must raise.
+    statuses = [
+        {
+            "running": True,
+            "data_exhausted": False,
+            "errored": False,
+            "error": None,
+            "inflight_workers": 1,
+            "generating_targets": [],
+        },
+        {
+            "running": False,
+            "data_exhausted": True,
+            "errored": False,
+            "error": None,
+            "inflight_workers": 0,
+            "generating_targets": [],
+        },
+    ]
+    status = MagicMock()
+    status.remote = MagicMock(side_effect=statuses)
+
+    with (
+        patch.object(
+            StubReplayBuffer,
+            "has_complete_batch",
+            property(lambda self: complete_batch),
+        ),
+        patch.object(
+            StubAsyncTrajectoryCollector,
+            "get_status",
+            property(lambda self: status),
+        ),
+        patch("nemo_rl.algorithms.grpo.time.sleep", return_value=None),
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        pytest.raises(
+            RuntimeError,
+            match=r"dataloader exhausted.*lookahead claim at target=1",
+        ),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    # Two polls prove the barrier waited once before detecting terminal state.
+    assert status.remote.call_count == 2
+
+
+def test_async_grpo_starvation_reports_collector_error(mock_grpo_components):
+    """Main-loop starvation reports a collector failure, not data exhaustion."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.get_latest_checkpoint_path.return_value = None
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+
+    empty_sample = MagicMock()
+    empty_sample.remote = MagicMock(return_value=None)
+    statuses = [
+        {
+            "running": True,
+            "data_exhausted": False,
+            "errored": False,
+            "error": None,
+            "inflight_workers": 0,
+            "generating_targets": [],
+        },
+        {
+            "running": False,
+            "data_exhausted": False,
+            "errored": True,
+            "error": "tokenizer failed",
+            "inflight_workers": 0,
+            "generating_targets": [],
+        },
+    ]
+    status = MagicMock()
+    status.remote = MagicMock(side_effect=statuses)
+
+    with (
+        patch.object(
+            StubReplayBuffer,
+            "sample",
+            property(lambda self: empty_sample),
+        ),
+        patch.object(
+            StubAsyncTrajectoryCollector,
+            "get_status",
+            property(lambda self: status),
+        ),
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        pytest.raises(
+            RuntimeError,
+            match=r"collector errored.*Inspect the preceding trajectory collector error",
+        ),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert status.remote.call_count == 2
+
+
 @pytest.mark.parametrize("frontier_aligned", [True, False])
 def test_async_checkpoint_rollouts_state_frontier_key_contract(
     mock_grpo_components, tmp_path, frontier_aligned
