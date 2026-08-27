@@ -58,6 +58,8 @@ data_plane:
     local_buffer_size:    4294967296
     reuse_registered_buffers: true
     staging_buffer_size:   268435456
+  observability:
+    verify_tensor_hash: true
 
 # SC async-RL runtime knobs, replacing the nulled ppo.async_ppo block.
 async_rl:

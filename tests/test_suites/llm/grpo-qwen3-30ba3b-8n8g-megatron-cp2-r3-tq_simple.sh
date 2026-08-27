@@ -37,8 +37,8 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     # The wire guard only counts; assert it found nothing.
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.02' \
-        'max(data["data_plane/cluster/step/hash/mismatches"]) == 0' \
-        'max(data["data_plane/cluster/step/hash/guard_failures"]) == 0'
+        'max(data.get("data_plane/cluster/step/hash/mismatches", data.get("data_plane/driver/step/hash/mismatches", {}))) == 0' \
+        'max(data.get("data_plane/cluster/step/hash/guard_failures", data.get("data_plane/driver/step/hash/guard_failures", {}))) == 0'
 
     rm -rf "$CKPT_DIR"
 fi
