@@ -345,6 +345,7 @@ testing.md
 documentation.md
 debugging.md
 nsys-profiling.md
+perfetto-tracing.md
 fp8.md
 guides/use-custom-vllm.md
 ```

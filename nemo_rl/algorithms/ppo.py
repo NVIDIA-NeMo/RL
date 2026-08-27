@@ -106,6 +106,7 @@ from nemo_rl.utils.logger import (
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.trace import Tracer, save_trace
 from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
@@ -1207,7 +1208,27 @@ def ppo_train(
     - Multiple training steps per rollout (ppo_epochs)
     - Configurable policy training start epoch
     """
-    timer = Timer()
+    driver_trace = Tracer(
+        "driver",
+        virtual_process_name="ppo_sync_rollouts",
+        process_sort_index=0,
+        virtual_process_sort_index=1,
+    )
+    timer = Timer(context={"worker": "driver"}, trace=driver_trace)
+    trace_saved = False
+
+    def _save_sync_trace() -> None:
+        nonlocal trace_saved
+        if trace_saved:
+            return
+        trace_saved = True
+        driver_trace.finalize_open_spans()
+        try:
+            save_trace(driver_trace.events())
+        except Exception as error:
+            warnings.warn(f"Could not save PPO Perfetto trace: {error}", stacklevel=2)
+
+    driver_trace.instant("ppo_training_start", args={"mode": "sync"})
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -1297,6 +1318,16 @@ def ppo_train(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
                 flush=True,
             )
+            driver_trace.instant(
+                "ppo_step_start",
+                args={
+                    "mode": "sync",
+                    "step": total_steps + 1,
+                    "epoch": current_epoch + 1,
+                    "ppo_epochs": ppo_epochs,
+                },
+            )
+            driver_trace.counter("ppo_training_step", {"step": total_steps + 1})
             maybe_gpu_profile_step(policy, total_steps + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
@@ -1411,6 +1442,8 @@ def ppo_train(
                             ],
                             max_rollout_turns=master_config.ppo.max_rollout_turns,
                             greedy=False,
+                            tracer=driver_trace,
+                            trace_prefix=f"step {total_steps + 1}",
                         )
                     else:
                         repeated_batch, rollout_metrics = run_multi_turn_rollout(
@@ -1594,6 +1627,17 @@ def ppo_train(
                 # PPO: Multiple training steps per rollout
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 for step in range(ppo_epochs):
+                    driver_trace.instant(
+                        "ppo_epoch_start",
+                        args={
+                            "step": total_steps + 1,
+                            "ppo_epoch": step + 1,
+                            "ppo_epochs": ppo_epochs,
+                            "policy_training": (
+                                total_steps >= policy_training_start_step
+                            ),
+                        },
+                    )
                     print(
                         f"▶ Step {step + 1}/{ppo_epochs}...",
                         flush=True,
@@ -1977,6 +2021,14 @@ def ppo_train(
                 prefix="timing/train",
                 step_finished=True,
             )
+            driver_trace.instant(
+                "ppo_step_complete",
+                args={
+                    "mode": "sync",
+                    "step": total_steps + 1,
+                    "reward": float(np.mean(rewards.numpy())),
+                },
+            )
 
             # Clear mem
             memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
@@ -1992,6 +2044,7 @@ def ppo_train(
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
+                _save_sync_trace()
                 return
             if total_steps >= max_num_steps:
                 checkpointer.shutdown()
@@ -2000,6 +2053,7 @@ def ppo_train(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
                 )
+                _save_sync_trace()
                 return
 
         current_epoch += 1
@@ -2011,6 +2065,7 @@ def ppo_train(
     # so without this the daemon finalization thread could be killed before the
     # final tmp_step_N is renamed.
     checkpointer.shutdown()
+    _save_sync_trace()
 
 
 def _async_ppo_generation_lead_steps(
@@ -2085,7 +2140,15 @@ def async_ppo_train(
     # Import async utilities only when needed (heavy Ray actors).
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
-    timer = Timer(context={"worker": "driver"})
+    driver_trace = Tracer(
+        "driver",
+        virtual_process_name="ppo_async_driver_events",
+        process_sort_index=0,
+        virtual_process_sort_index=1,
+    )
+    timer = Timer(context={"worker": "driver"}, trace=driver_trace)
+    trace_saved = False
+    driver_trace.instant("ppo_training_start", args={"mode": "async"})
     training_wall_start = time.perf_counter()
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
@@ -2126,12 +2189,26 @@ def async_ppo_train(
 
     def _shutdown_workers(*, propagate_checkpoint_error: bool) -> None:
         """Finalize pending saves and stop async PPO workers."""
+        nonlocal trace_saved
         checkpoint_error = None
         try:
             checkpointer.shutdown()
         except Exception as error:
             checkpoint_error = error
             print(f"Error finalizing pending checkpoint: {error}")
+
+        if not trace_saved:
+            trace_saved = True
+            driver_trace.finalize_open_spans()
+            trace_actors = (
+                (trajectory_collector,) if trajectory_collector is not None else ()
+            )
+            try:
+                save_trace(driver_trace.events(), actors=trace_actors)
+            except Exception as error:
+                warnings.warn(
+                    f"Could not save PPO Perfetto trace: {error}", stacklevel=2
+                )
 
         print("🛑 Stopping trajectory collection...")
         for actor, actor_name in (
@@ -2376,6 +2453,16 @@ def async_ppo_train(
         while step < max_training_steps:
             ray.get(trajectory_collector.check_health.remote())
             print(f"\n{'=' * 25} Step {step + 1}/{max_training_steps} {'=' * 25}")
+            driver_trace.instant(
+                "ppo_step_start",
+                args={
+                    "mode": "async",
+                    "step": step + 1,
+                    "weight_version": weight_version,
+                    "ppo_epochs": ppo_epochs,
+                },
+            )
+            driver_trace.counter("ppo_training_step", {"step": step + 1})
             maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
@@ -2591,6 +2678,15 @@ def async_ppo_train(
                 train_results = None
                 value_results = None
                 for epoch in range(ppo_epochs):
+                    driver_trace.instant(
+                        "ppo_epoch_start",
+                        args={
+                            "step": step + 1,
+                            "ppo_epoch": epoch + 1,
+                            "ppo_epochs": ppo_epochs,
+                            "policy_training": is_policy_training_step,
+                        },
+                    )
                     print(f"▶ PPO epoch {epoch + 1}/{ppo_epochs}...")
                     with timer.time("value_training_prep"):
                         value_model.prepare_for_training()
@@ -2991,6 +3087,16 @@ def async_ppo_train(
                 step + 1,
                 prefix="timing/train",
                 step_finished=True,
+            )
+            driver_trace.instant(
+                "ppo_step_complete",
+                args={
+                    "mode": "async",
+                    "step": step + 1,
+                    "weight_version": weight_version,
+                    "avg_trajectory_age": float(avg_trajectory_age),
+                    "buffer_size": int(buffer_size_current),
+                },
             )
 
             timer.reset()

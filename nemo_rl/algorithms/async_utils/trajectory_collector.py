@@ -66,6 +66,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.timer import ThreadSafeTimer
+from nemo_rl.utils.trace import Tracer
 
 TokenizerType = PreTrainedTokenizerBase
 _MAX_NEMO_GYM_STREAM_RETRIES = 3
@@ -142,12 +143,14 @@ class AsyncTrajectoryCollector:
             )
             self._debug_payload_metrics = algorithm_config.debug_payload_metrics
             self._max_generation_failures = async_config.max_generation_failures
+            algorithm_name = "grpo"
         elif isinstance(master_config, PPOMasterConfig):
             algorithm_config = master_config.ppo
             async_config = algorithm_config.async_ppo  # type: ignore
             self._deduplicate_multimodal_data = False
             self._debug_payload_metrics = False
             self._max_generation_failures = 0
+            algorithm_name = "ppo"
         else:
             raise TypeError(
                 "master_config must be a GRPO or PPO MasterConfig, got "
@@ -249,7 +252,16 @@ class AsyncTrajectoryCollector:
         self._outstanding_task_indices: set[int] = set()
 
         # Timer for efficiency metrics
-        self._efficiency_timer = ThreadSafeTimer(context={"worker": "collector"})
+        self._trace = Tracer(
+            "trajectory_collector_actor",
+            virtual_process_name=f"{algorithm_name}_async_rollouts",
+            process_sort_index=10,
+            virtual_process_sort_index=11,
+        )
+        self._efficiency_timer = ThreadSafeTimer(
+            context={"worker": "collector"}, trace=self._trace
+        )
+        self._trace_batch_counter = 0
 
         # Failure tracking for rollout batch workers.
         self._failure_count: int = 0
@@ -841,6 +853,11 @@ class AsyncTrajectoryCollector:
                 num_generations,
                 share_immutable_media=self._deduplicate_multimodal_data,
             )
+            self._trace_batch_counter += 1
+            trace_prefix = (
+                f"target {reserved_target} / generation {generation_weight_version} "
+                f"/ batch {self._trace_batch_counter}"
+            )
             print_multimodal_payload_metrics(
                 collect_multimodal_payload_metrics(
                     repeated_batch,
@@ -858,6 +875,7 @@ class AsyncTrajectoryCollector:
                         num_generations=num_generations,
                         use_nemo_gym=use_nemo_gym,
                         dispatched_task_indices=dispatched_task_indices,
+                        trace_prefix=trace_prefix,
                     )
                 )
 
@@ -918,6 +936,17 @@ class AsyncTrajectoryCollector:
             error_message = self._fatal_error_message
         if error_message is not None:
             raise RuntimeError(error_message)
+
+    def collect_trace(self, timing: bool = False) -> int | list[dict[str, Any]]:
+        """Return a clock sample or the collector's completed Perfetto events.
+
+        Open sample spans are intentionally omitted instead of finalized because
+        rollout worker threads can still be running while the driver takes this
+        final snapshot immediately before killing the actor.
+        """
+        if timing:
+            return time.monotonic_ns() // 1_000
+        return self._trace.events()
 
     def pause(self) -> None:
         """Pause trajectory collection."""
@@ -1254,6 +1283,7 @@ class AsyncTrajectoryCollector:
         num_generations: int,
         use_nemo_gym: bool,
         task_index_to_group_index: dict[int, int],
+        trace_prefix: str,
     ) -> AsyncGenerator[RolloutGroupResult, None]:
         """Yield prompt groups from either backend through one result type."""
         if use_nemo_gym:
@@ -1317,6 +1347,8 @@ class AsyncTrajectoryCollector:
             max_rollout_turns=self._max_rollout_turns,
             greedy=False,
             deduplicate_multimodal_data=self._deduplicate_multimodal_data,
+            tracer=self._trace,
+            trace_prefix=trace_prefix,
         ):
             yield rollout_result
 
@@ -1328,9 +1360,19 @@ class AsyncTrajectoryCollector:
         num_generations: int,
         use_nemo_gym: bool,
         dispatched_task_indices: Optional[list[int]] = None,
+        trace_prefix: str = "rollout",
     ) -> None:
         """Own one target reservation while collecting its rollout batch."""
         worker_start = time.perf_counter()
+        self._trace.start_span(
+            "collect_rollout_batch",
+            category="collector",
+            args={
+                "generation_weight": generation_weight_version,
+                "target_weight": target_weight_version,
+                "batch_size": repeated_batch.size,
+            },
+        )
         wake_generation_limits_after_cleanup = False
         try:
             await self._collect_rollout_batch(
@@ -1339,6 +1381,7 @@ class AsyncTrajectoryCollector:
                 target_weight_version=target_weight_version,
                 num_generations=num_generations,
                 use_nemo_gym=use_nemo_gym,
+                trace_prefix=trace_prefix,
             )
             with self._failure_lock:
                 if self._fatal_error_message is None:
@@ -1385,6 +1428,7 @@ class AsyncTrajectoryCollector:
                     flush=True,
                 )
         finally:
+            self._trace.end_span()
             if dispatched_task_indices:
                 # This worker's unbuffered ordinals are a permanent loss and
                 # must not keep holding the checkpoint cut down.
@@ -1560,6 +1604,7 @@ class AsyncTrajectoryCollector:
         target_weight_version: int,
         num_generations: int,
         use_nemo_gym: bool,
+        trace_prefix: str,
     ) -> None:
         """Run one backend batch and enqueue every completed prompt group."""
         collection_started_at = time.perf_counter()
@@ -1602,6 +1647,7 @@ class AsyncTrajectoryCollector:
                     num_generations=num_generations,
                     use_nemo_gym=use_nemo_gym,
                     task_index_to_group_index=task_index_to_group_index,
+                    trace_prefix=trace_prefix,
                 ):
                     group_index = rollout_result.group_index
                     if group_index not in expected_group_indices:
