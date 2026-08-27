@@ -833,6 +833,7 @@ def setup(
             env_configs,
             base_urls=base_urls,
             model_name=model_name,
+            generation_backend=backend,
             tokenizer=tokenizer,
             enable_router_replay=router_replay_enabled(policy_config),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),

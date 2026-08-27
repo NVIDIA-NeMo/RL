@@ -522,6 +522,7 @@ def setup(
                     env_configs,
                     base_urls=cast(list[str], deferred_vllm.dp_openai_server_base_urls),
                     model_name=generation_config["model_name"],
+                    generation_backend=backend,
                     tokenizer=tokenizer,
                     # Distillation does not configure vLLM for router replay.
                     enable_router_replay=False,
