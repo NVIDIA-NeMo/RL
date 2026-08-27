@@ -992,7 +992,7 @@ def setup_single_controller(
             tokenizer=tokenizer,
             cluster=inference_cluster,
             processor=processor,
-            weights_path=weights_path,
+            weights_path=str(weights_path) if weights_path is not None else None,
             skip_weight_load=True,
             reserved_http_server_port=reserved_http_server_port,
         )

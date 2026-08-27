@@ -151,8 +151,7 @@ class MegatronGeneration(GenerationInterface):
     ) -> None:
         """Reject config the Megatron generation backend cannot honor."""
         if not (
-            "megatron_cfg" in policy_config
-            and policy_config["megatron_cfg"]["enabled"]
+            "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
         ):
             raise ValueError(
                 "policy.generation.backend='megatron' requires the Megatron trainer "
