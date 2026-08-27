@@ -5,7 +5,6 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
-from megatron.training.datasets.sft_dataset import SFTDataset
 
 from nemo_rl.data.datasets.response_datasets import (
     DATASET_REGISTRY,
@@ -19,6 +18,10 @@ from nemo_rl.data.megatron_sft_packed import (
     megatron_sft_packed_preprocessor,
     split_megatron_sft_conversations,
 )
+
+# megatron.training is only importable in the mcore CI shard; the differential
+# test lazy-imports SFTDataset so collection never pulls it in elsewhere.
+pytestmark = pytest.mark.mcore
 
 
 class _DummyTokenizer:
@@ -173,6 +176,8 @@ def _megatron_preprocess(
     max_seq_length: int,
     context_parallel_size: int = 1,
 ) -> dict[str, torch.Tensor]:
+    from megatron.training.datasets.sft_dataset import SFTDataset
+
     dataset = SFTDataset.__new__(SFTDataset)
     dataset.dataset = _MegatronLowLevelDataset(messages)
     dataset.indices = np.asarray([0])

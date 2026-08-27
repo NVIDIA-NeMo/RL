@@ -569,12 +569,15 @@ class LossPostProcessor:
 
             cp_size = get_context_parallel_world_size()
             num_microbatches = self.num_microbatches
+            # Mirror the shared cp_normalize division below; this branch returns
+            # early and would otherwise skip it, inflating loss by cp_size.
+            cp_normalizer = cp_size * cp_size if self.cp_normalize else cp_size
 
             def _counteract_direct_mcore_loss_averaging(
                 model_losses: torch.Tensor,
             ) -> Tuple[torch.Tensor, Dict[str, Any]]:
                 loss, metrics = _direct_packed_model_loss(model_losses)
-                return loss * num_microbatches / cp_size, metrics
+                return loss * num_microbatches / cp_normalizer, metrics
 
             return _counteract_direct_mcore_loss_averaging
 

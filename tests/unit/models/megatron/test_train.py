@@ -1341,7 +1341,9 @@ class TestLossPostProcessor:
 def test_direct_model_loss_normalizes_target_aligned_tokens_and_schedule_scaling():
     loss, _ = _run_direct_model_loss()
 
-    assert torch.isclose(loss, torch.tensor(4.0 / 3.0))
+    # (1+3)/6 masked mean * num_microbatches(4) / cp_size(2), then the default
+    # cp_normalize division by cp_size(2) that every Megatron loss path applies.
+    assert torch.isclose(loss, torch.tensor(2.0 / 3.0))
 
 
 def test_direct_model_loss_defers_host_scalar_materialization():
