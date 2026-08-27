@@ -17,19 +17,15 @@
 from __future__ import annotations
 
 import copy
-import hashlib
-import io
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
-
-import torch
 
 if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 4
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 5
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 
 
@@ -45,7 +41,6 @@ class PromptRefState(TypedDict):
 
     sample_id: str
     task_name: str | None
-    payload_sha256: str
 
 
 class PromptGroupRecoveryState(TypedDict):
@@ -72,11 +67,10 @@ class RolloutRecoveryState(TypedDict):
 
 @dataclass(frozen=True)
 class PromptRef:
-    """Stable dataset identity and integrity check for one prompt."""
+    """Stable dataset identity for rebuilding one prompt."""
 
     sample_id: str
     task_name: str | None
-    payload_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -109,35 +103,6 @@ def _require_int(value: Any, *, field: str, minimum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{field} must be an integer >= {minimum}, got {value!r}")
     return value
-
-
-def _clone_tensor_leaves(value: Any) -> Any:
-    """Detach tensor content from batch-sized backing storage before hashing."""
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu().clone()
-    if isinstance(value, dict):
-        return {key: _clone_tensor_leaves(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_clone_tensor_leaves(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_clone_tensor_leaves(item) for item in value)
-    return value
-
-
-def prompt_payload_sha256(prompt_payload: object) -> str:
-    """Fingerprint stable prompt content within the same software runtime."""
-    if not isinstance(prompt_payload, dict):
-        raise TypeError("prompt payload fingerprint requires a dictionary")
-    canonical_payload = {
-        key: _clone_tensor_leaves(value)
-        for key, value in prompt_payload.items()
-        # Derived from the other prompts in the original dataloader batch and
-        # unused after collation; one-row recovery legitimately recomputes it.
-        if key != "batch_max_length"
-    }
-    payload = io.BytesIO()
-    torch.save(canonical_payload, payload)
-    return hashlib.sha256(payload.getbuffer()).hexdigest()
 
 
 def _prompt_task_name(prompt_payload: DatumSpec) -> str | None:
@@ -174,25 +139,6 @@ def _validate_prompt_identity(
         )
 
 
-def _validate_prompt_ref(
-    prompt_ref: PromptRef,
-    prompt_payload: DatumSpec,
-    *,
-    group_id: str,
-) -> str:
-    _validate_prompt_identity(prompt_ref, prompt_payload, group_id=group_id)
-    payload_sha256 = prompt_payload_sha256(prompt_payload)
-    if (
-        prompt_ref.payload_sha256 is not None
-        and payload_sha256 != prompt_ref.payload_sha256
-    ):
-        raise ValueError(
-            f"recovery group {group_id!r} prompt fingerprint mismatch for "
-            f"sample_id={prompt_ref.sample_id!r}"
-        )
-    return payload_sha256
-
-
 class RolloutRecoveryLedger:
     """Own prompts after dataloader advance and before canonical TQ commit."""
 
@@ -216,7 +162,7 @@ class RolloutRecoveryLedger:
         Args:
             prompt_id: Dataset-level prompt identity used for diagnostics.
             prompt_payload: Runtime prompt used for whole-group regeneration. Only
-                its stable dataset reference and fingerprint are checkpointed.
+                its stable dataset reference is checkpointed.
             expected_generations: Number of GRPO siblings in the prompt group.
             target_step: Original gated training step, when the sampler stamps one.
             start_weight_version: Policy version visible at reservation time.
@@ -266,7 +212,7 @@ class RolloutRecoveryLedger:
             # The rollout path treats the dataloader sample as immutable and builds
             # mutable environment inputs from copies. Retaining that sample by
             # reference avoids cloning a potentially very long prompt on every
-            # dispatch; state_dict() persists only its locator and fingerprint.
+            # dispatch; state_dict() persists only its dataset locator.
             prompt_ref=PromptRef(
                 sample_id=prompt_id,
                 task_name=_prompt_task_name(prompt_payload),
@@ -319,9 +265,9 @@ class RolloutRecoveryLedger:
         group_id: str,
         prompt_payload: DatumSpec,
     ) -> None:
-        """Attach and verify a dataset-rehydrated prompt after checkpoint load."""
+        """Attach a dataset-rehydrated prompt after identity validation."""
         record = self._require_group(group_id)
-        payload_sha256 = _validate_prompt_ref(
+        _validate_prompt_identity(
             record.prompt_ref,
             prompt_payload,
             group_id=group_id,
@@ -333,7 +279,6 @@ class RolloutRecoveryLedger:
             prompt_ref=PromptRef(
                 sample_id=record.prompt_ref.sample_id,
                 task_name=record.prompt_ref.task_name,
-                payload_sha256=payload_sha256,
             ),
             runtime_prompt_payload=prompt_payload,
             expected_generations=record.expected_generations,
@@ -367,7 +312,7 @@ class RolloutRecoveryLedger:
     def state_dict(self) -> RolloutRecoveryState:
         """Return versioned references without serializing full prompt payloads."""
         groups: list[PromptGroupRecoveryState] = []
-        for group_id, record in list(self._groups.items()):
+        for record in self._groups.values():
             prompt_payload = record.runtime_prompt_payload
             if prompt_payload is None:
                 raise RuntimeError(
@@ -379,20 +324,6 @@ class RolloutRecoveryLedger:
                 prompt_payload,
                 group_id=record.group_id,
             )
-            payload_sha256 = record.prompt_ref.payload_sha256
-            if payload_sha256 is None:
-                payload_sha256 = prompt_payload_sha256(prompt_payload)
-                record = replace(
-                    record,
-                    prompt_ref=replace(
-                        record.prompt_ref,
-                        payload_sha256=payload_sha256,
-                    ),
-                )
-                # Prompts are immutable after dataloader processing. Cache the
-                # first durable fingerprint so repeated checkpoints do not
-                # serialize the same long prompt merely to hash it again.
-                self._groups[group_id] = record
             groups.append(
                 {
                     "group_id": record.group_id,
@@ -401,7 +332,6 @@ class RolloutRecoveryLedger:
                     "prompt_ref": {
                         "sample_id": record.prompt_ref.sample_id,
                         "task_name": record.prompt_ref.task_name,
-                        "payload_sha256": payload_sha256,
                     },
                     "expected_generations": record.expected_generations,
                     "target_step": record.target_step,
@@ -493,7 +423,6 @@ class RolloutRecoveryLedger:
                 )
             sample_id = raw_prompt_ref.get("sample_id")
             task_name = raw_prompt_ref.get("task_name")
-            payload_sha256 = raw_prompt_ref.get("payload_sha256")
             if not isinstance(sample_id, str) or not sample_id:
                 raise ValueError(
                     f"rollout recovery groups[{index}].prompt_ref.sample_id "
@@ -509,17 +438,6 @@ class RolloutRecoveryLedger:
                     f"rollout recovery groups[{index}].prompt_ref.task_name "
                     "must be a string or None"
                 )
-            if (
-                not isinstance(payload_sha256, str)
-                or len(payload_sha256) != 64
-                or any(
-                    character not in "0123456789abcdef" for character in payload_sha256
-                )
-            ):
-                raise ValueError(
-                    f"rollout recovery groups[{index}].prompt_ref.payload_sha256 "
-                    "must be a lowercase SHA-256 digest"
-                )
             restored[group_id] = PromptGroupRecoveryRecord(
                 group_id=group_id,
                 admission_id=admission_id,
@@ -527,7 +445,6 @@ class RolloutRecoveryLedger:
                 prompt_ref=PromptRef(
                     sample_id=sample_id,
                     task_name=task_name,
-                    payload_sha256=payload_sha256,
                 ),
                 runtime_prompt_payload=None,
                 expected_generations=expected_generations,

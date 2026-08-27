@@ -9,7 +9,6 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     PromptGroupPhase,
     RolloutRecoveryLedger,
-    prompt_payload_sha256,
 )
 
 
@@ -45,7 +44,6 @@ def _group_state(
     target_step: int | None = 7,
     phase: str = "admitted",
 ) -> dict:
-    prompt = _prompt(idx)
     return {
         "group_id": f"g{idx}",
         "admission_id": "batch-7",
@@ -53,7 +51,6 @@ def _group_state(
         "prompt_ref": {
             "sample_id": str(idx),
             "task_name": None,
-            "payload_sha256": prompt_payload_sha256(prompt),
         },
         "expected_generations": 2,
         "target_step": target_step,
@@ -173,14 +170,13 @@ def test_state_dict_stores_a_prompt_ref_without_the_full_payload() -> None:
     assert group_state["prompt_ref"] == {
         "sample_id": "7",
         "task_name": None,
-        "payload_sha256": prompt_payload_sha256(prompt),
     }
     group_state["prompt_ref"]["sample_id"] = "100"
 
     assert ledger.get_group("g7").prompt_ref.sample_id == "7"
 
 
-def test_bind_runtime_prompt_rejects_changed_dataset_content() -> None:
+def test_bind_runtime_prompt_accepts_changed_content_with_the_same_identity() -> None:
     ledger = RolloutRecoveryLedger()
     original = _prompt()
     ledger.reserve_group(
@@ -198,8 +194,9 @@ def test_bind_runtime_prompt_rejects_changed_dataset_content() -> None:
 
     changed = _prompt()
     changed["message_log"][0]["content"] = "different prompt"
-    with pytest.raises(ValueError, match="fingerprint mismatch"):
-        restored.bind_runtime_prompt("g7", changed)
+    restored.bind_runtime_prompt("g7", changed)
+
+    assert restored.get_group("g7").prompt_payload == changed
 
 
 def test_bind_runtime_prompt_rejects_the_wrong_dataset_sample() -> None:
@@ -219,49 +216,6 @@ def test_bind_runtime_prompt_rejects_the_wrong_dataset_sample() -> None:
 
     with pytest.raises(ValueError, match="expected '7'"):
         restored.bind_runtime_prompt("g7", _prompt(8))
-
-
-def test_prompt_fingerprint_is_stable_for_equivalent_tensor_content() -> None:
-    first = {"idx": 7, "length": torch.tensor(3), "tokens": torch.tensor([1, 2, 3])}
-    second = {
-        "idx": 7,
-        "length": torch.tensor(3),
-        "tokens": torch.tensor([1, 2, 3]),
-    }
-
-    assert prompt_payload_sha256(first) == prompt_payload_sha256(second)
-
-    second["tokens"] = torch.tensor([1, 2, 4])
-    assert prompt_payload_sha256(first) != prompt_payload_sha256(second)
-
-
-def test_prompt_fingerprint_ignores_batch_storage_and_derived_max_length() -> None:
-    batch_lengths = torch.tensor([3, 9])
-    batch_loss_multipliers = torch.tensor([1.0, 1.0])
-    dispatched = {
-        "idx": 7,
-        "length": batch_lengths[0],
-        "loss_multiplier": batch_loss_multipliers[0],
-        "batch_max_length": batch_lengths.max(),
-        "message_log": [{"role": "user", "token_ids": torch.tensor([1, 2, 3])}],
-    }
-
-    restored_lengths = torch.tensor([3])
-    restored_loss_multipliers = torch.tensor([1.0])
-    one_row_recollated = {
-        "idx": 7,
-        "length": restored_lengths[0],
-        "loss_multiplier": restored_loss_multipliers[0],
-        "batch_max_length": restored_lengths.max(),
-        "message_log": [{"role": "user", "token_ids": torch.tensor([1, 2, 3])}],
-    }
-
-    assert batch_lengths[0].untyped_storage().nbytes() != (
-        restored_lengths[0].untyped_storage().nbytes()
-    )
-    assert prompt_payload_sha256(dispatched) == prompt_payload_sha256(
-        one_row_recollated
-    )
 
 
 def test_prompt_ref_rehydrates_through_a_restored_shuffled_dataloader() -> None:

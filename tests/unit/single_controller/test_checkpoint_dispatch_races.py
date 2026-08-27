@@ -59,7 +59,6 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_STATE_FILENAME,
     PromptGroupPhase,
     RolloutRecoveryLedger,
-    prompt_payload_sha256,
 )
 from tests.unit.single_controller._checkpoint_scenarios import (
     _record,
@@ -179,7 +178,6 @@ class _PendingLedger:
                     "prompt_ref": {
                         "sample_id": str(group.prompt_payload.get("idx", "unknown")),
                         "task_name": group.prompt_payload.get("task_name"),
-                        "payload_sha256": prompt_payload_sha256(group.prompt_payload),
                     },
                     "expected_generations": 2,
                     "start_weight_version": 7,
