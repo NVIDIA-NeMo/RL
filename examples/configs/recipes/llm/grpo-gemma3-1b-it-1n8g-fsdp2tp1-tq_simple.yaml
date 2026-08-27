@@ -2,4 +2,4 @@ defaults: grpo-gemma3-1b-it-1n8g-fsdp2tp1.yaml
 data_plane:
   enabled: true
   observability:
-    verify_tensor_hash: true  # wire guard; gated to 0 by the wrapper script
+    verify_tensor_hash: true

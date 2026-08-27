@@ -17,6 +17,8 @@ async_rl:
 
 data_plane:
   enabled: true
+  observability:
+    verify_tensor_hash: true
 
 checkpointing:
   checkpoint_dir: results/mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller

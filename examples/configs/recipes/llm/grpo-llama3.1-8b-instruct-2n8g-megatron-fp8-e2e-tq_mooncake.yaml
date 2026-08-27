@@ -3,4 +3,4 @@ data_plane:
   enabled: true
   backend: mooncake_cpu
   observability:
-    verify_tensor_hash: true  # wire guard; gated to 0 by the wrapper script
+    verify_tensor_hash: true

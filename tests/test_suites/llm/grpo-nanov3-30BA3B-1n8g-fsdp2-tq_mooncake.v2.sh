@@ -18,7 +18,12 @@ export EXP_NAME="$TQ_EXP_NAME"
 bash "$SCRIPT_DIR/$BASE_RECIPE.sh" "$@"
 
 # The wire guard only counts; assert it found nothing.
+# The delegated base runs in a subshell, so common.env's TEST_DRYRUN exit
+# does not reach here. Skip explicitly, or the dryrun check in
+# tests/unit/test_recipes_and_test_suites.py fails on a missing metrics.json.
+# `if` form, not `&& exit`: a false `[[ ]]` returns 1 and set -e would abort.
+if [[ -n "${TEST_DRYRUN:-}" ]]; then exit 0; fi
 cd "$SCRIPT_DIR/../../.."
 uv run tests/check_metrics.py "$SCRIPT_DIR/$TQ_EXP_NAME/metrics.json" \
-    'max(data["data_plane/cluster/step/hash/mismatches"]) == 0' \
-    'max(data["data_plane/cluster/step/hash/guard_failures"]) == 0'
+    'max(data.get("data_plane/cluster/step/hash/mismatches", data.get("data_plane/driver/step/hash/mismatches", {}))) == 0' \
+    'max(data.get("data_plane/cluster/step/hash/guard_failures", data.get("data_plane/driver/step/hash/guard_failures", {}))) == 0'
