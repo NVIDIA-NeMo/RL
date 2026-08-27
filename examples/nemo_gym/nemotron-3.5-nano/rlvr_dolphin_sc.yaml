@@ -1,0 +1,368 @@
+# =============================================================================
+# Nemotron 3.5 Nano — RLVR on the SingleController path
+# =============================================================================
+# Overlay on rlvr_dolphin.yaml that swaps the legacy async-GRPO driver for the
+# SingleController (SC) architecture: streaming forward/backward, the
+# TransferQueue data plane, gated in-order rollout sampling, and shard-to-shard
+# NCCL-reshard weight refit.
+#
+# Everything about the model, parallelism, batch shape, sequence length, node
+# split and the Gym blend is inherited unchanged, so a run of this config is
+# directly comparable against a rlvr_dolphin.yaml run on the same 64 nodes
+# (8 train + 40 generation + 16 gym, plus GenRM's own 4).
+#
+# Entrypoint: examples/run_grpo_single_controller.py (NOT run_grpo_nemo_gym.py).
+# nano35_dolphin_launch_sc.sh sets that via NRL_ENTRYPOINT.
+#
+# Group vs sample units: async_rl counts PROMPT GROUPS, not generations. One
+# optimizer cohort here is 2048 / 16 = 128 groups.
+# =============================================================================
+defaults: rlvr_dolphin.yaml
+
+# =============================================================================
+# Checkpointing — on, because a 100-step run outlives the 4 h wall
+# =============================================================================
+# The SC path saves and resumes now: _save_checkpoint writes policy weights, the
+# optimizer, the tokenizer, the dataloader state, the replay buffer and the
+# step/epoch/consumed-sample counters, and setup_single_controller resumes from
+# get_latest_checkpoint_path. Restoring the buffer matters more here than the
+# weights do -- a resumed run comes back with its lag-4 staleness distribution
+# instead of ramping from zero, so the convergence curve has no seam at the job
+# boundary. The buffer restore is skipped if the sampler name changed, so every
+# job in a chain must keep the same async_rl.sampler.name.
+#
+# grpo.max_num_steps is compared against the *restored* step count, so it is a
+# whole-campaign target: NRL_MAX_STEPS=100 once, and each requeued job continues
+# toward it rather than running 100 more steps.
+#
+# Inherited checkpoint settings are overridden for SC recovery:
+#
+#   metric_name    student_rlvr1.yaml sets "val:total_reward/mean", which
+#                  validate_single_controller_config rejects outright -- SC has
+#                  no validation loop, so a "val:" metric is never collected and
+#                  top-k retention would silently degrade to a no-op. null here
+#                  makes retention purely recency-based, which is what we want.
+#   save periods   Full trainer state is saved every step. Periodic rollout
+#                  snapshots after bootstrap require a durable checkpoint at
+#                  the matching trainer step, so a wider period would leave
+#                  most of a short pipeclean without an eligible anchor.
+#   keep_top_k     Inherited as 1000000, i.e. keep everything. With no metric,
+#                  "best" is recency, so this keeps the newest 3 periodic
+#                  checkpoints and lets the rest go.
+#
+# checkpoint_must_save_by comes from the launcher (CHECKPOINTING_SAVE_BY,
+# 00:03:35:00) and remains a wall-clock backstop.
+# =============================================================================
+checkpointing:
+  enabled: true
+  metric_name: null
+  save_period: 1
+  ft_save_period: 1
+  ft_keep_latest_k: 1
+  keep_top_k: 3
+  save_optimizer: true
+
+grpo:
+  # setup_single_controller rejects val_period > 0 outright, so the baseline's
+  # "effectively disabled" 10000000 is not enough — validation has to be off.
+  # val_start_at: -1, val_at_start: false and val_at_end: false are inherited
+  # and already satisfy the rest of the guard.
+  val_period: 0
+
+  # Required because loss_fn.reference_policy_kl_penalty is 0.0 (inherited from
+  # student_rlvr1.yaml). No reference model is built, but the SC train pump
+  # still computes reference logprobs unless this is set, and then fails with
+  # AttributeError: 'MegatronPolicyWorker' has no 'reference_state_dict'.
+  skip_reference_policy_logprobs_calculation: true
+
+  # run_grpo_single_controller.py raises unless this is null; the SC knobs live
+  # under async_rl. student_rlvr1.yaml interpolates
+  # ${add:${grpo.async_grpo.max_trajectory_age_steps}, 1} for num_groups_nemo_rl
+  # in two places, so both are pinned to the value that interpolation resolved
+  # to (max_trajectory_age_steps: 1) under env.nemo_gym below. Nothing may
+  # reference this block once it is null or config load fails.
+  async_grpo: null
+
+policy:
+  # ---------------------------------------------------------------------------
+  # Speculative-decoding draft head. run_grpo_single_controller.py reads
+  # config.policy["draft"]["enabled"] unconditionally, so omitting this block is
+  # a KeyError before Ray starts. The nemo_gym runner guards it with an `in`
+  # check, which is why neither rlvr_dolphin.yaml nor student_rlvr1.yaml needs it.
+  #
+  # Unrelated to the MTP head this recipe trains: MTP head training is on via
+  # megatron_cfg (5 repeated layers, loss 0.3, detached), and MTP speculative
+  # decoding in vLLM is off (ENABLE_MTP_INFERENCE=0), both inherited.
+  # ---------------------------------------------------------------------------
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  generation:
+    # -------------------------------------------------------------------------
+    # Pinned, not interpolated. rlvr_dolphin.yaml ties max_new_tokens to
+    # ${policy.max_total_sequence_length}, which also feeds vllm_cfg.max_model_len
+    # — so the generation budget and the context window are the same number and
+    # a prompt at exactly that length can never emit a token. It is rejected
+    # deterministically instead, and because Gym prepends system prompts and tool
+    # schemas at rollout time and rollouts are multi-turn, no first-turn filter
+    # bounds it: that pairing rejected 2108 prompts in one 8-node ultra probe arm
+    # and 1344 in another at a 16384 window.
+    #
+    # 73728 is the value the interpolation already resolves to here, kept
+    # identical on purpose so these arms stay comparable with the v1 and windowed
+    # arms they are measured against. The pin buys decoupling, not headroom: what
+    # actually keeps rejections at zero on this recipe is that the window is 4.5x
+    # the ultra one and no row of the dolphin blend approaches it (job 5995586
+    # logged no context rejections at this window). Anyone lowering
+    # max_total_sequence_length here must now choose a smaller max_new_tokens
+    # deliberately, which is the step the ultra fan-in config skipped.
+    # -------------------------------------------------------------------------
+    max_new_tokens: 73728
+
+    # -------------------------------------------------------------------------
+    # Weight refit transport. The inherited default (null) broadcasts every full
+    # parameter tensor from the 32 training ranks to all 160 generation ranks.
+    # nccl_reshard instead moves each parameter shard-to-shard between the two
+    # parallelism layouts over NCCL's M2N reshard, so no rank ever materializes
+    # a full tensor. The bulk path covers the MoE FFN projections, which are
+    # 97-98% of the weights at EP=16.
+    #
+    # Declared here rather than passed with `+` because refit_transport is
+    # NotRequired in VllmConfig; with the key present, REFIT_TRANSPORT=null in
+    # nano35_dolphin_launch_sc.sh falls back to the broadcast path.
+    #
+    # This config satisfies every config-checkable constraint in
+    # check_nccl_reshard_refit_support: non-colocated, Megatron train, vLLM gen,
+    # ETP=1, PP=1 with no custom layout, BF16 end to end, no EPLB, and vLLM
+    # expert_parallel_size=1 (allowed alongside any TP; the other legal value is
+    # EP == TP).
+    #
+    # STILL WORTH CHECKING ON THE FIRST RUN: if the container lacks the nccl4py
+    # M2N integration, xferdtensor.py logs "nccl.m2n.reshard not found" and
+    # silently falls back to a Python implementation. Grep the logs for it.
+    #
+    # The MTP-head risk flagged here before is now handled: this checkpoint's HF
+    # export does emit MTP expert projections (mtp.layers.N.mixer.experts.*), and
+    # they did take the bulk path and fail (job 5943756, "layer_prefix mismatch:
+    # mtp != backbone"). is_nccl_reshard_param now routes anything under mtp. to
+    # the misc path, matching what the broadcast baseline does with them.
+    # REFIT_TRANSPORT=null remains the escape hatch.
+    # -------------------------------------------------------------------------
+    refit_transport: nccl_reshard
+
+    # vllm_cfg.gpu_memory_utilization stays at the inherited 0.80. That was
+    # lowered from 0.85 for the broadcast path's staging buffer (job 5744748
+    # OOM'd in update_weights_from_collective at 128 generation ranks, and this
+    # shape has 160) — the exact pressure nccl_reshard removes. 0.85 may be
+    # recoverable here once a reshard run is confirmed healthy; left alone so
+    # the two recipes differ only in the transport.
+
+    vllm_cfg:
+      # -----------------------------------------------------------------------
+      # Samples vllm:num_requests_running / num_requests_waiting /
+      # kv_cache_usage_perc off each engine so a step's exposed_generation can
+      # be attributed. Every run so far shows generation as the binding
+      # constraint (0.18 groups/s produced against a 0.26 groups/s trainer
+      # appetite) without showing why: a compute-bound fleet and an
+      # under-subscribed one are indistinguishable from the trainer's side, and
+      # only the second gets faster when max_inflight_prompts rises. A waiting
+      # queue that is busy most of the step means the engines are the ceiling
+      # and deeper lag cannot help.
+      #
+      # Matches the nemotron-3-ultra recipes, which all enable this. Costs one
+      # Prometheus snapshot per engine every 0.5 s on a daemon thread.
+      # -----------------------------------------------------------------------
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+
+# =============================================================================
+# Loss — off-policy correction, required by every arm past lag 1
+# =============================================================================
+# student_rlvr1.yaml pins the importance ratio at 1, which makes
+# use_importance_sampling_correction inert: the sampled tokens come from an
+# older policy but the loss is computed as though they came from the current
+# one. A lag sweep run that way measures the uncorrected loss, not the
+# staleness, so the pin is lifted here for every sampler. This costs the
+# prev_logprobs forward pass that the inherited pin was skipping.
+# =============================================================================
+loss_fn:
+  force_on_policy_ratio: false
+
+# =============================================================================
+# SingleController async RL — required by MasterConfig
+# =============================================================================
+async_rl:
+  # in_order is checkpoint-replay capable and is the gated sampler used by the
+  # partial-rollout recovery implementation on this branch. The launcher can
+  # switch to weight_fifo or windowed while emitting that sampler's correctly
+  # named slack field.
+  sampler:
+    name: in_order
+    max_lookahead_versions: 4
+
+  recompute_kv_cache_after_weight_updates: false
+
+  # Begin forward/backward once this many groups are ready rather than waiting
+  # for all 128; the remainder streams in behind it and accumulates into the
+  # single GBS=2048 optimizer step. 32 is 25% of the cohort, the ratio the
+  # validated smaller-scale streaming runs used to get 2-3 chunks per step.
+  min_groups_for_streaming_train: 32
+
+  # Let the current cohort and all four lookahead cohorts generate
+  # concurrently: num_prompts_per_step * (max_staleness_versions + 1) = 128 * 5.
+  max_inflight_prompts: 640
+
+  # Hard floor, not a preference: validate_sampler_buffer_capacity raises if
+  # this is below num_prompts_per_step * (max_staleness_versions + 1) = 640,
+  # because the rollout pump would deadlock waiting for buffer slots. It scales
+  # with the slack, so raising one raises both.
+  #
+  # Keep it EQUAL to max_inflight_prompts, never above. The buffer permit is
+  # acquired before dispatch, so it is a dispatch semaphore rather than passive
+  # capacity: job 6014206 set 768 against 384 in flight and ran 1.8x slower.
+  max_buffered_rollouts: 640
+
+  # Rollout fault tolerance. Gym retries dropped connections itself, but hands
+  # us env-server 500s and truncated response bodies, and one of those used to
+  # abort the whole run: jobs 5966951 and 5967263 died that way after one and
+  # six steps while the legacy stack absorbed 400 of the same faults and kept
+  # training.
+  #
+  # Retrying matters more here than it does in v1. A dropped prompt leaves its
+  # batch a group short, and the in_order sampler only ever offers the trainer
+  # groups stamped for the current step, so that step can never close: job
+  # 5982927 wedged exactly this way after step 7 when two prompts hit 500s from
+  # a single sick env server, then sat idle for 104 minutes. Keeping the batch
+  # whole is worth waiting for; the trainer falls back to a shortened batch only
+  # once every attempt is gone.
+  #
+  # Keys follow the post-#3589 taxonomy: infra failures (dead shard, timeout,
+  # transport) re-dispatch onto a different shard, data failures do not. The two
+  # budgets are independent counters, not a total and a sub-total.
+  rollout_failure:
+    # 6 infra attempts with a 1s base gives 1s/2s/4s/8s/16s, bounded at 60s.
+    # Raised from 5/30 on 2026-08-26: job 6545243 died when one gym env server
+    # returned persistent 500s and all five attempts landed inside a ~15s
+    # window — too short for a wedged server to recover.
+    max_infra_attempts_per_prompt: 6
+    max_data_attempts_per_prompt: 2
+    backoff_base_s: 1.0
+    max_backoff_s: 60.0
+
+    # Bounded drop tolerance, raised from the fail-hard 0/0 on 2026-08-26.
+    # Fail-hard turned a single persistently sick env server into a run abort
+    # (6545243 after 3 clean steps; the capture arm's 6544554 died the same
+    # way pre-retry-wrapper). A dropped prompt credits its step's shortfall,
+    # so the trainer closes that step short rather than wedging; at 2048
+    # rollouts/step, 8 dropped prompts bounds the loss at <7% of one step's
+    # groups. max_consecutive_dropped_prompts=4 still aborts when the fleet —
+    # not one server — is broken. Held identical across arms for the A/B.
+    max_skipped_prompts: 8
+    max_consecutive_dropped_prompts: 4
+
+    # Deadlines. This is the NeMo-Gym rollout path, so only the nemo_gym block
+    # applies; validate_single_controller_config rejects a populated native
+    # block here rather than letting it look effective. Nothing below SC bounds
+    # a rollout -- Gym retries its server-to-server hops in an uncapped loop
+    # against an aiohttp session with no ClientTimeout -- so without this a
+    # wedged env server holds its in_order slot until the wall clock.
+    # DISABLED (null) 2026-08-25: 1800s is too tight for legit long-tail dolphin
+    # rollouts (step-1 exposed_generation alone is ~29 min at 4x engine
+    # oversubscription), so the deadline was timing out slow-but-healthy
+    # episodes and forcing retries -- the repeated genrm_compare verify
+    # failures trace to exactly this. The watchdog below (stall_action: warn)
+    # remains the wedge detector. If re-enabling, keep it strictly below
+    # async_rl.stall_watchdog.stall_timeout_s
+    # (_check_stall_watchdog_outlasts_rollouts).
+    nemo_gym:
+      rollout_timeout_s: null
+
+  # Must outlast every deadline above, which
+  # _check_stall_watchdog_outlasts_rollouts enforces: below it, a rollout that
+  # is merely slow reads as a stall.
+  stall_watchdog:
+    interval_s: 30.0
+    stall_timeout_s: 2400.0
+    stall_action: warn
+    gym_subprocess_check: true
+
+# =============================================================================
+# NeMo-Gym rollout actor
+# =============================================================================
+env:
+  nemo_gym:
+    # Pinned literals for what student_rlvr1.yaml interpolated off
+    # grpo.async_grpo.max_trajectory_age_steps, which is null on this path.
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_groups_nemo_rl: 2
+    policy_model_reasoning_off:
+      responses_api_models:
+        vllm_model:
+          num_groups_nemo_rl: 2
+
+# =============================================================================
+# TransferQueue data plane — mandatory for the SC path
+# =============================================================================
+# run_grpo_single_controller.py refuses to start unless enabled is true, and
+# DataPlaneConfig requires every key below with no Python-side defaults.
+# global_segment_size / local_buffer_size are read only when backend is
+# mooncake_cpu, but must still be present.
+# =============================================================================
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: "simple"
+  claim_meta_poll_interval_s: 0.5
+  # Sizing lives in the block named for the backend (post-restructure schema:
+  # interfaces.py backend_config reads ONLY the nested block; the old flat
+  # spelling parses but is never read, and simple.num_storage_units has no
+  # default, so a flat-only config fails SimpleStorageConfig validation at
+  # TQPolicy bootstrap — job 6539968 died exactly there).
+  simple:
+    # storage_capacity is global and TQ splits it per unit as
+    # ceil(total_storage_size / num_data_storage_units), so num_storage_units
+    # trades unit count against per-unit size and reserves nothing extra.
+    # Raising it costs one CPU actor each and buys read/write fan-out.
+    #
+    # 16 is headroom, not a fix for anything measured. The windowed sweep sizes
+    # the buffer as num_prompts_per_step * (staleness + 1), so the arms hold
+    # 256 / 384 / 640 / 896 groups resident — up to 14336 rows at staleness 6.
+    # Peak resident is still only ~1.4% of the 1000000-row global capacity, so
+    # the concern is the actors' aggregate throughput rather than their space.
+    # Held identical across arms deliberately.
+    storage_capacity: 1000000
+    num_storage_units: 16
+  # Mooncake-only: read solely on the mooncake_cpu branch, and this recipe is
+  # backend "simple". Inert here, kept for backend switches.
+  mooncake_cpu:
+    global_segment_size: 549755813888  # 512 GiB
+    local_buffer_size:   68719476736   # 64 GiB
+  # Required for restoring replay rows and token-capture receipts alongside
+  # trainer state and for periodic rollout snapshots.
+  checkpointing_enabled: true
+
+# Gate-authoritative token capture gives every logical sibling a durable TQ
+# receipt that can be reused after restart.
+token_capture:
+  enabled: true
+  on_capture_failure: continue
+  mixed_weight_version_policy: allow
+  # Sized from job 6544554: per-group finalize is ~1.4s and groups arrive in
+  # post-refit waves (queue depth peaked at 47, wait climbed 14->28s with the
+  # default 2 workers at ~95% busy). 8 drains a 47-deep wave in ~8s and keeps
+  # queue wait single-digit through the ~6%/step service-time growth.
+  num_finalizer_workers: 8
+
+# Periodic data-plane/ledger snapshots. The launcher exposes both intervals as
+# environment variables and forwards them as Hydra overrides.
+rollout_checkpointing:
+  interval_s: 120
+  telemetry_interval_s: 30
+  keep_latest_k: 2
+  restore_mode: latest
