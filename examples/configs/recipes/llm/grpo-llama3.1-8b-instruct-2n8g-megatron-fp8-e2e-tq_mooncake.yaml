@@ -2,3 +2,5 @@ defaults: grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e.yaml
 data_plane:
   enabled: true
   backend: mooncake_cpu
+  observability:
+    verify_tensor_hash: true  # wire guard; gated to 0 by the wrapper script
