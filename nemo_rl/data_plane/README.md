@@ -452,7 +452,7 @@ series. Do not read `comm_volume_mb` as cluster-wide volume.
 `OpStats` is additive on purpose, and `merge_snapshots()` uses it: the
 histogram buckets and the regression sufficient statistics from every rank
 *sum* into one cluster-wide view. Everything derived — percentiles, the
-affine fit, throughput — is recomputed from the merged totals, never
+throughput — is recomputed from the merged totals, never
 averaged across ranks (averaging per-rank percentiles does not give a
 cluster percentile).
 
@@ -465,7 +465,6 @@ totals and `percent_of_dataplane`, with the per-op detail in a table beside them
 |---|---|
 | `step/frac_of_step` | is the data plane worth optimising at all? |
 | `step/percent_of_dataplane/by_op/{put,get,clear,register}` | which call is expensive? |
-| `step/percent_of_dataplane/by_cause/{fixed_overhead,transfer}` | is that fixed per-request cost, or moving bytes? |
 | `step/wall_ms`, `step/comm_volume_mb` | how much time and traffic |
 | `step/volume_mb/by_op/{get,put}` | which direction that traffic went |
 
@@ -482,29 +481,14 @@ put". Whether that time mattered against compute is the *other* metric:
 `frac_of_step` divides by the step's own wall clock. Read them together —
 a workload can be 43% put and still not be worth touching.
 
-Each `by_cause` term names what it measures. `fixed_overhead` is the fitted
-per-request constant — the cost of making a request at all, independent of
-its size. `transfer` **is** the bandwidth term: bytes divided by the fitted
-bandwidth. Reading a real TransferQueue step:
+Reading a real TransferQueue step:
 
 ```
 step/frac_of_step                                  0.074   the data plane is 7% of the step
 step/percent_of_dataplane/by_op/put                 42.1   within it, put is the largest op
-step/percent_of_dataplane/by_cause/fixed_overhead   52.3   half the time is per-request cost
-step/percent_of_dataplane/by_cause/transfer         20.7   a fifth is bandwidth
 ```
 
-Overhead beats bandwidth roughly 2:1 here, so this workload is
-overhead-dominated: batching into fewer, larger requests buys more than a
-faster wire. Had `transfer` been the larger of the two, the conclusion
-would invert.
-
-Two decompositions of one total, because either alone leaves the next
-question unanswered. `by_op` sums to 100 by construction. `by_cause` sums
-to *at most* 100: only ops with an identifiable affine fit can be split, so
-the remainder (27% above — the `register` and `clear` calls, which move
-no bytes and so have no bandwidth term to fit) is time that could not be
-attributed rather than time that did not happen.
+`by_op` sums to 100 by construction.
 
 `volume_mb` counts *transfers*, not data size, and two things follow from
 that. A byte written and later read is counted on both sides. And every
@@ -529,19 +513,16 @@ and the wrong one for "what blocked the step".
 `data_plane/{cluster,driver}/breakdown` — one row per op, ordered by
 `percent_of_dataplane` so the bottleneck is the first line read:
 
-| op | percent_of_dataplane | calls | wall_ms | mean_ms | max_ms | p50_ms | p90_ms | overhead_ms | transfer_ms | mb |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| put | 43.0 | 2 | 53.9 | 26.9 | 29.4 | — | — | 19.4 | 6.39 | 1.32 |
-| get | 30.9 | 2 | 38.7 | 19.4 | 21.5 | — | — | 13.8 | 4.63 | 1.03 |
-| register | 17.1 | 1 | 21.4 | 21.4 | 21.4 | — | — | — | — | 0 |
-| clear | 8.93 | 1 | 11.2 | 11.2 | 11.2 | — | — | — | — | 0 |
+| op | percent_of_dataplane | calls | wall_ms | mean_ms | max_ms | p50_ms | p90_ms | mb |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| put | 43.0 | 2 | 53.9 | 26.9 | 29.4 | — | — | 1.32 |
+| get | 30.9 | 2 | 38.7 | 19.4 | 21.5 | — | — | 1.03 |
+| register | 17.1 | 1 | 21.4 | 21.4 | 21.4 | — | — | 0 |
+| clear | 8.93 | 1 | 11.2 | 11.2 | 11.2 | — | — | 0 |
 
-Everything in ms on that row is **per call** except `wall_ms`, and the two
-split terms add to `mean_ms`: that `put` row reads "each call cost 26.9 ms,
-of which 19.4 was fixed per-request overhead and 6.39 was bandwidth at this
-step's mean request size". Per call the overhead term *is* the fitted
-constant, so it is comparable against a hardware number. `calls`,
-`wall_ms` and `mb` are the only extensive columns.
+Everything in ms on that row is **per call** except `wall_ms`: that `put`
+row reads "each call cost 26.9 ms". `calls`, `wall_ms` and `mb` are the
+only extensive columns.
 
 **Per-call figures describe the wire; sums describe the run.** `wall_ms` on the cluster
 path is summed over processes that ran concurrently, so it is process-time
@@ -616,16 +597,7 @@ signal worth seeing rather than hiding.
 a chart mixing `wall_s` against `p90_ms` puts a 0.008 beside a 24.85 and
 reads as a data-plane bug rather than an axis one.
 
-**Per step you get, per op tag:** `calls`, `wall_ms`, `max_ms`, and — when
-the affine fit is trustworthy — `overhead_ms` and `transfer_ms`. Those last
-two are the split of the op's time into fixed per-request cost and
-bandwidth, in ms, and they *stack*: together they are the model's estimate
-of the step's `wall_ms`, so charting them against the measured `wall_ms`
-shows the breakdown and the model error in one picture. The coefficients
-come from the cumulative fit (a model should be stable); the attribution is
-per step, applied to that step's calls and bytes. A ratio was tried first
-and was the wrong shape — cumulative and therefore flat, and unitless on an
-axis of milliseconds. Percentiles come off the *step's* histogram delta, not the
+**Per step you get, per op tag:** `calls`, `wall_ms`, `max_ms`. Percentiles come off the *step's* histogram delta, not the
 cumulative one -- a per-step p50 off a histogram that is never reset goes
 flat -- and each is emitted only when the step holds enough calls to
 resolve it: **p50 at 20, p90 at 40**, roughly four observations above the
