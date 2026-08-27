@@ -1390,8 +1390,12 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
             )
+            # step_finished=True here since this is the final log of our current step.
             self._logger.log_metrics(
-                timing_metrics, step=self._train_steps, prefix="timing/train"
+                timing_metrics,
+                step=self._train_steps,
+                prefix="timing/train",
+                step_finished=True,
             )
             self._timer.reset()
 
@@ -1464,7 +1468,9 @@ class SingleControllerActor:
                         f"{type(error).__name__}: {error}",
                         flush=True,
                     )
-            self._logger.log_metrics(metrics, step=self._train_steps)
+            self._logger.log_metrics(
+                metrics, step=self._train_steps, step_metric="rollout/train_steps"
+            )
 
             if watchdog_cfg.gym_subprocess_check:
                 # Bounded by one tick so a wedged environment cannot stop the pump, and
