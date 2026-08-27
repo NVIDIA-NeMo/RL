@@ -16,12 +16,12 @@
 Runs a realistic VLM rollout write → TQ (NoOp adapter) → materialize →
 trainer read, exercising every layer the multimodal fix touches:
 
-  * ``PackedTensor.to_nested_wire`` on the write side
+  * ``PackedTensor.to_wire`` on the write side
   * ``kv_first_write`` wire-type filter
   * ``codec.pack_jagged_fields`` (write-time layout transform)
   * ``codec.materialize`` (read-time padded conversion), including the
     ``PACKED_MULTIMODAL_FIELDS`` pad_to_seqlen exclusion
-  * ``PackedTensor.from_nested_wire`` on the read side
+  * ``PackedTensor.from_wire`` on the read side
   * ``BatchedDataDict.get_multimodal_dict`` dispatch
 
 Guards the silent-drop regression class that motivated the PR.
@@ -144,7 +144,7 @@ def test_vlm_wire_roundtrip_through_noop_data_plane():
 
     # ── Write path ──────────────────────────────────────────────────
     client = NoOpDataPlaneClient()
-    fields = list(fb.keys()) + [PackedTensor.lengths_key(k) for k in packed_truth]
+    fields = list(fb.keys())
     register_train_partition(client, num_samples=n, fields=fields)
 
     bulk_batch: BatchedDataDict = BatchedDataDict()
@@ -155,11 +155,11 @@ def test_vlm_wire_roundtrip_through_noop_data_plane():
         dp_client=client,
         partition_id="train",
     )
-    # kv_first_write ships the wire-form parents AND the __lengths
-    # companions — both are needed by the read side for reassembly.
+    # kv_first_write ships one wire field per logical field — the nested
+    # parent carries its own row boundaries, so there is no companion.
     for k in packed_truth:
         assert k in meta.fields
-        assert PackedTensor.lengths_key(k) in meta.fields
+        assert f"{k}__lengths" not in meta.fields
     assert "mm_token_type_ids" in meta.fields
 
     # ── Read path ───────────────────────────────────────────────────
@@ -171,14 +171,17 @@ def test_vlm_wire_roundtrip_through_noop_data_plane():
     )
 
     # ── Contract checks on the materialized batch ───────────────────
-    # Packed multimodal parent survived as a rectangular tensor of
-    # shape ``[B, max_per_sample, ...]``; ``codec.materialize`` did NOT
-    # over-pad dim 1 to ``pad_to_seqlen`` (the fix that averts multi-GB
-    # zero blow-up for VLM).
-    assert fetched["pixel_values"].shape == (n, 5, 4, 4)  # max patches = 5
-    assert fetched["image_grid_thw"].shape == (n, 2, 3)  # max images = 2
-    assert PackedTensor.lengths_key("pixel_values") in fetched
-    assert PackedTensor.lengths_key("image_grid_thw") in fetched
+    # Packed multimodal fields stay NESTED through materialize — no
+    # rectangularization to ``[B, max_per_sample, ...]``, so no zero
+    # padding on the wire or in worker memory, and the row boundaries
+    # never have to be recovered from a companion column.
+    assert fetched["pixel_values"].is_nested
+    assert fetched["image_grid_thw"].is_nested
+    assert [t.shape[0] for t in fetched["pixel_values"].unbind()] == [
+        t.shape[0] for t in packed_truth["pixel_values"].to_wire().unbind()
+    ]
+    assert "pixel_values__lengths" not in fetched
+    assert "image_grid_thw__lengths" not in fetched
 
     # ── Reassembly via BatchedDataDict.get_multimodal_dict ──────────
     mm = fetched.get_multimodal_dict(as_tensors=True)
@@ -203,8 +206,13 @@ def test_vlm_wire_roundtrip_through_noop_data_plane():
 def test_materialize_forward_pad_skips_packed_multimodal_fields():
     """``codec.materialize`` right-pads dim 1 up to the cross-DP forward pad
     target, which is a *token* seqlen. For a packed multimodal field dim 1 is
-    patch/image count, so padding it there inflates ``pixel_values`` by the
-    ratio seqlen/patches — the ~40x blow-up the exclusion averts.
+    patch/image count, so padding it there would inflate ``pixel_values`` by
+    the ratio seqlen/patches — the ~40x blow-up the exclusion averts.
+
+    Those fields are now excluded one step earlier: they skip
+    ``to_padded_tensor`` entirely and stay nested, so they are never
+    rectangular for ``pad_to_seqlen`` to extend. This pins that the
+    token-aligned fields still pad while the multimodal ones are untouched.
 
     The pad only fires when ``GLOBAL_FORWARD_PAD_SEQLEN`` is stamped on the
     meta (``TQPolicy._stamp_pad_seqlen`` does this in production). The plain
@@ -216,9 +224,7 @@ def test_materialize_forward_pad_skips_packed_multimodal_fields():
     fb, _, _ = _make_vlm_rollout_output(n=n, seqlen=seqlen)
 
     client = NoOpDataPlaneClient()
-    fields = list(fb.keys()) + [
-        PackedTensor.lengths_key(k) for k in ("pixel_values", "image_grid_thw")
-    ]
+    fields = list(fb.keys())
     register_train_partition(client, num_samples=n, fields=fields)
 
     bulk_batch: BatchedDataDict = BatchedDataDict()
@@ -238,9 +244,12 @@ def test_materialize_forward_pad_skips_packed_multimodal_fields():
     # Token-aligned fields DO get padded up to the forward target.
     assert fetched["input_ids"].shape == (n, pad_to)
     assert fetched["mm_token_type_ids"].shape == (n, pad_to)
-    # Packed multimodal fields keep their patch/image dim 1 untouched.
-    assert fetched["pixel_values"].shape == (n, 5, 4, 4)
-    assert fetched["image_grid_thw"].shape == (n, 2, 3)
+    # Packed multimodal fields stay nested — no rectangularization, so the
+    # forward pad target cannot reach them.
+    assert fetched["pixel_values"].is_nested
+    assert fetched["image_grid_thw"].is_nested
+    assert max(t.shape[0] for t in fetched["pixel_values"].unbind()) == 5
+    assert max(t.shape[0] for t in fetched["image_grid_thw"].unbind()) == 2
 
     # Reassembly still reproduces the pre-wire values under forward padding.
     mm = fetched.get_multimodal_dict(as_tensors=True)
@@ -307,9 +316,7 @@ def test_train_dispatch_ships_the_same_multimodal_fields_as_logprob(monkeypatch)
     """
     mm_fields = [
         "pixel_values",
-        PackedTensor.lengths_key("pixel_values"),
         "image_grid_thw",
-        PackedTensor.lengths_key("image_grid_thw"),
         "mm_token_type_ids",
     ]
     meta = KVBatchMeta(
@@ -331,11 +338,7 @@ def test_train_dispatch_ships_the_same_multimodal_fields_as_logprob(monkeypatch)
     # Parity across the FULL registry, not just the hand-listed mm_fields:
     # the two supersets below would be satisfied by a dispatch that shipped
     # extra multimodal columns to one side only.
-    registry = (
-        PACKED_MULTIMODAL_FIELDS
-        | PER_TOKEN_MULTIMODAL_FIELDS
-        | {PackedTensor.lengths_key(k) for k in PACKED_MULTIMODAL_FIELDS}
-    )
+    registry = PACKED_MULTIMODAL_FIELDS | PER_TOKEN_MULTIMODAL_FIELDS
     assert set(mm_fields) <= lp_fields
     assert set(mm_fields) <= train_fields
     assert lp_fields & registry == train_fields & registry
@@ -370,7 +373,6 @@ def test_ref_logprob_dispatch_ships_multimodal_fields(monkeypatch):
     pin the ref task explicitly rather than trusting the shared body."""
     mm_fields = [
         "pixel_values",
-        PackedTensor.lengths_key("pixel_values"),
         "mm_token_type_ids",
     ]
     meta = KVBatchMeta(
@@ -396,9 +398,7 @@ def test_sc_microbatch_dispatch_ships_multimodal_fields(monkeypatch):
     image-blind forward while the sync path stays green."""
     mm_fields = [
         "pixel_values",
-        PackedTensor.lengths_key("pixel_values"),
         "image_grid_thw",
-        PackedTensor.lengths_key("image_grid_thw"),
         "mm_token_type_ids",
     ]
     meta = KVBatchMeta(
@@ -422,9 +422,5 @@ def test_sc_microbatch_dispatch_ships_multimodal_fields(monkeypatch):
 
     assert set(mm_fields) <= sc_fields
     # Both train entrypoints must request the identical multimodal set.
-    all_mm = (
-        PACKED_MULTIMODAL_FIELDS
-        | PER_TOKEN_MULTIMODAL_FIELDS
-        | {PackedTensor.lengths_key(k) for k in PACKED_MULTIMODAL_FIELDS}
-    )
+    all_mm = PACKED_MULTIMODAL_FIELDS | PER_TOKEN_MULTIMODAL_FIELDS
     assert sc_fields & all_mm == sync_fields & all_mm

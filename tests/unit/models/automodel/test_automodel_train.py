@@ -871,17 +871,15 @@ class TestCheckSequenceDim:
         assert seq_dim_size == 64
 
     def test_ignores_packed_multimodal_wire_fields(self):
-        """The data-plane wire form of a packed multimodal field is a plain
-        tensor whose dim 1 is patch/image count, not seqlen. Without the skip
-        every VLM step through the data plane trips this assert."""
+        """A packed multimodal field has patch/image count on dim 1, not
+        seqlen. Without the skip every VLM step through the data plane trips
+        this assert."""
         data = BatchedDataDict(
             {
                 "input_ids": torch.randint(0, 1000, (4, 64)),
                 # [B, max_patches, C, H, W] — dim 1 is 7 patches, not 64 tokens.
                 "pixel_values": torch.randn(4, 7, 3, 2, 2),
-                "pixel_values__lengths": torch.tensor([7, 5, 0, 2]),
                 "image_grid_thw": torch.zeros(4, 2, 3, dtype=torch.long),
-                "image_grid_thw__lengths": torch.tensor([2, 1, 0, 1]),
             }
         )
 

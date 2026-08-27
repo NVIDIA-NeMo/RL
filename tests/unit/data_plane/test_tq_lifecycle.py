@@ -215,7 +215,6 @@ def test_each_public_data_operation_marks_the_client_dirty(
     client._data_operations_started = False
     client._warmed_fields = {}
     client._poll_interval_s = 0
-    client._promote_1d = False
 
     _DATA_OPERATION_INVOKERS[operation_name](client)
 
@@ -297,7 +296,6 @@ def test_checkpoint_load_rejects_client_after_data_operation(
     client = object.__new__(tq_adapter.TQDataPlaneClient)
     client._backend = "simple"
     client._supports_checkpointing = True
-    client._promote_1d = False
     client._data_operations_started = False
     client.put_samples(
         sample_ids=["sample-0"],
@@ -454,9 +452,13 @@ def test_smoke_round_trip_backends(tq_client_backends) -> None:
 def test_smoke_round_trip_1d_fields(tq_client_backends) -> None:
     """A 1D (N,) tensor put into TQ must come back as (N,), not (N,1).
 
-    Regression guard for R-C2: TQ's KVStorageManager path silently unsqueezes
-    1D fields. The adapter's `_promote_1d_leaves` + `_from_wire` pair fixes
-    this for mooncake_cpu; simple passes the tensor through unchanged.
+    Regression guard for R-C2, and the end-to-end proof of
+    ``_patch_scalar_field_schema``: upstream ``extract_field_schema``
+    reports a ``(1,)`` sample shape for dense 1-D fields while storage
+    holds 0-d rows, so the KV path would rebuild this column as nested
+    ``(1,)`` rows. The patch makes the reported shape match what is
+    stored; ``simple`` never consulted the schema and is unaffected either
+    way, so running both backends here pins that they agree.
     """
     n = 6
     total_reward = torch.arange(n, dtype=torch.float32)
@@ -650,34 +652,34 @@ def test_object_and_tensor_mixed_round_trip_backends(tq_client_backends) -> None
     client.clear_samples(sample_ids=None, partition_id=partition_id)
 
 
-def test_promote_1d_leaves_object_array_roundtrip() -> None:
-    """``_promote_1d_leaves`` + ``_from_wire`` preserves non-tensor leaves.
+def test_from_wire_preserves_object_arrays_through_densify() -> None:
+    """``_from_wire`` must not drop non-tensor leaves when it rebuilds.
 
-    Pins the production TD shape (1D tensor + object array + 2D tensor)
-    against tensordict 0.12.2 reconstruction bugs that could silently
-    strip ``NonTensorStack`` / ``NonTensorData`` leaves. Symmetric to
-    the documented ``.contiguous()`` bug in
-    ``adapters/transfer_queue.py`` lines 558–562.
+    It only constructs a new ``TensorDict`` when it densifies a uniform
+    nested field, and that rebuild is where tensordict 0.12.2 can silently
+    strip ``NonTensorStack`` / ``NonTensorData`` leaves. Symmetric to the
+    documented ``.contiguous()`` bug in ``adapters/transfer_queue.py``.
     """
-    from nemo_rl.data_plane.adapters.transfer_queue import (
-        _from_wire,
-        _promote_1d_leaves,
-    )
+    from nemo_rl.data_plane.adapters.transfer_queue import _from_wire
 
     arr = np.empty(4, dtype=object)
     arr[:] = [["a", "b"], ["c"], ["d", "e"], ["f"]]
+    # Uniform rows, so _from_wire densifies and takes the rebuild path.
+    nested = torch.nested.as_nested_tensor(
+        [torch.zeros(8, dtype=torch.long) for _ in range(4)], layout=torch.jagged
+    )
     td = TensorDict(
         {
-            "input_ids": torch.zeros(4, 8, dtype=torch.long),
-            "input_lengths": torch.tensor([4, 3, 2, 1]),  # 1D → promoted
+            "input_ids": nested,
+            "input_lengths": torch.tensor([4, 3, 2, 1]),
             "content": arr,
         },
         batch_size=[4],
     )
-    promoted = _promote_1d_leaves(td)
-    assert promoted["input_lengths"].shape == (4, 1)
-    np.testing.assert_array_equal(promoted["content"], arr)
 
-    restored = _from_wire(promoted)
+    restored = _from_wire(td)
+    assert not restored["input_ids"].is_nested
+    assert restored["input_ids"].shape == (4, 8)
+    # Scalar column passes through untouched — no squeeze step any more.
     assert restored["input_lengths"].shape == (4,)
     np.testing.assert_array_equal(restored["content"], arr)

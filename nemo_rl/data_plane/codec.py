@@ -318,7 +318,15 @@ def materialize(
                 f"materialize() received unexpected leaf type for {key!r}: "
                 f"{type(val)}. Expected Tensor or NonTensorStack."
             )
-        if val.is_nested and layout == "padded":
+        # Multimodal packed fields stay nested. Their rows are per-sample
+        # media, not a padded sequence: ``to_padded_tensor`` would
+        # rectangularize to ``[B, max_rows, ...]`` and the row boundaries
+        # would then have to be recovered from a companion field. TQ
+        # already stores one entry per row and reassembles them
+        # (``extract_field_schema`` records ``per_sample_shapes``), so the
+        # nested value handed back here carries the true per-row shapes —
+        # ``PackedTensor.from_wire`` just unbinds it.
+        if val.is_nested and layout == "padded" and key not in PACKED_MULTIMODAL_FIELDS:
             pad = pads.get(key, 0)
             padded = torch.nested.to_padded_tensor(val, padding=pad)
         else:
@@ -330,12 +338,17 @@ def materialize(
         # this they'd skip the cross-DP forward pad target and break the
         # microbatch iterator (truncate_tensors → narrow length>size).
         #
-        # Skip multimodal packed fields — their dim 1 is patch/image
-        # count, not seqlen, and padding it up to token seqlen inflates
-        # memory ~40x for pixel_values [B, patches, C, H, W].
+        # ``not padded.is_nested`` must be tested BEFORE ``shape[1]``: a
+        # nested tensor's dim 1 is ragged, and comparing it raises
+        # ``ValueError: ge: relation is indeterminate``. Anything still
+        # nested here was deliberately left so (multimodal packed fields,
+        # which skip ``to_padded_tensor`` above) and must not be padded
+        # anyway — their dim 1 is patch/image count, not seqlen, so
+        # extending it to a token seqlen inflates pixel_values ~40x.
         if (
             pad_to_seqlen > 0
             and isinstance(padded, torch.Tensor)
+            and not padded.is_nested
             and padded.dim() >= 2
             and padded.shape[1] < pad_to_seqlen
             and key not in PACKED_MULTIMODAL_FIELDS
