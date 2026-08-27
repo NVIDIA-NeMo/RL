@@ -58,8 +58,10 @@ TRAIN_CMD=(
     async_rl.sampler.name=in_order
     async_rl.sampler.max_lookahead_versions=1
     async_rl.min_groups_for_streaming_train=4
-    async_rl.max_inflight_prompts=6
-    async_rl.max_buffered_rollouts=6
+    async_rl.max_inflight_prompts=8
+    # >= num_prompts_per_step * (max_lookahead_versions + 1) = 4 * 2, or the
+    # in_order sampler deadlocks waiting for buffer slots and setup rejects it.
+    async_rl.max_buffered_rollouts=8
     cluster.gpus_per_node=2
     logger.tensorboard_enabled=true
     logger.wandb_enabled=false
