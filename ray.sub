@@ -200,6 +200,15 @@ else
 fi
 mkdir -p $LOG_DIR
 
+# Some launchers (e.g. g32nt_mlperf.sh) rely on /logs inside the container
+# resolving to the shared LOG_DIR (mlperf's run_and_time.sh / logger.log_dir
+# hardcode /logs). Without this mount, /logs is container-local and not
+# shared across nodes, so anything written under it on one node (e.g. Gym
+# agent trajectories/llm_completions) is invisible to other nodes/processes.
+if [[ "${MOUNT_LOG_DIR_IN_CONTAINER:-0}" == "1" ]]; then
+  MOUNTS+=",$LOG_DIR:/logs"
+fi
+
 # LOG_DIR must be shared across all nodes. Write a canary the head and worker
 # containers check at startup: a node that can't see it isn't on the shared FS, so
 # we fail there immediately instead of hanging on signal files that never appear.
