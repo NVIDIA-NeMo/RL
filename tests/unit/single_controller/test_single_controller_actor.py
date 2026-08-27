@@ -590,6 +590,7 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=_grpo_stub(seq_logprob_error_threshold=2.0)
@@ -658,6 +659,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=_grpo_stub(seq_logprob_error_threshold=None)
@@ -720,6 +722,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=_grpo_stub(seq_logprob_error_threshold=2.0)
@@ -775,6 +778,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=_grpo_stub(seq_logprob_error_threshold=None)
@@ -990,6 +994,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._advantage_estimator = None
     ctrl._partition_id = "rollout_data"
     ctrl._sampler = sampler
@@ -1310,6 +1315,7 @@ def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> No
     ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._trainer = _OrderRecordingTrainer(calls)
     ctrl._sync_weights = AsyncMock(return_value=1)
     ctrl._logger = MagicMock()
@@ -1449,6 +1455,7 @@ def test_train_pump_parks_the_policy_when_neither_logprob_is_needed(
     )
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._trainer = _OrderRecordingTrainer(calls)
     ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
@@ -1647,6 +1654,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = True
     ctrl._master_config = SimpleNamespace(
         ppo=_grpo_stub(seq_logprob_error_threshold=None)
@@ -1718,6 +1726,7 @@ def _knob_ctrl(estimator, grpo_stub):
     ctrl._advantage_estimator = estimator
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
     ctrl._master_config = SimpleNamespace(grpo=grpo_stub)
     ctrl._algo_cfg = grpo_stub
     ctrl._is_ppo = False
