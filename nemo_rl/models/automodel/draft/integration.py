@@ -33,7 +33,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_rl.models.automodel.draft.common import DSparkForwardOutput
 from nemo_rl.models.automodel.draft.draft_qwen3 import Qwen3DSparkModel
-from nemo_rl.models.automodel.draft.eagle3_qwen3 import Qwen3Eagle3DraftModel
+from nemo_rl.models.automodel.draft.eagle3_llama import Eagle3DraftModel
 from nemo_rl.models.automodel.draft.loss import compute_dspark_loss
 from nemo_rl.models.policy import Eagle3DraftOptions
 
@@ -184,28 +184,33 @@ def _adapt_speculators_eagle3_config(
     model_name: str,
     target_num_hidden_layers: Optional[int],
 ) -> Any:
-    """Map a speculators-format eagle3 config onto the vendored layout."""
+    """Map a speculators-format eagle3 config onto automodel's LlamaEagle3DraftModel."""
     from transformers.models.llama.configuration_llama import LlamaConfig
-    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
     layer_cfg = dict(config_dict["transformer_layer_config"])
-    model_type = layer_cfg.pop("model_type", "qwen3")
-    # The layer family is architecture, not cosmetics: speculators publishes
-    # qwen3-target eagle3 drafts under the LLAMA model_type (no q/k norms —
-    # e.g. RedHatAI/Qwen3-8B-speculator.eagle3), and both speculators training
-    # and the pinned vLLM's serving drafter build llama-style layers for them.
-    # The vendored model dispatches on model_type the same way.
-    if model_type == "llama":
-        adapted = LlamaConfig(**layer_cfg)
-    elif model_type == "qwen3":
-        adapted = Qwen3Config(**layer_cfg)
-    else:
+    model_type = layer_cfg.pop("model_type", "llama")
+    # automodel's LlamaEagle3DraftModel (nemo_automodel.components.speculative
+    # .eagle.draft_llama) only builds llama-style layers (no q/k norms). This
+    # matches every published eagle3 checkpoint seen so far: speculators
+    # publishes qwen3-target eagle3 drafts under the LLAMA model_type anyway
+    # (e.g. RedHatAI/Qwen3-8B-speculator.eagle3), and both speculators
+    # training and the pinned vLLM's serving drafter build llama-style
+    # layers for them regardless of the target family.
+    if model_type != "llama":
         raise ValueError(
-            "Speculators eagle3 adapter only supports qwen3/llama draft "
-            f"transformers, got transformer_layer_config.model_type="
-            f"{model_type!r} for {model_name}."
+            "Speculators eagle3 adapter only supports llama-family draft "
+            f"transformers (automodel's LlamaEagle3DraftModel), got "
+            f"transformer_layer_config.model_type={model_type!r} for {model_name}."
         )
-    adapted._attn_implementation = "sdpa"
+    adapted = LlamaConfig(**layer_cfg)
+    # Eagle3LlamaAttention reads the plain `attn_implementation` field, not
+    # HF's private `_attn_implementation` (owned by PreTrainedModel).
+    # flash_attention_2, not eager: eager attention materializes a dense
+    # [B, H, T, T] fp32 softmax intermediate (H=32 heads here), which is a
+    # ~12 GiB single allocation at a 10k-token packed row -- OOMs at full
+    # 4n8g training scale. FlashAttention-2's varlen kernel (driven via
+    # Eagle3DraftModel.forward's seq_lens) never materializes it.
+    adapted.attn_implementation = "flash_attention_2"
     adapted.architectures = list(
         config_dict.get("architectures") or ["Eagle3Speculator"]
     )
@@ -239,6 +244,7 @@ def _adapt_speculators_eagle3_config(
             )
         aux_ids = default_eagle3_aux_layer_ids_vllm(target_num_hidden_layers)
     adapted.target_layer_ids = [int(i) - 1 for i in aux_ids]
+    adapted.num_aux_hidden_states = len(adapted.target_layer_ids)
     return adapted
 
 
@@ -258,7 +264,14 @@ def _adapt_native_flat_eagle3_config(
     from transformers import AutoConfig
 
     adapted = AutoConfig.from_pretrained(model_name)
-    adapted._attn_implementation = "sdpa"
+    # Eagle3LlamaAttention reads the plain `attn_implementation` field, not
+    # HF's private `_attn_implementation` (owned by PreTrainedModel).
+    # flash_attention_2, not eager: eager attention materializes a dense
+    # [B, H, T, T] fp32 softmax intermediate (H=32 heads here), which is a
+    # ~12 GiB single allocation at a 10k-token packed row -- OOMs at full
+    # 4n8g training scale. FlashAttention-2's varlen kernel (driven via
+    # Eagle3DraftModel.forward's seq_lens) never materializes it.
+    adapted.attn_implementation = "flash_attention_2"
     if not getattr(adapted, "draft_vocab_size", None):
         raise ValueError(
             f"eagle3 draft checkpoint {model_name} config is missing "
@@ -276,6 +289,7 @@ def _adapt_native_flat_eagle3_config(
             )
         aux_ids = default_eagle3_aux_layer_ids_vllm(target_num_hidden_layers)
     adapted.target_layer_ids = [int(i) - 1 for i in aux_ids]
+    adapted.num_aux_hidden_states = len(adapted.target_layer_ids)
     if not hasattr(adapted, "norm_before_residual"):
         # Not recorded in the checkpoint and not independently verified
         # against the SpecForge training source -- confirm empirically
@@ -426,12 +440,12 @@ def build_eagle3_draft_model(
     mesh: Any,
     target_num_hidden_layers: int,
     policy_model: Optional[nn.Module] = None,
-) -> Qwen3Eagle3DraftModel:
+) -> Eagle3DraftModel:
     """Build, validate, and FSDP2-shard an EAGLE3 draft from a checkpoint.
 
     ``policy_model`` is only required for native-flat (SpecForge-style)
     checkpoints, which ship no ``embed_tokens`` of their own -- see
-    ``_load_native_eagle3_weights``.
+    ``_load_eagle3_weights``.
     """
     draft_hf_config = load_draft_hf_config(
         model_name, algo="eagle3", target_num_hidden_layers=target_num_hidden_layers
@@ -444,7 +458,6 @@ def build_eagle3_draft_model(
     accepted_archs = (
         "Eagle3Speculator",
         "Eagle3DraftModel",
-        "Qwen3Eagle3DraftModel",
         *NATIVE_FLAT_EAGLE3_ARCHS,
     )
     architectures = getattr(draft_hf_config, "architectures", None) or []
@@ -459,45 +472,61 @@ def build_eagle3_draft_model(
             f"{eagle3_options.ttt_steps}."
         )
 
-    if any(arch in architectures for arch in NATIVE_FLAT_EAGLE3_ARCHS):
-        draft_model = Qwen3Eagle3DraftModel(draft_hf_config).to(torch_dtype)
-        _load_native_eagle3_weights(draft_model, model_name, policy_model)
-    else:
-        draft_model = Qwen3Eagle3DraftModel.from_pretrained(
-            model_name,
-            config=draft_hf_config,
-            torch_dtype=torch_dtype,
-        )
-    draft_model = draft_model.to("cuda")
+    # LlamaRotaryEmbedding sizes its cos/sin cache from config.torch_dtype,
+    # defaulting to fp32 when unset (neither speculators-format checkpoints'
+    # transformer_layer_config nor a bare adapted config carry this field).
+    # An fp32 cache promotes q/k to fp32 through apply_rotary_pos_emb while
+    # the cached V (untouched by RoPE) stays in torch_dtype, so eager
+    # attention's attn_probs @ v0 mismatches dtypes; set it explicitly so
+    # RoPE runs in the training dtype throughout, matching every other
+    # tensor in the TTT forward.
+    draft_hf_config.torch_dtype = torch_dtype
+    draft_model = Eagle3DraftModel(draft_hf_config)
+    _load_eagle3_weights(
+        draft_model,
+        model_name,
+        policy_model,
+        needs_embed_tokens_from_policy=any(
+            arch in architectures for arch in NATIVE_FLAT_EAGLE3_ARCHS
+        ),
+    )
+    draft_model = draft_model.to(torch_dtype).to("cuda")
 
     draft_model.requires_grad_(True)
     draft_model.set_embedding_head_trainable(bool(eagle3_options.train_embed_and_head))
 
     from torch.distributed.fsdp import fully_shard
 
-    for layer in draft_model.layers:
+    for layer in draft_model.model.layers:
         fully_shard(layer, mesh=mesh)
     fully_shard(draft_model, mesh=mesh)
     return draft_model
 
 
-def _load_native_eagle3_weights(
-    draft_model: Qwen3Eagle3DraftModel,
+def _load_eagle3_weights(
+    draft_model: Eagle3DraftModel,
     model_name: str,
     policy_model: Optional[nn.Module],
+    needs_embed_tokens_from_policy: bool,
 ) -> None:
-    """Load a native (SGLang SpecForge-style) eagle3 checkpoint's weights.
+    """Load an eagle3 checkpoint's weights into automodel's LlamaEagle3DraftModel.
 
-    These checkpoints publish their single decoder layer under the
-    ``midlayer.`` key prefix (the vendored model's ``nn.ModuleList`` uses
-    ``layers.0.``) and ship no ``embed_tokens`` at all -- the drafter is
-    meant to share the target model's embedding table. True weight tying
-    (aliasing the same ``nn.Parameter``) isn't possible here: the draft and
-    policy are ``fully_shard``-ed on different device meshes, so this copies
-    the policy's embedding VALUES once at init instead (matching how the
-    megatron eagle path backfills a checkpoint's missing lm_head from the
-    policy) and lets the copy train independently thereafter, governed by
-    ``train_embed_and_head`` like the rest of the embedding/head.
+    Checkpoints publish a FLAT layout (no ``model.`` prefix -- the vendored
+    single-file trainer this replaces used the same flat layout) with the
+    lone decoder layer under either ``layers.0.`` (speculators/RedHatAI) or
+    ``midlayer.`` (SGLang SpecForge/lmsys); both remap onto automodel's
+    ``model.layers.0.`` (``lm_head``/``d2t``/``t2d`` stay top-level in both
+    layouts, matching automodel's).
+
+    Some checkpoints (SpecForge) ship no ``embed_tokens`` at all -- the
+    drafter is meant to share the target model's embedding table. True
+    weight tying (aliasing the same ``nn.Parameter``) isn't possible here:
+    the draft and policy are ``fully_shard``-ed on different device meshes,
+    so ``needs_embed_tokens_from_policy`` copies the policy's embedding
+    VALUES once at init instead (matching how the megatron eagle path
+    backfills a checkpoint's missing lm_head from the policy) and lets the
+    copy train independently thereafter, governed by ``train_embed_and_head``
+    like the rest of the embedding/head.
     """
     import os
 
@@ -509,36 +538,44 @@ def _load_native_eagle3_weights(
         if os.path.isdir(model_name)
         else hf_hub_download(model_name, "model.safetensors")
     )
-    state_dict = {
-        (key.replace("midlayer.", "layers.0.", 1) if key.startswith("midlayer.") else key): value
-        for key, value in load_file(weights_path).items()
-    }
 
-    if policy_model is None:
-        raise ValueError(
-            f"eagle3 draft checkpoint {model_name} ships no embed_tokens weight "
-            "(it expects to share the target model's embedding table), but no "
-            "policy model was provided to copy it from."
+    def _remap(key: str) -> str:
+        if key in ("lm_head.weight", "d2t", "t2d"):
+            return key
+        if key.startswith("midlayer."):
+            return "model.layers.0." + key[len("midlayer.") :]
+        if key.startswith("layers.0."):
+            return "model.layers.0." + key[len("layers.0.") :]
+        return "model." + key
+
+    state_dict = {_remap(key): value for key, value in load_file(weights_path).items()}
+
+    if needs_embed_tokens_from_policy:
+        if policy_model is None:
+            raise ValueError(
+                f"eagle3 draft checkpoint {model_name} ships no embed_tokens "
+                "weight (it expects to share the target model's embedding "
+                "table), but no policy model was provided to copy it from."
+            )
+        policy_base, _ = _resolve_layers(policy_model)
+        policy_embed = getattr(policy_base, "embed_tokens", None)
+        if policy_embed is None:
+            raise ValueError(
+                f"Cannot initialize eagle3 draft embed_tokens for {model_name}: "
+                "the policy model has no `.embed_tokens`."
+            )
+        embed_weight = policy_embed.weight.detach()
+        if isinstance(embed_weight, DTensor):
+            embed_weight = embed_weight.full_tensor()
+        state_dict["model.embed_tokens.weight"] = embed_weight.to(
+            draft_model.model.embed_tokens.weight.dtype
         )
-    policy_base, _ = _resolve_layers(policy_model)
-    policy_embed = getattr(policy_base, "embed_tokens", None)
-    if policy_embed is None:
-        raise ValueError(
-            f"Cannot initialize eagle3 draft embed_tokens for {model_name}: the "
-            "policy model has no `.embed_tokens`."
-        )
-    embed_weight = policy_embed.weight.detach()
-    if isinstance(embed_weight, DTensor):
-        embed_weight = embed_weight.full_tensor()
-    state_dict["embed_tokens.weight"] = embed_weight.to(
-        draft_model.embed_tokens.weight.dtype
-    )
 
     missing, unexpected = draft_model.load_state_dict(state_dict, strict=False)
     if missing or unexpected:
         raise ValueError(
-            f"eagle3 native checkpoint {model_name} state dict mismatch after "
-            f"the midlayer->layers.0 remap: missing={missing}, "
+            f"eagle3 checkpoint {model_name} state dict mismatch after the "
+            f"flat->model.-prefixed remap: missing={missing}, "
             f"unexpected={unexpected}."
         )
 
@@ -982,7 +1019,7 @@ class Eagle3Runtime(_DraftRuntimeBase):
 
     def __init__(
         self,
-        draft_model: Qwen3Eagle3DraftModel,
+        draft_model: Eagle3DraftModel,
         eagle3_options: Eagle3DraftOptions,
         loss_weight: float,
         dp_group: Optional[dist.ProcessGroup],
@@ -1062,6 +1099,20 @@ class Eagle3Runtime(_DraftRuntimeBase):
         position_ids = (1 + positions).expand(batch_size, -1)
 
         total = batch_size * seq_len
+        # Every sample occupies a fixed seq_len-wide slot in the packed row
+        # (padding inside the slot, at its tail); for the flash_attention_2
+        # path each slot is declared as one FlashAttention-varlen "document"
+        # of that fixed width -- see Eagle3DraftModel.forward's seq_lens
+        # docstring for why that's safe despite the internal padding. Built
+        # unconditionally; Eagle3DraftModel ignores it on the eager path.
+        seq_lens = torch.full(
+            (1, batch_size), seq_len, dtype=torch.long, device=device
+        )
+
+        # Called as self.draft_model(...) (nn.Module.__call__), not a bare
+        # method: FSDP2's fully_shard unshard/reshard hooks fire on
+        # __call__, and this is the only entry point that runs the WHOLE
+        # TTT unroll under a single top-level call (see Eagle3DraftModel).
         terms = self.draft_model(
             fused_hidden_states=fused_hidden.reshape(1, total, -1),
             input_ids=input_ids.reshape(1, total),
@@ -1070,6 +1121,7 @@ class Eagle3Runtime(_DraftRuntimeBase):
             teacher_logits=teacher_logits.reshape(1, total, -1),
             position_ids=position_ids.reshape(1, total),
             ttt_steps=int(self.options.ttt_steps),
+            seq_lens=seq_lens,
         )
 
         decay = float(self.options.ttt_step_loss_decay)

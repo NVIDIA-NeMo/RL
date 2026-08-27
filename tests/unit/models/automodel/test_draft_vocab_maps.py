@@ -72,11 +72,11 @@ def _tiny_dspark_model(d2t: torch.Tensor, t2d: torch.Tensor):
 
 
 def _tiny_eagle3_model(d2t: torch.Tensor, t2d: torch.Tensor):
-    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+    from transformers.models.llama.configuration_llama import LlamaConfig
 
-    from nemo_rl.models.automodel.draft.eagle3_qwen3 import Qwen3Eagle3DraftModel
+    from nemo_rl.models.automodel.draft.eagle3_llama import Eagle3DraftModel
 
-    config = Qwen3Config(
+    config = LlamaConfig(
         hidden_size=32,
         intermediate_size=64,
         num_hidden_layers=1,
@@ -88,11 +88,12 @@ def _tiny_eagle3_model(d2t: torch.Tensor, t2d: torch.Tensor):
         rms_norm_eps=1e-6,
         attention_bias=False,
     )
-    config._attn_implementation = "eager"
+    config.attn_implementation = "eager"
     config.draft_vocab_size = DRAFT_VOCAB
     config.norm_before_residual = True
     config.target_layer_ids = [0, 0, 0]
-    model = Qwen3Eagle3DraftModel(config)
+    config.num_aux_hidden_states = 3
+    model = Eagle3DraftModel(config)
     with torch.no_grad():
         model.d2t.copy_(d2t)
         model.t2d.copy_(t2d)

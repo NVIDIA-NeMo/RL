@@ -188,6 +188,22 @@ def _maybe_adapt_tensor_to_hf(
     return [(fqn, tensor)]
 
 
+def _draft_refit_export_name(name: str) -> str:
+    """Strip the ``model.`` prefix automodel's eagle3 draft wraps params in.
+
+    vLLM's own serving-side eagle3 drafter (``Eagle3Qwen3ForCausalLM`` etc.)
+    is built the same way -- its own params carry a ``model.`` prefix too --
+    and ``VllmInternalWorkerExtension._expected_draft_keys()`` computes the
+    key it expects FROM the trainer as ``name.removeprefix("model.")``
+    (except ``lm_head.*``/``d2t``/``t2d``, which are already top-level on
+    both sides). Mirror that here so the ``draft.*`` refit manifest this
+    worker exports actually matches what vLLM expects. The dspark/dflash
+    draft (``Qwen3DSparkModel``) has no ``model.`` submodule at all, so this
+    is a no-op for it.
+    """
+    return name.removeprefix("model.")
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class DTensorPolicyWorkerV2Impl(
@@ -1223,7 +1239,10 @@ class DTensorPolicyWorkerV2Impl(
             # the stream generator only casts floating-point tensors.
             for name, tensor in self.draft_model.state_dict().items():
                 dtype = self.dtype if tensor.is_floating_point() else tensor.dtype
-                state_dict_info[f"draft.{name}"] = (tensor.shape, dtype)
+                state_dict_info[f"draft.{_draft_refit_export_name(name)}"] = (
+                    tensor.shape,
+                    dtype,
+                )
 
         return state_dict_info
 
@@ -1237,7 +1256,7 @@ class DTensorPolicyWorkerV2Impl(
         # The draft is a plain HF module (no LoRA, no state-dict adapter), so
         # the shared generator's merge/adapt steps are no-ops for it.
         draft_gen = (
-            (f"draft.{name}", tensor)
+            (f"draft.{_draft_refit_export_name(name)}", tensor)
             for name, tensor in dtensor_params_generator(self.draft_model, self.dtype)
         )
         return itertools.chain(gen, draft_gen)
