@@ -669,7 +669,7 @@ def test_prepare_refit_info_reports_only_fp8_weights(monkeypatch, enabled):
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
-    model = object()
+    model = torch.nn.Module()
     config = object()
     ext.model_runner = SimpleNamespace(model=model, vllm_config=config)
     state_dict_info = {

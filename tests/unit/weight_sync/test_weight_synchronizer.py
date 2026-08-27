@@ -655,6 +655,7 @@ class TestCollectiveWeightSynchronizer:
         policy.broadcast_weights_for_collective.assert_called_once_with(
             kv_scales=None,
             buffer_size_bytes=expected_bytes,
+            num_buffers=None,
         )
         gen.update_weights_from_collective.assert_called_once_with(
             buffer_size_bytes=expected_bytes

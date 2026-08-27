@@ -1094,7 +1094,7 @@ def test_load_weights_preserves_prequantized_mxfp8_and_clamps_scales(
     assert loaded[2][0] == "model.prequantized.weight_scale_from_checkpoint"
     assert loaded[2][1] is prequantized_scales
     assert loaded[3][0] == "model.receiver.weight"
-    assert loaded[3][1] is receiver_fp8
+    assert loaded[3][1].data_ptr() == receiver_fp8.data_ptr()
     assert loaded[4][0] == "model.receiver.weight_scale_from_checkpoint"
     torch.testing.assert_close(
         loaded[4][1],

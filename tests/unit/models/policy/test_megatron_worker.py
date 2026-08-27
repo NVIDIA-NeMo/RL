@@ -512,10 +512,12 @@ def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
             MegatronPolicyWorkerImpl._iter_params_with_optional_kv_scales
         )
         _maybe_prequantize_param = MegatronPolicyWorkerImpl._maybe_prequantize_param
+        _is_fp8_export = MegatronPolicyWorkerImpl._is_fp8_export
 
     name = "model.layers.0.mlp.down_proj.weight"
     weight = torch.randn(64, 64, dtype=torch.bfloat16)
     worker = _PrequantCheckpointWorker()
+    worker.fp8_cfg = None
     worker._refit_prequant_names = set()
     worker.model = object()
     worker.draft_model = None
