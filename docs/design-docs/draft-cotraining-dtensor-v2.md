@@ -49,6 +49,7 @@ mask 构造和 loss 数学计算（`nemo_automodel.components.speculative.dspark
 | `attention.dflash_mask.{create_dflash_block_mask, create_dflash_sdpa_mask}` | `draft_qwen3.py` 直接调用的 block-causal attention mask |
 | `dspark.common.{AcceptRatePredictor, context_doc_ids, create_noise_embed, create_position_ids, extract_context_feature, pin_rope_inv_freq_fp32, validate_target_layer_ids}` | 未改动的辅助函数，从 `nemo_rl/models/automodel/draft/common.py` re-export |
 | `dspark.markov_head.{GatedMarkovHead, RNNHead}` | markov head 类，未改动 |
+| `eagle.draft_llama.{LlamaEagle3DraftModel, Eagle3LlamaAttention, Eagle3LlamaDecoderLayer, Eagle3LlamaModel}` | eagle3 的整套网络实现（attention/decoder layer/embedding/fc/lm_head）——`eagle3_llama.py` 直接子类化 `LlamaEagle3DraftModel`，不重新实现 attention 数学（详见 §2.5，这是本次改动新增的复用面） |
 
 `nemo_rl/models/automodel/draft/__init__.py` 把这一层定位为"thin extension
 layer"：上表内容全部直接导入，只有下面几个文件包含本地代码，且每个文件顶部都
@@ -63,6 +64,7 @@ flowchart LR
         AM3["attention.dflash_mask"]
         AM4["dspark.common（大部分）"]
         AM5["dspark.markov_head（基类）"]
+        AM6["eagle.draft_llama<br/>LlamaEagle3DraftModel 网络实现"]
     end
     subgraph RL["nemo_rl/models/automodel/draft/（本地扩展）"]
         direction TB
@@ -70,7 +72,7 @@ flowchart LR
         RL2["draft_qwen3.py<br/>教师信号=policy 实时 logits"]
         RL3["loss.py<br/>DP/CP 归一化约定"]
         RL4["markov_head.py<br/>speculators 缩减词表适配"]
-        RL5["eagle3_qwen3.py<br/>从 speculators 独立 vendor"]
+        RL5["eagle3_llama.py<br/>子类化 automodel 的网络<br/>+ RL 形态的 TTT 训练循环"]
         RL6["integration.py<br/>RL 训练循环胶水层"]
     end
     AM --> RL
@@ -157,26 +159,127 @@ trainer 内部才能判断清楚。
 特有的决策，但因为它是加载本集成所面向的具体 checkpoint 所必需的，也就只能
 放在这里。
 
-### 2.5 `eagle3_qwen3.py` —— 从零 vendor，而非 Automodel 的扩展
+### 2.5 `eagle3_llama.py` —— 复用 Automodel 的网络实现，但训练循环仍是本地代码
 
-和 DSpark 家族不同，Automodel r0.6.0 在 DTensor-v2 路径上**并没有**提供
-EAGLE3 drafter（此前 EAGLE3 联合训练只存在于 Megatron 后端）。
-`eagle3_qwen3.py` 是直接从 `vllm-project/speculators@0b08a89`（而非
-Automodel）vendor 过来的，精简成一个自包含文件，包含以下改动，每一处都是
-为 RL 而非"监督式 drafter 预训练"而做的：
+这一节是本文档更新的重点，专门回答一个问题：**既然 eagle3 现在 import 了
+Automodel 的模型代码，为什么 `eagle3_llama.py`／`integration.py` 里还有
+好几百行本地代码，不能直接把 Automodel 的 eagle3 全套原样拿来用？**
 
-- **教师 logits 来自调用方传入的张量**，而不是冻结 verifier 的 norm/lm_head
-  副本——理由同 §2.2：教师必须是**当前** policy 的原始 logits（经 d2t 映射到
-  draft 词表顺序），蒸馏目标才能跟得上 RL 训练过程中 policy 分布的漂移。
-- **用 dense SDPA mask 代替 flex-attention block mask**——RL 训练序列足够短，
-  不值得为此引入 flex-attention 依赖；mask 语义（causal + 同文档 +
-  per-TTT-step 对角扩展）保持一致。
-- **embedding 梯度不再被 `no_grad` 挡住**——上游 trainer 在 TTT embedding
-  查表外面套的 `no_grad`，会悄悄让 `train_embed_and_head=True` 失效；这里
-  改为完全由 `set_embedding_head_trainable()` 控制可训练性。
-- **返回每个 step 的 loss 分子/分母**（而不是一个本地归一化好的标量），
-  这样 RL runtime 就能套用自己的全局（DP-reduced、按 microbatch slot 归一化）
-  组合方式——和 §2.3 里"谁负责最终归一化"是同一类拆分。
+早期版本的 `eagle3_qwen3.py` 是从 `vllm-project/speculators@0b08a89`
+（而非 Automodel）整段 vendor 过来、手写 attention 的一个自包含文件——原因是
+"当时没有做过 Automodel-vs-vendor 的成本对比"，而不是 Automodel 真的没有
+这块能力。这一版重新做了对比：Automodel `nemo_automodel.components
+.speculative.eagle.draft_llama` 其实**已经**提供了一套通用的
+`LlamaEagle3DraftModel` 网络实现（配套的 `Eagle3TrainerModule` 训练循环见
+`eagle.core`），而且这套 attention 实现明显优于手写版本——step 0 的
+causal block 只算一次，之后每个 TTT step 只需要对**自己上一步**的 K/V
+做一次 O(T) 的 einsum "对角线"注意力（靠一个共享的 `cache_hidden` 列表），
+而不是像手写版本那样每一步都要对整条不断增长的 KV cache 重新做一次
+O(T² × step) 的矩阵乘法。`eagle3_llama.py` 现在直接子类化
+`LlamaEagle3DraftModel`，**网络本身（attention/decoder layer/embedding/
+fc/lm_head）完全是 import 过来的，不再重新实现**。
+
+但"网络实现"和"训练循环"是两回事——Automodel 的 `Eagle3TrainerModule`
+（`eagle.core`）是配合它自己的 `TrainEagle3Recipe`（从零训练一个 drafter
+的离线 SFT recipe）设计的，跟 RL co-training 的形态在好几个维度上都对不上：
+
+- **它不知道怎么加载别人发布的 checkpoint。** `Eagle3TrainerModule` /
+  `LlamaEagle3DraftModel` 面向的场景是"用 Automodel 自己的 recipe 从零训一个
+  drafter"，整个 `speculative/eagle/` 目录里**没有任何一处** `from_pretrained`
+  是用来加载第三方发布的 draft checkpoint 的（唯二的 `from_pretrained` 调用
+  都是加载 target/verifier 模型）。而 RL co-training 的前提恰恰是**从一个
+  已经训练好、别人发布的 drafter 开始**（RedHatAI 的 speculators 格式
+  checkpoint、lmsys/SGLang SpecForge 的原生扁平格式 checkpoint），
+  co-train 让它跟上 RL 训练中漂移的 policy——这个能力 Automodel 完全没有，
+  只能自己写：`_adapt_speculators_eagle3_config` /
+  `_adapt_native_flat_eagle3_config` 把两种第三方格式翻译成
+  `LlamaEagle3DraftModel` 期望的 config，`_load_eagle3_weights` 把两种
+  格式各自的扁平 key（`layers.0.*` 或 SpecForge 的 `midlayer.*`）重映射到
+  Automodel 的 `model.*` 前缀布局（详见 §3.5）。
+- **`Eagle3TrainerModule.forward()` 的归一化约定跟 RL 的梯度累积对不上。**
+  它返回的是一个已经按 TTT 衰减权重合并好的标量 loss、和一个已经除好的
+  accuracy 比率，只对 CP group 做过 all-reduce——这跟 §2.3／§3.2 里
+  DSpark 遇到的问题是同一类：RL 需要按**整个 global batch** 的
+  microbatch-slot 数量做归一化，而不是 `Eagle3TrainerModule` 内置的那种
+  CP-only 归一化。所以 `eagle3_llama.py` 没有调用
+  `Eagle3TrainerModule.forward()`，而是在 `Eagle3DraftModel.forward()`
+  里重写了一份等价的 TTT 循环，返回每个 TTT step 的 loss 分子/分母
+  （而非合并好的标量），交给 `Eagle3Runtime.compute_loss` 去做
+  DP-reduced、按 microbatch slot 归一化的组合。
+- **RL 的 microbatch 打包方式跟它自带的 mask 构造对不上。**
+  `LlamaEagle3DraftModel.forward()` 这个"一键跑完整个 TTT step"的封装，
+  只会从一个 2D padding mask，或者一个按 `seq_lens` 表示的定长 packing
+  方案里构造 attention mask；而 RL 训练把一整个 microbatch（多条 rollout
+  序列）打包进**一行**、每条样本占一个固定宽度的 slot、padding 在 slot
+  尾部——这个具体的打包约定跟它自带的两条路径都不完全一致。因此
+  `Eagle3DraftModel.forward()` 没有走这层封装，而是直接调用模型暴露的、
+  明显是设计给外部 trainer 用的分件 API（`embed_input_ids` /
+  `project_hidden_states` / `model.layers[0]` / `compute_logits`），自己
+  拼出一份贴合 RL 打包方式的 mask（eager 路径）或 `seq_lens`/`cu_seqlens`
+  （flash-attn 路径）。flash-attn 这条路径上有个不算显然的小结论：把
+  **每个固定宽度的 slot（含尾部 padding）整体声明成一个 varlen "document"**
+  是安全的——padding 总是在 slot 尾部，causal mask 本来就不会让真实 token
+  往后看到自己的 padding，而 padding 位置自己的输出又会被 `loss_mask`
+  排除在 loss 之外，所以不需要在 `seq_lens` 里再区分 slot 内的真实长度和
+  padding 长度。这个结论已经写进了一个 GPU 单测
+  （`test_flash_attention_2_packing_matches_eager_dense_mask`），逐位对比
+  flash-attn 打包路径和 eager dense-mask 路径的 loss/梯度。
+- **它没有为 20k token 级别的 RL rollout 做过显存优化。** eager attention
+  在 `Eagle3TrainerModule`/`LlamaEagle3DraftModel` 里会构造一个
+  `[B, H, T, T]` 的 fp32 softmax 中间张量——在 32 个 head、1 万 token 的
+  打包行下就是单次 ~12 GiB 的分配，在完整 4n8g 训练规模下直接 OOM，这也是
+  `attn_implementation` 现在切到 `flash_attention_2` 的原因（eager 只是
+  迁移初期为了降低风险留的保底路径，配合上面提到的单测跟 flash-attn 版本
+  做数值对比）。`compute_logits`（也就是 `lm_head`）同样没做过分块——
+  预训练语料一般远短于 RL 生成的响应长度，不会暴露这个问题；但在
+  18-20k token 的 RL rollout、64000 词表的 draft 词表下，单次
+  `[1, T, draft_vocab]` 的 logits 张量就有 ~2.4 GiB，每个 TTT step 都会
+  materialize 一次。`eagle3_llama.py` 把 `compute_logits` 沿序列维度分块
+  调用（`_KL_CHUNK_TOKENS`），这两处都是 RL 长响应场景特有的问题，
+  Automodel 的 SFT 语料不会触发。
+
+除了"训练循环怎么接"之外，把 Automodel 的网络原样接进 RL 训练循环时还
+踩到了两个**真实的正确性 bug**，都不是 RL 特有的设计取舍，而是 Automodel
+这套代码本身在"被非它自己的 recipe 调用"时暴露出来的缺陷，只能在本地打
+补丁：
+
+- `Eagle3LlamaDecoderLayer.forward()` 把 `norm_before_residual`
+  这个残差卷积方式**写死成 False**，完全没有开关；而 RedHatAI 的
+  speculators checkpoint 在 config 里明确声明 `norm_before_residual: true`。
+  如果直接用未修改的 Automodel 层去加载这份 checkpoint，会悄悄用错残差
+  约定，训练数值不会报错但是错的。`_Eagle3LlamaDecoderLayerWithResidualToggle`
+  把这个开关加回来，只重写了 `forward()`，state dict 的 key/shape
+  跟父类完全一致，checkpoint 加载不受影响。
+- `LlamaRotaryEmbedding` 的 cos/sin cache dtype 取自 `config.torch_dtype`，
+  没设置时默认 fp32——这会让 RoPE 之后的 q/k 被提升成 fp32，而没被 RoPE
+  处理过的、缓存起来的 v 还留在训练 dtype（bf16），eager attention 里
+  `attn_probs @ v0` 直接类型不匹配报错。`build_eagle3_draft_model` 里
+  现在显式设置 `draft_hf_config.torch_dtype = torch_dtype`。
+
+最后，vLLM serving 侧对 draft checkpoint 权重流（refit）里 key 命名的
+预期，也是按照 Automodel **之前**没有的东西设计的：vLLM 自己的 eagle3
+serving 端模型同样是"把东西包在一个 `model` 子模块下面"的写法，refit
+校验逻辑（`_expected_draft_keys`）预期训练端发来的是**去掉 `model.` 前缀
+之后**的扁平 key（跟旧版手写 vendor 代码的扁平命名一致）。Automodel 的
+`LlamaEagle3DraftModel` 把网络包在 `self.model` 下面，导致训练端
+state_dict 的 key 天然带 `model.` 前缀，直接对不上 vLLM 的预期——
+`dtensor_policy_worker_v2.py` 里新增的 `_draft_refit_export_name` 就是
+在导出 refit 权重流时把这个前缀剥掉。
+
+也踩过的另一处，是 FSDP2 相关但更偏工程实现细节：`fully_shard` 的
+unshard/reshard 钩子只挂在 `nn.Module.__call__` 上，如果像上面说的那样
+直接调用 `embed_input_ids` / `compute_logits` 这些"裸方法"（不经过顶层
+`__call__`），这些子模块的参数会在 forward 中途仍然是切分后的 DTensor，
+导致矩阵乘法报 DTensor/Tensor 混用的错误。所以整个 TTT 循环现在整体放在
+`Eagle3DraftModel.forward()` 里，调用方永远是 `self.draft_model(...)`
+这样的整体调用，而不是拆开的分件调用。
+
+**小结**：Automodel 提供的是"网络长什么样、怎么算 attention"这一层，
+`eagle3_llama.py` 复用的正是这一层；但"怎么加载第三方发布的 checkpoint、
+怎么归一化 loss、怎么打包 RL 的 microbatch、怎么跟 FSDP2/refit 对接"这几层，
+本质上都是 §3 里反复出现的同一个理由——Automodel 的 Trainer 完全没有
+"RL rollout / refit / 第三方 checkpoint 兼容"这些概念，这些代码只能留在
+NeMo-RL 这一侧。
 
 ## 3. `integration.py` —— Automodel 没有位置安放的 RL 专属胶水层
 
@@ -285,7 +388,7 @@ flowchart TB
 Automodel 的 DCP checkpointer API，无论模型代码多么忠实于上游，这部分逻辑
 都只能放在集成层。
 
-### 3.5 speculators 格式 checkpoint 的 config 适配
+### 3.5 第三方发布 checkpoint 的 config／权重适配
 
 `load_draft_hf_config` / `_adapt_speculators_dspark_config` /
 `_adapt_speculators_eagle3_config` 把 speculators 格式的 checkpoint
@@ -296,6 +399,20 @@ Automodel 的 DCP checkpointer API，无论模型代码多么忠实于上游，�
 **联合训练与 vLLM 已经在 serving 的同一种 checkpoint 格式**，从而打通
 "训练 → refit → serving"这个闭环；一个从零开始的 drafter trainer 完全没有
 理由需要理解一个 serving 引擎的 checkpoint 方言。
+
+eagle3 这边还多了一层：`_adapt_native_flat_eagle3_config` 处理**不是**
+speculators 格式、而是 SGLang SpecForge 直接导出的原生扁平 checkpoint
+（例如 `lmsys/SGLang-EAGLE3-*`）——这类 checkpoint 既不记录
+`norm_before_residual`，也不记录 aux 捕获层 id，需要按跟 speculators
+适配器一致的方式补全默认值；同时它不带自己的 `embed_tokens`（设计上是要
+共享 target 模型的 embedding），`_load_eagle3_weights` 会从 policy 的
+embedding 拷贝一份初始值（不是真正的权重共享——draft 和 policy 分别挂在
+不同的 FSDP2 mesh 上，没法共享同一个 `nn.Parameter`），并把它的单层
+`midlayer.*` key 重映射到 Automodel 的 `model.layers.0.*`。这两条适配
+路径（speculators、SpecForge）连同 §2.5 提到的 `model.` 前缀重映射，
+被统一到一个 `_load_eagle3_weights` 里。同样地，能这样做的前提是
+Automodel 自己完全没有理解任何一种第三方 checkpoint 方言的理由——它只
+认得自己训出来的 checkpoint。
 
 ## 4. RL 训练循环中的接线（`draft/` 目录之外）
 
@@ -321,7 +438,11 @@ Automodel 的 DCP checkpointer API，无论模型代码多么忠实于上游，�
   这些 key，使**权重 refit 路径把 draft 权重和 policy 权重一起同步给 vLLM
   生成 worker**——这正是让 co-training 真正对 RL 有用的一步（下一轮 rollout
   会用更新后的 draft 权重做投机采样）。Automodel 的 Trainer 完全没有
-  "refit"这个概念；这纯粹是 RL rollout 生成侧的集成点。
+  "refit"这个概念；这纯粹是 RL rollout 生成侧的集成点。eagle3 改用
+  Automodel 的 `LlamaEagle3DraftModel` 之后，这里还多了一步
+  `_draft_refit_export_name`：把 state_dict 天然带的 `model.` 前缀剥掉，
+  对齐 vLLM serving 端 `_expected_draft_keys` 的扁平 key 预期（详见
+  §2.5 最后一段）。
 - **`nemo_rl/models/policy/lm_policy.py`**：校验 `policy.draft.*` 配置——
   后端限制（DSpark/DFlash 要求 DTensor-v2；EAGLE3 还可以走 Megatron 上
   已有的独立路径）、与 sequence packing 的不兼容（暂不支持）、以及在
@@ -341,14 +462,14 @@ flowchart TB
         B1["policy 自身的实时 logits/hidden 作为教师"]
         B2["anchor gate 在 rollout response 边界上"]
         B3["DP/CP 归一化约定"]
-        B4["draft/{common,draft_qwen3,loss,eagle3_qwen3}.py"]
+        B4["draft/{common,draft_qwen3,loss,eagle3_llama}.py"]
     end
     subgraph L3["训练循环 & 分布式拓扑胶水 —— NeMo-RL 拥有"]
         C1["hidden/logit 捕获钩子"]
         C2["跨梯度累积一致的 loss 缩放"]
         C3["跨 TP 确定性 anchor 采样"]
         C4["policy+draft 耦合 checkpoint"]
-        C5["speculators 格式 config 适配"]
+        C5["第三方 checkpoint 格式适配<br/>（speculators / SpecForge）"]
         C6["draft/integration.py"]
     end
     subgraph L4["把 co-training 接入 RL 主循环 —— NeMo-RL 拥有"]
@@ -367,6 +488,6 @@ flowchart TB
 | 复用边界 | 归属 | 原因 |
 | --- | --- | --- |
 | 模型架构、attention mask、纯 loss 数学 | Automodel（`nemo_automodel.components.speculative.*`） | 确定性、教师无关的计算；无论调用方是预训练 trainer 还是 NeMo-RL，结果完全一致 |
-| RL 形态的教师信号（policy 自身实时 logits/hidden）、anchor gate 在 rollout response 边界上、DP/CP 归一化约定 | NeMo-RL（`draft/{common,draft_qwen3,loss,eagle3_qwen3}.py`） | 依赖 NeMo-RL **如何**跑 policy 前向、**如何**分布梯度——Automodel 对这两者都不可见 |
-| hidden/logit 捕获钩子、跨梯度累积一致的 loss 缩放、跨 TP 确定性 anchor 采样、policy+draft 耦合 checkpoint、speculators 格式 config 适配 | NeMo-RL（`draft/integration.py`） | RL 训练循环与分布式拓扑相关的问题，上游没有对应场景 |
-| optimizer/参数组搭建、教师 logits 截获时机、组合 loss wrapper、权重 refit 同步、config 校验 | NeMo-RL（`automodel/{setup,train}.py`、`algorithms/loss/wrapper.py`、`policy/{lm_policy,workers/dtensor_policy_worker_v2}.py`） | 让 co-training 真正成为 RL 主循环（rollout → 训练 → refit）的一部分；Automodel 的 Trainer 没有 rollout/refit 概念可以接入 |
+| RL 形态的教师信号（policy 自身实时 logits/hidden）、anchor gate 在 rollout response 边界上、DP/CP 归一化约定 | NeMo-RL（`draft/{common,draft_qwen3,loss,eagle3_llama}.py`） | 依赖 NeMo-RL **如何**跑 policy 前向、**如何**分布梯度——Automodel 对这两者都不可见 |
+| hidden/logit 捕获钩子、跨梯度累积一致的 loss 缩放、跨 TP 确定性 anchor 采样、policy+draft 耦合 checkpoint、第三方 checkpoint 格式适配（speculators / SpecForge） | NeMo-RL（`draft/integration.py`） | RL 训练循环与分布式拓扑相关的问题，上游没有对应场景 |
+| optimizer/参数组搭建、教师 logits 截获时机、组合 loss wrapper、权重 refit 同步（含 eagle3 的 `model.` 前缀剥离）、config 校验 | NeMo-RL（`automodel/{setup,train}.py`、`algorithms/loss/wrapper.py`、`policy/{lm_policy,workers/dtensor_policy_worker_v2}.py`） | 让 co-training 真正成为 RL 主循环（rollout → 训练 → refit）的一部分；Automodel 的 Trainer 没有 rollout/refit 概念可以接入 |
