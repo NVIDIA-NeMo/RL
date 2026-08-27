@@ -69,7 +69,11 @@ class FakeBuffer:
             partition_id=self._partition_id,
             task_name=None,
             sample_ids=[f"{group_id}_g0"],
-            extra_info={"rollout_metrics": [dict(rollout_metrics or {})]},
+            extra_info=(
+                {}
+                if rollout_metrics is None
+                else {"rollout_metrics": [dict(rollout_metrics)]}
+            ),
             tags=[{"weight_version": weight, "group_id": group_id}],
         )
         self.meta_list.append(meta if ready else None)

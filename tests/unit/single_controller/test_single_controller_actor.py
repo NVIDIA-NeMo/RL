@@ -1415,6 +1415,8 @@ def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
     assert train_metrics["trajectory_duration_s/max"] == 3.0
     assert train_metrics["trajectory_duration_s/p95"] == 3.0
     assert train_call.kwargs == {"step": 1, "prefix": "train"}
+    # pop, not get: shard_meta_for_dp copies extra_info onto every rank meta.
+    assert all("rollout_metrics" not in meta.extra_info for meta in metas)
 
 
 def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> None:
