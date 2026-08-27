@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import asdict
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from packaging.version import Version as PkgVersion
@@ -34,16 +34,18 @@ from nemo_rl.utils.flops_formulas import (
 )
 
 
-def get_default_hf_config(model_name: str) -> PretrainedConfig:
-    """Get the default Hugging Face config for a model.
+def get_hf_config(model_name: str, **overrides: Any) -> PretrainedConfig:
+    """Get the effective Hugging Face config for a model.
 
-    Both the DTensor and MCore paths use the same default config, we initialize the model config
-    here to allow computation of theoretical flops which is agnostic to the backend.
+    Both the DTensor and MCore paths use the same config, which allows backend-agnostic
+    theoretical FLOPs computation. Policy overrides must be included so the tracker describes
+    the model that is actually trained.
     """
     return AutoConfig.from_pretrained(
         model_name,
         torch_dtype=torch.float32,
         trust_remote_code=True,
+        **overrides,
     )
 
 

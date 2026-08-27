@@ -72,9 +72,13 @@ dependencies = [
   "zstandard",                                                                                                # for sparse refit body compression
   "fastokens-b10>=0.1.1",                                                                                     # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                   # for transformer-engine no build isolation
-  # tilelang — required by fused DSA TileLang kernels on Blackwell and by
-  # mamba-ssm's replacement Triton kernel path on Hopper. Keep the range aligned
-  # with the backend-specific pins below while supporting both Linux architectures.
+  # tilelang — required by fused DSA TileLang kernels on Blackwell and by the
+  # replacement Triton kernel mamba-ssm requires when Triton >= 3.4.0 on Hopper;
+  # see https://github.com/state-spaces/mamba/issues/640.
+  # Without it, qwen3.5 / nano-v3 / moonlight Megatron recipes crash at first
+  # gated-chunk backward with a RuntimeError pointing at this exact pip install.
+  # Keep the base range broad for both supported Linux architectures; backend
+  # extras tighten the version as required.
   "tilelang>=0.1.9,<0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Data-plane stack — promoted to base so worker venvs (built by
   # nemo_rl.utils.venvs.create_local_venv via bare `uv sync`, no extras)
@@ -192,7 +196,7 @@ mcore = [
   # pyproject changes propagate on bump without any mirror here.
   "megatron-bridge[te,ssm]",
   "transformers==5.8.1",
-  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "tilelang==0.1.9; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76

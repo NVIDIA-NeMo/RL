@@ -42,7 +42,6 @@ policy:
   # unequal DP-rank lengths hang the MoE all-gather token dispatcher.
   make_sequence_length_divisible_by: 6144
   logprob_chunk_size: 1024
-  offload_optimizer_for_logprob: true
   dtensor_cfg:
     enabled: false
   megatron_cfg:

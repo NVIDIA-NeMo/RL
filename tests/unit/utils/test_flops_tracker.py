@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 import pytest
 import torch
 from transformers.configuration_utils import PretrainedConfig
@@ -21,6 +23,7 @@ from nemo_rl.utils.flops_formulas import FLOPSConfig, glm_moe_dsa, qwen3
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     convert_config_to_flops_config,
+    get_hf_config,
     get_theoretical_tflops,
     is_using_tf32,
 )
@@ -52,6 +55,36 @@ class GlmMoeDsaConfigForTest(PretrainedConfig):
         }
         defaults.update(kwargs)
         super().__init__(**defaults)
+
+
+@pytest.mark.parametrize("overrides", [{}, {"qk_rope_head_dim": 64}])
+def test_get_hf_config_forwards_overrides(
+    monkeypatch: pytest.MonkeyPatch, overrides: dict[str, Any]
+) -> None:
+    expected_config = PretrainedConfig()
+    captured_call: dict[str, Any] = {}
+
+    def fake_from_pretrained(model_name: str, **kwargs: Any) -> PretrainedConfig:
+        captured_call["model_name"] = model_name
+        captured_call["kwargs"] = kwargs
+        return expected_config
+
+    monkeypatch.setattr(
+        "nemo_rl.utils.flops_tracker.AutoConfig.from_pretrained",
+        fake_from_pretrained,
+    )
+
+    actual_config = get_hf_config("test/model", **overrides)
+
+    assert actual_config is expected_config
+    assert captured_call == {
+        "model_name": "test/model",
+        "kwargs": {
+            "torch_dtype": torch.float32,
+            "trust_remote_code": True,
+            **overrides,
+        },
+    }
 
 
 def _qwen3_flops_config(head_dim):
