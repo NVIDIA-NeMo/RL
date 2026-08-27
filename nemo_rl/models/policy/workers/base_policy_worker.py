@@ -171,6 +171,21 @@ class AbstractPolicyWorker:
             "nccl_reshard_refit is not implemented for this policy worker"
         )
 
+    def stand_down_refit_watchdog(self) -> int:
+        """Cancel any in-flight refit deadline in this worker; returns how many.
+
+        Called by the controller when a generation shard's process is confirmed GONE. A
+        dead peer closes its sockets and NCCL unblocks the survivors on its own, so the
+        deadline has nothing useful to do and firing it is actively harmful -- see
+        stand_down_armed_watchdogs.
+
+        Deliberately trivial: this runs on the actor's event loop while the refit itself
+        runs off it, so it must not block or touch CUDA.
+        """
+        from nemo_rl.distributed.refit_watchdog import stand_down_armed_watchdogs
+
+        return stand_down_armed_watchdogs()
+
     def is_alive(self) -> bool:
         """Check if the worker is alive."""
         return True
