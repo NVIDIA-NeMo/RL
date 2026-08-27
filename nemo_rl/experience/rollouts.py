@@ -68,11 +68,11 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     GenerationSamplingParams,
 )
+from nemo_rl.utils.length_penalty import apply_group_length_penalties
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
 )
-from nemo_rl.utils.length_penalty import apply_group_length_penalties
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase

@@ -73,20 +73,24 @@ _PARAM_KEYS = (
 )
 
 # Param keys that should be merged as bools rather than floats.
-_BOOL_PARAM_KEYS = frozenset({
-    "enabled",
-    "profile_band_total",
-    "profile_band_reasoning",
-    "profile_band_answer",
-    "group_length_penalty_profile_gate",
-    "group_length_penalty_profile_gate_positive_only",
-})
+_BOOL_PARAM_KEYS = frozenset(
+    {
+        "enabled",
+        "profile_band_total",
+        "profile_band_reasoning",
+        "profile_band_answer",
+        "group_length_penalty_profile_gate",
+        "group_length_penalty_profile_gate_positive_only",
+    }
+)
 
-_STR_PARAM_KEYS = frozenset({
-    "length_type",
-    "group_length_penalty_profile_gate_channel",
-    "group_length_penalty_profile_gate_field",
-})
+_STR_PARAM_KEYS = frozenset(
+    {
+        "length_type",
+        "group_length_penalty_profile_gate_channel",
+        "group_length_penalty_profile_gate_field",
+    }
+)
 
 # Length adjustments are defined for binary (0/1) env rewards only. Agents
 # already warned about non-binary rewards (warn once per agent, then skip
@@ -98,6 +102,7 @@ _BINARY_REWARD_TOL = 1e-6
 def _is_binary_reward(value: float) -> bool:
     v = float(value)
     return abs(v) <= _BINARY_REWARD_TOL or abs(v - 1.0) <= _BINARY_REWARD_TOL
+
 
 def _extract_reasoning_and_answer_text(result: dict[str, Any]) -> tuple[str, str]:
     """Extract reasoning and answer text from the Response API output items."""
@@ -112,17 +117,33 @@ def _extract_reasoning_and_answer_text(result: dict[str, Any]) -> tuple[str, str
     reasoning_text = ""
     answer_text = ""
     for item in output_items:
-        item_type = item.get("type", "") if isinstance(item, dict) else getattr(item, "type", "")
+        item_type = (
+            item.get("type", "")
+            if isinstance(item, dict)
+            else getattr(item, "type", "")
+        )
         if item_type == "reasoning":
-            summaries = item.get("summary", []) if isinstance(item, dict) else getattr(item, "summary", [])
+            summaries = (
+                item.get("summary", [])
+                if isinstance(item, dict)
+                else getattr(item, "summary", [])
+            )
             for s in summaries:
                 t = s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")
                 reasoning_text += t
         elif item_type == "message":
-            content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", [])
+            content = (
+                item.get("content", [])
+                if isinstance(item, dict)
+                else getattr(item, "content", [])
+            )
             if isinstance(content, list):
                 for c in content:
-                    t = c.get("text", "") if isinstance(c, dict) else getattr(c, "text", "")
+                    t = (
+                        c.get("text", "")
+                        if isinstance(c, dict)
+                        else getattr(c, "text", "")
+                    )
                     answer_text += t
             elif isinstance(content, str):
                 answer_text += content
@@ -298,8 +319,16 @@ def apply_group_length_penalties(
             idx = g + k
             r_text, a_text = texts[idx]
             if use_tokens and tokenizer is not None:
-                reasoning_lengths[idx] = len(tokenizer.encode(r_text, add_special_tokens=False)) if r_text else 0
-                answer_lengths[idx] = len(tokenizer.encode(a_text, add_special_tokens=False)) if a_text else 0
+                reasoning_lengths[idx] = (
+                    len(tokenizer.encode(r_text, add_special_tokens=False))
+                    if r_text
+                    else 0
+                )
+                answer_lengths[idx] = (
+                    len(tokenizer.encode(a_text, add_special_tokens=False))
+                    if a_text
+                    else 0
+                )
             else:
                 reasoning_lengths[idx] = len(r_text)
                 answer_lengths[idx] = len(a_text)
@@ -425,7 +454,9 @@ def apply_group_length_penalties(
         for g in range(0, n, num_gens):
             agent_name = agent_names[g]
             group_size = min(num_gens, n - g)
-            low_effort = any(results[g + k].get("low_effort_applied") for k in range(group_size))
+            low_effort = any(
+                results[g + k].get("low_effort_applied") for k in range(group_size)
+            )
             params = _resolve_agent_params(agent_name, agents_cfg, defaults)
             skipped = params is None
             disabled = params is not None and not params.get("enabled", True)
@@ -489,7 +520,9 @@ def apply_group_length_penalties(
             for k in range(group_size):
                 idx = g + k
                 orig = original_rewards[idx]
-                profiled_adj = all_profiled_length_adj[idx] if all_adjustments[idx] >= 0 else 0.0
+                profiled_adj = (
+                    all_profiled_length_adj[idx] if all_adjustments[idx] >= 0 else 0.0
+                )
                 final = max(
                     0.0,
                     orig
@@ -557,7 +590,6 @@ def apply_group_length_penalties(
         global_band=global_band,
         binary_ok=binary_ok,
     )
-
 
 
 def _resolve_global_profile_band(pb_cfg: Any) -> dict[str, dict[str, Any]]:
@@ -716,7 +748,9 @@ def _group_length_profile_gate_info(
     enabled = bool(params.get("group_length_penalty_profile_gate", False))
     channel = str(params.get("group_length_penalty_profile_gate_channel", "total"))
     field = str(params.get("group_length_penalty_profile_gate_field", "a"))
-    positive_only = bool(params.get("group_length_penalty_profile_gate_positive_only", True))
+    positive_only = bool(
+        params.get("group_length_penalty_profile_gate_positive_only", True)
+    )
     info = {
         "enabled": enabled,
         "open": True,
@@ -954,7 +988,11 @@ def _apply_length_penaltyes_and_penalties(
 
     # Reasoning bonus: shortest non-empty reasoning among top scorers
     if reasoning_bonus > 0:
-        valid = [(pi, pos_reasoning[k]) for k, pi in enumerate(positive_indices) if pos_reasoning[k] > 0]
+        valid = [
+            (pi, pos_reasoning[k])
+            for k, pi in enumerate(positive_indices)
+            if pos_reasoning[k] > 0
+        ]
         if valid:
             shortest_pi, _ = min(valid, key=lambda x: x[1])
             if adjusted[shortest_pi] >= top_threshold:
@@ -964,7 +1002,11 @@ def _apply_length_penaltyes_and_penalties(
 
     # Answer bonus: shortest non-empty answer among top scorers
     if answer_bonus > 0:
-        valid = [(pi, pos_answer[k]) for k, pi in enumerate(positive_indices) if pos_answer[k] > 0]
+        valid = [
+            (pi, pos_answer[k])
+            for k, pi in enumerate(positive_indices)
+            if pos_answer[k] > 0
+        ]
         if valid:
             shortest_pi, _ = min(valid, key=lambda x: x[1])
             if adjusted[shortest_pi] >= top_threshold:
@@ -974,7 +1016,11 @@ def _apply_length_penaltyes_and_penalties(
 
     # Total bonus: shortest combined (reasoning + answer) among top scorers
     if total_bonus > 0:
-        valid = [(pi, pos_total[k]) for k, pi in enumerate(positive_indices) if pos_total[k] > 0]
+        valid = [
+            (pi, pos_total[k])
+            for k, pi in enumerate(positive_indices)
+            if pos_total[k] > 0
+        ]
         if valid:
             shortest_pi, _ = min(valid, key=lambda x: x[1])
             if adjusted[shortest_pi] >= top_threshold:
@@ -984,7 +1030,11 @@ def _apply_length_penaltyes_and_penalties(
 
     # Longest reasoning penalty: longest among top-percentile scorers only
     if longest_reasoning_penalty > 0:
-        valid = [(pi, reasoning_lengths[pi]) for pi in top_scorer_indices if reasoning_lengths[pi] > 0]
+        valid = [
+            (pi, reasoning_lengths[pi])
+            for pi in top_scorer_indices
+            if reasoning_lengths[pi] > 0
+        ]
         if len(valid) >= 2:
             longest_pi, _ = max(valid, key=lambda x: x[1])
             pen = -longest_reasoning_penalty
@@ -994,7 +1044,11 @@ def _apply_length_penaltyes_and_penalties(
 
     # Longest answer penalty: longest among top-percentile scorers only
     if longest_answer_penalty > 0:
-        valid = [(pi, answer_lengths[pi]) for pi in top_scorer_indices if answer_lengths[pi] > 0]
+        valid = [
+            (pi, answer_lengths[pi])
+            for pi in top_scorer_indices
+            if answer_lengths[pi] > 0
+        ]
         if len(valid) >= 2:
             longest_pi, _ = max(valid, key=lambda x: x[1])
             pen = -longest_answer_penalty
@@ -1004,7 +1058,11 @@ def _apply_length_penaltyes_and_penalties(
 
     # Longest total penalty: longest combined length among top-percentile scorers only
     if longest_total_penalty > 0:
-        valid = [(pi, total_lengths[pi]) for pi in top_scorer_indices if total_lengths[pi] > 0]
+        valid = [
+            (pi, total_lengths[pi])
+            for pi in top_scorer_indices
+            if total_lengths[pi] > 0
+        ]
         if len(valid) >= 2:
             longest_pi, _ = max(valid, key=lambda x: x[1])
             pen = -longest_total_penalty
@@ -1013,7 +1071,11 @@ def _apply_length_penaltyes_and_penalties(
             t_longest_pen_per[longest_pi] = pen
 
     # Independent reasoning, answer, and total length penalties (zero-centered)
-    if group_reasoning_length_penalty_coeff > 0 or group_answer_length_penalty_coeff > 0 or group_total_length_penalty_coeff > 0:
+    if (
+        group_reasoning_length_penalty_coeff > 0
+        or group_answer_length_penalty_coeff > 0
+        or group_total_length_penalty_coeff > 0
+    ):
         reasoning_weights = _compute_length_weights(pos_reasoning)
         answer_weights = _compute_length_weights(pos_answer)
         total_weights = _compute_length_weights(pos_total)

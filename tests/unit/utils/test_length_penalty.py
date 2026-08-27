@@ -345,7 +345,9 @@ class TestProfiledLengthPenalty:
         p_rewards, p_lengths = [1, 1, 0], [10, 14, 100]
         results = [
             self.make_profiled("12345", "12345", 1.0, p_rewards, p_lengths),  # 10 < thr
-            self.make_profiled("1234567890", "1234567890", 1.0, p_rewards, p_lengths),  # 20 >= thr
+            self.make_profiled(
+                "1234567890", "1234567890", 1.0, p_rewards, p_lengths
+            ),  # 20 >= thr
         ]
         apply_group_length_penalties(results, self.cfg())
         assert rewards_of(results) == pytest.approx([1.0, 0.7])
@@ -377,7 +379,9 @@ class TestProfiledLengthPenalty:
         p_rewards, p_lengths = [1, 0], [10, 100]
         results = [
             self.make_profiled("1234", "1234", 1.0, p_rewards, p_lengths),  # 8 < 10
-            self.make_profiled("1234567890", "1234567890", 1.0, p_rewards, p_lengths),  # 20 >= 10
+            self.make_profiled(
+                "1234567890", "1234567890", 1.0, p_rewards, p_lengths
+            ),  # 20 >= 10
         ]
         apply_group_length_penalties(results, self.cfg(min_samples=1))
         assert rewards_of(results) == pytest.approx([1.0, 0.7])
@@ -454,9 +458,7 @@ class TestReviewFixes:
         for r in results:
             r["profiled_rewards"] = [1, 1]
             r["profiled_output_lengths"] = [10, 10]
-        cfg = make_config(
-            default={"enabled": True, "profiled_length_penalty": 1.5}
-        )
+        cfg = make_config(default={"enabled": True, "profiled_length_penalty": 1.5})
         apply_group_length_penalties(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 0.0])
 
@@ -496,9 +498,7 @@ class TestReviewFixes:
         for r in results:
             r["profiled_rewards"] = [1, 1]
             r["profiled_output_lengths"] = [10, 10]
-        cfg = make_config(
-            default={"enabled": True, "profiled_length_penalty": 0.3}
-        )
+        cfg = make_config(default={"enabled": True, "profiled_length_penalty": 0.3})
         apply_group_length_penalties(results, cfg)
         assert rewards_of(results) == pytest.approx([0.0, 0.0])
 
@@ -560,8 +560,6 @@ class TestReviewFixes:
             make_result("12345", "12345", 1.0),
             make_result("1234567890", "1234567890", 1.0),
         ]
-        cfg = make_config(
-            default={"enabled": True, "longest_total_penalty": 0.2}
-        )
+        cfg = make_config(default={"enabled": True, "longest_total_penalty": 0.2})
         apply_group_length_penalties(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 0.8])

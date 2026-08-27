@@ -72,18 +72,22 @@ except ImportError:
     yaml = None  # type: ignore
 
 CHANNEL_TO_LENGTHS_KEY = {
-    "total":     "profiled_output_lengths",
+    "total": "profiled_output_lengths",
     "reasoning": "profiled_reasoning_lengths",
-    "answer":    "profiled_answer_lengths",
+    "answer": "profiled_answer_lengths",
 }
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--input", required=True, help="Path to profiled JSONL (input).")
     p.add_argument("--config", required=True, help="Path to profile_band yaml config.")
     p.add_argument("--output", required=True, help="Path to write augmented JSONL.")
-    p.add_argument("--quiet", action="store_true", help="Suppress per-row diagnostics summary.")
+    p.add_argument(
+        "--quiet", action="store_true", help="Suppress per-row diagnostics summary."
+    )
     return p.parse_args()
 
 
@@ -106,7 +110,9 @@ def load_config(path: str) -> dict[str, Any]:
     cfg["_f_table"] = f_table
     bad_channels = [c for c in cfg["channels"] if c not in CHANNEL_TO_LENGTHS_KEY]
     if bad_channels:
-        sys.exit(f"unknown channels in config: {bad_channels}; valid: {sorted(CHANNEL_TO_LENGTHS_KEY)}")
+        sys.exit(
+            f"unknown channels in config: {bad_channels}; valid: {sorted(CHANNEL_TO_LENGTHS_KEY)}"
+        )
     return cfg
 
 
@@ -197,7 +203,9 @@ def main() -> None:
         print(f"input  : {in_path}")
         print(f"output : {out_path}")
         print(f"rows in: {n_total}")
-        print(f"rows w/ profile_band: {n_with_band}  ({100*n_with_band/n_total:.1f}%)")
+        print(
+            f"rows w/ profile_band: {n_with_band}  ({100 * n_with_band / n_total:.1f}%)"
+        )
         print(f"rows skipped (pass_rate not in f_table): {n_pr_skipped}")
         if n_pr_skipped_by_passrate:
             print("  by pass_rate:")
@@ -206,8 +214,8 @@ def main() -> None:
         print("channels emitted (per row, summed):")
         for ch in cfg["channels"]:
             c = n_channels_emitted.get(ch, 0)
-            print(f"  {ch:>10}: {c}  ({100*c/n_total:.1f}% of rows)")
-        print(f"f_table (rounded pass_rate -> f):")
+            print(f"  {ch:>10}: {c}  ({100 * c / n_total:.1f}% of rows)")
+        print("f_table (rounded pass_rate -> f):")
         for pr in sorted(cfg["_f_table"]):
             print(f"  {pr:.3f} -> {cfg['_f_table'][pr]}")
         print(f"n_std={cfg['n_std']}  min_passing={cfg['min_passing']}")
