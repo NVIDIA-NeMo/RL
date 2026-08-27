@@ -549,7 +549,9 @@ def _hash_deltas(hv: dict[str, int], prev_hv: dict[str, int]) -> dict[str, float
     Returns:
         ``step/hash/{counter}`` deltas, or ``{}`` when the guard never ran.
     """
-    if not hv or not hv.get("rows_recorded"):
+    # ``guard_failures`` counts too: a guard that raised on the first put
+    # records no rows, and gating on rows alone would make it look switched off.
+    if not hv or not (hv.get("rows_recorded") or hv.get("guard_failures")):
         return {}
     deltas: dict[str, float] = {
         f"step/hash/{name}": hv[name] - prev_hv.get(name, 0)
@@ -559,6 +561,7 @@ def _hash_deltas(hv: dict[str, int], prev_hv: dict[str, int]) -> dict[str, float
             "rows_unverified",
             "mismatches",
             "fields_skipped",
+            "guard_failures",
         )
     }
     # Corruption of every row of every field in a step, repeated identically,
@@ -823,6 +826,7 @@ def merge_snapshots(snapshots: "list[dict[str, Any]]") -> dict[str, Any]:
             "rows_unverified",
             "mismatches",
             "fields_skipped",
+            "guard_failures",
         )
     }
     by_op: dict[str, dict[str, Any]] = {}
@@ -1097,6 +1101,11 @@ class HashStats:
     # uniform row shape) and leaves whose leading dim doesn't match the
     # sample count, so a row cannot be attributed to a sample id.
     fields_skipped: int = 0
+    # Batches the guard raised on, and so never checked. Same "reads as clean
+    # because it checked nothing" hazard as ``fields_skipped``, counted for
+    # the same reason. Not ``errors``: ``OpStats.errors`` already means failed
+    # transfers, and these are failures of the check, not of the wire.
+    guard_failures: int = 0
 
 
 @dataclass
@@ -1427,7 +1436,38 @@ class MetricsDataPlaneClient(DataPlaneClient):
             )
         return out
 
+    def _hash_guard_failed(self, op: str, exc: Exception) -> None:
+        """Absorb a hash-guard failure: count it, log it, never re-raise.
+
+        The guard is a debug aid on a transfer that already succeeded, so a
+        bug in it must not take the transfer down. Swallowing is only safe
+        because the failure stays visible in ``step/hash/guard_failures`` -- a
+        guard that silently stopped checking would report zero mismatches.
+        """
+        self._stats.hash_verify.guard_failures += 1
+        # Logged once, not capped at a handful: whatever makes the guard raise
+        # on one batch makes it raise on every batch, so line two would carry
+        # nothing line one did not. The count is the series.
+        if self._stats.hash_verify.guard_failures == 1:
+            logger.warning(
+                "data-plane hash guard failed on %s (%s: %s). The transfer "
+                "itself is unaffected, but this batch went unchecked -- see "
+                "step/hash/guard_failures for how many.",
+                op,
+                type(exc).__name__,
+                exc,
+            )
+
     def _record_hashes(
+        self, partition_id: str, sample_ids: list[str], fields: TensorDict | None
+    ) -> None:
+        """Store wire-in fingerprints for a successful put. Never raises."""
+        try:
+            self._record_hashes_impl(partition_id, sample_ids, fields)
+        except Exception as exc:  # noqa: BLE001 - a debug check must never fail a transfer
+            self._hash_guard_failed("put", exc)
+
+    def _record_hashes_impl(
         self, partition_id: str, sample_ids: list[str], fields: TensorDict | None
     ) -> None:
         """Store wire-in fingerprints for a successful put."""
@@ -1456,6 +1496,15 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._stats.hash_verify.rows_recorded += len(sample_ids)
 
     def _check_hashes(self, partition_id: str, sample_ids: list[str], out: Any) -> None:
+        """Compare wire-out fingerprints against what was written. Never raises."""
+        try:
+            self._check_hashes_impl(partition_id, sample_ids, out)
+        except Exception as exc:  # noqa: BLE001 - a debug check must never fail a transfer
+            self._hash_guard_failed("get", exc)
+
+    def _check_hashes_impl(
+        self, partition_id: str, sample_ids: list[str], out: Any
+    ) -> None:
         """Compare wire-out fingerprints against what was written."""
         if not isinstance(out, TensorDict):
             return

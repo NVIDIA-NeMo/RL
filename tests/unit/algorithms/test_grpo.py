@@ -5798,3 +5798,111 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 )
 def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
+
+
+@pytest.mark.parametrize(
+    ("n_snapshots", "scope"),
+    [
+        (1, "driver"),  # fan-out reached one process -> the driver's own counters
+        (2, "cluster"),  # it reached the workers -> the summed cluster view
+    ],
+)
+def test_grpo_train_sync_logs_data_plane_metrics_before_committing_the_step(
+    mock_grpo_components, n_snapshots, scope
+):
+    """The data-plane series reach the logger, in the right scope, before the
+    commit that would drop them.
+
+    ``data_plane.observability.enabled`` defaults to true in
+    ``grpo_math_1B.yaml``, which every recipe inherits, so this path runs on
+    every sync step of every run. Three things can silently disable it, and none
+    is reachable from the observability unit tests because those never build a
+    trainer:
+
+    * ``policy.dp_client`` not being a ``MetricsDataPlaneClient`` -- the
+      isinstance guard in ``_log_data_plane_metrics`` then returns early and the
+      whole feature is a no-op that logs nothing and raises nothing;
+    * the wrong scope being chosen, so the driver's one-op-per-step counters get
+      reported as if they were the cluster's bulk traffic, or vice versa;
+    * the call landing after ``log_metrics(..., step_finished=True)`` -- wandb
+      drops anything logged against an already-committed step, so every series
+      is computed, printed to stdout, and discarded.
+    """
+    from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+    from nemo_rl.data_plane.observability import MetricsDataPlaneClient
+
+    policy = mock_grpo_components["policy"]
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=2, consumer_tasks=["t"]
+    )
+    client.put_samples(
+        sample_ids=["a", "b"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.zeros(2, 64)}, batch_size=[2]),
+    )
+    policy.dp_client = client
+    policy.collect_data_plane_snapshots = MagicMock(
+        return_value=[client.snapshot() for _ in range(n_snapshots)]
+    )
+    # A real policy has no such attribute on the first step, so the production
+    # ``getattr(policy, "_prev_cluster_snapshot", {})`` yields {}. A MagicMock
+    # would auto-create one and hand arithmetic a mock instead of a dict.
+    policy._prev_cluster_snapshot = {}
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.data_plane = {"enabled": True}
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+
+    with ExitStack() as stack:
+        stack.enter_context(mock_sync_grpo_infrastructure(policy))
+        stack.enter_context(
+            patch("nemo_rl.algorithms.grpo_sync.validate_sync", return_value=({}, {}))
+        )
+        grpo_train_sync(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    calls = mock_grpo_components["logger"].log_metrics.call_args_list
+    want = f"data_plane/{scope}"
+    dp = [i for i, c in enumerate(calls) if c.kwargs.get("prefix") == want]
+    commit = [i for i, c in enumerate(calls) if c.kwargs.get("step_finished")]
+
+    assert dp, (
+        f"no data_plane/{scope} series logged; prefixes seen: "
+        f"{[c.kwargs.get('prefix') for c in calls]}"
+    )
+    assert commit, "the step was never committed"
+    assert dp[0] < commit[0], (
+        "data-plane metrics logged after the committing log_metrics call; "
+        "wandb drops anything logged against an already-committed step"
+    )
+
+    payload = calls[dp[0]].args[0]
+    assert payload["step/comm_volume_mb"] > 0, "the put moved bytes; the series says 0"
+    for key in ("step/wall_ms", "step/frac_of_step", "step/self/overhead_ms"):
+        assert key in payload, f"{key} missing from {sorted(payload)}"
+
+    assert [
+        c
+        for c in mock_grpo_components["logger"].log_table.call_args_list
+        if f"data_plane/{scope}/breakdown" in c.args
+    ], "the per-op breakdown table was not logged"
+    client.close()
