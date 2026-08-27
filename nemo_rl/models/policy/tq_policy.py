@@ -40,7 +40,6 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data.multimodal_utils import (
     PACKED_MULTIMODAL_FIELDS,
     PER_TOKEN_MULTIMODAL_FIELDS,
-    PackedTensor,
 )
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
@@ -57,13 +56,10 @@ from nemo_rl.utils.timer import Timer
 
 # Include-list of multimodal fields every forward-running dispatch
 # (logprob *and* train) must ship so the trainer's forward matches the
-# rollout. Only ``PACKED`` fields ship a companion ``__lengths`` —
-# per-token fields are rectangular and travel as plain tensors.
-_WIRE_MULTIMODAL_FIELDS = (
-    PER_TOKEN_MULTIMODAL_FIELDS
-    | PACKED_MULTIMODAL_FIELDS
-    | frozenset(PackedTensor.lengths_key(k) for k in PACKED_MULTIMODAL_FIELDS)
-)
+# rollout. One wire field per logical field: ``PACKED`` fields travel as
+# a single nested tensor whose rows carry their own shapes, and per-token
+# fields are rectangular and travel as plain tensors.
+_WIRE_MULTIMODAL_FIELDS = PER_TOKEN_MULTIMODAL_FIELDS | PACKED_MULTIMODAL_FIELDS
 
 
 def _present_multimodal_fields(meta: KVBatchMeta) -> list[str]:

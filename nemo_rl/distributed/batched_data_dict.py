@@ -144,12 +144,11 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         Four cases per (k, v):
           * ``PackedTensor`` — in-memory form, keep as-is.
-          * ``k`` in ``PACKED_MULTIMODAL_FIELDS`` — data-plane wire form,
-            reassemble via ``PackedTensor.from_nested_wire``.
+          * ``k`` in ``PACKED_MULTIMODAL_FIELDS`` — data-plane wire form
+            (a nested tensor), reassemble via ``PackedTensor.from_wire``.
           * ``k`` in ``PER_TOKEN_MULTIMODAL_FIELDS`` — plain per-token
             tensor, keep as-is.
-          * anything else (including ``<key>__lengths`` companions) —
-            not multimodal, skip.
+          * anything else — not multimodal, skip.
 
         ``pixel_dtype`` converts pixel tensors without materializing repeated
         logical segments. This is used to reduce policy-bound Ray payloads.
@@ -194,13 +193,10 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 # Plain per-token tensor: emit as-is.
                 result[k] = v
             elif k in PACKED_MULTIMODAL_FIELDS:
-                # Data-plane wire form: parent tensor + companion
-                # ``__lengths`` (the TQ fetch must include both).
-                lengths_key = PackedTensor.lengths_key(k)
-                assert lengths_key in self.data, (
-                    f"missing companion {lengths_key!r} for {k!r}"
-                )
-                packed = PackedTensor.from_nested_wire(v, self.data[lengths_key])
+                # Data-plane wire form: the nested value straight off TQ.
+                # ``codec.materialize`` leaves these nested, so every row
+                # is already at its stored size — no companion needed.
+                packed = PackedTensor.from_wire(v)
                 if packed is None:
                     continue  # empty batch (0 rows); nothing to emit
                 if pixel_dtype is not None and k in self._PIXEL_DTYPE_CAST_KEYS:
@@ -978,9 +974,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             # seqlen silently corrupts images (or raises when the patch
             # count is smaller than the seqlen). The in-memory
             # ``PackedTensor`` form is skipped by ``torch.is_tensor``
-            # below, but the data-plane wire form is a plain tensor plus
-            # a 1-D ``<key>__lengths`` companion, so name both here.
-            if k in PACKED_MULTIMODAL_FIELDS or k.endswith(PackedTensor.LENGTHS_SUFFIX):
+            # below, but the data-plane wire form is a nested tensor, so
+            # name it here.
+            if k in PACKED_MULTIMODAL_FIELDS:
                 continue
             if torch.is_tensor(v) and len(v.shape) >= dim + 1:
                 self.data[k] = torch.narrow(v, dim=dim, start=0, length=truncated_len)

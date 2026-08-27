@@ -116,17 +116,14 @@ def test_truncate_tensors_with_packed_data():
 
 def test_truncate_tensors_skips_wire_form_multimodal():
     """Dynamic batching narrows dim 1 to the microbatch seqlen. The
-    data-plane wire form of a packed multimodal field is a plain tensor
-    whose dim 1 is patch count, not seqlen — narrowing it would corrupt
-    the images (or raise when patches < seqlen)."""
+    data-plane wire form of a packed multimodal field has patch count on
+    dim 1, not seqlen — narrowing it would corrupt the images (or raise
+    when patches < seqlen)."""
     batch = BatchedDataDict(
         {
             "input_ids": torch.arange(8).reshape(2, 4),
             # [B, max_patches, feat] — 3 patches, fewer than seqlen=4.
             "pixel_values": torch.randn(2, 3, 16),
-            PackedTensor.lengths_key("pixel_values"): torch.tensor(
-                [3, 2], dtype=torch.int32
-            ),
             # Per-token multimodal IS sequence-aligned and must truncate.
             "mm_token_type_ids": torch.ones((2, 4), dtype=torch.long),
         }
@@ -137,7 +134,6 @@ def test_truncate_tensors_skips_wire_form_multimodal():
     assert torch.equal(batch["input_ids"], torch.tensor([[0, 1], [4, 5]]))
     assert batch["mm_token_type_ids"].shape == (2, 2)
     assert batch["pixel_values"].shape == (2, 3, 16)
-    assert batch[PackedTensor.lengths_key("pixel_values")].shape == (2,)
 
 
 def test_multiturn_rollout_with_packed_data():
@@ -671,7 +667,7 @@ def test_packedtensor_empty_legacy_rows_survive_copy_pickle_and_slice():
         assert value.as_tensor() is None
 
 
-def test_to_nested_wire_emits_one_row_per_logical_row_under_dedup():
+def test_to_wire_emits_one_row_per_logical_row_under_dedup():
     """Deduplicated values map one logical row to several shared physical
     segments, so the wire encoder must walk logical rows — iterating
     ``tensors`` would emit the physical segment count as the batch size
@@ -687,24 +683,21 @@ def test_to_nested_wire_emits_one_row_per_logical_row_under_dedup():
     ).enable_deduplication()
     assert len(packed) == 3
 
-    nested, lengths = packed.to_nested_wire()
-    assert lengths.tolist() == [2, 6, 4]
-
-    padded = torch.nested.to_padded_tensor(nested, padding=0.0)
-    assert padded.shape == (3, 6, 3)
+    nested = packed.to_wire()
+    assert [t.shape[0] for t in nested.unbind()] == [2, 6, 4]
     assert torch.equal(
-        PackedTensor.from_nested_wire(padded, lengths).as_tensor(),
+        PackedTensor.from_wire(nested).as_tensor(),
         packed.as_tensor(),
     )
 
 
-def test_to_nested_wire_pads_segments_before_concat_under_dedup():
+def test_to_wire_pads_segments_before_concat_under_dedup():
     """A dedup row spanning segments of differing trailing dims.
 
     ``as_tensor`` pads each physical segment then concatenates. The wire
     encoder must use the same order: concatenating first raises
     ``RuntimeError: Sizes of tensors must match except in dimension 0``
-    before the padding can fix the mismatch, so ``to_nested_wire`` would
+    before the padding can fix the mismatch, so ``to_wire`` would
     fail on a value ``as_tensor`` handles fine.
     """
     # One logical row referencing two segments: 2x4 and 4x2 spatial dims.
@@ -719,93 +712,88 @@ def test_to_nested_wire_pads_segments_before_concat_under_dedup():
     expected = packed.as_tensor()
     assert expected.shape == (2, 3, 4, 4)  # padded to the batch max
 
-    nested, lengths = packed.to_nested_wire()
-    assert lengths.tolist() == [2]
+    nested = packed.to_wire()
+    assert [t.shape[0] for t in nested.unbind()] == [2]
 
-    padded = torch.nested.to_padded_tensor(nested, padding=0.0)
-    restored = PackedTensor.from_nested_wire(padded, lengths).as_tensor()
+    restored = PackedTensor.from_wire(nested).as_tensor()
     assert torch.equal(restored, expected)
 
 
-def test_from_nested_wire_rejects_mismatched_companion_length():
-    """A short/long companion would misalign images against samples."""
-    padded = torch.zeros(3, 2, 4)
-    with pytest.raises(ValueError, match="wire companion length mismatch"):
-        PackedTensor.from_nested_wire(padded, torch.tensor([2, 2], dtype=torch.int32))
+def test_from_wire_rejects_dense_input():
+    """A dense value here means ``materialize`` padded the field, which
+    silently loses the row boundaries. Fail loud instead."""
+    with pytest.raises(TypeError, match="expects the nested value"):
+        PackedTensor.from_wire(torch.zeros(3, 2, 4))
 
 
-def test_from_nested_wire_empty_rows_match_legacy_none_semantics():
+def test_from_wire_empty_rows_match_legacy_none_semantics():
     """An image-free shard must reconstruct as legacy does: ``as_tensor``
     returns ``None`` and the per-row counts are 0, not a ``(0, ...)``
-    tensor with counts of 1."""
-    padded = torch.zeros(2, 3, 4)
-    lengths = torch.tensor([0, 0], dtype=torch.int32)
+    tensor with counts of 1. A zero-length row is how absence travels."""
+    nested = torch.nested.as_nested_tensor(
+        [torch.zeros(0, 3, 4), torch.zeros(0, 3, 4)], layout=torch.jagged
+    )
 
-    restored = PackedTensor.from_nested_wire(padded, lengths)
+    restored = PackedTensor.from_wire(nested)
     assert restored.as_tensor() is None
     assert restored.logical_segment_counts_by_row() == [0, 0]
 
 
-def test_to_nested_wire_materializes_pad_to_max_shape():
+def test_to_wire_materializes_pad_to_max_shape():
     """Dynamic-resolution values carry ``pad_to_max_shape``, which the wire
-    cannot round-trip (``from_nested_wire`` has no way to recover it) and
+    cannot round-trip (``from_wire`` has no way to recover it) and
     ``torch.nested`` jagged cannot represent (rows must agree on every dim
-    but dim 0). The write side must therefore materialize the padding."""
+    but dim 0). The write side must therefore materialize the padding —
+    and that padded form is exactly what ``as_tensor`` returns, so it is
+    the value, not a transport artifact."""
     # Same rank, different trailing dims — nemotron-omni style tiles.
     first = torch.ones(1, 3, 2, 4)
     second = 2 * torch.ones(2, 3, 4, 2)
     packed = PackedTensor([first, second], dim_to_pack=0, pad_to_max_shape=True)
 
-    nested, lengths = packed.to_nested_wire()
-    assert lengths.tolist() == [1, 2]
-
-    padded = torch.nested.to_padded_tensor(nested, padding=0.0)
-    # Trailing dims padded to the batch max (3, 4, 4); dim 1 is the ragged
-    # per-sample tile count, so it is the max tile count (2).
-    assert padded.shape == (2, 2, 3, 4, 4)
+    nested = packed.to_wire()
+    rows = list(nested.unbind())
+    assert [t.shape[0] for t in rows] == [1, 2]
+    # Trailing dims padded to the batch max (3, 4, 4); dim 0 stays ragged.
+    assert all(tuple(t.shape[1:]) == (3, 4, 4) for t in rows)
 
     # Plain concat on the read side reproduces the pre-wire as_tensor().
     assert torch.equal(
-        PackedTensor.from_nested_wire(padded, lengths).as_tensor(),
+        PackedTensor.from_wire(nested).as_tensor(),
         packed.as_tensor(),
     )
 
 
-def test_get_multimodal_dict_missing_companion_asserts():
-    """Wire-form parent without its ``__lengths`` companion must fail
-    loud with a wire-contract error (not a bare KeyError deep in the
-    trainer forward)."""
-    data = BatchedDataDict(
-        {
-            "pixel_values": torch.zeros(2, 3, 4, 4),
-            # pixel_values__lengths intentionally omitted
-        }
-    )
-    with pytest.raises(AssertionError, match="missing companion"):
+def test_get_multimodal_dict_rejects_padded_wire_field():
+    """A dense wire value means ``codec.materialize`` padded the field and
+    the row boundaries are gone. Fail loud with a wire-contract error, not
+    a silent mis-shaped forward."""
+    data = BatchedDataDict({"pixel_values": torch.zeros(2, 3, 4, 4)})
+    with pytest.raises(TypeError, match="expects the nested value"):
         data.get_multimodal_dict(as_tensors=False)
 
 
-def test_get_multimodal_dict_empty_batch_skips_wire_field():
-    """Empty batch (0 rows) must not crash ``PackedTensor.__init__``'s
-    non-empty-list assertion — ``from_nested_wire`` returns ``None`` and
-    the read side skips the field."""
-    data = BatchedDataDict(
-        {
-            "pixel_values": torch.zeros(0, 3, 4, 4),
-            PackedTensor.lengths_key("pixel_values"): torch.zeros(0, dtype=torch.int32),
-        }
-    )
-    mm = data.get_multimodal_dict(as_tensors=False)
-    assert "pixel_values" not in mm
+def test_image_free_shard_emits_no_wire_field_and_reads_back_empty():
+    """An all-empty packed field never reaches the wire, end to end.
 
+    Replaces an earlier "0-row wire field" guard: that state is now
+    unconstructible. ``to_wire`` returns ``None`` for an all-``None``
+    value so the field is never emitted, and ``kv_first_write`` rejects a
+    zero-row batch outright — so the read side has nothing to skip rather
+    than an empty column to tolerate.
+    """
+    packed = PackedTensor([None, None], dim_to_pack=0)
 
-# ── encode_multimodal_for_wire (the rollout actor's write-side dispatcher) ──
+    assert list(encode_multimodal_for_wire("pixel_values", packed)) == []
 
+    # What the trainer actually receives for an image-free shard.
+    data = BatchedDataDict({"input_ids": torch.zeros(2, 4, dtype=torch.long)})
+    assert "pixel_values" not in data.get_multimodal_dict(as_tensors=False)
 
-def test_encode_multimodal_for_wire_packed_emits_parent_and_lengths():
-    """A ``PackedTensor`` must arrive on the wire as two entries — the
-    ``torch.nested`` parent and its ``__lengths`` companion. Emitting only
-    the parent is unrecoverable on the read side."""
+def test_encode_multimodal_for_wire_packed_emits_single_nested_entry():
+    """A ``PackedTensor`` arrives on the wire as exactly one entry. Row
+    boundaries live in the nested tensor itself and are preserved by TQ
+    (one stored entry per row), so no companion field is emitted."""
     packed = PackedTensor(
         [torch.ones(3, 4), torch.ones(1, 4)],
         dim_to_pack=0,
@@ -813,15 +801,14 @@ def test_encode_multimodal_for_wire_packed_emits_parent_and_lengths():
 
     pairs = dict(encode_multimodal_for_wire("pixel_values", packed))
 
-    assert set(pairs) == {"pixel_values", "pixel_values__lengths"}
+    assert set(pairs) == {"pixel_values"}
     assert pairs["pixel_values"].is_nested
-    assert pairs["pixel_values__lengths"].tolist() == [3, 1]
-    assert pairs["pixel_values__lengths"].dtype == torch.int32
+    assert [t.shape[0] for t in pairs["pixel_values"].unbind()] == [3, 1]
 
 
 def test_encode_multimodal_for_wire_per_token_passes_through():
     """Per-token fields are rectangular ``[B, S]`` — they ride as plain
-    tensors with no ``__lengths`` companion."""
+    tensors, not nested ones."""
     ids = torch.ones((2, 6), dtype=torch.long)
 
     pairs = list(encode_multimodal_for_wire("mm_token_type_ids", ids))
@@ -832,8 +819,7 @@ def test_encode_multimodal_for_wire_per_token_passes_through():
 
 
 def test_encode_multimodal_for_wire_skips_all_empty_packed():
-    """An all-``None`` packed field has nothing to ship; yielding a bare
-    ``__lengths`` with no parent would break reassembly."""
+    """An all-``None`` packed field has nothing to ship at all."""
     packed = PackedTensor([None, None], dim_to_pack=0)
 
     assert list(encode_multimodal_for_wire("pixel_values", packed)) == []
@@ -910,28 +896,28 @@ def test_multimodal_registries_are_disjoint():
     assert not (PACKED_MULTIMODAL_FIELDS & PER_TOKEN_MULTIMODAL_FIELDS)
 
 
-# ── to_nested_wire guard rails ──────────────────────────────────────────
+# ── to_wire guard rails ──────────────────────────────────────────
 
 
-def test_to_nested_wire_rejects_nonzero_dim_to_pack():
+def test_to_wire_rejects_nonzero_dim_to_pack():
     """Only ``dim_to_pack=0`` round-trips; anything else needs
     ``ragged_idx`` threading, so it must raise instead of silently
     encoding along the wrong axis."""
     packed = PackedTensor([torch.ones(2, 3), torch.ones(2, 5)], dim_to_pack=1)
 
     with pytest.raises(NotImplementedError, match="only supports dim_to_pack=0"):
-        packed.to_nested_wire()
+        packed.to_wire()
 
 
-def test_to_nested_wire_all_none_returns_none_pair():
-    """All-empty batch signals 'skip this field' with ``(None, None)``
-    rather than an empty nested tensor the read side cannot interpret."""
+def test_to_wire_all_none_returns_none():
+    """All-empty batch signals 'skip this field' with ``None`` rather than
+    an empty nested tensor the read side cannot interpret."""
     packed = PackedTensor([None, None, None], dim_to_pack=0)
 
-    assert packed.to_nested_wire() == (None, None)
+    assert packed.to_wire() is None
 
 
-def test_to_nested_wire_pad_to_max_shape_rejects_rank_mismatch():
+def test_to_wire_pad_to_max_shape_rejects_rank_mismatch():
     """``pad_to_max_shape`` pads trailing dims to the batch max, which is
     only defined when every row has the same rank."""
     packed = PackedTensor(
@@ -941,4 +927,4 @@ def test_to_nested_wire_pad_to_max_shape_rejects_rank_mismatch():
     )
 
     with pytest.raises(ValueError, match="same rank"):
-        packed.to_nested_wire()
+        packed.to_wire()
