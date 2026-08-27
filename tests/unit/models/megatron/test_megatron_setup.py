@@ -28,7 +28,7 @@ import os
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -3813,6 +3813,8 @@ class TestPeftWarmStart:
         )  # should not raise
 
     def test_warm_start_hook_loads_adapter_only_and_restores_cfg(self, tmp_path):
+        from megatron.core.rerun_state_machine import RerunMode
+
         from nemo_rl.models.megatron.setup import _create_peft_warm_start_hook
 
         ckpt_cfg = SimpleNamespace(
@@ -3837,6 +3839,18 @@ class TestPeftWarmStart:
         state.train_state.step = 123
         state.train_state.consumed_train_samples = 456
 
+        class FakeRerunStateMachine:
+            def __init__(self):
+                self.mode = RerunMode.VALIDATE_RESULTS
+
+            def get_mode(self):
+                return self.mode
+
+            def set_mode(self, mode):
+                self.mode = mode
+
+        rerun_state_machine = FakeRerunStateMachine()
+
         captured = {}
 
         def fake_load(**kwargs):
@@ -3856,6 +3870,7 @@ class TestPeftWarmStart:
             ]
             captured["ignore_ckpt_step"] = kwargs["ignore_ckpt_step"]
             captured["checkpointing_context"] = kwargs["checkpointing_context"]
+            captured["rerun_mode"] = rerun_state_machine.get_mode()
             return 0, 0
 
         model = [MagicMock()]
@@ -3868,6 +3883,10 @@ class TestPeftWarmStart:
             patch(
                 "nemo_rl.models.megatron.setup.update_num_microbatches"
             ) as mock_update_microbatches,
+            patch(
+                "nemo_rl.models.megatron.setup.get_rerun_state_machine",
+                return_value=rerun_state_machine,
+            ),
         ):
             hook = _create_peft_warm_start_hook(
                 megatron_cfg, state, "/donor/iter_0000005"
@@ -3891,11 +3910,13 @@ class TestPeftWarmStart:
         # An empty context isolates the donor load from the run's own
         # dataloader-state directory.
         assert captured["checkpointing_context"] == {}
+        assert captured["rerun_mode"] is RerunMode.DISABLED
         # Config restored after the load.
         assert ckpt_cfg.load == "/runs/current/policy/weights"
         assert ckpt_cfg.finetune is True
         assert ckpt_cfg.load_optim is True
         assert ckpt_cfg.load_rng is True
+        assert rerun_state_machine.get_mode() is RerunMode.VALIDATE_RESULTS
         # Train state reset so the run starts at step 0.
         assert state.train_state.step == 0
         assert state.train_state.consumed_train_samples == 0
@@ -3904,6 +3925,8 @@ class TestPeftWarmStart:
         )
 
     def test_warm_start_hook_restores_cfg_on_load_failure(self):
+        from megatron.core.rerun_state_machine import RerunMode
+
         from nemo_rl.models.megatron.setup import _create_peft_warm_start_hook
 
         ckpt_cfg = SimpleNamespace(
@@ -3917,6 +3940,8 @@ class TestPeftWarmStart:
         from megatron.bridge.training.state import GlobalState
 
         state = GlobalState()
+        rerun_state_machine = MagicMock()
+        rerun_state_machine.get_mode.return_value = RerunMode.VALIDATE_RESULTS
 
         with (
             patch(
@@ -3924,6 +3949,10 @@ class TestPeftWarmStart:
                 side_effect=RuntimeError("boom"),
             ),
             patch("nemo_rl.models.megatron.setup.update_num_microbatches"),
+            patch(
+                "nemo_rl.models.megatron.setup.get_rerun_state_machine",
+                return_value=rerun_state_machine,
+            ),
         ):
             hook = _create_peft_warm_start_hook(
                 megatron_cfg, state, "/donor/iter_0000005"
@@ -3936,6 +3965,10 @@ class TestPeftWarmStart:
         assert ckpt_cfg.finetune is True
         assert ckpt_cfg.load_optim is True
         assert ckpt_cfg.load_rng is True
+        assert rerun_state_machine.set_mode.call_args_list == [
+            call(RerunMode.DISABLED),
+            call(RerunMode.VALIDATE_RESULTS),
+        ]
 
     def test_restore_from_without_peft_enabled_raises(self):
         """restore_from with PEFT disabled must fail loudly, not silently no-op."""
@@ -3977,36 +4010,144 @@ class TestPeftWarmStart:
                     megatron_cfg=megatron_cfg,
                 )
 
-    def test_is_peft_resume_predicate_unchanged_upstream(self):
-        """Tripwire: fail loudly if Bridge changes the is_peft_resume predicate.
-
-        The entire warm-start mechanism rests on Bridge's five-clause
-        predicate at checkpointing.py (guarding the adapter-only filter):
-        cfg.peft set, load_dir == cfg.checkpoint.load, load_dir !=
-        cfg.checkpoint.pretrained_checkpoint, and not cfg.checkpoint.finetune.
-        Every test here mocks _load_checkpoint_from_path, so they all pass
-        even if Bridge stops honouring it -- degrading the warm start into a
-        strict full-model load. Skips when mcore/Bridge is unavailable.
-        """
-        import inspect
-
+    def test_bridge_peft_resume_filters_adapters_and_loads_non_strict(self):
+        """Exercise both Bridge behaviors required by the warm-start hook."""
         checkpointing = pytest.importorskip(
             "megatron.bridge.training.checkpointing",
             reason="requires the mcore extra (Megatron-Bridge)",
         )
-        src = inspect.getsource(checkpointing)
-        for clause in (
-            "cfg.peft is not None",
-            "cfg.checkpoint.load is not None",
-            "load_dir == cfg.checkpoint.load",
-            "load_dir != cfg.checkpoint.pretrained_checkpoint",
-            "not cfg.checkpoint.finetune",
-        ):
-            assert clause in src, (
-                f"Megatron-Bridge's is_peft_resume predicate no longer contains "
-                f"{clause!r}; the adapter-only warm-start filter is now a "
-                "silent no-op."
+        from megatron.bridge.training.state import TrainState
+
+        load_dir = "/donor/iter_0000005"
+        peft = MagicMock()
+        cfg = SimpleNamespace(
+            peft=peft,
+            checkpoint=SimpleNamespace(
+                load=load_dir,
+                pretrained_checkpoint="/base-model",
+                finetune=False,
+                load_rng=False,
+                load_optim=False,
+                ckpt_format="torch_dist",
+                fully_parallel_save=True,
+                stage_precision_aware_optimizer_state_on_cpu=False,
+                load_main_params_from_ckpt=False,
+            ),
+            model=SimpleNamespace(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                fp16=False,
+                bf16=False,
+            ),
+            optimizer=SimpleNamespace(use_distributed_optimizer=False),
+            rng=SimpleNamespace(data_parallel_random_init=False),
+            ddp=SimpleNamespace(use_megatron_fsdp=False),
+        )
+        state = SimpleNamespace(
+            cfg=cfg,
+            train_state=TrainState(),
+            wandb_logger=None,
+            mlflow_logger=None,
+            comet_logger=None,
+        )
+        model = [MagicMock()]
+        pg_collection = MagicMock()
+        pg_collection.tp.rank.return_value = 0
+        pg_collection.tp.size.return_value = 1
+        pg_collection.pp.rank.return_value = 0
+        pg_collection.pp.size.return_value = 1
+        pg_collection.dp_cp = MagicMock()
+
+        full_state_dict = {
+            "model": {
+                "decoder.layers.0.linear.weight": torch.ones(2, 2),
+                "decoder.layers.0.linear.adapter.lora_A": torch.ones(1, 2),
+            },
+            "checkpoint_version": 3.0,
+        }
+        filtered_state_dict = {
+            "model": {
+                "decoder.layers.0.linear.adapter.lora_A": torch.ones(1, 2),
+            },
+            "checkpoint_version": 3.0,
+        }
+
+        def fake_load_base(*args, rank0, **kwargs):
+            loaded = (
+                {"checkpoint_version": 3.0} if rank0 else kwargs["sharded_state_dict"]
             )
+            return loaded, load_dir, False, None
+
+        run_config = {
+            "model": {
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+            },
+            "checkpoint": {
+                "save_rng": False,
+                "save_optim": False,
+                "fully_parallel_save": True,
+            },
+        }
+
+        with (
+            patch.object(
+                checkpointing,
+                "_load_base_checkpoint",
+                side_effect=fake_load_base,
+            ),
+            patch.object(
+                checkpointing,
+                "generate_state_dict",
+                return_value=full_state_dict,
+            ),
+            patch.object(
+                checkpointing,
+                "apply_peft_adapter_filter_to_state_dict",
+                return_value=filtered_state_dict,
+            ) as mock_filter,
+            patch.object(
+                checkpointing.dist_checkpointing,
+                "load_content_metadata",
+                return_value={},
+            ),
+            patch.object(checkpointing, "read_run_config", return_value=run_config),
+            patch.object(checkpointing, "file_exists", return_value=True),
+            patch.object(checkpointing, "read_train_state", return_value=TrainState()),
+            patch.object(checkpointing, "update_num_microbatches"),
+            patch.object(checkpointing, "set_checkpoint_version"),
+            patch.object(checkpointing, "get_checkpoint_version", return_value=3.0),
+            patch.object(
+                checkpointing,
+                "_get_model_glu_interleave_sizes",
+                return_value=(None, None),
+            ),
+            patch.object(checkpointing, "_load_model_state_dict") as mock_model_load,
+            patch.object(checkpointing, "is_hf_checkpoint_dir", return_value=False),
+            patch.object(checkpointing, "unwrap_model", return_value=model),
+            patch.object(checkpointing.wandb_utils, "on_load_checkpoint_success"),
+            patch.object(checkpointing.mlflow_utils, "on_load_checkpoint_success"),
+            patch.object(checkpointing.comet_utils, "on_load_checkpoint_success"),
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch("torch.cuda.empty_cache"),
+        ):
+            checkpointing._load_checkpoint_from_path(
+                load_dir=load_dir,
+                state=state,
+                model=model,
+                optimizer=None,
+                opt_param_scheduler=None,
+                strict=True,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+                ignore_ckpt_step=True,
+                pg_collection=pg_collection,
+            )
+
+        mock_filter.assert_called_once_with(full_state_dict, peft)
+        mock_model_load.assert_called_once_with(
+            model[0], filtered_state_dict["model"], False
+        )
 
     def _run_policy_setup(self, tmp_path, *, resume_exists):
         """Run setup_model_and_optimizer with PEFT warm start configured.

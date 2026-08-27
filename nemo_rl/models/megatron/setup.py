@@ -65,6 +65,7 @@ from megatron.core import parallel_state
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.rerun_state_machine import RerunMode, get_rerun_state_machine
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
@@ -619,6 +620,8 @@ def _create_peft_warm_start_hook(
 
     def peft_warm_start_hook(model: list[MegatronModule]) -> list[MegatronModule]:
         ckpt_cfg = megatron_cfg.checkpoint
+        rerun_state_machine = get_rerun_state_machine()
+        original_rerun_mode = rerun_state_machine.get_mode()
         original_load = ckpt_cfg.load
         original_finetune = ckpt_cfg.finetune
         original_load_optim = ckpt_cfg.load_optim
@@ -629,6 +632,10 @@ def _create_peft_warm_start_hook(
         ckpt_cfg.finetune = False
         ckpt_cfg.load_optim = False
         ckpt_cfg.load_rng = False
+        # Bridge restores rerun metadata independently of load_rng/load_optim.
+        # A disabled machine ignores donor rerun state, and setup is serialized,
+        # so temporarily disabling it makes this adapter load weights-only.
+        rerun_state_machine.set_mode(RerunMode.DISABLED)
         try:
             _load_checkpoint_from_path(
                 load_dir=restore_dir,
@@ -645,6 +652,7 @@ def _create_peft_warm_start_hook(
             ckpt_cfg.finetune = original_finetune
             ckpt_cfg.load_optim = original_load_optim
             ckpt_cfg.load_rng = original_load_rng
+            rerun_state_machine.set_mode(original_rerun_mode)
         # finetune=False also pulled the donor run's train state (step, consumed
         # samples) and fed it to the global microbatch calculator. This is a
         # warm start, not a resume: reset both so the new run starts at step 0.

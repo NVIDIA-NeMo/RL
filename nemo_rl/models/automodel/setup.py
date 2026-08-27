@@ -55,8 +55,11 @@ else:
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components._peft.lora import PeftConfig
+from nemo_automodel.components.checkpoint.checkpointing import (
+    _maybe_adapt_state_dict_to_hf,
+)
 from nemo_automodel.components.checkpoint.stateful_wrappers import (
-    _has_expert_parallelism,
+    _rename_dora_keys_to_hf,
 )
 from nemo_automodel.components.config.loader import _resolve_target
 from nemo_automodel.components.distributed.config import FSDP2Config
@@ -660,19 +663,17 @@ def _validate_lora_adapter_config(
         )
 
 
-def _validate_lora_adapter_keys(adapter_dir: str, model: torch.nn.Module) -> None:
+def _validate_lora_adapter_keys(
+    adapter_dir: str, model: torch.nn.Module, *, moe_mesh: Any = None
+) -> None:
     """Fail closed if the donor adapter tensors don't cover this model's LoRA params.
 
     The underlying PEFT load is unconditionally non-strict (a key mismatch is
     only a warning), so this check is the only guarantee that the donor covers
-    every LoRA parameter -- it must run for all models, including those with a
-    custom state_dict_adapter. The sole exception is expert-parallel models:
-    their LoRA params get custom state_dict key names (e.g.
-    ``gate_up_linear.weight0``) that do not appear in ``named_parameters()``,
-    so their coverage cannot be checked against parameter names.
+    every LoRA parameter. Expected keys are converted through the same native
+    to HF state-dict adapter path used when saving, so the comparison also works
+    for custom model implementations and expert-parallel models.
     """
-    if _has_expert_parallelism(model):
-        return
     with safe_open(
         os.path.join(adapter_dir, "adapter_model.safetensors"), framework="pt"
     ) as f:
@@ -685,16 +686,32 @@ def _validate_lora_adapter_keys(adapter_dir: str, model: torch.nn.Module) -> Non
     # HF PEFT exports prefix keys with "base_model.model."; the loader strips
     # the prefix when present, so accept either form here.
     prefix = "base_model.model."
-    stripped_donor_keys = {
+    normalized_donor_keys = {
         key[len(prefix) :] if key.startswith(prefix) else key for key in donor_keys
     }
-    expected_keys = {
-        name.replace("_checkpoint_wrapped_module.", "")
-        for name, _ in model.named_parameters()
+
+    expected_state_dict = {
+        f"{prefix}{name.replace('_checkpoint_wrapped_module.', '')}": (
+            param.full_tensor().detach().cpu()
+            if hasattr(param, "full_tensor")
+            else param.detach().cpu()
+        )
+        for name, param in model.named_parameters()
         if "lora_" in name
     }
-    missing = sorted(expected_keys - stripped_donor_keys)
-    unexpected = sorted(stripped_donor_keys - expected_keys)
+    _rename_dora_keys_to_hf(expected_state_dict)
+    expected_state_dict = _maybe_adapt_state_dict_to_hf(
+        model,
+        expected_state_dict,
+        quantization=False,
+        device_mesh=moe_mesh,
+    )
+    normalized_expected_keys = {
+        key[len(prefix) :] if key.startswith(prefix) else key
+        for key in expected_state_dict
+    }
+    missing = sorted(normalized_expected_keys - normalized_donor_keys)
+    unexpected = sorted(normalized_donor_keys - normalized_expected_keys)
     if missing or unexpected:
         raise ValueError(
             "dtensor_cfg.lora_cfg.restore_from: donor adapter key mismatch "
@@ -722,9 +739,13 @@ def _load_initial_lora_adapter(
     checkpoints. Optimizer state is not loaded: warm starts begin with a
     fresh optimizer.
     """
-    adapter_dir = _resolve_lora_adapter_dir(restore_from)
+    adapter_dir = os.path.abspath(_resolve_lora_adapter_dir(restore_from))
     _validate_lora_adapter_config(adapter_dir, lora_cfg, model_name)
-    _validate_lora_adapter_keys(adapter_dir, model)
+    _validate_lora_adapter_keys(
+        adapter_dir,
+        model,
+        moe_mesh=getattr(checkpoint_manager, "moe_mesh", None),
+    )
     staging_dir = None
     load_dir = adapter_dir
     if os.path.basename(adapter_dir.rstrip(os.sep)) != "model":

@@ -15,6 +15,7 @@
 """Unit tests for automodel setup utilities."""
 
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, create_autospec, patch
 
 import pytest
@@ -2332,6 +2333,59 @@ class _TinyLoraModel(torch.nn.Module):
         self.layer = LinearLoRA(torch.nn.Linear(4, 8), dim=2, alpha=4)
 
 
+class _IdentityStateDictAdapter:
+    """Minimal custom adapter that preserves state-dict keys."""
+
+    @staticmethod
+    def to_hf(state_dict, **kwargs):
+        return state_dict
+
+
+class _TinyQwen3MoeLoraModel(torch.nn.Module):
+    """Minimal native Qwen3-MoE LoRA key layout for adapter-key tests."""
+
+    def __init__(self, *, ep_size=1):
+        from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import (
+            Qwen3MoeStateDictAdapter,
+        )
+
+        super().__init__()
+        experts = torch.nn.Module()
+        experts.ep_size = ep_size
+        experts.register_parameter(
+            "lora_gate_and_up_A", torch.nn.Parameter(torch.empty(2, 4, 2))
+        )
+        experts.register_parameter(
+            "lora_gate_and_up_B", torch.nn.Parameter(torch.empty(2, 2, 6))
+        )
+        experts.register_parameter(
+            "lora_down_A", torch.nn.Parameter(torch.empty(2, 3, 2))
+        )
+        experts.register_parameter(
+            "lora_down_B", torch.nn.Parameter(torch.empty(2, 2, 4))
+        )
+        mlp = torch.nn.Module()
+        mlp.add_module("experts", experts)
+        layer = torch.nn.Module()
+        layer.add_module("mlp", mlp)
+        inner_model = torch.nn.Module()
+        inner_model.add_module("layers", torch.nn.ModuleList([layer]))
+        self.add_module("model", inner_model)
+        self.state_dict_adapter = Qwen3MoeStateDictAdapter(
+            config=SimpleNamespace(),
+            moe_config=SimpleNamespace(n_routed_experts=2),
+            backend=SimpleNamespace(),
+        )
+
+
+_QWEN3_MOE_HF_LORA_KEYS = (
+    "base_model.model.model.layers.0.mlp.experts.base_layer.lora_B.weight",
+    "base_model.model.model.layers.0.mlp.experts.base_layer.lora_A.weight",
+    "base_model.model.model.layers.0.mlp.experts.lora_B.weight",
+    "base_model.model.model.layers.0.mlp.experts.lora_A.weight",
+)
+
+
 def _write_adapter_checkpoint(
     adapter_dir,
     *,
@@ -2514,7 +2568,8 @@ class TestValidateLoraAdapterKeys:
         ``state_dict_adapter``, which 26/33 Automodel architectures set
         (including plain LlamaForCausalLM) -- so the check silently passed
         while the non-strict PEFT load left donor-uncovered adapters at fresh
-        init. Only expert-parallel models may skip.
+        init. The validator must instead compare keys after the adapter's HF
+        conversion.
         """
         from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
 
@@ -2523,21 +2578,26 @@ class TestValidateLoraAdapterKeys:
             adapter_dir, keys=("base_model.model.layer.lora_A.weight",)
         )
         model = _TinyLoraModel()
-        model.state_dict_adapter = object()  # custom key space, but not EP
+        model.state_dict_adapter = _IdentityStateDictAdapter()
         with pytest.raises(ValueError, match="Missing from donor"):
             _validate_lora_adapter_keys(str(adapter_dir), model)
 
-    def test_expert_parallel_model_skips_key_check(self, tmp_path):
+    def test_qwen3_moe_hf_keys_match_at_ep1(self, tmp_path):
         from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
 
         adapter_dir = tmp_path / "adapter"
-        _write_adapter_checkpoint(adapter_dir, keys=("anything.at.all",))
-        model = _TinyLoraModel()
-        # Expert-parallel models give their LoRA params custom state_dict
-        # names (e.g. gate_up_linear.weight0) that don't appear in
-        # named_parameters(), so the coverage check cannot run for them.
-        model.layer.ep_size = 2
-        _validate_lora_adapter_keys(str(adapter_dir), model)  # should not raise
+        _write_adapter_checkpoint(adapter_dir, keys=_QWEN3_MOE_HF_LORA_KEYS)
+        _validate_lora_adapter_keys(str(adapter_dir), _TinyQwen3MoeLoraModel(ep_size=1))
+
+    def test_expert_parallel_model_with_incomplete_donor_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, keys=_QWEN3_MOE_HF_LORA_KEYS[:-1])
+        with pytest.raises(ValueError, match="Missing from donor"):
+            _validate_lora_adapter_keys(
+                str(adapter_dir), _TinyQwen3MoeLoraModel(ep_size=2)
+            )
 
 
 @pytest.mark.automodel
@@ -2635,6 +2695,43 @@ class TestLoadInitialLoraAdapter:
         assert seen["resolves"]
         # The staging directory was cleaned up after the load.
         assert not os.path.exists(os.path.dirname(seen["model_path"]))
+
+    @pytest.mark.parametrize("relative_path", ["adapter", "model"])
+    def test_relative_adapter_path_is_canonicalized(
+        self, tmp_path, monkeypatch, relative_path
+    ):
+        from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
+
+        adapter_dir = tmp_path / relative_path
+        _write_adapter_checkpoint(
+            adapter_dir,
+            keys=(
+                "base_model.model.layer.lora_A.weight",
+                "base_model.model.layer.lora_B.weight",
+            ),
+        )
+        monkeypatch.chdir(tmp_path)
+        manager = create_autospec(AutomodelCheckpointManager, instance=True)
+        manager.checkpointer = create_autospec(Checkpointer, instance=True)
+        seen = {}
+
+        def fake_load_model(*, model, model_path, **kwargs):
+            seen["model_path"] = model_path
+            seen["resolves"] = os.path.isfile(
+                os.path.join(model_path, "adapter_model.safetensors")
+            )
+
+        manager.checkpointer.load_model.side_effect = fake_load_model
+        _load_initial_lora_adapter(
+            model=_TinyLoraModel(),
+            checkpoint_manager=manager,
+            restore_from=relative_path,
+            lora_cfg=_lora_cfg(),
+            model_name="tiny-model",
+        )
+
+        assert os.path.isabs(seen["model_path"])
+        assert seen["resolves"]
 
 
 @pytest.fixture
