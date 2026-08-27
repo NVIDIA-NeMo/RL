@@ -812,6 +812,9 @@ def distillation_train(
                             task_to_env=task_to_env,
                             max_seq_len=None,
                             generation_config=generation_config,
+                            num_generations_per_prompt=(
+                                master_config.distillation.num_generations_per_prompt
+                            ),
                             log_full_result_tables=should_log_nemo_gym_full_result_tables(
                                 wandb_enabled=master_config.logger["wandb_enabled"],
                                 wandb_config=master_config.logger["wandb"],
@@ -1224,6 +1227,7 @@ def validate(
                     task_to_env=val_task_to_env,
                     max_seq_len=None,
                     generation_config=generation_config,
+                    num_generations_per_prompt=1,
                     log_full_result_tables=should_log_nemo_gym_full_result_tables(
                         wandb_enabled=master_config.logger["wandb_enabled"],
                         wandb_config=master_config.logger["wandb"],

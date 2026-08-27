@@ -3082,6 +3082,9 @@ def grpo_train(
                                 "max_total_sequence_length"
                             ],
                             generation_config=generation_config,
+                            num_generations_per_prompt=(
+                                master_config.grpo.num_generations_per_prompt
+                            ),
                             log_full_result_tables=should_log_nemo_gym_full_result_tables(
                                 wandb_enabled=master_config.logger["wandb_enabled"],
                                 wandb_config=master_config.logger["wandb"],
@@ -4004,6 +4007,7 @@ def validate(
                     task_to_env=val_task_to_env,
                     max_seq_len=master_config.policy["max_total_sequence_length"],
                     generation_config=generation_config,
+                    num_generations_per_prompt=val_num_generations_per_prompt,
                     sampling_params=val_sampling_params,
                     log_full_result_tables=should_log_nemo_gym_full_result_tables(
                         wandb_enabled=master_config.logger["wandb_enabled"],

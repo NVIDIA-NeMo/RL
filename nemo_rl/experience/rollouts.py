@@ -2362,6 +2362,7 @@ async def run_async_nemo_gym_rollout(
     sampling_params: Optional[GenerationSamplingParams] = None,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    identity_num_generations: Optional[int] = None,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2400,6 +2401,10 @@ async def run_async_nemo_gym_rollout(
             remote Gym return and restore the exact original payload locally.
         debug_payload_metrics: Emit logical, physical, and serialized media
             payload metrics at the Gym Ray boundary.
+        identity_num_generations: Number of contiguous rows sharing one logical
+            prompt-group identity. Defaults to ``num_generations``. Synchronous
+            callers set this independently because they collect the full batch as
+            one result while preserving per-prompt GenRM cohort identities.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
@@ -2410,10 +2415,11 @@ async def run_async_nemo_gym_rollout(
         AssertionError: If an unsupported generation option is requested.
         TypeError: If a row lacks a valid ``responses_create_params`` dictionary or
             the actor returns a non-integer row index.
-        ValueError: If ``num_generations`` is not positive, the batch is empty or
-            not divisible by ``num_generations``, ``returns_entire_batch`` has an
-            incompatible size, a streamed row index is out of range or duplicated,
-            a prompt group mixes agents, or its task indices disagree.
+        ValueError: If either generation count is not positive, the batch is empty
+            or not divisible by the relevant generation count,
+            ``returns_entire_batch`` has an incompatible size, a streamed row index
+            is out of range or duplicated, a prompt group mixes agents, or its task
+            indices disagree.
         RuntimeError: If the actor fails, returns NaN generation logprobs, ends the
             stream before all expected rows arrive, or produces no final group.
     """
@@ -2460,11 +2466,19 @@ async def run_async_nemo_gym_rollout(
     )
     if num_generations <= 0:
         raise ValueError("num_generations must be greater than zero")
+    if identity_num_generations is None:
+        identity_num_generations = num_generations
+    if identity_num_generations <= 0:
+        raise ValueError("identity_num_generations must be greater than zero")
     if not nemo_gym_rows:
         raise ValueError("NeMo-Gym rollout batch must not be empty")
     if len(nemo_gym_rows) % num_generations != 0:
         raise ValueError(
             "NeMo-Gym rollout batch size must be divisible by num_generations"
+        )
+    if len(nemo_gym_rows) % identity_num_generations != 0:
+        raise ValueError(
+            "NeMo-Gym rollout batch size must be divisible by identity_num_generations"
         )
     if returns_entire_batch and len(nemo_gym_rows) != num_generations:
         raise ValueError(
@@ -2489,7 +2503,7 @@ async def run_async_nemo_gym_rollout(
             nemo_gym_rows,
             generation_config,
             sampling_params,
-            num_generations,
+            identity_num_generations,
         )
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
@@ -2599,6 +2613,8 @@ def run_nemo_gym_rollout_sync(
     task_to_env: dict[str, EnvironmentInterface],
     generation_config: GenerationConfig,
     log_full_result_tables: bool,
+    *,
+    num_generations_per_prompt: int,
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
@@ -2626,6 +2642,9 @@ def run_nemo_gym_rollout_sync(
         generation_config: Sampling parameters forwarded to every NeMo-Gym row.
         log_full_result_tables: Whether to include complete per-agent result
             payloads as W&B Tables in the rollout metrics.
+        num_generations_per_prompt: Number of contiguous rows belonging to each
+            logical prompt group. This controls Gym/GenRM cohort identity only;
+            the synchronous API still collects and returns the entire input batch.
         max_seq_len: Policy sequence-length limit used for compatibility validation.
         max_rollout_turns: Must be ``None`` because NeMo-Gym owns turn limits.
         greedy: Must be ``False`` because this path does not support greedy mode.
@@ -2662,6 +2681,7 @@ def run_nemo_gym_rollout_sync(
             task_to_env=task_to_env,
             generation_config=generation_config,
             num_generations=input_batch.size,
+            identity_num_generations=num_generations_per_prompt,
             log_full_result_tables=log_full_result_tables,
             max_seq_len=max_seq_len,
             max_rollout_turns=max_rollout_turns,

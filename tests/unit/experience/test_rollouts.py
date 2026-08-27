@@ -2113,8 +2113,10 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     ) is log_full_result_tables
 
 
-def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
-    input_batch = BatchedDataDict({"loss_multiplier": torch.ones(3)})
+def test_run_nemo_gym_rollout_sync_separates_collection_and_identity_groups(
+    monkeypatch,
+):
+    input_batch = BatchedDataDict({"loss_multiplier": torch.ones(4)})
     expected = rollouts_mod.NemoGymRolloutResult(
         input_ids=torch.empty(0),
         final_batch=input_batch,
@@ -2124,6 +2126,7 @@ def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
 
     async def fake_stream(**kwargs):
         assert kwargs["num_generations"] == input_batch.size
+        assert kwargs["identity_num_generations"] == 2
         assert kwargs["returns_entire_batch"] is True
         assert kwargs["log_full_result_tables"] is False
         assert kwargs["deduplicate_multimodal_data"] is True
@@ -2139,6 +2142,7 @@ def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
         task_to_env={},
         generation_config={},
         log_full_result_tables=False,
+        num_generations_per_prompt=2,
         deduplicate_multimodal_data=True,
         debug_payload_metrics=True,
     )
@@ -2360,6 +2364,7 @@ def test_run_async_nemo_gym_rollout(
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         generation_config=nemo_gym_vllm_generation.cfg,
         log_full_result_tables=True,
+        num_generations_per_prompt=1,
         max_rollout_turns=None,
         debug_payload_metrics=True,
     )
