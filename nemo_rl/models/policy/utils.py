@@ -15,6 +15,7 @@
 import gc
 import os
 import traceback
+import warnings
 from enum import Enum
 from typing import Any, Dict, Iterable, Optional
 
@@ -218,6 +219,39 @@ def configure_dynamo_cache() -> None:
     See https://github.com/pytorch/pytorch/issues/153791 for more details.
     """
     torch._inductor.config.autotune_local_cache = False
+
+
+def make_empty_cache_best_effort_under_expandable_segments() -> None:
+    """Make torch.cuda.empty_cache() best-effort when expandable segments are on.
+
+    With ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``, this torch
+    build's ``torch._C._cuda_emptyCache()`` can raise ``RuntimeError:
+    std::get: wrong index for variant`` from the caching allocator's block
+    bookkeeping (stochastic; observed from the empty_cache calls in
+    prepare_for_training/prepare_for_lp_inference after checkpoint saves).
+    empty_cache is a memory-hygiene optimization, never a correctness
+    requirement — and expandable segments already return freed memory to the
+    OS-level segment pool — so under that allocator mode we degrade the call
+    to best-effort instead of letting a failed cache flush kill training.
+    """
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "expandable_segments:True" not in alloc_conf:
+        return
+    original_empty_cache = torch.cuda.empty_cache
+    if getattr(original_empty_cache, "_nrl_best_effort", False):
+        return
+
+    def _best_effort_empty_cache() -> None:
+        try:
+            original_empty_cache()
+        except RuntimeError as e:
+            warnings.warn(
+                f"torch.cuda.empty_cache() failed under expandable_segments; "
+                f"skipping cache flush: {e}"
+            )
+
+    _best_effort_empty_cache._nrl_best_effort = True  # type: ignore[attr-defined]
+    torch.cuda.empty_cache = _best_effort_empty_cache
 
 
 def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:

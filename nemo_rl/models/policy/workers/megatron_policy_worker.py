@@ -98,7 +98,10 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    get_runtime_env_for_policy_worker,
+    make_empty_cache_best_effort_under_expandable_segments,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.checkpoint_engine import (
     MegatronCheckpointEngineSendMixin,
@@ -424,6 +427,7 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        make_empty_cache_best_effort_under_expandable_segments()
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
         # not initialize a CUDA context ahead of the set_device below.
         log_gpu_memory_diagnostics(
