@@ -70,6 +70,32 @@ from tests.unit.single_controller.test_checkpointing import (
     _make_actor_args,
 )
 
+_ASYNC_TEST_TIMEOUT_S = 10.0
+
+
+async def _wait_for_event_or_pump(
+    event: asyncio.Event,
+    pump: asyncio.Task[None],
+) -> None:
+    """Wait for a test hook while surfacing an early rollout-pump failure."""
+    event_waiter = asyncio.create_task(event.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {event_waiter, pump},
+            timeout=_ASYNC_TEST_TIMEOUT_S,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            raise TimeoutError("rollout pump did not reach the expected test hook")
+        if pump in done:
+            await pump
+            raise AssertionError("rollout pump completed before the expected test hook")
+        await event_waiter
+    finally:
+        if not event_waiter.done():
+            event_waiter.cancel()
+            await asyncio.gather(event_waiter, return_exceptions=True)
+
 
 class _CountingInOrderSampler(InOrderSampler):
     """Real in-order sampler with observable admission calls."""
@@ -390,7 +416,7 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
         sampler.restore_dispatch_index(6)
         controller._sampler = sampler
         pump = asyncio.create_task(controller._rollout_pump())
-        await asyncio.wait_for(sampler.admission_entered.wait(), timeout=1.0)
+        await _wait_for_event_or_pump(sampler.admission_entered, pump)
         assert controller._sampler.dispatch_index == 6
 
         try:
@@ -400,9 +426,9 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
             )
         finally:
             sampler.release_admission.set()
-            await asyncio.wait_for(rollout_manager.started.wait(), timeout=1.0)
+            await _wait_for_event_or_pump(rollout_manager.started, pump)
             rollout_manager.release.set()
-            await asyncio.wait_for(pump, timeout=1.0)
+            await asyncio.wait_for(pump, timeout=_ASYNC_TEST_TIMEOUT_S)
             controller._checkpointer.shutdown()
 
         checkpoint = tmp_path / "checkpoints" / "step_7"
@@ -464,7 +490,7 @@ def test_checkpoint_owns_batch_7_while_its_rollout_is_unfinished(tmp_path) -> No
         controller = controller_cls(config, actor_args, SetupTimingMetrics())
 
         pump = asyncio.create_task(controller._rollout_pump())
-        await asyncio.wait_for(rollout_manager.started.wait(), timeout=1.0)
+        await _wait_for_event_or_pump(rollout_manager.started, pump)
         assert controller._sampler.dispatch_index == 7
 
         try:
@@ -474,7 +500,7 @@ def test_checkpoint_owns_batch_7_while_its_rollout_is_unfinished(tmp_path) -> No
             )
         finally:
             rollout_manager.release.set()
-            await asyncio.wait_for(pump, timeout=1.0)
+            await asyncio.wait_for(pump, timeout=_ASYNC_TEST_TIMEOUT_S)
             controller._checkpointer.shutdown()
 
         checkpoint = tmp_path / "checkpoints" / "step_7"

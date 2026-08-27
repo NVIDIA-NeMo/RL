@@ -1322,6 +1322,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     checkpoint_path = tmp_path / "tmp_step_1"
     checkpoint_path.mkdir(parents=True, exist_ok=True)
 
+    actor._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     actor._save_state = SimpleNamespace()
     actor._train_steps = 1
     actor._trainer_version = 1
