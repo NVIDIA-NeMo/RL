@@ -43,6 +43,7 @@ from nemo_rl.environments.nemo_gym import (
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
+    should_use_nemo_gym,
     validate_reward_components_match_scalar,
 )
 from nemo_rl.environments.nemo_gym_video import (
@@ -960,6 +961,46 @@ def test_nemo_gym_stub_module():
     print(
         f"NeMo-Gym test successfully run! NeMo-Gym config_types module: {config_types}"
     )
+
+
+def test_setup_nemo_gym_config_selects_sglang_without_mutating_vllm():
+    inactive_vllm_cfg = {"async_engine": False, "expose_http_server": False}
+    config = SimpleNamespace(
+        policy={
+            "generation": {
+                "backend": "sglang",
+                "sglang_cfg": {"context_length": 1024},
+                "vllm_cfg": inactive_vllm_cfg,
+                "stop_strings": ["stop"],
+                "stop_token_ids": [1],
+            }
+        }
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert config.policy["generation"]["use_async_rollouts"] is True
+    assert inactive_vllm_cfg == {
+        "async_engine": False,
+        "expose_http_server": False,
+    }
+    assert config.policy["generation"]["stop_strings"] is None
+    assert config.policy["generation"]["stop_token_ids"] is None
+
+
+def test_should_use_nemo_gym_accepts_sglang_native_http_server():
+    config = SimpleNamespace(
+        env={"should_use_nemo_gym": True},
+        policy={
+            "generation": {
+                "backend": "sglang",
+                "use_async_rollouts": True,
+                "sglang_cfg": {"context_length": 1024},
+            }
+        },
+    )
+
+    assert should_use_nemo_gym(config)
 
 
 @pytest.fixture(scope="function")

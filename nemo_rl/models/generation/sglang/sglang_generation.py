@@ -80,6 +80,7 @@ class SGLangGeneration(GenerationInterface):
         # GenerationInterface consumers (create_weight_synchronizer, the refit
         # transports) read ``cfg``; keep the sglang-specific name as the alias.
         self.cfg = sglang_cfg
+        self._owns_runtime = True
         # Set by ``grpo.setup``; ``refit_policy_generation`` dispatches on it.
         self.weight_synchronizer: WeightSynchronizer | None = None
         self._async_loop: AsyncLoopThread | None = AsyncLoopThread()
@@ -146,9 +147,38 @@ class SGLangGeneration(GenerationInterface):
             monitor.start()
             self._health_monitor = monitor
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Return a collector-safe copy without driver-owned runtime state."""
+        state = self.__dict__.copy()
+        state["_owns_runtime"] = False
+        state["_http_client"] = None
+        state["_async_loop"] = None
+        state["_health_monitor"] = None
+        state["weight_synchronizer"] = None
+        state["rollout_engine_lock"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Rebuild only the HTTP resources local to a deserialized copy."""
+        self.__dict__.update(state)
+        self._owns_runtime = False
+        if self._async_loop is None:
+            self._async_loop = AsyncLoopThread()
+        if self._http_client is None:
+            self._http_client = HttpClient(self.sglang_cfg)
+
     # ------------------------------------------------------------------
     # Engine topology properties (formerly ``ServerGroup``)
     # ------------------------------------------------------------------
+    @property
+    def dp_openai_server_base_urls(self) -> list[str]:
+        """Return the stable router URL used by NeMo Gym.
+
+        Individual engine URLs change when fault tolerance replaces an engine;
+        the router address remains stable and tracks the replacement.
+        """
+        return [f"http://{self.router_ip}:{self.router_port}"]
+
     @property
     def nodes_per_engine(self) -> int:
         return max(1, self.num_gpus_per_engine // self.num_gpus_per_node)
@@ -431,56 +461,63 @@ class SGLangGeneration(GenerationInterface):
 
     def shutdown(self) -> bool:
         ok = True
-        if self._health_monitor:
-            self._health_monitor.stop()
+        if getattr(self, "_owns_runtime", True):
+            health_monitor = getattr(self, "_health_monitor", None)
+            if health_monitor is not None:
+                health_monitor.stop()
 
-        if self.weight_synchronizer is not None:
-            # ``shutdown`` is reachable twice (explicit call + ``__del__``);
-            # drop the handle so teardown stays one-shot.
-            self.weight_synchronizer.shutdown()
-            self.weight_synchronizer = None
+            weight_synchronizer = getattr(self, "weight_synchronizer", None)
+            if weight_synchronizer is not None:
+                # ``shutdown`` is reachable twice (explicit call + ``__del__``);
+                # drop the handle so teardown stays one-shot.
+                weight_synchronizer.shutdown()
+                self.weight_synchronizer = None
 
-        rollout_engine_lock = getattr(self, "rollout_engine_lock", None)
-        if rollout_engine_lock is not None:
+            rollout_engine_lock = getattr(self, "rollout_engine_lock", None)
+            if rollout_engine_lock is not None:
+                try:
+                    ray.kill(rollout_engine_lock)
+                except Exception as e:
+                    logger.warning(f"Rollout-engine lock terminate failed: {e}")
+                    ok = False
+                self.rollout_engine_lock = None
+
+            all_engines = getattr(self, "all_engines", [])
+            engines = [e for e in all_engines if e is not None]
+            if engines:
+                try:
+                    ray.get([e.shutdown.remote() for e in engines])
+                except Exception as e:
+                    logger.warning(f"Engine shutdown failed: {e}")
+                    ok = False
+                self.all_engines = [None] * len(all_engines)
+
+            router_actor = getattr(self, "_router_actor", None)
+            if router_actor is not None:
+                try:
+                    ray.get(router_actor.stop.remote())
+                    ray.kill(router_actor)
+                except Exception as e:
+                    logger.warning(f"Router terminate failed: {e}")
+                    ok = False
+                self._router_actor = None
+
+        http_client = getattr(self, "_http_client", None)
+        async_loop = getattr(self, "_async_loop", None)
+        if http_client is not None:
             try:
-                ray.kill(rollout_engine_lock)
-            except Exception as e:
-                logger.warning(f"Rollout-engine lock terminate failed: {e}")
-                ok = False
-            del self.rollout_engine_lock
-
-        engines = [e for e in self.all_engines if e is not None]
-        if engines:
-            try:
-                ray.get([e.shutdown.remote() for e in engines])
-            except Exception as e:
-                logger.warning(f"Engine shutdown failed: {e}")
-                ok = False
-            self.all_engines = [None] * len(self.all_engines)
-
-        if self._router_actor is not None:
-            try:
-                ray.get(self._router_actor.stop.remote())
-                ray.kill(self._router_actor)
-            except Exception as e:
-                logger.warning(f"Router terminate failed: {e}")
-                ok = False
-            self._router_actor = None
-
-        if self._http_client is not None:
-            try:
-                if self._async_loop is not None:
-                    self._async_loop.run(self._http_client.aclose())
+                if async_loop is not None:
+                    async_loop.run(http_client.aclose())
                 else:
-                    self._http_client.shutdown()
+                    http_client.shutdown()
             except Exception as e:
                 logger.warning(f"HTTP client shutdown failed: {e}")
                 ok = False
             self._http_client = None
 
-        if self._async_loop is not None:
+        if async_loop is not None:
             try:
-                self._async_loop.close()
+                async_loop.close()
             except Exception as e:
                 logger.warning(f"AsyncLoopThread close failed: {e}")
                 ok = False

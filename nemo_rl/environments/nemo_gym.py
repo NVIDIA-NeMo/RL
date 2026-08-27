@@ -100,6 +100,10 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         should_expose_http_server = generation_config.get(
             "mcore_generation_config", {}
         ).get("expose_http_server")
+    elif generation_config["backend"] == "sglang":
+        # SGLang always serves an OpenAI-compatible HTTP endpoint through its
+        # router; no additional expose-http-server switch is required.
+        should_expose_http_server = True
     elif generation_config["backend"] == "trtllm":
         should_expose_http_server = generation_config.get("trtllm_cfg", {}).get(
             "expose_http_server"
@@ -1112,9 +1116,20 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
 
-    # Enable the http server. Requires both async engine and the expose_http_server flag
-    generation_config["vllm_cfg"]["async_engine"] = True
-    generation_config["vllm_cfg"]["expose_http_server"] = True
+    if generation_config["backend"] == "sglang":
+        if generation_config.get("sglang_cfg") is None:
+            raise ValueError(
+                "NeMo Gym with the SGLang backend requires "
+                "policy.generation.sglang_cfg."
+            )
+        # SGLang is always an HTTP server. This switch selects its asynchronous
+        # rollout control flow without mutating an inherited inactive vLLM block.
+        generation_config["use_async_rollouts"] = True
+    else:
+        # Preserve the established setup for the other Gym backends, whose
+        # entrypoints currently configure the OpenAI server through vllm_cfg.
+        generation_config["vllm_cfg"]["async_engine"] = True
+        generation_config["vllm_cfg"]["expose_http_server"] = True
 
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None

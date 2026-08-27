@@ -1023,9 +1023,9 @@ def setup(
                 # so cross-node all-reduce uses NVLink, not InfiniBand.
                 #
                 # For vLLM: total GPUs per instance = TP * PP (separate dimensions).
-                # For SGLang: gpus_per_server already includes all parallelism
+                # For SGLang: num_gpus_per_engine already includes all parallelism
                 #   dimensions (TP, DP-attention, PP are internal subdivisions),
-                #   so we use it directly without multiplying by pp_size.
+                #   so use it directly without multiplying by pp_size.
                 # For Megatron: the NVLink-domain span of the parallelism the
                 #   generation workers actually run with.
                 if generation_config["backend"] == "megatron":
@@ -1046,9 +1046,15 @@ def setup(
                     gpus_per_instance = DynamoConfig.model_validate(
                         generation_config
                     ).engine_world_size
+                elif generation_config["backend"] == "sglang":
+                    gpus_per_instance = generation_config["sglang_cfg"][
+                        "sglang_server_config"
+                    ]["num_gpus_per_engine"]
                 else:
-                    sglang_cfg = generation_config.get("sglang_cfg", {})
-                    gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
+                    raise ValueError(
+                        "Unsupported generation backend for topology placement: "
+                        f"{generation_config['backend']!r}"
+                    )
                 nodes_per_instance = (
                     gpus_per_instance + inference_gpus_per_node - 1
                 ) // inference_gpus_per_node
@@ -1123,6 +1129,12 @@ def setup(
                 # Managed Dynamo creates one single-node engine per placement
                 # group and does not need a backend-specific PG strategy.
                 inference_cluster.get_placement_groups()
+            elif generation_config["backend"] == "sglang":
+                # Match SGLangGeneration.__init__: all engines share one PG.
+                inference_cluster._init_placement_groups(
+                    strategy="PACK",
+                    use_unified_pg=True,
+                )
             else:
                 {
                     "vllm": VllmGeneration,
@@ -1563,6 +1575,13 @@ def setup(
             f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
             flush=True,
         )
+
+        if enable_nemo_gym:
+            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
+                policy_generation.dp_openai_server_base_urls,
+                generation_config["model_name"],
+            )
+            setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
     elif backend == "trtllm":
         generation_config = cast(TrtllmConfig, generation_config)
@@ -4229,17 +4248,18 @@ def async_grpo_train(
             media to NeMo Gym prompt rows.
     """
     # Ensure we are running with a compatible async generation backend.
-    # Async GRPO supports vLLM, Megatron, TRT-LLM, and Dynamo;
-    # SGLang async rollouts do not support the async GRPO replay path.
+    # SGLang drains pending requests at each refit boundary rather than
+    # overlapping generation with an in-flight weight update.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
-    assert backend in ("vllm", "megatron", "trtllm", "dynamo"), (
-        "Async GRPO supports the vLLM, Megatron, TRT-LLM, and Dynamo generation backends; "
+    assert backend in ("vllm", "megatron", "sglang", "trtllm", "dynamo"), (
+        "Async GRPO supports the vLLM, Megatron, SGLang, TRT-LLM, and Dynamo generation backends; "
         f"got policy.generation.backend={backend!r}."
     )
     assert should_use_async_rollouts(generation_config), (
-        "Async GRPO requires Dynamo, Megatron, or an async vLLM or TRT-LLM "
+        "Async GRPO requires Dynamo, Megatron, SGLang, or an async vLLM or TRT-LLM "
         "generation engine. Set policy.generation.backend=dynamo, "
+        "policy.generation.use_async_rollouts=true (SGLang), "
         "policy.generation.vllm_cfg.async_engine=true (vLLM), or "
         "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM). "
         "Megatron Inference always uses its async engine."
