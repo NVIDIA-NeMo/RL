@@ -118,6 +118,47 @@ def _extract_reasoning_and_answer_text(result: dict[str, Any]) -> tuple[str, str
     return reasoning_text, answer_text
 
 
+_TOP_LEVEL_LENGTH_BONUS_KEYS = frozenset(
+    {"verbose", "default", "agent_overrides", "profile_band"}
+)
+_PROFILE_BAND_BLOCK_KEYS = frozenset({"enabled", "defaults"})
+_PROFILE_BAND_CHANNELS = frozenset({"total", "reasoning", "answer"})
+
+
+def _reject_unknown_length_bonus_keys(length_cfg: dict[str, Any]) -> None:
+    """Raise on unknown config keys instead of silently ignoring them."""
+
+    def _check(block: Any, allowed: frozenset, where: str) -> None:
+        if not isinstance(block, dict):
+            return
+        unknown = sorted(set(block) - allowed)
+        if unknown:
+            raise ValueError(
+                f"Unknown key(s) {unknown} in {where}; allowed: {sorted(allowed)}"
+            )
+
+    _check(length_cfg, _TOP_LEVEL_LENGTH_BONUS_KEYS, "grpo.length_bonus")
+    _check(
+        length_cfg.get("default"), frozenset(_PARAM_KEYS), "grpo.length_bonus.default"
+    )
+    agents_cfg = length_cfg.get("agent_overrides")
+    if isinstance(agents_cfg, dict):
+        for agent_name, overrides in agents_cfg.items():
+            _check(
+                overrides,
+                frozenset(_PARAM_KEYS),
+                f"grpo.length_bonus.agent_overrides.{agent_name}",
+            )
+    pb_cfg = length_cfg.get("profile_band")
+    if isinstance(pb_cfg, dict):
+        _check(pb_cfg, _PROFILE_BAND_BLOCK_KEYS, "grpo.length_bonus.profile_band")
+        _check(
+            pb_cfg.get("defaults"),
+            _PROFILE_BAND_CHANNELS,
+            "grpo.length_bonus.profile_band.defaults",
+        )
+
+
 def apply_group_length_adjustments(
     results: list[dict[str, Any]],
     master_config: dict[str, Any],
@@ -139,6 +180,7 @@ def apply_group_length_adjustments(
     if not length_cfg:
         return
 
+    _reject_unknown_length_bonus_keys(length_cfg)
     default_cfg = length_cfg.get("default", {})
     agents_cfg = length_cfg.get("agent_overrides")
     global_band = _resolve_global_profile_band(length_cfg.get("profile_band"))
@@ -165,13 +207,16 @@ def apply_group_length_adjustments(
             defaults[k] = default_cfg.get(k, 2)
         elif k == "profiled_length_n_std":
             defaults[k] = default_cfg.get(k, 1.0)
+        elif k == "top_percentile":
+            defaults[k] = default_cfg.get(k, 0.5)
         else:
             defaults[k] = default_cfg.get(k, 0.0)
-    defaults.setdefault("top_percentile", 0.2)
     # Channels listed under length_bonus.profile_band.defaults are implicitly
-    # enabled; per-agent overrides can still disable them.
+    # enabled — unless the user explicitly configured the channel flag, which
+    # always wins (e.g. profile_band_total: false stays false).
     for _ch in global_band:
-        defaults[f"profile_band_{_ch}"] = True
+        if f"profile_band_{_ch}" not in default_cfg:
+            defaults[f"profile_band_{_ch}"] = True
 
     n = len(results)
     original_rewards = [r["full_result"]["reward"] for r in results]
@@ -525,6 +570,11 @@ def _apply_profile_band_multipliers(
             idx = g + k
             # Gate on the env reward (correct rollouts only).
             if original_rewards[idx] <= 0:
+                continue
+            # Additive penalties can push the base below zero; multiplying a
+            # negative base by m < 1 would RAISE the reward for longer
+            # rollouts. Scale only the non-negative part.
+            if base_rewards[idx] <= 0:
                 continue
             current_reward = base_rewards[idx]
 

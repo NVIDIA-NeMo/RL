@@ -381,3 +381,77 @@ class TestProfiledLengthPenalty:
         ]
         apply_group_length_adjustments(results, self.cfg(min_samples=1))
         assert rewards_of(results) == pytest.approx([1.0, 0.7])
+
+
+class TestReviewFixes:
+    """Regression tests for review findings on PR #3852."""
+
+    def test_band_multiplier_skips_negative_base(self):
+        # A flat additive penalty pushes the correct-but-long rollout's base
+        # negative; the band multiplier must NOT scale it (base * m - base > 0
+        # for base < 0 would make longer rollouts score HIGHER).
+        band = {"total": {"a": 1, "b": 2, "f": 0.1}}  # length 20 -> m = 0.1
+        results = [
+            make_result("12345", "12345", 1.0, band=band),
+            make_result("1234567890", "1234567890", 1.0, band=band),
+        ]
+        # zMAD-free setup: use profiled penalty to force one base negative.
+        results[1]["profiled_rewards"] = [1, 1]
+        results[1]["profiled_output_lengths"] = [5, 5]
+        results[0]["profiled_rewards"] = [1, 1]
+        results[0]["profiled_output_lengths"] = [5, 5]
+        cfg = make_config(
+            default={
+                "enabled": True,
+                "profiled_length_penalty": 1.5,  # threshold 5: len 20 -> base -0.5
+                "profile_band_total": True,
+            }
+        )
+        apply_group_length_adjustments(results, cfg)
+        r_short, r_long = rewards_of(results)
+        # Short rollout (len 10 >= 5) also penalized to -0.5; both bases are
+        # negative, so the band phase must leave both untouched.
+        assert r_short == pytest.approx(-0.5)
+        assert r_long == pytest.approx(-0.5)
+        assert r_long <= r_short  # longer must never beat shorter
+
+    def test_explicit_false_channel_not_overridden_by_global_defaults(self):
+        cfg = make_config(
+            default={"enabled": True, "profile_band_total": False},
+            profile_band={
+                "enabled": True,
+                "defaults": {"total": {"a": 10, "b": 20, "f": 0.5}},
+            },
+        )
+        results = [
+            make_result("1234567890123456789012345", "12345", 1.0),  # total 30
+            make_result("12345", "12345", 1.0),
+        ]
+        apply_group_length_adjustments(results, cfg)
+        assert rewards_of(results) == pytest.approx([1.0, 1.0])
+
+    def test_unknown_key_raises(self):
+        cfg = make_config(default={"enabled": True, "group_total_length_coeff": 0.1})
+        results = [make_result("12345", "12345", 1.0), make_result("123", "123", 1.0)]
+        try:
+            apply_group_length_adjustments(results, cfg)
+        except ValueError as e:
+            assert "group_total_length_coeff" in str(e)
+        else:
+            raise AssertionError("expected ValueError for unknown config key")
+
+    def test_top_percentile_default_is_half(self):
+        # With 2 positive scorers (rewards 1.0 and 0.9) and default
+        # top_percentile=0.5, only the best scorer is a "top scorer" — the
+        # longest-total penalty needs >= 2 eligible top scorers, so it no-ops.
+        # With the old effective default of 0.0 the behavior was the same, but
+        # an explicit 1.0 must include both and penalize the longer one.
+        results = [
+            make_result("12345", "12345", 1.0),
+            make_result("1234567890", "1234567890", 0.9),
+        ]
+        cfg = make_config(
+            default={"enabled": True, "longest_total_penalty": 0.2, "top_percentile": 1.0}
+        )
+        apply_group_length_adjustments(results, cfg)
+        assert rewards_of(results) == pytest.approx([1.0, 0.7])
