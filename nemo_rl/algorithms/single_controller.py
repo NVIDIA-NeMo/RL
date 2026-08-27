@@ -506,6 +506,22 @@ class SingleControllerActor:
         return result
 
     def _log_data_plane_metrics(self, total_step_time: float) -> None:
+        """Log this step's data-plane cost. Never raises.
+
+        On by default, so this runs every step of every recipe. Mirrors
+        ``grpo_sync._log_data_plane_metrics``.
+        """
+        try:
+            self._log_data_plane_metrics_impl(total_step_time)
+        except Exception as exc:  # noqa: BLE001 - a panel must never fail a step
+            logging.getLogger(__name__).warning(
+                "data-plane metrics failed at step %d (%s: %s); training continues",
+                self._train_steps,
+                type(exc).__name__,
+                exc,
+            )
+
+    def _log_data_plane_metrics_impl(self, total_step_time: float) -> None:
         """Log this step's data-plane cost. No-op unless observability is enabled.
 
         The synchronous loop logs these series from ``_log_data_plane_metrics``
@@ -532,15 +548,9 @@ class SingleControllerActor:
         self._logger.log_metrics(
             headline_series(metrics), step, prefix="data_plane/driver"
         )
-        try:
-            columns, rows = breakdown_table(metrics)
-        except Exception as exc:  # noqa: BLE001 - a panel must never fail a step
-            logging.getLogger(__name__).warning("data-plane breakdown failed: %s", exc)
-        else:
-            if rows:
-                self._logger.log_table(
-                    columns, rows, step, "data_plane/driver/breakdown"
-                )
+        columns, rows = breakdown_table(metrics)
+        if rows:
+            self._logger.log_table(columns, rows, step, "data_plane/driver/breakdown")
         print(
             f"  • data plane: {metrics['step/wall_ms']:.0f}ms, "
             f"{metrics['step/comm_volume_mb']:.1f} MB moved",

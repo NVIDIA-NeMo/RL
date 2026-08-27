@@ -391,19 +391,33 @@ def _log_breakdown(
 ) -> None:
     """Log the per-op breakdown as a table beside the series.
 
-    Best effort: a backend without a table type skips it, and a failure here
-    must not take a step down over a visualisation.
+    A backend without a table type has no rows to log. Failures propagate to
+    the caller, which already guarantees the logging path cannot fail a step.
     """
-    try:
-        columns, rows = breakdown_table(metrics)
-    except Exception as exc:  # noqa: BLE001 - a panel must never fail a step
-        logging.getLogger(__name__).warning("data-plane breakdown failed: %s", exc)
-    else:
-        if rows:
-            logger.log_table(columns, rows, step, name)
+    columns, rows = breakdown_table(metrics)
+    if rows:
+        logger.log_table(columns, rows, step, name)
 
 
 def _log_data_plane_metrics(
+    policy: Any, logger: Logger, step: int, total_step_time: float
+) -> None:
+    """Log this step's data-plane cost. Never raises.
+
+    On by default, so this runs every step of every recipe.
+    """
+    try:
+        _log_data_plane_metrics_impl(policy, logger, step, total_step_time)
+    except Exception as exc:  # noqa: BLE001 - a panel must never fail a step
+        logging.getLogger(__name__).warning(
+            "data-plane metrics failed at step %d (%s: %s); training continues",
+            step,
+            type(exc).__name__,
+            exc,
+        )
+
+
+def _log_data_plane_metrics_impl(
     policy: Any, logger: Logger, step: int, total_step_time: float
 ) -> None:
     """Log this step's data-plane cost. No-op unless observability is enabled.
