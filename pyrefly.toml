@@ -274,6 +274,8 @@ project-includes = [
   "nemo_rl/weight_sync/ipc_weight_synchronizer.py",
   "nemo_rl/weight_sync/megatron_weight_synchronizer.py",
   "nemo_rl/weight_sync/membership.py",
+  "nemo_rl/weight_sync/model_express/__init__.py",
+  "nemo_rl/weight_sync/model_express/synchronizer.py",
   "nemo_rl/weight_sync/nccl_reshard_utils.py",
   "nemo_rl/weight_sync/nccl_reshard_weight_synchronizer.py",
   "nemo_rl/weight_sync/sglang_weight_synchronizer.py",

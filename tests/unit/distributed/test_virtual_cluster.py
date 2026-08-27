@@ -558,6 +558,8 @@ class TestVllmPortAssignment:
             num_gpus=1, bundle_indices=bundle_indices
         )
         assert env_vars["VLLM_PORT"] == str(expected_port)
+        assert "MX_METADATA_PORT" not in env_vars
+        assert "MX_WORKER_GRPC_PORT" not in env_vars
 
     @pytest.mark.parametrize(
         "num_gpus_per_node,bundle_indices,expected_slot",
@@ -609,6 +611,8 @@ class TestVllmPortAssignment:
             DEFAULT_VLLM_PORT_RANGE_LOW + expected_slot * DEFAULT_VLLM_PORTS_PER_ENGINE
         )
         assert env_vars["VLLM_PORT"] == str(expected_port)
+        assert "MX_METADATA_PORT" not in env_vars
+        assert "MX_WORKER_GRPC_PORT" not in env_vars
 
     @pytest.mark.parametrize(
         "num_gpus_per_node,bundle_indices",

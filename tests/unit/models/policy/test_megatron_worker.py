@@ -57,6 +57,56 @@ def test_model_owned_packing_capability_is_detected():
     assert _model_self_packs_for_cp(ModelOwnedPackingModel())
 
 
+def test_model_express_binds_nonzero_data_parallel_replica(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker._model_express = MagicMock()
+    worker._model_express.bind_tensors.return_value = "megatron:partition:a"
+    worker.megatron_bridge = SimpleNamespace(transformer_config=object())
+    worker._build_refit_conversion_tasks = MagicMock(return_value=["task"])
+    monkeypatch.setattr(
+        worker_module.parallel_state, "get_data_parallel_rank", lambda: 1
+    )
+    monkeypatch.setattr(
+        worker_module.parallel_state, "get_context_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        worker_module.parallel_state,
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        worker_module.parallel_state, "get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        worker_module.parallel_state,
+        "get_expert_tensor_parallel_world_size",
+        lambda: 2,
+    )
+    monkeypatch.setattr(
+        worker_module.parallel_state,
+        "get_expert_tensor_parallel_rank",
+        lambda: 1,
+    )
+    build_specs = MagicMock(return_value=["spec"])
+    monkeypatch.setattr(
+        "modelexpress_rl.train.engines.megatron.build_megatron_tensor_specs",
+        build_specs,
+    )
+
+    assert worker.initialize_model_express(server_url=None) == "megatron:partition:a"
+    build_specs.assert_called_once_with(
+        conversion_tasks=["task"],
+        transformer_config=worker.megatron_bridge.transformer_config,
+        tensor_parallel_size=1,
+        tensor_parallel_rank=0,
+        expert_tensor_parallel_size=2,
+        expert_tensor_parallel_rank=1,
+    )
+    worker._model_express.bind_tensors.assert_called_once_with(["spec"])
+
+
 def test_model_owned_mtp_loss_mask_packing_capability_is_detected():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         _model_self_packs_mtp_loss_mask,
