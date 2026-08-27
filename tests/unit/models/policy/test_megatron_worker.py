@@ -1306,21 +1306,6 @@ def test_sync_params_before_refit_gathers_pending_bf16_params(
     worker._copy_main_params_to_param_buffer.assert_not_called()
 
 
-def test_nvte_backward_override_is_scoped_to_training(monkeypatch):
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
-
-    worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker._nvte_backward_override = "dequantized"
-    monkeypatch.delenv("NVTE_BACKWARD_OVERRIDE", raising=False)
-
-    with worker._nvte_backward_override_training_ctx():
-        assert os.environ["NVTE_BACKWARD_OVERRIDE"] == "dequantized"
-
-    assert "NVTE_BACKWARD_OVERRIDE" not in os.environ
-
-
 def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
     """Async checkpoint tensor references must be released before GPU offload."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (

@@ -626,7 +626,7 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
     logger.info("Successfully disabled decoder-level SP-MoE for GLM DSA models.")
 
 
-def _patch_vllm_moe_routed_experts_capture(logger) -> None:
+def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) -> bool:
     """Fire the routed-experts capture hook on the monolithic fused-MoE path.
 
     ``RoutedExpertsCapturer`` (used by router replay / R3) is driven by the
@@ -648,10 +648,11 @@ def _patch_vllm_moe_routed_experts_capture(logger) -> None:
             "model_executor/layers/fused_moe/runner/moe_runner.py"
         )
     except RuntimeError:
-        logger.warning(
-            "Could not locate moe_runner.py for routed-experts capture patch."
-        )
-        return
+        message = "Could not locate moe_runner.py for routed-experts capture patch."
+        if required:
+            raise RuntimeError(message) from None
+        logger.warning(message)
+        return False
 
     marker = "NeMo-RL patch (routed-experts capture for router replay)"
     old_snippet = (
@@ -662,7 +663,8 @@ def _patch_vllm_moe_routed_experts_capture(logger) -> None:
     new_snippet = (
         "        if self.routed_experts.quant_method.is_monolithic:\n"
         "            # Monolithic kernels: pass router_logits to routed_experts\n"
-        f"            # {marker}: monolithic MoE kernels compute top-k routing\n"
+        "            # NeMo-RL patch (routed-experts capture for router replay): "
+        "monolithic MoE kernels compute top-k routing\n"
         "            # inside the fused kernel and never call router.select_experts,\n"
         "            # so the RoutedExpertsCapturer hook never fires and returned\n"
         "            # routes are all-zero. Fire it explicitly when capture is on.\n"
@@ -679,18 +681,22 @@ def _patch_vllm_moe_routed_experts_capture(logger) -> None:
     with _locked_file_patch(file_to_patch) as (content, write_back):
         if marker in content:
             logger.info("MoE routed-experts capture patch already applied.")
-            return
+            return True
         if old_snippet not in content:
-            logger.warning(
+            message = (
                 "Could not apply MoE routed-experts capture patch: expected "
-                "code snippet not found in %s. The vLLM version may have changed.",
-                file_to_patch,
+                f"code snippet not found in {file_to_patch}. The vLLM version "
+                "may have changed."
             )
-            return
+            if required:
+                raise RuntimeError(message)
+            logger.warning(message)
+            return False
         content = content.replace(old_snippet, new_snippet, 1)
         write_back(content)
 
     logger.info("Successfully patched MoE routed-experts capture (monolithic path).")
+    return True
 
 
 def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> bool:
@@ -862,6 +868,7 @@ def _apply_vllm_patches(
     *,
     extra_env_vars: list[str] | None = None,
     nemotron_h_fp32_lm_head: bool | None = None,
+    require_moe_routed_experts_capture: bool = False,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
     import vllm.envs as envs
@@ -929,4 +936,6 @@ def _apply_vllm_patches(
             "could not be applied. Disable the flag or update the patch anchors "
             "for this vLLM version."
         )
-    _patch_vllm_moe_routed_experts_capture(patch_logger)
+    _patch_vllm_moe_routed_experts_capture(
+        patch_logger, required=require_moe_routed_experts_capture
+    )

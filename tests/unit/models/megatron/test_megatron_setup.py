@@ -1946,6 +1946,7 @@ class TestApplyPerformanceConfig:
         "policy_update",
         [
             {"precision": "float32"},
+            {"quant_cfg": "examples/modelopt/quant_configs/nvfp4_experts.yaml"},
             {"megatron_cfg": {"fp4_cfg": {"enabled": False}}},
             {"megatron_cfg": {"fp4_cfg": {"fp4_recipe": "other"}}},
             {"megatron_cfg": {"fp4_cfg": {"fp4_param": True}}},
@@ -1969,6 +1970,8 @@ class TestApplyPerformanceConfig:
         }
         if "precision" in policy_update:
             config["precision"] = policy_update["precision"]
+        if "quant_cfg" in policy_update:
+            config["quant_cfg"] = policy_update["quant_cfg"]
         if "megatron_cfg" in policy_update:
             config["megatron_cfg"]["fp4_cfg"].update(
                 policy_update["megatron_cfg"]["fp4_cfg"]
