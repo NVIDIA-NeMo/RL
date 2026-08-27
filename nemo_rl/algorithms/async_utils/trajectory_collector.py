@@ -1291,7 +1291,7 @@ class AsyncTrajectoryCollector:
                 max_rollout_turns=None,
                 greedy=False,
                 reward_penalty_config=self.master_config.reward_penalties,
-                length_adjustment_config=self.master_config.grpo.model_dump(),
+                length_penalty_config=self.master_config.grpo.model_dump(),
                 thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
                 mask_env_flagged_samples=should_mask_flagged_samples(
                     self.master_config.env

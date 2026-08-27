@@ -1,10 +1,10 @@
-# Length Adjustment Algorithms
+# Length Penalty Algorithms
 
 This file documents the length-penalty and length-bonus algorithms implemented in:
 
-`nemo_rl/utils/length_adjustments.py`
+`nemo_rl/utils/length_penalty.py`
 
-Configure `grpo.length_bonus`. The length adjustments mutate `full_result["reward"]` in
+Configure `grpo.length_penalty`. The length adjustments mutate `full_result["reward"]` in
 place during rollout postprocessing.
 
 All algorithms are resolved per prompt group. Unless otherwise stated, only rollouts with
@@ -31,7 +31,7 @@ Consequences of binariness worth knowing:
 
 ```yaml
 grpo:
-  length_bonus:
+  length_penalty:
     verbose: true
     default:
       enabled: true
@@ -84,7 +84,7 @@ agent:
 
 ```yaml
 grpo:
-  length_bonus:
+  length_penalty:
     default:
       enabled: true
       group_total_length_penalty_coeff: 0.1
@@ -226,7 +226,7 @@ Example:
 
 ```yaml
 grpo:
-  length_bonus:
+  length_penalty:
     default:
       enabled: true
       total_bonus: 0.1
@@ -256,7 +256,7 @@ Example:
 
 ```yaml
 grpo:
-  length_bonus:
+  length_penalty:
     default:
       enabled: true
       top_percentile: 0.5
@@ -292,7 +292,7 @@ Example:
 
 ```yaml
 grpo:
-  length_bonus:
+  length_penalty:
     default:
       enabled: true
       group_total_length_penalty_coeff: 0.1
@@ -332,7 +332,7 @@ Example:
 
 ```yaml
 grpo:
-  length_bonus:
+  length_penalty:
     default:
       enabled: true
       total_zmad_threshold: 2.5
@@ -370,7 +370,7 @@ Example:
 
 ```yaml
 grpo:
-  length_bonus:
+  length_penalty:
     default:
       enabled: true
       profiled_length_penalty: 0.1
@@ -416,7 +416,7 @@ Example:
 
 ```yaml
 grpo:
-  length_bonus:
+  length_penalty:
     default:
       enabled: true
       profile_band_total: true
@@ -425,12 +425,12 @@ grpo:
 #### Global Defaults (dataset without per-prompt bands)
 
 When the dataset has no per-prompt `profile_band` metadata, global `{a, b, f}` values can be
-set directly in the config under `length_bonus.profile_band`. Only the channels listed under
+set directly in the config under `length_penalty.profile_band`. Only the channels listed under
 `defaults` are activated:
 
 ```yaml
 grpo:
-  length_bonus:
+  length_penalty:
     profile_band:
       enabled: true
       defaults:
@@ -439,7 +439,7 @@ grpo:
 
 ```yaml
 grpo:
-  length_bonus:
+  length_penalty:
     profile_band:
       enabled: true
       defaults:
@@ -448,7 +448,7 @@ grpo:
 
 ```yaml
 grpo:
-  length_bonus:
+  length_penalty:
     profile_band:
       enabled: true
       defaults:
@@ -461,7 +461,7 @@ only, and the last on answer length only. Multiple channels may be listed togeth
 Semantics:
 
 - Channels under `defaults` are implicitly enabled — no need to also set
-  `profile_band_total/reasoning/answer: true` under `length_bonus.default`. Per-agent
+  `profile_band_total/reasoning/answer: true` under `length_penalty.default`. Per-agent
   `agent_overrides` can still disable a channel (e.g. `profile_band_total: false`).
 - Per-prompt `profile_band` metadata, when present on a row, takes precedence over the global
   defaults on a per-channel basis (a row that only provides `total` still falls back to the
@@ -493,7 +493,7 @@ For each prompt group:
 
 1. Read a threshold from `profile_band[channel][field]`, for example `profile_band["total"]["a"]`.
    The band is the row's `profile_band` metadata merged over the global
-   `length_bonus.profile_band.defaults` (row channels win), so the gate also works on datasets
+   `length_penalty.profile_band.defaults` (row channels win), so the gate also works on datasets
    without per-prompt bands when global defaults are configured.
 2. Compute the mean rollout length for the selected channel.
 3. If `group_length_penalty_profile_gate_positive_only` is true, use only positive rollouts in
@@ -521,7 +521,7 @@ Example:
 
 ```yaml
 grpo:
-  length_bonus:
+  length_penalty:
     default:
       enabled: true
       group_total_length_penalty_coeff: 0.1

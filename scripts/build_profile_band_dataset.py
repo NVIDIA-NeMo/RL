@@ -19,7 +19,7 @@ Reads a JSONL produced by ``profile_run`` (rows must carry
 ``profiled_reasoning_lengths``, ``profiled_answer_lengths``, and
 ``pass_rate``) and writes a new JSONL where each row has an additional
 ``profile_band`` field consumed by Mechanism 6 in
-``nemo_rl/utils/length_adjustments.py``::
+``nemo_rl/utils/length_penalty.py``::
 
     profile_band:
       total:     {a, b, f}    # only present if data is non-degenerate

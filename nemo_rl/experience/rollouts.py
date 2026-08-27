@@ -72,7 +72,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
 )
-from nemo_rl.utils.length_adjustments import apply_group_length_adjustments
+from nemo_rl.utils.length_penalty import apply_group_length_penalties
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -2272,7 +2272,7 @@ async def run_async_nemo_gym_rollout(
     greedy: bool = False,
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
-    length_adjustment_config: dict[str, Any] | BaseModel | None = None,
+    length_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
     returns_entire_batch: bool = False,
@@ -2304,7 +2304,7 @@ async def run_async_nemo_gym_rollout(
         greedy: Must be ``False`` because this path does not support greedy mode.
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
-        length_adjustment_config: Optional GRPO config block for length adjustments.
+        length_penalty_config: Optional GRPO config block for length adjustments.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
         mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
             flags in the rollout batch for loss masking.
@@ -2480,7 +2480,7 @@ async def run_async_nemo_gym_rollout(
                         log_full_result_tables=log_full_result_tables,
                         effort_config=effort_config,
                         reward_penalty_config=reward_penalty_config,
-                        length_adjustment_config=length_adjustment_config,
+                        length_penalty_config=length_penalty_config,
                         thinking_tags=thinking_tags,
                         mask_env_flagged_samples=mask_env_flagged_samples,
                     )
@@ -2518,7 +2518,7 @@ def run_nemo_gym_rollout_sync(
     greedy: bool = False,
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
-    length_adjustment_config: dict[str, Any] | BaseModel | None = None,
+    length_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     sampling_params: Optional[GenerationSamplingParams] = None,
     mask_env_flagged_samples: bool = True,
@@ -2583,7 +2583,7 @@ def run_nemo_gym_rollout_sync(
             greedy=greedy,
             effort_config=effort_config,
             reward_penalty_config=reward_penalty_config,
-            length_adjustment_config=length_adjustment_config,
+            length_penalty_config=length_penalty_config,
             thinking_tags=thinking_tags,
             mask_env_flagged_samples=mask_env_flagged_samples,
             returns_entire_batch=True,
@@ -2610,7 +2610,7 @@ def _postprocess_single_nemo_gym_group(
     log_full_result_tables: bool,
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
-    length_adjustment_config: dict[str, Any] | BaseModel | None = None,
+    length_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
 ) -> NemoGymRolloutResult:
@@ -2627,15 +2627,15 @@ def _postprocess_single_nemo_gym_group(
     )
     penalty_counts = apply_reward_penalties(results, resolved_reward_penalty_config)
 
-    if length_adjustment_config is not None:
+    if length_penalty_config is not None:
         grpo_config = (
-            length_adjustment_config.model_dump()
-            if isinstance(length_adjustment_config, BaseModel)
-            else dict(length_adjustment_config)
+            length_penalty_config.model_dump()
+            if isinstance(length_penalty_config, BaseModel)
+            else dict(length_penalty_config)
         )
         # Callers pass the whole grpo config block; runs without a
-        # grpo.length_bonus section are untouched by this block.
-        if grpo_config.get("length_bonus"):
+        # grpo.length_penalty section are untouched by this block.
+        if grpo_config.get("length_penalty"):
             # Copy the per-row fields the length adjustments consume.
             for nemo_gym_row, result in zip(nemo_gym_rows, results):
                 result["agent_ref"] = nemo_gym_row["agent_ref"]
@@ -2644,7 +2644,7 @@ def _postprocess_single_nemo_gym_group(
                     "profiled_output_lengths"
                 )
                 result["profile_band"] = nemo_gym_row.get("profile_band")
-            apply_group_length_adjustments(
+            apply_group_length_penalties(
                 results, {"grpo": grpo_config}, tokenizer=tokenizer
             )
 
