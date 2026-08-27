@@ -118,7 +118,7 @@ logger:
   tensorboard_enabled: true
   wandb:
     project: nemo-rl-glm-perf
-    name: grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated
+    name: grpo-glm5.2-72n8g-megatron-noncolocated
 cluster:
   gpus_per_node: 8
   num_nodes: 72
