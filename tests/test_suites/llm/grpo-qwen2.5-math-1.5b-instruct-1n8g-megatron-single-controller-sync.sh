@@ -36,7 +36,9 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
         'data["train/token_mult_prob_error"]["450"] < 1.1' \
-        'mean(data["timing/train/total_step_time"], 2) < 25'
+        'mean(data["timing/train/total_step_time"], 2) < 25' \
+        'max(data.get("data_plane/cluster/step/hash/mismatches", data.get("data_plane/driver/step/hash/mismatches", {}))) == 0' \
+        'max(data.get("data_plane/cluster/step/hash/guard_failures", data.get("data_plane/driver/step/hash/guard_failures", {}))) == 0'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

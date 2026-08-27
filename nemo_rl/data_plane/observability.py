@@ -888,12 +888,6 @@ def cluster_step_metrics(
     """
     wall_ms = merged["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
     overhead_ms = merged["self_ms"] - prev.get("self_ms", 0.0) + collect_ms
-    # Not ``frac_of_step``: ``wall_ms`` here is the SUM over processes that
-    # ran concurrently, so dividing by one step's wall clock gives a number
-    # that exceeds 1 whenever they overlapped (measured 1.054 across ten
-    # processes) -- correct arithmetic, but it reads as "105% of the step".
-    # The mean fraction of the step a process spent in the data plane is
-    # bounded and answers the question people ask of it.
     n_procs = max(merged.get("n_processes", 1), 1)
     # step/ is a delta over this step; now/ is a level at this instant.
     # The unit alone does not distinguish them -- see README.md.

@@ -534,11 +534,9 @@ class SingleControllerActor:
         advantage stage's get plus the post-train clear; the bulk traffic is
         the trainer and generation workers' own clients, in their own
         processes with their own counters, so ``comm_volume_mb`` here is well
-        under what the job actually moved. ``grpo_sync`` prefers a cluster
-        view by fanning out over its policy worker group, but nothing
-        implements ``collect_data_plane_snapshots`` yet, so that path also
-        falls through to the driver's counters alone -- there is no cluster
-        view to mirror here until one exists.
+        under what the job actually moved. ``grpo_sync`` gets a cluster view by
+        fanning out over its policy worker group; this loop has no such group to
+        fan out over, so driver scope is all there is here.
         """
         if not isinstance(self._dp_client, MetricsDataPlaneClient):
             return  # observability disabled -> plain adapter
