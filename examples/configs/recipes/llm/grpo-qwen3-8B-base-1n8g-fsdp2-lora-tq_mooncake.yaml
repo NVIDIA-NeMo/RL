@@ -2,3 +2,5 @@ defaults: grpo-qwen3-8B-base-1n8g-fsdp2-lora.yaml
 data_plane:
   enabled: true
   backend: mooncake_cpu
+  observability:
+    verify_tensor_hash: true  # wire guard; gated to 0 by the wrapper script

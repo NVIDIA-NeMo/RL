@@ -34,8 +34,11 @@ uv run examples/run_grpo.py \
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    # The wire guard only counts; assert it found nothing.
     uv run tests/check_metrics.py $JSON_METRICS \
-        'median(data["train/token_mult_prob_error"]) < 1.02'
+        'median(data["train/token_mult_prob_error"]) < 1.02' \
+        'max(data["data_plane/cluster/step/hash/mismatches"]) == 0' \
+        'max(data["data_plane/cluster/step/hash/guard_failures"]) == 0'
 
     rm -rf "$CKPT_DIR"
 fi
