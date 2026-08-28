@@ -43,6 +43,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
@@ -54,6 +55,20 @@ class _InitBuffer:
     """Minimal non-optional TQ buffer contract for actor-init tests."""
 
     def __init__(self) -> None:
+        self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
+
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        self.checkpoint_barrier = barrier
+
+
+class _InitRolloutManager:
+    """Minimal rollout-manager contract for actor-init tests."""
+
+    def __init__(self, tq_buffer: _InitBuffer) -> None:
+        self._tq_buffer = tq_buffer
+        self.recovery_ledger = RolloutRecoveryLedger()
         self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
 
     def set_data_plane_checkpoint_barrier(
@@ -111,7 +126,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=tq_buffer,
-        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
+        rollout_manager=_InitRolloutManager(tq_buffer),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -161,7 +176,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=tq_buffer,
-        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
+        rollout_manager=_InitRolloutManager(tq_buffer),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
