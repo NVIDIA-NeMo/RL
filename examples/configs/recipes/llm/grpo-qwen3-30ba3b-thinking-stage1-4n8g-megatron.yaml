@@ -1,0 +1,17 @@
+defaults: ../../../nemo_gym/grpo_qwen3_30ba3b_thinking_stage1.yaml
+grpo:
+  num_prompts_per_step: 16
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-thinking-stage1-4n8g-megatron
+  enabled: false
+policy:
+  train_global_batch_size: 256
+data:
+  train:
+    data_path: "${oc.env:HF_HOME}/conversational_tool_use_pivot/train.jsonl"
+  validation:
+    data_path: "${oc.env:HF_HOME}/conversational_tool_use_pivot/val.jsonl"
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-thinking-stage1-4n8g-megatron
+  wandb:
+    name: grpo-qwen3-30ba3b-thinking-stage1-4n8g-megatron

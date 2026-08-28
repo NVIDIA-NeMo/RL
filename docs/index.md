@@ -142,6 +142,13 @@ Train Qwen2.5-Omni-7B with GRPO on PhilipC/IntentTrain (audio-visual intent reco
 Train Qwen3-30B-A3B-Thinking into a SWE agent with a pivot stage plus end-to-end agentic RL on SWE-bench.
 :::
 
+:::{grid-item-card} {octicon}`comment-discussion` Conversational Tool-Use Pivot RL (Qwen3 Thinking)
+:link: guides/conversational-tool-use-pivot-qwen3
+:link-type: doc
+
+Reproduce PivotRL's single-step conversational tool-use RL stage on Qwen3-30B-A3B-Thinking, evaluated on tau2-bench.
+:::
+
 :::{grid-item-card} {octicon}`plus-circle` Adding New Models
 :link: adding-new-models
 :link-type: doc
@@ -297,6 +304,7 @@ guides/lora.md
 guides/cispo.md
 guides/prorlv2.md
 guides/swe-rl-qwen3.md
+guides/conversational-tool-use-pivot-qwen3.md
 guides/grpo.md
 guides/ppo.md
 guides/grpo-deepscaler.md

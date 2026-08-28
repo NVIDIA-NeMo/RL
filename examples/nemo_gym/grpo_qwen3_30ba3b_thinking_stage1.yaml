@@ -1,0 +1,141 @@
+# GRPO conversational tool-use pivot (PivotRL stage 1, single-step) recipe for Qwen3-30B-A3B-Thinking.
+#
+# Conversational analog of grpo_qwen3_30ba3b_thinking_swe1.yaml: single-step GRPO on
+# pivot states extracted from expert conversational tool-use trajectories
+# (PivotRL, https://arxiv.org/abs/2603.21383), rewarded by the NeMo-Gym
+# `single_step_tool_use_with_argument_comparison` verifier (tool name + fuzzy
+# argument comparison). Unlike SWE1 this recipe follows the original tau run:
+# colocated synchronous GRPO, 64 prompts x 16 generations, decoupled clip 0.2/0.2,
+# no KL penalty, lr 1e-6, 32k context, default Qwen3-Thinking chat template
+# (no custom interleaved-thinking template).
+#
+# Data: nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-Pivot-v1 (HF), prepared with
+#   uv run examples/nemo_gym/prepare_conversational_tool_use_pivot_data.py --output-dir datasets/conversational_tool_use_pivot
+#
+# Note on node count: the original run used 16 nodes (DP=8); at 4 nodes DP=2, so
+# per-rank optimizer state is 4x larger. If training or the colocated vLLM
+# wake_up OOMs, set policy.megatron_cfg.optimizer.optimizer_cpu_offload=true
+# (+ optimizer_offload_fraction=1.0) and/or lower
+# policy.generation.vllm_cfg.gpu_memory_utilization (the 1n8g smoke uses 0.55).
+
+defaults: "grpo_qwen3_30ba3b_instruct.yaml"
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30b-thinking-stage1
+  metric_name: train:total_reward/mean
+  higher_is_better: true
+  keep_top_k: 10
+  save_period: 10
+  model_save_format: safetensors
+  save_consolidated: false
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
+  max_num_epochs: 10
+  use_leave_one_out_baseline: true
+  normalize_rewards: true
+  val_period: 10
+  val_at_start: false
+  val_batch_size: 256
+  val_num_generations_per_prompt: 1
+  overlong_filtering: false
+  # KL penalty is 0, so reference-policy logprobs are never used.
+  skip_reference_policy_logprobs_calculation: true
+loss_fn:
+  reference_policy_kl_penalty: 0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  # Plain token-level GRPO (the instruct base switches to GSPO; switch back).
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: false
+  force_on_policy_ratio: false
+policy:
+  model_name: Qwen/Qwen3-30B-A3B-Thinking-2507
+  tokenizer:
+    chat_template_kwargs: null
+  # Megatron is the training backend, but checkpointing.model_save_format
+  # (safetensors) is only honored on the _v2 save path (same combo as swe1).
+  dtensor_cfg:
+    _v2: true
+  train_global_batch_size: 1024
+  generation_batch_size: 32
+  logprob_chunk_size: 1024
+  max_total_sequence_length: 32768
+  # The instruct base interpolates this to TP (=1 here), but CP=4 requires
+  # sequences padded to a multiple of 2*CP.
+  make_sequence_length_divisible_by: 8
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 4
+    context_parallel_size: 4
+    # TP=1, so sequence parallelism is a no-op.
+    sequence_parallel: false
+    freeze_moe_router: true
+    moe_aux_loss_coeff: 0.0001
+    moe_router_enable_expert_bias: true
+    bias_activation_fusion: false
+    empty_unused_memory_level: 1
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}
+    vllm_cfg:
+      tensor_parallel_size: 8
+      enable_expert_parallel: true
+      expert_parallel_size: 8
+      enforce_eager: true
+      enable_prefix_caching: true
+      gpu_memory_utilization: 0.7
+      # Weights arrive via refit before the first generation.
+      load_format: dummy
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+        reasoning_parser: deepseek_r1
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+data:
+  max_input_seq_length: null
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: datasets/conversational_tool_use_pivot/train.jsonl
+  validation:
+    data_path: datasets/conversational_tool_use_pivot/val.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+  _override_: true
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  should_mask_flagged_samples: true
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
+  _override_: true
+logger:
+  log_dir: logs
+  wandb:
+    project: nemo-rl-tau
+    name: qwen3-30b-thinking-stage1-pivot
+  mlflow:
+    experiment_name: qwen3-30b-thinking-stage1-pivot
+    run_name: qwen3-30b-thinking-stage1-pivot
+cluster:
+  num_nodes: 4
