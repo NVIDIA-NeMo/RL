@@ -902,6 +902,89 @@ def test_native_mxfp8_metadata_has_ordered_component_shapes() -> None:
         ]
 
 
+def test_native_mxfp8_metadata_keeps_bf16_ignored_experts_in_misc() -> None:
+    from megatron.bridge.models.conversion.param_mapping import (
+        AutoMapping,
+        GatedMLPMapping,
+    )
+
+    native_prefix = "model.layers.0.mlp.experts.0"
+    ignored_prefix = "model.layers.1.mlp.experts.0"
+    native_fc1 = SimpleNamespace(
+        mapping=GatedMLPMapping(
+            "decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.weight",
+            gate=f"{native_prefix}.gate_proj.weight",
+            up=f"{native_prefix}.up_proj.weight",
+        ),
+        param_weight=_native_tensor((8, 64), value_marker=1, scale_marker=2),
+        global_param_name="decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.weight",
+    )
+    native_fc2 = SimpleNamespace(
+        mapping=AutoMapping(
+            "decoder.layers.0.mlp.experts.local_experts.0.linear_fc2.weight",
+            f"{native_prefix}.down_proj.weight",
+        ),
+        param_weight=_native_tensor((64, 32), value_marker=3, scale_marker=4),
+        global_param_name="decoder.layers.0.mlp.experts.local_experts.0.linear_fc2.weight",
+    )
+    ignored_fc1 = SimpleNamespace(
+        mapping=GatedMLPMapping(
+            "decoder.layers.1.mlp.experts.local_experts.0.linear_fc1.weight",
+            gate=f"{ignored_prefix}.gate_proj.weight",
+            up=f"{ignored_prefix}.up_proj.weight",
+        ),
+        param_weight=torch.zeros((8, 64), dtype=torch.bfloat16),
+        global_param_name="decoder.layers.1.mlp.experts.local_experts.0.linear_fc1.weight",
+    )
+    ignored_fc2 = SimpleNamespace(
+        mapping=AutoMapping(
+            "decoder.layers.1.mlp.experts.local_experts.0.linear_fc2.weight",
+            f"{ignored_prefix}.down_proj.weight",
+        ),
+        param_weight=torch.zeros((64, 32), dtype=torch.bfloat16),
+        global_param_name="decoder.layers.1.mlp.experts.local_experts.0.linear_fc2.weight",
+    )
+    tasks = [native_fc1, native_fc2, ignored_fc1, ignored_fc2]
+    worker = _native_worker(tasks)
+    worker._calculate_refit_param_info = lambda: []
+    worker.draft_model = None
+    worker.model = SimpleNamespace(config=SimpleNamespace(num_layers=2))
+
+    def export_hf_weights(_models: Any, **kwargs: Any):
+        exported_tasks = kwargs["conversion_tasks"]
+        for task in exported_tasks:
+            hf_param = task.mapping.hf_param
+            names = hf_param.values() if isinstance(hf_param, dict) else (hf_param,)
+            for name in names:
+                yield str(name), torch.zeros((1,), dtype=torch.bfloat16)
+
+    worker.megatron_bridge = SimpleNamespace(export_hf_weights=export_hf_weights)
+
+    refit_info = worker.prepare_nccl_reshard_refit_info(
+        {"tp_size": 1, "ep_size": 1, "pp_size": 1},
+        {"tp_size": 1, "ep_size": 1, "pp_size": 1},
+        1,
+        1,
+    )
+
+    native_names = [
+        param["name"]
+        for params in refit_info["per_layer_params"].values()
+        for param in params
+    ]
+    assert native_names == [
+        "model.layers.0.mlp.experts.gate_proj.weight",
+        "model.layers.0.mlp.experts.up_proj.weight",
+        "model.layers.0.mlp.experts.down_proj.weight",
+    ]
+    assert list(refit_info["misc_meta"]) == [
+        f"{ignored_prefix}.gate_proj.weight",
+        f"{ignored_prefix}.up_proj.weight",
+        f"{ignored_prefix}.down_proj.weight",
+    ]
+    assert worker._misc_conversion_tasks == [ignored_fc1, ignored_fc2]
+
+
 def test_native_mxfp8_per_expert_metadata_expands_global_expert_axis() -> None:
     from megatron.bridge.models.conversion.param_mapping import (
         AutoMapping,
