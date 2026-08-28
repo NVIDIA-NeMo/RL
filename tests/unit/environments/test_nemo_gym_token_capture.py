@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nemo_rl.environments.nemo_gym import NemoGym
+from nemo_rl.environments.nemo_gym import NemoGym, _external_staging_backend
 
 # Receipt assembly imports nemo_gym at call time (resolve_terminal etc.), so
 # these tests must run in the Nemo_Gym shard, not the base-env Environments one.
@@ -29,6 +29,30 @@ pytestmark = pytest.mark.nemo_gym
 def _capture_env() -> NemoGym:
     env_cls = NemoGym.__ray_metadata__.modified_class
     return object.__new__(env_cls)
+
+
+@pytest.mark.parametrize(
+    ("generation_backend", "expected"),
+    [("vllm", "vllm_worker"), ("megatron", "megatron_ledger")],
+)
+def test_external_staging_backend_maps_generation_backend(
+    generation_backend: str, expected: str
+) -> None:
+    token_capture = {"generation_backend": generation_backend}
+
+    assert _external_staging_backend(token_capture) == expected
+    assert token_capture == {"generation_backend": generation_backend}
+
+
+@pytest.mark.parametrize(
+    "token_capture",
+    [{}, {"generation_backend": None}, {"generation_backend": "sglang"}],
+)
+def test_external_staging_backend_rejects_missing_or_invalid_backend(
+    token_capture: dict,
+) -> None:
+    with pytest.raises(ValueError, match="setup-derived generation_backend"):
+        _external_staging_backend(token_capture)
 
 
 def _manifest_record(

@@ -279,6 +279,23 @@ def test_rollout_flush_validates_http_lengths_before_staging(monkeypatch):
     ]
 
 
+def test_rollout_flush_validates_http_token_content_before_staging(monkeypatch):
+    sink = _MemorySink()
+    ledger_record = _ledger_record()
+    ledger_record["generated_token_ids"] = [99]
+    ledger = {"minf-1": ledger_record}
+    generation = _generation(monkeypatch, sink, ledger)
+
+    with pytest.raises(RuntimeError, match="token content differs"):
+        generation.flush_token_capture(_receipt())
+
+    assert sink.records == []
+    assert "minf-1" in ledger
+    assert [call[0] for call in generation._policy.worker_group.calls] == [
+        "fetch_token_capture_records"
+    ]
+
+
 def test_worker_enables_and_reads_minf_ledger() -> None:
     record = SimpleNamespace(**_ledger_record())
 

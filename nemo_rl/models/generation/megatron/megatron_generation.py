@@ -392,6 +392,7 @@ class MegatronGeneration(GenerationInterface):
 
     def flush_token_capture(self, receipt: dict[str, Any]) -> dict[str, Any]:
         """Batch-convert one rollout's MInf ledger rows into durable TQ rows."""
+        from nemo_gym.token_id_capture.staging.digest import compute_chain_hash
         from nemo_gym.token_id_capture.staging.protocols import DeferredCaptureAdapter
         from nemo_gym.token_id_capture.staging.records import (
             CaptureAdmission,
@@ -469,6 +470,15 @@ class MegatronGeneration(GenerationInterface):
                             f"parent {record.parent_call_id!r}"
                         )
                     parent_chain_hash = parent.chain_hash
+                ledger_delta = prompt_token_ids[record.prev_len :] + generated_token_ids
+                if (
+                    compute_chain_hash(parent_chain_hash, ledger_delta)
+                    != record.chain_hash
+                ):
+                    raise RuntimeError(
+                        f"MInf request {record.ledger_request_uid!r} token content "
+                        "differs from the HTTP lineage"
+                    )
                 admission = CaptureAdmission(
                     rollout_id=str(receipt["rollout_id"]),
                     model_call_id=record.model_call_id,

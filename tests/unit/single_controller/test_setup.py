@@ -208,6 +208,39 @@ def _save_state(
     return state
 
 
+@pytest.mark.parametrize(
+    ("backend", "expected", "unexpected"),
+    [
+        (
+            "megatron",
+            "driver environment",
+            "VllmAsyncGenerationWorker environment",
+        ),
+        (
+            "vllm",
+            "VllmAsyncGenerationWorker environment",
+            "driver environment",
+        ),
+    ],
+)
+def test_missing_nemo_gym_remediation_is_backend_specific(
+    backend: str, expected: str, unexpected: str
+) -> None:
+    import_error = ModuleNotFoundError("No module named 'nemo_gym'")
+
+    with pytest.raises(RuntimeError, match=expected) as exc_info:
+        sc_setup_mod._raise_missing_nemo_gym_error(import_error, backend)
+
+    assert unexpected not in str(exc_info.value)
+    assert exc_info.value.__cause__ is import_error
+    if backend == "megatron":
+        assert "uv run --extra nemo_gym" in str(exc_info.value)
+        assert "uv sync --extra nemo_gym" in str(exc_info.value)
+    else:
+        assert "NRL_FORCE_REBUILD_VENVS=true" in str(exc_info.value)
+        assert "$NEMO_RL_VENV_DIR" in str(exc_info.value)
+
+
 @pytest.fixture
 def patched_factories():
     """Patch every external factory setup calls.
@@ -1240,7 +1273,7 @@ class TestSetup:
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
-            ),
+            ) as mock_spinup,
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
             patch(
                 "nemo_rl.experience.finalizer_actor.create_finalizer_actors",
@@ -1259,6 +1292,10 @@ class TestSetup:
         assert actor_kwargs == {"num_workers": 3}
         assert actor_args.finalizer_actors == fake_actors
         assert not hasattr(actor_args.rollout_manager, "_finalizer")
+        assert mc.token_capture.generation_backend == "vllm"
+        assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
+            "vllm"
+        )
 
     def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
         """Non-colocated vLLM records every per-phase field."""
