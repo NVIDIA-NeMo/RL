@@ -415,14 +415,33 @@ class TrtllmAsyncGenerationWorkerImpl:
         if self._http_base_url is not None:
             return self._http_base_url
 
+        from nemo_rl.utils.fastokens import maybe_patch_fastokens
+
+        # Apply fastokens inside this Ray actor before constructing the tokenizer.
+        maybe_patch_fastokens(False)
+
         from transformers import AutoTokenizer
 
-        from nemo_rl.models.generation.trtllm.trtllm_http_server import start_server
+        from nemo_rl.models.generation.trtllm.trtllm_http_server import (
+            _tokenizer_backend_name,
+            start_server,
+        )
 
         tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
             trust_remote_code=True,
         )
+        tokenizer_backend = _tokenizer_backend_name(tokenizer)
+        print(f"[TrtllmAsyncWorker] HTTP tokenizer backend: {tokenizer_backend}")
+        if (
+            os.environ.get("NRL_USE_FASTOKENS") == "1"
+            and tokenizer_backend != "fastokens._compat._TokenizerShim"
+        ):
+            raise RuntimeError(
+                "NRL_USE_FASTOKENS=1, but the TRT-LLM HTTP tokenizer backend "
+                f"is {tokenizer_backend!r}; expected "
+                "'fastokens._compat._TokenizerShim'"
+            )
         self._http_thread, self._http_base_url, self._http_server = start_server(
             llm=self.llm,
             tokenizer=tokenizer,
