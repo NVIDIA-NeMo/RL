@@ -15,8 +15,12 @@
 """Unit tests for community_import checkpoint-save strategy shim."""
 
 import importlib
+import os
 import sys
+import time
 from types import ModuleType, SimpleNamespace
+
+import pytest
 
 
 def _ensure_package(monkeypatch, name: str) -> ModuleType:
@@ -43,6 +47,9 @@ def _load_community_import_module(monkeypatch):
     fake_torch.float32 = object()
     fake_torch.bfloat16 = object()
     fake_torch.float16 = object()
+    # import_model_from_hf_name guards its collectives on this; single-process
+    # tests take the non-distributed path.
+    fake_torch.distributed = SimpleNamespace(is_available=lambda: False)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
     # Stub megatron imports required by the module.
@@ -188,7 +195,14 @@ def test_prefer_nvrx_falls_back_to_original_save_when_nvrx_missing(monkeypatch):
     assert strategy.original_save_calls == [({"y": 2}, "/tmp/ckpt")]
 
 
-def test_import_model_from_hf_name_calls_bridge_save(monkeypatch):
+def _stage_conversion(path) -> None:
+    """Materialize a complete conversion layout (iter_0000000/run_config.yaml)."""
+    os.makedirs(os.path.join(str(path), "iter_0000000"), exist_ok=True)
+    with open(os.path.join(str(path), "iter_0000000", "run_config.yaml"), "w") as f:
+        f.write("{}\n")
+
+
+def test_import_model_from_hf_name_calls_bridge_save(monkeypatch, tmp_path):
     module = _load_community_import_module(monkeypatch)
     _install_runtime_stubs_for_hf_import(monkeypatch)
     # Force this import path to stay unavailable even if real megatron modules
@@ -231,6 +245,9 @@ def test_import_model_from_hf_name_calls_bridge_save(monkeypatch):
         def save_megatron_model(self, megatron_model, output_path):
             self.saved_model = megatron_model
             self.saved_path = output_path
+            # The real save materializes the checkpoint; publish needs the
+            # staged directory (and its completion marker) to exist.
+            _stage_conversion(output_path)
 
     fake_bridge = FakeBridge()
 
@@ -243,7 +260,48 @@ def test_import_model_from_hf_name_calls_bridge_save(monkeypatch):
 
     monkeypatch.setattr(module, "AutoBridge", FakeAutoBridge)
 
-    module.import_model_from_hf_name("fake/hf-model", "/tmp/out")
+    output_path = tmp_path / "out"
+    module.import_model_from_hf_name("fake/hf-model", str(output_path))
 
     assert fake_bridge.saved_model is not None
-    assert fake_bridge.saved_path == "/tmp/out"
+    # The save lands in a hidden staging sibling, then is renamed into place.
+    assert os.path.basename(fake_bridge.saved_path).startswith(".out.staging-")
+    assert module.megatron_conversion_is_complete(str(output_path))
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out"]
+
+
+@pytest.mark.parametrize(
+    ("occupant", "overwrite", "staged_wins"),
+    [
+        # The empty-target happy path is covered end to end by
+        # test_import_model_from_hf_name_calls_bridge_save.
+        # A concurrent producer's complete artifact wins; the staged copy is discarded.
+        ("complete", False, False),
+        # A stale partial occupant (bare iter_0000000/, interrupted run) is displaced.
+        ("partial", False, True),
+        # force_reconvert_from_hf replaces even a complete artifact.
+        ("complete", True, True),
+    ],
+)
+def test_publish_conversion(monkeypatch, tmp_path, occupant, overwrite, staged_wins):
+    """Publish atomically renames the staging dir, resolving occupants of the final path."""
+    module = _load_community_import_module(monkeypatch)
+    staging, final = tmp_path / ".ckpt.staging-abc", tmp_path / "ckpt"
+    _stage_conversion(staging)
+    (staging / "staged_marker").touch()
+    if occupant == "complete":
+        _stage_conversion(final)
+    elif occupant == "partial":
+        (final / "iter_0000000").mkdir(parents=True)
+
+    module.publish_megatron_conversion(str(staging), str(final), overwrite=overwrite)
+
+    assert module.megatron_conversion_is_complete(str(final))
+    assert (final / "staged_marker").exists() is staged_wins
+    # Doomed copies are deleted on a background thread; wait for it.
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline and sorted(
+        p.name for p in tmp_path.iterdir()
+    ) != ["ckpt"]:
+        time.sleep(0.01)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["ckpt"]

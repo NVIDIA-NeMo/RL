@@ -468,6 +468,9 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     )
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
+    # No fleet health: _sync_weights reconciles refit membership first, and with no
+    # monitor there is nothing to reconcile.
+    ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
@@ -491,6 +494,9 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._async_cfg = AsyncRLConfig()
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
+    # No fleet health: _sync_weights reconciles refit membership first, and with no
+    # monitor there is nothing to reconcile.
+    ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
