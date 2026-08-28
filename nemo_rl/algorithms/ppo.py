@@ -763,7 +763,7 @@ def setup(
 
     # train_iters is the total scheduler-tick budget. Each Megatron worker
     # ticks once per train() call, so policy and value need separate budgets
-    # when the critic trains for more epochs than the actor.
+    # when their epoch counts or training start steps differ.
     ppo_epochs = ppo_config.ppo_epochs
     critic_ppo_epochs = ppo_config.resolved_critic_ppo_epochs
     async_config = ppo_config.async_ppo
@@ -775,7 +775,16 @@ def setup(
             ppo_config.max_num_epochs * len(dataloader),
         )
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        policy_config["megatron_cfg"]["train_iters"] = outer_training_steps * ppo_epochs
+        policy_training_steps = max(
+            outer_training_steps - ppo_config.policy_training_start_step,
+            0,
+        )
+        # Megatron-Bridge requires a positive scheduler horizon at setup. The
+        # scheduler is never advanced when critic warmup spans the whole run.
+        policy_config["megatron_cfg"]["train_iters"] = max(
+            policy_training_steps * ppo_epochs,
+            1,
+        )
 
     if value_config.get("megatron_cfg", {}).get("enabled", False):
         value_config["megatron_cfg"]["train_iters"] = (

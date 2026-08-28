@@ -59,7 +59,7 @@ When only one node remains for policy and generation after other resources are r
 
 ### Asynchronous PPO
 
-Set `ppo.async_ppo.enabled: true` to overlap rollout generation with training. A background collector fills a replay buffer on the non-colocated vLLM GPUs while the policy and value model train on their shared cluster. Values and policy/reference log probabilities are recomputed when a trajectory is sampled, then PPO runs GAE and its normal `ppo_epochs` updates before publishing one new policy version to vLLM.
+Set `ppo.async_ppo.enabled: true` to overlap rollout generation with training. A background collector fills a replay buffer on the non-colocated vLLM GPUs while the policy and value model train on their shared cluster. Values and policy/reference log probabilities are recomputed when a trajectory is sampled, then PPO runs GAE, all `critic_ppo_epochs` critic updates, and all `ppo_epochs` policy updates before publishing one new policy version to vLLM.
 
 Async PPO reuses the trajectory collector, replay buffer, and weight-versioning infrastructure described in the [Async GRPO guide](async-grpo.md); this section focuses on PPO-specific behavior and constraints.
 

@@ -870,18 +870,19 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     assert master_config.ppo is not None
     _ = master_config.ppo.resolved_critic_ppo_epochs
 
-    # Without it the critic steps once per chunk and the policy once per step,
-    # which is two effective learning rates from one config, and no error.
+    # Each PPO epoch must consume the complete RL batch. Without this guard, every
+    # chunk would independently run the configured actor and critic optimizer steps.
     if async_config.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step:
         raise ValueError(
             "PPO on the SingleController path requires "
             "async_rl.min_groups_for_streaming_train "
             f"({async_config.min_groups_for_streaming_train}) == "
             f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) so that each RL "
-            "step is assembled from a single chunk: the critic steps its "
-            "optimizer once per chunk and the policy once per step. Streaming "
-            "PPO needs a split train API on the value workers, which they do "
-            "not have yet (#2625)."
+            "step is assembled from a single chunk. Otherwise each chunk would "
+            "run ppo.critic_ppo_epochs critic optimizer steps and ppo.ppo_epochs "
+            "policy optimizer steps on only part of the RL batch. Streaming PPO "
+            "needs a split train API on the value workers, which they do not have "
+            "yet (#2625)."
         )
 
     failure_config = async_config.rollout_failure
@@ -934,8 +935,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         raise ValueError(
             "num_prompts_per_step * num_generations_per_prompt "
             f"({rl_step_samples}) must equal value.train_global_batch_size "
-            f"({value_global_batch_size}) so that one RL step maps to exactly one "
-            "critic optimizer.step."
+            f"({value_global_batch_size}) so that each critic epoch consumes one "
+            "complete RL batch."
         )
 
 

@@ -263,8 +263,7 @@ class TestPPOValidation:
             validate_single_controller_config(mc)
 
     def test_rejects_multi_chunk_streaming(self):
-        """The critic has no split API, so it would step once per chunk while
-        the policy steps once per RL step."""
+        """PPO cannot spread one full-batch optimizer epoch across chunks."""
         mc = _ppo_master_config(min_groups_for_streaming_train=1)
 
         with pytest.raises(
@@ -484,20 +483,42 @@ class TestAdvantageEstimatorSelection:
 
 
 class TestMegatronTrainIters:
-    @pytest.mark.parametrize(("ppo_epochs", "expected"), [(1, 7), (3, 21)])
-    def test_injects_into_both_policy_and_value(self, ppo_epochs, expected):
-        """Each epoch steps both optimizers, so each is a scheduler tick."""
+    @pytest.mark.parametrize(
+        (
+            "ppo_epochs",
+            "policy_training_start_step",
+            "expected_policy",
+            "expected_value",
+        ),
+        [
+            (1, 0, 7, 7),
+            (3, 0, 21, 21),
+            (3, 2, 15, 21),
+            (3, 7, 1, 21),
+        ],
+    )
+    def test_injects_into_both_policy_and_value(
+        self,
+        ppo_epochs,
+        policy_training_start_step,
+        expected_policy,
+        expected_value,
+    ):
+        """Each scheduler budget matches its model's optimizer update count."""
         mc = _ppo_master_config(
             megatron_enabled=True,
             ppo=PPOConfig.model_construct(
-                max_num_steps=7, ppo_epochs=ppo_epochs, **_STEP_CONFIG
+                max_num_steps=7,
+                ppo_epochs=ppo_epochs,
+                policy_training_start_step=policy_training_start_step,
+                **_STEP_CONFIG,
             ),
         )
 
         sc_setup_mod._maybe_inject_megatron_train_iters(mc)
 
-        assert mc.policy["megatron_cfg"]["train_iters"] == expected
-        assert mc.value["megatron_cfg"]["train_iters"] == expected
+        assert mc.policy["megatron_cfg"]["train_iters"] == expected_policy
+        assert mc.value["megatron_cfg"]["train_iters"] == expected_value
 
     def test_injects_distinct_policy_and_value_budgets(self):
         mc = _ppo_master_config(

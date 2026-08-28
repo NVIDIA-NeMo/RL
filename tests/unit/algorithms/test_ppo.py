@@ -2019,20 +2019,23 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
     (
         "async_enabled",
         "critic_ppo_epochs",
+        "policy_training_start_step",
         "expected_policy_train_iters",
         "expected_value_train_iters",
     ),
     [
-        (False, None, 3, 3),
-        (False, 5, 3, 5),
-        (True, None, 30, 30),
-        (True, 5, 30, 50),
+        (False, None, 0, 3, 3),
+        (False, 5, 0, 3, 5),
+        (True, None, 0, 30, 30),
+        (True, 5, 2, 24, 50),
+        (True, 5, 10, 1, 50),
     ],
 )
 def test_megatron_train_iters_matches_ppo_training_limit(
     monkeypatch,
     async_enabled,
     critic_ppo_epochs,
+    policy_training_start_step,
     expected_policy_train_iters,
     expected_value_train_iters,
 ):
@@ -2046,6 +2049,7 @@ def test_megatron_train_iters_matches_ppo_training_limit(
     config.ppo.max_num_epochs = -1 if async_enabled else 1
     config.ppo.ppo_epochs = 3
     config.ppo.critic_ppo_epochs = critic_ppo_epochs
+    config.ppo.policy_training_start_step = policy_training_start_step
     config.ppo.async_ppo = AsyncPPOConfig(enabled=async_enabled)
 
     _run_noncolocated_setup(monkeypatch, config)

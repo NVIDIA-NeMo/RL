@@ -714,9 +714,17 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     algo_cfg = algo_config(master_config)
     ppo_config = master_config.ppo if is_ppo_run(master_config) else None
     # train_iters is a scheduler-tick budget. Policy and value need separate
-    # budgets when the critic takes more optimizer steps per rollout batch.
+    # budgets when their epoch counts or training start steps differ.
     policy_epochs = ppo_config.ppo_epochs if ppo_config is not None else 1
-    policy_train_iters = algo_cfg.max_num_steps * policy_epochs
+    policy_training_steps = algo_cfg.max_num_steps
+    if ppo_config is not None:
+        policy_training_steps = max(
+            policy_training_steps - ppo_config.policy_training_start_step,
+            0,
+        )
+    # Megatron-Bridge requires a positive scheduler horizon at setup. A PPO
+    # policy scheduler is never advanced when critic warmup spans the whole run.
+    policy_train_iters = max(policy_training_steps * policy_epochs, 1)
 
     # policy
     policy_config = master_config.policy

@@ -1745,6 +1745,8 @@ def test_train_pump_runs_all_critic_epochs_before_actor_epochs(monkeypatch) -> N
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert calls == [
+        # Neither logprob is required here, so the policy is parked up front.
+        "policy.offload_to_cpu",
         "policy.finish_inference",
         "critic.prepare_for_inference",
         "critic.get_values_from_meta",
