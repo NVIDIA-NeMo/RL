@@ -1394,6 +1394,8 @@ def _create_megatron_config(
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
+    if fp8_cfg is not None and fp8_cfg.get("enabled", False):
+        optimizer_kwargs["fp8_recipe"] = fp8_cfg.get("fp8_recipe")
 
     # Fused linear logprobs run the decoder but read output_layer.weight directly
     # instead of calling output_layer.forward(). Megatron's distributed-optimizer
