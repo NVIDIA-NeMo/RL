@@ -30,6 +30,8 @@ NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY = "_nemo_rl_empty_response_output"
 # Trainer version/step for which an async rollout was reserved. This is internal
 # replay metadata and is deliberately not sent to Gym or the generation backend.
 TARGET_WEIGHT_VERSION_KEY = "target_weight_version"
+# Opaque async-RL target version; None means the field is not forwarded.
+NEMO_GYM_TARGET_WEIGHT_VERSION_KEY = "_ng_target_weight_version"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 # Unconsumed suffix of a gap-fill dataloader batch, carried in the async
 # collector's rollouts state so a checkpoint cannot strand yielded prompts.
