@@ -380,6 +380,29 @@ class TestWindowedSelect:
         ]
         assert buf.start_weight_list == [5]
 
+    def test_carries_metrics_for_groups_restored_without_them(self):
+        buf = FakeBuffer()
+        buf.add("restored", weight=5)
+        buf.add("fresh", weight=5, rollout_metrics={"metric": 2.0})
+        # A checkpoint written before per-group metrics existed restores metas
+        # whose extra_info has no ROLLOUT_METRICS key at all.
+        restored_meta = buf.meta_list[0]
+        assert restored_meta is not None
+        restored_meta.extra_info.pop(ROLLOUT_METRICS)
+        sampler = WindowedSampler(buf, max_staleness_versions=1)
+
+        meta, num_groups = _run(
+            sampler.select(
+                current_train_weight=5,
+                min_prompt_groups=1,
+                max_prompt_groups=2,
+            )
+        )
+
+        assert num_groups == 2
+        assert meta is not None
+        assert meta.extra_info[ROLLOUT_METRICS] == [{"metric": 2.0}]
+
     def test_below_min_returns_none(self):
         buf = FakeBuffer()
         buf.add("a", weight=5)

@@ -1405,7 +1405,12 @@ class SingleControllerActor:
             # TODO: per-step train_data jsonl dump, vllm metrics logger,
             #   histogram log, pretty-print "Training Results" block,
             #   print_performance_metrics.
-            print(f"step_metrics={step_metrics}", flush=True)
+            printable_step_metrics = {
+                name: value
+                for name, value in step_metrics.items()
+                if not isinstance(value, list)
+            }
+            print(f"step_metrics={printable_step_metrics}", flush=True)
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
             )

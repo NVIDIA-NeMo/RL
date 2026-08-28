@@ -1404,6 +1404,7 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
 
 def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
     monkeypatch,
+    capsys,
 ) -> None:
     metas = [
         KVBatchMeta(
@@ -1423,6 +1424,7 @@ def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
                     "total_turns": 2,
                     "accuracy": 0.25,
                     "trajectory_duration_s": 1.0,
+                    "histogram/gen_tokens_length": [7, 10],
                 },
                 {
                     "gen_tokens/min": 3,
@@ -1430,6 +1432,7 @@ def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
                     "total_turns": 5,
                     "accuracy": 0.75,
                     "trajectory_duration_s": 3.0,
+                    "histogram/gen_tokens_length": [3, 20],
                 },
             ]
         )
@@ -1450,7 +1453,10 @@ def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
     assert train_metrics["trajectory_duration_s"] == pytest.approx(2.0)
     assert train_metrics["trajectory_duration_s/max"] == 3.0
     assert train_metrics["trajectory_duration_s/p95"] == 3.0
+    assert train_metrics["histogram/gen_tokens_length"] == [7, 10, 3, 20]
     assert train_call.kwargs == {"step": 1, "prefix": "train"}
+    assert all(ROLLOUT_METRICS not in meta.extra_info for meta in metas)
+    assert "histogram/gen_tokens_length" not in capsys.readouterr().out
 
 
 def test_train_pump_collects_generation_metrics_at_step_boundaries(
