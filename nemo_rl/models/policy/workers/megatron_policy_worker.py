@@ -755,6 +755,16 @@ class MegatronPolicyWorkerImpl(
             self.megatron_cfg.optimizer, "reuse_grad_buf_for_mxfp8_param_ag", False
         ) and getattr(self.megatron_cfg.ddp, "overlap_param_gather", False)
 
+    def _sync_native_mxfp8_params_for_refit(self) -> None:
+        if not (
+            self._is_native_mxfp8_export()
+            and self._uses_mxfp8_overlap_shared_param_buffer()
+        ):
+            return
+
+        self.optimizer.prepare_model_params_for_param_sync()
+        self.model.start_param_sync(force_sync=True)
+
     def _get_model_extra_state_dict(self) -> dict[str, Any]:
         fp8_enabled = self.fp8_cfg and self.fp8_cfg.get("enabled", False)
         if not fp8_enabled:
@@ -3918,6 +3928,7 @@ class MegatronPolicyWorkerImpl(
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
         if self._is_native_mxfp8_export():
+            self._sync_native_mxfp8_params_for_refit()
             self._refresh_local_native_mxfp8_param_components()
             self._validate_local_native_grouped_mxfp8_components()
 
