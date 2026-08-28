@@ -503,3 +503,88 @@ def test_monitor_names_the_missing_tuning_keys():
     ):
         assert key in message
     assert "use_fault_tolerance" in message
+
+
+# ---------------------------------------------------------------------------
+# Recovery cohort rollback (checkpoint-engine restart contract)
+# ---------------------------------------------------------------------------
+
+
+def _bare_generation_for_recover():
+    gen = SGLangGeneration.__new__(SGLangGeneration)
+    gen.all_engines = ["survivor", None]
+    gen.num_new_engines = 0
+    gen._health_monitor = None
+    gen.needs_offload = False
+    return gen
+
+
+def test_recover_rolls_back_the_cohort_when_replacement_init_fails(monkeypatch):
+    """A failed attempt must leave only ``None`` slots and the old count.
+
+    ``_start_engines`` publishes replacement actors and rewrites
+    ``num_new_engines`` before their init is awaited, so without rollback a
+    partially initialized cohort stays visible and the refit dispatch would
+    rebind against a broken actor.
+    """
+    from unittest.mock import MagicMock
+
+    from nemo_rl.models.generation.sglang import sglang_generation
+
+    gen = _bare_generation_for_recover()
+    fake_actor = MagicMock()
+
+    def fake_start_engines(port_cursors=None):
+        gen.all_engines[1] = fake_actor
+        gen.num_new_engines = 1
+        return (["init-handle"], {})
+
+    gen._start_engines = fake_start_engines
+    killed = []
+    monkeypatch.setattr(
+        sglang_generation.ray,
+        "get",
+        MagicMock(side_effect=RuntimeError("replacement init died")),
+    )
+    monkeypatch.setattr(
+        sglang_generation.ray, "kill", lambda actor: killed.append(actor)
+    )
+
+    with pytest.raises(RuntimeError, match="replacement init died"):
+        gen._recover()
+
+    assert gen.all_engines == ["survivor", None]
+    assert gen.num_new_engines == 0
+    assert killed == [fake_actor]
+
+
+def test_recover_escalates_when_the_rollback_itself_fails(monkeypatch):
+    """Rollback failure means inconsistent engine state: terminal, not retry."""
+    from unittest.mock import MagicMock
+
+    from nemo_rl.models.generation.sglang import sglang_generation
+    from nemo_rl.models.generation.sglang.fault_tolerance import (
+        RecoveryRollbackError,
+    )
+
+    gen = _bare_generation_for_recover()
+
+    def fake_start_engines(port_cursors=None):
+        gen.all_engines[1] = MagicMock()
+        gen.num_new_engines = 1
+        return (["init-handle"], {})
+
+    gen._start_engines = fake_start_engines
+    monkeypatch.setattr(
+        sglang_generation.ray,
+        "get",
+        MagicMock(side_effect=RuntimeError("replacement init died")),
+    )
+
+    def failing_kill(_actor):
+        raise RuntimeError("kill failed")
+
+    monkeypatch.setattr(sglang_generation.ray, "kill", failing_kill)
+
+    with pytest.raises(RecoveryRollbackError, match="rollback"):
+        gen._recover()

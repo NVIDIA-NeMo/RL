@@ -581,3 +581,46 @@ def test_public_entry_point_drives_a_full_refit():
     assert worker.update_weights_from_checkpoint_engine()
     assert worker._checkpoint_engine_weight_version == 1
     assert len(worker.update_calls) == 1
+
+
+def test_init_checkpoint_engine_publishes_only_on_full_success(monkeypatch):
+    """A partial construction failure must not arm the idempotency early-return.
+
+    ``init_checkpoint_engine`` keys its early return on a non-``None``
+    ``checkpoint_engines``; publishing before the loop would turn every retry
+    after a mid-loop constructor failure into a silent no-op, which breaks
+    restart recovery (a rebind relies on re-running init to construct the
+    missing receivers).
+    """
+    calls = []
+
+    def create_engine(_backend, *, bucket_size_bytes, engine_kwargs):
+        calls.append(engine_kwargs["device"])
+        if len(calls) == 2:
+            raise RuntimeError("second receiver died")
+        return _Engine(device=engine_kwargs["device"])
+
+    monkeypatch.setattr(
+        "nemo_rl.utils.checkpoint_engines.base.create_checkpoint_engine",
+        create_engine,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.sglang.utils.train_utils.monkey_patch_torch_reductions",
+        MagicMock(),
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
+
+    worker = _Worker()
+    with pytest.raises(RuntimeError, match="second receiver died"):
+        worker.init_checkpoint_engine(
+            "nixl", 1024, {"device": "cuda", "release_after_refit": False}, 0
+        )
+
+    # Mutation check: with publish-before-loop this is a partial (non-None)
+    # list and the retry below silently early-returns with one receiver.
+    assert getattr(worker, "checkpoint_engines", None) is None
+
+    worker.init_checkpoint_engine(
+        "nixl", 1024, {"device": "cuda", "release_after_refit": False}, 0
+    )
+    assert len(worker.checkpoint_engines) == 2

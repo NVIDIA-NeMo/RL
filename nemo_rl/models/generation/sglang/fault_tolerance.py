@@ -24,6 +24,17 @@ from nemo_rl.models.generation.sglang.config import SGLangConfig
 logger = logging.getLogger(__name__)
 
 
+class RecoveryRollbackError(RuntimeError):
+    """Engine recovery failed AND the cohort rollback could not restore a clean state.
+
+    A plain recovery failure is retryable: the failed replacement cohort was
+    killed, its slots restored to ``None``, and the pre-attempt
+    ``num_new_engines`` count restored, so the next attempt re-recovers from
+    scratch. This error means that rollback itself failed, leaving engine state
+    inconsistent — callers must treat it as terminal.
+    """
+
+
 class RolloutHealthMonitor:
     """Health monitor for rollout engines.
 

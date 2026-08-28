@@ -367,9 +367,35 @@ class SGLangGeneration(GenerationInterface):
             return
 
         port_cursors: dict[int, int] = {}
+        pre_attempt_count = self.num_new_engines
         handles, _ = self._start_engines(port_cursors)
-        if handles:
-            ray.get(handles)
+        try:
+            if handles:
+                ray.get(handles)
+        except Exception as recover_exc:
+            # ``_start_engines`` publishes the replacement actors into
+            # ``all_engines`` and rewrites ``num_new_engines`` before their init
+            # is awaited, so a partially initialized cohort is already visible.
+            # Roll the whole attempt back: the restored ``None`` slots — not a
+            # count for actors that never initialized — drive the next attempt.
+            try:
+                for i in dead_indices:
+                    engine = self.all_engines[i]
+                    if engine is not None:
+                        ray.kill(engine)
+                    self.all_engines[i] = None
+                self.num_new_engines = pre_attempt_count
+            except Exception as rollback_exc:
+                from nemo_rl.models.generation.sglang.fault_tolerance import (
+                    RecoveryRollbackError,
+                )
+
+                raise RecoveryRollbackError(
+                    "Engine recovery failed and the replacement-cohort rollback "
+                    f"also failed ({rollback_exc!r}); engine state is "
+                    "inconsistent and refit must not proceed."
+                ) from recover_exc
+            raise
 
         assert self.num_new_engines == len(dead_indices), (
             "num_new_engines does not match dead_indices length"

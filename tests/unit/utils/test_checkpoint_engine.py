@@ -1327,3 +1327,48 @@ def test_nixl_process_group_uses_parallel_policy_to_rollout_topology():
         "policy-2",
         None,
     )
+
+
+def test_replacement_rebind_disconnects_the_dead_peer_and_binds_the_new_agent(
+    monkeypatch,
+):
+    """Restart-recovery contract: re-running process-group init IS the rebind.
+
+    A policy sender re-initialized with fresh fleet metadata must drop the
+    dead rollout incarnation and bind the replacement's new ``agent_name``;
+    NIXL identifies incarnations by that UUID, so this is the paired-peer
+    assertion the GPU harness cannot make (no RPC exposes ``next_agent``).
+    """
+    transport = _FakeNixlTransport()
+    removed = []
+
+    def make_agent(*_args, **_kwargs):
+        agent = transport.create_agent("policy")
+        original_remove = agent.remove_remote_agent
+
+        def recording_remove(agent_name):
+            removed.append(agent_name)
+            return original_remove(agent_name)
+
+        agent.remove_remote_agent = recording_remove
+        return agent
+
+    monkeypatch.setattr(nixl_mod, "NixlAgent", make_agent)
+    sender = NIXLCheckpointEngine(bucket_size=1024, device="cpu")
+    kwargs = dict(worker_rank=0, train_world_size=1, rollout_world_size=1)
+
+    sender.init_policy_process_group(
+        **kwargs,
+        metadata=[{"agent_name": "policy"}, {"agent_name": "rollout-old"}],
+    )
+    assert sender.next_agent == "rollout-old"
+    assert removed == []
+
+    # The paired rollout engine died and was replaced: same rank, new UUID.
+    sender.init_policy_process_group(
+        **kwargs,
+        metadata=[{"agent_name": "policy"}, {"agent_name": "rollout-new"}],
+    )
+
+    assert sender.next_agent == "rollout-new"
+    assert removed == ["rollout-old"]
