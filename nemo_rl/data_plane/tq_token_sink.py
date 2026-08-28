@@ -371,13 +371,19 @@ class TQTokenSource:
             return []
         if len(set(staging_keys)) != len(staging_keys):
             raise KeyError("prefix fetch: staging_keys contains duplicates")
-        rows = _call_dp(
-            self._dp_client,
-            "get_samples",
-            sample_ids=list(staging_keys),
-            partition_id=self._staging_partition,
-            select_fields=["token_ids_delta"],
-        )
+        try:
+            rows = _call_dp(
+                self._dp_client,
+                "get_samples",
+                sample_ids=list(staging_keys),
+                partition_id=self._staging_partition,
+                select_fields=["token_ids_delta"],
+            )
+        except Exception as error:  # noqa: BLE001 — protocol maps any miss to KeyError
+            raise KeyError(
+                f"prefix fetch: staged rows for {len(staging_keys)} keys could "
+                f"not be fetched from {self._staging_partition!r}: {error}"
+            ) from error
         n_rows = int(rows.batch_size[0]) if rows.batch_size else 0
         if n_rows != len(staging_keys):
             raise KeyError(
