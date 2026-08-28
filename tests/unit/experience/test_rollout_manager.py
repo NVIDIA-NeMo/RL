@@ -1353,13 +1353,27 @@ def _receipt_record(rollout_ids, receipts):
     )
 
 
-def _make_capture_manager(buf, *, on_run=None, num_generations=2):
+def _make_capture_manager(
+    buf,
+    *,
+    on_run=None,
+    num_generations=2,
+    retry_policy: RolloutRetryPolicy | None = None,
+):
     mgr = object.__new__(RolloutManager)
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = num_generations
     mgr._tq_buffer = buf
     mgr._env_handles = {}
     mgr._weight_version = 7
+    mgr._retry_policy = (
+        retry_policy
+        if retry_policy is not None
+        else RolloutRetryPolicy.single_attempt()
+    )
+    mgr._stats = RolloutStats()
+    mgr._skipped_prompts = 0
+    mgr._consecutive_infra_drops = 0
 
     class _CaptureImpl:
         def __init__(self):

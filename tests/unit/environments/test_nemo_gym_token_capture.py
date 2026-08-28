@@ -17,7 +17,13 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock
 
+import pytest
+
 from nemo_rl.environments.nemo_gym import NemoGym
+
+# Receipt assembly imports nemo_gym at call time (resolve_terminal etc.), so
+# these tests must run in the Nemo_Gym shard, not the base-env Environments one.
+pytestmark = pytest.mark.nemo_gym
 
 
 def _capture_env() -> NemoGym:
