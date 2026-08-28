@@ -417,12 +417,28 @@ def setup(
     # Validate batch_multiplier
     batch_multiplier = ppo_config.batch_multiplier
     dataloader_batch_size = ppo_config.num_prompts_per_step
-    if not ppo_config.use_dynamic_sampling:
-        assert batch_multiplier == 1, (
-            "batch_multiplier>1 can only be used if use_dynamic_sampling=True"
+    if ppo_config.use_dynamic_sampling:
+        # PPO implements no filtering for this knob. ``dynamic_sampling`` was
+        # copied into this module but has never been called from any commit
+        # since it was added -- ``grpo.py:3226`` is the only call site in the
+        # tree, and it reaches ``grpo.py``'s copy. Accepting the flag scaled
+        # the rollout batch by ``batch_multiplier`` and then trained on all of
+        # it, so ``num_prompts_per_step`` silently stopped meaning what it
+        # says and the LR schedule, ``consumed_samples``, and every per-step
+        # metric were computed against a different batch size than the recipe
+        # declares. Async PPO already rejects the flag
+        # (``examples/run_ppo.py``), as does the SingleController path
+        # (``single_controller_utils/config.py``); the synchronous driver was
+        # the one that neither implemented nor refused it.
+        raise NotImplementedError(
+            "ppo.use_dynamic_sampling=true is not supported: PPO does not "
+            "implement dynamic sampling, so enabling it would resize the "
+            "rollout batch without filtering it. Set it to false, or use GRPO."
         )
-    else:
-        dataloader_batch_size = int(dataloader_batch_size * batch_multiplier)
+    assert batch_multiplier == 1, (
+        "ppo.batch_multiplier>1 only has an effect under dynamic sampling, "
+        "which PPO does not support."
+    )
 
     dataloader = StatefulDataLoader(
         dataset,
