@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import inspect
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
+from pathlib import Path
 from types import ModuleType, SimpleNamespace, TracebackType
 from typing import Any
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch.distributed._tensor import Shard
 from torch.distributed.tensor.placement_types import Replicate
 
@@ -37,6 +39,43 @@ class _ConfigContext(AbstractContextManager[None]):
         self.exit_errors.append(exc_value)
         if self._exit_error is not None:
             raise self._exit_error
+
+
+@contextmanager
+def _single_rank_vllm_model_parallel(
+    *,
+    tmp_path: Path,
+    vllm_config: Any,
+):
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import parallel_state
+
+    init_method = f"file://{tmp_path / 'vllm_pg_init'}"
+    torch.cuda.set_device(0)
+    parallel_state.cleanup_dist_env_and_memory()
+    with set_current_vllm_config(vllm_config):
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend="nccl",
+                rank=0,
+                world_size=1,
+                init_method=init_method,
+            )
+        parallel_state.init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=init_method,
+            backend="nccl",
+        )
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
+        try:
+            yield
+        finally:
+            parallel_state.cleanup_dist_env_and_memory()
 
 
 def _native_refit_info() -> dict[str, Any]:
@@ -900,7 +939,9 @@ def test_0251_adapter_repeated_refits_change_bytes_and_preserve_runtime_pointers
 
 
 @pytest.mark.vllm
-def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers() -> None:
+def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers(
+    tmp_path: Path,
+) -> None:
     vllm = pytest.importorskip("vllm")
     if vllm.__version__ != "0.25.1":
         pytest.skip("native refit integration is pinned to vLLM 0.25.1")
@@ -911,7 +952,7 @@ def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers() ->
 
     from unittest.mock import patch
 
-    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config import VllmConfig
     from vllm.model_executor.layers.fused_moe import FusedMoE
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
     from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
@@ -1044,7 +1085,7 @@ def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers() ->
             "process_weights_after_loading",
             process_weights_after_loading_mxfp8_moe,
         ),
-        set_current_vllm_config(vllm_config),
+        _single_rank_vllm_model_parallel(tmp_path=tmp_path, vllm_config=vllm_config),
         torch.device("cuda"),
     ):
         model = NativeModel(vllm_config=vllm_config, quant_config=quant_config)

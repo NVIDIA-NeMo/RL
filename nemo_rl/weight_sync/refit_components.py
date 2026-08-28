@@ -142,15 +142,21 @@ def component_plan_digest(refit_info: Mapping[str, Any]) -> str:
                             "dtype": str(component["dtype"]),
                             "global_shape": list(component["global_shape"]),
                             "src_placements": _canonical_placements(
-                                component.get(
-                                    "src_placements",
-                                    param_info.get("src_placements", []),
+                                _placement_sequence(
+                                    component.get(
+                                        "src_placements",
+                                        param_info.get("src_placements", []),
+                                    ),
+                                    f"{param_info['name']} src_placements",
                                 )
                             ),
                             "dst_placements": _canonical_placements(
-                                component.get(
-                                    "dst_placements",
-                                    param_info.get("dst_placements", []),
+                                _placement_sequence(
+                                    component.get(
+                                        "dst_placements",
+                                        param_info.get("dst_placements", []),
+                                    ),
+                                    f"{param_info['name']} dst_placements",
                                 )
                             ),
                         }
@@ -219,3 +225,10 @@ def _canonical_placements(placements: Sequence[Any]) -> list[dict[str, int | str
         else:
             raise ValueError(f"unsupported refit placement {placement!r}")
     return result
+
+
+def _placement_sequence(value: Any, context: str) -> Sequence[Any]:
+    """Validate serialized placement lists before canonicalization."""
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError(f"{context} must be a placement sequence")
+    return value

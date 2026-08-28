@@ -269,6 +269,8 @@ class VllmInternalWorkerExtension:
     # worker unsafe to reuse. Keep the original failure for the worker lifetime.
     _nrl_layerwise_reload_failure: Exception | None = None
     _nccl_reshard_refit_adapter: Any | None = None
+    nccl_reshard_refit_info: dict[str, Any]
+    hf_to_local_param_map: HFToLocalParamMap
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -1029,9 +1031,7 @@ class VllmInternalWorkerExtension:
             restore_refit_info_placements,
         )
 
-        self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
-            restore_refit_info_placements(refit_info)
-        )
+        self.nccl_reshard_refit_info = restore_refit_info_placements(refit_info)
         if _native_mxfp8_param_names(self.nccl_reshard_refit_info):
             adapter = self._get_nccl_reshard_refit_adapter()
             adapter.validate_plan(self.nccl_reshard_refit_info)
