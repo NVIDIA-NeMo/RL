@@ -467,6 +467,7 @@ def test_dtensor_v2_checkpoint_save_and_load(
                 optimizer_path=optimizer_path,
                 checkpointing_cfg=checkpointing_config,
             )
+            policy.finalize_async_save()
 
             # Verify checkpoint files were created
             assert os.path.exists(weights_path), "Weights path should exist after save"
