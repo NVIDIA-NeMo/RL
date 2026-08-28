@@ -43,14 +43,14 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StagedCallRecord,
 )
 
+from nemo_rl.data_plane.schema import (  # noqa: E402
+    ROUTE_PASSTHROUGH_FLAG,
+    ROUTE_PLAN_TAG,
+)
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     STAGING_FIELDS,
     TQTokenSink,
     TQTokenSource,
-)
-from nemo_rl.data_plane.schema import (  # noqa: E402
-    ROUTE_PASSTHROUGH_FLAG,
-    ROUTE_PLAN_TAG,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
 from nemo_rl.experience.blackbox_finalizer import BlackboxFinalizer  # noqa: E402

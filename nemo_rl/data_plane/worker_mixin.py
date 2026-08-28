@@ -371,6 +371,7 @@ class TQWorkerMixin:
             EXTRAS_DIGEST_VERSION,
             compute_extras_digest,
         )
+
         from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
         if extras_digest_version != EXTRAS_DIGEST_VERSION:

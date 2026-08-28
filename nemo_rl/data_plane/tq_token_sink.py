@@ -38,13 +38,12 @@ from typing import Any
 
 import ray
 import torch
-from tensordict import TensorDict
-
 from nemo_gym.token_id_capture.staging.records import (
     StagedCallRecord,
     StagedCallSnapshot,
     StageResult,
 )
+from tensordict import TensorDict
 
 from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_ENCODING_FIELD,
