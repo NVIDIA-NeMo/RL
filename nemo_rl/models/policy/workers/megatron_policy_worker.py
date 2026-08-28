@@ -13,6 +13,7 @@
 # limitations under the License.
 import copy
 import gc
+import itertools
 import logging
 import math
 import os
@@ -118,6 +119,7 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.mxfp8_refit_source import (
+    NativeMXFP8Components,
     extract_native_mxfp8_components,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
@@ -688,8 +690,9 @@ class MegatronPolicyWorkerImpl(
         # [(mcore_param_name, estimated_memory), ...]
         # Note: here param name is local param name, with local layer number and
         # local expert id etc.
-        self.refit_conversion_tasks = None
-        self._native_grouped_mxfp8_tasks = []
+        self.refit_conversion_tasks: Optional[list[Any]] = None
+        self._native_grouped_mxfp8_tasks: list[Any] = []
+        self._native_direct_component_specs: dict[tuple[str, str], LocalParamSpec] = {}
         self.refit_conversion_tasks_current_index = None
         self.refit_param_info_mcore = None
 
@@ -2307,15 +2310,25 @@ class MegatronPolicyWorkerImpl(
 
     def _is_native_mxfp8_export(self) -> bool:
         """Return whether both endpoints use native MXFP8 parameter storage."""
+        if getattr(self, "fp8_cfg", None) is None:
+            return False
+        generation_cfg = cast(dict[str, Any], self.cfg["generation"])
+        vllm_cfg = cast(dict[str, Any], generation_cfg.get("vllm_cfg", {}))
         return bool(
-            getattr(self, "fp8_cfg", None) is not None
-            and self.fp8_cfg.get("fp8_param", False)
+            self.fp8_cfg.get("fp8_param", False)
             and self.fp8_cfg.get("fp8_recipe") == "mxfp8"
-            and self.cfg["generation"]["vllm_cfg"]["precision"] == "fp8"
-            and self.cfg["generation"]["vllm_cfg"].get("is_mx") is True
+            and vllm_cfg.get("precision") == "fp8"
+            and vllm_cfg.get("is_mx") is True
         )
 
-    def _build_native_grouped_mxfp8_tasks(self) -> list[Any]:
+    def _build_native_grouped_mxfp8_tasks(
+        self,
+        *,
+        bridge: Any,
+        registry: Any,
+        global_names: list[str],
+        pp_rank: int,
+    ) -> list[Any]:
         """Build deterministic source tasks for singular grouped expert weights."""
         if not self._is_native_mxfp8_export() or not getattr(
             self.model.config, "moe_single_grouped_weight", False
@@ -2328,10 +2341,7 @@ class MegatronPolicyWorkerImpl(
         )
         from megatron.core.fp8_utils import is_grouped_mxfp8tensor
 
-        bridge = self.megatron_bridge._model_bridge
         models = [self.model]
-        registry = bridge.mapping_registry()
-        global_names = bridge._megatron_global_param_names_all_pp_ranks(models)
         grouped_suffixes = (
             ".mlp.experts.linear_fc1.weight",
             ".mlp.experts.linear_fc2.weight",
@@ -2378,9 +2388,114 @@ class MegatronPolicyWorkerImpl(
                     global_param_name=global_name,
                     mapping=mapping,
                     param_weight=param_weight,
+                    pp_rank=pp_rank,
+                    vp_stage=0 if param_weight is not None else None,
                 )
             )
         return tasks
+
+    def _build_native_mxfp8_conversion_tasks(self) -> list[Any]:
+        """Build strict ordinary tasks around singular grouped MXFP8 sources."""
+        from megatron.bridge.models.conversion.model_bridge import (
+            WeightConversionTask,
+            _get_pg_collection_from_model,
+            _get_pp_rank,
+            _megatron_local_name_to_global,
+        )
+        from megatron.bridge.models.conversion.utils import (
+            get_module_and_param_from_name,
+            persistent_buffers,
+        )
+
+        models = [self.model]
+        bridge = self.megatron_bridge._model_bridge
+        hf_pretrained = self.megatron_bridge.hf_pretrained
+        bridge.hf_pretrained = hf_pretrained
+        bridge.hf_config = (
+            hf_pretrained.config if hasattr(hf_pretrained, "config") else hf_pretrained
+        )
+        registry = bridge.mapping_registry()
+        set_process_groups = getattr(
+            registry, "set_process_groups_from_pg_collection", None
+        )
+        if callable(set_process_groups):
+            set_process_groups(_get_pg_collection_from_model(models))
+
+        global_names = bridge._megatron_global_param_names_all_pp_ranks(models)
+        shares_embeddings = getattr(
+            bridge, "_share_embeddings_and_output_weights", None
+        )
+        if callable(shares_embeddings) and shares_embeddings(self.model.config):
+            global_names = [name for name in global_names if "output_layer" not in name]
+        pp_rank = _get_pp_rank(models)
+        grouped_tasks = self._build_native_grouped_mxfp8_tasks(
+            bridge=bridge,
+            registry=registry,
+            global_names=global_names,
+            pp_rank=pp_rank,
+        )
+        self._native_grouped_mxfp8_tasks = grouped_tasks
+        grouped_names = {task.global_param_name for task in grouped_tasks}
+        remaining_names = [name for name in global_names if name not in grouped_names]
+        if not remaining_names:
+            return grouped_tasks
+
+        has_hf_state = hasattr(hf_pretrained, "state") and hasattr(
+            hf_pretrained.state, "source"
+        )
+        hf_keys = hf_pretrained.state.source.get_all_keys() if has_hf_state else None
+
+        mappings = bridge._validate_conversion_mappings(
+            registry,
+            remaining_names,
+            hf_keys,
+        )
+        remaining_set = set(remaining_names)
+        local_tasks: dict[str, Any] = {}
+        for local_name, _ in itertools.chain(
+            self.model.named_parameters(), persistent_buffers(self.model)
+        ):
+            if "_extra_state" in local_name or bridge._is_adapter_param_name(
+                local_name
+            ):
+                continue
+            local_name = bridge._unwrap_name(local_name)
+            global_name = _megatron_local_name_to_global(
+                models, self.model.config, local_name, 0
+            )
+            if global_name not in remaining_set:
+                continue
+            local_module, local_weight = get_module_and_param_from_name(
+                models, local_name, 0
+            )
+            if local_module is not None and not hasattr(local_module, "config"):
+                setattr(local_module, "config", self.model.config)
+            local_tasks[global_name] = WeightConversionTask(
+                pp_rank=pp_rank,
+                vp_stage=0,
+                param_name=local_name,
+                global_param_name=global_name,
+                megatron_module=local_module,
+                param_weight=local_weight,
+                mapping=mappings[global_name],
+            )
+
+        task_by_name = {task.global_param_name: task for task in grouped_tasks}
+        for global_name in remaining_names:
+            local_task = local_tasks.get(global_name)
+            if local_task is not None:
+                task_by_name[global_name] = local_task
+            else:
+                task_by_name[global_name] = WeightConversionTask(
+                    pp_rank=pp_rank,
+                    vp_stage=None,
+                    param_name=global_name,
+                    global_param_name=global_name,
+                    megatron_module=None,
+                    param_weight=None,
+                    mapping=mappings[global_name],
+                )
+        return [task_by_name[name] for name in global_names]
 
     def _build_refit_conversion_tasks(self) -> list:
         """Build the conversion-task list driving refit (BF16 or FP8 export).
@@ -2398,9 +2513,17 @@ class MegatronPolicyWorkerImpl(
                 tasks = self.megatron_bridge._model_bridge.build_export_fp8_tasks(
                     self.megatron_bridge.hf_pretrained, [self.model]
                 )
+            elif self._is_native_mxfp8_export() and getattr(
+                self.model.config, "moe_single_grouped_weight", False
+            ):
+                tasks = self._build_native_mxfp8_conversion_tasks()
             else:
                 tasks = self.megatron_bridge.get_conversion_tasks([self.model])
-            self._native_grouped_mxfp8_tasks = self._build_native_grouped_mxfp8_tasks()
+            if not (
+                self._is_native_mxfp8_export()
+                and getattr(self.model.config, "moe_single_grouped_weight", False)
+            ):
+                self._native_grouped_mxfp8_tasks = []
             return [task for task in tasks if task is not None]
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
@@ -2649,7 +2772,7 @@ class MegatronPolicyWorkerImpl(
             return ((names[0], "gate"), (names[1], "up"))
 
         if isinstance(mapping, FusedGatedExpertMapping):
-            raw_name = str(mapping.hf_param)
+            raw_name = str(mapping.hf_param).removesuffix(".weight")
             if not is_nccl_reshard_param(raw_name):
                 return ()
             prefix = raw_name[: -len(".gate_up_proj")]
@@ -2668,7 +2791,7 @@ class MegatronPolicyWorkerImpl(
             return ((names[0], "gate"), (names[1], "up"))
 
         if isinstance(mapping, FusedExpertMapping):
-            raw_name = str(mapping.hf_param)
+            raw_name = str(mapping.hf_param).removesuffix(".weight")
             if not is_nccl_reshard_param(raw_name):
                 return ()
             expert_match = re.search(r"\d+$", global_name)
@@ -2697,20 +2820,39 @@ class MegatronPolicyWorkerImpl(
             if grouped:
                 name = self._canonical_grouped_expert_name(name, "down_proj")
             return ((name, "down"),)
+        if (
+            len(bulk_names) == 1
+            and re.search(r"\.linear_fc1\.weight\d*$", global_name) is not None
+            and bulk_names[0].endswith("up_proj.weight")
+            and isinstance(mapping, AutoMapping)
+        ):
+            name = bulk_names[0]
+            if grouped:
+                name = self._canonical_grouped_expert_name(name, "up_proj")
+            return ((name, "up_direct"),)
         raise ValueError(
             f"Unsupported native MXFP8 source {bulk_names[0]!r} role 'weight' "
             f"with mapping {type(mapping).__name__}"
         )
 
     @staticmethod
-    def _native_component_tensor(
-        task: Any,
+    def _native_projection_component(
+        components: NativeMXFP8Components,
         projection: str,
         role: str,
     ) -> torch.Tensor:
-        components = extract_native_mxfp8_components(task.param_weight)
-        tensor = getattr(components, role)
+        if role == "weight":
+            tensor = components.weight
+        elif role == "weight_scale":
+            tensor = components.weight_scale
+        else:
+            raise ValueError(f"Unsupported native MXFP8 component role {role!r}")
         if projection in ("gate", "up"):
+            if tensor.shape[-2] % 2:
+                raise ValueError(
+                    f"Native MXFP8 fused FC1 role {role!r} requires an even "
+                    f"output dimension; got {tuple(tensor.shape)}"
+                )
             gate, up = torch.chunk(tensor, 2, dim=-2)
             return gate if projection == "gate" else up
         return tensor
@@ -2723,17 +2865,82 @@ class MegatronPolicyWorkerImpl(
             task.global_param_name
             for task in getattr(self, "_native_grouped_mxfp8_tasks", [])
         }
-        for task in self.refit_conversion_tasks:
+        conversion_tasks = self.refit_conversion_tasks
+        if conversion_tasks is None:
+            raise RuntimeError("Native MXFP8 conversion tasks are not initialized")
+        for task in conversion_tasks:
             if task.param_weight is None or task.global_param_name in grouped_names:
                 continue
             projections = self._native_task_projections(task)
+            if not projections:
+                continue
+            components = extract_native_mxfp8_components(task.param_weight)
             for logical_name, projection in projections:
                 for role in ("weight", "weight_scale"):
                     yield (
                         logical_name,
                         role,
-                        self._native_component_tensor(task, projection, role),
+                        self._native_projection_component(
+                            components,
+                            projection,
+                            role,
+                        ),
                     )
+
+    def _refresh_local_native_mxfp8_param_components(self) -> None:
+        """Refresh every direct native source spec from one current task walk."""
+        specs = getattr(self, "_native_direct_component_specs", {})
+        for (
+            logical_name,
+            role,
+            tensor,
+        ) in self._iter_local_native_mxfp8_param_components():
+            spec = specs.get((logical_name, role))
+            if spec is None:
+                raise ValueError(
+                    f"Missing native MXFP8 source {logical_name!r} role {role!r}"
+                )
+            spec.base = tensor
+
+    def _validate_local_native_grouped_mxfp8_components(self) -> None:
+        """Validate every owned grouped member without allocating transfer stacks."""
+        from megatron.core.fp8_utils import get_grouped_quantized_members
+
+        for task in getattr(self, "_native_grouped_mxfp8_tasks", []):
+            if task.param_weight is None:
+                continue
+            projections = self._native_task_projections(task, grouped=True)
+            if not projections:
+                continue
+            members = get_grouped_quantized_members(
+                task.param_weight, create_if_missing=False
+            )
+            if not members:
+                raise ValueError(
+                    f"Grouped MXFP8 source {projections[0][0]!r} role 'weight' "
+                    "has no members"
+                )
+            for member in members:
+                try:
+                    components = extract_native_mxfp8_components(member)
+                except ValueError as error:
+                    raise ValueError(
+                        f"Invalid grouped MXFP8 source {projections[0][0]!r} "
+                        f"role 'weight/weight_scale': {error}"
+                    ) from error
+                for logical_name, projection in projections:
+                    for role in ("weight", "weight_scale"):
+                        try:
+                            self._native_projection_component(
+                                components,
+                                projection,
+                                role,
+                            )
+                        except ValueError as error:
+                            raise ValueError(
+                                f"Invalid grouped MXFP8 source {logical_name!r} "
+                                f"role {role!r}: {error}"
+                            ) from error
 
     def _materialize_native_grouped_component(
         self,
@@ -2761,16 +2968,19 @@ class MegatronPolicyWorkerImpl(
         selected: list[torch.Tensor] = []
         for member in members:
             try:
-                component = getattr(extract_native_mxfp8_components(member), role)
+                components = extract_native_mxfp8_components(member)
             except ValueError as error:
                 raise ValueError(
                     f"Invalid grouped MXFP8 source {logical_name!r} role {role!r}: "
                     f"{error}"
                 ) from error
-            if projection in ("gate", "up"):
-                gate, up = torch.chunk(component, 2, dim=-2)
-                component = gate if projection == "gate" else up
-            selected.append(component)
+            selected.append(
+                self._native_projection_component(
+                    components,
+                    projection,
+                    role,
+                )
+            )
         return torch.stack(selected, dim=0)
 
     def _build_native_mxfp8_shape_metadata(
@@ -2824,21 +3034,38 @@ class MegatronPolicyWorkerImpl(
                     if grouped:
                         shape = [expert_count, *shape]
                     elif not bool(getattr(task.mapping, "is_expert", False)):
-                        shard_dim = -2 if projection in ("gate", "up") else -1
+                        shard_dim = (
+                            -2 if projection in ("gate", "up", "up_direct") else -1
+                        )
                         shape[shard_dim] *= tp_size
-                    grouped_projection = f"{projection}_proj" if grouped else None
+                    grouped_projection = (
+                        {
+                            "gate": "gate_proj",
+                            "up": "up_proj",
+                            "up_direct": "up_proj",
+                            "down": "down_proj",
+                        }[projection]
+                        if grouped
+                        else None
+                    )
                     local_entries.append((logical_name, shape, grouped_projection))
             broadcaster = getattr(task.mapping, "broadcast_obj_from_pp_rank", None)
             if callable(broadcaster):
-                return broadcaster(
-                    local_entries,
-                    cache_key=f"native-mxfp8-shape:{task.global_param_name}",
+                return cast(
+                    Optional[list[tuple[str, list[int], Optional[str]]]],
+                    broadcaster(
+                        local_entries,
+                        cache_key=f"native-mxfp8-shape:{task.global_param_name}",
+                    ),
                 )
             return local_entries
 
+        conversion_tasks = self.refit_conversion_tasks
+        if conversion_tasks is None:
+            raise RuntimeError("Native MXFP8 conversion tasks are not initialized")
         direct_tasks = [
             task
-            for task in self.refit_conversion_tasks
+            for task in conversion_tasks
             if task.global_param_name not in grouped_names
         ]
         for task, grouped in (
@@ -3265,6 +3492,9 @@ class MegatronPolicyWorkerImpl(
         )
 
         self.refit_param_info_mcore = self._calculate_refit_param_info()
+        conversion_tasks = self.refit_conversion_tasks
+        if conversion_tasks is None:
+            raise RuntimeError("Refit conversion tasks are not initialized")
         native_mxfp8 = self._is_native_mxfp8_export()
 
         # Single pass over Bridge's stream: classify each param as major
@@ -3303,7 +3533,7 @@ class MegatronPolicyWorkerImpl(
         # exports MTP as trailing ``model.layers.N`` indices, so provenance is
         # the only reliable signal. vLLM keeps the MTP drafter separate from
         # the main model and updates it through load_weights -> misc path.
-        mtp_hf_layers_names = _collect_mtp_hf_layer_names(self.refit_conversion_tasks)
+        mtp_hf_layers_names = _collect_mtp_hf_layer_names(conversion_tasks)
 
         if native_mxfp8:
             grouped_names = {
@@ -3311,7 +3541,7 @@ class MegatronPolicyWorkerImpl(
             }
             self._misc_conversion_tasks = [
                 task
-                for task in self.refit_conversion_tasks
+                for task in conversion_tasks
                 if task.global_param_name not in grouped_names
                 and not self._native_task_projections(task)
             ]
@@ -3406,7 +3636,7 @@ class MegatronPolicyWorkerImpl(
         if not native_mxfp8:
             self._misc_conversion_tasks = [
                 task
-                for task in self.refit_conversion_tasks
+                for task in conversion_tasks
                 if task is not None and _task_is_misc(task)
             ]
 
@@ -3500,46 +3730,16 @@ class MegatronPolicyWorkerImpl(
                     )
                 direct_specs[key] = spec
 
-            def _direct_spec(
-                task: Any,
-                logical_name: str,
-                projection: str,
-                role: str,
-            ) -> LocalParamSpec:
-                def _read() -> torch.Tensor:
-                    try:
-                        return self._native_component_tensor(task, projection, role)
-                    except ValueError as error:
-                        raise ValueError(
-                            f"Invalid native MXFP8 source {logical_name!r} "
-                            f"role {role!r}: {error}"
-                        ) from error
-
-                base = _read()
-
-                def pre(_base: Any) -> RefitCtx:
-                    return RefitCtx(buf=_read())
-
-                return LocalParamSpec(base=base, pre=pre)
-
-            grouped_names = {
-                task.global_param_name
-                for task in getattr(self, "_native_grouped_mxfp8_tasks", [])
-            }
-            for task in self.refit_conversion_tasks:
-                if task.param_weight is None or task.global_param_name in grouped_names:
-                    continue
-                for logical_name, projection in self._native_task_projections(task):
-                    for role in ("weight", "weight_scale"):
-                        _register(
-                            (logical_name, role),
-                            _direct_spec(
-                                task,
-                                logical_name,
-                                projection,
-                                role,
-                            ),
-                        )
+            for (
+                logical_name,
+                role,
+                tensor,
+            ) in self._iter_local_native_mxfp8_param_components():
+                _register(
+                    (logical_name, role),
+                    LocalParamSpec(base=tensor),
+                )
+            self._native_direct_component_specs = direct_specs
 
             for task in getattr(self, "_native_grouped_mxfp8_tasks", []):
                 if task.param_weight is None:
@@ -3608,7 +3808,7 @@ class MegatronPolicyWorkerImpl(
 
                 return LocalParamSpec(base=None, pre=pre)
 
-            mapping: dict[tuple[str, str], LocalParamSpec] = {}
+            mapping: dict[str | tuple[str, str], LocalParamSpec] = {}
             for layer_name in refit_info["layer_names"]:
                 for param_info in refit_info["per_layer_params"][layer_name]:
                     name = param_info["name"]
@@ -3644,7 +3844,7 @@ class MegatronPolicyWorkerImpl(
 
             return LocalParamSpec(base=None, pre=pre)
 
-        mapping = {}
+        mapping: dict[str | tuple[str, str], LocalParamSpec] = {}
         for layer_name in refit_info["layer_names"]:
             for p in refit_info["per_layer_params"][layer_name]:
                 name = p["name"]
@@ -3726,6 +3926,10 @@ class MegatronPolicyWorkerImpl(
         # refits.
         from nemo_rl.distributed.refit_watchdog import sync_stream_within
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
+
+        if self._is_native_mxfp8_export():
+            self._refresh_local_native_mxfp8_param_components()
+            self._validate_local_native_grouped_mxfp8_components()
 
         # spec.pre (grouped-MoE expert stacking) and spec.post enqueue on this
         # worker's current stream; xferdtensor should use the same stream.
