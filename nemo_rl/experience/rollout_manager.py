@@ -16,6 +16,7 @@ import asyncio
 import copy
 import enum
 import json
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -41,7 +42,13 @@ from nemo_rl.experience.failures import (
     RolloutTimeout,
     classify_rollout_failure,
 )
-from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_GROUP_ATTEMPT_KEY,
+    NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    Completion,
+    PromptGroupRecord,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
@@ -857,10 +864,23 @@ class AsyncNemoGymRolloutImpl:
         )
 
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
+        group_id = template_row.get(NEMO_GYM_GROUP_ID_KEY) or uuid.uuid4().hex
+        group_attempt = template_row.get(NEMO_GYM_GROUP_ATTEMPT_KEY, 0)
+        if (
+            not isinstance(group_attempt, int)
+            or isinstance(group_attempt, bool)
+            or group_attempt < 0
+        ):
+            raise ValueError(
+                f"{NEMO_GYM_GROUP_ATTEMPT_KEY} must be a non-negative integer"
+            )
         rows = []
         for i in range(self._num_generations_per_prompt):
             row = copy.deepcopy(template_row)
             row["_rowidx"] = i
+            row[NEMO_GYM_GROUP_ID_KEY] = group_id
+            row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempt
+            row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
             rows.append(row)
         return rows
 
@@ -1270,6 +1290,26 @@ class RolloutManager:
         infra_attempts = 0
         data_attempts = 0
         last_infra_error: Optional[Exception] = None
+        logical_group_id: Optional[str] = None
+        group_attempt = 0
+        extra_env_info = input_sample.get("extra_env_info")
+        if isinstance(extra_env_info, dict):
+            configured_group_id = extra_env_info.get(NEMO_GYM_GROUP_ID_KEY)
+            if configured_group_id is not None and (
+                not isinstance(configured_group_id, str) or not configured_group_id
+            ):
+                raise ValueError(f"{NEMO_GYM_GROUP_ID_KEY} must be a non-empty string")
+            logical_group_id = configured_group_id or uuid.uuid4().hex
+            configured_group_attempt = extra_env_info.get(NEMO_GYM_GROUP_ATTEMPT_KEY, 0)
+            if (
+                not isinstance(configured_group_attempt, int)
+                or isinstance(configured_group_attempt, bool)
+                or configured_group_attempt < 0
+            ):
+                raise ValueError(
+                    f"{NEMO_GYM_GROUP_ATTEMPT_KEY} must be a non-negative integer"
+                )
+            group_attempt = configured_group_attempt
 
         # The loop condition is the infrastructure budget, so running out of it exits
         # here rather than raising from inside the handler. The data budget is tracked
@@ -1277,9 +1317,9 @@ class RolloutManager:
         # about the prompt rather than about the fleet.
         while infra_attempts < policy.max_infra_attempts:
             start_version = self._weight_version
-            # Reserved inside the loop so each attempt owns a fresh group_id: rows a
+            # Reserved inside the loop so each attempt owns a fresh TQ group ID: rows a
             # failed attempt may have written cannot then collide with the retry's.
-            group_id = self._tq_buffer.reserve(
+            tq_group_id = self._tq_buffer.reserve(
                 weight_version=start_version, target_step=target_step
             )
             try:
@@ -1289,16 +1329,24 @@ class RolloutManager:
                 if inflight_registry is not None:
                     current_task = asyncio.current_task()
                     assert current_task is not None
-                    inflight_registry[group_id] = (current_task, start_version)
+                    inflight_registry[tq_group_id] = (current_task, start_version)
                 # Unregister before commit so cancellation cannot interrupt it.
                 try:
-                    record = await self.run_rollout(input_sample)
+                    attempt_input_sample = input_sample
+                    if logical_group_id is not None:
+                        attempt_input_sample = copy.deepcopy(input_sample)
+                        attempt_extra_env_info = attempt_input_sample["extra_env_info"]
+                        attempt_extra_env_info[NEMO_GYM_GROUP_ID_KEY] = logical_group_id
+                        attempt_extra_env_info[NEMO_GYM_GROUP_ATTEMPT_KEY] = (
+                            group_attempt
+                        )
+                    record = await self.run_rollout(attempt_input_sample)
                 finally:
                     if inflight_registry is not None:
-                        inflight_registry.pop(group_id, None)
+                        inflight_registry.pop(tq_group_id, None)
                 end_version = self._weight_version
                 await self._tq_buffer.commit(
-                    group_id,
+                    tq_group_id,
                     record,
                     start_weight_version=start_version,
                     end_weight_version=end_version,
@@ -1308,10 +1356,10 @@ class RolloutManager:
                 # in-order sampler. commit() rolls back any DataPlane rows it wrote.
                 # Cleanup failure must not mask the error that caused it.
                 try:
-                    await self._tq_buffer.remove_group(group_id)
+                    await self._tq_buffer.remove_group(tq_group_id)
                 except Exception as cleanup_exc:
                     print(
-                        f"  warn: remove_group({group_id}) cleanup failed: {cleanup_exc!r}",
+                        f"  warn: remove_group({tq_group_id}) cleanup failed: {cleanup_exc!r}",
                         flush=True,
                     )
                 # The rollout itself succeeded. Re-running generation cannot repair
@@ -1330,6 +1378,7 @@ class RolloutManager:
                     # The backpressure permit is held across this sleep, so the wait is
                     # capped by max_backoff_s rather than growing without bound.
                     await asyncio.sleep(policy.backoff_for(infra_attempts))
+                    group_attempt += 1
                     continue
 
                 data_attempts += 1
@@ -1361,14 +1410,15 @@ class RolloutManager:
                 # documented above as the sign the fleet is degrading -- climb for bad
                 # data, which is the one distinction the two budgets exist to draw.
                 self._stats.record_data_retry(reason)
+                group_attempt += 1
                 continue
             except BaseException:
                 # Cancellation and other non-Exception exits: clean up, never retry.
                 try:
-                    await self._tq_buffer.remove_group(group_id)
+                    await self._tq_buffer.remove_group(tq_group_id)
                 except Exception as cleanup_exc:
                     print(
-                        f"  warn: remove_group({group_id}) cleanup failed: {cleanup_exc!r}",
+                        f"  warn: remove_group({tq_group_id}) cleanup failed: {cleanup_exc!r}",
                         flush=True,
                     )
                 raise
