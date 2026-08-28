@@ -43,9 +43,7 @@ def test_rollout_group_ids_keep_identical_multimodal_prompts_separate():
     rewards = torch.cat((torch.ones(16), torch.zeros(16)))
     valid_mask = torch.ones_like(rewards)
 
-    baseline, _ = calculate_baseline_and_std_per_prompt(
-        group_ids, rewards, valid_mask
-    )
+    baseline, _ = calculate_baseline_and_std_per_prompt(group_ids, rewards, valid_mask)
 
     assert torch.equal(baseline, rewards)
 
@@ -76,9 +74,7 @@ def test_rollout_group_ids_from_tq_sample_ids():
 )
 def test_rollout_group_ids_reject_malformed_or_partial_groups(sample_ids):
     with pytest.raises(ValueError):
-        build_rollout_group_ids_from_sample_ids(
-            sample_ids, expected_group_size=2
-        )
+        build_rollout_group_ids_from_sample_ids(sample_ids, expected_group_size=2)
 
 
 @pytest.mark.parametrize(
@@ -89,9 +85,7 @@ def test_rollout_group_ids_reject_invalid_shapes(
     batch_size, group_size, start_group_id
 ):
     with pytest.raises(ValueError):
-        build_rollout_group_ids(
-            batch_size, group_size, start_group_id=start_group_id
-        )
+        build_rollout_group_ids(batch_size, group_size, start_group_id=start_group_id)
 
 
 @pytest.fixture

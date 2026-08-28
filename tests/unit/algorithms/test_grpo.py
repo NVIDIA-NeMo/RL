@@ -2231,9 +2231,7 @@ def test_dapo_dynamic_sampling_batch_caching(mock_grpo_components):
 
     repeated_batch = create_mock_batch(batch_size, task_names, message_logs)
     repeated_batch["total_reward"] = torch.tensor([1.0, 0.0, 0.5])  # Non-zero std
-    repeated_batch["rollout_group_ids"] = torch.zeros(
-        (batch_size, 1), dtype=torch.long
-    )
+    repeated_batch["rollout_group_ids"] = torch.zeros((batch_size, 1), dtype=torch.long)
 
     prompts = torch.tensor(
         [
@@ -2276,9 +2274,7 @@ def test_dapo_dynamic_sampling_batch_caching(mock_grpo_components):
     # Run dynamic sampling again with a separately namespaced rollout group.
     next_batch = create_mock_batch(batch_size, task_names, message_logs)
     next_batch["total_reward"] = torch.tensor([1.0, 0.0, 0.5])
-    next_batch["rollout_group_ids"] = torch.ones(
-        (batch_size, 1), dtype=torch.long
-    )
+    next_batch["rollout_group_ids"] = torch.ones((batch_size, 1), dtype=torch.long)
     result_batch, is_batch_complete, batch_cache, _ = dynamic_sampling(
         next_batch,
         std,

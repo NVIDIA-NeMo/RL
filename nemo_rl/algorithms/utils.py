@@ -123,9 +123,7 @@ def build_rollout_group_ids(
             f"group_size={group_size}"
         )
     if start_group_id < 0:
-        raise ValueError(
-            f"start_group_id must be non-negative, got {start_group_id}"
-        )
+        raise ValueError(f"start_group_id must be non-negative, got {start_group_id}")
     num_groups = batch_size // group_size
     return torch.arange(
         start_group_id,
