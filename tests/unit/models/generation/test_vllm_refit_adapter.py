@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from contextlib import AbstractContextManager
 from types import ModuleType, SimpleNamespace, TracebackType
 from typing import Any
@@ -52,6 +53,240 @@ def _native_refit_info() -> dict[str, Any]:
             ]
         },
     }
+
+
+def _native_binding_refit_info() -> dict[str, Any]:
+    hidden_size = 32
+    intermediate_size = 64
+    num_experts = 4
+
+    def parameter(
+        name: str,
+        shape: tuple[int, ...],
+        *,
+        grouped_expert_proj: str | None = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "name": name,
+            "global_shape": shape,
+            "dtype": "torch.float8_e4m3fn",
+            "components": [
+                {
+                    "role": "weight",
+                    "dtype": "torch.float8_e4m3fn",
+                    "global_shape": shape,
+                },
+                {
+                    "role": "weight_scale",
+                    "dtype": "torch.uint8",
+                    "global_shape": (*shape[:-1], shape[-1] // 32),
+                },
+            ],
+        }
+        if grouped_expert_proj is not None:
+            result["grouped_expert_proj"] = grouped_expert_proj
+        return result
+
+    prefix = "model.layers.0.mlp"
+    return {
+        "gen_tp_size": 2,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                parameter(
+                    f"{prefix}.gate_proj.weight", (intermediate_size, hidden_size)
+                ),
+                parameter(f"{prefix}.up_proj.weight", (intermediate_size, hidden_size)),
+                parameter(
+                    f"{prefix}.down_proj.weight", (hidden_size, intermediate_size)
+                ),
+                parameter(
+                    f"{prefix}.experts.gate_proj.weight",
+                    (num_experts, intermediate_size, hidden_size),
+                    grouped_expert_proj="gate_proj",
+                ),
+                parameter(
+                    f"{prefix}.experts.up_proj.weight",
+                    (num_experts, intermediate_size, hidden_size),
+                    grouped_expert_proj="up_proj",
+                ),
+                parameter(
+                    f"{prefix}.experts.down_proj.weight",
+                    (num_experts, hidden_size, intermediate_size),
+                    grouped_expert_proj="down_proj",
+                ),
+            ]
+        },
+    }
+
+
+class _BindingModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+        mlp = torch.nn.Module()
+        self.model.layers[0].mlp = mlp
+        mlp.gate_up_proj = torch.nn.Module()
+        mlp.down_proj = torch.nn.Module()
+        mlp.experts = torch.nn.Module()
+        mlp.experts.routed_experts = torch.nn.Module()
+
+        self._register_runtime_pair(
+            mlp.gate_up_proj,
+            value_shape=(64, 32),
+            scale_shape=(64, 1),
+        )
+        self._register_runtime_pair(
+            mlp.down_proj,
+            value_shape=(32, 32),
+            scale_shape=(32, 1),
+        )
+        self._register_runtime_pair(
+            mlp.experts.routed_experts,
+            value_name="w13_weight",
+            value_shape=(2, 64, 32),
+            scale_shape=(2, 64, 1),
+        )
+        self._register_runtime_pair(
+            mlp.experts.routed_experts,
+            value_name="w2_weight",
+            value_shape=(2, 32, 32),
+            scale_shape=(2, 32, 1),
+        )
+
+    @staticmethod
+    def _register_runtime_pair(
+        owner: torch.nn.Module,
+        *,
+        value_shape: tuple[int, ...],
+        scale_shape: tuple[int, ...],
+        value_name: str = "weight",
+    ) -> None:
+        value = torch.nn.Parameter(
+            torch.zeros(value_shape, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        runtime_scale = torch.nn.Parameter(
+            torch.zeros(scale_shape, dtype=torch.uint8),
+            requires_grad=False,
+        )
+        checkpoint_scale = torch.nn.Parameter(
+            torch.zeros(scale_shape, dtype=torch.uint8),
+            requires_grad=False,
+        )
+        owner.register_parameter(value_name, value)
+        owner.register_parameter(f"{value_name}_scale", runtime_scale)
+        owner.register_parameter(
+            f"{value_name}_scale_from_checkpoint", checkpoint_scale
+        )
+        for parameter in (value, runtime_scale, checkpoint_scale):
+            parameter.weight_loader = lambda target, loaded_weight: target.copy_(
+                loaded_weight
+            )
+
+
+def _make_binding_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[str],
+) -> tuple[
+    refit_adapter.Vllm0251RefitAdapter,
+    _BindingModel,
+    list[tuple[str, inspect.BoundArguments]],
+]:
+    model = _BindingModel()
+    runtime_parameters = dict(model.named_parameters())
+    retained_loads: list[tuple[str, inspect.BoundArguments]] = []
+
+    def make_online_process_loader(owner: torch.nn.Module, parameter_name: str) -> Any:
+        original_loader = getattr(owner, parameter_name).weight_loader
+        signature = inspect.signature(original_loader)
+
+        def online_process_loader(*args: Any, **kwargs: Any) -> None:
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            retained_loads.append((parameter_name, bound))
+            original_loader(*bound.args, **bound.kwargs)
+
+        online_process_loader.__name__ = "online_process_loader"
+        online_process_loader.__wrapped__ = original_loader
+        return online_process_loader
+
+    def initialize(checkpoint_model: _BindingModel) -> None:
+        events.append("initialize")
+        for module_name, owner in checkpoint_model.named_modules():
+            for parameter_name in tuple(owner._parameters):
+                if parameter_name.endswith("_scale_from_checkpoint"):
+                    owner._parameters.pop(parameter_name)
+                    continue
+                runtime = getattr(owner, parameter_name)
+                replacement = torch.nn.Parameter(
+                    torch.empty_like(runtime), requires_grad=False
+                )
+
+                def unsupported_checkpoint_loader(
+                    _target: torch.Tensor,
+                    _loaded_weight: torch.Tensor,
+                    **_kwargs: Any,
+                ) -> None:
+                    raise AssertionError(
+                        "the vLLM checkpoint loader must be replaced by the local bridge"
+                    )
+
+                replacement.weight_loader = unsupported_checkpoint_loader
+                owner._parameters[parameter_name] = replacement
+                replacement.weight_loader = make_online_process_loader(
+                    owner, parameter_name
+                )
+                events.append(f"checkpoint:{module_name}.{parameter_name}")
+
+    def finalize(checkpoint_model: _BindingModel, _model_config: object) -> None:
+        events.append("finalize")
+        checkpoint_parameters = dict(checkpoint_model.named_parameters())
+        for runtime_name, runtime in runtime_parameters.items():
+            if runtime_name.endswith("_scale_from_checkpoint"):
+                active_name = runtime_name.removesuffix("_from_checkpoint")
+            else:
+                active_name = runtime_name
+            runtime.copy_(checkpoint_parameters[active_name])
+
+        for module_name, owner in checkpoint_model.named_modules():
+            prefix = f"{module_name}." if module_name else ""
+            for parameter_name in tuple(owner._parameters):
+                owner._parameters.pop(parameter_name)
+            owned_runtime = {
+                name.removeprefix(prefix): parameter
+                for name, parameter in runtime_parameters.items()
+                if name.startswith(prefix) and "." not in name.removeprefix(prefix)
+            }
+            for parameter_name, parameter in owned_runtime.items():
+                owner.register_parameter(parameter_name, parameter)
+
+    reload_module = ModuleType("vllm.model_executor.model_loader.reload")
+    reload_module.initialize_layerwise_reload = initialize
+    reload_module.finalize_layerwise_reload = finalize
+    layerwise_module = ModuleType("vllm.model_executor.model_loader.reload.layerwise")
+    layerwise_module.make_online_process_loader = make_online_process_loader
+    config_module = ModuleType("vllm.config")
+    config_module.set_current_vllm_config = lambda _config: _ConfigContext(events)
+    _fake_importer(
+        monkeypatch,
+        {
+            "vllm.config": config_module,
+            "vllm.model_executor.model_loader.reload": reload_module,
+            "vllm.model_executor.model_loader.reload.layerwise": layerwise_module,
+        },
+    )
+    runner = SimpleNamespace(model=model, vllm_config=object())
+    return (
+        refit_adapter.Vllm0251RefitAdapter(
+            model_runner=runner,
+            model_config=object(),
+            device=torch.device("cpu"),
+        ),
+        model,
+        retained_loads,
+    )
 
 
 def _fake_importer(
@@ -415,3 +650,202 @@ def test_capability_probe_records_later_engine_api_without_selecting_it(
         },
     )
     assert not refit_adapter.probe_vllm_refit_capabilities().trainer_weight_transfer
+
+
+@pytest.mark.parametrize(
+    ("logical_name", "role", "expected_shape"),
+    [
+        ("model.layers.0.mlp.gate_proj.weight", "weight", (32, 32)),
+        ("model.layers.0.mlp.gate_proj.weight", "weight_scale", (32, 1)),
+        ("model.layers.0.mlp.up_proj.weight", "weight", (32, 32)),
+        ("model.layers.0.mlp.up_proj.weight", "weight_scale", (32, 1)),
+        ("model.layers.0.mlp.down_proj.weight", "weight", (32, 32)),
+        ("model.layers.0.mlp.down_proj.weight", "weight_scale", (32, 1)),
+        ("model.layers.0.mlp.experts.gate_proj.weight", "weight", (2, 32, 32)),
+        (
+            "model.layers.0.mlp.experts.gate_proj.weight",
+            "weight_scale",
+            (2, 32, 1),
+        ),
+        ("model.layers.0.mlp.experts.up_proj.weight", "weight", (2, 32, 32)),
+        (
+            "model.layers.0.mlp.experts.up_proj.weight",
+            "weight_scale",
+            (2, 32, 1),
+        ),
+        ("model.layers.0.mlp.experts.down_proj.weight", "weight", (2, 32, 32)),
+        (
+            "model.layers.0.mlp.experts.down_proj.weight",
+            "weight_scale",
+            (2, 32, 1),
+        ),
+    ],
+)
+def test_0251_adapter_binds_dense_and_routed_checkpoint_components(
+    monkeypatch: pytest.MonkeyPatch,
+    logical_name: str,
+    role: str,
+    expected_shape: tuple[int, ...],
+) -> None:
+    adapter, _model, retained_loads = _make_binding_adapter(monkeypatch, [])
+    adapter.prepare(_native_binding_refit_info())
+    adapter.begin_update()
+
+    spec = adapter.resolve_destination(logical_name=logical_name, role=role)
+    ctx = (
+        spec.pre(spec.base) if spec.pre is not None else SimpleNamespace(buf=spec.base)
+    )
+
+    assert tuple(ctx.buf.shape) == expected_shape
+    assert ctx.buf.dtype == (torch.float8_e4m3fn if role == "weight" else torch.uint8)
+    assert spec.post is not None
+    ctx.buf.fill_(3 if role == "weight" else 7)
+    spec.post(ctx)
+
+    routed = ".experts." in logical_name
+    expected_calls = expected_shape[0] if routed else 1
+    assert len(retained_loads) == expected_calls
+    for _parameter_name, bound in retained_loads:
+        assert bound.arguments["logical_name"] == logical_name
+        assert bound.arguments["role"] == role
+        if routed:
+            assert bound.arguments["weight_name"].endswith(
+                "weight" if role == "weight" else "weight_scale"
+            )
+            assert bound.arguments["shard_id"] in {"w1", "w2", "w3"}
+            assert isinstance(bound.arguments["expert_id"], int)
+        elif logical_name.endswith(("gate_proj.weight", "up_proj.weight")):
+            assert bound.arguments["loaded_shard_id"] in {0, 1}
+
+
+@pytest.mark.parametrize(
+    ("case", "error"),
+    [
+        ("missing_runtime_alias", "scale_from_checkpoint"),
+        ("missing_runtime_scale", "runtime scale"),
+        ("wrong_runtime_scale_shape", "shape"),
+        ("wrong_runtime_scale_dtype", "torch.uint8"),
+        ("missing_runtime_loader", "weight_loader"),
+        ("wrong_component_role", "unsupported component role"),
+        ("wrong_component_shape", "scale shape"),
+        ("wrong_component_dtype", "weight_scale dtype"),
+    ],
+)
+def test_0251_adapter_prepare_rejects_invalid_destinations_before_begin(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    error: str,
+) -> None:
+    adapter, model, _retained_loads = _make_binding_adapter(monkeypatch, [])
+    refit_info = _native_binding_refit_info()
+    parameters = dict(model.named_parameters())
+    value_name = "model.layers.0.mlp.gate_up_proj.weight"
+    runtime_scale_name = f"{value_name}_scale"
+    alias_name = f"{runtime_scale_name}_from_checkpoint"
+
+    if case == "missing_runtime_alias":
+        model.model.layers[0].mlp.gate_up_proj._parameters.pop(
+            "weight_scale_from_checkpoint"
+        )
+    elif case == "missing_runtime_scale":
+        model.model.layers[0].mlp.gate_up_proj._parameters.pop("weight_scale")
+    elif case == "wrong_runtime_scale_shape":
+        parameters[alias_name].data = torch.empty(64, 2, dtype=torch.uint8)
+    elif case == "wrong_runtime_scale_dtype":
+        parameters[alias_name].data = torch.empty(64, 1, dtype=torch.float32)
+    elif case == "missing_runtime_loader":
+        del parameters[alias_name].weight_loader
+    else:
+        gate = refit_info["per_layer_params"]["model.layers.0"][0]
+        scale = gate["components"][1]
+        if case == "wrong_component_role":
+            scale["role"] = "runtime_scale"
+        elif case == "wrong_component_shape":
+            scale["global_shape"] = (64, 2)
+        elif case == "wrong_component_dtype":
+            scale["dtype"] = "torch.float32"
+
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        adapter.prepare(refit_info)
+
+    assert runtime_scale_name not in getattr(adapter, "_active_scale_names", {})
+
+
+def test_0251_adapter_rejects_missing_checkpoint_alias_and_loader_before_receive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for case in ("missing", "loader"):
+        adapter, model, _retained_loads = _make_binding_adapter(monkeypatch, [])
+        adapter.prepare(_native_binding_refit_info())
+        adapter.begin_update()
+        owner = model.model.layers[0].mlp.gate_up_proj
+        if case == "missing":
+            owner._parameters.pop("weight_scale")
+        else:
+            del owner.weight_scale.weight_loader
+
+        with pytest.raises(
+            (RuntimeError, ValueError), match="checkpoint|weight_loader"
+        ):
+            adapter.resolve_destination(
+                logical_name="model.layers.0.mlp.gate_proj.weight",
+                role="weight_scale",
+            )
+
+
+def test_0251_adapter_wrapped_loader_owns_received_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _model, retained_loads = _make_binding_adapter(monkeypatch, [])
+    adapter.prepare(_native_binding_refit_info())
+    adapter.begin_update()
+    spec = adapter.resolve_destination(
+        logical_name="model.layers.0.mlp.gate_proj.weight",
+        role="weight",
+    )
+    assert spec.pre is not None and spec.post is not None
+    ctx = spec.pre(spec.base)
+    ctx.buf.fill_(3)
+    spec.post(ctx)
+    retained = retained_loads[0][1].arguments["loaded_weight"]
+    ctx.buf.fill_(5)
+
+    assert torch.all(retained.float() == 3)
+    assert retained.untyped_storage().data_ptr() != ctx.buf.untyped_storage().data_ptr()
+
+
+def test_0251_adapter_repeated_refits_change_bytes_and_preserve_runtime_pointers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    adapter, model, _retained_loads = _make_binding_adapter(monkeypatch, events)
+    refit_info = _native_binding_refit_info()
+    adapter.prepare(refit_info)
+    runtime_parameters = dict(model.named_parameters())
+    value = runtime_parameters["model.layers.0.mlp.down_proj.weight"]
+    scale = runtime_parameters["model.layers.0.mlp.down_proj.weight_scale"]
+    value_pointer = value.data_ptr()
+    scale_pointer = scale.data_ptr()
+    snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    for fill_value in (1, 2):
+        adapter.begin_update()
+        for param_info in refit_info["per_layer_params"]["model.layers.0"]:
+            for component in param_info["components"]:
+                role = component["role"]
+                spec = adapter.resolve_destination(
+                    logical_name=param_info["name"], role=role
+                )
+                assert spec.pre is not None and spec.post is not None
+                ctx = spec.pre(spec.base)
+                ctx.buf.fill_(fill_value if role == "weight" else fill_value + 4)
+                spec.post(ctx)
+        adapter.finish_update()
+        snapshots.append((value.clone(), scale.clone()))
+        assert value.data_ptr() == value_pointer
+        assert scale.data_ptr() == scale_pointer
+
+    assert not torch.equal(snapshots[0][0], snapshots[1][0])
+    assert not torch.equal(snapshots[0][1], snapshots[1][1])
+    assert events.count("initialize") == 2
+    assert events.count("finalize") == 2
