@@ -1043,6 +1043,10 @@ class TestTQReplayBufferStateDict:
                 "per_worker_token_counts": {0: 7},
             }
         ]
+        assert restored_buf._rollout_ids_list == [
+            list(meta.sample_ids) for meta in metas
+        ]
+        assert restored_buf._staging_keys_list == [None, None]
         assert restored_dp.put_calls == []
 
     def test_checkpoint_serialization_preserves_full_result_table(self):
@@ -1092,6 +1096,35 @@ class TestTQReplayBufferStateDict:
         assert isinstance(restored_table, Table)
         assert restored_table.columns == ["Full result"]
         assert restored_table.data == [['{"reward":1.0,"status":"completed"}']]
+
+    def test_token_capture_round_trip_restores_staging_cleanup_ownership(self):
+        plan = encode_route_plan(
+            RouteAssemblyPlan(
+                schema_version=ROUTE_PLAN_SCHEMA_VERSION,
+                staging_partition="rollout_staging",
+                spans=(RouteSpan("r0/on_chain", 0, 2, 2, 1, "0" * 64),),
+                cleanup_staging_keys=("r0/on_chain", "r0/off_chain"),
+                expected_token_length=2,
+            )
+        )
+        group = _make_group_entry("g0", weight=1)
+        group["meta"].tags = [
+            {ROUTE_PLAN_TAG: plan} for _ in group["meta"].sample_ids
+        ]
+        state = _make_metadata_envelope([group])
+
+        restored = TQReplayBuffer(
+            MultiPartitionFakeDataPlaneClient(),
+            partition_id="rollout_data",
+            pad_value_dict={"token_ids": 0},
+            staging_partition_id="rollout_staging",
+        )
+        assert _load(restored, state) == 1
+
+        assert restored._rollout_ids_list == [list(group["meta"].sample_ids)]
+        assert restored._staging_keys_list == [
+            ["r0/on_chain", "r0/off_chain"]
+        ]
 
     def test_round_trip_preserves_end_weight_and_target_step(self):
         # start != end and a non-None target_step must survive the round-trip:

@@ -389,6 +389,9 @@ class _FakeRolloutManager:
         self._tq_buffer = None
         self.recovery_ledger = RolloutRecoveryLedger()
 
+    def set_data_plane_checkpoint_barrier(self, barrier: Any) -> None:
+        self.data_plane_checkpoint_barrier = barrier
+
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
 

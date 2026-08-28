@@ -30,6 +30,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     PromptGroupPhase,
+    RolloutAttemptStatus,
     RolloutRecoveryLedger,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
@@ -414,6 +415,56 @@ def test_prompt_ref_rehydrates_through_a_restored_shuffled_dataloader() -> None:
     _bind(restored_ledger, "unfinished", dataset_prompt)
 
     assert restored_ledger.get_group("unfinished").prompt_payload == owned_prompt
+
+
+def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    sealed_attempt_id = group.siblings[0].current_attempt.attempt_id
+    sealed_id = group.gate_rollout_id(0)
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=0,
+            gate_rollout_id=sealed_id,
+            receipt={
+                "rollout_id": sealed_id,
+                "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
+            },
+            reward=1.0,
+        )
+    )
+
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    _mutate(lambda cut: restored.prepare_for_restart(cut))
+    recovered_group = restored.get_group("g7")
+
+    assert (
+        recovered_group.siblings[0].current_attempt.status
+        is RolloutAttemptStatus.SEALED
+    )
+    assert (
+        recovered_group.siblings[1].current_attempt.status
+        is RolloutAttemptStatus.ABANDONED
+    )
+    assert restored.expected_staging_keys() == {"g7/sibling-0/call-0"}
+
+    retry = _mutate(lambda cut: restored.prepare_incomplete_retry(cut, "g7"))
+    assert retry.siblings[0].current_attempt.attempt_id == sealed_attempt_id
+    assert retry.siblings[0].current_attempt.status is RolloutAttemptStatus.SEALED
+    assert retry.siblings[1].current_attempt.status is RolloutAttemptStatus.RESERVED
 
 
 @pytest.mark.parametrize(
