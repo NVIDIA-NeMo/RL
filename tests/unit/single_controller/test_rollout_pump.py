@@ -1162,9 +1162,13 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
         release_finalizers = asyncio.Event()
         finalizers_started = 0
 
-        async def _delayed_finalize(request: Any) -> bool:
+        async def _delayed_finalize(
+            request: Any,
+            *,
+            target_step: int | None = None,
+        ) -> bool:
             nonlocal finalizers_started
-            del request
+            del request, target_step
             finalizers_started += 1
             await release_finalizers.wait()
             return True
@@ -1319,7 +1323,14 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         ctrl._finalizer_actors = [object()]
         ctrl._rollout_recovery_enabled = True
 
-        async def _finalize(_: Any) -> bool:
+        async def _finalize(
+            request: Any,
+            *,
+            target_step: int | None = None,
+        ) -> bool:
+            del target_step
+            async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
+                manager.recovery_ledger.discard_group(cut, request.group_id)
             return committed
 
         ctrl._finalize_with_actor = _finalize
