@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 import torch
+from torch.distributed._tensor import Shard
+from torch.distributed.tensor.placement_types import Replicate
 
 from nemo_rl.models.generation.vllm import refit_adapter
 
@@ -59,6 +61,7 @@ def _native_binding_refit_info() -> dict[str, Any]:
     hidden_size = 32
     intermediate_size = 64
     num_experts = 4
+    destination_mesh = SimpleNamespace(mesh=torch.arange(2))
 
     def parameter(
         name: str,
@@ -66,20 +69,31 @@ def _native_binding_refit_info() -> dict[str, Any]:
         *,
         grouped_expert_proj: str | None = None,
     ) -> dict[str, Any]:
+        shard_dim = (
+            0
+            if grouped_expert_proj is not None
+            or name.endswith(("gate_proj.weight", "up_proj.weight"))
+            else 1
+        )
+        destination_placements = [Shard(shard_dim)]
         result: dict[str, Any] = {
             "name": name,
             "global_shape": shape,
             "dtype": "torch.float8_e4m3fn",
+            "dst_mesh_info": destination_mesh,
+            "dst_placements": destination_placements,
             "components": [
                 {
                     "role": "weight",
                     "dtype": "torch.float8_e4m3fn",
                     "global_shape": shape,
+                    "dst_placements": destination_placements,
                 },
                 {
                     "role": "weight_scale",
                     "dtype": "torch.uint8",
                     "global_shape": (*shape[:-1], shape[-1] // 32),
+                    "dst_placements": destination_placements,
                 },
             ],
         }
@@ -725,6 +739,29 @@ def test_0251_adapter_binds_dense_and_routed_checkpoint_components(
             assert bound.arguments["loaded_shard_id"] in {0, 1}
 
 
+def test_0251_adapter_rejects_consistent_dense_metadata_that_misses_fused_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _model, retained_loads = _make_binding_adapter(monkeypatch, [])
+    refit_info = _native_binding_refit_info()
+    gate, up = refit_info["per_layer_params"]["model.layers.0"][:2]
+    for param_info in (gate, up):
+        param_info["global_shape"] = (128, 32)
+        param_info["components"][0]["global_shape"] = (128, 32)
+        param_info["components"][1]["global_shape"] = (128, 1)
+
+    adapter.prepare(refit_info)
+    adapter.begin_update()
+
+    with pytest.raises(ValueError, match="local shape.*expected.*64, 32"):
+        adapter.resolve_destination(
+            logical_name="model.layers.0.mlp.gate_proj.weight",
+            role="weight",
+        )
+
+    assert retained_loads == []
+
+
 @pytest.mark.parametrize(
     ("case", "error"),
     [
@@ -859,3 +896,205 @@ def test_0251_adapter_repeated_refits_change_bytes_and_preserve_runtime_pointers
     assert not torch.equal(snapshots[0][1], snapshots[1][1])
     assert events.count("initialize") == 2
     assert events.count("finalize") == 2
+
+
+@pytest.mark.vllm
+def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers() -> None:
+    vllm = pytest.importorskip("vllm")
+    if vllm.__version__ != "0.25.1":
+        pytest.skip("native refit integration is pinned to vLLM 0.25.1")
+    if not torch.cuda.is_available():
+        pytest.skip("native refit integration requires CUDA")
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("native MXFP8 refit integration requires SM100+")
+
+    from unittest.mock import patch
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe import FusedMoE
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMxFp8Config,
+        ModelOptMxFp8FusedMoE,
+        ModelOptMxFp8LinearMethod,
+    )
+    from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
+
+    from nemo_rl.models.generation.vllm.quantization.fp8 import (
+        create_weights_mxfp8_moe,
+        process_weights_after_loading_mxfp8_linear,
+        process_weights_after_loading_mxfp8_moe,
+    )
+
+    class NativeModel(torch.nn.Module):
+        def __init__(
+            self,
+            *,
+            vllm_config: VllmConfig,
+            quant_config: ModelOptMxFp8Config,
+        ) -> None:
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+            mlp = torch.nn.Module()
+            self.model.layers[0].mlp = mlp
+            mlp.gate_up_proj = MergedColumnParallelLinear(
+                input_size=128,
+                output_sizes=[128, 128],
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=quant_config,
+                prefix="model.layers.0.mlp.gate_up_proj",
+                disable_tp=True,
+            )
+            mlp.experts = FusedMoE(
+                num_experts=2,
+                top_k=1,
+                hidden_size=128,
+                intermediate_size=128,
+                params_dtype=torch.bfloat16,
+                quant_config=quant_config,
+                tp_size=1,
+                dp_size=1,
+                pcp_size=1,
+                prefix="model.layers.0.mlp.experts",
+            )
+            record_metadata_for_reloading(self)
+
+    def parameter(
+        name: str,
+        shape: tuple[int, ...],
+        *,
+        grouped_expert_proj: str | None = None,
+    ) -> dict[str, Any]:
+        placements = [Replicate()]
+        result: dict[str, Any] = {
+            "name": name,
+            "global_shape": shape,
+            "dtype": "torch.float8_e4m3fn",
+            "dst_mesh_info": SimpleNamespace(mesh=torch.tensor([0])),
+            "dst_placements": placements,
+            "components": [
+                {
+                    "role": "weight",
+                    "dtype": "torch.float8_e4m3fn",
+                    "global_shape": shape,
+                    "dst_placements": placements,
+                },
+                {
+                    "role": "weight_scale",
+                    "dtype": "torch.uint8",
+                    "global_shape": (*shape[:-1], shape[-1] // 32),
+                    "dst_placements": placements,
+                },
+            ],
+        }
+        if grouped_expert_proj is not None:
+            result["grouped_expert_proj"] = grouped_expert_proj
+        return result
+
+    prefix = "model.layers.0.mlp"
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                parameter(f"{prefix}.gate_proj.weight", (128, 128)),
+                parameter(f"{prefix}.up_proj.weight", (128, 128)),
+                parameter(
+                    f"{prefix}.experts.gate_proj.weight",
+                    (2, 128, 128),
+                    grouped_expert_proj="gate_proj",
+                ),
+                parameter(
+                    f"{prefix}.experts.up_proj.weight",
+                    (2, 128, 128),
+                    grouped_expert_proj="up_proj",
+                ),
+                parameter(
+                    f"{prefix}.experts.down_proj.weight",
+                    (2, 128, 128),
+                    grouped_expert_proj="down_proj",
+                ),
+            ]
+        },
+    }
+    vllm_config = VllmConfig()
+    quant_config = ModelOptMxFp8Config(
+        is_checkpoint_mxfp8_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+    )
+
+    with (
+        patch.object(
+            ModelOptMxFp8LinearMethod,
+            "process_weights_after_loading",
+            process_weights_after_loading_mxfp8_linear,
+        ),
+        patch.object(
+            ModelOptMxFp8FusedMoE,
+            "create_weights",
+            create_weights_mxfp8_moe,
+        ),
+        patch.object(
+            ModelOptMxFp8FusedMoE,
+            "process_weights_after_loading",
+            process_weights_after_loading_mxfp8_moe,
+        ),
+        set_current_vllm_config(vllm_config),
+        torch.device("cuda"),
+    ):
+        model = NativeModel(vllm_config=vllm_config, quant_config=quant_config)
+        for parameter_value in model.parameters():
+            parameter_value.fill_(1)
+        for module in model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            if isinstance(quant_method, QuantizeMethodBase):
+                quant_method.process_weights_after_loading(module)
+
+        runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+        adapter = refit_adapter.Vllm0251RefitAdapter(
+            model_runner=runner,
+            model_config=vllm_config.model_config,
+            device=torch.device("cuda"),
+        )
+        adapter.prepare(refit_info)
+        runtime_parameters = dict(model.named_parameters())
+        tracked_names = (
+            "model.layers.0.mlp.gate_up_proj.weight",
+            "model.layers.0.mlp.gate_up_proj.weight_scale",
+            "model.layers.0.mlp.experts.routed_experts.w13_weight",
+            "model.layers.0.mlp.experts.routed_experts.w13_weight_scale",
+            "model.layers.0.mlp.experts.routed_experts.w2_weight",
+            "model.layers.0.mlp.experts.routed_experts.w2_weight_scale",
+        )
+        pointers = {name: runtime_parameters[name].data_ptr() for name in tracked_names}
+        snapshots: list[dict[str, torch.Tensor]] = []
+
+        for fill_value in (2, 3):
+            adapter.begin_update()
+            for param_info in refit_info["per_layer_params"]["model.layers.0"]:
+                for component in param_info["components"]:
+                    role = component["role"]
+                    spec = adapter.resolve_destination(
+                        logical_name=param_info["name"], role=role
+                    )
+                    assert spec.pre is not None and spec.post is not None
+                    ctx = spec.pre(spec.base)
+                    ctx.buf.fill_(fill_value if role == "weight" else fill_value + 8)
+                    spec.post(ctx)
+            adapter.finish_update()
+            torch.cuda.synchronize()
+            snapshots.append(
+                {name: runtime_parameters[name].clone() for name in tracked_names}
+            )
+            assert {
+                name: runtime_parameters[name].data_ptr() for name in tracked_names
+            } == pointers
+
+        assert any(
+            not torch.equal(snapshots[0][name], snapshots[1][name])
+            for name in tracked_names
+        )
