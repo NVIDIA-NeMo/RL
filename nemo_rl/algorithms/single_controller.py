@@ -1038,9 +1038,7 @@ class SingleControllerActor:
         clear_unreferenced: bool,
     ) -> None:
         """Require every unfinished receipt or deferred route to retain staging."""
-        expected_staging_keys = (
-            self._rollout_recovery_ledger.expected_staging_keys()
-        )
+        expected_staging_keys = self._rollout_recovery_ledger.expected_staging_keys()
         if replay_metadata is not None:
             for group in replay_metadata["groups"]:
                 for tag in group["meta"].tags or []:
@@ -1410,9 +1408,7 @@ class SingleControllerActor:
         self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
         return finalized
 
-    async def _cleanup_consumed_metas_unlocked(
-        self, metas: list[KVBatchMeta]
-    ) -> None:
+    async def _cleanup_consumed_metas_unlocked(self, metas: list[KVBatchMeta]) -> None:
         """Clear consumed ownership while holding a barrier mutation slot."""
         canonical_by_partition: dict[str, list[str]] = {}
         staging_by_partition: dict[str, list[str]] = {}
