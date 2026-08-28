@@ -4454,6 +4454,7 @@ def async_grpo_train(
         f"max_generation_failures={max_generation_failures}"
     )
 
+    timer.start("init/total")
     print("⏳ Preparing policy generation for training...", flush=True)
     if POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...", flush=True)
@@ -4570,7 +4571,12 @@ def async_grpo_train(
     print(
         f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
     )
-    timer.start("init/total")
+    # Initial rollout collection belongs to the first optimizer step.  Record
+    # it as a first timing sample; the regular per-step contexts append their
+    # samples below and get_timing_metrics(sum) combines both before logging.
+    timer.stop("init/total")
+    timer.start("total_step_time")
+    timer.start("exposed_generation")
     wait_iterations = 0
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
@@ -4649,7 +4655,8 @@ def async_grpo_train(
         wait_iterations += 1
         time.sleep(1.0)
 
-    timer.stop("init/total")
+    timer.stop("exposed_generation")
+    timer.stop("total_step_time")
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
