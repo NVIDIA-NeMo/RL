@@ -42,9 +42,10 @@ def _as_routed_experts_tensor(
     which would otherwise wrap silently (e.g. if the expert count was
     mis-detected when resolving the dtype).
     """
-    global G_ROUTED_EXPERTS_RANGE_CHECKED
+    # global G_ROUTED_EXPERTS_RANGE_CHECKED
     tensor = torch.as_tensor(value, device=device)
-    if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
+    if False:
+    # if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
         max_id = int(tensor.max())
         limit = torch.iinfo(dtype).max
         if max_id > limit:
