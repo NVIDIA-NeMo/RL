@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 5
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 1
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 
 
