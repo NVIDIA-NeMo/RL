@@ -168,10 +168,6 @@ class SGLangGeneration(GenerationInterface):
             for j in range(len(self.engines))
         ]
 
-    def get_rollout_engine_urls(self) -> list[str]:
-        """Resolve node-0 engine HTTP base URLs once on the driver."""
-        return ray.get([e.get_base_url.remote() for e in self.rollout_engines])
-
     def run_checkpoint_engine_method(
         self, checkpoint_method: str, method_args: tuple[Any, ...] = ()
     ) -> list[ray.ObjectRef]:

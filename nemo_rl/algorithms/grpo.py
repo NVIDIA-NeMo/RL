@@ -1554,8 +1554,9 @@ def setup(
             if checkpoint_engine_config is None:
                 raise NotImplementedError(
                     f"SGLang does not support refit_transport={refit_transport!r}. "
-                    "Use 'nixl', a custom checkpoint-engine path, or null for "
-                    "colocated CUDA-IPC refit."
+                    "Use 'nixl', a custom 'module:ClassName' checkpoint "
+                    "engine, or null for the default path (Ray CUDA-IPC when "
+                    "colocated, SGLang's NCCL weight-update group when not)."
                 )
 
         # Set model_path if not already set

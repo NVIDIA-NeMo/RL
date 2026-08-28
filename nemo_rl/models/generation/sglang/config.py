@@ -15,6 +15,7 @@
 from typing import Any, Literal, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.vllm.config import VllmRefitConfig
 
 
 class SglangQuantizationConfig(TypedDict):
@@ -239,7 +240,11 @@ class SGLangConfig(GenerationConfig):
 
     sglang_cfg: SglangSpecificArgs
     sglang_kwargs: NotRequired[dict[str, Any]]
-    # Null uses the colocated CUDA-IPC path. ``nixl`` and custom checkpoint
-    # engines are supported for non-colocated generation.
+    # Null selects the default refit path: Ray CUDA-IPC when colocated,
+    # SGLang's NCCL weight-update group when non-colocated. ``nixl`` and custom
+    # ``module:ClassName`` checkpoint engines are supported for non-colocated
+    # generation.
     refit_transport: NotRequired[str | None]
-    refit_cfg: NotRequired[Any]
+    # Normalized by the same schema as vLLM's: ``checkpoint_engine_refit_config``
+    # runs ``normalize_vllm_refit_config`` and writes the validated model back.
+    refit_cfg: NotRequired[VllmRefitConfig | None]
