@@ -23,6 +23,7 @@ a mock worker group.
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -64,6 +65,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         _rollout_weight_version=0,
         _staging_source=None,
         _prefix_cache={},
+        _prefix_cache_lock=threading.Lock(),
     )
     worker.install_token_capture = lambda capture: setattr(
         worker, "token_capture", capture
@@ -203,6 +205,7 @@ def _worker_with_capture(sink: _MemorySink):
     worker = _fake_worker()
     worker._capture_calls = {}
     worker._prefix_cache = {}
+    worker._prefix_cache_lock = threading.Lock()
     worker._staging_source = None
     worker._delta_align_routed_experts = (
         VllmAsyncGenerationWorkerImpl._delta_align_routed_experts
