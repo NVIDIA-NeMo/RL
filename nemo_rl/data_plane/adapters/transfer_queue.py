@@ -51,7 +51,6 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
     DataPlaneConfig,
     KVBatchMeta,
-    MooncakeCheckpointConfig,
     backend_config,
     data_plane_supports_checkpointing,
 )
@@ -604,14 +603,11 @@ def _connect_existing() -> None:
     tq.init()
 
 
-def _init_tq(cfg: DataPlaneConfig) -> Any | None:
+def _init_tq(cfg: DataPlaneConfig) -> None:
     """Driver-process path: bootstrap the TQ controller for the chosen backend."""
     from omegaconf import OmegaConf
 
     base = OmegaConf.load(str(resources.files("transfer_queue") / "config.yaml"))
-    checkpoint_master: Any | None = None
-    checkpoint_cfg: MooncakeCheckpointConfig | None = None
-    mooncake_master_executable: str | None = None
 
     backend = cfg["backend"]
 
@@ -650,13 +646,13 @@ def _init_tq(cfg: DataPlaneConfig) -> Any | None:
         import mooncake.store  # type: ignore[import-not-found]  # noqa: F401
 
         _moon_pkg = os.path.dirname(mooncake.__file__)
-        mooncake_master_executable = os.path.join(_moon_pkg, "mooncake_master")
+        _master = os.path.join(_moon_pkg, "mooncake_master")
         try:
-            os.chmod(mooncake_master_executable, 0o755)
+            os.chmod(_master, 0o755)
         except OSError as e:
-            if not os.access(mooncake_master_executable, os.X_OK):
+            if not os.access(_master, os.X_OK):
                 raise RuntimeError(
-                    f"Failed to make {mooncake_master_executable} executable: {e}. "
+                    f"Failed to make {_master} executable: {e}. "
                     f"Mooncake bootstrap requires this binary."
                 ) from e
         _existing_path = os.environ.get("PATH", "")
@@ -675,16 +671,11 @@ def _init_tq(cfg: DataPlaneConfig) -> Any | None:
         # Sizes are per client process and RDMA-pinned — see MooncakeCpuConfig
         # in nemo_rl/data_plane/interfaces.py for the per-node arithmetic.
         mooncake_cfg = backend_config(cfg)
-        checkpoint_cfg = mooncake_cfg.checkpoint
         overlay = {
             **controller_overlay,
             "backend": {
                 "storage_backend": "MooncakeStore",
                 "MooncakeStore": {
-                    # The checkpoint plugin owns the exact master process when
-                    # enabled so it can add direct-DISK flags and stop only
-                    # that process during teardown.
-                    "auto_init": not checkpoint_cfg.enabled,
                     "global_segment_size": int(mooncake_cfg.global_segment_size),
                     "local_buffer_size": int(mooncake_cfg.local_buffer_size),
                     # _init_tq runs on the driver only — driver IS the
@@ -692,7 +683,7 @@ def _init_tq(cfg: DataPlaneConfig) -> Any | None:
                     # mooncake_master + the metadata server bind to.
                     "metadata_server": f"{local_ip}:50050",
                     "master_server_address": f"{local_ip}:50051",
-                    "checkpoint": checkpoint_cfg.model_dump(),
+                    "checkpoint": mooncake_cfg.checkpoint.model_dump(),
                     **_mooncake_transport_config(),
                 },
             },
@@ -702,30 +693,8 @@ def _init_tq(cfg: DataPlaneConfig) -> Any | None:
 
     conf = OmegaConf.merge(base, overlay)
 
-    if checkpoint_cfg is not None and checkpoint_cfg.enabled:
-        if checkpoint_cfg.storage_root is None:
-            raise ValueError("Mooncake checkpoint storage_root is required")
-        if mooncake_master_executable is None:
-            raise RuntimeError("Mooncake master executable was not resolved")
-        from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
-            start_mooncake_checkpoint_master,
-        )
-
-        checkpoint_master = start_mooncake_checkpoint_master(
-            executable=mooncake_master_executable,
-            metadata_server=str(conf.backend.MooncakeStore.metadata_server),
-            master_server_address=str(conf.backend.MooncakeStore.master_server_address),
-            storage_root=checkpoint_cfg.storage_root,
-        )
-
-    try:
-        # pyrefly: ignore  # bad-argument-type
-        tq.init(conf=conf)
-    except Exception:
-        if checkpoint_master is not None:
-            checkpoint_master.close()
-        raise
-    return checkpoint_master
+    # pyrefly: ignore  # bad-argument-type
+    tq.init(conf=conf)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -855,9 +824,8 @@ class TQDataPlaneClient(DataPlaneClient):
 
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
-        self._checkpoint_master: Any | None = None
         if bootstrap:
-            self._checkpoint_master = _init_tq(cfg)
+            _init_tq(cfg)
         else:
             _connect_existing()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
@@ -1181,7 +1149,3 @@ class TQDataPlaneClient(DataPlaneClient):
             tq.close()
         except Exception:
             pass
-        finally:
-            if self._checkpoint_master is not None:
-                self._checkpoint_master.close()
-                self._checkpoint_master = None
