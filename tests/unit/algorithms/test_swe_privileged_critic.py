@@ -79,6 +79,154 @@ def test_resolve_tolerates_unparseable_instance_dict():
     assert resolve_privilege_fields(info)["golden_patch"] == "G"
 
 
+# ------------------------------------------------------- R2E-Gym (no patch string)
+def _r2e_file_diff(path, added, deleted=(), section=""):
+    lines = [{"content": c, "type": "deleted"} for c in deleted]
+    lines += [{"content": c, "type": "added"} for c in added]
+    return {
+        "header": {"file": {"path": path}},
+        "index_line": {"old_commit_hash": "aaa", "new_commit_hash": "bbb", "mode": "100644"},
+        "minus_file": {"path": f"a/{path}"},
+        "plus_file": {"path": f"b/{path}"},
+        "is_binary_file": False,
+        "hunks": [
+            {
+                "descriptor": {
+                    "old_range": {"start": 1, "length": 3},
+                    "new_range": {"start": 1, "length": 4},
+                    "section": section,
+                },
+                "line_group": {"all_lines": [{"content": "ctx", "type": "context"}] + lines},
+                # whole function bodies; must NOT reach the block
+                "modified_entities": [{"content": "def f():\n    " + "x" * 5000}],
+            }
+        ],
+    }
+
+
+def _r2e_env_info(file_diffs, relevant_files=None, expected_output=None):
+    """R2E-Gym stores no patch string: the commit is structured, under
+    parsed_commit_content, and the acceptance criterion is expected_output_json."""
+    return _env_info(
+        instance_id="r2e-1",
+        dataset_name="R2E-Gym/R2E-Gym-Subset",
+        instance_dict=json.dumps(
+            {
+                "instance_id": "r2e-1",
+                "FAIL_TO_PASS": [],
+                "PASS_TO_PASS": [],
+                "relevant_files": relevant_files or [],
+                "parsed_commit_content": json.dumps({"file_diffs": file_diffs}),
+                "expected_output_json": json.dumps(expected_output or {}),
+            }
+        ),
+    )
+
+
+def test_r2e_gym_reconstructs_a_unified_diff():
+    """R2E-Gym is the 6.2% of the corpus with no patch string anywhere; the fix
+    has to be rebuilt from structured hunks or the whole group is unusable."""
+    info = _r2e_env_info(
+        [_r2e_file_diff("src/app.py", added=["new line"], deleted=["old line"], section="def f():")],
+        relevant_files=["src/app.py"],
+    )
+    gold = resolve_privilege_fields(info)["golden_patch"]
+    assert gold.startswith("diff --git a/src/app.py b/src/app.py")
+    assert "index aaa..bbb 100644" in gold
+    assert "--- a/src/app.py" in gold and "+++ b/src/app.py" in gold
+    assert "@@ -1,3 +1,4 @@ def f():" in gold
+    assert "+new line" in gold and "-old line" in gold and " ctx" in gold
+    # modified_entities are whole function bodies and would dwarf the hunks
+    assert "xxxxx" not in gold
+
+
+def test_r2e_gym_splits_fix_from_grading_tests():
+    info = _r2e_env_info(
+        [
+            _r2e_file_diff("src/app.py", added=["fix"]),
+            _r2e_file_diff("tests/test_app.py", added=["assert True"]),
+        ],
+        relevant_files=["src/app.py"],
+    )
+    f = resolve_privilege_fields(info)
+    assert "src/app.py" in f["golden_patch"] and "tests/test_app.py" not in f["golden_patch"]
+    assert "tests/test_app.py" in f["test_patch"] and "src/app.py" not in f["test_patch"]
+
+
+def test_r2e_gym_relevant_files_does_not_narrow_the_fix():
+    """relevant_files names the PRIMARY file only. A second non-test file that it
+    omits is still part of the accepted fix (R2E-Gym's own diff rendering
+    includes it), so it must not be misfiled as a grading test."""
+    info = _r2e_env_info(
+        [
+            _r2e_file_diff("src/app.py", added=["fix a"]),
+            _r2e_file_diff("src/helper.py", added=["fix b"]),
+        ],
+        relevant_files=["src/app.py"],
+    )
+    gold = resolve_privilege_fields(info)["golden_patch"]
+    assert "src/app.py" in gold and "src/helper.py" in gold
+    assert resolve_privilege_fields(info)["test_patch"] == ""
+
+
+def test_r2e_gym_test_shaped_source_module_stays_in_the_fix():
+    """pandas/util/testing.py is a source module. A pure path heuristic files it
+    as a test and leaves that instance with an EMPTY golden patch -- which is
+    exactly the failure the whole R2E-Gym branch exists to prevent."""
+    info = _r2e_env_info(
+        [
+            _r2e_file_diff("pandas/util/testing.py", added=["fix"]),
+            _r2e_file_diff("pandas/tests/test_testing.py", added=["assert True"]),
+        ],
+        relevant_files=["pandas/util/testing.py"],
+    )
+    f = resolve_privilege_fields(info)
+    assert "pandas/util/testing.py" in f["golden_patch"]
+    assert "pandas/tests/test_testing.py" in f["test_patch"]
+
+
+def test_r2e_gym_expected_output_becomes_the_acceptance_criterion():
+    """FAIL_TO_PASS/PASS_TO_PASS are empty for every R2E-Gym instance; the
+    expected test statuses play that role and belong in that budget slot."""
+    info = _r2e_env_info(
+        [_r2e_file_diff("src/app.py", added=["fix"])],
+        relevant_files=["src/app.py"],
+        expected_output={"test_a": "PASSED", "test_b": "ERROR"},
+    )
+    f = resolve_privilege_fields(info)
+    assert f["fail_to_pass"] == "test_a: PASSED\ntest_b: ERROR"
+    assert f["pass_to_pass"] == ""
+
+
+def test_r2e_gym_branch_does_not_touch_the_other_datasets():
+    """A record that HAS a patch string must take exactly the path it always did,
+    even if it also happens to carry parsed_commit_content."""
+    info = _env_info(
+        instance_id="x",
+        instance_dict=json.dumps(
+            {
+                "patch": "REAL",
+                "test_patch": "REAL_TESTS",
+                "FAIL_TO_PASS": ["a::b"],
+                "parsed_commit_content": json.dumps(
+                    {"file_diffs": [_r2e_file_diff("src/app.py", added=["ignored"])]}
+                ),
+            }
+        ),
+    )
+    f = resolve_privilege_fields(info)
+    assert f["golden_patch"] == "REAL"
+    assert f["test_patch"] == "REAL_TESTS"
+    assert f["fail_to_pass"] == "a::b"
+
+
+def test_unresolvable_record_still_raises():
+    """The loud failure must survive: a genuinely broken data path (no patch, no
+    parsed commit) must not be papered over with an empty block."""
+    info = _env_info(instance_id="x", instance_dict=json.dumps({"repo": "r"}))
+    assert resolve_privilege_fields(info)["golden_patch"] == ""
+
+
 @pytest.mark.parametrize(
     "raw,expected",
     [

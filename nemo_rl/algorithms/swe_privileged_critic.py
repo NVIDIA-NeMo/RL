@@ -39,10 +39,22 @@ Unbiasedness is preserved: the policy cannot see the reference, so
 ``a_t ⊥ z | s_t`` and ``E[∇log π(a_t|s_t) · V(s_t, z)] = 0``. The privileged
 batch must never reach the policy worker.
 
-Field availability was audited over all 9262 instances of the SWE curriculum:
-golden patch and test patch are present for 100% of them, but under four
-different key names across four source datasets and usually nested inside the
-``instance_dict`` JSON string rather than at the top level of ``metadata``.
+Field availability: the curriculum draws on FIVE source datasets, and the fix is
+recoverable for 100% of them -- but not uniformly.
+
+  * swe-bench-ext, SWE-rebench-V2, nv-internal-1, SWE-Gym carry a patch STRING,
+    under three different key names, usually nested inside the ``instance_dict``
+    JSON string rather than at the top level of ``metadata``.
+  * R2E-Gym carries no patch string at all. It stores the commit structurally
+    under ``parsed_commit_content``, which :func:`_resolve_r2e_gym` reassembles
+    into a unified diff so the critic sees one schema everywhere.
+
+An earlier audit covered only the first four and concluded "100%", which is why
+the first privileged launch died with "no golden patch resolved for 48/512
+rollouts". Re-measured directly over the 7394 collected rollout groups:
+SWE-rebench-V2 4769, swe-bench-ext 1613, R2E-Gym 456, nv-internal-1 377,
+SWE-Gym 179 -- gold now resolves for all 7394.
+
 ``rubric``/``requirements``/``interface`` exist for only 6.9% (and ``interface``
 is already in the agent's prompt), so nothing here depends on them.
 """
@@ -59,6 +71,32 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 # ``patch``, nv-internal-1 uses ``gold_patch``, SWE-Gym carries ``golden_patch``
 # alongside ``patch``.
 GOLD_KEYS: tuple[str, ...] = ("golden_patch", "gold_patch", "patch")
+
+# R2E-Gym is the fifth dataset in this curriculum and the one exception to
+# "every instance carries a patch string": it stores NO unified diff at all.
+# 456 of the 7394 collected groups (6.2%) are R2E-Gym, and the original audit
+# missed them, which is what made the first privileged launch die with
+# "no golden patch resolved for 48/512 rollouts".
+#
+# The reference fix IS present, just structured rather than textual, under
+# ``parsed_commit_content`` -- a JSON blob of per-file hunks that we reassemble
+# into a real unified diff below. Two other sources were considered and
+# rejected:
+#   * the ``prompt`` field embeds a ```diff block, but measured over all 456
+#     instances it covers only PART of the non-test files in 38% of them (it is
+#     the issue-writer's prompt, not the patch of record) -- so it silently
+#     under-reports the fix;
+#   * ``old_file_content``/``new_file_content`` are whole files (median ~190 KB),
+#     which would blow the token budget on unchanged lines.
+# Reassembling the hunks gives 100% coverage AND keeps the critic on ONE schema
+# across all five datasets, which is the thing that actually has to be learnable.
+R2E_COMMIT_KEY = "parsed_commit_content"
+# R2E-Gym leaves FAIL_TO_PASS/PASS_TO_PASS empty (0/456) and states its
+# acceptance criterion as ``expected_output_json``: test name -> expected status
+# (PASSED / ERROR / FAILED). That is the same role FAIL_TO_PASS plays for the
+# other four datasets, so it is emitted in that slot.
+R2E_EXPECTED_KEY = "expected_output_json"
+_DIFF_LINE_PREFIX = {"context": " ", "deleted": "-", "added": "+"}
 
 # Emitted in this order. Least discriminative first: the block sits ~100k tokens
 # before the late values that need it, and this model is a 52-layer hybrid with
@@ -210,6 +248,120 @@ def _as_lines(value: Any) -> str:
     return str(value)
 
 
+def _is_test_path(path: str) -> bool:
+    """Path heuristic for the fix/tests split -- the FALLBACK only.
+
+    ``relevant_files`` (see :func:`_resolve_r2e_gym`) states the split
+    authoritatively and covers 100% of this corpus, so this only runs on a
+    record that lacks it. Deliberately conservative: an earlier version also
+    treated ``test*.py`` as a test file and thereby swallowed pandas'
+    ``pandas/util/testing.py`` -- a source module -- leaving that instance with
+    an empty golden patch.
+    """
+    low = path.lower()
+    base = low.rsplit("/", 1)[-1]
+    return (
+        base.startswith("test_")
+        or base.endswith("_test.py")
+        or base.endswith("_test.go")
+        or "/tests/" in f"/{low}"
+        or "/test/" in f"/{low}"
+    )
+
+
+def _unified_diff_from_file_diff(fd: dict[str, Any]) -> str:
+    """Rebuild one file's unified diff from R2E-Gym's structured hunks.
+
+    Emits exactly the ``diff --git`` / ``index`` / ``---`` / ``+++`` / ``@@``
+    shape the other four datasets supply verbatim, so the critic sees a single
+    patch format everywhere. ``modified_entities`` (whole function bodies, which
+    dwarf the hunks) is deliberately dropped.
+    """
+    path = ((fd.get("header") or {}).get("file") or {}).get("path") or ""
+    if not path:
+        return ""
+    minus = (fd.get("minus_file") or {}).get("path") or f"a/{path}"
+    plus = (fd.get("plus_file") or {}).get("path") or f"b/{path}"
+    out = [f"diff --git a/{path} b/{path}"]
+    idx = fd.get("index_line") or {}
+    if idx.get("old_commit_hash") and idx.get("new_commit_hash"):
+        mode = f" {idx['mode']}" if idx.get("mode") else ""
+        out.append(f"index {idx['old_commit_hash']}..{idx['new_commit_hash']}{mode}")
+    if fd.get("is_binary_file"):
+        out.append(fd.get("binary_line") or f"Binary files {minus} and {plus} differ")
+        return "\n".join(out)
+    out += [f"--- {minus}", f"+++ {plus}"]
+    for hunk in fd.get("hunks") or []:
+        d = hunk.get("descriptor") or {}
+        o, n = d.get("old_range") or {}, d.get("new_range") or {}
+        section = d.get("section") or ""
+        out.append(
+            f"@@ -{o.get('start', 0)},{o.get('length', 0)} "
+            f"+{n.get('start', 0)},{n.get('length', 0)} @@"
+            + (f" {section}" if section else "")
+        )
+        for line in ((hunk.get("line_group") or {}).get("all_lines") or []):
+            prefix = _DIFF_LINE_PREFIX.get(line.get("type"), " ")
+            out.append(prefix + (line.get("content") or ""))
+    return "\n".join(out)
+
+
+def _resolve_r2e_gym(src: dict[str, Any]) -> dict[str, str]:
+    """Privileged fields for an R2E-Gym instance (no patch string in metadata).
+
+    Returns ``{}`` when this is not an R2E-Gym-shaped record, so the caller can
+    keep failing loudly on a genuinely broken data path rather than papering
+    over it with empty strings.
+    """
+    try:
+        commit = json.loads(src.get(R2E_COMMIT_KEY) or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    file_diffs = commit.get("file_diffs") if isinstance(commit, dict) else None
+    if not file_diffs:
+        return {}
+
+    # Gold/test split from BOTH available signals, because neither alone is
+    # right. ``relevant_files`` is R2E-Gym's "primary" file(s) and is narrower
+    # than the fix -- on one Pillow instance it names ImagePalette.py while the
+    # commit also fixes Image.py, and R2E-Gym's OWN diff rendering includes
+    # both. The path heuristic is broader but misfires on source modules that
+    # merely look test-shaped (pandas/util/testing.py). Union of the two: a file
+    # is part of the fix unless it looks like a test AND R2E-Gym did not call it
+    # relevant. Cross-checked against R2E-Gym's own rendering over all 456
+    # instances (see the docstring's note on _unified_diff_from_file_diff).
+    relevant = src.get("relevant_files")
+    relevant = set(relevant) if isinstance(relevant, list) else set()
+
+    gold_parts, test_parts = [], []
+    for fd in file_diffs:
+        if not isinstance(fd, dict):
+            continue
+        text = _unified_diff_from_file_diff(fd)
+        if not text:
+            continue
+        path = ((fd.get("header") or {}).get("file") or {}).get("path") or ""
+        is_test = _is_test_path(path) and path not in relevant
+        (test_parts if is_test else gold_parts).append(text)
+
+    # expected_output_json is the acceptance criterion; "name: STATUS" per line
+    # matches the one-item-per-line shape _as_lines() gives the other datasets.
+    expected = ""
+    try:
+        eo = json.loads(src.get(R2E_EXPECTED_KEY) or "{}")
+        if isinstance(eo, dict):
+            expected = "\n".join(f"{k}: {v}" for k, v in eo.items())
+    except (json.JSONDecodeError, TypeError):
+        expected = ""
+
+    return {
+        "golden_patch": "\n".join(gold_parts),
+        "test_patch": "\n".join(test_parts),
+        "fail_to_pass": expected,
+        "pass_to_pass": "",
+    }
+
+
 def resolve_privilege_fields(env_info: dict[str, Any]) -> dict[str, str]:
     """Pull the privileged fields out of one rollout's ``extra_env_info``.
 
@@ -234,9 +386,19 @@ def resolve_privilege_fields(env_info: dict[str, Any]) -> dict[str, str]:
         if isinstance(v, str) and v.strip():
             gold = v
             break
+    instance_id = str(src.get("instance_id") or md.get("instance_id") or "")
+
+    # R2E-Gym: no patch string anywhere, but the commit is present structurally.
+    # Only consulted when the textual keys came up empty, so the other four
+    # datasets take exactly the path they always did.
+    if not gold:
+        r2e = _resolve_r2e_gym(src)
+        if r2e.get("golden_patch"):
+            return {"instance_id": instance_id, **r2e}
+
     test_patch = src.get("test_patch")
     return {
-        "instance_id": str(src.get("instance_id") or md.get("instance_id") or ""),
+        "instance_id": instance_id,
         "golden_patch": gold,
         "test_patch": test_patch if isinstance(test_patch, str) else "",
         "fail_to_pass": _as_lines(src.get("FAIL_TO_PASS")),
@@ -431,16 +593,17 @@ def build_swe_privileged_value_inputs(
             )
         critic_message_logs.append(critic_msgs)
 
-    # Golden patch is present for 100% of the audited corpus, so any miss is a
-    # data-path bug, not a straggler. Fail loudly rather than degrade to a blind
-    # critic under a privileged label.
+    # The fix resolves for 100% of the five source datasets, so any miss is a
+    # data-path or new-dataset bug, not a straggler. Fail loudly rather than
+    # degrade to a blind critic under a privileged label.
     if missing:
         raise ValueError(
             f"SWE privileged critic: no golden patch resolved for {len(missing)}/"
             f"{len(message_logs)} rollouts (rows {missing[:8]}...). Expected one of "
-            f"{GOLD_KEYS} in extra_env_info metadata or its instance_dict. "
-            "Audited coverage of the SWE curriculum is 100%, so this indicates the "
-            "metadata did not survive the data path."
+            f"{GOLD_KEYS} in extra_env_info metadata / its instance_dict, or an "
+            f"R2E-Gym-style {R2E_COMMIT_KEY!r}. Either the metadata did not "
+            "survive the data path, or the campaign mixes in a SIXTH dataset with "
+            "yet another schema — check dataset_name on the failing rows."
         )
 
     if metrics_out is not None and block_stats:
