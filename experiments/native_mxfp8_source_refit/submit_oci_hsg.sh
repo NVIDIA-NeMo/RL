@@ -11,6 +11,7 @@ WALLTIME=${WALLTIME:-04:00:00}
 PARTITION=${PARTITION:-batch}
 LOCAL_SCRATCH=${LOCAL_SCRATCH:-/raid/scratch/${USER}}
 SLURM_HELPER_CANDIDATE_DIRS=${SLURM_HELPER_CANDIDATE_DIRS:-/usr/local/bin:/usr/bin:/bin}
+SLURM_HELPER_RESOLVER_CANDIDATES=${SLURM_HELPER_RESOLVER_CANDIDATES:-/usr/bin/readlink:/bin/readlink:/usr/bin/realpath:/bin/realpath}
 
 case "${ACTION}" in
   render|test-only|submit) ;;
@@ -112,6 +113,7 @@ resolve_helper_path() {
     local candidate_dir
     IFS=: read -r -a candidate_dirs <<< "${SLURM_HELPER_CANDIDATE_DIRS}"
     for candidate_dir in "${candidate_dirs[@]}"; do
+      [[ -n "${candidate_dir}" ]] || continue
       if [[ -x "${candidate_dir}/${helper}" ]]; then
         helper_path="${candidate_dir}/${helper}"
         break
@@ -128,12 +130,40 @@ resolve_helper_path() {
   fi
 
   local resolved_path
-  resolved_path=$(readlink -f "${helper_path}" 2>/dev/null || realpath "${helper_path}" 2>/dev/null || printf '%s\n' "${helper_path}")
+  resolved_path=$(resolve_real_path "${helper_path}")
   if [[ ! -x "${resolved_path}" ]]; then
     echo "Required Slurm helper ${helper} is not executable: ${resolved_path}" >&2
     exit 2
   fi
-  dirname "${resolved_path}"
+  local helper_dir=${resolved_path%/*}
+  if [[ -z "${helper_dir}" || "${helper_dir}" == "${resolved_path}" ]]; then
+    helper_dir=/
+  fi
+  printf '%s\n' "${helper_dir}"
+}
+
+resolve_real_path() {
+  local path=$1
+  local resolver resolver_candidates=() resolved_path
+  IFS=: read -r -a resolver_candidates <<< "${SLURM_HELPER_RESOLVER_CANDIDATES}"
+  for resolver in "${resolver_candidates[@]}"; do
+    [[ -n "${resolver}" && -x "${resolver}" ]] || continue
+    case "${resolver}" in
+      */readlink)
+        if resolved_path=$("${resolver}" -f "${path}" 2>/dev/null) && [[ -n "${resolved_path}" ]]; then
+          printf '%s\n' "${resolved_path}"
+          return
+        fi
+        ;;
+      */realpath)
+        if resolved_path=$("${resolver}" "${path}" 2>/dev/null) && [[ -n "${resolved_path}" ]]; then
+          printf '%s\n' "${resolved_path}"
+          return
+        fi
+        ;;
+    esac
+  done
+  printf '%s\n' "${path}"
 }
 
 resolve_slurm_helper_path() {

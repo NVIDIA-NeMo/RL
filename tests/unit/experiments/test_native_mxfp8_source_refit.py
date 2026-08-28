@@ -44,16 +44,30 @@ def test_launcher_exports_resolved_slurm_helper_path_to_batch_shell() -> None:
     launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
 
     assert "resolve_slurm_helper_path()" in launcher
-    assert 'readlink -f "${helper_path}"' in launcher
-    assert "realpath" in launcher
     assert "SLURM_HELPER_PATH=$(resolve_slurm_helper_path)" in launcher
     assert '--export="ALL,SLURM_HELPER_PATH=${SLURM_HELPER_PATH}"' in launcher
     assert "Required Slurm helper ${helper} not found" in launcher
 
 
+def test_launcher_resolver_does_not_depend_on_original_path_for_fallback_tools() -> None:
+    launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
+
+    assert "/usr/bin/readlink" in launcher
+    assert "/bin/readlink" in launcher
+    assert "/usr/bin/realpath" in launcher
+    assert "/bin/realpath" in launcher
+    assert 'readlink -f "${helper_path}"' not in launcher
+    assert 'realpath "${helper_path}"' not in launcher
+    assert 'dirname "${resolved_path}"' not in launcher
+    assert 'helper_dir=${resolved_path%/*}' in launcher
+
+
 def test_ray_sub_bootstraps_slurm_helper_path_before_queries() -> None:
     ray_sub = (REPO_ROOT / "ray.sub").read_text()
 
-    path_bootstrap = 'export PATH="${SLURM_HELPER_PATH:-/usr/local/bin:/usr/bin:/bin:/cm/shared/apps/slurm/current/bin}:${PATH:-}"'
+    path_bootstrap = 'if [[ -n "${SLURM_HELPER_PATH:-}" ]]; then'
     assert path_bootstrap in ray_sub
+    assert 'export PATH="${SLURM_HELPER_PATH}:${PATH}"' in ray_sub
+    assert 'export PATH="${SLURM_HELPER_PATH}"' in ray_sub
+    assert "SLURM_HELPER_PATH:-/usr/local" not in ray_sub
     assert ray_sub.index(path_bootstrap) < ray_sub.index("maybe_gres_arg()")
