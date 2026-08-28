@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -44,6 +44,13 @@ class PromptGroupPhase(StrEnum):
 
     RESERVED = "reserved"
     ADMITTED = "admitted"
+
+
+class RecoveryGranularity(StrEnum):
+    """Unit of completed work reused after restoring an unfinished group."""
+
+    SIBLING = "sibling"
+    PROMPT_GROUP = "prompt_group"
 
 
 class RolloutAttemptStatus(StrEnum):
@@ -92,6 +99,33 @@ class PromptRef:
             raise ValueError("prompt sample_id must not be empty")
 
 
+def _validate_prompt_identity(
+    prompt_ref: PromptRef,
+    prompt_payload: DatumSpec,
+    *,
+    group_id: str,
+) -> None:
+    """Require a runtime prompt to resolve the ledger's durable dataset key."""
+    sample_id = prompt_payload.get("idx")
+    if isinstance(sample_id, bool) or not isinstance(sample_id, int):
+        raise ValueError(
+            f"recovery group {group_id!r} prompt payload must contain an integer idx"
+        )
+    if str(sample_id) != prompt_ref.sample_id:
+        raise ValueError(
+            f"recovery group {group_id!r} resolved sample_id={sample_id!r}; "
+            f"expected {prompt_ref.sample_id!r}"
+        )
+    task_name = prompt_payload.get("task_name")
+    if task_name is not None and not isinstance(task_name, str):
+        raise TypeError("prompt task_name must be a string or None")
+    if task_name != prompt_ref.task_name:
+        raise ValueError(
+            f"recovery group {group_id!r} resolved task_name={task_name!r}; "
+            f"expected {prompt_ref.task_name!r}"
+        )
+
+
 @dataclass
 class RolloutAttemptRecord:
     """One physical attempt for a stable logical sibling."""
@@ -132,6 +166,8 @@ class PromptGroupRecoveryRecord:
     admission_id: str
     prompt_id: str
     prompt_ref: PromptRef
+    agent_name: Optional[str]
+    recovery_granularity: RecoveryGranularity
     runtime_prompt_payload: Optional[DatumSpec]
     expected_generations: int
     target_step: Optional[int]
@@ -199,6 +235,15 @@ class OpenTrainStepRecord:
     status: TrainStepStatus = TrainStepStatus.OPEN
 
 
+@dataclass(frozen=True)
+class ParsedRolloutRecoveryState:
+    """Validated controller and ledger state loaded from one checkpoint sidecar."""
+
+    ledger_state: RolloutRecoveryState
+    batch_shortfall: dict[int, int]
+    sampler_stamps_target_steps: Optional[bool]
+
+
 def _new_attempt() -> RolloutAttemptRecord:
     return RolloutAttemptRecord(
         attempt_uuid=uuid.uuid4(),
@@ -249,6 +294,8 @@ class RolloutRecoveryLedger:
         expected_generations: int,
         target_step: Optional[int],
         start_weight_version: int,
+        agent_name: Optional[str] = None,
+        recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
         admitted: bool = True,
         group_id: Optional[str] = None,
         admission_id: Optional[str] = None,
@@ -290,6 +337,8 @@ class RolloutRecoveryLedger:
             admission_id=admission_id,
             prompt_id=prompt_id,
             prompt_ref=prompt_ref,
+            agent_name=agent_name,
+            recovery_granularity=recovery_granularity,
             # Retain the immutable dataloader sample by reference instead of copying
             # a potentially 131k-token payload. This cache is never serialized and
             # is released as soon as canonical rows take over recovery ownership.
@@ -333,27 +382,38 @@ class RolloutRecoveryLedger:
         """Attach a dataset-reconstructed prompt after identity validation."""
         cut.require_live()
         record = self._require_group(group_id)
-        sample_id = prompt_payload.get("idx")
-        if str(sample_id) != record.prompt_ref.sample_id:
-            raise ValueError(
-                f"recovery group {group_id!r} resolved sample_id={sample_id!r}; "
-                f"expected {record.prompt_ref.sample_id!r}"
-            )
-        task_name = prompt_payload.get("task_name")
-        if task_name != record.prompt_ref.task_name:
-            raise ValueError(
-                f"recovery group {group_id!r} resolved task_name={task_name!r}; "
-                f"expected {record.prompt_ref.task_name!r}"
-            )
+        _validate_prompt_identity(
+            record.prompt_ref,
+            prompt_payload,
+            group_id=group_id,
+        )
         record.runtime_prompt_payload = prompt_payload
 
     def prepare_for_restart(self, cut: DataPlaneMutationCut) -> None:
-        """Turn crash-interrupted physical attempts into retryable state."""
+        """Apply each group's persisted restore policy to interrupted attempts."""
         cut.require_live()
         self.assert_checkpoint_safe()
         for record in self._groups.values():
             if record.status is PromptGroupStatus.GENERATING:
-                self.abandon_unsealed(cut, record.group_id)
+                if record.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
+                    self._abandon_entire_group(record)
+                else:
+                    self.abandon_unsealed(cut, record.group_id)
+
+    @staticmethod
+    def _abandon_entire_group(record: PromptGroupRecoveryRecord) -> None:
+        """Discard every current sibling when an incomplete group is atomic.
+
+        Sealed staging rows become unreferenced here. The controller's restore
+        inventory pass removes those rows from TQ before redispatch.
+        """
+        for sibling in record.siblings:
+            attempt = sibling.current_attempt
+            attempt.status = RolloutAttemptStatus.ABANDONED
+            attempt.receipt = None
+            attempt.reward = None
+            attempt.staging_keys.clear()
+        record.status = PromptGroupStatus.GENERATING
 
     def assert_checkpoint_safe(self) -> None:
         """Reject states whose publication or optimizer outcome is ambiguous."""
@@ -431,9 +491,7 @@ class RolloutRecoveryLedger:
         cut.require_live()
         record = self._require_group(group_id)
         if record.phase is not PromptGroupPhase.ADMITTED:
-            raise ValueError(
-                f"cannot dispatch unadmitted recovery group {group_id!r}"
-            )
+            raise ValueError(f"cannot dispatch unadmitted recovery group {group_id!r}")
         if record.status != PromptGroupStatus.GENERATING:
             raise ValueError(
                 f"cannot dispatch group {group_id!r} from {record.status.value!r}"
@@ -772,6 +830,8 @@ class RolloutRecoveryLedger:
                         "sample_id": record.prompt_ref.sample_id,
                         "task_name": record.prompt_ref.task_name,
                     },
+                    "agent_name": record.agent_name,
+                    "recovery_granularity": record.recovery_granularity.value,
                     "expected_generations": record.expected_generations,
                     "target_step": record.target_step,
                     "start_weight_version": record.start_weight_version,
@@ -892,9 +952,7 @@ class RolloutRecoveryLedger:
             record.claimed_train_step is not None for record in ledger._groups.values()
         ):
             raise ValueError("claimed groups require an open_train_step record")
-        admission_states: dict[
-            str, tuple[PromptGroupPhase, Optional[int]]
-        ] = {}
+        admission_states: dict[str, tuple[PromptGroupPhase, Optional[int]]] = {}
         for record in ledger._groups.values():
             signature = (record.phase, record.target_step)
             previous = admission_states.setdefault(record.admission_id, signature)
@@ -913,7 +971,9 @@ class RolloutRecoveryLedger:
         """Replace this empty ledger from a validated checkpoint envelope."""
         cut.require_live()
         if self._groups or self._open_train_step is not None:
-            raise RuntimeError("cannot restore into a non-empty rollout recovery ledger")
+            raise RuntimeError(
+                "cannot restore into a non-empty rollout recovery ledger"
+            )
         restored = self.from_state_dict(state)
         self._groups = restored._groups
         self._open_train_step = restored._open_train_step
@@ -930,6 +990,8 @@ class RolloutRecoveryLedger:
         group_id = raw_group.get("group_id")
         admission_id = raw_group.get("admission_id")
         prompt_id = raw_group.get("prompt_id")
+        agent_name = raw_group.get("agent_name")
+        raw_recovery_granularity = raw_group.get("recovery_granularity")
         expected_generations = raw_group.get("expected_generations")
         siblings_state = raw_group.get("siblings")
         if not isinstance(group_id, str) or not group_id:
@@ -938,6 +1000,16 @@ class RolloutRecoveryLedger:
             raise ValueError("admission_id must be a non-empty string")
         if not isinstance(prompt_id, str) or not prompt_id:
             raise ValueError("prompt_id must be a non-empty string")
+        if agent_name is not None and not isinstance(agent_name, str):
+            raise ValueError("agent_name must be a string or None")
+        if not isinstance(raw_recovery_granularity, str):
+            raise ValueError("recovery_granularity must be a string")
+        try:
+            recovery_granularity = RecoveryGranularity(raw_recovery_granularity)
+        except ValueError as error:
+            raise ValueError(
+                f"invalid recovery_granularity={raw_recovery_granularity!r}"
+            ) from error
         if not isinstance(expected_generations, int) or expected_generations < 1:
             raise ValueError("expected_generations must be a positive integer")
         if (
@@ -1106,6 +1178,8 @@ class RolloutRecoveryLedger:
             admission_id=admission_id,
             prompt_id=prompt_id,
             prompt_ref=PromptRef(sample_id=sample_id, task_name=task_name),
+            agent_name=agent_name,
+            recovery_granularity=recovery_granularity,
             runtime_prompt_payload=None,
             expected_generations=expected_generations,
             target_step=target_step,
@@ -1133,6 +1207,8 @@ class RolloutRecoveryLedger:
             admission_id=record.admission_id,
             prompt_id=record.prompt_id,
             prompt_ref=record.prompt_ref,
+            agent_name=record.agent_name,
+            recovery_granularity=record.recovery_granularity,
             runtime_prompt_payload=record.runtime_prompt_payload,
             expected_generations=record.expected_generations,
             target_step=record.target_step,
@@ -1175,3 +1251,77 @@ class RolloutRecoveryLedger:
         if open_step is None or open_step.train_step != train_step:
             raise ValueError(f"train step {train_step} is not open")
         return open_step
+
+
+def _validate_batch_shortfall(value: object) -> dict[int, int]:
+    """Return a defensive copy of per-step permanent rollout losses."""
+    if not isinstance(value, dict):
+        raise TypeError("rollout recovery batch_shortfall must be a dictionary")
+    batch_shortfall: dict[int, int] = {}
+    for step, count in value.items():
+        if (
+            isinstance(step, bool)
+            or not isinstance(step, int)
+            or step < 0
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+        ):
+            raise ValueError(
+                "rollout recovery batch_shortfall entries must contain "
+                f"non-negative integer steps and counts, got {step!r}: {count!r}"
+            )
+        batch_shortfall[step] = count
+    return batch_shortfall
+
+
+def build_rollout_recovery_state(
+    ledger: RolloutRecoveryLedger,
+    *,
+    batch_shortfall: dict[int, int],
+    sampler_stamps_target_steps: bool,
+) -> RolloutRecoveryState:
+    """Build the complete versioned sidecar from ledger and controller state."""
+    if not isinstance(sampler_stamps_target_steps, bool):
+        raise TypeError(
+            "rollout recovery sampler_stamps_target_steps must be a boolean"
+        )
+    state = ledger.state_dict()
+    state["batch_shortfall"] = _validate_batch_shortfall(batch_shortfall)
+    state["sampler_stamps_target_steps"] = sampler_stamps_target_steps
+    return state
+
+
+def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
+    """Validate and split a complete checkpoint sidecar by runtime owner."""
+    if not isinstance(state, dict):
+        raise TypeError(
+            "rollout recovery sidecar must contain a dictionary, got "
+            f"{type(state).__name__}"
+        )
+    if state.get("schema_version") != ROLLOUT_RECOVERY_SCHEMA_VERSION:
+        raise ValueError(
+            "unsupported rollout recovery schema_version="
+            f"{state.get('schema_version')!r}; expected "
+            f"{ROLLOUT_RECOVERY_SCHEMA_VERSION}"
+        )
+    groups = state.get("groups")
+    if not isinstance(groups, list):
+        raise TypeError("rollout recovery groups must be a list")
+
+    raw_sampler_stamps = state.get("sampler_stamps_target_steps")
+    if raw_sampler_stamps is not None and not isinstance(raw_sampler_stamps, bool):
+        raise TypeError(
+            "rollout recovery sampler_stamps_target_steps must be a boolean"
+        )
+
+    ledger_state: RolloutRecoveryState = {
+        "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+        "groups": groups,
+        "open_train_step": state.get("open_train_step"),
+    }
+    return ParsedRolloutRecoveryState(
+        ledger_state=ledger_state,
+        batch_shortfall=_validate_batch_shortfall(state.get("batch_shortfall", {})),
+        sampler_stamps_target_steps=raw_sampler_stamps,
+    )

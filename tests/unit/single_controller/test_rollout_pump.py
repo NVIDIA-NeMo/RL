@@ -45,13 +45,14 @@ from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
+    RolloutRecoveryConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
-    RolloutRecoveryLedgerState,
+    RolloutRecoveryState,
 )
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
@@ -931,7 +932,7 @@ def test_checkpoint_observes_stale_abort_ledger_discard() -> None:
 
         checkpoint_entered = asyncio.Event()
 
-        async def checkpoint_snapshot() -> RolloutRecoveryLedgerState:
+        async def checkpoint_snapshot() -> RolloutRecoveryState:
             async with barrier.checkpoint():
                 checkpoint_entered.set()
                 return ledger.state_dict()
@@ -1299,6 +1300,7 @@ def test_rollout_pump_writes_expected_tq_data(
         task_to_env=task_to_env,
         num_generations_per_prompt=num_generations,
         max_seq_len=max_seq_len,
+        rollout_recovery_config=RolloutRecoveryConfig(),
         max_rollout_turns=max_rollout_turns,
         policy_generation=vllm_generation,
         use_nemo_gym=False,
