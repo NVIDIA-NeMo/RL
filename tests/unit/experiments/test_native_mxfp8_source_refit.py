@@ -67,7 +67,8 @@ def test_ray_sub_bootstraps_slurm_helper_path_before_queries() -> None:
 
     path_bootstrap = 'if [[ -n "${SLURM_HELPER_PATH:-}" ]]; then'
     assert path_bootstrap in ray_sub
-    assert 'export PATH="${SLURM_HELPER_PATH}:${PATH}"' in ray_sub
+    assert 'export PATH="${PATH}:${SLURM_HELPER_PATH}"' in ray_sub
     assert 'export PATH="${SLURM_HELPER_PATH}"' in ray_sub
+    assert 'export PATH="${SLURM_HELPER_PATH}:${PATH}"' not in ray_sub
     assert "SLURM_HELPER_PATH:-/usr/local" not in ray_sub
     assert ray_sub.index(path_bootstrap) < ray_sub.index("maybe_gres_arg()")

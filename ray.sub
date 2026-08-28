@@ -26,7 +26,7 @@ set -eoux pipefail
 
 if [[ -n "${SLURM_HELPER_PATH:-}" ]]; then
   if [[ -n "${PATH:-}" ]]; then
-    export PATH="${SLURM_HELPER_PATH}:${PATH}"
+    export PATH="${PATH}:${SLURM_HELPER_PATH}"
   else
     export PATH="${SLURM_HELPER_PATH}"
   fi
