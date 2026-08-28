@@ -36,6 +36,8 @@ policy:
     name: ${policy.model_name}
   hf_config_overrides:
     language_model_only: true
+    text_config:
+      router_aux_loss_coef: 0.0
   train_global_batch_size: 128
   train_micro_batch_size: 1
   logprob_batch_size: 1
