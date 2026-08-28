@@ -1161,11 +1161,12 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
         release_finalizers = asyncio.Event()
         finalizers_started = 0
 
-        async def _delayed_finalize(request: Any) -> None:
+        async def _delayed_finalize(request: Any) -> bool:
             nonlocal finalizers_started
             del request
             finalizers_started += 1
             await release_finalizers.wait()
+            return True
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
