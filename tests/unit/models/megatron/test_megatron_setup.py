@@ -1051,6 +1051,41 @@ matchers:
         assert model_cfg.num_layers_at_start_in_bf16 == 0
         assert model_cfg.num_layers_at_end_in_bf16 == 8
 
+    def test_resolves_te_recipe_relative_to_repo_root(self, tmp_path, monkeypatch):
+        """Ray workers can load repo-relative recipes from another cwd."""
+        from nemo_rl.models.megatron import setup
+
+        recipe_path = tmp_path / "configs" / "routed-experts.yaml"
+        recipe_path.parent.mkdir()
+        recipe_path.write_text(
+            """\
+configs:
+  bf16: {transformer_engine_config_type: TEQuantizationParams}
+matchers:
+  all_modules:
+    config: bf16
+    type: glob
+    pattern: "*"
+    enabled: true
+"""
+        )
+        worker_cwd = tmp_path / "worker"
+        worker_cwd.mkdir()
+        monkeypatch.chdir(worker_cwd)
+        monkeypatch.setattr(setup, "_NEMO_RL_ROOT", tmp_path)
+
+        model_cfg = SimpleNamespace()
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "te_precision_config_file": "configs/routed-experts.yaml",
+            }
+        }
+
+        setup._apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.quant_recipe is not None
+
 
 @pytest.mark.mcore
 class TestApplyPerformanceConfig:
