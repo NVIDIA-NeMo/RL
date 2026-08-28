@@ -179,6 +179,6 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - Generation backend: only vLLM is supported and validated; Megatron generation, SGLang, and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`).
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, and the critic shards it against the configured `value.train_global_batch_size` rather than its actual size, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
-- Reward shaping and sample filtering — `overlong_filtering`, `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping.
+- Reward shaping and sample filtering — `overlong_filtering`, `reward_shaping`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. `reward_scaling` is applied, in the advantage stage, before advantages are computed.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported.

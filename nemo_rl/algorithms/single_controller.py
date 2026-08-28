@@ -2031,20 +2031,26 @@ class SingleControllerActor:
             if self._is_ppo:
                 returns = torch.zeros_like(mask)
 
-        # grpo_sync.py:915 does the same, immediately before its data-plane
-        # write. A no-op unless advantage_clip_low/high are set, and GRPO-only:
-        # _clip_grpo_advantages has no counterpart in ppo.py, and PPOConfig
-        # carries neither knob, so a PPO run must not reach for them.
-        # ``hasattr``: only GRPOConfig carries the two knobs. PPOConfig does
-        # not, DistillationConfig does not, and the OPD test doubles build a
-        # bare namespace -- all of which mean "no clipping configured".
-        if not self._is_ppo and hasattr(self._algo_cfg, "advantage_clip_low"):
-            advantages = _clip_grpo_advantages(advantages, self._algo_cfg)
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
         self._step_log_dict["masked_advantages"].append(
             response_advantages.detach().cpu()
         )
+
+        # Clip after logging, not before: grpo.py logs at :3471 and clips at
+        # :3487, grpo_sync.py at :903 then :915. Both report pre-clip
+        # advantages, so clipping first would make SC's advantages/mean|max|min
+        # mean something different from every other driver's.
+        #
+        # A no-op unless advantage_clip_low/high are set, and GRPO-only:
+        # _clip_grpo_advantages has no counterpart in ppo.py.
+        # ``hasattr``: only GRPOConfig carries the two knobs. DistillationConfig
+        # does not, and the OPD test doubles build a bare namespace -- both mean
+        # "no clipping configured". ``not self._is_ppo`` is load-bearing on top
+        # of that, because PPOConfig is ``extra="allow"``: a user who sets
+        # ppo.advantage_clip_low would otherwise get GRPO clipping on a PPO run.
+        if not self._is_ppo and hasattr(self._algo_cfg, "advantage_clip_low"):
+            advantages = _clip_grpo_advantages(advantages, self._algo_cfg)
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if seq_logprob_error_threshold is not None:

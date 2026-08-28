@@ -15,7 +15,6 @@
 """Tests for SingleController initialization and pump lifecycle."""
 
 import asyncio
-import importlib
 import math
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -52,6 +51,21 @@ def _grpo_stub(**overrides):
         "reward_scaling": GRPOConfig.model_fields["reward_scaling"].default_factory(),
         "advantage_clip_low": None,
         "advantage_clip_high": None,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _ppo_stub(**overrides):
+    """The ppo config fields ``_advantage_stage`` reads.
+
+    Deliberately without ``advantage_clip_low``/``_high``: real PPOConfig
+    declares neither, so a stub that carries them would hide whether the
+    ``not self._is_ppo`` half of the clip guard does anything.
+    """
+    fields = {
+        "seq_logprob_error_threshold": None,
+        "reward_scaling": GRPOConfig.model_fields["reward_scaling"].default_factory(),
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -1649,9 +1663,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._is_ppo = True
-    ctrl._master_config = SimpleNamespace(
-        ppo=_grpo_stub(seq_logprob_error_threshold=None)
-    )
+    ctrl._master_config = SimpleNamespace(ppo=_ppo_stub())
     ctrl._algo_cfg = ctrl._master_config.ppo
     ctrl._step_log_dict = {
         "rewards": [],
@@ -1697,29 +1709,21 @@ class _RewardRecordingAdvantageEstimator:
     def compute_advantage(self, *, rewards, mask, **kwargs):
         del kwargs
         self.rewards = rewards.clone()
-        adv = rewards.unsqueeze(-1).expand_as(mask).clone()
-        # Bare tensor today, AdvantageResult once #3512 lands. Resolved through
-        # the module so this file does not import a name that exists only on
-        # that branch.
-        result_cls = getattr(
-            importlib.import_module("nemo_rl.algorithms.advantage_estimator"),
-            "AdvantageResult",
-            None,
-        )
-        return adv if result_cls is None else result_cls(advantages=adv)
+        return rewards.unsqueeze(-1).expand_as(mask).clone()
 
 
-def _knob_ctrl(estimator, grpo_stub):
+def _knob_ctrl(estimator, grpo_stub, *, is_ppo=False):
     batch, seq = 2, 4
-    data = TensorDict(
-        {
-            "prompt_ids_for_adv": torch.zeros(batch, seq, dtype=torch.long),
-            "total_reward": torch.tensor([-4.0, 6.0]),
-            "token_mask": torch.ones(batch, seq),
-            "sample_mask": torch.ones(batch),
-        },
-        batch_size=[batch],
-    )
+    columns = {
+        "prompt_ids_for_adv": torch.zeros(batch, seq, dtype=torch.long),
+        "total_reward": torch.tensor([-4.0, 6.0]),
+        "token_mask": torch.ones(batch, seq),
+        "sample_mask": torch.ones(batch),
+    }
+    if is_ppo:
+        # The PPO branch fetches the critic's values column.
+        columns["values"] = torch.zeros(batch, seq)
+    data = TensorDict(columns, batch_size=[batch])
     data_plane = _AdvantageDataPlane(data)
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
@@ -1729,9 +1733,11 @@ def _knob_ctrl(estimator, grpo_stub):
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
-    ctrl._master_config = SimpleNamespace(grpo=grpo_stub)
+    ctrl._master_config = (
+        SimpleNamespace(ppo=grpo_stub) if is_ppo else SimpleNamespace(grpo=grpo_stub)
+    )
     ctrl._algo_cfg = grpo_stub
-    ctrl._is_ppo = False
+    ctrl._is_ppo = is_ppo
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -1758,6 +1764,40 @@ def test_advantage_clip_bounds_are_applied_before_the_write() -> None:
     written = data_plane.written_fields["advantages"]
     assert written.min().item() == pytest.approx(-1.0)
     assert written.max().item() == pytest.approx(2.0)
+
+    # ...but the logged advantages stay pre-clip, because grpo.py:3471 and
+    # grpo_sync.py:903 both log before they clip. Clipping first would leave
+    # SC's advantages/mean|max|min meaning something no other driver's does.
+    logged = torch.cat([t.flatten() for t in ctrl._step_log_dict["masked_advantages"]])
+    assert logged.min().item() == pytest.approx(-4.0)
+    assert logged.max().item() == pytest.approx(6.0)
+
+
+def test_a_ppo_run_ignores_advantage_clip_knobs_set_on_its_own_block() -> None:
+    """``not self._is_ppo`` is the guard, not ``hasattr``.
+
+    PPOConfig is ``extra="allow"``, so a user who sets ``ppo.advantage_clip_low``
+    gets the field -- and ``hasattr`` alone would then run GRPO clipping on a
+    PPO run, which ppo.py never does.
+    """
+
+    class _GaeLikeEstimator:
+        def compute_advantage(self, *, rewards, mask, **kwargs):
+            del kwargs
+            adv = rewards.unsqueeze(-1).expand_as(mask).clone()
+            return adv, adv + 1.0
+
+    ctrl, data_plane, meta = _knob_ctrl(
+        _GaeLikeEstimator(),
+        _ppo_stub(advantage_clip_low=-1.0, advantage_clip_high=2.0),
+        is_ppo=True,
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    written = data_plane.written_fields["advantages"]
+    assert written.min().item() == pytest.approx(-4.0)
+    assert written.max().item() == pytest.approx(6.0)
 
 
 def test_advantages_are_untouched_when_no_clip_bounds_are_set() -> None:
