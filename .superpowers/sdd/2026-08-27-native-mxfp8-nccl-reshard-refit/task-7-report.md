@@ -249,10 +249,50 @@ pointer identity. The test does not substitute a wrapper or finalizer.
 Task 9/10 Linux SM100 command:
 
 ```bash
-uv run pytest -q \
+uv run --extra vllm --group test pytest -q --vllm-only \
   tests/unit/models/generation/test_vllm_refit_adapter.py \
   -k native_cuda_dense_and_routed_refit_preserves_runtime_pointers
 ```
 
 The gate collected and skipped locally only because vLLM is unavailable on
 macOS. No native vLLM/CUDA success is claimed in this report.
+
+## Final Native Integration Assertion Review
+
+Test commit: `b006977f test(refit): require every native runtime tensor to
+change` (`Signed-off-by` present).
+
+The pinned integration gate now seeds every ordered dense/routed value and
+scale component distinctly in each refit. Its second refit uses a disjoint seed
+range. After each finalization it still compares the complete six-entry pointer
+map for exact identity. After both refits it now requires `all(...)` six tracked
+runtime tensors to contain changed bytes:
+
+- dense fused value and runtime scale;
+- routed W13 value and runtime scale;
+- routed W2 value and runtime scale.
+
+The previous `any(...)` assertion could pass with five stale tensors. A native
+behavioral RED was not available on this macOS host because the exact vLLM/CUDA
+test is gated before execution. The isolated suite still collected that test
+and skipped it only for missing vLLM:
+
+```text
+test_vllm_refit_adapter.py: 33 passed, 1 skipped in 4.21s
+ruff check: All checks passed
+ruff format --check: 1 file already formatted
+python3 -m py_compile: success
+git diff --check: success
+```
+
+The corrected Task 9/10 command was also attempted locally:
+
+```bash
+uv run --extra vllm --group test pytest -q --vllm-only \
+  tests/unit/models/generation/test_vllm_refit_adapter.py \
+  -k native_cuda_dense_and_routed_refit_preserves_runtime_pointers
+```
+
+It exited before collection with the expected message that the checked-in
+lockfile supports Linux x86_64/aarch64 only. The command is ready to execute the
+`vllm`-marked test in the pinned Linux SM100 gate.
