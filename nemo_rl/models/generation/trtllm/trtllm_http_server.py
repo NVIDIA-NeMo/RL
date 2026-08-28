@@ -27,6 +27,7 @@ Under PD disaggregation this endpoint is *leg-aware*. A replica's
 """
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -40,6 +41,14 @@ from nemo_rl.models.generation.openai_server_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _tokenizer_backend_name(tokenizer: Any) -> str:
+    """Return the concrete backend that performs encode/decode operations."""
+    backend = getattr(tokenizer, "_tokenizer", None)
+    implementation = backend if backend is not None else tokenizer
+    implementation_type = type(implementation)
+    return f"{implementation_type.__module__}.{implementation_type.__name__}"
 
 
 def _context_leg_response(
@@ -238,6 +247,7 @@ def create_app(
         else getattr(generation_config, "eos_token_id", None)
     )
     _add_eos_token_ids(generation_eos_token_ids)
+    tokenizer_backend = _tokenizer_backend_name(tokenizer)
 
     app = FastAPI()
 
@@ -251,6 +261,23 @@ def create_app(
         messages: list[dict] = body.get("messages", [])
         tools: list[dict] | None = body.get("tools")
         logprobs_requested = body.get("logprobs", False)
+
+        # Timeline collection (skill: collect-training-timeline). Mirrors the
+        # vLLM adapter's NRL_TRAINING_TIMELINE gating. Field names below are
+        # nemo_trtllm_*_ts_us -- this deployment's NeMo Gym overlay
+        # (nemo_gym/openai_utils.py) was renamed from the skill's original
+        # nemo_vllm_*_ts_us to match, since this container only ever runs the
+        # TRT-LLM backend. Renaming both sides in lockstep like this is
+        # required: they're not interchangeable field names, Gym's schema
+        # only recognizes whichever one it declares.
+        timeline_request_timing_enabled = os.environ.get(
+            "NRL_TRAINING_TIMELINE"
+        ) == "1"
+        # This is the HTTP-frontend hand-off boundary (request accepted by
+        # this adapter, about to be submitted to the engine), not an engine
+        # timestamp -- TRT-LLM's timing_metrics has no separate "received by
+        # frontend" event the way vLLM's RequestMetrics does.
+        timeline_arrival_ts_us = time.time_ns() // 1_000
 
         # Under PD disaggregation a replica's OpenAIDisaggServer drives this
         # endpoint twice per request -- once context_only, once generation_only
@@ -322,20 +349,31 @@ def create_app(
             )
 
         # Full retokenization avoids accumulating generation token IDs twice.
+        prompt_tokenize_start_ns = time.perf_counter_ns()
         prompt_token_ids = _build_prompt_token_ids(
             conversation,
             tokenizer,
             tools=tools,
             default_template_kwargs=effective_template_kwargs,
         )
+        prompt_tokenize_duration_us = max(
+            time.perf_counter_ns() - prompt_tokenize_start_ns, 0
+        ) // 1_000
 
         # Empty required_prefix_ids on turn one returns the template unchanged.
+        prefix_tokenize_start_ns = time.perf_counter_ns()
         required_prefix_ids, template_prefix_ids = _compute_splice_inputs(
             messages,
             conversation,
             tokenizer,
             tools,
             effective_template_kwargs,
+        )
+        prefix_tokenize_duration_us = max(
+            time.perf_counter_ns() - prefix_tokenize_start_ns, 0
+        ) // 1_000
+        total_tokenize_duration_us = (
+            prompt_tokenize_duration_us + prefix_tokenize_duration_us
         )
 
         adj_prompt = replace_prefix_tokens(
@@ -390,7 +428,6 @@ def create_app(
             stop_token_ids=stop_token_ids,
             max_tokens=max_tokens,
         )
-
         try:
             output = await llm.generate_async(
                 {"prompt_token_ids": adj_prompt},
@@ -417,6 +454,76 @@ def create_app(
                 model_name, adj_prompt, gen, disagg_params
             )
 
+        timeline_fields: dict[str, int | str] | None = None
+        if timeline_request_timing_enabled:
+            # Always emit the wall-clock (Python-side) boundary even when the
+            # engine-side timing_metrics below are unavailable -- these two
+            # are independent capture points, not one dependent on the other.
+            timeline_fields = {
+                "nemo_trtllm_arrival_ts_us": timeline_arrival_ts_us,
+                "nemo_trtllm_prompt_tokenize_duration_us": (
+                    prompt_tokenize_duration_us
+                ),
+                "nemo_trtllm_prefix_tokenize_duration_us": (
+                    prefix_tokenize_duration_us
+                ),
+                "nemo_trtllm_total_tokenize_duration_us": (
+                    total_tokenize_duration_us
+                ),
+                "nemo_trtllm_tokenizer_backend": tokenizer_backend,
+            }
+            try:
+                # When timeline collection is enabled, the worker constructs
+                # AsyncLLM with return_perf_metrics=True. TRT-LLM propagates
+                # that constructor setting to SamplingParams and supplies the
+                # executor arrival_time needed to populate timing_metrics.
+                req_perf_metrics = getattr(gen, "request_perf_metrics", None)
+                timing = (
+                    getattr(req_perf_metrics, "timing_metrics", None)
+                    if req_perf_metrics is not None
+                    else None
+                )
+                if timing is not None:
+                    # steady_clock_now() (cpp std::chrono::steady_clock) is the
+                    # same clock domain as Python's time.monotonic_ns() on
+                    # Linux, so the same process-local offset trick the vLLM
+                    # adapter uses applies here.
+                    monotonic_epoch_offset_ns = (
+                        time.time_ns() - time.monotonic_ns()
+                    )
+
+                    def _to_epoch_us(duration: Any) -> int:
+                        return (
+                            monotonic_epoch_offset_ns
+                            + int(duration.total_seconds() * 1_000_000_000)
+                        ) // 1_000
+
+                    timeline_fields.update(
+                        {
+                            # TRT-LLM has no distinct frontend-arrival vs.
+                            # engine-queued timestamp; timing_metrics.arrival_time
+                            # is when the executor received the request, which is
+                            # the closest analog to vLLM's "queued" milestone.
+                            "nemo_trtllm_queued_ts_us": _to_epoch_us(
+                                timing.arrival_time
+                            ),
+                            "nemo_trtllm_first_scheduled_ts_us": _to_epoch_us(
+                                timing.first_scheduled_time
+                            ),
+                            "nemo_trtllm_first_token_ts_us": _to_epoch_us(
+                                timing.first_token_time
+                            ),
+                            "nemo_trtllm_last_token_ts_us": _to_epoch_us(
+                                timing.last_token_time
+                            ),
+                        }
+                    )
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                logger.debug(
+                    "Unable to attach TRT-LLM request timing metadata",
+                    exc_info=True,
+                )
+
         gen_token_ids = list(gen.token_ids)
 
         gen_logprobs: list[float] = []
@@ -437,7 +544,15 @@ def create_app(
             if gen_logprobs:
                 gen_logprobs.pop()
 
+        detokenize_start_ns = time.perf_counter_ns()
         gen_text = tokenizer.decode(gen_token_ids, skip_special_tokens=False)
+        detokenize_duration_us = max(
+            time.perf_counter_ns() - detokenize_start_ns, 0
+        ) // 1_000
+        if timeline_fields is not None:
+            timeline_fields["nemo_trtllm_detokenize_duration_us"] = (
+                detokenize_duration_us
+            )
 
         finish_reason = "stop"
         if gen.finish_reason is not None:
@@ -516,6 +631,10 @@ def create_app(
                 "total_tokens": len(adj_prompt) + len(gen_token_ids),
             },
         }
+
+        if timeline_fields is not None:
+            response.update(timeline_fields)
+            response["nemo_trtllm_response_ready_ts_us"] = time.time_ns() // 1_000
 
         if logprobs_requested and gen_logprobs:
             # `token` carries the id rather than the decoded text when asked.

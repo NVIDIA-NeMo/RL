@@ -249,6 +249,16 @@ class TrtllmAsyncGenerationWorkerImpl:
             ),
         )
 
+        # TRT-LLM must be told to collect request performance metrics when the
+        # LLM is constructed, not only on SamplingParams. In TRT-LLM 1.3,
+        # BaseLLM.generate_async() captures the executor arrival_time only when
+        # LlmArgs.return_perf_metrics is true; the same constructor flag then
+        # enables SamplingParams.return_perf_metrics for every request. Asking
+        # only at request time produces an incomplete metrics request and has
+        # caused empty generations in this deployment.
+        if os.environ.get("NRL_TRAINING_TIMELINE") == "1":
+            llm_kwargs["return_perf_metrics"] = True
+
         # Pull the optional KvCacheConfig sub-dict out of trtllm_kwargs. Its
         # fields (free_gpu_memory_fraction, mamba_ssm_cache_dtype, ...) live on
         # KvCacheConfig, not on LlmArgs, so they can't be spread as top-level
@@ -388,14 +398,36 @@ class TrtllmAsyncGenerationWorkerImpl:
         if self._http_base_url is not None:
             return self._http_base_url
 
+        from nemo_rl.utils.fastokens import maybe_patch_fastokens
+
+        # This tokenizer is constructed in the TRT-LLM Ray actor, so a patch
+        # applied in the driver or NeMo Gym process does not reach it. The
+        # environment override is propagated into this actor's runtime_env;
+        # NRL_USE_FASTOKENS=1 enables the patch before AutoTokenizer is built.
+        maybe_patch_fastokens(False)
+
         from transformers import AutoTokenizer
 
-        from nemo_rl.models.generation.trtllm.trtllm_http_server import start_server
+        from nemo_rl.models.generation.trtllm.trtllm_http_server import (
+            _tokenizer_backend_name,
+            start_server,
+        )
 
         tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
             trust_remote_code=True,
         )
+        tokenizer_backend = _tokenizer_backend_name(tokenizer)
+        print(f"[TrtllmAsyncWorker] HTTP tokenizer backend: {tokenizer_backend}")
+        if (
+            os.environ.get("NRL_USE_FASTOKENS") == "1"
+            and tokenizer_backend != "fastokens._compat._TokenizerShim"
+        ):
+            raise RuntimeError(
+                "NRL_USE_FASTOKENS=1, but the TRT-LLM HTTP tokenizer backend "
+                f"is {tokenizer_backend!r}; expected "
+                "'fastokens._compat._TokenizerShim'"
+            )
         self._http_thread, self._http_base_url, self._http_server = start_server(
             llm=self.llm,
             tokenizer=tokenizer,
