@@ -22,8 +22,9 @@ Importing ``megatron_policy_worker`` pulls in megatron.core, so this is
 mcore-marked and skipped where mcore is unavailable.
 """
 
+import math
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -68,7 +69,7 @@ def _native_tensor(
     value_marker: int,
     scale_marker: int,
 ) -> _FakeMXFP8Tensor:
-    rows = torch.tensor(shape[:-1]).prod().item()
+    rows = math.prod(shape[:-1])
     return _FakeMXFP8Tensor(
         torch.full(shape, value_marker, dtype=torch.uint8),
         torch.full(
@@ -86,12 +87,15 @@ def _native_worker(
 ) -> MegatronPolicyWorkerImpl:
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.fp8_cfg = {"fp8_param": True, "fp8_recipe": "mxfp8"}
-    worker.cfg = {
-        "generation": {
-            "backend": "vllm",
-            "vllm_cfg": {"precision": "fp8", "is_mx": True},
-        }
-    }
+    worker.cfg = cast(
+        Any,
+        {
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {"precision": "fp8", "is_mx": True},
+            }
+        },
+    )
     worker.refit_conversion_tasks = tasks
     worker._native_grouped_mxfp8_tasks = grouped_tasks or []
     return worker
@@ -139,7 +143,7 @@ def _refit_info(
 def _group(proj, grouped_name, expert_groups):
     # _group_experts ignores self; pass a dummy.
     return MegatronPolicyWorkerImpl._group_experts(
-        SimpleNamespace(), proj, grouped_name, expert_groups
+        cast(Any, SimpleNamespace()), proj, grouped_name, expert_groups
     )
 
 
@@ -182,11 +186,16 @@ def test_build_hf_to_local_param_map_train_side():
     direct = torch.randn(8, 16)  # a dense FFN down_proj local shard view
     e0 = torch.randn(128, 16)  # this rank's local expert 0 gate_proj
     e1 = torch.randn(128, 16)  # local expert 1 gate_proj
-    w._iter_local_hf_param_shards = lambda: [
-        ("model.layers.0.mlp.down_proj.weight", direct),
-        (f"{prefix}.0.gate_proj.weight", e0),
-        (f"{prefix}.1.gate_proj.weight", e1),
-    ]
+    w._iter_local_hf_param_shards = cast(
+        Any,
+        lambda: iter(
+            [
+                ("model.layers.0.mlp.down_proj.weight", direct),
+                (f"{prefix}.0.gate_proj.weight", e0),
+                (f"{prefix}.1.gate_proj.weight", e1),
+            ]
+        ),
+    )
     refit_info = {
         "layer_names": ["model.layers.0"],
         "per_layer_params": {
@@ -209,13 +218,15 @@ def test_build_hf_to_local_param_map_train_side():
 
     # Direct: base is the live local view, sent as-is (no hooks).
     d = pmap.get("model.layers.0.mlp.down_proj.weight")
+    assert d is not None
     assert d.base is direct and d.pre is None and d.post is None
 
     # Grouped expert: pre stacks this rank's per-expert views into [E_local, ...]
     # fresh each refit (base unused — the views are captured in the hook).
     g = pmap.get(f"{prefix}.gate_proj.weight")
-    assert g.pre is not None
-    ctx = g.pre(g.base)
+    assert g is not None and g.pre is not None
+    pre = g.pre
+    ctx = pre(g.base)
     assert ctx.buf.shape == (2, 128, 16)
     assert torch.equal(ctx.buf[0], e0) and torch.equal(ctx.buf[1], e1)
 
@@ -272,13 +283,15 @@ def test_native_mxfp8_dense_fc1_split_and_fc2_direct_refresh() -> None:
             spec = source_map.get(name, role=role)
             assert spec is not None
             assert spec.base.shape == shape
-            assert spec.pre is not None
+            assert spec.pre is None
 
     down_weight = source_map.get(down_name, role="weight")
-    first = down_weight.pre(down_weight.base).buf
+    assert down_weight is not None
+    first = down_weight.base
     replacement = torch.full((64, 32), 91, dtype=torch.uint8)
     fc2._metadata["rowwise_data"] = replacement
-    second = down_weight.pre(down_weight.base).buf
+    worker._refresh_local_native_mxfp8_param_components()
+    second = down_weight.base
     assert first.data_ptr() != second.data_ptr()
     assert second.view(torch.uint8).data_ptr() == replacement.data_ptr()
     assert torch.equal(second.view(torch.uint8), replacement)
@@ -359,6 +372,7 @@ def test_native_mxfp8_build_refit_tasks_bypasses_strict_grouped_names(
     worker.model = FakeModel()
     worker.megatron_bridge = SimpleNamespace(
         _model_bridge=FakeBridge(),
+        hf_pretrained=SimpleNamespace(),
         get_conversion_tasks=strict_get_conversion_tasks,
     )
 
@@ -372,7 +386,16 @@ def test_native_mxfp8_build_refit_tasks_bypasses_strict_grouped_names(
     assert lookups == [f"{fc1_name}0", f"{fc2_name}0"]
 
 
-def test_native_mxfp8_simple_expert_fc1_up_projection_is_direct() -> None:
+@pytest.mark.parametrize(
+    "global_name",
+    [
+        "decoder.layers.0.mlp.experts.local_experts.3.linear_fc1.weight",
+        "decoder.layers.0.mlp.experts.linear_fc1.weight3",
+    ],
+)
+def test_native_mxfp8_simple_expert_fc1_up_projection_is_direct(
+    global_name: str,
+) -> None:
     from megatron.bridge.models.conversion.param_mapping import AutoMapping
 
     expert_name = "model.layers.0.mlp.experts.3.up_proj.weight"
@@ -381,11 +404,11 @@ def test_native_mxfp8_simple_expert_fc1_up_projection_is_direct() -> None:
         [
             SimpleNamespace(
                 mapping=AutoMapping(
-                    "decoder.layers.0.mlp.experts.local_experts.3.linear_fc1.weight",
+                    global_name,
                     expert_name,
                 ),
                 param_weight=source,
-                global_param_name="decoder.layers.0.mlp.experts.local_experts.3.linear_fc1.weight",
+                global_param_name=global_name,
             )
         ]
     )
@@ -484,8 +507,10 @@ def test_native_mxfp8_source_map_uses_shared_component_iterator() -> None:
         _refit_info([(name, (64, 32), None)])
     )
 
-    assert source_map.get(name, role="weight").base is weight
-    assert source_map.get(name, role="weight_scale").base is scale
+    weight_spec = source_map.get(name, role="weight")
+    scale_spec = source_map.get(name, role="weight_scale")
+    assert weight_spec is not None and weight_spec.base is weight
+    assert scale_spec is not None and scale_spec.base is scale
 
 
 def test_native_mxfp8_per_expert_fc1_fc2_group_both_roles_numerically() -> None:
@@ -532,7 +557,7 @@ def test_native_mxfp8_per_expert_fc1_fc2_group_both_roles_numerically() -> None:
             ]
         )
     worker = _native_worker(tasks)
-    params = [
+    params: list[tuple[str, tuple[int, ...], str | None]] = [
         (f"{prefix}.{projection}.weight", shape, projection)
         for projection, shape in (
             ("gate_proj", (2, 4, 64)),
@@ -621,7 +646,7 @@ def test_native_mxfp8_grouped_members_refresh_without_aggregate_extraction(
         ),
     ]
     worker = _native_worker([], grouped_tasks=grouped_tasks)
-    params = [
+    params: list[tuple[str, tuple[int, ...], str | None]] = [
         (f"{prefix}.{projection}.weight", shape, projection)
         for projection, shape in (
             ("gate_proj", (2, 4, 64)),
@@ -646,10 +671,12 @@ def test_native_mxfp8_grouped_members_refresh_without_aggregate_extraction(
             assert spec.pre(spec.base).buf.shape == shape
 
     gate_spec = source_map.get(f"{prefix}.gate_proj.weight", role="weight")
-    first = gate_spec.pre(gate_spec.base).buf
+    assert gate_spec is not None and gate_spec.pre is not None
+    gate_pre = gate_spec.pre
+    first = gate_pre(gate_spec.base).buf
     replacement = torch.full((8, 64), 99, dtype=torch.uint8)
     fc1_members[0]._metadata["rowwise_data"] = replacement
-    second = gate_spec.pre(gate_spec.base).buf
+    second = gate_pre(gate_spec.base).buf
     assert first.data_ptr() != second.data_ptr()
     assert torch.equal(second[0].view(torch.uint8), replacement[:4])
     assert all(create_if_missing is False for _, create_if_missing in member_calls)
@@ -685,8 +712,8 @@ def test_native_mxfp8_grouped_validation_fails_before_any_collective(
     )
     worker = _native_worker([], grouped_tasks=[grouped_task])
     worker.my_pp_stage = 0
-    worker.pp_comm_group = object()
-    worker._broadcast_misc_params_packed = lambda **_: None
+    worker.pp_comm_group = cast(Any, object())
+    worker._broadcast_misc_params_packed = cast(Any, lambda **_: None)
 
     def grouped_pre(_base: object, *, role: str):
         from nemo_rl.weight_sync.nccl_reshard_utils import RefitCtx
