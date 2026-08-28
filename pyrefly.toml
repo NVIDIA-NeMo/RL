@@ -228,6 +228,7 @@ project-includes = [
   "nemo_rl/models/policy/workers/__init__.py",
   "nemo_rl/models/policy/workers/checkpoint_engine.py",
   "nemo_rl/models/policy/workers/megatron_remote_sparse_refit.py",
+  "nemo_rl/models/policy/workers/mxfp8_refit_source.py",
   "nemo_rl/models/policy/workers/patches.py",
   "nemo_rl/models/value/__init__.py",
   "nemo_rl/models/value/config.py",
