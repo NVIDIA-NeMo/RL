@@ -42,6 +42,7 @@ import torch
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.route_plan import (
     ROUTE_PLAN_SCHEMA_VERSION,
     RouteAssemblyPlan,
@@ -50,7 +51,6 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
     encoded_route_plan_size_bytes,
 )
-from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.row_dump import maybe_dump_train_rows
 
 # Keep the finalizer importable in its CPU-only actor without importing the
@@ -250,8 +250,8 @@ class BlackboxFinalizer:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.digest import compute_staging_digest
         from nemo_gym.token_id_capture.staging.rebuild import (
-            ReceiptVerificationError,
             RebuildError,
+            ReceiptVerificationError,
             verify_and_linearize,
         )
         from nemo_gym.token_id_capture.staging.records import RolloutReceipt
