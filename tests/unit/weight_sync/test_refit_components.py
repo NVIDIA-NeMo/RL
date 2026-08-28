@@ -49,9 +49,10 @@ def test_native_mxfp8_requires_ordered_value_and_scale() -> None:
 
 
 @pytest.mark.parametrize(
-    ("components", "match"),
+    ("logical_shape", "components", "match"),
     [
         (
+            [64, 256],
             [
                 {"role": "weight", "shape": [64, 256], "dtype": "torch.float8_e4m3fn"},
                 {"role": "weight", "shape": [64, 256], "dtype": "torch.float8_e4m3fn"},
@@ -59,10 +60,12 @@ def test_native_mxfp8_requires_ordered_value_and_scale() -> None:
             "duplicate component role",
         ),
         (
+            [64, 256],
             [{"role": "weight_scale", "shape": [64, 8], "dtype": "torch.uint8"}],
             "must include 'weight'",
         ),
         (
+            [64, 256],
             [
                 {"role": "weight", "shape": [64, 256], "dtype": "torch.float8_e4m3fn"},
                 {"role": "weight_scale", "shape": [64, 8], "dtype": "torch.float16"},
@@ -70,6 +73,7 @@ def test_native_mxfp8_requires_ordered_value_and_scale() -> None:
             "torch.uint8",
         ),
         (
+            [64, 255],
             [
                 {"role": "weight", "shape": [64, 255], "dtype": "torch.float8_e4m3fn"},
                 {"role": "weight_scale", "shape": [64, 8], "dtype": "torch.uint8"},
@@ -77,6 +81,7 @@ def test_native_mxfp8_requires_ordered_value_and_scale() -> None:
             "divisible by 32",
         ),
         (
+            [64, 256],
             [
                 {"role": "weight", "shape": [64, 256], "dtype": "torch.float8_e4m3fn"},
                 {"role": "weight_scale", "shape": [64, 9], "dtype": "torch.uint8"},
@@ -86,13 +91,13 @@ def test_native_mxfp8_requires_ordered_value_and_scale() -> None:
     ],
 )
 def test_normalize_refit_components_rejects_invalid_native_pairs(
-    components: list[dict[str, object]], match: str
+    logical_shape: list[int], components: list[dict[str, object]], match: str
 ) -> None:
     with pytest.raises(ValueError, match=match):
         normalize_refit_components(
             "model.layers.0.mlp.down_proj.weight",
             {
-                "shape": [64, 256],
+                "shape": logical_shape,
                 "dtype": "torch.float8_e4m3fn",
                 "components": components,
             },
