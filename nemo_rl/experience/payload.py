@@ -173,6 +173,7 @@ def record_to_train_batch(
     if include_message_violation_fields:
         train_data[INVALID_TOOL_CALL_MASK] = flat[INVALID_TOOL_CALL_MASK]
         train_data[MALFORMED_THINKING_MASK] = flat[MALFORMED_THINKING_MASK]
+    train_data.update(flat.get_multimodal_dict(as_tensors=False))
     return BatchedDataDict[Any](train_data)
 
 
