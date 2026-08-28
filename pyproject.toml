@@ -425,6 +425,12 @@ override-dependencies = [
   # decord2 is pulled transitively by sglang → qwen-vl-utils[decord] on aarch64 Linux.
   # NeMo-RL no longer calls any decord API (replaced by torchvision/torchaudio).
   "decord2; sys_platform == 'never'",
+  # Force fla-core to 0.5.2 (PR #953 + PR #1000): Blackwell GDN fwd/bwd
+  # autotune restricted to 2 warps for the Triton tl.dot recurrence race.
+  # megatron-core's dev extra would otherwise pin ==0.5.1 (still racy on
+  # VR200/GB300). See fla-org/flash-linear-attention#945 / PR #953.
+  "fla-core==0.5.2",
+  "flash-linear-attention==0.5.2",
 ]
 
 # CVE fixes
