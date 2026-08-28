@@ -36,6 +36,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     round_robin_local_indices,
     shard_batch_identity,
 )
+
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
