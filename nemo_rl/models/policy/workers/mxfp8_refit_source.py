@@ -14,16 +14,13 @@
 
 """Canonical Transformer Engine MXFP8 source storage for refit."""
 
+import importlib
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
-
-_PINNED_TE_DTYPE_MODULE = "transformer_engine_torch"
-_PINNED_TE_DTYPE_NAME = "DType"
-_PINNED_TE_E4M3_DTYPE = "DType.kFloat8E4M3"
 
 
 @dataclass(frozen=True)
@@ -87,13 +84,25 @@ def _logical_shape(value: object) -> tuple[int, ...]:
 
 
 def _validate_e4m3_format(metadata: Mapping[str, Any]) -> None:
-    fp8_dtype = metadata.get("fp8_dtype")
-    dtype_type = type(fp8_dtype)
-    if (
-        dtype_type.__module__ != _PINNED_TE_DTYPE_MODULE
-        or dtype_type.__name__ != _PINNED_TE_DTYPE_NAME
-        or str(fp8_dtype) != _PINNED_TE_E4M3_DTYPE
-    ):
+    if "fp8_dtype" not in metadata:
+        raise ValueError("Native MXFP8 refit metadata must include fp8_dtype")
+    try:
+        expected_dtype = importlib.import_module(
+            "transformer_engine_torch"
+        ).DType.kFloat8E4M3
+    except ModuleNotFoundError as error:
+        if error.name != "transformer_engine_torch":
+            raise
+        raise ValueError(
+            "Native MXFP8 refit cannot validate fp8_dtype because "
+            "transformer_engine_torch.DType.kFloat8E4M3 is unavailable"
+        ) from error
+    except AttributeError as error:
+        raise ValueError(
+            "Native MXFP8 refit cannot validate fp8_dtype because "
+            "transformer_engine_torch.DType.kFloat8E4M3 is unavailable"
+        ) from error
+    if metadata["fp8_dtype"] is not expected_dtype:
         raise ValueError(
             "Native MXFP8 refit fp8_dtype must be "
             "transformer_engine_torch.DType.kFloat8E4M3"
