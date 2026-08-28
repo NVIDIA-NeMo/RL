@@ -37,6 +37,9 @@ run_test() {
 run_test fast uv run --no-sync bash ./tests/functional/grpo_sglang_sync.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_sglang_async.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_sglang_nixl_non_colocated.sh
+# 3 GPUs, so full mode only: the tp_size=1 run above cannot exercise the
+# payload-index -> TP-rank scatter.
+run_test uv run --no-sync bash ./tests/functional/grpo_sglang_nixl_non_colocated_tp2.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
