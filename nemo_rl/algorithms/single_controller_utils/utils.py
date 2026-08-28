@@ -114,7 +114,7 @@ def reduce_advantage_pump_metrics(
     Returns:
         Step-level reward, advantage, token-count, optional sequence
         log-probability error metrics, and per-sample violation counts.
-    
+
     """
     out: dict[str, float] = {}
     if rewards:
