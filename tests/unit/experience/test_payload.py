@@ -201,10 +201,14 @@ def test_record_to_train_batch_backfills_routes_for_failed_completion() -> None:
 
 
 def test_pack_payload_stamps_violation_counts_on_tags() -> None:
-    """Flagged assistant turns are counted per row; ungenerated turns are ignored."""
-    completions = [_completion(route_start=10, reward=1.0), _failed_completion()]
+    """Each flag lands in its own counter; a row that never generated counts zero."""
+    completions = [
+        _completion(route_start=10, reward=1.0),
+        _completion(route_start=30, reward=1.0),
+        _failed_completion(),
+    ]
     completions[0].message_log[1]["is_invalid_tool_call"] = True
-    completions[0].message_log[1]["has_malformed_thinking"] = True
+    completions[1].message_log[1]["has_malformed_thinking"] = True
 
     train_batch = record_to_train_batch(
         _record(completions),
@@ -217,6 +221,12 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
         {
             "weight_version": 7,
             "num_invalid_tool_calls": 1,
+            "num_malformed_thinking": 0,
+            "num_assistant_messages": 1,
+        },
+        {
+            "weight_version": 7,
+            "num_invalid_tool_calls": 0,
             "num_malformed_thinking": 1,
             "num_assistant_messages": 1,
         },
