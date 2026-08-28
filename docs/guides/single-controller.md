@@ -25,7 +25,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       enabled: true
     ```
 
-2. **Enable vLLM async engine** and **disable colocated inference** (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine; setup rejects `colocated.enabled: true`):
+2. **Pick a generation backend** and **disable colocated inference** (setup rejects `colocated.enabled: true`). With vLLM, enable the async engine (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine):
 
     ```yaml
     policy:
@@ -38,6 +38,23 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
           resources:
             num_nodes: 1
             gpus_per_node: 4  # inference GPUs; remainder go to training
+    ```
+
+    Megatron generation is also supported, non-colocated only. It requires the Megatron trainer (`policy.megatron_cfg.enabled: true`) and NeMo-Gym rollouts additionally require `policy.generation.mcore_generation_config.expose_http_server: true`. The exemplar — a NeMo-Gym run with the OpenAI server exposed — lives at [examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml](../../examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml):
+
+    ```yaml
+    policy:
+      megatron_cfg:
+        enabled: true
+      generation:
+        backend: "megatron"
+        mcore_generation_config:
+          expose_http_server: true  # required for NeMo-Gym rollouts
+        colocated:
+          enabled: false
+          resources:
+            num_nodes: 1
+            gpus_per_node: 1  # inference GPUs; remainder go to training
     ```
 
 3. **One RL step = one training batch.** The batch a step trains on is the whole step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)). A GRPO step is also one optimizer step; a PPO step is `ppo.ppo_epochs` of them over that same batch.
@@ -54,7 +71,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       use_importance_sampling_correction: true
     ```
 
-5. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step.
+5. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step. `ppo.warm_start_value_checkpoint` seeds that critic from another run's checkpoint instead, so a fresh run can skip the online warmup entirely — see [Warm-Starting the Critic](./ppo.md#warm-starting-the-critic).
 
 ## Async-RL Knobs and Sampler Modes
 
@@ -160,6 +177,8 @@ The [legacy async GRPO](./async-grpo.md) (`grpo.async_grpo.enabled: true` under 
 
 SC reads its async knobs from `async_rl:` and **requires `grpo.async_grpo: null`** (or `ppo.async_ppo: null` on a PPO run) — `run_grpo_single_controller.py` raises if a legacy block is still present, so null it out when porting rather than leaving it in place.
 
+Do not carry `max_num_epochs: -1` across either. [ppo.md](./ppo.md#asynchronous-ppo) requires that value for legacy async PPO, but SC has no `-1` convention: the rollout pump gates on `_current_epoch < max_num_epochs`, so any non-positive value trains zero steps and exits successfully. Setup rejects it — set a positive `max_num_epochs` and bound the run with `max_num_steps`.
+
 | Legacy `grpo.async_grpo.*` / `ppo.async_ppo.*` | SC equivalent `async_rl.*` |
 | -------------------------- | -------------------------- |
 | `enabled: true` | Implicit — SC is always async; use `sampler.max_lookahead_versions: 0` for sync semantics, `>= 1` for async |
@@ -175,9 +194,12 @@ SC reads its async knobs from `async_rl:` and **requires `grpo.async_grpo: null`
 
 The SC path is still under active development. Feature gaps are tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625). Notable items:
 
+- Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo
+  Gym rollouts; multimodal/VLM MOPD is not yet supported. See
+  [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
-- Generation backend: only vLLM is supported and validated; Megatron generation, SGLang, and TRT-LLM have not been tested on SC.
-- Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`).
+- Generation backend: vLLM and Megatron generation are supported; SGLang and TRT-LLM have not been tested on SC.
+- Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, and the critic shards it against the configured `value.train_global_batch_size` rather than its actual size, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
 - Reward shaping and sample filtering — `overlong_filtering`, `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.

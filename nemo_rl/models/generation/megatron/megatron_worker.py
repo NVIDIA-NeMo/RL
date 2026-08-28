@@ -186,6 +186,16 @@ class MegatronGenerationMixin:
                 "generation, but no CUDA-graph manager could be created for this model."
             )
 
+            # When the model-level manager owns block-scope graphs,
+            # construction deletes the decoder's fallback manager.
+            decoder = getattr(lang_module, "decoder", None)
+            if (
+                hasattr(lang_module, "cudagraph_manager")
+                and decoder is not None
+                and hasattr(decoder, "cudagraph_manager")
+            ):
+                del decoder.cudagraph_manager
+
         # Detach for training; this caches the managers built above.
         toggle_cuda_graphs(lang_module, set_to="none")
 
@@ -291,7 +301,7 @@ class MegatronGenerationMixin:
             ),
             logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
-            logprobs_mode="processed_logprobs",
+            logprobs_mode=mcore_generation_config["logprobs_mode"],
             max_requests=max_requests,
         )
 
@@ -918,6 +928,10 @@ class MegatronGenerationRefitMixin:
                 nccl_store, global_rank, world_size, nccl_options
             )
             nccl_backend._set_sequence_number_for_group()
+            # Create the group-wide NCCL communicator now, on every rank.
+            nccl_backend.eager_connect_single_device(
+                torch.device("cuda", torch.cuda.current_device())
+            )
             pg._register_backend(
                 torch.device("cuda"),
                 ProcessGroup.BackendType.NCCL,
@@ -966,8 +980,8 @@ class MegatronGenerationRefitMixin:
         """Initialize NVShmem collectively before any weight transfer.
 
         Must be called on ALL participating ranks (training + inference) simultaneously,
-        after `prepare_for_generation()` has completed and the CG has been recorded.
-        The `NVSHMEMCopyService` lazy init can corrupt CUDA graph state.
+        outside CUDA graph capture. Lazy initialization during graph recording or replay
+        can corrupt CUDA graph state.
         """
         if not hasattr(self, "refit_copy_service"):
             return
