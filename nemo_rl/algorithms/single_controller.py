@@ -269,7 +269,11 @@ class SingleControllerActor:
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
         self._logger = Logger(master_config.logger)  # type: ignore
-        self._logger.log_hyperparams(master_config.model_dump())
+        hparams = master_config.model_dump()
+        if hparams.get("token_capture"):
+            # The control-plane bearer token must never reach W&B/TB telemetry.
+            hparams["token_capture"]["control_auth_token"] = "<redacted>"
+        self._logger.log_hyperparams(hparams)
         self._logger.log_metrics(
             setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
         )
