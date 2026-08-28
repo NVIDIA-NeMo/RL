@@ -302,9 +302,7 @@ def test_canonical_groups_are_discarded_without_touching_unfinished_groups() -> 
             admitted=True,
         )
 
-    assert _mutate(
-        lambda cut: ledger.discard_canonical_groups(cut, {"canonical"})
-    ) == 1
+    assert _mutate(lambda cut: ledger.discard_canonical_groups(cut, {"canonical"})) == 1
     assert [group.group_id for group in ledger.groups()] == ["unfinished"]
 
 

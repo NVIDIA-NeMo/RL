@@ -387,8 +387,7 @@ async def _round_trip(
         )
         if selected_meta is not None:
             selected = {
-                sample_id.rpartition("_g")[0]
-                for sample_id in selected_meta.sample_ids
+                sample_id.rpartition("_g")[0] for sample_id in selected_meta.sample_ids
             }
     return RoundTrip(
         recovered=recovered,

@@ -59,9 +59,9 @@ from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     LEGACY_REPLAY_BUFFER_FILENAME,
+    REPLACEMENT_RESERVE_FILENAME,
     REPLAY_BUFFER_METADATA_FILENAME,
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
-    REPLACEMENT_RESERVE_FILENAME,
     DataPlaneCheckpointBarrier,
     DataPlaneCheckpointMetadata,
     DataPlaneMutationCut,
@@ -847,9 +847,7 @@ class SingleControllerActor:
             PromptGroupPhase.RESERVED,
         )
         unhandled_groups = [
-            group
-            for group in groups_to_recover
-            if group.phase not in recognized_phases
+            group for group in groups_to_recover if group.phase not in recognized_phases
         ]
         if unhandled_groups:
             details = ", ".join(
@@ -1309,9 +1307,7 @@ class SingleControllerActor:
                 dataloader_iterator = iter(self._dataloader)
                 while True:
                     prompt_dispatches: list[tuple[DatumSpec, str]] = []
-                    async with (
-                        self._data_plane_checkpoint_barrier.mutation()
-                    ) as cut:
+                    async with self._data_plane_checkpoint_barrier.mutation() as cut:
                         try:
                             prompt_batch = next(dataloader_iterator)
                         except StopIteration:
@@ -2395,6 +2391,7 @@ class SingleControllerActor:
 
     async def _abort_stale_inflight(self) -> int:
         """Abort in-flight rollouts that the sampler can no longer select."""
+
         def _stale_groups() -> list[tuple[str, asyncio.Task[None]]]:
             stale_groups: list[tuple[str, asyncio.Task[None]]] = []
             for group_id, inflight in self._inflight_by_group_id.items():
@@ -2532,9 +2529,7 @@ class SingleControllerActor:
                     rollout_recovery_state = build_rollout_recovery_state(
                         self._rollout_manager.recovery_ledger,
                         batch_shortfall=self._batch_shortfall,
-                        sampler_stamps_target_steps=(
-                            self._sampler_stamps_target_steps
-                        ),
+                        sampler_stamps_target_steps=(self._sampler_stamps_target_steps),
                     )
                     if replay_metadata is not None:
                         canonical_group_ids = {

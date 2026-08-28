@@ -52,8 +52,8 @@ from nemo_rl.algorithms.grpo import _initial_grpo_save_state
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
@@ -68,8 +68,8 @@ from tests.unit.single_controller._checkpoint_scenarios import (
     patch_converter,
 )
 from tests.unit.single_controller.test_checkpointing import (
-    _FakeDataloader,
     _actor_master_config,
+    _FakeDataloader,
     _make_actor_args,
 )
 
@@ -961,9 +961,7 @@ def test_recovery_rejects_an_unhandled_phase_before_redispatch() -> None:
         )
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
-        controller._rollout_manager = SimpleNamespace(
-            recovery_ledger=recovery_ledger
-        )
+        controller._rollout_manager = SimpleNamespace(recovery_ledger=recovery_ledger)
         launched = False
 
         async def _recover(
