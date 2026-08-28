@@ -76,6 +76,12 @@ def validate_warm_start_checkpoint(
             override written as ``key=`` with an unset variable arrives as "".
         model_component: Subtree the seed must carry, matching get_resume_paths.
     """
+    if not str(warm_start).strip():
+        raise ValueError(
+            "warm_start_value_checkpoint is empty. A Hydra override written as "
+            "`ppo.warm_start_value_checkpoint=` with an unset variable produces "
+            "this; point it at a step_<n> directory or drop the override."
+        )
     if not (Path(warm_start) / model_component / "weights").exists():
         raise ValueError(
             f"warm_start_value_checkpoint={str(warm_start)!r} has no "
