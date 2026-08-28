@@ -1082,7 +1082,11 @@ def setup_single_controller(
                 generation, gen_load_time = submitted["generation"].result()
                 trainer, value, time_metrics = submitted["trainer"].result()
             if megatron_reserved_url is not None:
-                # The Megatron engine only comes up at the initial refit; run it now.
+                # Gym initialization needs a live URL that will respond to health checks.
+                # Megatron generation can only respond to health checks once initialized.
+                # The Megatron engine cannot be initialized with dummy weights.
+                # Thus, we must do an initial refit during initialization,
+                # before Gym can spin up.
                 t0 = time.perf_counter()
                 weight_synchronizer = create_weight_synchronizer(
                     policy=trainer,
