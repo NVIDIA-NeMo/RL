@@ -739,7 +739,8 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
 
         # Precision compatibility (train ↔ gen).  Supported combinations:
         #   BF16 train  ↔ BF16 gen   (default, tested)
-        #   FP8  train  ↔ FP8  gen   (fp8_param=True + blockwise + vllm precision=fp8)
+        #   Blockwise FP8 train ↔ blockwise FP8 gen
+        #   Native MXFP8 train ↔ MXFP8 gen
         #   BF16 storage → MXFP8 gen  (receiver quantizes the resharded BF16 shard)
         # FP8→BF16 has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
@@ -747,6 +748,12 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
         fp8_recipe = fp8_cfg.get("fp8_recipe", None)
         trainer_precision = policy.get("precision")
         gen_precision = vllm_cfg.get("precision", None)
+        native_mxfp8 = bool(
+            fp8_param
+            and fp8_recipe == "mxfp8"
+            and gen_precision == "fp8"
+            and vllm_cfg.get("is_mx") is True
+        )
 
         # The refit byte-copies weights train -> gen, so gen dtype must match
         # train: BF16 (unset / "auto" / "bf16" / "bfloat16") or FP8 ("fp8").  A
@@ -764,7 +771,16 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
 
         if gen_precision == "fp8":
             if fp8_param:
-                if vllm_cfg.get("is_mx"):
+                if native_mxfp8:
+                    pass
+                elif fp8_recipe == "mxfp8":
+                    violations.append(
+                        "native MXFP8 storage requires "
+                        "policy.generation.vllm_cfg.is_mx=True "
+                        "(native MXFP8 values and E8M0 scales cannot be "
+                        "loaded by a blockwise-FP8 target)."
+                    )
+                elif vllm_cfg.get("is_mx"):
                     violations.append(
                         "policy.generation.vllm_cfg.is_mx=True does not support "
                         "blockwise-FP8 storage from "

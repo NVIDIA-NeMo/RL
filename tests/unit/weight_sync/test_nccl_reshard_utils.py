@@ -112,7 +112,19 @@ def test_check_nccl_reshard_refit_support_keeps_matching_blockwise_fp8() -> None
     check_nccl_reshard_refit_support(config)
 
 
-@pytest.mark.parametrize("fp8_recipe", ["tensorwise", "mxfp8", None])
+def test_check_nccl_reshard_refit_support_accepts_native_mxfp8_pair() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_param": True,
+        "fp8_recipe": "mxfp8",
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("fp8_recipe", ["tensorwise", None])
 def test_check_nccl_reshard_refit_support_rejects_non_blockwise_fp8_storage(
     fp8_recipe: str | None,
 ) -> None:
@@ -124,6 +136,42 @@ def test_check_nccl_reshard_refit_support_rejects_non_blockwise_fp8_storage(
     }
 
     with pytest.raises(ValueError, match="fp8_recipe must be 'blockwise'"):
+        check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize(
+    ("vllm_cfg", "expected_violation"),
+    [
+        (
+            {},
+            "fp8_param=True requires policy.generation.vllm_cfg.precision='fp8'",
+        ),
+        (
+            {"precision": "fp8"},
+            "native MXFP8 storage requires policy.generation.vllm_cfg.is_mx=True",
+        ),
+        (
+            {"precision": "fp8", "is_mx": False},
+            "native MXFP8 storage requires policy.generation.vllm_cfg.is_mx=True",
+        ),
+        (
+            {"precision": "fp8", "is_mx": 1},
+            "native MXFP8 storage requires policy.generation.vllm_cfg.is_mx=True",
+        ),
+    ],
+)
+def test_check_nccl_reshard_refit_support_rejects_native_mxfp8_format_mismatches(
+    vllm_cfg: dict[str, object], expected_violation: str
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update(vllm_cfg)
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_param": True,
+        "fp8_recipe": "mxfp8",
+    }
+
+    with pytest.raises(ValueError, match=expected_violation):
         check_nccl_reshard_refit_support(config)
 
 
@@ -144,6 +192,24 @@ def test_check_nccl_reshard_refit_support_rejects_blockwise_fp8_to_mxfp8() -> No
     }
 
     with pytest.raises(ValueError, match="does not support blockwise-FP8 storage"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_native_mxfp8_with_etp() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+    config.policy["megatron_cfg"].update(
+        {
+            "expert_tensor_parallel_size": 2,
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8_param": True,
+                "fp8_recipe": "mxfp8",
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="expert_tensor_parallel_size is not supported"):
         check_nccl_reshard_refit_support(config)
 
 

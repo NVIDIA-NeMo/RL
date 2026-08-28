@@ -1,0 +1,12 @@
+defaults: ./qwen30-fp8param-false.yaml
+
+checkpointing:
+  checkpoint_dir: results/native_mxfp8_source_refit/qwen30-fp8param-true
+policy:
+  megatron_cfg:
+    fp8_cfg:
+      fp8_param: true
+logger:
+  log_dir: logs/native_mxfp8_source_refit/qwen30-fp8param-true
+  wandb:
+    name: native-mxfp8-qwen30-fp8param-true

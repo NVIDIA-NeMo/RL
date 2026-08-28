@@ -1,0 +1,82 @@
+defaults: ../../examples/configs/grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 8
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/native_mxfp8_source_refit/nano-fp8param-false
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  make_sequence_length_divisible_by: 8
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 2
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    sequence_parallel: true
+    moe_router_dtype: fp32
+    te_precision_config_file: experiments/native_mxfp8_source_refit/te_nano_routed.yaml
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 0
+    num_layers_at_end_in_bf16: 8
+    distributed_data_parallel_config:
+      overlap_param_gather: true
+      overlap_grad_reduce: true
+    fp8_cfg:
+      enabled: true
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      fp8_param: false
+  generation:
+    backend: vllm
+    refit_transport: nccl_reshard
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 4
+        gpus_per_node: 4
+    vllm_cfg:
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      gpu_memory_utilization: 0.5
+      precision: fp8
+      is_mx: true
+      quantization_ignore_patterns:
+      - model.layers.*.mixer.qkv_proj
+      - model.layers.*.mixer.o_proj
+      - model.layers.*.mixer.in_proj
+      - model.layers.*.mixer.out_proj
+      - model.layers.*.mixer.up_proj
+      - model.layers.*.mixer.down_proj
+      - model.layers.*.mixer.gate
+      - model.layers.*.mixer.shared_experts.*
+      - model.layers.*.mixer.fc1_latent_proj
+      - model.layers.*.mixer.fc2_latent_proj
+      - lm_head
+    vllm_kwargs:
+      moe_backend: flashinfer_trtllm
+logger:
+  log_dir: logs/native_mxfp8_source_refit/nano-fp8param-false
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl-mxfp8-training
+    name: native-mxfp8-nano-fp8param-false
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
+  segment_size: 4
