@@ -867,10 +867,14 @@ def setup(
 
     elif backend == "sglang":
         generation_config = cast(SGLangConfig, generation_config)
+        from nemo_rl.models.generation.sglang.quantization_utils import (
+            prepare_sglang_quantized_generation,
+        )
 
-        # Set model_path if not already set
-        if "model_path" not in generation_config["sglang_cfg"]:
-            generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
+        prepare_sglang_quantized_generation(
+            generation_config=generation_config,
+            policy_config=policy_config,
+        )
 
         policy_generation, policy, value_model = initialize_generation_with_policy(
             init_generation_fn=init_sglang,

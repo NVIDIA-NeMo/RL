@@ -296,6 +296,15 @@ class TestSGLangColocatedWeightSynchronizer:
         call_kwargs = policy.update_weights_to_sglang_colocated.call_args.kwargs
         assert call_kwargs["buffer_size_bytes"] == 2 * (1024**3)
 
+    def test_target_precision_comes_from_quantization_cfg(self, mock_ray):
+        policy = _megatron_policy()
+        gen = _mock_sglang_generation(quantization={"scheme": "mxfp8"})
+        SGLangColocatedWeightSynchronizer(policy, gen).sync_weights()
+
+        call_kwargs = policy.update_weights_to_sglang_colocated.call_args.kwargs
+        assert call_kwargs["target_precision"] == "mxfp8"
+        assert call_kwargs["sglang_quantization_cfg"] == {"scheme": "mxfp8"}
+
     @pytest.mark.parametrize("quantization", [None, {}])
     def test_quantization_config_is_required(self, mock_ray, quantization):
         policy = _mock_policy()

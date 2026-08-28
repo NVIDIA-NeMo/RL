@@ -87,6 +87,7 @@ def make_sglang_cfg(
             "cuda_graph_backend_prefill": "disabled",
             "disable_cuda_graph": True,
             "mem_fraction_static": 0.3,
+            "quantization": {"scheme": "bf16"},
             "sglang_server_config": {
                 "num_gpus": num_gpus,
                 "num_gpus_per_engine": tp_size,
