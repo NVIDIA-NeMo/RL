@@ -34,6 +34,7 @@ from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _prompt_opens_reasoning,
     _resolve_tool_parser_name,
     _tokens_for_response_text,
+    _tokenizer_backend_name,
 )
 
 pytestmark = pytest.mark.trtllm
@@ -61,6 +62,19 @@ class _RecordingTokenizer:
     def apply_chat_template(self, messages, **kwargs):
         self.calls.append((messages, kwargs))
         return [1, 2, 3]
+
+
+def test_tokenizer_backend_name_prefers_concrete_backend():
+    backend = SimpleNamespace()
+    tokenizer = SimpleNamespace(_tokenizer=backend)
+
+    assert _tokenizer_backend_name(tokenizer) == "types.SimpleNamespace"
+
+
+def test_tokenizer_backend_name_falls_back_to_tokenizer():
+    tokenizer = _RecordingTokenizer()
+
+    assert _tokenizer_backend_name(tokenizer).endswith("._RecordingTokenizer")
 
 
 def test_http_sampling_params_match_the_direct_path():
