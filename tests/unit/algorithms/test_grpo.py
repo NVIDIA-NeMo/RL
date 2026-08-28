@@ -3237,7 +3237,10 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
             "enabled": False,
             "resources": {"gpus_per_node": 1, "num_nodes": 1},
         },
-        "mcore_generation_config": {"expose_http_server": True},
+        "mcore_generation_config": {
+            "expose_http_server": True,
+            "kv_cache_management_mode": "persist",
+        },
     }
     master_config.env = {"should_use_nemo_gym": True}
     master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
