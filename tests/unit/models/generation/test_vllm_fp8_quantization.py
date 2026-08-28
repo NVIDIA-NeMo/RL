@@ -835,7 +835,7 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     layer._expert_routing_tables = lambda: (None, None, None)
     moe_config = types.SimpleNamespace(is_act_and_mul=False)
     quant_config = object()
-    experts_cls = object()
+    experts_cls = types.SimpleNamespace(is_monolithic=lambda: True)
     quant_config_calls = []
 
     def get_quant_config(_layer):
@@ -1608,7 +1608,9 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
             (f"{layers_prefix}.0.mlp.experts.gate_up_proj", gate_up),
             (f"{layers_prefix}.0.mlp.experts.down_proj", down),
         ],
-        types.SimpleNamespace(model=model),
+        types.SimpleNamespace(
+            model=model, vllm_config=types.SimpleNamespace(additional_config={})
+        ),
     )
 
     assert [k for k, _ in loaded] == [
@@ -1677,7 +1679,9 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(
             (f"{layers_prefix}.0.mlp.experts.gate_up_proj", gate_up),
             (f"{layers_prefix}.0.mlp.experts.down_proj", down),
         ],
-        types.SimpleNamespace(model=model),
+        types.SimpleNamespace(
+            model=model, vllm_config=types.SimpleNamespace(additional_config={})
+        ),
     )
 
     base = f"{layers_prefix}.0.mlp.experts"
@@ -1726,5 +1730,7 @@ def test_load_weights_rejects_grouped_experts_for_mxfp8(fp8_module, monkeypatch)
                     torch.randn(2, 512, 384).to(torch.bfloat16),
                 )
             ],
-            types.SimpleNamespace(model=model),
+            types.SimpleNamespace(
+                model=model, vllm_config=types.SimpleNamespace(additional_config={})
+            ),
         )
