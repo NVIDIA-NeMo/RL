@@ -259,20 +259,24 @@ class SGLangCheckpointEngineMixin:
         monkey_patch_torch_reductions()
         self._checkpoint_engine_rollout_rank_start = rollout_rank_start
         self._checkpoint_engine_target_devices = self._checkpoint_engine_devices()
-        self.checkpoint_engines = []
+        # Publish only after every constructor succeeds: the early return above
+        # keys on a non-None attribute, so a partially built list would make
+        # every retry a silent no-op.
+        engines: list["CheckpointEngine"] = []
         for device in self._checkpoint_engine_target_devices:
             rank_engine_kwargs = dict(engine_kwargs)
             configured_device = torch.device(rank_engine_kwargs.get("device", "cuda"))
             if configured_device.type == "cuda":
                 rank_engine_kwargs["device"] = str(device)
             with torch.cuda.device(device):
-                self.checkpoint_engines.append(
+                engines.append(
                     create_checkpoint_engine(
                         backend,
                         bucket_size_bytes=bucket_size_bytes,
                         engine_kwargs=rank_engine_kwargs,
                     )
                 )
+        self.checkpoint_engines = engines
 
     def prepare_checkpoint_engine(self) -> list[Any]:
         metadata = []
