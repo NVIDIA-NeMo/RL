@@ -2949,3 +2949,69 @@ def test_vocab_parallel_gather_columns_tp_sharded(monkeypatch):
     ref[..., idx].float().backward(grad_out)
     torch.testing.assert_close(shards[0].grad, ref.grad[..., :v_local])
     torch.testing.assert_close(shards[1].grad, ref.grad[..., v_local:])
+
+
+def _sampling_importance_ratio(tis_type, *, ratio=5.0, ratio_min=0.5):
+    """Run the loss on fixed logprobs and return the reported metric.
+
+    One prompt, three response tokens whose true IS weights are roughly
+    [0.61, 12.18, 0.82] — mean 4.54, i.e. a backend that has drifted well
+    above 1. Under ``icepop`` the middle token is zeroed rather than clamped,
+    which is what drags the reported mean below 1.
+    """
+    torch.manual_seed(0)
+    data, *_ = _setup_clipped_pg_test_data(batch_size=1, seq_len=4, device="cpu")
+    data["advantages"] = torch.zeros(1, 4)
+    data["prev_logprobs"] = torch.tensor([[0.0, -1.0, -1.0, -1.0]])
+    data["generation_logprobs"] = torch.tensor([[0.0, -0.5, -3.5, -0.8]])
+    data["reference_policy_logprobs"] = torch.zeros(1, 4)
+
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type=tis_type,
+        truncated_importance_sampling_ratio=None if tis_type is None else ratio,
+        truncated_importance_sampling_ratio_min=None if tis_type is None else ratio_min,
+    )
+    loss_fn = ClippedPGLossFn(cfg)
+
+    logprobs = torch.tensor([[-1.0, -1.0, -1.0]])
+    valid_seqs = data["sample_mask"].sum().float()
+    valid_toks = (data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)).sum()
+    _, metrics = loss_fn(logprobs, data, valid_seqs, valid_toks.float())
+    return metrics["sampling_importance_ratio"]
+
+
+def test_sampling_importance_ratio_is_reported_untruncated():
+    """The metric is defined without truncation, and truncation must not move it.
+
+    docs/guides/grpo.md#sampling-importance-ratio defines it as the raw
+    ``exp(log pi_training - log pi_inference)`` and says it exists to surface
+    the *bias* in training/inference mismatch. Reporting the post-truncation
+    weights makes it saturate at ``truncated_importance_sampling_ratio``, so a
+    backend that drifted to 4.5 reads as the cap. How often truncation fires
+    is reported separately as ``is_oob_ratio``.
+    """
+    raw = _sampling_importance_ratio(None)
+
+    assert raw == pytest.approx(4.5359, abs=1e-3)
+    for tis_type in ("tis", "icepop", "seq-mask-tis"):
+        assert _sampling_importance_ratio(tis_type) == pytest.approx(raw, abs=1e-3), (
+            f"{tis_type} moved sampling_importance_ratio away from its definition"
+        )
+
+
+def test_icepop_does_not_invert_the_sampling_importance_ratio():
+    """Under icepop the old reading pointed the opposite way from the drift.
+
+    icepop zeroes out-of-band tokens instead of clamping them, so the mean is
+    pulled *down*: the same batch whose true mean ratio is 4.54 reported 0.48.
+    A user reads "below 1" — the training policy assigning less probability
+    than inference — at the moment the truth is the reverse, and the guide
+    tells them this should hover around 1.
+    """
+    reported = _sampling_importance_ratio("icepop")
+
+    assert reported > 1.0
+    # The value the truncated weights would have given, for the record.
+    assert reported != pytest.approx(0.4751, abs=1e-3)

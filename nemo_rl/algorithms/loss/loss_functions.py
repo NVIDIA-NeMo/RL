@@ -582,6 +582,24 @@ class ClippedPGLossFn(LossFunction):
             actor_importance_weights_expanded = torch.nan_to_num(
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
             )
+        # Snapshot before truncation: ``sampling_importance_ratio`` is defined
+        # in docs/guides/grpo.md#sampling-importance-ratio as the raw
+        # exp(log pi_training - log pi_inference), and its stated job is to
+        # surface *the bias* in training/inference mismatch. Reporting the
+        # truncated weights instead makes it saturate under ``tis`` and invert
+        # under ``icepop``, where out-of-band tokens are zeroed rather than
+        # clamped: a batch whose true mean ratio is 4.5 reads as 0.48, i.e.
+        # below 1, exactly when the backend has drifted furthest above it. How
+        # often truncation fires is already reported separately as
+        # ``is_oob_ratio``.
+        #
+        # An alias, not a copy: all three truncation branches below rebind
+        # ``actor_importance_weights_expanded`` to a fresh tensor rather than
+        # mutating it, so this keeps pointing at the raw weights. Switching one
+        # to an in-place form (``clamp_``) would break that silently -- the two
+        # tests named after this metric are what would catch it.
+        untruncated_importance_weights = actor_importance_weights_expanded
+
         # ---- Truncated Importance Sampling ----
         # "tis"          – clamp IS weights to [min, max], where min defaults to 0
         # "icepop"       – zero out tokens whose IS weight ∉ [min, max]   (ref bounds: 0.5–5)
@@ -696,13 +714,13 @@ class ClippedPGLossFn(LossFunction):
         # See: docs/guides/grpo.md#sampling-importance-ratio
         if self.sequence_level_importance_ratios:
             sample_importance_ratio = masked_mean(
-                actor_importance_weights.squeeze(-1),
+                untruncated_importance_weights.squeeze(-1),
                 sample_mask,
                 global_normalization_factor=global_valid_seqs,
             )
         else:
             sample_importance_ratio = masked_mean(
-                actor_importance_weights,
+                untruncated_importance_weights,
                 mask,
                 global_normalization_factor=global_valid_toks,
             )
