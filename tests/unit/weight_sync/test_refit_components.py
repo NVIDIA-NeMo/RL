@@ -48,6 +48,31 @@ def test_native_mxfp8_requires_ordered_value_and_scale() -> None:
     assert components[1].checkpoint_name == "model.layers.0.mlp.down_proj.weight_scale"
 
 
+def test_native_mxfp8_rejects_reversed_value_and_scale() -> None:
+    with pytest.raises(
+        ValueError, match=r"components must be ordered as \('weight', 'weight_scale'\)"
+    ):
+        normalize_refit_components(
+            "model.layers.0.mlp.down_proj.weight",
+            {
+                "shape": [64, 256],
+                "dtype": "torch.float8_e4m3fn",
+                "components": [
+                    {
+                        "role": "weight_scale",
+                        "shape": [64, 8],
+                        "dtype": "torch.uint8",
+                    },
+                    {
+                        "role": "weight",
+                        "shape": [64, 256],
+                        "dtype": "torch.float8_e4m3fn",
+                    },
+                ],
+            },
+        )
+
+
 @pytest.mark.parametrize(
     ("logical_shape", "components", "match"),
     [

@@ -107,6 +107,12 @@ def normalize_refit_components(
     if "weight" not in roles:
         raise ValueError(f"{logical_name} components must include 'weight'")
     _validate_weight_scale_pair(logical_name, logical_shape, result)
+    role_sequence = tuple(component.role for component in result)
+    if role_sequence not in (("weight",), ("weight", "weight_scale")):
+        raise ValueError(
+            f"{logical_name} components must be ordered as "
+            "('weight', 'weight_scale')"
+        )
     return tuple(result)
 
 
