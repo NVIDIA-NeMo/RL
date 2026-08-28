@@ -37,6 +37,7 @@ from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.experience.rollout_recovery import RetryScope
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
@@ -325,6 +326,8 @@ class RolloutCheckpointConfig(BaseModel, extra="allow"):
     telemetry_interval_s: Optional[float] = Field(default=None, gt=0)
     keep_latest_k: int = Field(default=2, ge=1)
     restore_mode: Literal["latest", "trainer_checkpoint", "none"] = "latest"
+    default_retry_scope: RetryScope = RetryScope.SIBLING
+    retry_scope_overrides: dict[str, RetryScope] = Field(default_factory=dict)
 
 
 class MasterConfig(BaseModel, extra="allow"):

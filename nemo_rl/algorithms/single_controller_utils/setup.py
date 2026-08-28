@@ -1273,6 +1273,8 @@ def setup_single_controller(
         ),
         retry_policy=_build_retry_policy(master_config),
         recovery_ledger=recovery_ledger,
+        default_retry_scope=master_config.rollout_checkpointing.default_retry_scope,
+        retry_scope_overrides=master_config.rollout_checkpointing.retry_scope_overrides,
     )
 
     # Print setup timing metrics

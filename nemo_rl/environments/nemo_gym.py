@@ -691,15 +691,16 @@ Depending on your data shape, you may want to change these values."""
             with timer.time(label=f"{timer_prefix}/await_results"):
                 try:
                     nemo_gym_row, nemo_gym_result = await task
-                except aiohttp.ClientResponseError as e:
+                except aiohttp.ClientResponseError as error:
                     # aiohttp exceptions carry CIMultiDictProxy headers that
-                    # Ray cannot pickle across the actor boundary, masking the
-                    # real error with a TypeError; re-raise as a plain,
-                    # picklable RuntimeError.
-                    raise RuntimeError(
-                        f"NemoGym rollout HTTP error: {e.status} "
-                        f"{e.message} url={e.request_info.real_url}"
-                    ) from None
+                    # Ray cannot pickle across the actor boundary. Classify the
+                    # response while its status is still available and raise the
+                    # corresponding single-string, picklable rollout failure.
+                    typed = _typed_gym_failure(error)
+                    assert typed is not None, (
+                        "aiohttp.ClientResponseError must carry an HTTP status"
+                    )
+                    raise typed from None
                 except Exception as error:
                     if hasattr(error, "response_content"):
                         print(

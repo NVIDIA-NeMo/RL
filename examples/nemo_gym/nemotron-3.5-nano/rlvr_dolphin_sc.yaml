@@ -263,13 +263,13 @@ async_rl:
     # against an aiohttp session with no ClientTimeout -- so without this a
     # wedged env server holds its in_order slot until the wall clock.
     nemo_gym:
-      rollout_timeout_s: 1800.0
+      rollout_timeout_s: null
 
   # Must outlast every deadline above, which _check_watchdog_outlasts_rollouts
   # enforces: below it, a rollout that is merely slow reads as a stall.
   watchdog:
     interval_s: 30.0
-    stall_timeout_s: 2400.0
+    stall_timeout_s: 11000.0
     stall_action: warn
     gym_subprocess_check: true
 
@@ -278,6 +278,10 @@ async_rl:
 # =============================================================================
 env:
   nemo_gym:
+    # Include inner-server response details when Gym turns them into HTTP 500s.
+    # Without this, the outer /run error hides which dependency failed and why.
+    global_aiohttp_client_request_debug: true
+
     # Pinned literals for what student_rlvr1.yaml interpolated off
     # grpo.async_grpo.max_trajectory_age_steps, which is null on this path.
     policy_model:
@@ -339,3 +343,10 @@ rollout_checkpointing:
   telemetry_interval_s: 30
   keep_latest_k: 2
   restore_mode: latest
+  default_retry_scope: sibling
+  retry_scope_overrides:
+    # GenRM rewards are one atomic 16-response comparison cohort. If any
+    # sibling outcome is unknown, replace the complete physical cohort.
+    genrm_agent: prompt_group
+    genrm_simple_agent: prompt_group
+    genrm_simple_agent_reasoning_off: prompt_group

@@ -24,9 +24,15 @@ __init__ only, which does not start the Gym servers, so a restarted NemoGym reac
 state and previously surfaced it as an AttributeError from deep inside a rollout.
 """
 
+import asyncio
+
+import aiohttp
 import pytest
+from multidict import CIMultiDict, CIMultiDictProxy
+from yarl import URL
 
 from nemo_rl.environments.nemo_gym import NemoGym
+from nemo_rl.experience.failures import GymTransportError
 
 # NemoGym is a Ray actor; grab the plain class so these run without a cluster.
 NemoGymClass = NemoGym.__ray_metadata__.modified_class
@@ -52,6 +58,27 @@ class _FakeRunHelper:
 
     def shutdown(self) -> None:
         self.shutdowns += 1
+
+
+class _FailingRolloutCollectionHelper:
+    @staticmethod
+    def run_examples(**_kwargs):
+        async def fail():
+            headers = CIMultiDictProxy(
+                CIMultiDict({"Content-Type": "application/json"})
+            )
+            request_info = aiohttp.RequestInfo(
+                URL("http://gym/run"), "POST", headers, URL("http://gym")
+            )
+            raise aiohttp.ClientResponseError(
+                request_info,
+                (),
+                status=500,
+                message="synthetic server failure",
+                headers=headers,
+            )
+
+        return [fail()]
 
 
 class TestHealthCheck:
@@ -93,3 +120,16 @@ class TestUnspunActor:
         env.rh = _FakeRunHelper()
         env.shutdown()
         assert env.rh.shutdowns == 1
+
+
+def test_run_rollouts_preserves_http_500_as_picklable_infra_failure():
+    env = _unspun()
+    env.rh = _FakeRunHelper()
+    env.rch = _FailingRolloutCollectionHelper()
+
+    async def consume() -> None:
+        generator = env.run_rollouts([{"agent_ref": {"name": "a"}}], None, "timing/x")
+        with pytest.raises(GymTransportError, match="HTTP 500"):
+            await anext(generator)
+
+    asyncio.run(consume())

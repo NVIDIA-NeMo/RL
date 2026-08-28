@@ -775,6 +775,12 @@ _local_project_paths=(
   "research/template_project"
 )
 for _local_project_path in "${_local_project_paths[@]}"; do
+  # MOUNT_LOCAL_GYM=0 keeps the container's Gym, whose setup assets the local
+  # worktree does not carry.
+  if [[ "${_local_project_path}" == "3rdparty/Gym-workspace/Gym" && "${MOUNT_LOCAL_GYM:-1}" != "1" ]]; then
+    echo "  Mount: Gym skipped (using container-provided Gym and setup assets)"
+    continue
+  fi
   if [[ -d "${OVERLAY_SOURCE}/${_local_project_path}" ]]; then
     _append_mount "${OVERLAY_SOURCE}/${_local_project_path}:/opt/nemo-rl/${_local_project_path}"
     echo "  Mount: ${_local_project_path} → /opt/nemo-rl/${_local_project_path}"
@@ -864,6 +870,21 @@ _seed_cache "\$CACHE_READ/inductor_cache.tar.zst" "\$LOCAL_IND" "Inductor"
 _seed_cache "\$CACHE_READ/triton_cache.tar.zst" "\$LOCAL_TRI" "Triton"
 
 echo "[CACHE SEED] Done."
+
+# The prefetched async vLLM worker venv is normally built with only the vLLM
+# extra. Token capture switches that actor to the combined VLLM_GYM executable
+# at runtime, but the existing prefetched venv is reused without syncing the
+# additional Gym dependencies. Add the requested dependencies in place so the
+# worker can import Gym's token-capture store without rebuilding the venv.
+if [ -n "${NRL_VLLM_WORKER_PIP_INSTALL:-}" ]; then
+  _worker_venv="\${NEMO_RL_VENV_DIR:-/opt/ray_venvs}/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+  if [ ! -x "\$_worker_venv/bin/python" ]; then
+    echo "[WORKER DEPS] no prefetched async vLLM worker venv at \$_worker_venv" >&2
+    exit 1
+  fi
+  uv pip install --python "\$_worker_venv/bin/python" ${NRL_VLLM_WORKER_PIP_INSTALL:-}
+  echo "[WORKER DEPS] installed '${NRL_VLLM_WORKER_PIP_INSTALL:-}' into \$_worker_venv"
+fi
 SETUPEOF
 export SETUP_COMMAND
 

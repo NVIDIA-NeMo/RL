@@ -237,7 +237,7 @@ def test_bootstrap_fingerprint_rejects_generation_semantic_changes() -> None:
     )
 
 
-def test_bootstrap_fingerprint_ignores_nested_gym_log_directory() -> None:
+def test_bootstrap_fingerprint_ignores_nested_gym_runtime_fields() -> None:
     base = {
         "policy": {"model": "model-a"},
         "env": {
@@ -247,6 +247,10 @@ def test_bootstrap_fingerprint_ignores_nested_gym_log_directory() -> None:
                 "should_log_nemo_gym_responses": True,
                 "policy_model": {"temperature": 1.0},
                 "agent": {"concurrency": 16, "max_turns": 20},
+                "resources_servers": {
+                    "genrm": {"base_url": "http://10.0.0.1:8000"},
+                    "nl2bash": {"base_url": "http://10.0.0.1:8001"},
+                },
             },
         },
     }
@@ -259,6 +263,10 @@ def test_bootstrap_fingerprint_ignores_nested_gym_log_directory() -> None:
                 "nemo_gym_log_dir": "/run/two/nemo_gym",
                 "should_log_nemo_gym_responses": False,
                 "agent": {"concurrency": 64, "max_turns": 20},
+                "resources_servers": {
+                    "genrm": {"base_url": "http://10.0.0.2:8000"},
+                    "nl2bash": {"base_url": "http://10.0.0.2:8001"},
+                },
             },
         },
     }
@@ -281,6 +289,10 @@ def test_bootstrap_fingerprint_ignores_nested_gym_log_directory() -> None:
         cast(Any, _DumpedConfig(semantic_changed))
     )
     assert base["env"]["nemo_gym"]["nemo_gym_log_dir"] == "/run/one/nemo_gym"
+    assert (
+        base["env"]["nemo_gym"]["resources_servers"]["genrm"]["base_url"]
+        == "http://10.0.0.1:8000"
+    )
 
 
 def test_prune_bootstrap_snapshots_requires_durable_trainer_checkpoint(tmp_path):

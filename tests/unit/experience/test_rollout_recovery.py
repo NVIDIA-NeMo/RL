@@ -28,8 +28,10 @@ from nemo_rl.experience.route_plan import (
 from nemo_rl.experience.rollout_recovery import (
     PromptRef,
     PromptGroupStatus,
+    RetryScope,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
+    SiblingSealResult,
     TrainStepStatus,
 )
 
@@ -48,7 +50,12 @@ class _NoDeepcopy:
         raise AssertionError("runtime prompt payload must not be deep-copied")
 
 
-def _reserve(ledger: RolloutRecoveryLedger, *, group_id: str = "group-1"):
+def _reserve(
+    ledger: RolloutRecoveryLedger,
+    *,
+    group_id: str = "group-1",
+    retry_scope: RetryScope = RetryScope.SIBLING,
+):
     return ledger.reserve_group(
         group_id=group_id,
         prompt_id="17",
@@ -57,6 +64,8 @@ def _reserve(ledger: RolloutRecoveryLedger, *, group_id: str = "group-1"):
         expected_generations=2,
         target_step=8,
         start_weight_version=7,
+        agent_name="genrm_agent",
+        retry_scope=retry_scope,
     )
 
 
@@ -116,6 +125,95 @@ def test_retry_preserves_logical_id_and_reuses_sealed_sibling() -> None:
     assert retried.siblings[1].current_attempt.status == RolloutAttemptStatus.RESERVED
 
 
+def test_prompt_group_retry_replaces_every_sibling_and_increments_group_attempt() -> (
+    None
+):
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger, retry_scope=RetryScope.PROMPT_GROUP)
+    first_gate_ids = group.gate_rollout_ids
+    ledger.mark_group_dispatched(group.group_id)
+    ledger.abandon_unsealed(group.group_id)
+
+    retried = ledger.prepare_incomplete_retry(group.group_id)
+
+    assert retried.group_attempt == 1
+    assert retried.gate_rollout_ids[0] != first_gate_ids[0]
+    assert retried.gate_rollout_ids[1] != first_gate_ids[1]
+    assert all(
+        sibling.current_attempt.status == RolloutAttemptStatus.RESERVED
+        for sibling in retried.siblings
+    )
+
+
+def test_prompt_group_seal_is_atomic() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger, retry_scope=RetryScope.PROMPT_GROUP)
+    ledger.mark_group_dispatched(group.group_id)
+    results = {
+        index: SiblingSealResult(
+            gate_rollout_id=gate_id,
+            receipt=_receipt(gate_id),
+            reward=float(index),
+        )
+        for index, gate_id in enumerate(group.gate_rollout_ids)
+    }
+
+    with pytest.raises(ValueError, match="every logical sibling"):
+        ledger.mark_group_sealed(group.group_id, {0: results[0]})
+    before_commit = ledger.get_group(group.group_id)
+    assert before_commit.group_committed is False
+    assert all(
+        sibling.current_attempt.status == RolloutAttemptStatus.DISPATCHED
+        for sibling in before_commit.siblings
+    )
+
+    ledger.mark_group_sealed(group.group_id, results)
+
+    committed = ledger.get_group(group.group_id)
+    assert committed.group_committed is True
+    assert committed.status == PromptGroupStatus.READY_TO_FINALIZE
+    assert all(
+        sibling.current_attempt.status == RolloutAttemptStatus.SEALED
+        for sibling in committed.siblings
+    )
+
+
+def test_retry_scope_and_group_attempt_survive_checkpoint_load() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger, retry_scope=RetryScope.PROMPT_GROUP)
+    ledger.mark_group_dispatched(group.group_id)
+    ledger.abandon_unsealed(group.group_id)
+    ledger.prepare_incomplete_retry(group.group_id)
+
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict()).get_group(
+        group.group_id
+    )
+
+    assert restored.agent_name == "genrm_agent"
+    assert restored.retry_scope == RetryScope.PROMPT_GROUP
+    assert restored.group_attempt == 1
+    assert restored.group_committed is False
+
+
+def test_schema_v2_loads_with_legacy_sibling_scope() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger)
+    state = ledger.state_dict()
+    state["schema_version"] = 2
+    for raw_group in state["groups"]:
+        raw_group.pop("agent_name")
+        raw_group.pop("retry_scope")
+        raw_group.pop("group_attempt")
+        raw_group.pop("group_committed")
+
+    restored = RolloutRecoveryLedger.from_state_dict(state).get_group(group.group_id)
+
+    assert restored.agent_name is None
+    assert restored.retry_scope == RetryScope.SIBLING
+    assert restored.group_attempt == 0
+    assert restored.group_committed is False
+
+
 def test_all_siblings_must_be_sealed_before_finalization() -> None:
     ledger = RolloutRecoveryLedger()
     group = _reserve(ledger)
@@ -131,6 +229,29 @@ def test_all_siblings_must_be_sealed_before_finalization() -> None:
     )
     assert canonical_ids == ["group-1_g0", "group-1_g1"]
     assert [receipt["rollout_id"] for receipt in receipts] == physical_ids
+    assert rewards == [0.0, 1.0]
+
+
+def test_missing_receipt_is_a_restart_safe_sealed_placeholder() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger)
+    ledger.mark_group_dispatched(group.group_id)
+    missing_receipt_id = group.gate_rollout_ids[0]
+    ledger.mark_sibling_sealed(
+        group.group_id,
+        generation_index=0,
+        gate_rollout_id=missing_receipt_id,
+        receipt=None,
+        reward=0.0,
+    )
+    _seal(ledger, group.group_id, 1)
+
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    physical_ids, _, receipts, rewards = restored.finalization_inputs(group.group_id)
+
+    assert physical_ids[0] == missing_receipt_id
+    assert receipts[0] is None
+    assert receipts[1] is not None
     assert rewards == [0.0, 1.0]
 
 

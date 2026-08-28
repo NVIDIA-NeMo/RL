@@ -39,18 +39,29 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.failures import GenerationUnavailable
-from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_GROUP_ATTEMPT_KEY,
+    NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    Completion,
+    PromptGroupRecord,
+)
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutManager,
     RolloutRetryPolicy,
     RolloutStats,
 )
-from nemo_rl.experience.rollout_recovery import PromptRef, RolloutRecoveryLedger
+from nemo_rl.experience.rollout_recovery import (
+    PromptRef,
+    RetryScope,
+    RolloutRecoveryLedger,
+)
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
 )
+from nemo_rl.utils.timer import Timer
 
 # Fixtures shared with the heavyweight rollout tests.
 from tests.unit.environments.test_nemo_gym import (
@@ -448,6 +459,9 @@ def _nemo_gym_impl(mask_env_flagged_samples):
             "stop_strings": None,
             "stop_token_ids": None,
             "top_k": None,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_new_tokens": 100,
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
     )
@@ -478,6 +492,68 @@ def test_result_to_completion_drops_mask_flag_when_gate_off():
     completion = _nemo_gym_impl(False)._result_to_completion(_mask_gate_result())
     assert "mask_sample" not in completion.env_extras["instance_config"]
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
+
+
+def test_nemo_gym_build_inputs_stamps_logical_group_coordinates():
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 3
+    input_sample = {
+        "extra_env_info": {
+            "responses_create_params": {},
+        }
+    }
+
+    rows = impl._build_inputs(input_sample)
+
+    assert len({row[NEMO_GYM_GROUP_ID_KEY] for row in rows}) == 1
+    assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0]
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2]
+    assert [row["_rowidx"] for row in rows] == [0, 1, 2]
+
+
+def test_nemo_gym_build_inputs_preserves_explicit_group_id_for_partial_dispatch():
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 3
+    input_sample = {
+        "extra_env_info": {
+            NEMO_GYM_GROUP_ATTEMPT_KEY: 2,
+            NEMO_GYM_GROUP_ID_KEY: "stable-group",
+            "responses_create_params": {},
+        }
+    }
+
+    rows = impl._build_inputs(input_sample, generation_indices=[1, 2])
+
+    assert [row[NEMO_GYM_GROUP_ID_KEY] for row in rows] == [
+        "stable-group",
+        "stable-group",
+    ]
+    assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [2, 2]
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [1, 2]
+
+
+def test_prompt_group_scope_disables_inner_sibling_redispatch():
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 2
+    impl._task_to_env = {"nemo_gym": object()}
+    impl._max_gym_row_attempts = 3
+    impl._retry_scope_overrides = {"genrm_agent": RetryScope.PROMPT_GROUP}
+    stream_calls = 0
+
+    async def fail_stream(*args, **kwargs):
+        nonlocal stream_calls
+        stream_calls += 1
+        raise GenerationUnavailable("worker disappeared")
+
+    impl._stream_rows = fail_stream  # type: ignore[method-assign]
+    inputs = [
+        {"_rowidx": index, "agent_ref": {"name": "genrm_agent"}} for index in range(2)
+    ]
+
+    with pytest.raises(GenerationUnavailable, match="worker disappeared"):
+        _run(impl._run_rollouts(inputs, Timer(), "timing/test"))
+
+    assert stream_calls == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1065,6 +1141,9 @@ def _make_capture_manager(buf, *, on_run=None, num_generations=2):
     mgr._stats = RolloutStats()
     mgr._skipped_prompts = 0
     mgr._recovery_ledger = RolloutRecoveryLedger()
+    mgr._default_retry_scope = RetryScope.SIBLING
+    mgr._retry_scope_overrides = {}
+    mgr._pending_group_results = {}
     mgr._data_plane_checkpoint_barrier = None
 
     class _CaptureImpl:
@@ -1131,6 +1210,43 @@ class TestGenerateForFinalizationFlow:
         # Finalization and commit are exclusively owned by the controller's
         # actor-pool path; the manager leaves the reservation unready.
         assert buf.commit_calls == []
+
+    def test_explicit_missing_receipt_reaches_finalizer_as_placeholder(self):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf)
+
+        class _MissingReceiptImpl:
+            async def run_rollout(
+                self,
+                _sample,
+                *,
+                rollout_ids=None,
+                generation_indices=None,
+                on_completion=None,
+            ):
+                indices = generation_indices or list(range(len(rollout_ids)))
+                selected_ids = [rollout_ids[index] for index in indices]
+                receipts = [
+                    None,
+                    {
+                        "rollout_id": selected_ids[1],
+                        "manifest": [
+                            {"staging_key": f"{selected_ids[1]}/call"}
+                        ],
+                    },
+                ]
+                record = _receipt_record(selected_ids, receipts)
+                for generation_index, completion in zip(indices, record.completions):
+                    await on_completion(generation_index, completion)
+                return record
+
+        mgr._impl = _MissingReceiptImpl()
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+
+        assert request is not None
+        assert request.receipts[0] is None
+        assert request.receipts[1] is not None
 
     def test_dispatch_uses_pre_reserved_dataloader_lineage(self):
         buf = _FakeCaptureBuffer()
@@ -1248,6 +1364,90 @@ class TestGenerateForFinalizationFlow:
         assert second_ids[0] == first_ids[0]
         assert second_ids[1] != first_ids[1]
         assert request.rollout_ids == (second_ids[0], second_ids[1])
+
+    def test_prompt_group_scope_redispatches_every_sibling_with_new_group_attempt(
+        self,
+    ):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf)
+        mgr._retry_scope_overrides = {"genrm_agent": RetryScope.PROMPT_GROUP}
+        mgr._retry_policy = RolloutRetryPolicy.single_attempt(
+            max_infra_attempts=2,
+            backoff_base_s=0.0,
+        )
+
+        class _PartialCaptureImpl:
+            def __init__(self):
+                self.generation_indices: list[list[int]] = []
+                self.group_attempts: list[int] = []
+
+            async def run_rollout(
+                self,
+                sample,
+                *,
+                rollout_ids=None,
+                generation_indices=None,
+                on_completion=None,
+            ):
+                indices = list(generation_indices)
+                self.generation_indices.append(indices)
+                self.group_attempts.append(
+                    sample["extra_env_info"][NEMO_GYM_GROUP_ATTEMPT_KEY]
+                )
+                completions = []
+                for generation_index in indices:
+                    rollout_id = rollout_ids[generation_index]
+                    receipt = {
+                        "rollout_id": rollout_id,
+                        "manifest": [{"staging_key": f"{rollout_id}/call"}],
+                    }
+                    completion = _receipt_record([rollout_id], [receipt]).completions[0]
+                    assert completion.env_extras is not None
+                    completion.env_extras.update(
+                        {
+                            NEMO_GYM_GROUP_ID_KEY: sample["extra_env_info"][
+                                NEMO_GYM_GROUP_ID_KEY
+                            ],
+                            NEMO_GYM_GROUP_ATTEMPT_KEY: sample["extra_env_info"][
+                                NEMO_GYM_GROUP_ATTEMPT_KEY
+                            ],
+                            NEMO_GYM_ROLLOUT_INDEX_KEY: generation_index,
+                        }
+                    )
+                    completions.append(completion)
+                    await on_completion(generation_index, completion)
+                    if len(self.generation_indices) == 1:
+                        raise GenerationUnavailable("worker disappeared")
+                return PromptGroupRecord(
+                    prompt_idx=0,
+                    prompt=[],
+                    extra_env_info={},
+                    metadata={"task_name": "nemo_gym"},
+                    completions=completions,
+                    rollout_metrics={},
+                )
+
+        impl = _PartialCaptureImpl()
+        mgr._impl = impl
+        sample = {
+            "prompt": "p",
+            "idx": 9,
+            "extra_env_info": {"agent_ref": {"name": "genrm_agent"}},
+        }
+
+        request = _run(mgr.generate_for_finalization(sample))
+
+        assert request is not None
+        assert impl.generation_indices == [[0, 1], [0, 1]]
+        assert impl.group_attempts == [0, 1]
+        first_ids, second_ids = buf.reserve_rollout_ids
+        assert first_ids is not None and second_ids is not None
+        assert second_ids[0] != first_ids[0]
+        assert second_ids[1] != first_ids[1]
+        group = mgr.recovery_ledger.get_group(request.group_id)
+        assert group.retry_scope == RetryScope.PROMPT_GROUP
+        assert group.group_attempt == 1
+        assert group.group_committed is True
 
     def test_recovery_redispatches_only_sibling_missing_from_snapshot(self):
         buf = _FakeCaptureBuffer()

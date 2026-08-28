@@ -35,8 +35,19 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayGroupMetadata
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
+_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {
+    2,
+    ROLLOUT_RECOVERY_SCHEMA_VERSION,
+}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
+
+
+class RetryScope(StrEnum):
+    """Atomic commit and redispatch unit for one prompt group."""
+
+    SIBLING = "sibling"
+    PROMPT_GROUP = "prompt_group"
 
 
 class RolloutAttemptStatus(StrEnum):
@@ -128,6 +139,10 @@ class PromptGroupRecoveryRecord:
     expected_generations: int
     target_step: Optional[int]
     start_weight_version: int
+    agent_name: Optional[str]
+    retry_scope: RetryScope
+    group_attempt: int
+    group_committed: bool
     siblings: list[RolloutSiblingRecord]
     status: PromptGroupStatus = PromptGroupStatus.GENERATING
     canonical_meta: Optional[KVBatchMeta] = None
@@ -191,6 +206,17 @@ class OpenTrainStepRecord:
     status: TrainStepStatus = TrainStepStatus.OPEN
 
 
+@dataclass(frozen=True)
+class SiblingSealResult:
+    """Terminal result staged for an atomic prompt-group commit."""
+
+    gate_rollout_id: str
+    # None is an explicit terminal capture failure. The finalizer publishes a
+    # masked placeholder for it, matching the non-recovery token-capture path.
+    receipt: Optional[dict[str, Any]]
+    reward: float
+
+
 def _new_attempt() -> RolloutAttemptRecord:
     return RolloutAttemptRecord(
         attempt_uuid=uuid.uuid4(),
@@ -198,8 +224,10 @@ def _new_attempt() -> RolloutAttemptRecord:
     )
 
 
-def _receipt_staging_keys(receipt: dict[str, Any]) -> list[str]:
-    """Validate a sealed Gate receipt and return its ordered staging keys."""
+def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
+    """Validate a terminal Gate receipt and return its ordered staging keys."""
+    if receipt is None:
+        return []
     manifest = receipt.get("manifest")
     if not isinstance(manifest, list):
         raise ValueError("sealed rollout receipt must contain a manifest list")
@@ -340,6 +368,8 @@ class RolloutRecoveryLedger:
         expected_generations: int,
         target_step: Optional[int],
         start_weight_version: int,
+        agent_name: Optional[str] = None,
+        retry_scope: RetryScope = RetryScope.SIBLING,
         group_id: Optional[str] = None,
     ) -> PromptGroupRecoveryRecord:
         """Create one logical group and its first physical sibling attempts."""
@@ -375,21 +405,35 @@ class RolloutRecoveryLedger:
             expected_generations=expected_generations,
             target_step=target_step,
             start_weight_version=start_weight_version,
+            agent_name=agent_name,
+            retry_scope=retry_scope,
+            group_attempt=0,
+            group_committed=False,
             siblings=siblings,
         )
         self._groups[group_id] = record
         return self._copy_group(record)
 
     def prepare_incomplete_retry(self, group_id: str) -> PromptGroupRecoveryRecord:
-        """Mint fresh physical attempts only for siblings that are not sealed."""
+        """Mint fresh physical attempts according to the persisted retry scope."""
         record = self._require_group(group_id)
         if record.status != PromptGroupStatus.GENERATING:
             raise ValueError(
                 f"cannot retry group {group_id!r} from status {record.status.value!r}"
             )
+        retrying_prompt_group = record.retry_scope == RetryScope.PROMPT_GROUP and any(
+            sibling.current_attempt.status
+            in {RolloutAttemptStatus.ABANDONED, RolloutAttemptStatus.FAILED}
+            for sibling in record.siblings
+        )
+        if retrying_prompt_group:
+            record.group_attempt += 1
         for sibling in record.siblings:
             attempt = sibling.current_attempt
-            if attempt.status == RolloutAttemptStatus.SEALED:
+            if (
+                record.retry_scope == RetryScope.SIBLING
+                and attempt.status == RolloutAttemptStatus.SEALED
+            ):
                 continue
             if attempt.status == RolloutAttemptStatus.RESERVED:
                 continue
@@ -433,11 +477,15 @@ class RolloutRecoveryLedger:
         *,
         generation_index: int,
         gate_rollout_id: str,
-        receipt: dict[str, Any],
+        receipt: Optional[dict[str, Any]],
         reward: float,
     ) -> None:
-        """Record one streamed sibling receipt as soon as the row arrives."""
+        """Record one streamed terminal result as soon as the row arrives."""
         record = self._require_group(group_id)
+        if record.retry_scope != RetryScope.SIBLING:
+            raise ValueError(
+                f"cannot independently seal siblings for {record.retry_scope.value!r} recovery"
+            )
         sibling = self._require_sibling(record, generation_index)
         attempt = sibling.current_attempt
         expected_gate_rollout_id = record.gate_rollout_id(generation_index)
@@ -447,7 +495,7 @@ class RolloutRecoveryLedger:
                 "streamed rollout identity mismatch: "
                 f"result={gate_rollout_id!r}, expected={expected_gate_rollout_id!r}"
             )
-        if receipt.get("rollout_id") != gate_rollout_id:
+        if receipt is not None and receipt.get("rollout_id") != gate_rollout_id:
             raise ValueError(
                 "receipt rollout identity mismatch: "
                 f"receipt={receipt.get('rollout_id')!r}, expected={gate_rollout_id!r}"
@@ -478,7 +526,64 @@ class RolloutRecoveryLedger:
             item.current_attempt.status == RolloutAttemptStatus.SEALED
             for item in record.siblings
         ):
+            record.group_committed = True
             record.status = PromptGroupStatus.READY_TO_FINALIZE
+
+    def mark_group_sealed(
+        self,
+        group_id: str,
+        results: dict[int, SiblingSealResult],
+    ) -> None:
+        """Atomically seal one complete prompt-group-scoped cohort."""
+        record = self._require_group(group_id)
+        if record.retry_scope != RetryScope.PROMPT_GROUP:
+            raise ValueError(
+                f"cannot atomically seal a {record.retry_scope.value!r} recovery group"
+            )
+        if record.status != PromptGroupStatus.GENERATING:
+            raise ValueError(
+                f"cannot seal group {group_id!r} from {record.status.value!r}"
+            )
+        expected_indices = set(range(record.expected_generations))
+        if set(results) != expected_indices:
+            raise ValueError(
+                "prompt-group seal requires every logical sibling exactly once: "
+                f"expected={sorted(expected_indices)}, actual={sorted(results)}"
+            )
+
+        validated: list[tuple[RolloutAttemptRecord, SiblingSealResult, list[str]]] = []
+        for generation_index in range(record.expected_generations):
+            result = results[generation_index]
+            sibling = self._require_sibling(record, generation_index)
+            attempt = sibling.current_attempt
+            expected_gate_rollout_id = record.gate_rollout_id(generation_index)
+            if attempt.status != RolloutAttemptStatus.DISPATCHED:
+                raise ValueError(
+                    f"cannot seal logical rollout {record.logical_rollout_id(generation_index)!r} "
+                    f"from status {attempt.status.value!r}"
+                )
+            if result.gate_rollout_id != expected_gate_rollout_id:
+                raise ValueError(
+                    "streamed rollout identity mismatch: "
+                    f"result={result.gate_rollout_id!r}, expected={expected_gate_rollout_id!r}"
+                )
+            if (
+                result.receipt is not None
+                and result.receipt.get("rollout_id") != expected_gate_rollout_id
+            ):
+                raise ValueError(
+                    "receipt rollout identity mismatch: "
+                    f"receipt={result.receipt.get('rollout_id')!r}, expected={expected_gate_rollout_id!r}"
+                )
+            validated.append((attempt, result, _receipt_staging_keys(result.receipt)))
+
+        for attempt, result, staging_keys in validated:
+            attempt.receipt = copy.deepcopy(result.receipt)
+            attempt.reward = float(result.reward)
+            attempt.staging_keys = staging_keys
+            attempt.status = RolloutAttemptStatus.SEALED
+        record.group_committed = True
+        record.status = PromptGroupStatus.READY_TO_FINALIZE
 
     def abandon_unsealed(self, group_id: str) -> None:
         """Abandon failed attempts without destroying reusable sealed receipts."""
@@ -490,10 +595,20 @@ class RolloutRecoveryLedger:
             raise ValueError(
                 f"cannot abandon group {group_id!r} from {record.status.value!r}"
             )
+        abandon_entire_group = (
+            record.retry_scope == RetryScope.PROMPT_GROUP and not record.group_committed
+        )
         for sibling in record.siblings:
             attempt = sibling.current_attempt
-            if attempt.status == RolloutAttemptStatus.SEALED:
+            if (
+                attempt.status == RolloutAttemptStatus.SEALED
+                and not abandon_entire_group
+            ):
                 continue
+            if attempt.status == RolloutAttemptStatus.SEALED:
+                attempt.receipt = None
+                attempt.reward = None
+                attempt.staging_keys.clear()
             attempt.status = RolloutAttemptStatus.ABANDONED
         record.status = (
             PromptGroupStatus.READY_TO_FINALIZE
@@ -506,20 +621,21 @@ class RolloutRecoveryLedger:
 
     def finalization_inputs(
         self, group_id: str
-    ) -> tuple[list[str], list[str], list[dict[str, Any]], list[float]]:
+    ) -> tuple[
+        list[str], list[str], list[Optional[dict[str, Any]]], list[float]
+    ]:
         """Return physical IDs, canonical IDs, receipts and rewards in sibling order."""
         record = self._require_group(group_id)
         if record.status != PromptGroupStatus.READY_TO_FINALIZE:
             raise ValueError(
                 f"group {group_id!r} is not ready to finalize: {record.status.value!r}"
             )
-        receipts: list[dict[str, Any]] = []
+        receipts: list[Optional[dict[str, Any]]] = []
         rewards: list[float] = []
         for sibling in record.siblings:
             attempt = sibling.current_attempt
             if (
                 attempt.status != RolloutAttemptStatus.SEALED
-                or attempt.receipt is None
                 or attempt.reward is None
             ):
                 raise ValueError(
@@ -762,6 +878,10 @@ class RolloutRecoveryLedger:
                 {
                     "group_id": record.group_id,
                     "prompt_id": record.prompt_id,
+                    "agent_name": record.agent_name,
+                    "retry_scope": record.retry_scope.value,
+                    "group_attempt": record.group_attempt,
+                    "group_committed": record.group_committed,
                     "prompt_ref": {
                         "sample_id": record.prompt_ref.sample_id,
                         "task_name": record.prompt_ref.task_name,
@@ -812,7 +932,8 @@ class RolloutRecoveryLedger:
     @classmethod
     def from_state_dict(cls, state: dict[str, Any]) -> Self:
         """Restore and validate a ledger metadata envelope."""
-        if state.get("schema_version") != ROLLOUT_RECOVERY_SCHEMA_VERSION:
+        schema_version = state.get("schema_version")
+        if schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS:
             raise ValueError(
                 "Unsupported rollout-recovery schema version: "
                 f"{state.get('schema_version')!r}"
@@ -827,6 +948,7 @@ class RolloutRecoveryLedger:
             record = cls._group_from_state(
                 raw_group,
                 seen_attempt_uuids=seen_attempt_uuids,
+                schema_version=schema_version,
             )
             if record.group_id in ledger._groups:
                 raise ValueError(f"duplicate recovery group_id={record.group_id!r}")
@@ -888,6 +1010,7 @@ class RolloutRecoveryLedger:
         raw_group: Any,
         *,
         seen_attempt_uuids: set[uuid.UUID],
+        schema_version: int,
     ) -> PromptGroupRecoveryRecord:
         if not isinstance(raw_group, dict):
             raise ValueError("rollout-recovery group must be a mapping")
@@ -899,6 +1022,30 @@ class RolloutRecoveryLedger:
             raise ValueError("group_id must be a non-empty string")
         if not isinstance(prompt_id, str) or not prompt_id:
             raise ValueError("prompt_id must be a non-empty string")
+        if schema_version >= 3:
+            agent_name = raw_group.get("agent_name")
+            raw_retry_scope = raw_group.get("retry_scope")
+            group_attempt = raw_group.get("group_attempt")
+            group_committed = raw_group.get("group_committed")
+            if agent_name is not None and not isinstance(agent_name, str):
+                raise ValueError("agent_name must be a string or None")
+            try:
+                retry_scope = RetryScope(raw_retry_scope)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"invalid retry_scope={raw_retry_scope!r}") from error
+            if (
+                not isinstance(group_attempt, int)
+                or isinstance(group_attempt, bool)
+                or group_attempt < 0
+            ):
+                raise ValueError("group_attempt must be a non-negative integer")
+            if not isinstance(group_committed, bool):
+                raise ValueError("group_committed must be a boolean")
+        else:
+            agent_name = None
+            retry_scope = RetryScope.SIBLING
+            group_attempt = 0
+            group_committed = False
         if not isinstance(expected_generations, int) or expected_generations < 1:
             raise ValueError("expected_generations must be a positive integer")
         if (
@@ -961,14 +1108,28 @@ class RolloutRecoveryLedger:
                 ):
                     raise ValueError("staging_keys must be a list of strings")
                 if attempt_status == RolloutAttemptStatus.SEALED:
-                    if not isinstance(receipt, dict) or not isinstance(
-                        reward, (int, float)
-                    ):
-                        raise ValueError("sealed attempts require receipt and reward")
-                    if receipt.get("rollout_id") != gate_id:
-                        raise ValueError("sealed receipt identity mismatch")
-                    if _receipt_staging_keys(receipt) != staging_keys:
-                        raise ValueError("sealed receipt staging manifest mismatch")
+                    if not isinstance(reward, (int, float)):
+                        raise ValueError("sealed attempts require a reward")
+                    if receipt is None:
+                        if schema_version < 3:
+                            raise ValueError(
+                                "sealed attempts require a receipt before schema v3"
+                            )
+                        if staging_keys:
+                            raise ValueError(
+                                "sealed missing-receipt placeholders cannot own staging keys"
+                            )
+                    elif isinstance(receipt, dict):
+                        if receipt.get("rollout_id") != gate_id:
+                            raise ValueError("sealed receipt identity mismatch")
+                        if _receipt_staging_keys(receipt) != staging_keys:
+                            raise ValueError(
+                                "sealed receipt staging manifest mismatch"
+                            )
+                    else:
+                        raise ValueError(
+                            "sealed attempt receipt must be a mapping or None"
+                        )
                 elif receipt is not None or reward is not None or staging_keys:
                     raise ValueError("only sealed attempts may retain receipt data")
                 attempts.append(
@@ -1031,6 +1192,12 @@ class RolloutRecoveryLedger:
             sibling.current_attempt.status == RolloutAttemptStatus.SEALED
             for sibling in siblings
         )
+        if schema_version < 3:
+            group_committed = all_current_attempts_sealed
+        if group_committed != all_current_attempts_sealed:
+            raise ValueError(
+                "group_committed must match whether every current sibling attempt is sealed"
+            )
         if status == PromptGroupStatus.GENERATING and all_current_attempts_sealed:
             raise ValueError("generating group must retain an unfinished sibling")
         if status in prefinalization_sealed_states and not all_current_attempts_sealed:
@@ -1065,6 +1232,10 @@ class RolloutRecoveryLedger:
             expected_generations=expected_generations,
             target_step=target_step,
             start_weight_version=start_weight,
+            agent_name=agent_name,
+            retry_scope=retry_scope,
+            group_attempt=group_attempt,
+            group_committed=group_committed,
             siblings=siblings,
             status=status,
             canonical_meta=copy.deepcopy(canonical_meta),
@@ -1090,6 +1261,10 @@ class RolloutRecoveryLedger:
             expected_generations=record.expected_generations,
             target_step=record.target_step,
             start_weight_version=record.start_weight_version,
+            agent_name=record.agent_name,
+            retry_scope=record.retry_scope,
+            group_attempt=record.group_attempt,
+            group_committed=record.group_committed,
             siblings=copy.deepcopy(record.siblings),
             status=record.status,
             canonical_meta=copy.deepcopy(record.canonical_meta),

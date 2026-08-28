@@ -1136,7 +1136,58 @@ class TestTQReplayBufferStateDict:
         assert [meta.sample_ids for meta in restored_buf.meta_list] == [
             list(meta.sample_ids) for meta in metas
         ]
+        assert restored_buf._rollout_ids_list == [None, None]
+        assert restored_buf._staging_keys_list == [None, None]
         assert restored_dp.put_calls == []
+
+    def test_restored_index_stays_aligned_for_recovery_slots(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+        _add_group(buf, weight=1)
+        _add_group(buf, weight=2)
+        state = buf.metadata_state_dict(saved_capacity=8)
+
+        restored_buf = _make_buffer(FakeDataPlaneClient())
+        assert _load(restored_buf, state) == 2
+
+        aborted_group = restored_buf.reserve(
+            weight_version=3,
+            group_id="recovered-abort",
+            rollout_ids=["physical-abort"],
+        )
+        assert restored_buf.abort(aborted_group)
+
+        finalized_group = restored_buf.reserve(
+            weight_version=3,
+            group_id="recovered-finalize",
+            rollout_ids=["physical-finalize"],
+        )
+        finalized_meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["recovered-finalize_g0"],
+            fields=["input_ids"],
+        )
+        _run(
+            restored_buf.commit_finalized(
+                finalized_group,
+                finalized_meta,
+                group_min_wv=3,
+                group_max_wv=4,
+                staging_keys=["physical-finalize/call"],
+            )
+        )
+
+        assert restored_buf.ready_list == [True, True, True]
+        assert restored_buf._rollout_ids_list == [
+            None,
+            None,
+            ["physical-finalize"],
+        ]
+        assert restored_buf._staging_keys_list == [
+            None,
+            None,
+            ["physical-finalize/call"],
+        ]
 
     def test_round_trip_preserves_end_weight_and_target_step(self):
         # start != end and a non-None target_step must survive the round-trip:

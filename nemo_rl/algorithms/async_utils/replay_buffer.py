@@ -1536,6 +1536,31 @@ class TQReplayBuffer:
             self.target_step_list.append(group["target_step"])
             self.ready_list.append(True)
             self._group_ids.append(group["group_id"])
+            # Restored groups are already finalized, so they have no live
+            # physical rollout attempt. Deferred router replay can still own
+            # staging rows; their cleanup keys are durably encoded in the
+            # canonical route-plan tags.
+            self._rollout_ids_list.append(None)
+            tagged_plans = [
+                tag[ROUTE_PLAN_TAG]
+                for tag in (meta.tags or [])
+                if ROUTE_PLAN_TAG in tag
+            ]
+            if tagged_plans:
+                # Imported lazily to avoid loading the optional routing path
+                # for ordinary replay-buffer checkpoint restoration.
+                from nemo_rl.experience.route_plan import decode_route_plan
+
+                staging_keys = list(
+                    dict.fromkeys(
+                        key
+                        for encoded in tagged_plans
+                        for key in decode_route_plan(encoded).cleanup_staging_keys
+                    )
+                )
+                self._staging_keys_list.append(staging_keys)
+            else:
+                self._staging_keys_list.append(None)
 
         print(
             f"📦 Restored {len(groups)} replay group(s) from checkpoint",

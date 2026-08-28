@@ -95,6 +95,7 @@ _BOOTSTRAP_TOKEN_CAPTURE_FIELDS = frozenset(
 _BOOTSTRAP_ENV_RUNTIME_FIELDS = frozenset(
     {
         "apptainer_memory_limit_mb",
+        "base_url",
         "concurrency",
         "nemo_gym_log_dir",
         "num_gpu_nodes",

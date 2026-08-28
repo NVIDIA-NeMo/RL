@@ -2117,6 +2117,15 @@ wheels = [
 ]
 
 [[package]]
+name = "gprof2dot"
+version = "2025.4.14"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/bb/fd/cad13fa1f7a463a607176432c4affa33ea162f02f58cc36de1d40d3e6b48/gprof2dot-2025.4.14.tar.gz", hash = "sha256:35743e2d2ca027bf48fa7cba37021aaf4a27beeae1ae8e05a50b55f1f921a6ce", size = 39536, upload-time = "2025-04-14T07:21:45.76Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/71/ed/89d760cb25279109b89eb52975a7b5479700d3114a2421ce735bfb2e7513/gprof2dot-2025.4.14-py3-none-any.whl", hash = "sha256:0742e4c0b4409a5e8777e739388a11e1ed3750be86895655312ea7c20bd0090e", size = 37555, upload-time = "2025-04-14T07:21:43.319Z" },
+]
+
+[[package]]
 name = "graphene"
 version = "3.4.3"
 source = { registry = "https://pypi.org/simple" }
@@ -3516,6 +3525,7 @@ dependencies = [
     { name = "fastapi", version = "0.139.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra == 'extra-7-nemo-rl-trtllm' or extra != 'extra-7-nemo-rl-vllm'" },
     { name = "fonttools" },
     { name = "gitpython" },
+    { name = "gprof2dot" },
     { name = "hydra-core", version = "1.3.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "hydra-core", version = "1.3.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra != 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "itsdangerous" },
@@ -3525,7 +3535,6 @@ dependencies = [
     { name = "omegaconf" },
     { name = "openai" },
     { name = "orjson" },
-    { name = "packaging" },
     { name = "psutil" },
     { name = "pyarrow" },
     { name = "pyasn1" },
