@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import hashlib
 import json
 import pickle
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -27,10 +29,8 @@ import pytest
 import nemo_rl.data_plane.adapters.tq_mooncake_checkpoint as checkpoint_plugin
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     _load_storage_checkpoint,
-    _master_command,
     _physical_keys,
     _save_storage_checkpoint,
-    _wait_for_disk_objects,
     install_tq_mooncake_checkpoint_plugin,
 )
 
@@ -62,73 +62,81 @@ def _controller_state() -> dict[str, Any]:
     return {"partitions": {"train": partition}}
 
 
-class _DiskDescriptor:
-    def __init__(self, path: Path, size: int) -> None:
-        self.status = SimpleNamespace(name="COMPLETE")
-        self._disk = SimpleNamespace(file_path=str(path), object_size=size)
-
-    def is_disk_replica(self) -> bool:
-        return True
-
-    def get_disk_descriptor(self) -> Any:
-        return self._disk
-
-
 class _FakeStore:
-    def __init__(self, live_root: Path, objects: dict[str, bytes]) -> None:
-        self.live_root = live_root
+    def __init__(
+        self, objects: dict[str, bytes], *, unregister_result: int = 0
+    ) -> None:
         self.objects = dict(objects)
-        self.paths: dict[str, Path] = {}
-        self.registered: set[int] = set()
+        self.unregister_result = unregister_result
+        self.registered: dict[int, int] = {}
+        self.saved_gets: list[str] = []
         self.mapped_upserts: list[str] = []
-        live_root.mkdir(parents=True, exist_ok=True)
-        for index, (key, value) in enumerate(sorted(objects.items())):
-            path = live_root / f"source-{index}.bin"
-            path.write_bytes(value)
-            self.paths[key] = path
 
-    def batch_get_replica_desc(self, keys: list[str]) -> dict[str, list[Any]]:
-        return {
-            key: [_DiskDescriptor(self.paths[key], len(self.objects[key]))]
-            for key in keys
-            if key in self.paths
-        }
+    def get_size(self, key: str) -> int:
+        value = self.objects.get(key)
+        return -1 if value is None else len(value)
+
+    def register_buffer(self, pointer: int, size: int) -> int:
+        assert pointer not in self.registered
+        self.registered[pointer] = size
+        return 0
+
+    def get_into(self, key: str, pointer: int, size: int) -> int:
+        assert self.registered[pointer] == size
+        value = self.objects[key]
+        assert len(value) == size
+        ctypes.memmove(pointer, value, size)
+        self.saved_gets.append(key)
+        return size
+
+    def unregister_buffer(self, pointer: int) -> int:
+        if self.unregister_result == 0:
+            self.registered.pop(pointer)
+        return self.unregister_result
 
     def batch_is_exist(self, keys: list[str]) -> list[int]:
         return [1 if key in self.objects else 0 for key in keys]
 
-    def register_buffer(self, pointer: int, _size: int) -> int:
-        self.registered.add(pointer)
-        return 0
-
-    def unregister_buffer(self, pointer: int) -> int:
-        self.registered.remove(pointer)
-        return 0
-
     def upsert_from(self, key: str, pointer: int, size: int, _config: Any) -> int:
-        assert pointer in self.registered
-        value = ctypes.string_at(pointer, size)
-        self.objects[key] = value
+        assert self.registered[pointer] == size
+        self.objects[key] = ctypes.string_at(pointer, size)
         self.mapped_upserts.append(key)
-        path = self.live_root / f"restored-{len(self.paths)}.bin"
-        path.write_bytes(value)
-        self.paths[key] = path
         return 0
 
 
-def _manager(storage_root: Path, store: _FakeStore) -> Any:
+class _ShortGetStore(_FakeStore):
+    def __init__(self, objects: dict[str, bytes], short_key: str) -> None:
+        super().__init__(objects)
+        self.short_key = short_key
+
+    def get_into(self, key: str, pointer: int, size: int) -> int:
+        result = super().get_into(key, pointer, size)
+        return result - 1 if key == self.short_key else result
+
+
+def _manager(store: _FakeStore) -> Any:
     config = {
         "use_gdr": False,
         "gdr_staging_buffer_mb": 1024,
-        "checkpoint": {
-            "enabled": True,
-            "storage_root": str(storage_root),
-            "durability_timeout_s": 1.0,
-            "poll_interval_s": 0.001,
-        },
+        "checkpoint": {"enabled": True},
     }
     client = SimpleNamespace(_store=store, replica_config=object())
     return SimpleNamespace(config=config, storage_client=client)
+
+
+@pytest.fixture
+def quarantined_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[list[Any]]:
+    buffers: list[Any] = []
+    monkeypatch.setattr(
+        checkpoint_plugin, "_QUARANTINED_BUFFERS", buffers, raising=False
+    )
+    yield buffers
+    for buffer in buffers:
+        if not buffer.closed:
+            buffer.close()
+    buffers.clear()
 
 
 def _write_controller(checkpoint_dir: Path) -> None:
@@ -136,6 +144,39 @@ def _write_controller(checkpoint_dir: Path) -> None:
 
     with (checkpoint_dir / tq_interface._CONTROLLER_FILE).open("wb") as output:
         pickle.dump(_controller_state(), output)
+
+
+def _payloads() -> dict[str, bytes]:
+    return {
+        "0@router_indices": b"router",
+        "0@tokens:c0": b"token-chunk-0",
+        "0@tokens:c1": b"token-chunk-1",
+        "1@metadata": b"pickled non-tensor bytes",
+        "1@tokens": b"tokens",
+    }
+
+
+def _manifest(checkpoint_dir: Path) -> dict[str, Any]:
+    manifest_path = checkpoint_dir / "mooncake_storage" / "manifest.json"
+    return json.loads(manifest_path.read_text())
+
+
+def _saved_payloads(checkpoint_dir: Path) -> dict[str, bytes]:
+    storage_dir = checkpoint_dir / "mooncake_storage"
+    packed = (storage_dir / "objects.bin").read_bytes()
+    return {
+        entry["key"]: packed[entry["offset"] : entry["offset"] + entry["size"]]
+        for entry in _manifest(checkpoint_dir)["objects"]
+    }
+
+
+def _corrupt_first_object(checkpoint_dir: Path) -> None:
+    storage_dir = checkpoint_dir / "mooncake_storage"
+    packed_path = storage_dir / "objects.bin"
+    first = _manifest(checkpoint_dir)["objects"][0]
+    packed = bytearray(packed_path.read_bytes())
+    packed[first["offset"]] ^= 0xFF
+    packed_path.write_bytes(packed)
 
 
 def test_physical_keys_include_all_produced_fields_and_gdr_chunks() -> None:
@@ -148,175 +189,187 @@ def test_physical_keys_include_all_produced_fields_and_gdr_chunks() -> None:
     ]
 
 
-def test_storage_checkpoint_round_trip_uses_raw_mooncake_objects(
+def test_explicit_storage_checkpoint_round_trip_uses_raw_mooncake_objects(
     tmp_path: Path,
 ) -> None:
-    storage_root = tmp_path / "storage"
-    live_root = storage_root / "live"
-    payloads = {
-        "0@router_indices": b"router",
-        "0@tokens:c0": b"token-chunk-0",
-        "0@tokens:c1": b"token-chunk-1",
-        "1@metadata": b"pickled non-tensor bytes",
-        "1@tokens": b"tokens",
-    }
-    source_store = _FakeStore(live_root, payloads)
+    payloads = _payloads()
+    source_store = _FakeStore(payloads)
     checkpoint_dir = tmp_path / "checkpoint"
     checkpoint_dir.mkdir()
     _write_controller(checkpoint_dir)
 
-    _save_storage_checkpoint(_manager(storage_root, source_store), str(checkpoint_dir))
+    _save_storage_checkpoint(_manager(source_store), str(checkpoint_dir))
 
-    manifest = json.loads(
-        (checkpoint_dir / "mooncake_storage" / "manifest.json").read_text()
-    )
-    assert [entry["key"] for entry in manifest["objects"]] == sorted(payloads)
+    manifest = _manifest(checkpoint_dir)
+    assert manifest["version"] == 2
+    assert sorted(
+        path.name for path in (checkpoint_dir / "mooncake_storage").iterdir()
+    ) == [
+        "manifest.json",
+        "objects.bin",
+    ]
+    assert source_store.saved_gets == sorted(payloads)
+    assert source_store.registered == {}
+    assert _saved_payloads(checkpoint_dir) == payloads
+    offset = 0
+    for entry in manifest["objects"]:
+        value = payloads[entry["key"]]
+        assert entry == {
+            "key": entry["key"],
+            "offset": offset,
+            "size": len(value),
+            "sha256": hashlib.sha256(value).hexdigest(),
+        }
+        offset += len(value)
 
-    restored_store = _FakeStore(live_root, {})
-    _load_storage_checkpoint(
-        _manager(storage_root, restored_store), str(checkpoint_dir)
-    )
+    restored_store = _FakeStore({})
+    _load_storage_checkpoint(_manager(restored_store), str(checkpoint_dir))
+
     assert restored_store.objects == payloads
     assert restored_store.mapped_upserts == sorted(payloads)
-    assert restored_store.registered == set()
+    assert restored_store.registered == {}
+
+
+def test_save_rejects_a_missing_mooncake_object(tmp_path: Path) -> None:
+    payloads = _payloads()
+    payloads.pop("1@tokens")
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    _write_controller(checkpoint_dir)
+
+    with pytest.raises(RuntimeError, match="positive size.*'1@tokens'"):
+        _save_storage_checkpoint(_manager(_FakeStore(payloads)), str(checkpoint_dir))
+
+
+def test_save_rejects_a_short_get_and_unregisters_the_buffer(tmp_path: Path) -> None:
+    payloads = _payloads()
+    store = _ShortGetStore(payloads, "0@tokens:c0")
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    _write_controller(checkpoint_dir)
+
+    with pytest.raises(RuntimeError):
+        _save_storage_checkpoint(_manager(store), str(checkpoint_dir))
+
+    assert store.registered == {}
+
+
+def test_save_quarantines_a_buffer_when_unregister_fails(
+    tmp_path: Path,
+    quarantined_buffers: list[Any],
+) -> None:
+    store = _FakeStore(_payloads(), unregister_result=-1)
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    _write_controller(checkpoint_dir)
+
+    with pytest.raises(RuntimeError, match="buffer cleanup failed"):
+        _save_storage_checkpoint(_manager(store), str(checkpoint_dir))
+
+    assert len(quarantined_buffers) == 1
+    assert quarantined_buffers[0].closed is False
+    pointer, size = next(iter(store.registered.items()))
+    assert ctypes.string_at(pointer, size) == _payloads()["0@router_indices"]
 
 
 def test_restore_rejects_a_corrupt_payload(tmp_path: Path) -> None:
-    storage_root = tmp_path / "storage"
-    payloads = {
-        "0@router_indices": b"router",
-        "0@tokens:c0": b"token-chunk-0",
-        "0@tokens:c1": b"token-chunk-1",
-        "1@metadata": b"pickled non-tensor bytes",
-        "1@tokens": b"tokens",
-    }
     checkpoint_dir = tmp_path / "checkpoint"
     checkpoint_dir.mkdir()
     _write_controller(checkpoint_dir)
-    _save_storage_checkpoint(
-        _manager(storage_root, _FakeStore(storage_root / "live", payloads)),
-        str(checkpoint_dir),
-    )
-    first_payload = next((checkpoint_dir / "mooncake_storage" / "objects").iterdir())
-    first_payload.write_bytes(b"corrupt")
+    _save_storage_checkpoint(_manager(_FakeStore(_payloads())), str(checkpoint_dir))
+    _corrupt_first_object(checkpoint_dir)
 
     with pytest.raises(ValueError, match="Corrupt Mooncake checkpoint payload"):
-        _load_storage_checkpoint(
-            _manager(storage_root, _FakeStore(storage_root / "live", {})),
-            str(checkpoint_dir),
-        )
+        _load_storage_checkpoint(_manager(_FakeStore({})), str(checkpoint_dir))
 
 
-def test_save_rejects_storage_root_inside_checkpoint_destination(
+def test_restore_rechecks_the_bytes_loaded_after_manifest_validation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    destination = tmp_path / "checkpoint"
-    checkpoint_tmp = tmp_path / "checkpoint.tmp"
-    checkpoint_tmp.mkdir()
-    _write_controller(checkpoint_tmp)
-    storage_root = destination / "active-storage"
-    store = _FakeStore(storage_root / "live", {})
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    _write_controller(checkpoint_dir)
+    _save_storage_checkpoint(_manager(_FakeStore(_payloads())), str(checkpoint_dir))
+    original_load_manifest = checkpoint_plugin._load_manifest
 
-    with pytest.raises(ValueError, match="inside the TQ checkpoint destination"):
-        _save_storage_checkpoint(_manager(storage_root, store), str(checkpoint_tmp))
+    def load_manifest_then_corrupt(checkpoint_root: Path) -> Any:
+        result = original_load_manifest(checkpoint_root)
+        _corrupt_first_object(checkpoint_dir)
+        return result
 
+    monkeypatch.setattr(checkpoint_plugin, "_load_manifest", load_manifest_then_corrupt)
 
-def test_disk_wait_rejects_distinct_keys_with_the_same_path(tmp_path: Path) -> None:
-    live_root = tmp_path / "live"
-    store = _FakeStore(live_root, {"key-a": b"a", "key-b": b"b"})
-    store.paths["key-b"] = store.paths["key-a"]
-
-    with pytest.raises(RuntimeError, match="distinct keys to the same DISK path"):
-        _wait_for_disk_objects(
-            store,
-            ["key-a", "key-b"],
-            live_root=live_root,
-            timeout_s=1.0,
-            poll_interval_s=0.001,
-        )
+    with pytest.raises(ValueError, match="Corrupt Mooncake checkpoint payload"):
+        _load_storage_checkpoint(_manager(_FakeStore({})), str(checkpoint_dir))
 
 
 def test_restore_rejects_a_different_gdr_layout(tmp_path: Path) -> None:
-    storage_root = tmp_path / "storage"
     checkpoint_dir = tmp_path / "checkpoint"
     checkpoint_dir.mkdir()
     _write_controller(checkpoint_dir)
-    payloads = {key: key.encode() for key in _physical_keys(_controller_state())}
-    _save_storage_checkpoint(
-        _manager(storage_root, _FakeStore(storage_root / "live", payloads)),
-        str(checkpoint_dir),
-    )
-    restore_manager = _manager(storage_root, _FakeStore(storage_root / "live", {}))
+    _save_storage_checkpoint(_manager(_FakeStore(_payloads())), str(checkpoint_dir))
+    restore_manager = _manager(_FakeStore({}))
     restore_manager.config["use_gdr"] = True
 
     with pytest.raises(ValueError, match="storage layout does not match"):
         _load_storage_checkpoint(restore_manager, str(checkpoint_dir))
 
 
-def test_master_command_enables_direct_disk_without_offload(tmp_path: Path) -> None:
-    command = _master_command(
-        executable="/opt/mooncake_master",
-        metadata_server="10.0.0.1:50050",
-        master_server_address="10.0.0.1:50051",
-        live_root=tmp_path / "live",
-        session_id="session-1",
-    )
-    assert f"--root_fs_dir={tmp_path / 'live'}" in command
-    assert "--cluster_id=session-1" in command
-    assert "--enable_disk_eviction=false" in command
-    assert "--enable_offload=false" in command
-    assert not any(argument.startswith("--offload_on_evict") for argument in command)
+def test_restore_requires_a_clean_mooncake_store(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    _write_controller(checkpoint_dir)
+    _save_storage_checkpoint(_manager(_FakeStore(_payloads())), str(checkpoint_dir))
+
+    with pytest.raises(RuntimeError, match="requires a clean store"):
+        _load_storage_checkpoint(
+            _manager(_FakeStore({"0@router_indices": b"stale"})),
+            str(checkpoint_dir),
+        )
 
 
-def test_installed_put_fence_waits_for_the_clients_disk_replica(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_restore_quarantines_a_buffer_when_unregister_fails(
+    tmp_path: Path,
+    quarantined_buffers: list[Any],
+) -> None:
+    payloads = _payloads()
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    _write_controller(checkpoint_dir)
+    _save_storage_checkpoint(_manager(_FakeStore(payloads)), str(checkpoint_dir))
+    store = _FakeStore({}, unregister_result=-1)
+
+    with pytest.raises(RuntimeError, match="buffer cleanup failed"):
+        _load_storage_checkpoint(_manager(store), str(checkpoint_dir))
+
+    assert len(quarantined_buffers) == 1
+    assert quarantined_buffers[0].closed is False
+    pointer, size = next(iter(store.registered.items()))
+    assert ctypes.string_at(pointer, size) == payloads["0@router_indices"]
+
+
+def test_plugin_install_does_not_change_the_normal_put_path(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from transfer_queue.storage.clients import mooncake_client
     from transfer_queue.storage.managers.base import StorageManagerFactory
 
-    calls: list[tuple[str, list[str]]] = []
-
-    def original_upsert(
-        _client: Any, keys: list[str], _pointers: list[int], _sizes: list[int]
-    ) -> None:
-        calls.append(("upsert", keys))
-
-    def wait_for_disk(_store: Any, keys: list[str], **_kwargs: Any) -> list[Any]:
-        calls.append(("wait", keys))
-        return []
-
-    monkeypatch.setattr(
-        mooncake_client.MooncakeStoreClient,
-        "_batch_upsert_with_retry",
-        original_upsert,
-    )
+    original_upsert = mooncake_client.MooncakeStoreClient._batch_upsert_with_retry
     monkeypatch.setitem(
         StorageManagerFactory._registry,
         "MooncakeStore",
         StorageManagerFactory._registry["MooncakeStore"],
     )
-    monkeypatch.setattr(checkpoint_plugin, "_wait_for_disk_objects", wait_for_disk)
+
     install_tq_mooncake_checkpoint_plugin()
 
-    storage_root = tmp_path / "storage"
-    fake_client = SimpleNamespace(
-        config={
-            "checkpoint": {
-                "enabled": True,
-                "storage_root": str(storage_root),
-                "durability_timeout_s": 1.0,
-                "poll_interval_s": 0.001,
-            }
-        },
-        _store=object(),
+    assert (
+        mooncake_client.MooncakeStoreClient._batch_upsert_with_retry is original_upsert
     )
-    mooncake_client.MooncakeStoreClient._batch_upsert_with_retry(
-        fake_client, ["0@tokens"], [1], [6]
-    )
-    assert calls == [("upsert", ["0@tokens"]), ("wait", ["0@tokens"])]
 
 
-def test_installed_manager_dispatches_storage_save_and_load(
+def test_installed_manager_dispatches_explicit_storage_save_and_load(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from transfer_queue.storage.managers.base import StorageManagerFactory

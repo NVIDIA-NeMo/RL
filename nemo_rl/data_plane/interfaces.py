@@ -37,10 +37,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, TypedDict
+from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 from tensordict import TensorDict
 
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
@@ -62,29 +61,13 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
 
 
 class MooncakeCheckpointConfig(BaseModel, extra="allow"):
-    """Opt-in durable storage for TQ's Mooncake backend.
+    """Opt in to explicit TQ storage checkpoints for Mooncake.
 
-    ``storage_root`` must be a shared filesystem visible at the same absolute
-    path on every node, and must not be placed inside the TQ checkpoint
-    destination. Checkpoint-enabled Mooncake PUTs wait for their direct DISK
-    replica, so enabling this trades write latency for restart durability.
+    Normal PUTs remain memory-only. Payload transfer to durable storage starts
+    only when the caller invokes ``tq.save_checkpoint``.
     """
 
     enabled: bool = False
-    storage_root: str | None = None
-    durability_timeout_s: Annotated[float, Field(gt=0)] = 300.0
-    poll_interval_s: Annotated[float, Field(gt=0)] = 0.1
-
-    @model_validator(mode="after")
-    def validate_storage_root(self) -> MooncakeCheckpointConfig:
-        if self.enabled and (
-            not self.storage_root or not Path(self.storage_root).is_absolute()
-        ):
-            raise ValueError(
-                "checkpoint.storage_root must be an absolute shared-filesystem "
-                "path when Mooncake checkpointing is enabled"
-            )
-        return self
 
 
 class MooncakeCpuConfig(BaseModel, extra="allow"):
