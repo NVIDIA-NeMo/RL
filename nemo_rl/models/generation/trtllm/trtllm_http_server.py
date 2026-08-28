@@ -201,6 +201,14 @@ def _parse_disaggregated_params(raw: Optional[dict[str, Any]]) -> tuple[Any, boo
     return to_llm_disaggregated_params(wire), return_b64
 
 
+def _tokenizer_backend_name(tokenizer: Any) -> str:
+    """Return the concrete backend that performs encode/decode operations."""
+    backend = getattr(tokenizer, "_tokenizer", None)
+    implementation = backend if backend is not None else tokenizer
+    implementation_type = type(implementation)
+    return f"{implementation_type.__module__}.{implementation_type.__name__}"
+
+
 def _context_leg_response(
     model_name: str,
     prompt_token_ids: list[int],
@@ -575,7 +583,6 @@ def create_app(
             stop_token_ids=stop_token_ids,
             max_tokens=max_tokens,
         )
-
         try:
             _conv_params = None
             if _conv_id:
