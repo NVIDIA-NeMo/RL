@@ -2619,6 +2619,16 @@ def _postprocess_single_nemo_gym_group(
         reward_penalty_config, tokenizer, thinking_tags=thinking_tags
     )
     penalty_counts = apply_reward_penalties(results, resolved_reward_penalty_config)
+    shared_genrm_metrics = (
+        "reward_score_raw",  # Selected score source before length/style shaping.
+        "reward_rubric_mean_clean",  # Rubric mean, omitted when any rubric comparison failed.
+        "reward_overall_raw",  # GenRM overall score before shaping.
+        "reward_overall_len_adjusted",  # Overall score after length/style shaping.
+        "reward_length_adjustment",  # Difference between adjusted and raw overall scores.
+        "genrm_parse_failure_rate_per_group",  # Overall-score parse failures.
+        "genrm_rubric_parse_failure_rate_per_group",  # Rubric-score parse failures.
+        "genrm_api_error_rate_per_group",  # GenRM request failures.
+    )
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
@@ -2660,17 +2670,33 @@ def _postprocess_single_nemo_gym_group(
                     ),
                     default=0,
                 ),
+                "reasoning_tokens": sum(
+                    m["reasoning_token_count"]
+                    for m in r["message_log"]
+                    if "reasoning_token_count" in m
+                ),
+                "response_tokens": sum(
+                    m["response_token_count"]
+                    for m in r["message_log"]
+                    if "response_token_count" in m
+                ),
+                "token_split_valid": all(
+                    "reasoning_token_count" in m and "response_token_count" in m
+                    for m in r["message_log"]
+                    if m["role"] == "assistant"
+                ),
             }
             for r in results
         ]
-
     # Aggregate metrics across all samples
     with timer.time(f"{timer_prefix}/aggregate_metrics"):
         turn_counts = [m["turn_count"] for m in all_sample_metrics]
         max_gen_tokens_per_turn_values = [
             m["max_gen_tokens_per_turn"] for m in all_sample_metrics
         ]
-
+        valid_token_splits = [m for m in all_sample_metrics if m["token_split_valid"]]
+        reasoning_token_values = [m["reasoning_tokens"] for m in valid_token_splits]
+        response_token_values = [m["response_tokens"] for m in valid_token_splits]
         rollout_metrics = {
             **calculate_single_metric(
                 turn_counts,
@@ -2706,6 +2732,8 @@ def _postprocess_single_nemo_gym_group(
             / batch_size,
             "truncation_rate": sum(m["hit_max_tokens"] for m in all_sample_metrics)
             / batch_size,
+            "reasoning_response_token_split_failure_rate": 1
+            - len(valid_token_splits) / batch_size,
             # TODO enable this metric. We don't have a clear handle on which tokens are user or tool role.
             # We would probably need to re-tokenize the messages post-hoc to kind of figure this out.
             # "mean_env_tokens_per_sample": sum(
@@ -2713,6 +2741,24 @@ def _postprocess_single_nemo_gym_group(
             # )
             # / batch_size,
         }
+        for key, values in (
+            ("reasoning_tokens_per_sample", reasoning_token_values),
+            ("response_tokens_per_sample", response_token_values),
+        ):
+            if values:
+                rollout_metrics.update(calculate_single_metric(values, len(values), key))
+                rollout_metrics[f"{key}/p05"] = pct(values, 5)
+                rollout_metrics[f"{key}/p95"] = pct(values, 95)
+        for key in shared_genrm_metrics:
+            values = [
+                float(result["full_result"][key])
+                for result in results
+                if isinstance(result["full_result"].get(key), (bool, int, float))
+            ]
+            if values:
+                rollout_metrics.update(
+                    calculate_single_metric(values, len(values), key)
+                )
 
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
@@ -2725,8 +2771,10 @@ def _postprocess_single_nemo_gym_group(
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
-            keys = agent_results[0].keys()
+            keys = set().union(*(result.keys() for result in agent_results))
             for key in keys:
+                if key in shared_genrm_metrics:
+                    continue
                 values = [
                     float(r[key])
                     for r in agent_results
@@ -2735,7 +2783,7 @@ def _postprocess_single_nemo_gym_group(
                 if values:
                     per_agent_metrics.update(
                         calculate_single_metric(
-                            values, len(agent_results), f"{agent_name}/{key}"
+                            values, len(values), f"{agent_name}/{key}"
                         )
                     )
 

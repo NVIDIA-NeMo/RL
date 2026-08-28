@@ -75,6 +75,44 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
 
+def _reasoning_response_token_counts(
+    prompt_token_ids: list[int],
+    generation_token_ids: list[int],
+    think_open_token_id: int,
+    think_close_token_id: int,
+    think_prefill_suffix_token_ids: list[int] | None = None,
+) -> tuple[int, int] | None:
+    """Split sampled tokens without decode/retokenize; return None for ambiguous tags."""
+    if think_open_token_id == think_close_token_id:
+        return None
+
+    generation_has_open_tag = think_open_token_id in generation_token_ids
+    generation_close_tag_indices = [
+        i
+        for i, token_id in enumerate(generation_token_ids)
+        if token_id == think_close_token_id
+    ]
+
+    # Only the configured chat-template suffix starts reasoning; other tags are content.
+    prefill_suffix = think_prefill_suffix_token_ids or [think_open_token_id]
+    starts_in_thinking = len(prompt_token_ids) >= len(prefill_suffix) and (
+        prompt_token_ids[-len(prefill_suffix) :] == prefill_suffix
+    )
+    if starts_in_thinking and not generation_has_open_tag:
+        if not generation_close_tag_indices:
+            # A truncated generation without ``</think>`` is entirely reasoning.
+            return len(generation_token_ids), 0
+        if len(generation_close_tag_indices) == 1:
+            # The closing tag belongs to reasoning; later tokens are the response.
+            reasoning_tokens = generation_close_tag_indices[0] + 1
+            return reasoning_tokens, len(generation_token_ids) - reasoning_tokens
+    # Unexpected generated thinking tags make the split ambiguous.
+    if generation_has_open_tag or generation_close_tag_indices:
+        return None
+    # Without a structural prefill or generated tags, everything is response text.
+    return 0, len(generation_token_ids)
+
+
 class NemoGymCompatibleConfig(Protocol):
     """Configuration fields required to select the NeMo Gym rollout path."""
 
@@ -238,6 +276,7 @@ class NemoGymConfig(TypedDict):
     thinking_tags: NotRequired[
         List[str] | None
     ]  # Thinking tags to check for malformed usage
+    thinking_prefill_suffix: NotRequired[str | None]
     require_routed_experts: NotRequired[
         bool
     ]  # Require Gym output items to carry R3 routed_experts
@@ -761,7 +800,8 @@ Depending on your data shape, you may want to change these values."""
 
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
-            "host": "0.0.0.0",
+            # Remote RLHF workers need a routable address, not 0.0.0.0.
+            "host": self.node_ip,
             "port": self.head_server_port,
         }
 
@@ -990,6 +1030,23 @@ Depending on your data shape, you may want to change these values."""
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         batch_decode_items = []
+        thinking_tags = self.cfg.get("thinking_tags") or DEFAULT_THINKING_TAGS
+        think_token_ids = [
+            tokenizer.encode(tag, add_special_tokens=False) for tag in thinking_tags[:2]
+        ]
+        thinking_prefill_suffix = self.cfg.get("thinking_prefill_suffix")
+        thinking_prefill_suffix_token_ids = (
+            tokenizer.encode(thinking_prefill_suffix, add_special_tokens=False)
+            if thinking_prefill_suffix
+            else []
+        )
+        # Missing or invalid template metadata disables the split rather than guessing.
+        can_split_thinking = (
+            len(think_token_ids) == 2
+            and all(len(token_ids) == 1 for token_ids in think_token_ids)
+            and bool(thinking_prefill_suffix_token_ids)
+            and thinking_prefill_suffix_token_ids[0] == think_token_ids[0][0]
+        )
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -1104,6 +1161,20 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 "is_invalid_tool_call": is_invalid_tool_call,
                 "has_malformed_thinking": has_malformed_thinking,
             }
+            if can_split_thinking:
+                token_counts = _reasoning_response_token_counts(
+                    prompt_token_ids,
+                    generation_token_ids,
+                    think_token_ids[0][0],
+                    think_token_ids[1][0],
+                    thinking_prefill_suffix_token_ids,
+                )
+                if token_counts is not None:
+                    # Ambiguous tag layouts omit counts and are tracked as split failures.
+                    (
+                        assistant_message["reasoning_token_count"],
+                        assistant_message["response_token_count"],
+                    ) = token_counts
             if routed_experts is not None:
                 assistant_message["routed_experts"] = routed_experts[
                     generation_start:generation_end
@@ -1331,6 +1402,7 @@ def spinup_nemo_gym_actor(
     # (where the detector reads them), not part of Gym's global config.
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+    thinking_prefill_suffix = nemo_gym_dict.pop("thinking_prefill_suffix", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     # Same treatment for the multimodal knobs: NemoGymConfig declares them as
@@ -1356,6 +1428,7 @@ def spinup_nemo_gym_actor(
         base_urls=base_urls,
         invalid_tool_call_patterns=invalid_tool_call_patterns,
         thinking_tags=thinking_tags,
+        thinking_prefill_suffix=thinking_prefill_suffix,
         tokenizer_config=tokenizer_config,
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,

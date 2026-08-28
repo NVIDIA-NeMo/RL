@@ -2064,7 +2064,7 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
         {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
     ]
     results = []
-    for reward in (1.0, 2.0):
+    for index, reward in enumerate((1.0, 2.0)):
         input_message = {
             "role": "user",
             "content": "prompt",
@@ -2080,9 +2080,21 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
                         "content": "answer",
                         "token_ids": torch.tensor([2]),
                         "generation_logprobs": torch.tensor([-0.1]),
+                        "reasoning_token_count": index,
+                        "response_token_count": 1,
                     },
                 ],
-                "full_result": {"reward": reward},
+                "full_result": {
+                    "reward": reward,
+                    "reward_score_raw": reward,
+                    "reward_rubric_mean_clean": reward if index == 0 else None,
+                    "reward_overall_raw": reward,
+                    "reward_overall_len_adjusted": reward + 0.1,
+                    "reward_length_adjustment": 0.1,
+                    "genrm_parse_failure_rate_per_group": 0.0,
+                    "genrm_rubric_parse_failure_rate_per_group": 0.5,
+                    "genrm_api_error_rate_per_group": 0.0,
+                },
             }
         )
 
@@ -2103,6 +2115,25 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
 
     assert rollout_result.task_index == 42
     assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
+    assert rollout_result.rollout_metrics["reward_score_raw/mean"] == 1.5
+    assert rollout_result.rollout_metrics["reasoning_tokens_per_sample/mean"] == 0.5
+    assert rollout_result.rollout_metrics["reasoning_tokens_per_sample/p05"] == 0.0
+    assert rollout_result.rollout_metrics["reasoning_tokens_per_sample/p95"] == 1.0
+    assert rollout_result.rollout_metrics["response_tokens_per_sample/mean"] == 1.0
+    assert (
+        rollout_result.rollout_metrics[
+            "reasoning_response_token_split_failure_rate"
+        ]
+        == 0.0
+    )
+    assert rollout_result.rollout_metrics["reward_rubric_mean_clean/mean"] == 1.0
+    assert rollout_result.rollout_metrics["reward_overall_raw/mean"] == 1.5
+    assert rollout_result.rollout_metrics["reward_overall_len_adjusted/mean"] == pytest.approx(1.6)
+    assert rollout_result.rollout_metrics["reward_length_adjustment/mean"] == 0.1
+    assert (
+        rollout_result.rollout_metrics["genrm_rubric_parse_failure_rate_per_group/mean"]
+        == 0.5
+    )
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
