@@ -15,6 +15,8 @@
 """Tests for canonical Transformer Engine MXFP8 source storage extraction."""
 
 from collections.abc import Mapping
+from types import ModuleType
+import sys
 
 import pytest
 import torch
@@ -34,8 +36,30 @@ class DType:
         return "DType.kFloat8E4M3"
 
 
-DType.__module__ = "transformer_engine_torch"
 PINNED_TE_E4M3 = DType()
+DType.__module__ = "transformer_engine_torch"
+DType.kFloat8E4M3 = PINNED_TE_E4M3
+
+
+class ForgedDType:
+    """Matches the old structural predicate without being the TE binding."""
+
+    def __str__(self) -> str:
+        return "DType.kFloat8E4M3"
+
+
+ForgedDType.__module__ = "transformer_engine_torch"
+ForgedDType.__name__ = "DType"
+FORGED_TE_E4M3 = ForgedDType()
+
+
+@pytest.fixture(autouse=True)
+def transformer_engine_torch_binding(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    """Install the minimal pinned TE enum binding only while a test executes."""
+    module = ModuleType("transformer_engine_torch")
+    module.DType = DType
+    monkeypatch.setitem(sys.modules, "transformer_engine_torch", module)
+    return module
 
 
 class FakeMXFP8Tensor:
@@ -215,6 +239,7 @@ def test_extract_native_mxfp8_components_does_not_fall_back_to_columnwise_storag
         ),
         (_source(with_gemm_swizzled_scales=True), "compact rowwise scales"),
         (_source(with_gemm_swizzled_scales=None), "compact rowwise scales"),
+        (_source(fp8_dtype=FORGED_TE_E4M3), "fp8_dtype"),
         (_source(fp8_dtype="DType.kFloat8E4M3"), "fp8_dtype"),
         (_source(fp8_dtype="DType.kFloat8E5M2"), "E4M3"),
         (_source(fp8_dtype="DType.kFloat8E4M3-compatible"), "fp8_dtype"),
@@ -237,10 +262,23 @@ def test_extract_native_mxfp8_components_rejects_missing_fp8_dtype() -> None:
         extract_native_mxfp8_components(source)
 
 
-def test_extract_native_mxfp8_components_accepts_pinned_te_e4m3_dtype() -> None:
+def test_extract_native_mxfp8_components_accepts_pinned_te_e4m3_dtype(
+    transformer_engine_torch_binding: ModuleType,
+) -> None:
+    assert transformer_engine_torch_binding.DType.kFloat8E4M3 is PINNED_TE_E4M3
+
     result = extract_native_mxfp8_components(_source(fp8_dtype=PINNED_TE_E4M3))
 
     assert result.weight.dtype == torch.float8_e4m3fn
+
+
+def test_extract_native_mxfp8_components_requires_te_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delitem(sys.modules, "transformer_engine_torch")
+
+    with pytest.raises(ValueError, match="transformer_engine_torch"):
+        extract_native_mxfp8_components(_source())
 
 
 def test_extract_native_mxfp8_components_rejects_object_without_metadata_api() -> None:
