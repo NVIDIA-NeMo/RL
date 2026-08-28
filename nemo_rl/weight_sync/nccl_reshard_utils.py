@@ -37,7 +37,10 @@ import torch
 from torch.distributed._tensor import Shard
 from torch.distributed.tensor.placement_types import Replicate
 
-from nemo_rl.weight_sync.refit_components import normalize_refit_components
+from nemo_rl.weight_sync.refit_components import (
+    component_plan_digest,
+    normalize_refit_components,
+)
 
 # =========================================================================
 # MeshInfo — lightweight mesh wrapper type
@@ -328,6 +331,7 @@ def restore_refit_info_placements(refit_info: dict) -> dict:
     ``xferdtensor`` (which relies on ``isinstance(p, Shard)``) works
     correctly.  Idempotent — safe to call on already-restored ``refit_info``.
     """
+    received_plan_digest = refit_info.get("plan_digest")
     for layer_name in refit_info.get("layer_names", []):
         for param_info in refit_info.get("per_layer_params", {}).get(layer_name, []):
             param_info["src_placements"] = [
@@ -349,6 +353,14 @@ def restore_refit_info_placements(refit_info: dict) -> dict:
                         if not isinstance(mesh_tensor, torch.Tensor):
                             mesh_tensor = torch.tensor(mesh_tensor)
                         param_info[key] = MeshInfo(mesh_tensor)
+    if received_plan_digest is not None:
+        recomputed_plan_digest = component_plan_digest(refit_info)
+        if received_plan_digest != recomputed_plan_digest:
+            raise ValueError(
+                "refit plan digest mismatch: "
+                f"received={received_plan_digest}, "
+                f"recomputed={recomputed_plan_digest}"
+            )
     return refit_info
 
 
