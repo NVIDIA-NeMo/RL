@@ -126,6 +126,74 @@ async def _aligned_checkpoint_engine_batches(
         yield aligned
 
 
+async def _load_checkpoint_engine_weights(
+    worker: "SGLangCheckpointEngineMixin",
+) -> bool:
+    """Drain every checkpoint engine and push the batches into SGLang.
+
+    Deliberately a module-level coroutine rather than a method: Ray flips an
+    actor into asyncio mode when *any* member of the class is a coroutine
+    function (``has_async_methods`` walks the MRO), and inside that event loop
+    the ``asyncio.run`` below raises. Keeping the loop off
+    ``SGLangCheckpointEngineMixin`` leaves ``SGLangGenerationWorker`` a threaded
+    actor, which is what every one of its other RPCs was written against.
+    """
+    loaded_batches = 0
+    loaded_tensors = 0
+    loaded_bytes = 0
+    start_time = time.time()
+
+    async for typed_batches in _aligned_checkpoint_engine_batches(
+        worker.checkpoint_engines
+    ):
+        serialized_by_dtype, keepalive_buckets = (
+            worker._serialize_checkpoint_engine_batches(typed_batches)
+        )
+        for serialized_named_tensors in serialized_by_dtype:
+            result = worker.update_weights_from_tensor(
+                serialized_named_tensors=serialized_named_tensors,
+                load_format="flattened_bucket",
+                flush_cache=False,
+                weight_version=str(
+                    getattr(worker, "_checkpoint_engine_weight_version", 0) + 1
+                ),
+            )
+            if result is not None and not result.get("success", True):
+                error = result.get("error_message") or result.get(
+                    "message", "unknown error"
+                )
+                raise RuntimeError(f"SGLang checkpoint-engine refit failed: {error}")
+
+        loaded_batches += 1
+        loaded_tensors += sum(len(batch) for batch in typed_batches)
+        loaded_bytes += sum(
+            tensor.nbytes for batch in typed_batches for _name, tensor in batch
+        )
+        del typed_batches, serialized_by_dtype, keepalive_buckets
+
+    if loaded_tensors == 0:
+        # Every receiver drained empty. Bumping the weight version and
+        # reporting success here would let a sender that shipped nothing look
+        # like a completed refit, and the run would keep rolling out on stale
+        # weights with no error pointing at why.
+        raise RuntimeError(
+            "SGLang checkpoint-engine refit received no tensors from any "
+            "checkpoint engine; the policy side sent nothing."
+        )
+
+    worker._checkpoint_engine_weight_version = (
+        getattr(worker, "_checkpoint_engine_weight_version", 0) + 1
+    )
+    total_time = time.time() - start_time
+    print(
+        "[SGLang refit] Loaded "
+        f"{loaded_tensors} rank-local tensors in {loaded_batches} batches via "
+        f"checkpoint engine; bytes={loaded_bytes / 1024**3:.2f}GiB "
+        f"total={total_time:.2f}s"
+    )
+    return True
+
+
 class SGLangCheckpointEngineMixin:
     """Receive checkpoint-engine batches and hand them to SGLang via CUDA IPC."""
 
@@ -174,6 +242,11 @@ class SGLangCheckpointEngineMixin:
                 "shard_expert_weights=true; use full-weight MoE refit instead."
             )
         if getattr(self, "checkpoint_engines", None) is not None:
+            # Receivers are built once and reused for the actor's lifetime.
+            # Engine fault tolerance (#3613) restarts a dead SGLang engine and
+            # rejoins it mid-run; after such a restart these cached receivers
+            # would hold stale NIXL registrations and rank state, so that work
+            # needs a reset hook here rather than this early return.
             return
 
         from nemo_rl.models.generation.sglang.utils.train_utils import (
@@ -258,57 +331,8 @@ class SGLangCheckpointEngineMixin:
             serialized_by_dtype.append(rank_payloads)
         return serialized_by_dtype, keepalive_buckets
 
-    async def _update_weights_from_checkpoint_engine_async(self) -> bool:
-        loaded_batches = 0
-        loaded_tensors = 0
-        loaded_bytes = 0
-        start_time = time.time()
-
-        async for typed_batches in _aligned_checkpoint_engine_batches(
-            self.checkpoint_engines
-        ):
-            serialized_by_dtype, keepalive_buckets = (
-                self._serialize_checkpoint_engine_batches(typed_batches)
-            )
-            for serialized_named_tensors in serialized_by_dtype:
-                result = self.update_weights_from_tensor(
-                    serialized_named_tensors=serialized_named_tensors,
-                    load_format="flattened_bucket",
-                    flush_cache=False,
-                    weight_version=str(
-                        getattr(self, "_checkpoint_engine_weight_version", 0) + 1
-                    ),
-                )
-                if result is not None and not result.get("success", True):
-                    error = result.get("error_message") or result.get(
-                        "message", "unknown error"
-                    )
-                    raise RuntimeError(
-                        f"SGLang checkpoint-engine refit failed: {error}"
-                    )
-
-            loaded_batches += 1
-            loaded_tensors += sum(len(batch) for batch in typed_batches)
-            loaded_bytes += sum(
-                tensor.nbytes for batch in typed_batches for _name, tensor in batch
-            )
-            del typed_batches, serialized_by_dtype, keepalive_buckets
-
-        self._checkpoint_engine_weight_version = (
-            getattr(self, "_checkpoint_engine_weight_version", 0) + 1
-        )
-        self.invalidate_kv_cache()
-        total_time = time.time() - start_time
-        print(
-            "[SGLang refit] Loaded "
-            f"{loaded_tensors} rank-local tensors in {loaded_batches} batches via "
-            f"checkpoint engine; bytes={loaded_bytes / 1024**3:.2f}GiB "
-            f"total={total_time:.2f}s"
-        )
-        return True
-
     def update_weights_from_checkpoint_engine(self) -> bool:
-        return asyncio.run(self._update_weights_from_checkpoint_engine_async())
+        return asyncio.run(_load_checkpoint_engine_weights(self))
 
     def finalize_checkpoint_engine(self) -> None:
         for checkpoint_engine in getattr(self, "checkpoint_engines", []):

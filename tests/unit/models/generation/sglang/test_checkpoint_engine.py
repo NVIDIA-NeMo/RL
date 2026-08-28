@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -23,8 +24,13 @@ import torch
 from nemo_rl.models.generation.sglang.checkpoint_engine import (
     SGLangCheckpointEngineMixin,
     _aligned_checkpoint_engine_batches,
+    _load_checkpoint_engine_weights,
     _validate_rank_batches,
 )
+
+# The message SGLang's scheduler asserts with at the pinned rev when a tensor
+# update arrives outside a weight-update session.
+_NO_SESSION = "update_weights_from_tensor requires an open begin_weight_update session"
 
 
 class _Worker(SGLangCheckpointEngineMixin):
@@ -34,17 +40,33 @@ class _Worker(SGLangCheckpointEngineMixin):
         self.base_gpu_id = 0
         self.node_rank = 0
         self.update_calls = []
-        self.invalidated = False
+        self.weight_update_in_progress = False
 
     def _to_local_gpu_id(self, gpu_id):
         return gpu_id
 
+    def begin_weight_update(self):
+        self.weight_update_in_progress = True
+
+    def end_weight_update(self):
+        self.weight_update_in_progress = False
+
     def update_weights_from_tensor(self, **kwargs):
+        # Models the pinned rev's own gate rather than rubber-stamping the
+        # call: a transfer that escapes the session fails here the way it
+        # would against a real server.
+        assert self.weight_update_in_progress, _NO_SESSION
         self.update_calls.append(kwargs)
         return {"success": True}
 
-    def invalidate_kv_cache(self):
-        self.invalidated = True
+
+def _refit(worker):
+    """Run one refit the way the synchronizer does -- inside the session."""
+    worker.begin_weight_update()
+    try:
+        return asyncio.run(_load_checkpoint_engine_weights(worker))
+    finally:
+        worker.end_weight_update()
 
 
 class _Engine:
@@ -161,13 +183,12 @@ def test_checkpoint_engine_update_streams_each_aligned_batch(monkeypatch):
     )
     monkeypatch.setattr(worker, "_serialize_checkpoint_engine_batches", serialize)
 
-    assert asyncio.run(worker._update_weights_from_checkpoint_engine_async())
+    assert _refit(worker)
     assert [call["serialized_named_tensors"] for call in worker.update_calls] == [
         ["a-r0", "a-r1"],
         ["b-r0", "b-r1"],
     ]
     assert [call["weight_version"] for call in worker.update_calls] == ["1", "1"]
-    assert worker.invalidated
     assert worker._checkpoint_engine_weight_version == 1
 
 
@@ -259,7 +280,7 @@ def test_checkpoint_engine_update_rejects_misaligned_stream_lengths(monkeypatch)
     )
 
     with pytest.raises(RuntimeError, match="ended with different weights"):
-        asyncio.run(worker._update_weights_from_checkpoint_engine_async())
+        _refit(worker)
 
 
 def test_checkpoint_engine_rejects_cross_node_tensor_parallelism():
@@ -390,15 +411,13 @@ def test_checkpoint_engine_update_posts_once_per_dtype_group():
         torch.device("cpu"),
     ]
 
-    assert asyncio.run(worker._update_weights_from_checkpoint_engine_async())
+    assert _refit(worker)
 
     assert len(worker.update_calls) == 2, "expected one POST per dtype group"
     for call in worker.update_calls:
         assert len(call["serialized_named_tensors"]) == 2
         assert call["load_format"] == "flattened_bucket"
         assert call["flush_cache"] is False
-    # Exactly one cache invalidation, after every dtype group has been posted.
-    assert worker.invalidated
 
 
 def test_checkpoint_engine_weight_version_advances_across_refits():
@@ -408,7 +427,7 @@ def test_checkpoint_engine_weight_version_advances_across_refits():
 
     for expected in (1, 2):
         worker.checkpoint_engines = [_Engine(batches=[[("a", torch.ones(1))]])]
-        assert asyncio.run(worker._update_weights_from_checkpoint_engine_async())
+        assert _refit(worker)
         assert worker._checkpoint_engine_weight_version == expected
         assert worker.update_calls[-1]["weight_version"] == str(expected)
 
@@ -474,3 +493,66 @@ def test_checkpoint_engine_payload_index_matches_sglang_rank():
         torch.testing.assert_close(
             dict(bucket.reconstruct_tensors())["a"], torch.tensor([float(rank)])
         )
+
+
+def test_transfer_outside_a_weight_update_session_is_rejected():
+    """The double's gate has to bite, or every test above proves nothing."""
+    worker = _Worker()
+    worker.checkpoint_engines = [_Engine(batches=[[("a", torch.ones(1))]])]
+    worker._checkpoint_engine_target_devices = [torch.device("cpu")]
+
+    with pytest.raises(AssertionError, match="begin_weight_update"):
+        asyncio.run(_load_checkpoint_engine_weights(worker))
+
+
+def test_refit_rejects_a_sender_that_shipped_nothing():
+    """Zero tensors is a failed refit, not a fast one.
+
+    Reporting success here would bump the weight version and let the run keep
+    rolling out on stale weights with nothing pointing at why.
+    """
+    worker = _Worker()
+    worker.checkpoint_engines = [_Engine(batches=[])]
+    worker._checkpoint_engine_target_devices = [torch.device("cpu")]
+
+    with pytest.raises(RuntimeError, match="received no tensors"):
+        _refit(worker)
+
+    assert not hasattr(worker, "_checkpoint_engine_weight_version")
+
+
+def test_mixin_defines_no_coroutine_members():
+    """No coroutine may become a member of this mixin.
+
+    ``SGLangGenerationWorker`` mixes it in and is a ``@ray.remote`` actor. Ray
+    picks between a threaded and an asyncio actor with ``has_async_methods``,
+    which is ``inspect.getmembers(cls, is_async_func)`` over the whole MRO --
+    so one ``async def`` here flips every pre-existing worker RPC into
+    asyncio-actor semantics, and because Ray then runs *sync* methods on that
+    event loop, the ``asyncio.run`` in the refit entry point raises
+    ``asyncio.run() cannot be called from a running event loop`` on the first
+    refit. The receive loop lives at module scope for exactly that reason.
+    """
+    coroutines = [
+        name
+        for name, _member in inspect.getmembers(
+            SGLangCheckpointEngineMixin, inspect.iscoroutinefunction
+        )
+    ]
+
+    assert coroutines == [], (
+        f"{coroutines} would make SGLangGenerationWorker an asyncio actor; "
+        "keep the receive loop at module scope"
+    )
+
+
+def test_public_entry_point_drives_a_full_refit():
+    """Cover the wrapper the synchronizer actually calls, not just the loop."""
+    worker = _Worker()
+    worker.checkpoint_engines = [_Engine(batches=[[("a", torch.ones(1))]])]
+    worker._checkpoint_engine_target_devices = [torch.device("cpu")]
+    worker.begin_weight_update()
+
+    assert worker.update_weights_from_checkpoint_engine()
+    assert worker._checkpoint_engine_weight_version == 1
+    assert len(worker.update_calls) == 1
