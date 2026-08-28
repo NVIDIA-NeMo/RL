@@ -181,6 +181,9 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller
 # Token-capture (gate-authoritative) path: same SC+Gym smoke with the gate
 # custodying token lineage and the finalizer publishing training rows.
 run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
+# Two-process token-capture recovery: preserve one sealed sibling in TQ and
+# redispatch only its unfinished peer after restoring the step checkpoint.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
