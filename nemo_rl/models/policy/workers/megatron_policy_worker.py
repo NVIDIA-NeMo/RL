@@ -23,7 +23,7 @@ import time
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
+from typing import Any, Iterable, Iterator, Literal, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
 
@@ -3616,6 +3616,29 @@ class MegatronPolicyWorkerImpl(
             f"xfer_frac={_xfer_bytes / max(_tot, 1):.1%}",
             flush=True,
         )
+
+        assertion_scope = cast(
+            Literal["qwen30", "nano"] | None,
+            self.cfg["megatron_cfg"].get("native_mxfp8_storage_assertion"),
+        )
+        if assertion_scope is not None:
+            if not native_mxfp8:
+                raise ValueError(
+                    "native_mxfp8_storage_assertion requires native MXFP8 source storage"
+                )
+            from nemo_rl.models.policy.workers.native_mxfp8_inventory import (
+                assert_native_mxfp8_storage_inventory,
+            )
+
+            assert_native_mxfp8_storage_inventory(
+                native_metadata=state_dict_metadata,
+                misc_metadata=misc_meta,
+                model_scope=assertion_scope,
+                num_layers_at_end_in_bf16=cast(
+                    int,
+                    self.cfg["megatron_cfg"].get("num_layers_at_end_in_bf16", 0),
+                ),
+            )
 
         pp_size = train_parallelism.get("pp_size", 1)
         # Construct a dict[layer_name:str] -> pp_stage:int.

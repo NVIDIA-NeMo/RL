@@ -27,6 +27,14 @@ set -eoux pipefail
 # Record job-start epoch so Python can measure pre-Python overhead
 export NRL_JOB_START_EPOCH=$(date +%s.%N)
 
+# Resolve a job-scoped Ray temp root before either Ray daemon starts. The
+# submitter provides only the scratch parent because SLURM_JOB_ID is available
+# here, not when sbatch is invoked.
+if [[ -n "${RAY_TMPDIR_ROOT:-}" ]]; then
+  export RAY_TMPDIR="${RAY_TMPDIR_ROOT}/${SLURM_JOB_ID:?}"
+  mkdir -p "$RAY_TMPDIR"
+fi
+
 # Log a timestamped, seconds-since-job-start marker at each phase boundary.
 log_phase() {
   echo "[NRL_PHASE][$(date '+%Y-%m-%dT%H:%M:%S%z')][+$(( $(date +%s) - ${NRL_JOB_START_EPOCH%.*} ))s] $*"

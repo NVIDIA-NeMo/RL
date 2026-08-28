@@ -481,6 +481,17 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # Optional Megatron-Core TE quantization recipe. The first enabled matcher
+    # determines the quantization config for each provider module.
+    te_precision_config_file: NotRequired[str | None]
+    # Preserve the configured leading/trailing transformer layers in BF16 even
+    # when the TE recipe selects quantized compute for matching modules.
+    first_last_layers_bf16: NotRequired[bool]
+    num_layers_at_start_in_bf16: NotRequired[int]
+    num_layers_at_end_in_bf16: NotRequired[int]
+    # Task-owned native source smoke gate. When selected, the policy worker
+    # validates its refit metadata inventory before building the NCCL plan.
+    native_mxfp8_storage_assertion: NotRequired[Literal["qwen30", "nano"] | None]
     # Passed through to the Megatron model's freeze() method.
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.

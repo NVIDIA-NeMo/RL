@@ -4,6 +4,7 @@ checkpointing:
   checkpoint_dir: results/native_mxfp8_source_refit/qwen30-fp8param-true
 policy:
   megatron_cfg:
+    native_mxfp8_storage_assertion: qwen30
     fp8_cfg:
       fp8_param: true
 logger:

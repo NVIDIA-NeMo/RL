@@ -1071,6 +1071,21 @@ def _apply_precision_config(
     }
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
 
+    megatron_cfg = config["megatron_cfg"]
+    recipe_path = megatron_cfg.get("te_precision_config_file")
+    if recipe_path is not None:
+        from megatron.core.quantization.utils import load_quantization_recipe
+
+        model_cfg.quant_recipe = load_quantization_recipe(recipe_path)
+
+    for field in (
+        "first_last_layers_bf16",
+        "num_layers_at_start_in_bf16",
+        "num_layers_at_end_in_bf16",
+    ):
+        if field in megatron_cfg:
+            setattr(model_cfg, field, megatron_cfg[field])
+
 
 def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply performance optimization configuration."""

@@ -148,7 +148,6 @@ export HF_HOME_SOURCE=${HF_HOME}
 export HF_HOME=${LOCAL_SCRATCH}/hf-cache/${MODEL}
 export HF_DATASETS_CACHE=\${HF_HOME}/datasets
 export HUGGINGFACE_HUB_CACHE=\${HF_HOME}/hub
-export RAY_TMPDIR=${LOCAL_SCRATCH}/ray/\${SLURM_JOB_ID}
 export NEMO_RL_VENV_DIR=${LOCAL_SCRATCH}/nemo-rl-worker-cache/${SOURCE_SHA}
 export VLLM_CACHE_ROOT=${LOCAL_SCRATCH}/vllm-cache/${SOURCE_SHA}/fp8param-${FP8_PARAM}
 export TORCHINDUCTOR_CACHE_DIR=${LOCAL_SCRATCH}/inductor-cache/${SOURCE_SHA}/fp8param-${FP8_PARAM}
@@ -158,7 +157,7 @@ export UV_PYTHON_INSTALL_DIR=${LOCAL_SCRATCH}/uv-python
 export UV_LOCK_TIMEOUT=7200
 export PYTHONPATH=${REPO}
 unset UV_PROJECT_ENVIRONMENT WANDB_API_KEY
-mkdir -p "\${RAY_TMPDIR}" "\${HF_HOME}"
+mkdir -p "\${HF_HOME}"
 /opt/nemo_rl_venv/bin/python examples/run_grpo.py \\
   --config ${CONFIG} \\
   grpo.max_num_steps=${MAX_STEPS} \\
@@ -200,6 +199,7 @@ EOF
 export CONTAINER
 export MOUNTS="/lustre:/lustre,/home:/home,/raid/scratch:/raid/scratch,${WANDB_HOME}/.netrc:/root/.netrc"
 export CONTAINER_REMAP_ROOT=1
+export RAY_TMPDIR_ROOT="${LOCAL_SCRATCH}/ray"
 export COMMAND
 export SETUP_COMMAND
 export GPUS_PER_NODE=4

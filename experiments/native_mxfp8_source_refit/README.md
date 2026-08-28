@@ -21,6 +21,13 @@ and the final eight layers in BF16. Its native smoke must verify that only the
 routed-expert FC1/FC2 tensors carry E4M3 values plus E8M0 scales; attention,
 shared experts, router, QKVO, and `lm_head` remain BF16 misc entries.
 
+The native overlays enable a bounded worker-side assertion over the actual
+refit metadata. Before the NCCL refit plan is built, it emits one
+`[native-mxfp8-inventory]` JSON record and exits nonzero when the routed scope,
+BF16 catch-all scopes, component roles/dtypes, or Nano final-eight boundary do
+not match. `RAY_TMPDIR_ROOT` is exported before `ray.sub`; `ray.sub` derives
+the job-scoped scratch directory before starting the Ray head or workers.
+
 ## Environment
 
 `REPO` must be a clean source checkout under `/home`. `CONTAINER`, `HF_HOME`,

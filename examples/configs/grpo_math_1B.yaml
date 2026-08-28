@@ -316,6 +316,12 @@ policy:
       fp8_recipe: "blockwise"
       fp8_param: false
 
+    te_precision_config_file: null
+    first_last_layers_bf16: false
+    num_layers_at_start_in_bf16: 0
+    num_layers_at_end_in_bf16: 0
+    native_mxfp8_storage_assertion: null
+
     env_vars: null
 
   draft:
