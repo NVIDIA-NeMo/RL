@@ -13,13 +13,16 @@
 # limitations under the License.
 
 import copy
+import functools
 import hashlib
+import inspect
 import json
 import os
 import threading
 import time
 import warnings
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import fields, is_dataclass, replace
 from typing import Any, Callable, Optional, TypeVar
 
@@ -62,6 +65,9 @@ from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.inference.shards import build_inference_pg_collection
+from megatron.core.model_parallel_config import (
+    resolve_tensor_parallel_weight_shards,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
@@ -700,6 +706,9 @@ def setup_model_config(
     # Apply MoE settings
     _apply_moe_config(model_cfg, config)
 
+    # Apply GTP settings (after MoE, which finalizes expert_tensor_parallel_size)
+    _apply_gtp_config(model_cfg, config)
+
     # Apply MTP settings
     _apply_mtp_config(model_cfg, config)
 
@@ -911,6 +920,125 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         assert not config["megatron_cfg"].get("use_fused_linear_logprobs", False), (
             "Context Parallelism is not supported with linear CE fusion loss, please set use_fused_linear_logprobs to false"
         )
+
+
+def _apply_gtp_config(model_cfg: Any, config: PolicyConfig) -> None:
+    """Apply Generalized Tensor Parallelism (GTP) weight-shard configuration.
+
+    ``tensor_parallel_num_weight_shards`` is MCore's user-facing knob: the total
+    number of shards a weight is split into across the TP and GTP axes. GTP is
+    the quotient ``tensor_parallel_num_weight_shards // tensor_model_parallel_size``
+    and shards each weight further along dim 0, rematerializing it on demand.
+
+    The provider dataclass was already constructed by the time NeMo-RL applies
+    its settings, so ``ModelParallelConfig.__post_init__`` has already run and
+    will not re-derive the internal ``gtp_weight_remat_size``. Derive it here
+    with MCore's own reconciliation helper so the two stay consistent.
+    """
+    num_weight_shards = config["megatron_cfg"].get(
+        "tensor_parallel_num_weight_shards", None
+    )
+    expert_num_weight_shards = config["megatron_cfg"].get(
+        "expert_tensor_parallel_num_weight_shards", None
+    )
+    if num_weight_shards is None and expert_num_weight_shards is None:
+        return
+
+    (
+        model_cfg.tensor_parallel_num_weight_shards,
+        model_cfg.gtp_weight_remat_size,
+    ) = resolve_tensor_parallel_weight_shards(
+        model_cfg.tensor_model_parallel_size,
+        num_weight_shards,
+        model_cfg.gtp_weight_remat_size,
+    )
+    (
+        model_cfg.expert_tensor_parallel_num_weight_shards,
+        model_cfg.expert_gtp_weight_remat_size,
+    ) = resolve_tensor_parallel_weight_shards(
+        model_cfg.expert_tensor_parallel_size,
+        expert_num_weight_shards,
+        model_cfg.expert_gtp_weight_remat_size,
+        shards_field="expert_tensor_parallel_num_weight_shards",
+        tp_field="expert_tensor_parallel_size",
+    )
+
+
+@contextmanager
+def _gtp_process_groups(model_cfg: Any):
+    """Make Megatron-Bridge create the GTP rematerialization process groups.
+
+    Bridge's ``initialize_megatron`` calls
+    ``parallel_state.initialize_model_parallel`` without ``gtp_remat_size`` /
+    ``expert_gtp_remat_size``, so those groups are never created and
+    ``gtp_weight_remat_size`` on the model config silently has no effect (MCore
+    layers only wrap their weights for GTP when the group exists and has size
+    > 1). Bridge resolves the function off the ``parallel_state`` module at call
+    time, so temporarily wrapping the module attribute is enough to forward the
+    sizes. No-op unless GTP is actually requested.
+
+    TODO: drop this once Megatron-Bridge forwards the GTP sizes itself.
+    """
+    gtp_remat_size = getattr(model_cfg, "gtp_weight_remat_size", 1)
+    expert_gtp_remat_size = getattr(model_cfg, "expert_gtp_weight_remat_size", 1)
+    if gtp_remat_size <= 1 and expert_gtp_remat_size <= 1:
+        yield
+        return
+
+    original = parallel_state.initialize_model_parallel
+    accepted = inspect.signature(original).parameters
+    missing = [
+        name
+        for name in ("gtp_remat_size", "expert_gtp_remat_size")
+        if name not in accepted
+    ]
+    if missing:
+        raise RuntimeError(
+            "GTP was requested via megatron_cfg.tensor_parallel_num_weight_shards "
+            f"(gtp={gtp_remat_size}, expert_gtp={expert_gtp_remat_size}), but the "
+            f"pinned Megatron-LM's initialize_model_parallel does not accept {missing}. "
+            "Bump Megatron-LM to a revision with GTP support."
+        )
+
+    # Accepting the kwargs is not the same as being able to use GTP: MCore's GTP
+    # core requires a newer TransformerEngine than it requires overall, and when
+    # that check fails it degrades to import stubs rather than raising. Nothing
+    # downstream re-checks -- MCore's own layer constructors gate GTP on the
+    # process-group size alone -- so without this the run dies ~6 frames deep in
+    # generalized_tensor_parallelism.py on `isinstance() arg 2 must be a type`,
+    # which says nothing about TE. Fail here with the actual requirement instead.
+    # Local import: gtp_api does not exist on Megatron-LM revisions predating GTP,
+    # and setup.py must keep importing against those.
+    from megatron.core.tensor_parallel import gtp_api
+
+    if not gtp_api.HAVE_GTP:
+        raise RuntimeError(
+            "GTP was requested via megatron_cfg.tensor_parallel_num_weight_shards "
+            f"(gtp={gtp_remat_size}, expert_gtp={expert_gtp_remat_size}), but the "
+            "installed Megatron-LM reports GTP unavailable (HAVE_GTP=False). This is "
+            "almost always TransformerEngine being too old -- MCore's GTP core "
+            "requires a newer TE than MCore itself does. Check "
+            "megatron.core.tensor_parallel.generalized_tensor_parallelism for the "
+            "minimum version, or leave tensor_parallel_num_weight_shards unset/null "
+            "to run without GTP."
+        )
+
+    @functools.wraps(original)
+    def initialize_model_parallel_with_gtp(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("gtp_remat_size", gtp_remat_size)
+        kwargs.setdefault("expert_gtp_remat_size", expert_gtp_remat_size)
+        return original(*args, **kwargs)
+
+    parallel_state.initialize_model_parallel = initialize_model_parallel_with_gtp
+    print(
+        f"[gtp] enabling GTP weight rematerialization (gtp_remat_size={gtp_remat_size} "
+        f"expert_gtp_remat_size={expert_gtp_remat_size})",
+        flush=True,
+    )
+    try:
+        yield
+    finally:
+        parallel_state.initialize_model_parallel = original
 
 
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -1621,6 +1749,25 @@ def build_inference_model(
         inference_provider.sequence_parallel
         and inference_provider.tensor_model_parallel_size > 1
     )
+    # GTP shards weights to save training memory and rematerializes them on every
+    # forward/backward — pure overhead for inference. Refit is what maps the
+    # training model's GTP shards onto these whole weights, so force the layout
+    # off here rather than inheriting it from the training provider snapshot.
+    #
+    # Forcing it off on the provider is necessary but not sufficient: megatron's
+    # layers resolve their GTP axis from the process-group collection, not from
+    # the provider, and `build_inference_pg_collection` must declare the axis
+    # explicitly off for that resolution to not fall back to the *training* MPU
+    # globals. That is NVIDIA/Megatron-LM#6940; until it merges, running with
+    # `tensor_parallel_num_weight_shards` < TP needs a megatron-core carrying it.
+    inference_provider.tensor_parallel_num_weight_shards = (
+        inference_provider.tensor_model_parallel_size
+    )
+    inference_provider.gtp_weight_remat_size = 1
+    inference_provider.expert_tensor_parallel_num_weight_shards = (
+        inference_provider.expert_tensor_parallel_size
+    )
+    inference_provider.expert_gtp_weight_remat_size = 1
     # Inference never trains: disable recompute.
     inference_provider.recompute_granularity = None
     inference_provider.recompute_method = None
@@ -1689,11 +1836,12 @@ def setup_model_and_optimizer(
     state.initialize_async_checkpoint_worker()
 
     megatron_cfg.dist.external_gpu_device_mapping = True
-    initialize_megatron(
-        cfg=megatron_cfg,
-        get_embedding_ranks=get_embedding_ranks,
-        get_position_embedding_ranks=get_position_embedding_ranks,
-    )
+    with _gtp_process_groups(megatron_cfg.model):
+        initialize_megatron(
+            cfg=megatron_cfg,
+            get_embedding_ranks=get_embedding_ranks,
+            get_position_embedding_ranks=get_position_embedding_ranks,
+        )
 
     if megatron_cfg.ft and megatron_cfg.ft.enable_ft_package:
         fault_tolerance.setup(megatron_cfg, state)

@@ -348,6 +348,13 @@ class MegatronConfig(TypedDict):
     # when None. Use ["moe"] to recompute only expert activations (production-proven config).
     recompute_modules: NotRequired[list[str] | None]
     tensor_model_parallel_size: int
+    # Generalized Tensor Parallelism (GTP). Total number of shards each weight is
+    # split into across the tensor-parallel and GTP axes; must be a multiple of
+    # tensor_model_parallel_size. The quotient is MCore's gtp_weight_remat_size:
+    # an extra dim-0 sharding of every weight, carved out of the data-parallel
+    # axis and all-gathered on demand in the forward and backward passes. Absent
+    # or null leaves GTP off (equivalent to tensor_model_parallel_size).
+    tensor_parallel_num_weight_shards: NotRequired[int | None]
     pipeline_model_parallel_size: int
     num_layers_in_first_pipeline_stage: int | None
     num_layers_in_last_pipeline_stage: int | None
@@ -365,6 +372,9 @@ class MegatronConfig(TypedDict):
     sequence_parallel: bool
     freeze_moe_router: bool
     expert_tensor_parallel_size: int
+    # Expert-side counterpart of tensor_parallel_num_weight_shards; must be a
+    # multiple of expert_tensor_parallel_size. Independent of the dense knob.
+    expert_tensor_parallel_num_weight_shards: NotRequired[int | None]
     expert_model_parallel_size: int
     # If True, defer the casting of logits to float32 until the backward pass.
     # If you are using logprob_chunk_size, you must set this to True.
