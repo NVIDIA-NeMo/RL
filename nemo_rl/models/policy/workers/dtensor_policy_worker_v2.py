@@ -33,6 +33,9 @@ from nemo_automodel.components.distributed.tensor_utils import (
 )
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from torch import nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    _CHECKPOINT_PREFIX,
+)
 from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
@@ -113,7 +116,8 @@ def dtensor_params_generator(
         Tuples of (fully_qualified_name, tensor) where tensors are converted to
         the refit dtype and made contiguous.
     """
-    module_map = dict(model.named_modules())
+    module_map = _state_dict_keyed_module_map(model)
+    _assert_lora_modules_reachable(module_map, model.state_dict())
     for name, tensor in model.state_dict().items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
@@ -131,6 +135,47 @@ def dtensor_params_generator(
         del adapted_fqn_tensors
         del merged_tensor
         del full_tensor
+
+
+def _state_dict_keyed_module_map(model: nn.Module) -> dict[str, nn.Module]:
+    """Map modules by the FQN ``state_dict()`` uses for their parameters.
+
+    ``checkpoint_wrapper`` installs a state_dict hook that strips
+    ``_CHECKPOINT_PREFIX`` from parameter keys but leaves it in ``named_modules()``.
+    Keying the map on the raw module name therefore misses every LoRA module whenever
+    activation checkpointing is on, and ``_maybe_merge_lora_weight`` silently returns
+    the *unmerged* base weight -- so the adapter never reaches the inference engine and
+    generation runs on the base model for the whole job.
+    """
+    return {
+        name.replace(_CHECKPOINT_PREFIX, ""): module
+        for name, module in model.named_modules()
+    }
+
+
+def _assert_lora_modules_reachable(
+    module_map: dict[str, nn.Module],
+    state_dict: dict[str, Any],
+) -> None:
+    """Fail loudly if any LoRA module's weight is not addressable in ``state_dict``.
+
+    A missed lookup is otherwise invisible: the refit streams base weights, generation
+    silently diverges from the trained policy, and the only symptom is a slowly climbing
+    ``token_mult_prob_error`` many steps later.
+    """
+    unreachable = sorted(
+        name
+        for name, module in module_map.items()
+        if isinstance(module, LinearLoRA) and f"{name}.weight" not in state_dict
+    )
+    if unreachable:
+        raise RuntimeError(
+            f"{len(unreachable)} LoRA module(s) could not be matched to a state_dict "
+            f"entry, so their adapters would not be merged into the weights sent to the "
+            f"inference engine. First few: {unreachable[:5]}. This usually means a module "
+            f"wrapper is rewriting parameter names in a way _state_dict_keyed_module_map "
+            f"does not undo."
+        )
 
 
 @torch.no_grad()
@@ -158,8 +203,11 @@ def _maybe_merge_lora_weight(
         if isinstance(module.lora_B.weight, DTensor)
         else module.lora_B.weight
     )
-    lora_a = lora_a.to(device=tensor.device, dtype=tensor.dtype)
-    lora_b = lora_b.to(device=tensor.device, dtype=tensor.dtype)
+    # Accumulate in fp32: at rank 128 with alpha/rank scaling, a bf16 matmul of the
+    # low-rank product carries enough relative error to show up as train/generation
+    # logprob drift, which is exactly what this merge exists to prevent.
+    lora_a = lora_a.to(device=tensor.device, dtype=torch.float32)
+    lora_b = lora_b.to(device=tensor.device, dtype=torch.float32)
     scale = getattr(module, "scale", None)
 
     if scale is None and hasattr(module, "alpha") and hasattr(module, "dim"):
@@ -167,7 +215,8 @@ def _maybe_merge_lora_weight(
     if scale is None:
         scale = 1.0
 
-    return tensor + torch.matmul(lora_b, lora_a) * scale
+    delta = torch.matmul(lora_b, lora_a) * scale
+    return (tensor.to(torch.float32) + delta).to(tensor.dtype)
 
 
 def _maybe_adapt_tensor_to_hf(
