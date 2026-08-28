@@ -43,6 +43,15 @@ The recipe targets 4 nodes (`cluster.num_nodes: 4`, DP=2). The original PivotRL 
 `wake_up` OOMs, enable `policy.megatron_cfg.optimizer.optimizer_cpu_offload` (see the comments at
 the top of the recipe YAML for the full set of knobs).
 
+## Training curves
+
+![Training reward, validation accuracy, generation length, and stability metrics over 600 steps](../assets/tau_pivot_qwen3.png)
+
+Training reward and validation accuracy climb steadily to step ~500-600, with generation length
+growing alongside reward (no degenerate length collapse). `token_mult_prob_error` and `grad_norm`
+stay flat and healthy throughout, aside from a single-step spike around step 320 from a training
+window restart (4-hour job time limit); it recovers immediately on the next step.
+
 ## Evaluation
 
 We evaluate with the official [tau2-bench](https://github.com/sierra-research/tau2-bench) harness
