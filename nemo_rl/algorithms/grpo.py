@@ -2992,12 +2992,6 @@ def grpo_train(
                             enabled=master_config.grpo.debug_payload_metrics,
                         )
                     )
-                    # Convert LLMMessageLogType to FlatMessagesType for generation
-                    batched_flat, input_lengths = batched_message_log_to_flat_message(
-                        repeated_batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    input_ids = batched_flat["token_ids"]
 
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 memory_tracker.snapshot_start_of_stage("Generation", dir())
@@ -3103,7 +3097,6 @@ def grpo_train(
                                 master_config.grpo.debug_payload_metrics
                             ),
                         )
-                        input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
@@ -3264,7 +3257,6 @@ def grpo_train(
                     # Use the sampling group itself as the GRPO identity. Distinct
                     # media-conditioned prompts can have identical text tokens.
                     prompt_ids_for_adv = repeated_batch.pop("rollout_group_ids")
-                    del input_ids
                     del baseline
                     del std
 
