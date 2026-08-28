@@ -264,6 +264,40 @@ def test_native_mxfp8_export_selection(
     assert worker._is_native_mxfp8_export() is expected
 
 
+def test_native_mxfp8_refit_syncs_shared_storage_before_reading_components() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.optimizer = MagicMock()
+    worker.model = MagicMock()
+    worker._is_native_mxfp8_export = MagicMock(return_value=True)
+    worker._uses_mxfp8_overlap_shared_param_buffer = MagicMock(return_value=True)
+
+    worker._sync_native_mxfp8_params_for_refit()
+
+    worker.optimizer.prepare_model_params_for_param_sync.assert_called_once_with()
+    worker.model.start_param_sync.assert_called_once_with(force_sync=True)
+
+
+def test_native_mxfp8_refit_skips_param_sync_without_shared_storage() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.optimizer = MagicMock()
+    worker.model = MagicMock()
+    worker._is_native_mxfp8_export = MagicMock(return_value=True)
+    worker._uses_mxfp8_overlap_shared_param_buffer = MagicMock(return_value=False)
+
+    worker._sync_native_mxfp8_params_for_refit()
+
+    worker.optimizer.prepare_model_params_for_param_sync.assert_not_called()
+    worker.model.start_param_sync.assert_not_called()
+
+
 def test_native_mxfp8_transfer_uses_metadata_component_order(monkeypatch) -> None:
     import nemo_rl.weight_sync.xferdtensor as xfer_module
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
