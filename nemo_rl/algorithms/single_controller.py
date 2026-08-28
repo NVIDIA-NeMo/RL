@@ -334,10 +334,11 @@ class SingleControllerActor:
         # index exactly. Generation may continue, but completed rollouts wait at
         # commit; _buffer_capacity bounds reservations and eventually stalls
         # dispatch instead of allowing unbounded TQ growth.
-        # A future staging/finalizer path must join the same barrier before
-        # native restore can be authoritative.
         self._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         self._buffer.set_data_plane_checkpoint_barrier(
+            self._data_plane_checkpoint_barrier
+        )
+        self._rollout_manager.set_data_plane_checkpoint_barrier(
             self._data_plane_checkpoint_barrier
         )
 
@@ -671,6 +672,7 @@ class SingleControllerActor:
 
         recovery_ledger = self._rollout_manager.recovery_ledger
         recovery_ledger.load_state_dict(cast(RolloutRecoveryState, state))
+        recovery_ledger.prepare_for_restart()
         raw_batch_shortfall = state.get("batch_shortfall", {})
         if not isinstance(raw_batch_shortfall, dict):
             raise TypeError("rollout recovery batch_shortfall must be a dictionary")
@@ -700,6 +702,11 @@ class SingleControllerActor:
         )
         canonical_group_ids = {group["group_id"] for group in canonical_state["groups"]}
         recovery_ledger.discard_canonical_groups(canonical_group_ids)
+        if self._master_config.token_capture.enabled:
+            await self._validate_rollout_recovery_inventory(
+                replay_metadata=canonical_state,
+                clear_unreferenced=True,
+            )
         await self._rehydrate_rollout_recovery_prompts()
         self._sampler_stamps_target_steps = (
             raw_sampler_stamps
@@ -951,6 +958,57 @@ class SingleControllerActor:
         print(
             "📦 Native TQ replay inventory validated: "
             f"samples={len(actual_sample_ids)}",
+            flush=True,
+        )
+
+    async def _validate_rollout_recovery_inventory(
+        self,
+        *,
+        replay_metadata: Optional[TQReplayMetadataState],
+        clear_unreferenced: bool,
+    ) -> None:
+        """Require every unfinished receipt or deferred route to retain staging."""
+        expected_staging_keys = (
+            self._rollout_recovery_ledger.expected_staging_keys()
+        )
+        if replay_metadata is not None:
+            for group in replay_metadata["groups"]:
+                for tag in group["meta"].tags or []:
+                    encoded_plan = tag.get(ROUTE_PLAN_TAG)
+                    if encoded_plan is not None:
+                        expected_staging_keys.update(
+                            decode_route_plan(encoded_plan).cleanup_staging_keys
+                        )
+
+        staging_partition = self._master_config.token_capture.staging_partition
+        actual_staging_keys = set(
+            await self._call_dp(
+                "list_sample_ids",
+                partition_id=staging_partition,
+            )
+        )
+        missing = sorted(expected_staging_keys - actual_staging_keys)
+        if missing:
+            raise RuntimeError(
+                "rollout-recovery ownership references staging rows missing "
+                f"from live TQ state: missing={missing[:10]!r} "
+                f"(total={len(missing)})"
+            )
+        unreferenced = sorted(actual_staging_keys - expected_staging_keys)
+        if clear_unreferenced and unreferenced:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=unreferenced,
+                partition_id=staging_partition,
+            )
+            print(
+                "rollout recovery cleared unreferenced staging rows: "
+                f"count={len(unreferenced)}",
+                flush=True,
+            )
+        print(
+            "📦 Rollout-recovery staging inventory validated: "
+            f"referenced={len(expected_staging_keys)}",
             flush=True,
         )
 
@@ -1392,7 +1450,7 @@ class SingleControllerActor:
                             if self._rollout_recovery_enabled:
                                 assert lineage_group_id is not None
                                 async with self._data_plane_checkpoint_barrier.mutation():
-                                    self._rollout_manager.discard_prompt_group(
+                                    await self._rollout_manager.discard_recovery_group(
                                         lineage_group_id
                                     )
                                     self._credit_shortfall(target_step)
@@ -2857,6 +2915,12 @@ class SingleControllerActor:
                     rollout_recovery_payload_sha256 = hashlib.sha256(
                         rollout_recovery_payload
                     ).hexdigest()
+
+                if self._master_config.token_capture.enabled:
+                    await self._validate_rollout_recovery_inventory(
+                        replay_metadata=replay_metadata,
+                        clear_unreferenced=False,
+                    )
 
                 await self._save_data_plane_checkpoint(
                     checkpoint_path,

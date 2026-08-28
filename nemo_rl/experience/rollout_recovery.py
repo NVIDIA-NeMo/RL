@@ -332,6 +332,48 @@ class RolloutRecoveryLedger:
             )
         record.runtime_prompt_payload = prompt_payload
 
+    def prepare_for_restart(self) -> None:
+        """Turn crash-interrupted physical attempts into retryable state."""
+        self.assert_checkpoint_safe()
+        for record in self._groups.values():
+            if record.status is PromptGroupStatus.GENERATING:
+                self.abandon_unsealed(record.group_id)
+
+    def assert_checkpoint_safe(self) -> None:
+        """Reject states whose publication or optimizer outcome is ambiguous."""
+        if self._open_train_step is not None:
+            raise RuntimeError(
+                "rollout recovery contains an open optimizer step; restoring "
+                "mid-step training ownership is not supported"
+            )
+        unsafe = [
+            record.group_id
+            for record in self._groups.values()
+            if record.status
+            in {
+                PromptGroupStatus.FINALIZING,
+                PromptGroupStatus.FINALIZATION_UNKNOWN,
+                PromptGroupStatus.CLAIMED_FOR_TRAINING,
+                PromptGroupStatus.APPLIED_UNCHECKPOINTED,
+            }
+        ]
+        if unsafe:
+            raise RuntimeError(
+                "rollout recovery contains checkpoint-unsafe group states: "
+                f"groups={unsafe!r}"
+            )
+
+    def expected_staging_keys(self) -> set[str]:
+        """Return staged token rows still owned by sealed sibling attempts."""
+        return {
+            staging_key
+            for record in self._groups.values()
+            for sibling in record.siblings
+            for attempt in sibling.attempts[-1:]
+            if attempt.status is RolloutAttemptStatus.SEALED
+            for staging_key in attempt.staging_keys
+        }
+
     def prepare_incomplete_retry(self, group_id: str) -> PromptGroupRecoveryRecord:
         """Mint fresh physical attempts only for siblings that are not sealed."""
         record = self._require_group(group_id)
@@ -662,6 +704,7 @@ class RolloutRecoveryLedger:
 
     def state_dict(self) -> dict[str, Any]:
         """Return the versioned metadata envelope used by later persistence."""
+        self.assert_checkpoint_safe()
         groups = []
         for record in self._groups.values():
             groups.append(
@@ -968,6 +1011,8 @@ class RolloutRecoveryLedger:
             sibling.current_attempt.status == RolloutAttemptStatus.SEALED
             for sibling in siblings
         )
+        if status is PromptGroupStatus.GENERATING and all_current_attempts_sealed:
+            raise ValueError("generating group must retain an unfinished sibling")
         if status in prefinalization_sealed_states and not all_current_attempts_sealed:
             raise ValueError(
                 f"group state {status.value!r} requires every sibling to be sealed"

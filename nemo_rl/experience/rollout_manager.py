@@ -16,7 +16,8 @@ import asyncio
 import copy
 import enum
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -26,6 +27,7 @@ from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
     PostWriteEnrichmentError,
     TQReplayBuffer,
 )
@@ -1348,6 +1350,9 @@ class RolloutManager:
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
         self._recovery_ledger = RolloutRecoveryLedger()
+        self._data_plane_checkpoint_barrier: Optional[
+            DataPlaneCheckpointBarrier
+        ] = None
         self._env_handles = task_to_env
         self._weight_version: int = 0
         # Run-wide, shared across concurrent generate_and_push calls. Safe as a plain
@@ -1367,6 +1372,22 @@ class RolloutManager:
     def recovery_ledger(self) -> RolloutRecoveryLedger:
         """Return the prompt-group ownership ledger shared with the controller."""
         return self._recovery_ledger
+
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        """Join streamed sibling transitions to the SC snapshot barrier."""
+        self._data_plane_checkpoint_barrier = barrier
+
+    @asynccontextmanager
+    async def _recovery_mutation(self) -> AsyncIterator[None]:
+        """Serialize short lineage transitions with native TQ snapshots."""
+        barrier = getattr(self, "_data_plane_checkpoint_barrier", None)
+        if barrier is None:
+            yield
+            return
+        async with barrier.mutation():
+            yield
 
     def reserve_prompt_group(
         self,
@@ -1410,6 +1431,7 @@ class RolloutManager:
     def discard_prompt_group(self, group_id: str) -> None:
         """Release a reservation that will intentionally never be dispatched."""
         self._recovery_ledger.discard_group(group_id)
+
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
 
@@ -1753,11 +1775,12 @@ class RolloutManager:
         from nemo_rl.experience.finalizer_actor import FinalizationRequest
 
         assert self._tq_buffer is not None
-        recovery_group = self._recovery_ledger.get_group(recovery_group_id)
-        if recovery_group.status == PromptGroupStatus.GENERATING:
-            recovery_group = self._recovery_ledger.prepare_incomplete_retry(
-                recovery_group_id
-            )
+        async with self._recovery_mutation():
+            recovery_group = self._recovery_ledger.get_group(recovery_group_id)
+            if recovery_group.status == PromptGroupStatus.GENERATING:
+                recovery_group = self._recovery_ledger.prepare_incomplete_retry(
+                    recovery_group_id
+                )
         pending_indices = [
             sibling.generation_index
             for sibling in recovery_group.siblings
@@ -1791,13 +1814,14 @@ class RolloutManager:
                 raise ValueError(
                     "token-capture completion must contain its Gate rollout ID"
                 )
-            self._recovery_ledger.mark_sibling_sealed(
-                group_id,
-                generation_index=generation_index,
-                gate_rollout_id=gate_rollout_id,
-                receipt=receipt,
-                reward=completion.reward,
-            )
+            async with self._recovery_mutation():
+                self._recovery_ledger.mark_sibling_sealed(
+                    group_id,
+                    generation_index=generation_index,
+                    gate_rollout_id=gate_rollout_id,
+                    receipt=receipt,
+                    reward=completion.reward,
+                )
 
         try:
             if inflight_registry is not None:
@@ -1806,9 +1830,10 @@ class RolloutManager:
                 inflight_registry[group_id] = (current_task, start_version)
             try:
                 if pending_indices:
-                    self._recovery_ledger.mark_group_dispatched(
-                        group_id, generation_indices=pending_indices
-                    )
+                    async with self._recovery_mutation():
+                        self._recovery_ledger.mark_group_dispatched(
+                            group_id, generation_indices=pending_indices
+                        )
                     await self.run_rollout(
                         input_sample,
                         rollout_ids=list(rollout_ids),
@@ -1818,12 +1843,13 @@ class RolloutManager:
             finally:
                 if inflight_registry is not None:
                     inflight_registry.pop(group_id, None)
-            (
-                physical_rollout_ids,
-                canonical_sample_ids,
-                receipts,
-                rewards,
-            ) = self._recovery_ledger.finalization_inputs(group_id)
+            async with self._recovery_mutation():
+                (
+                    physical_rollout_ids,
+                    canonical_sample_ids,
+                    receipts,
+                    rewards,
+                ) = self._recovery_ledger.finalization_inputs(group_id)
             request = FinalizationRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
@@ -1843,11 +1869,16 @@ class RolloutManager:
             # yet). Their ledger files are inert — failure rows or missing
             # terminal rows keep any later read fail-closed.
             self._tq_buffer.abort(group_id)
-            self._recovery_ledger.abandon_unsealed(group_id)
+            async with self._recovery_mutation():
+                self._recovery_ledger.abandon_unsealed(group_id)
             # The capture ledger has no per-rollout fail endpoint. Rows from
             # abandoned attempts are unreferenced and are swept with the
             # staging partition at run teardown.
             raise
+
+    async def discard_recovery_group(self, group_id: str) -> None:
+        """Drop a skipped group after clearing its known staged rows."""
+        await self._discard_recovery_group(group_id)
 
     async def _discard_recovery_group(self, group_id: str) -> None:
         """Clean known staged rows before intentionally dropping lineage."""
@@ -1858,5 +1889,6 @@ class RolloutManager:
             for sibling in group.siblings
             for key in sibling.current_attempt.staging_keys
         ]
-        await self._tq_buffer.clear_staging_keys(staging_keys)
-        self._recovery_ledger.discard_group(group_id)
+        async with self._recovery_mutation():
+            await self._tq_buffer.clear_staging_keys(staging_keys)
+            self._recovery_ledger.discard_group(group_id)
