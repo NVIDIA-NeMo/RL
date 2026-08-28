@@ -115,7 +115,10 @@ class VllmAsyncGenerationWorkerImpl(
         # exact engine prompt ids recorded at preprocess time).
         self._capture_calls: dict[int, tuple[Any, list[int]]] = {}
         self._staging_source: Any | None = None
+        # Guarded by _prefix_cache_lock: _fetch_chain_prefix runs on executor
+        # threads (asyncio.to_thread), so lookups/evictions can be concurrent.
         self._prefix_cache: dict[str, list[int]] = {}
+        self._prefix_cache_lock = threading.Lock()
 
         super().__init__(
             config,
@@ -427,25 +430,28 @@ class VllmAsyncGenerationWorkerImpl(
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
         """Assemble prefix token ids from staging_chain, with a worker-local LRU cache."""
         cache = self._prefix_cache
-        cached_ids: list[int] = []
-        miss_start = 0
-        for i, key in enumerate(staging_chain):
-            if key in cache:
-                cached_ids = cache[key]
-                miss_start = i + 1
-        miss_keys = staging_chain[miss_start:]
+        with self._prefix_cache_lock:
+            cached_ids: list[int] = []
+            miss_start = 0
+            for i, key in enumerate(staging_chain):
+                if key in cache:
+                    cached_ids = cache[key]
+                    miss_start = i + 1
+            miss_keys = staging_chain[miss_start:]
         if not miss_keys:
             return list(cached_ids)
         if self._staging_source is None:
             raise RuntimeError(
                 "_staging_source not initialized; call setup_token_capture() first"
             )
+        # TQ read stays outside the lock so concurrent fetches overlap.
         fetched = self._staging_source.fetch_prefix_token_ids(miss_keys)
         result = cached_ids + fetched
         last_key = staging_chain[-1]
-        cache[last_key] = result
-        if len(cache) > 256:
-            del cache[next(iter(cache))]
+        with self._prefix_cache_lock:
+            cache[last_key] = result
+            if len(cache) > 256:
+                del cache[next(iter(cache))]
         return result
 
     def _patch_chain_prefix(self, ng_capture: dict[str, Any]) -> list[int] | None:
@@ -715,9 +721,12 @@ class VllmAsyncGenerationWorkerImpl(
                     raise
 
                 # Check staging_chain in ng_capture before required_prefix_token_ids.
+                # Off-loop: the prefix fetch is a blocking TQ read, and Gym's
+                # staging protocol requires the serving host to move blocking
+                # staging I/O off its event loop explicitly.
                 ng_capture_dict = getattr(request, "ng_capture", None) or {}
-                chain_prefix_token_ids = worker_self._patch_chain_prefix(
-                    ng_capture_dict
+                chain_prefix_token_ids = await asyncio.to_thread(
+                    worker_self._patch_chain_prefix, ng_capture_dict
                 )
 
                 if chain_prefix_token_ids is not None:
@@ -1043,7 +1052,11 @@ class VllmAsyncGenerationWorkerImpl(
                 )
                 # Token capture: stage the delta and ride the coords on the
                 # response; strips logprobs/ids (no-op when capture is off).
-                content = worker_self._finish_request_capture(request, content)
+                # Off-loop: the sink write inside complete_call is a blocking
+                # TQ round trip (see the staging protocol's serving-host rule).
+                content = await asyncio.to_thread(
+                    worker_self._finish_request_capture, request, content
+                )
                 return JSONResponse(content=content)
 
             worker_self._abort_request_capture(request, reason="streaming_response")
