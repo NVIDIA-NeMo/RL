@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG

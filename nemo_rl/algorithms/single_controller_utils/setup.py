@@ -1429,6 +1429,7 @@ def setup_single_controller(
         task_to_env=env_handles,
         num_generations_per_prompt=algo_cfg.num_generations_per_prompt,
         max_seq_len=_generation_max_seq_len(generation_config),
+        rollout_recovery_config=master_config.rollout_recovery,
         max_rollout_turns=algo_cfg.max_rollout_turns,
         policy_generation=generation,
         generation_config=generation_config,

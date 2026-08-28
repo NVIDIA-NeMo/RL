@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal, Optional
 
@@ -43,6 +44,7 @@ from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -613,6 +615,58 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     num_finalizer_workers: PositiveInt = 2
 
 
+@dataclass(frozen=True)
+class ResolvedRolloutRecovery:
+    """Policy coordinates stamped on one newly reserved ledger group."""
+
+    agent_name: Optional[str]
+    granularity: RecoveryGranularity
+
+
+class RolloutRecoveryConfig(BaseModel, extra="allow"):
+    """Restore policy for unfinished token-capture prompt groups.
+
+    The resolved value is persisted on each ledger group, so restoring a saved
+    group does not reinterpret it using a newer configuration.
+    """
+
+    default_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING
+    # NeMo-Gym agent_ref.name takes precedence over task_name when both match.
+    agent_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+        default_factory=dict
+    )
+    task_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+        default_factory=dict
+    )
+
+    def resolve_for_prompt(self, prompt: Mapping[str, Any]) -> ResolvedRolloutRecovery:
+        """Resolve one new group using agent, then task, then the global default."""
+        extra_env_info = prompt.get("extra_env_info")
+        agent_name: Optional[str] = None
+        if isinstance(extra_env_info, Mapping):
+            agent_ref = extra_env_info.get("agent_ref")
+            if agent_ref is not None and not isinstance(agent_ref, Mapping):
+                raise TypeError("prompt agent_ref must be a mapping or None")
+            if isinstance(agent_ref, Mapping):
+                raw_agent_name = agent_ref.get("name")
+                if raw_agent_name is not None and not isinstance(raw_agent_name, str):
+                    raise TypeError("prompt agent_ref.name must be a string or None")
+                agent_name = raw_agent_name
+        if agent_name is not None:
+            override = self.agent_granularity_overrides.get(agent_name)
+            if override is not None:
+                return ResolvedRolloutRecovery(agent_name, override)
+
+        task_name = prompt.get("task_name")
+        if task_name is not None and not isinstance(task_name, str):
+            raise TypeError("prompt task_name must be a string or None")
+        if task_name is not None:
+            override = self.task_granularity_overrides.get(task_name)
+            if override is not None:
+                return ResolvedRolloutRecovery(agent_name, override)
+        return ResolvedRolloutRecovery(agent_name, self.default_granularity)
+
+
 class MasterConfig(BaseModel, extra="allow"):
     # algo configs
     grpo: Optional[GRPOConfig] = None
@@ -630,6 +684,9 @@ class MasterConfig(BaseModel, extra="allow"):
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
+    rollout_recovery: RolloutRecoveryConfig = Field(
+        default_factory=RolloutRecoveryConfig
+    )
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
 
     @model_validator(mode="after")

@@ -17,6 +17,7 @@ from typing import Optional
 
 import pytest
 
+from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutManager,
@@ -326,6 +327,7 @@ def test_rollout_manager_forwards_effort_config():
         "task_to_env": {},
         "num_generations_per_prompt": 1,
         "max_seq_len": 1,
+        "rollout_recovery_config": RolloutRecoveryConfig(),
         "generation_config": _GENERATION_CONFIG,
         "use_nemo_gym": True,
     }

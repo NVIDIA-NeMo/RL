@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import asyncio
 import copy
 import enum
@@ -75,6 +77,7 @@ TokenizerType = PreTrainedTokenizerBase
 RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
 
 if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
     from nemo_rl.experience.finalizer_actor import FinalizationRequest
 
 
@@ -1295,6 +1298,7 @@ class RolloutManager:
         task_to_env: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
         max_seq_len: int,
+        rollout_recovery_config: RolloutRecoveryConfig,
         max_rollout_turns: int = 1,
         policy_generation: Optional[GenerationInterface] = None,
         generation_config: Optional[GenerationConfig] = None,
@@ -1349,6 +1353,7 @@ class RolloutManager:
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
+        self._rollout_recovery_config = rollout_recovery_config
         self._tq_buffer = tq_buffer
         self._recovery_ledger = RolloutRecoveryLedger()
         self._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
@@ -1400,6 +1405,7 @@ class RolloutManager:
                 "rollout recovery requires every dataloader sample to contain "
                 f"a stable integer idx, got {prompt_idx!r}"
             )
+        recovery_policy = self._rollout_recovery_config.resolve_for_prompt(input_sample)
         record = self._recovery_ledger.reserve_group(
             cut,
             prompt_id=str(prompt_idx),
@@ -1407,6 +1413,8 @@ class RolloutManager:
             expected_generations=self._num_generations_per_prompt,
             target_step=target_step,
             start_weight_version=self._weight_version,
+            agent_name=recovery_policy.agent_name,
+            recovery_granularity=recovery_policy.granularity,
             admitted=admitted,
             admission_id=admission_id,
         )

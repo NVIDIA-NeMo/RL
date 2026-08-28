@@ -60,6 +60,7 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     PromptGroupPhase,
+    RecoveryGranularity,
     RolloutRecoveryLedger,
     build_rollout_recovery_state,
 )
@@ -354,6 +355,8 @@ class _LedgerFacade:
             expected_generations=2,
             target_step=target_step,
             start_weight_version=7,
+            agent_name=None,
+            recovery_granularity=RecoveryGranularity.SIBLING,
             admitted=admitted,
             admission_id=admission_id,
         )

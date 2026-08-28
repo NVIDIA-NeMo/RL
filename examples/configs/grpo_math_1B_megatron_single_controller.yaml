@@ -162,6 +162,15 @@ logger:
 data_plane:
   enabled: true
 
+# Restore-only policy for unfinished token-capture groups. "sibling" reuses
+# already sealed generations; "prompt_group" regenerates every sibling when
+# any sibling was unfinished at the checkpoint. Agent overrides win over task
+# overrides. Live in-process retries remain sibling-level.
+rollout_recovery:
+  default_granularity: sibling
+  agent_granularity_overrides: {}
+  task_granularity_overrides: {}
+
 cluster:
   gpus_per_node: 2
   master_port_range_low: 25000
