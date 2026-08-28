@@ -831,6 +831,24 @@ def test_native_mxfp8_refit_rebuilds_destinations_and_loads_ordered_components(
     assert torch.all(adapter.loaded[1][2] == 7)
 
 
+def test_native_mxfp8_refit_fences_after_finalize_and_mtp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    extension = _make_ext({})
+    extension.nccl_reshard_refit_info = _native_down_refit_info()
+    extension.pp_comm_groups = {0: object()}
+    extension._nccl_reshard_refit_adapter = _RecordingNativeAdapter(events)
+    extension._receive_and_load_misc_params = lambda: events.append("misc")
+    extension._maybe_process_mtp_drafter_after_loading = lambda: events.append("mtp")
+    _patch_cpu_nccl_refit(monkeypatch, events)
+
+    assert extension.nccl_reshard_refit()
+
+    assert events.index("finish") < events.index("mtp") < len(events) - 1
+    assert events[-1] == "sync"
+
+
 def test_native_mxfp8_refit_aborts_before_collective_on_destination_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
