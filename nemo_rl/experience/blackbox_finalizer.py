@@ -89,9 +89,11 @@ class FinalizedGroup:
     group_max_wv: int
     staging_keys: list[str]
     metrics: dict[str, float] = field(default_factory=dict)
-    # True when min_valid_fraction_per_group rejected the whole group; the
-    # caller aborts the slot instead of committing it.
+    # True when the finalizer rejected the whole group as a policy outcome
+    # (see drop_reason); the caller aborts the slot instead of committing it.
     dropped: bool = False
+    # Which policy dropped the group, for the caller's log line.
+    drop_reason: Optional[str] = None
 
 
 def _linearize_metadata_only(receipt: Any, snapshots: list[Any]) -> Any:
@@ -615,6 +617,10 @@ class BlackboxFinalizer:
                 staging_keys=[],
                 metrics=metrics,
                 dropped=True,
+                drop_reason=(
+                    f"min_valid_fraction_per_group: {valid_fraction:.3f} < "
+                    f"{self._min_valid_fraction}"
+                ),
             )
 
         _tensorize_t0 = time.perf_counter()
@@ -675,6 +681,10 @@ class BlackboxFinalizer:
                     staging_keys=[],
                     metrics=metrics,
                     dropped=True,
+                    drop_reason=(
+                        "router replay on, no rollout carried routed_experts, "
+                        "and (L, K) is unknown yet"
+                    ),
                 )
             train_batch["routed_experts"] = self._build_routed_experts_tensor(
                 rows, max_len=max_len, metrics=metrics
