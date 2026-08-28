@@ -97,7 +97,11 @@ test -f "${CKPT_DIR}/step_2/replay_buffer.pt"
 grep -q "Restoring replay buffer from checkpoint" "${EXP_DIR}/run2.log"
 test -d "${CKPT_DIR}/step_4/policy/weights"
 
-for run_spec in "run1 2" "run2 4"; do
+# run2 resumes at step 2 and writes to its own log dir, so it logs the two
+# steps it actually runs, not all four. ppo_async_single_controller.sh:104
+# asserts the same shape. The step_4 checkpoint above is what proves the
+# resume reached step 4.
+for run_spec in "run1 2" "run2 2"; do
     read -r run expected_steps <<< "${run_spec}"
     metrics="${EXP_DIR}/metrics_${run}.json"
     uv run tests/json_dump_tb_logs.py "${EXP_DIR}/logs_${run}" \
