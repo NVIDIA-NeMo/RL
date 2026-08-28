@@ -83,3 +83,46 @@ Both commits are signed off with `git commit -s`.
   environment validation remains for Task 9.
 - This task intentionally does not identify MXFP8 tensors in worker code or
   select the native refit path. Task 5 owns those runtime gates.
+
+## Review Fix: Require Pinned E4M3 Metadata
+
+The original helper accepted a missing `fp8_dtype` and any value whose string
+representation merely contained `e4m3`. That would permit arbitrary uint8
+storage to be reinterpreted as E4M3.
+
+### RED Evidence
+
+The focused isolated CPU harness was run after adding regressions for a missing
+field, a bare string, and an `E4M3-compatible` lookalike:
+
+```text
+FAILED ...test_extract_native_mxfp8_components_rejects_invalid_storage[source16-fp8_dtype]
+Failed: DID NOT RAISE ValueError
+```
+
+The accepted value was the bare string `"DType.kFloat8E4M3"`, proving that the
+previous substring validation was not a type-safe format boundary.
+
+### GREEN Evidence
+
+`_validate_e4m3_format()` now requires all of:
+
+- `type(fp8_dtype).__module__ == "transformer_engine_torch"`
+- `type(fp8_dtype).__name__ == "DType"`
+- `str(fp8_dtype) == "DType.kFloat8E4M3"`
+
+The focused TE-free fake models that pinned enum boundary without importing
+Transformer Engine. The isolated command exited 0 with `25 passed in 1.78s`.
+
+```text
+uvx ruff check nemo_rl/models/policy/workers/mxfp8_refit_source.py tests/unit/models/policy/test_mxfp8_refit_source.py
+uvx ruff format --check nemo_rl/models/policy/workers/mxfp8_refit_source.py tests/unit/models/policy/test_mxfp8_refit_source.py
+```
+
+Both Ruff commands exited 0, as did `git diff --check` before each repair
+commit.
+
+### Review Fix Commits
+
+- `c775bb32 test(refit): require pinned MXFP8 dtype metadata`
+- `2480c0c4 fix(refit): validate pinned MXFP8 dtype metadata`
