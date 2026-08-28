@@ -474,9 +474,7 @@ def test_native_mxfp8_skips_pp_placeholders_and_misc_mappings() -> None:
                     "decoder.layers.0.self_attention.linear_qkv.weight",
                     "model.layers.0.self_attn.q_proj.weight",
                 ),
-                param_weight=_native_tensor(
-                    (64, 64), value_marker=1, scale_marker=2
-                ),
+                param_weight=_native_tensor((64, 64), value_marker=1, scale_marker=2),
                 global_param_name="decoder.layers.0.self_attention.linear_qkv.weight",
             ),
         ]
@@ -494,9 +492,7 @@ def test_native_mxfp8_rejects_unsupported_bulk_mapping() -> None:
         [
             SimpleNamespace(
                 mapping=mapping,
-                param_weight=_native_tensor(
-                    (64, 32), value_marker=1, scale_marker=2
-                ),
+                param_weight=_native_tensor((64, 32), value_marker=1, scale_marker=2),
                 global_param_name="decoder.layers.0.mlp.linear_fc2.weight",
             )
         ]
@@ -526,9 +522,7 @@ def test_native_mxfp8_metadata_has_ordered_component_shapes() -> None:
                     gate=gate_name,
                     up=up_name,
                 ),
-                param_weight=_native_tensor(
-                    (16, 64), value_marker=1, scale_marker=2
-                ),
+                param_weight=_native_tensor((16, 64), value_marker=1, scale_marker=2),
                 global_param_name="decoder.layers.0.mlp.linear_fc1.weight",
             ),
             SimpleNamespace(
@@ -536,9 +530,7 @@ def test_native_mxfp8_metadata_has_ordered_component_shapes() -> None:
                     "decoder.layers.0.mlp.linear_fc2.weight",
                     down_name,
                 ),
-                param_weight=_native_tensor(
-                    (64, 32), value_marker=3, scale_marker=4
-                ),
+                param_weight=_native_tensor((64, 32), value_marker=3, scale_marker=4),
                 global_param_name="decoder.layers.0.mlp.linear_fc2.weight",
             ),
         ]
@@ -562,3 +554,58 @@ def test_native_mxfp8_metadata_has_ordered_component_shapes() -> None:
             *metadata[name]["shape"][:-1],
             metadata[name]["shape"][-1] // 32,
         ]
+
+
+def test_native_mxfp8_per_expert_metadata_expands_global_expert_axis() -> None:
+    from megatron.bridge.models.conversion.param_mapping import (
+        AutoMapping,
+        GatedMLPMapping,
+    )
+
+    from nemo_rl.weight_sync.nccl_reshard_utils import (
+        group_expert_params_in_metadata,
+    )
+
+    prefix = "model.layers.0.mlp.experts"
+    tasks = []
+    for local_expert in range(2):
+        tasks.extend(
+            [
+                SimpleNamespace(
+                    mapping=GatedMLPMapping(
+                        f"decoder.layers.0.mlp.experts.local_experts.{local_expert}.linear_fc1.weight",
+                        gate=f"{prefix}.{local_expert}.gate_proj.weight",
+                        up=f"{prefix}.{local_expert}.up_proj.weight",
+                    ),
+                    param_weight=_native_tensor(
+                        (8, 64), value_marker=1, scale_marker=2
+                    ),
+                    global_param_name=f"decoder.layers.0.mlp.experts.local_experts.{local_expert}.linear_fc1.weight",
+                ),
+                SimpleNamespace(
+                    mapping=AutoMapping(
+                        f"decoder.layers.0.mlp.experts.local_experts.{local_expert}.linear_fc2.weight",
+                        f"{prefix}.{local_expert}.down_proj.weight",
+                    ),
+                    param_weight=_native_tensor(
+                        (64, 32), value_marker=3, scale_marker=4
+                    ),
+                    global_param_name=f"decoder.layers.0.mlp.experts.local_experts.{local_expert}.linear_fc2.weight",
+                ),
+            ]
+        )
+    worker = _native_worker(tasks)
+
+    metadata = worker._build_native_mxfp8_shape_metadata(
+        {"tp_size": 4, "ep_size": 2, "pp_size": 1}
+    )
+    grouped = group_expert_params_in_metadata(metadata)
+
+    assert grouped[f"{prefix}.gate_proj.weight"]["shape"] == [4, 4, 64]
+    assert grouped[f"{prefix}.up_proj.weight"]["shape"] == [4, 4, 64]
+    assert grouped[f"{prefix}.down_proj.weight"]["shape"] == [4, 64, 32]
+    assert grouped[f"{prefix}.down_proj.weight"]["components"][1]["shape"] == [
+        4,
+        64,
+        1,
+    ]

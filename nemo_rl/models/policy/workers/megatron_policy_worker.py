@@ -14,6 +14,7 @@
 import copy
 import gc
 import logging
+import math
 import os
 import re
 import socket
@@ -115,6 +116,9 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     MegatronCheckpointEngineSendMixin,
     PolicyCheckpointEngineMixin,
     maybe_preinit_nixl_checkpoint_engine,
+)
+from nemo_rl.models.policy.workers.mxfp8_refit_source import (
+    extract_native_mxfp8_components,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
@@ -676,6 +680,7 @@ class MegatronPolicyWorkerImpl(
         # Note: here param name is local param name, with local layer number and
         # local expert id etc.
         self.refit_conversion_tasks = None
+        self._native_grouped_mxfp8_tasks = []
         self.refit_conversion_tasks_current_index = None
         self.refit_param_info_mcore = None
 
@@ -2291,6 +2296,83 @@ class MegatronPolicyWorkerImpl(
             and self.fp8_cfg.get("fp8_recipe") == "blockwise"
         )
 
+    def _is_native_mxfp8_export(self) -> bool:
+        """Return whether both endpoints use native MXFP8 parameter storage."""
+        return bool(
+            getattr(self, "fp8_cfg", None) is not None
+            and self.fp8_cfg.get("fp8_param", False)
+            and self.fp8_cfg.get("fp8_recipe") == "mxfp8"
+            and self.cfg["generation"]["vllm_cfg"]["precision"] == "fp8"
+            and self.cfg["generation"]["vllm_cfg"].get("is_mx") is True
+        )
+
+    def _build_native_grouped_mxfp8_tasks(self) -> list[Any]:
+        """Build deterministic source tasks for singular grouped expert weights."""
+        if not self._is_native_mxfp8_export() or not getattr(
+            self.model.config, "moe_single_grouped_weight", False
+        ):
+            return []
+
+        from megatron.bridge.models.conversion.model_bridge import (
+            WeightConversionTask,
+            _megatron_local_name_to_global,
+        )
+        from megatron.core.fp8_utils import is_grouped_mxfp8tensor
+
+        bridge = self.megatron_bridge._model_bridge
+        models = [self.model]
+        registry = bridge.mapping_registry()
+        global_names = bridge._megatron_global_param_names_all_pp_ranks(models)
+        grouped_suffixes = (
+            ".mlp.experts.linear_fc1.weight",
+            ".mlp.experts.linear_fc2.weight",
+        )
+        local_tasks: dict[str, tuple[str, torch.Tensor, Any]] = {}
+        for local_name, param in self.model.named_parameters():
+            local_name = bridge._unwrap_name(local_name)
+            if not local_name.endswith(grouped_suffixes):
+                continue
+            if not is_grouped_mxfp8tensor(param):
+                raise ValueError(
+                    f"Expected grouped MXFP8 storage for {local_name!r} role 'weight'"
+                )
+            global_name = _megatron_local_name_to_global(
+                models, self.model.config, local_name, 0
+            )
+            mapping = registry.megatron_to_hf_lookup(f"{global_name}0")
+            if mapping is None:
+                raise ValueError(
+                    "Missing Megatron-Bridge mapping for grouped MXFP8 source "
+                    f"{global_name!r} role 'weight'"
+                )
+            local_tasks[global_name] = (local_name, param, mapping)
+
+        tasks: list[Any] = []
+        for global_name in global_names:
+            if not global_name.endswith(grouped_suffixes):
+                continue
+            local = local_tasks.get(global_name)
+            if local is None:
+                param_name = global_name
+                param_weight = None
+                mapping = registry.megatron_to_hf_lookup(f"{global_name}0")
+            else:
+                param_name, param_weight, mapping = local
+            if mapping is None:
+                raise ValueError(
+                    "Missing Megatron-Bridge mapping for grouped MXFP8 source "
+                    f"{global_name!r} role 'weight'"
+                )
+            tasks.append(
+                WeightConversionTask(
+                    param_name=param_name,
+                    global_param_name=global_name,
+                    mapping=mapping,
+                    param_weight=param_weight,
+                )
+            )
+        return tasks
+
     def _build_refit_conversion_tasks(self) -> list:
         """Build the conversion-task list driving refit (BF16 or FP8 export).
 
@@ -2304,14 +2386,13 @@ class MegatronPolicyWorkerImpl(
 
         with draft_model_detached([self.model]):
             if self._is_fp8_export():
-                return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
+                tasks = self.megatron_bridge._model_bridge.build_export_fp8_tasks(
                     self.megatron_bridge.hf_pretrained, [self.model]
                 )
-            return [
-                task
-                for task in self.megatron_bridge.get_conversion_tasks([self.model])
-                if task is not None
-            ]
+            else:
+                tasks = self.megatron_bridge.get_conversion_tasks([self.model])
+            self._native_grouped_mxfp8_tasks = self._build_native_grouped_mxfp8_tasks()
+            return [task for task in tasks if task is not None]
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
@@ -2508,6 +2589,324 @@ class MegatronPolicyWorkerImpl(
             hf_param = task.mapping.hf_param
             if not isinstance(hf_param, dict) and is_nccl_reshard_param(str(hf_param)):
                 yield str(hf_param), local_tensor
+
+    @staticmethod
+    def _canonical_grouped_expert_name(hf_name: str, projection: str) -> str:
+        match = re.match(r"(.+\.experts)\.\d+\.[^.]+\.weight$", hf_name)
+        if match is None:
+            raise ValueError(
+                f"Unsupported grouped MXFP8 source {hf_name!r} role 'weight'"
+            )
+        return f"{match.group(1)}.{projection}.weight"
+
+    def _native_task_projections(
+        self,
+        task: Any,
+        *,
+        grouped: bool = False,
+    ) -> tuple[tuple[str, str], ...]:
+        """Return canonical ``(logical_name, projection)`` outputs for a task."""
+        from megatron.bridge.models.conversion.param_mapping import (
+            AutoMapping,
+            FusedExpertMapping,
+            FusedGatedExpertMapping,
+            GatedMLPMapping,
+            RowParallelMapping,
+        )
+
+        from nemo_rl.weight_sync.nccl_reshard_utils import is_nccl_reshard_param
+
+        global_name = task.global_param_name
+        if global_name.startswith("mtp.") or ".mtp." in global_name:
+            return ()
+
+        mapping = task.mapping
+        if isinstance(mapping, GatedMLPMapping):
+            names = (
+                str(mapping.hf_param["gate"]),
+                str(mapping.hf_param["up"]),
+            )
+            if not any(is_nccl_reshard_param(name) for name in names):
+                return ()
+            if not all(is_nccl_reshard_param(name) for name in names):
+                raise ValueError(
+                    f"Unsupported native MXFP8 source {names[0]!r} role 'weight'"
+                )
+            if grouped:
+                names = (
+                    self._canonical_grouped_expert_name(names[0], "gate_proj"),
+                    self._canonical_grouped_expert_name(names[1], "up_proj"),
+                )
+            return ((names[0], "gate"), (names[1], "up"))
+
+        if isinstance(mapping, FusedGatedExpertMapping):
+            raw_name = str(mapping.hf_param)
+            if not is_nccl_reshard_param(raw_name):
+                return ()
+            prefix = raw_name[: -len(".gate_up_proj")]
+            expert_match = re.search(r"\d+$", global_name)
+            if grouped or expert_match is None:
+                names = (
+                    f"{prefix}.gate_proj.weight",
+                    f"{prefix}.up_proj.weight",
+                )
+            else:
+                expert = expert_match.group()
+                names = (
+                    f"{prefix}.{expert}.gate_proj.weight",
+                    f"{prefix}.{expert}.up_proj.weight",
+                )
+            return ((names[0], "gate"), (names[1], "up"))
+
+        if isinstance(mapping, FusedExpertMapping):
+            raw_name = str(mapping.hf_param)
+            if not is_nccl_reshard_param(raw_name):
+                return ()
+            expert_match = re.search(r"\d+$", global_name)
+            if grouped or expert_match is None:
+                name = f"{raw_name}.weight"
+            else:
+                prefix = raw_name[: -len(".down_proj")]
+                name = f"{prefix}.{expert_match.group()}.down_proj.weight"
+            return ((name, "down"),)
+
+        hf_param = mapping.hf_param
+        hf_names = (
+            tuple(str(name) for name in hf_param.values())
+            if isinstance(hf_param, dict)
+            else (str(hf_param),)
+        )
+        bulk_names = tuple(name for name in hf_names if is_nccl_reshard_param(name))
+        if not bulk_names:
+            return ()
+        if (
+            len(bulk_names) == 1
+            and bulk_names[0].endswith("down_proj.weight")
+            and isinstance(mapping, (AutoMapping, RowParallelMapping))
+        ):
+            name = bulk_names[0]
+            if grouped:
+                name = self._canonical_grouped_expert_name(name, "down_proj")
+            return ((name, "down"),)
+        raise ValueError(
+            f"Unsupported native MXFP8 source {bulk_names[0]!r} role 'weight' "
+            f"with mapping {type(mapping).__name__}"
+        )
+
+    @staticmethod
+    def _native_component_tensor(
+        task: Any,
+        projection: str,
+        role: str,
+    ) -> torch.Tensor:
+        components = extract_native_mxfp8_components(task.param_weight)
+        tensor = getattr(components, role)
+        if projection in ("gate", "up"):
+            gate, up = torch.chunk(tensor, 2, dim=-2)
+            return gate if projection == "gate" else up
+        return tensor
+
+    def _iter_local_native_mxfp8_param_components(
+        self,
+    ) -> Iterator[tuple[str, str, torch.Tensor]]:
+        """Yield current canonical MXFP8 value and scale shards in Bridge order."""
+        grouped_names = {
+            task.global_param_name
+            for task in getattr(self, "_native_grouped_mxfp8_tasks", [])
+        }
+        for task in self.refit_conversion_tasks:
+            if task.param_weight is None or task.global_param_name in grouped_names:
+                continue
+            projections = self._native_task_projections(task)
+            for logical_name, projection in projections:
+                for role in ("weight", "weight_scale"):
+                    yield (
+                        logical_name,
+                        role,
+                        self._native_component_tensor(task, projection, role),
+                    )
+
+    def _materialize_native_grouped_component(
+        self,
+        task: Any,
+        projection: str,
+        role: str,
+    ) -> torch.Tensor:
+        """Stack one current canonical role from cached grouped MXFP8 members."""
+        from megatron.core.fp8_utils import get_grouped_quantized_members
+
+        logical_name = next(
+            name
+            for name, task_projection in self._native_task_projections(
+                task, grouped=True
+            )
+            if task_projection == projection
+        )
+        members = get_grouped_quantized_members(
+            task.param_weight, create_if_missing=False
+        )
+        if not members:
+            raise ValueError(
+                f"Grouped MXFP8 source {logical_name!r} role {role!r} has no members"
+            )
+        selected: list[torch.Tensor] = []
+        for member in members:
+            try:
+                component = getattr(extract_native_mxfp8_components(member), role)
+            except ValueError as error:
+                raise ValueError(
+                    f"Invalid grouped MXFP8 source {logical_name!r} role {role!r}: "
+                    f"{error}"
+                ) from error
+            if projection in ("gate", "up"):
+                gate, up = torch.chunk(component, 2, dim=-2)
+                component = gate if projection == "gate" else up
+            selected.append(component)
+        return torch.stack(selected, dim=0)
+
+    def _build_native_mxfp8_shape_metadata(
+        self,
+        train_parallelism: dict[str, int],
+    ) -> OrderedDict[str, dict[str, Any]]:
+        """Build global native MXFP8 FFN component shapes without full tensors."""
+        from megatron.core.fp8_utils import get_grouped_quantized_members
+
+        from nemo_rl.weight_sync.nccl_reshard_utils import _INDIVIDUAL_EXPERT_RE
+
+        tp_size = train_parallelism.get("tp_size", 1)
+        ep_size = train_parallelism.get("ep_size", 1)
+        grouped_tasks = getattr(self, "_native_grouped_mxfp8_tasks", [])
+        grouped_names = {task.global_param_name for task in grouped_tasks}
+        metadata: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+        def _task_metadata(
+            task: Any,
+            *,
+            grouped: bool,
+        ) -> list[tuple[str, list[int], Optional[str]]] | None:
+            projections = self._native_task_projections(task, grouped=grouped)
+            local_entries: list[tuple[str, list[int], Optional[str]]] | None = None
+            if task.param_weight is not None:
+                if grouped:
+                    members = get_grouped_quantized_members(
+                        task.param_weight, create_if_missing=False
+                    )
+                    if not members:
+                        first_name = projections[0][0]
+                        raise ValueError(
+                            f"Grouped MXFP8 source {first_name!r} role 'weight' "
+                            "has no members"
+                        )
+                    base_shape = list(members[0].shape)
+                    expert_count = len(members) * ep_size
+                else:
+                    base_shape = list(task.param_weight.shape)
+                    expert_count = 0
+                local_entries = []
+                for logical_name, projection in projections:
+                    shape = list(base_shape)
+                    if projection in ("gate", "up"):
+                        if len(shape) < 2 or shape[-2] % 2:
+                            raise ValueError(
+                                f"Native MXFP8 source {logical_name!r} role 'weight' "
+                                f"requires an even FC1 output dimension; got {shape}"
+                            )
+                        shape[-2] //= 2
+                    if grouped:
+                        shape = [expert_count, *shape]
+                    elif not bool(getattr(task.mapping, "is_expert", False)):
+                        shard_dim = -2 if projection in ("gate", "up") else -1
+                        shape[shard_dim] *= tp_size
+                    grouped_projection = f"{projection}_proj" if grouped else None
+                    local_entries.append((logical_name, shape, grouped_projection))
+            broadcaster = getattr(task.mapping, "broadcast_obj_from_pp_rank", None)
+            if callable(broadcaster):
+                return broadcaster(
+                    local_entries,
+                    cache_key=f"native-mxfp8-shape:{task.global_param_name}",
+                )
+            return local_entries
+
+        direct_tasks = [
+            task
+            for task in self.refit_conversion_tasks
+            if task.global_param_name not in grouped_names
+        ]
+        for task, grouped in (
+            *((task, False) for task in direct_tasks),
+            *((task, True) for task in grouped_tasks),
+        ):
+            entries = _task_metadata(task, grouped=grouped)
+            if entries is None:
+                continue
+            for logical_name, shape, grouped_projection in entries:
+                if not shape or shape[-1] % 32:
+                    raise ValueError(
+                        f"Native MXFP8 source {logical_name!r} role 'weight' "
+                        f"requires K divisible by 32; got {shape}"
+                    )
+                if logical_name in metadata:
+                    raise ValueError(
+                        f"Duplicate native MXFP8 source {logical_name!r} role 'weight'"
+                    )
+                entry: dict[str, Any] = {
+                    "shape": shape,
+                    "dtype": "torch.float8_e4m3fn",
+                    "components": [
+                        {
+                            "role": "weight",
+                            "shape": shape,
+                            "dtype": "torch.float8_e4m3fn",
+                        },
+                        {
+                            "role": "weight_scale",
+                            "shape": [*shape[:-1], shape[-1] // 32],
+                            "dtype": "torch.uint8",
+                        },
+                    ],
+                }
+                if grouped_projection is not None:
+                    entry["grouped_expert_proj"] = grouped_projection
+                metadata[logical_name] = entry
+
+        expert_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for name, entry in metadata.items():
+            match = _INDIVIDUAL_EXPERT_RE.match(name)
+            if match is not None:
+                expert_groups.setdefault((match.group(1), match.group(3)), []).append(
+                    entry
+                )
+        if not expert_groups or ep_size == 1:
+            return metadata
+
+        expanded: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        emitted: set[tuple[str, str]] = set()
+        for name, entry in metadata.items():
+            match = _INDIVIDUAL_EXPERT_RE.match(name)
+            if match is None:
+                expanded[name] = entry
+                continue
+            key = (match.group(1), match.group(3))
+            if key in emitted:
+                continue
+            emitted.add(key)
+            entries = expert_groups[key]
+            template = entries[0]
+            if any(item["shape"] != template["shape"] for item in entries[1:]):
+                raise ValueError(
+                    f"Native MXFP8 expert source {key[0]!r} role 'weight' has "
+                    "inconsistent local shapes"
+                )
+            for expert_index in range(len(entries) * ep_size):
+                expanded[f"{key[0]}.{expert_index}.{key[1]}.weight"] = {
+                    **template,
+                    "shape": list(template["shape"]),
+                    "components": [
+                        {**component, "shape": list(component["shape"])}
+                        for component in template["components"]
+                    ],
+                }
+        return expanded
 
     # ------------------------------------------------------------------
     # SGLang weight update (colocate IPC + disaggregate broadcast)
@@ -2823,6 +3222,7 @@ class MegatronPolicyWorkerImpl(
         )
 
         self.refit_param_info_mcore = self._calculate_refit_param_info()
+        native_mxfp8 = self._is_native_mxfp8_export()
 
         # Single pass over Bridge's stream: classify each param as major
         # (xferdtensor) or misc (packed_broadcast), preserve yield order so
@@ -2832,9 +3232,18 @@ class MegatronPolicyWorkerImpl(
         # xferdtensor path (>97% of payload for the large models this targets);
         # everything else (attention, embeddings, norms, router, MLA, scales)
         # goes to the misc packed_broadcast + vLLM load_weights path.
-        state_dict_metadata = {}
+        state_dict_metadata = (
+            self._build_native_mxfp8_shape_metadata(train_parallelism)
+            if native_mxfp8
+            else {}
+        )
         misc_meta = OrderedDict()
-        _xfer_bytes = _bcast_bytes = 0  # full-tensor payload routed to each path
+        _xfer_bytes = sum(
+            math.prod(component["shape"])
+            for metadata in state_dict_metadata.values()
+            for component in metadata["components"]
+        )
+        _bcast_bytes = 0
 
         # Iterates all the params to construct the state_dict_metadata (xferdtensor path)
         # state_dict_metadata[hf_name] -> [shape, dtype]
@@ -2853,9 +3262,29 @@ class MegatronPolicyWorkerImpl(
         # the main model and updates it through load_weights -> misc path.
         mtp_hf_layers_names = _collect_mtp_hf_layer_names(self.refit_conversion_tasks)
 
-        layer_prefix = None
+        if native_mxfp8:
+            grouped_names = {
+                task.global_param_name for task in self._native_grouped_mxfp8_tasks
+            }
+            self._misc_conversion_tasks = [
+                task
+                for task in self.refit_conversion_tasks
+                if task.global_param_name not in grouped_names
+                and not self._native_task_projections(task)
+            ]
+            metadata_conversion_tasks = self._misc_conversion_tasks
+        else:
+            metadata_conversion_tasks = None
+
+        layer_prefix = (
+            _extract_layer_prefix(next(iter(state_dict_metadata)))
+            if state_dict_metadata
+            else None
+        )
         with _meta_tensor_alloc_context():
-            for name, tensor in self._iter_params_with_optional_kv_scales():
+            for name, tensor in self._iter_params_with_optional_kv_scales(
+                conversion_tasks=metadata_conversion_tasks
+            ):
                 meta = {
                     "shape": list(tensor.shape),
                     "dtype": str(tensor.dtype),
@@ -2863,7 +3292,10 @@ class MegatronPolicyWorkerImpl(
                 _nbytes = tensor.numel() * tensor.element_size()
                 # Downsized whitelist: only FFN gate/up/down weights take the bulk
                 # nccl-reshard path; everything else -> misc (packed_broadcast).
-                if (
+                if native_mxfp8:
+                    misc_meta[name] = meta
+                    _bcast_bytes += _nbytes
+                elif (
                     is_nccl_reshard_param(name)
                     and _extract_layer_name(name) not in mtp_hf_layers_names
                 ):
@@ -2928,11 +3360,12 @@ class MegatronPolicyWorkerImpl(
             name = next(iter(hf.values())) if isinstance(hf, dict) else str(hf)
             return name in _misc_names
 
-        self._misc_conversion_tasks = [
-            task
-            for task in self.refit_conversion_tasks
-            if task is not None and _task_is_misc(task)
-        ]
+        if not native_mxfp8:
+            self._misc_conversion_tasks = [
+                task
+                for task in self.refit_conversion_tasks
+                if task is not None and _task_is_misc(task)
+            ]
 
         return self.nccl_reshard_refit_info
 
@@ -3009,6 +3442,152 @@ class MegatronPolicyWorkerImpl(
         - grouped MoE expert: ``pre`` stacks the per-expert views into
           ``[E_local, ...]`` fresh each refit via ``_group_experts``.
         """
+        if self._is_native_mxfp8_export():
+            from nemo_rl.weight_sync.nccl_reshard_utils import _INDIVIDUAL_EXPERT_RE
+
+            direct_specs: dict[tuple[str, str], LocalParamSpec] = {}
+
+            def _register(
+                key: tuple[str, str],
+                spec: LocalParamSpec,
+            ) -> None:
+                if key in direct_specs:
+                    raise ValueError(
+                        f"Duplicate native MXFP8 source {key[0]!r} role {key[1]!r}"
+                    )
+                direct_specs[key] = spec
+
+            def _direct_spec(
+                task: Any,
+                logical_name: str,
+                projection: str,
+                role: str,
+            ) -> LocalParamSpec:
+                def _read() -> torch.Tensor:
+                    try:
+                        return self._native_component_tensor(task, projection, role)
+                    except ValueError as error:
+                        raise ValueError(
+                            f"Invalid native MXFP8 source {logical_name!r} "
+                            f"role {role!r}: {error}"
+                        ) from error
+
+                base = _read()
+
+                def pre(_base: Any) -> RefitCtx:
+                    return RefitCtx(buf=_read())
+
+                return LocalParamSpec(base=base, pre=pre)
+
+            grouped_names = {
+                task.global_param_name
+                for task in getattr(self, "_native_grouped_mxfp8_tasks", [])
+            }
+            for task in self.refit_conversion_tasks:
+                if task.param_weight is None or task.global_param_name in grouped_names:
+                    continue
+                for logical_name, projection in self._native_task_projections(task):
+                    for role in ("weight", "weight_scale"):
+                        _register(
+                            (logical_name, role),
+                            _direct_spec(
+                                task,
+                                logical_name,
+                                projection,
+                                role,
+                            ),
+                        )
+
+            for task in getattr(self, "_native_grouped_mxfp8_tasks", []):
+                if task.param_weight is None:
+                    continue
+                for logical_name, projection in self._native_task_projections(
+                    task, grouped=True
+                ):
+                    for role in ("weight", "weight_scale"):
+
+                        def pre(
+                            _base: Any,
+                            *,
+                            task: Any = task,
+                            projection: str = projection,
+                            role: str = role,
+                        ) -> RefitCtx:
+                            return RefitCtx(
+                                buf=self._materialize_native_grouped_component(
+                                    task, projection, role
+                                )
+                            )
+
+                        _register(
+                            (logical_name, role),
+                            LocalParamSpec(base=None, pre=pre),
+                        )
+
+            expert_sources: dict[
+                tuple[str, str, str], list[tuple[int, LocalParamSpec]]
+            ] = {}
+            for (name, role), spec in direct_specs.items():
+                match = _INDIVIDUAL_EXPERT_RE.match(name)
+                if match is None:
+                    continue
+                key = (match.group(1), match.group(3), role)
+                expert_sources.setdefault(key, []).append((int(match.group(2)), spec))
+            for sources in expert_sources.values():
+                sources.sort(key=lambda item: item[0])
+
+            def _expert_spec(
+                grouped_name: str,
+                projection: str,
+                role: str,
+            ) -> Optional[LocalParamSpec]:
+                prefix = grouped_name.rsplit(f".{projection}.weight", 1)[0]
+                sources = expert_sources.get((prefix, projection, role))
+                if not sources:
+                    return None
+
+                def pre(_base: Any) -> RefitCtx:
+                    refreshed: list[torch.Tensor] = []
+                    try:
+                        for _, source in sources:
+                            ctx = (
+                                source.pre(source.base)
+                                if source.pre is not None
+                                else RefitCtx(buf=source.base)
+                            )
+                            refreshed.append(ctx.buf)
+                    except ValueError as error:
+                        raise ValueError(
+                            f"Invalid native MXFP8 source {grouped_name!r} "
+                            f"role {role!r}: {error}"
+                        ) from error
+                    return RefitCtx(buf=torch.stack(refreshed, dim=0))
+
+                return LocalParamSpec(base=None, pre=pre)
+
+            mapping: dict[tuple[str, str], LocalParamSpec] = {}
+            for layer_name in refit_info["layer_names"]:
+                for param_info in refit_info["per_layer_params"][layer_name]:
+                    name = param_info["name"]
+                    for component in param_info["components"]:
+                        role = component["role"]
+                        key = (name, role)
+                        spec = direct_specs.get(key)
+                        if spec is None and param_info.get("grouped_expert_proj"):
+                            spec = _expert_spec(
+                                name,
+                                param_info["grouped_expert_proj"],
+                                role,
+                            )
+                        if spec is not None:
+                            if key in mapping:
+                                raise ValueError(
+                                    f"Duplicate native MXFP8 source {name!r} "
+                                    f"role {role!r}"
+                                )
+                            mapping[key] = spec
+            return HFToLocalParamMap(specs=mapping)
+
         # This rank's local TP/EP HF param shards (live views), and the
         # per-expert views grouped for torch.stack.  Build-time only.
         param_map = dict(self._iter_local_hf_param_shards())
@@ -3057,44 +3636,72 @@ class MegatronPolicyWorkerImpl(
             for param_info in self.nccl_reshard_refit_info["per_layer_params"][
                 layer_name
             ]:
+                if param_info.get("pp_stage", 0) != self.my_pp_stage:
+                    continue
+                for component in param_info["components"]:
+                    role = component["role"]
+                    spec = self.hf_to_local_param_map.get(param_info["name"], role=role)
+                    if spec is None:
+                        raise RuntimeError(
+                            f"Missing source for {param_info['name']!r} role {role!r}"
+                        )
+                    if spec.base is None and spec.pre is None:
+                        raise RuntimeError(
+                            f"Missing tensor for {param_info['name']!r} role {role!r}"
+                        )
+
+        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
+            for param_info in self.nccl_reshard_refit_info["per_layer_params"][
+                layer_name
+            ]:
                 # Each train worker handles only its own PP stage's params
                 # (non-PP = every param is in pp_stage 0).
                 if param_info.get("pp_stage", 0) != self.my_pp_stage:
                     continue
                 group = self.pp_comm_group
+                component_specs: list[tuple[dict[str, Any], LocalParamSpec]] = []
+                for component in param_info["components"]:
+                    role = component["role"]
+                    spec = self.hf_to_local_param_map.get(param_info["name"], role=role)
+                    if spec is None:
+                        raise RuntimeError(
+                            f"Missing source for {param_info['name']!r} role {role!r}"
+                        )
+                    component_specs.append((component, spec))
 
-                spec = self.hf_to_local_param_map.get(param_info["name"])
-                assert spec is not None, (
-                    f"no spec for {param_info['name']!r} in hf_to_local_param_map"
-                )
-                # pre stacks grouped MoE experts fresh each refit; a direct
-                # param sends its live TP/EP-local view as-is.
-                ctx = (
-                    spec.pre(spec.base)  # stack grouped MoE experts
-                    if spec.pre is not None
-                    else RefitCtx(buf=spec.base)  # send local shard as-is
-                )
-                assert ctx.buf is not None, (
-                    f"no local tensor for {param_info['name']!r}"
-                )
-                src_tensor = DTensorRef(
-                    local_tensor=ctx.buf, global_shape=param_info["global_shape"]
-                )
-                xferdtensor(
-                    src_tensor,
-                    param_info["src_mesh_info"],
-                    param_info["src_placements"],
-                    None,
-                    param_info["dst_mesh_info"],
-                    param_info["dst_placements"],
-                    group,
-                    nccl_reshard_stream,
-                )
-                if spec.post is not None:
-                    spec.post(ctx)
-                # Drop refs to the per-iteration grouped MoE tensor so its CUDA
-                # memory returns to the caching allocator
-                del ctx, src_tensor
+                prepared: list[tuple[dict[str, Any], LocalParamSpec, RefitCtx]] = []
+                for component, spec in component_specs:
+                    role = component["role"]
+                    ctx = (
+                        spec.pre(spec.base)
+                        if spec.pre is not None
+                        else RefitCtx(buf=spec.base)
+                    )
+                    if ctx.buf is None:
+                        raise RuntimeError(
+                            f"Missing tensor for {param_info['name']!r} role {role!r}"
+                        )
+                    prepared.append((component, spec, ctx))
+
+                for component, spec, ctx in prepared:
+                    src_tensor = DTensorRef(
+                        local_tensor=ctx.buf,
+                        global_shape=component["global_shape"],
+                    )
+                    xferdtensor(
+                        src_tensor,
+                        param_info["src_mesh_info"],
+                        component["src_placements"],
+                        None,
+                        param_info["dst_mesh_info"],
+                        component["dst_placements"],
+                        group,
+                        nccl_reshard_stream,
+                    )
+                    if spec.post is not None:
+                        spec.post(ctx)
+                    del src_tensor
+                del prepared
 
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
