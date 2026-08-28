@@ -94,6 +94,7 @@ def reduce_advantage_pump_metrics(
     rewards: list[torch.Tensor],
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
+    *,
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
     num_invalid_tool_calls: list[int] | None = None,
     num_malformed_thinking: list[int] | None = None,
