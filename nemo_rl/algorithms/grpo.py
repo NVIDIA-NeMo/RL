@@ -74,6 +74,10 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.nemo_gym_sample_artifacts import (
+    NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY,
+    AsyncNemoGymTrainingSampleWriter,
+)
 from nemo_rl.data.train_data_artifacts import AsyncTrainDataArtifactWriter
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
@@ -87,7 +91,11 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import (
+    should_log_nemo_gym_training_samples,
+    should_use_nemo_gym,
+    spinup_nemo_gym_actor,
+)
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
@@ -2229,6 +2237,46 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     return num_masked
 
 
+def _take_nemo_gym_training_samples_for_log(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    *,
+    enabled: bool,
+) -> Optional[list[dict[str, Any]]]:
+    """Detach the selected Gym response snapshots from the replay batch."""
+    has_samples = NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY in repeated_batch
+    if not enabled:
+        if has_samples:
+            raise RuntimeError(
+                "NeMo Gym training samples reached the trainer while "
+                "env.nemo_gym.log_training_samples is disabled"
+            )
+        return None
+    if not has_samples:
+        raise RuntimeError(
+            "env.nemo_gym.log_training_samples=true, but the sampled replay "
+            "batch contains no retained NeMo Gym responses"
+        )
+
+    raw_samples = repeated_batch[NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY]
+    del repeated_batch[NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY]
+    if not isinstance(raw_samples, list) or len(raw_samples) != repeated_batch.size:
+        actual_size = len(raw_samples) if isinstance(raw_samples, list) else None
+        raise ValueError(
+            "Retained NeMo Gym response count must match the selected training "
+            f"batch: got {actual_size}, expected {repeated_batch.size}"
+        )
+
+    samples: list[dict[str, Any]] = []
+    for index, raw_sample in enumerate(raw_samples):
+        if not isinstance(raw_sample, dict):
+            raise TypeError(
+                "Retained NeMo Gym training samples must be dictionaries, "
+                f"got {type(raw_sample).__name__} at row {index}"
+            )
+        samples.append(dict(raw_sample))
+    return samples
+
+
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     """Whether NeMo Gym is responsible for full response logging.
 
@@ -4212,6 +4260,15 @@ def async_grpo_train(
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
     max_generation_failures = master_config.grpo.async_grpo.max_generation_failures
+    log_nemo_gym_training_samples = should_log_nemo_gym_training_samples(
+        master_config.env
+    )
+    if log_nemo_gym_training_samples and not master_config.env.get(
+        "should_use_nemo_gym", False
+    ):
+        raise ValueError(
+            "env.nemo_gym.log_training_samples requires env.should_use_nemo_gym=true"
+        )
 
     if router_replay_enabled(master_config.policy) and (
         master_config.data_plane or {}
@@ -4661,6 +4718,9 @@ def async_grpo_train(
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
     train_data_writer = AsyncTrainDataArtifactWriter(logger.log_train_data_artifacts)
+    nemo_gym_sample_writer = AsyncNemoGymTrainingSampleWriter(
+        logger.log_nemo_gym_training_samples
+    )
 
     # Main training loop
     try:
@@ -4668,6 +4728,7 @@ def async_grpo_train(
             # Surface a completed background-save failure before doing more work.
             # A still-running save is allowed to overlap the optimizer step.
             train_data_writer.finish(wait=False)
+            nemo_gym_sample_writer.finish(wait=False)
             ray.get(trajectory_collector.check_health.remote())
             refit_metrics: dict[str, float] = {}
             early_stop_message: Optional[str] = None
@@ -4854,6 +4915,18 @@ def async_grpo_train(
                     )
 
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
+
+                with timer.time("save_nemo_gym_training_samples"):
+                    nemo_gym_training_samples = _take_nemo_gym_training_samples_for_log(
+                        repeated_batch,
+                        enabled=log_nemo_gym_training_samples,
+                    )
+                    if nemo_gym_training_samples is not None:
+                        nemo_gym_sample_writer.start(
+                            step=step + 1,
+                            samples=nemo_gym_training_samples,
+                        )
+                        del nemo_gym_training_samples
 
                 # Baseline spec-decode counters; the delta read at metrics time gives
                 # MTP acceptance over this step's generation window (async generation
@@ -5677,12 +5750,21 @@ def async_grpo_train(
 
     finally:
         had_active_exception = sys.exc_info()[0] is not None
-        train_data_finalize_error: Optional[Exception] = None
+        artifact_finalize_error: Optional[Exception] = None
         try:
             train_data_writer.finish(wait=True)
         except Exception as e:
             print(f"Error finalizing background train-data save: {e}", flush=True)
-            train_data_finalize_error = e
+            artifact_finalize_error = e
+        try:
+            nemo_gym_sample_writer.finish(wait=True)
+        except Exception as e:
+            print(
+                f"Error finalizing background NeMo Gym training-sample save: {e}",
+                flush=True,
+            )
+            if artifact_finalize_error is None:
+                artifact_finalize_error = e
 
         # Finalize any pending async checkpoint before tearing down workers.
         try:
@@ -5720,5 +5802,5 @@ def async_grpo_train(
         print("Async GRPO training complete!")
         # Preserve an already-active training exception.  Otherwise surface a
         # persistence failure only after all workers and checkpoints are clean.
-        if train_data_finalize_error is not None and not had_active_exception:
-            raise train_data_finalize_error
+        if artifact_finalize_error is not None and not had_active_exception:
+            raise artifact_finalize_error

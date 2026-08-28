@@ -49,6 +49,9 @@ from nemo_rl.data.multimodal_utils import (
     attach_image_model_inputs_to_message,
     extract_input_images_from_responses_messages,
 )
+from nemo_rl.data.nemo_gym_sample_artifacts import (
+    NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -58,7 +61,11 @@ from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
     get_pad_dynamic_image_shapes,
 )
-from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
@@ -2223,8 +2230,10 @@ def _prepare_nemo_gym_rows(
     rows: list[dict],
     generation_config: GenerationConfig,
     sampling_params: GenerationSamplingParams,
+    target_weight_version: Optional[int] = None,
 ) -> None:
     """Apply NeMo-RL sampling parameters and stable row indices in place."""
+    next_rollout_index_by_task: dict[Any, int] = defaultdict(int)
     for row_index, row in enumerate(rows):
         responses_create_params = row.get("responses_create_params")
         if not isinstance(responses_create_params, dict):
@@ -2242,6 +2251,16 @@ def _prepare_nemo_gym_rows(
             else configured_max_tokens
         )
         row["_rowidx"] = row_index
+
+        task_index = row.get(NEMO_GYM_TASK_INDEX_KEY)
+        if task_index is not None:
+            row[NEMO_GYM_ROLLOUT_INDEX_KEY] = next_rollout_index_by_task[task_index]
+            next_rollout_index_by_task[task_index] += 1
+
+        if target_weight_version is None:
+            row.pop(NEMO_GYM_TARGET_WEIGHT_VERSION_KEY, None)
+        else:
+            row[NEMO_GYM_TARGET_WEIGHT_VERSION_KEY] = target_weight_version
 
 
 def _tensorize_nemo_gym_result(result: dict) -> None:
@@ -2277,6 +2296,8 @@ async def run_async_nemo_gym_rollout(
     sampling_params: Optional[GenerationSamplingParams] = None,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    target_weight_version: Optional[int] = None,
+    log_training_samples: bool = False,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2315,6 +2336,11 @@ async def run_async_nemo_gym_rollout(
             remote Gym return and restore the exact original payload locally.
         debug_payload_metrics: Emit logical, physical, and serialized media
             payload metrics at the Gym Ray boundary.
+        target_weight_version: Opaque async-RL target version forwarded to vLLM
+            on every model request. ``None`` omits the field.
+        log_training_samples: Retain tensor-free Gym responses in the rollout
+            batch so the async trainer can persist only the replay samples it
+            selects. Large token, logprob, and route fields become sentinels.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
@@ -2400,7 +2426,12 @@ async def run_async_nemo_gym_rollout(
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
     with timer.time(total_timer_label):
-        _prepare_nemo_gym_rows(nemo_gym_rows, generation_config, sampling_params)
+        _prepare_nemo_gym_rows(
+            nemo_gym_rows,
+            generation_config,
+            sampling_params,
+            target_weight_version=target_weight_version,
+        )
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
             num_generations=num_generations,
@@ -2415,6 +2446,10 @@ async def run_async_nemo_gym_rollout(
                 timer_prefix,
                 deduplicate_multimodal_data,
             )
+            # Preserve the three-argument flag-off call shape for old actors and
+            # tests. The actor's fourth parameter defaults to false.
+            if log_training_samples:
+                ray_arguments += (True,)
             print_multimodal_payload_metrics(
                 collect_multimodal_payload_metrics(
                     ray_arguments,
@@ -2479,6 +2514,7 @@ async def run_async_nemo_gym_rollout(
                         reward_penalty_config=reward_penalty_config,
                         thinking_tags=thinking_tags,
                         mask_env_flagged_samples=mask_env_flagged_samples,
+                        log_training_samples=log_training_samples,
                     )
                     if accumulator.is_complete:
                         final_rollout_result = rollout_result
@@ -2519,6 +2555,8 @@ def run_nemo_gym_rollout_sync(
     mask_env_flagged_samples: bool = True,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    target_weight_version: Optional[int] = None,
+    log_training_samples: bool = False,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
 
@@ -2550,6 +2588,10 @@ def run_nemo_gym_rollout_sync(
         deduplicate_multimodal_data: Omit initial policy-ready media from the
             remote Gym return and restore it from the input batch.
         debug_payload_metrics: Emit exact Gym Ray-boundary media payload metrics.
+        target_weight_version: Opaque async-RL target version forwarded to vLLM
+            on every model request. ``None`` omits the field.
+        log_training_samples: Retain tensor-free Gym responses in the returned
+            batch. Intended for training callers, not validation.
 
     Returns:
         The fully postprocessed NeMo-Gym rollout batch in input-row order.
@@ -2584,6 +2626,8 @@ def run_nemo_gym_rollout_sync(
             sampling_params=sampling_params,
             deduplicate_multimodal_data=deduplicate_multimodal_data,
             debug_payload_metrics=debug_payload_metrics,
+            target_weight_version=target_weight_version,
+            log_training_samples=log_training_samples,
         ):
             pass
         if rollout_result is None:
@@ -2606,6 +2650,7 @@ def _postprocess_single_nemo_gym_group(
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
+    log_training_samples: bool = False,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
     # Length-based reward shaping for low-effort prompts
@@ -2792,6 +2837,24 @@ def _postprocess_single_nemo_gym_group(
     # count for advantages. env.should_mask_flagged_samples=false skips this.
     if mask_env_flagged_samples:
         final_batch["mask_sample"] = _extract_mask_sample_flags(results)
+
+    if log_training_samples:
+        training_samples: list[dict[str, Any]] = []
+        for nemo_gym_row, result in zip(nemo_gym_rows, results):
+            sample = {
+                "agent_ref": nemo_gym_row["agent_ref"],
+                "_rowidx": int(nemo_gym_row["_rowidx"]),
+                "full_result": result["full_result"],
+            }
+            for metadata_key in (
+                NEMO_GYM_TASK_INDEX_KEY,
+                NEMO_GYM_ROLLOUT_INDEX_KEY,
+                NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
+            ):
+                if metadata_key in nemo_gym_row:
+                    sample[metadata_key] = nemo_gym_row[metadata_key]
+            training_samples.append(sample)
+        final_batch[NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY] = training_samples
 
     if length_rewards_low:
         rollout_metrics["mean_length_reward_low"] = sum(length_rewards_low) / len(
