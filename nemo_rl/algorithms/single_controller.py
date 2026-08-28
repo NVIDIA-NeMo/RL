@@ -1116,6 +1116,7 @@ class SingleControllerActor:
             f"{checkpoint_dir} ({time.monotonic() - started:.2f}s)",
             flush=True,
         )
+
     @staticmethod
     def _request_staging_keys(request: "FinalizationRequest") -> list[str]:
         """Return the full receipt-manifest staging ownership for a request."""
@@ -1379,18 +1380,31 @@ class SingleControllerActor:
                     # hand the metadata-only request to the finalizer actor pool.
                     ownership_transferred = False
                     try:
-                        request = await self._rollout_manager.generate_for_finalization(
-                            prompt,
-                            target_step=target_step,
-                            inflight_registry=self._inflight_by_group_id,
-                            lineage_group_id=lineage_group_id,
-                        )
+                        if lineage_group_id is None:
+                            request = (
+                                await self._rollout_manager.generate_for_finalization(
+                                    prompt,
+                                    target_step=target_step,
+                                    inflight_registry=self._inflight_by_group_id,
+                                )
+                            )
+                        else:
+                            request = (
+                                await self._rollout_manager.generate_for_finalization(
+                                    prompt,
+                                    target_step=target_step,
+                                    inflight_registry=self._inflight_by_group_id,
+                                    lineage_group_id=lineage_group_id,
+                                )
+                            )
                         if request is None:
                             if self._rollout_recovery_enabled:
                                 assert lineage_group_id is not None
-                                async with self._data_plane_checkpoint_barrier.mutation():
+                                async with (
+                                    self._data_plane_checkpoint_barrier.mutation()
+                                ) as cut:
                                     self._rollout_manager.discard_prompt_group(
-                                        lineage_group_id
+                                        cut, lineage_group_id
                                     )
                                     self._credit_shortfall(target_step)
                             else:
@@ -1401,25 +1415,37 @@ class SingleControllerActor:
                         inflight_count_released = True
                         sem.release()
                         generation_permit_released = True
-                        if request is None:
-                            # Dropped within the infra budget: nothing was
-                            # committed, so the train pump will never release
-                            # this permit, and the step it was stamped for
-                            # must be allowed to close short.
-                            self._buffer_capacity.release()
-                            self._credit_shortfall(target_step)
-                            return
                         committed = await self._finalize_with_actor(request)
-                        if not committed:
+                        if committed:
+                            # Canonical replay now owns the backpressure permit. Drop
+                            # the transient recovery owner so the sidecar stays bounded.
+                            ownership_transferred = True
+                            if self._rollout_recovery_enabled:
+                                assert lineage_group_id is not None
+                                async with (
+                                    self._data_plane_checkpoint_barrier.mutation()
+                                ) as cut:
+                                    self._rollout_manager.discard_prompt_group(
+                                        cut, lineage_group_id
+                                    )
+                        else:
                             # Finalizer dropped the group as a policy outcome;
-                            # ownership was already cleaned up, so like the
-                            # dropped-prompt path above the train pump will
-                            # never release this permit and the step must be
-                            # allowed to close short.
+                            # canonical/staging ownership was already cleaned up.
+                            # Remove recovery-ledger ownership before allowing the
+                            # step to close short.
+                            if self._rollout_recovery_enabled:
+                                assert lineage_group_id is not None
+                                async with (
+                                    self._data_plane_checkpoint_barrier.mutation()
+                                ) as cut:
+                                    self._rollout_manager.discard_prompt_group(
+                                        cut, lineage_group_id
+                                    )
+                                    self._credit_shortfall(target_step)
+                            else:
+                                self._credit_shortfall(target_step)
                             self._buffer_capacity.release()
-                            self._credit_shortfall(target_step)
                             return
-                        ownership_transferred = True
                     except BaseException:
                         # On success ownership transfers to the train pump, which
                         # releases this permit after consuming the committed group.
@@ -1429,12 +1455,19 @@ class SingleControllerActor:
                 else:
                     while True:
                         try:
-                            outcome = await self._rollout_manager.generate_and_push(
-                                prompt,
-                                target_step=target_step,
-                                inflight_registry=self._inflight_by_group_id,
-                                lineage_group_id=lineage_group_id,
-                            )
+                            if lineage_group_id is None:
+                                outcome = await self._rollout_manager.generate_and_push(
+                                    prompt,
+                                    target_step=target_step,
+                                    inflight_registry=self._inflight_by_group_id,
+                                )
+                            else:
+                                outcome = await self._rollout_manager.generate_and_push(
+                                    prompt,
+                                    target_step=target_step,
+                                    inflight_registry=self._inflight_by_group_id,
+                                    lineage_group_id=lineage_group_id,
+                                )
                         except BaseException:
                             # On success ownership transfers to the train pump, which
                             # releases this permit after consuming the committed group.

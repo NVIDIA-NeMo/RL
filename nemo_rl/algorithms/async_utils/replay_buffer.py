@@ -1360,9 +1360,7 @@ class TQReplayBuffer:
         if clear_data_plane:
             if dropped_sample_ids:
                 try:
-                    await self._clear_samples_unlocked(
-                        sample_ids=dropped_sample_ids
-                    )
+                    await self._clear_samples_unlocked(sample_ids=dropped_sample_ids)
                 except Exception as error:
                     raise RuntimeError(
                         "canonical cleanup failed; retained replay-buffer ownership "
