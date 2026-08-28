@@ -1038,7 +1038,7 @@ class SingleControllerActor:
                             train_meta.extra_info.pop(ROLLOUT_METRICS, [])
                         )
 
-                    if groups_dispatched == 0:
+                    if groups_dispatched == 0 and self._gen is not None:
                         await asyncio.to_thread(self._gen.snapshot_step_metrics)
 
                     # ---- 2. Prepare the batch ----
@@ -1258,7 +1258,10 @@ class SingleControllerActor:
                 step_metrics.update(
                     aggregate_rollout_metrics(per_group_rollout_metrics)
                 )
-                step_metrics.update(await asyncio.to_thread(self._gen.get_step_metrics))
+                if self._gen is not None:
+                    step_metrics.update(
+                        await asyncio.to_thread(self._gen.get_step_metrics)
+                    )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 step_metrics.update(
                     _pooled_opd_metrics(

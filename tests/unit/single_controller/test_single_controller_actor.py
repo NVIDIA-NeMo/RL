@@ -1492,6 +1492,29 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
     assert train_metrics["vllm/spec_acceptance_rate"] == pytest.approx(0.8)
 
 
+def test_train_pump_skips_generation_metrics_without_generation_handle(
+    monkeypatch,
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
+    ctrl._gen = None
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert "vllm/spec_acceptance_rate" not in train_metrics
+
+
 def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> None:
     """The logprob detour between chunks must not offload the trainer's grad
     buffers, because mcore's offload frees the gradients the earlier chunks of
