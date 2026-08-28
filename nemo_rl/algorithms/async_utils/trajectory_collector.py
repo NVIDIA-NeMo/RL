@@ -30,6 +30,7 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
+    _get_effort_config,
 )
 from nemo_rl.algorithms.grpo import (
     MasterConfig as GRPOMasterConfig,
@@ -58,7 +59,11 @@ from nemo_rl.experience.rollouts import (
     attach_initial_nemo_gym_image_payloads,
     run_async_multi_turn_rollout_groups,
 )
-from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
+from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
+    GenerationInterface,
+    should_use_async_rollouts,
+)
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
@@ -190,6 +195,8 @@ class AsyncTrajectoryCollector:
 
         self._refit_pause_cleared = _threading.Event()
         self._refit_pause_cleared.set()  # Start in cleared state
+        self._generation_pause_requested_for_refit: bool = False
+        self._generation_paused_for_refit: bool = False
 
         self.current_weight_version: int = start_step
         self.initial_weight_version: int = start_step
@@ -932,9 +939,10 @@ class AsyncTrajectoryCollector:
     def prepare_for_refit(self) -> None:
         """Pause new generation starts and optionally wait for pending generations.
 
-        For backends with an async engine in-flight weight updates allows ongoing generations
-        to continue with their current KV caches while weights are updated.
-        This significantly improves async performance.
+        Every async backend configured for in-flight weight updates, except managed
+        Dynamo, is asked to pause generation. vLLM preserves in-flight request state
+        with its native keep-mode pause. Backends without pause support warn and
+        retain their existing behavior. Managed Dynamo drains active trajectories.
 
         For non-async engines, waits for all pending generations to complete before refit.
         """
@@ -943,24 +951,14 @@ class AsyncTrajectoryCollector:
 
         # Pause new generation starts
         self._refit_pause_cleared.clear()
+        self._generation_pause_requested_for_refit = False
+        self._generation_paused_for_refit = False
         print("⏸️ New generation starts paused")
 
         # Check if we're using async engine
-        generation_cfg = self.master_config.policy.get("generation", {})
-        backend = generation_cfg.get("backend", "")
-        if backend == "vllm":
-            is_async_engine = generation_cfg.get("vllm_cfg", {}).get(
-                "async_engine", False
-            )
-        elif backend == "megatron":
-            is_async_engine = True
-        elif backend == "trtllm":
-            assert generation_cfg.get("trtllm_cfg", {}).get("async_engine", False), (
-                "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
-                "synchronous engine path (async_engine=false) is no longer supported."
-            )
-            is_async_engine = True
-        elif backend == "dynamo":
+        generation_cfg = self.master_config.policy["generation"]
+        backend = generation_cfg["backend"]
+        if backend == "dynamo":
             # Dynamo's native layerwise reload temporarily materializes model
             # parameters while the NCCL update is in progress.  It is not safe
             # to execute an already-issued vLLM request concurrently with that
@@ -969,19 +967,26 @@ class AsyncTrajectoryCollector:
             # starts above and drain every active trajectory before refitting.
             is_async_engine = False
         else:
-            is_async_engine = False
+            is_async_engine = should_use_async_rollouts(generation_cfg)
         in_flight_weight_updates = self.async_config.in_flight_weight_updates
 
         if is_async_engine and in_flight_weight_updates:
-            # async engines support in-flight weight updates
-            # Ongoing generations will continue with their current KV caches
-            # New generations (after weight update) will use the updated weights
-            print(
-                f"🚀 Using {backend} in-flight weight update - skipping wait for pending generations"
+            clear_cache = self.async_config.recompute_kv_cache_after_weight_updates
+            self._generation_pause_requested_for_refit = True
+            print(f"⏸️ Requesting {backend} generation pause before refit")
+            self._generation_paused_for_refit = (
+                self.policy_generation.pause_generation_for_refit(
+                    clear_cache=clear_cache
+                )
             )
-            print(
-                f"   {len(self._inflight_threads)} ongoing generations will complete with current weights"
-            )
+            if self._generation_paused_for_refit:
+                print(
+                    f"   {len(self._inflight_threads)} ongoing generation batches paused"
+                )
+            else:
+                print(
+                    f"   {len(self._inflight_threads)} ongoing generations will complete with current weights"
+                )
         else:
             # For non-async engines, wait for all pending generations to complete
             print(
@@ -995,6 +1000,21 @@ class AsyncTrajectoryCollector:
     def resume_after_refit(self) -> None:
         """Resume new generation starts after refit is complete."""
         print("🔄 Resuming generation starts after refit")
+
+        if self._generation_pause_requested_for_refit:
+            backend = self.master_config.policy["generation"]["backend"]
+            print(f"▶️ Requesting {backend} generation resume after refit")
+            resumed = self.policy_generation.resume_generation_after_refit()
+            if self._generation_paused_for_refit and not resumed:
+                raise RuntimeError(
+                    f"Failed to resume {backend} generation after successful pause"
+                )
+
+        if self._generation_paused_for_refit:
+            self._generation_pause_requested_for_refit = False
+            self._generation_paused_for_refit = False
+            self._refit_pause_cleared.set()
+            return
 
         # Invalidate&recompute vLLM caches after the weight updates (in-flight or not) if
         # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
@@ -1015,16 +1035,17 @@ class AsyncTrajectoryCollector:
                     )
             except Exception as e:
                 print(f"⚠️ Failed to invalidate generation backend KV caches: {e}")
-                if (
-                    "generation" in self.master_config.policy
-                    and self.master_config.policy["generation"]["backend"] == "dynamo"
-                ):
+                if self.master_config.policy["generation"]["backend"] == "dynamo":
                     raise RuntimeError(
                         "Managed Dynamo KV cache invalidation failed after refit"
                     ) from e
             finally:
+                self._generation_pause_requested_for_refit = False
+                self._generation_paused_for_refit = False
                 self._refit_pause_cleared.set()
         else:
+            self._generation_pause_requested_for_refit = False
+            self._generation_paused_for_refit = False
             self._refit_pause_cleared.set()
 
     def wait_for_pending_generations(self) -> None:
@@ -1285,6 +1306,11 @@ class AsyncTrajectoryCollector:
                 ),
                 max_rollout_turns=None,
                 greedy=False,
+                effort_config=(
+                    _get_effort_config(self.master_config)
+                    if isinstance(self.master_config, GRPOMasterConfig)
+                    else None
+                ),
                 reward_penalty_config=self.master_config.reward_penalties,
                 thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
                 mask_env_flagged_samples=should_mask_flagged_samples(

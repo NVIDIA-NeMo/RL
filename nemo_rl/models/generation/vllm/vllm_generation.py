@@ -1279,6 +1279,39 @@ class VllmGeneration(GenerationInterface):
             print(f"Error invalidating vLLM caches: {e}")
             return False
 
+    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
+        """Pause every async vLLM engine while preserving in-flight requests."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError("pause_generation_for_refit requires async_engine=True")
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        futures = self.worker_group.run_all_workers_single_data(
+            "pause_generation_async",
+            clear_cache=clear_cache,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        if not all(ray.get(futures)):
+            raise RuntimeError("Failed to pause every async vLLM engine")
+        return True
+
+    def resume_generation_after_refit(self) -> bool:
+        """Resume every async vLLM engine paused for refit."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "resume_generation_after_refit requires async_engine=True"
+            )
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        futures = self.worker_group.run_all_workers_single_data(
+            "resume_generation_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        if not all(ray.get(futures)):
+            raise RuntimeError("Failed to resume every async vLLM engine")
+        return True
+
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Check if KV cache scales should be synchronized during refit.

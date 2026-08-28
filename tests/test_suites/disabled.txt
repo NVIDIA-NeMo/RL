@@ -6,6 +6,9 @@
 # so this is the pre-existing Qwen3.5 + Megatron + EP hang.
 tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.sh
 
+# Long-context-capable GLM validation is manual-only because it exceeds the recurring-suite GPU-hour budget.
+tests/test_suites/llm/grpo-glm5.2-72n8g-megatron-noncolocated.sh
+
 # The async video GRPO regression is self-contained, but its 16-node topology
 # is too large for nightly. Run it manually before changes to the async video
 # rollout/training path are merged.
