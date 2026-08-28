@@ -27,6 +27,17 @@ from nemo_rl.models.policy.workers.mxfp8_refit_source import (
 _DEFAULT_METADATA = object()
 
 
+class DType:
+    """Structural stand-in for ``transformer_engine_torch.DType``."""
+
+    def __str__(self) -> str:
+        return "DType.kFloat8E4M3"
+
+
+DType.__module__ = "transformer_engine_torch"
+PINNED_TE_E4M3 = DType()
+
+
 class FakeMXFP8Tensor:
     """Structural stand-in for the supported Transformer Engine metadata API."""
 
@@ -37,7 +48,7 @@ class FakeMXFP8Tensor:
         rowwise_data: object = None,
         rowwise_scale_inv: object = None,
         with_gemm_swizzled_scales: object = False,
-        fp8_dtype: object = "kFloat8E4M3",
+        fp8_dtype: object = PINNED_TE_E4M3,
         metadata: object = _DEFAULT_METADATA,
         columnwise_data: object = None,
         columnwise_scale_inv: object = None,
@@ -193,12 +204,20 @@ def test_extract_native_mxfp8_components_does_not_fall_back_to_columnwise_storag
         ),
         (_source(shape=(3, 63)), "divisible by 32"),
         (
-            FakeMXFP8Tensor(shape=(), metadata={"with_gemm_swizzled_scales": False}),
+            FakeMXFP8Tensor(
+                shape=(),
+                metadata={
+                    "with_gemm_swizzled_scales": False,
+                    "fp8_dtype": PINNED_TE_E4M3,
+                },
+            ),
             "non-empty",
         ),
         (_source(with_gemm_swizzled_scales=True), "compact rowwise scales"),
         (_source(with_gemm_swizzled_scales=None), "compact rowwise scales"),
-        (_source(fp8_dtype="kFloat8E5M2"), "E4M3"),
+        (_source(fp8_dtype="DType.kFloat8E4M3"), "fp8_dtype"),
+        (_source(fp8_dtype="DType.kFloat8E5M2"), "E4M3"),
+        (_source(fp8_dtype="DType.kFloat8E4M3-compatible"), "fp8_dtype"),
     ],
 )
 def test_extract_native_mxfp8_components_rejects_invalid_storage(
@@ -208,13 +227,18 @@ def test_extract_native_mxfp8_components_rejects_invalid_storage(
         extract_native_mxfp8_components(source)
 
 
-def test_extract_native_mxfp8_components_accepts_metadata_without_fp8_format() -> None:
+def test_extract_native_mxfp8_components_rejects_missing_fp8_dtype() -> None:
     source = _source()
     metadata = source.get_metadata()
     assert isinstance(metadata, Mapping)
     del metadata["fp8_dtype"]
 
-    result = extract_native_mxfp8_components(source)
+    with pytest.raises(ValueError, match="fp8_dtype"):
+        extract_native_mxfp8_components(source)
+
+
+def test_extract_native_mxfp8_components_accepts_pinned_te_e4m3_dtype() -> None:
+    result = extract_native_mxfp8_components(_source(fp8_dtype=PINNED_TE_E4M3))
 
     assert result.weight.dtype == torch.float8_e4m3fn
 
