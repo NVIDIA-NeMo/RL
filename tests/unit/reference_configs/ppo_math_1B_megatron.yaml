@@ -10,6 +10,7 @@ ppo:
   max_num_steps: 100000
   ppo_epochs: 4
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
+  warm_start_value_checkpoint: null  # step_<n> dir of a critic-pretrain run whose value/ seeds the critic
   val_period: 20
   val_at_start: true
   val_at_end: false

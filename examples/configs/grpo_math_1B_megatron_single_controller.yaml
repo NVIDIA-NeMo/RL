@@ -101,9 +101,16 @@ async_rl:
     unhealthy_threshold: 3            # ~15s to quarantine at the default interval
     healthy_threshold: 2              # successes before a suspect shard is trusted again
     selection: least_outstanding      # steers away from a slow shard without diagnosing it
-    on_dead_shard: fail_fast          # recovery modes arrive with the communicator rebuild
+    on_dead_shard: fail_fast          # only value; recovery is not selected here -- the reconcile
+                                      # rebuilds over the survivors whenever a shard becomes absent
     max_restart_attempts_per_shard: 5
     min_healthy_shards: 1             # below this the run aborts
+    refit_timeout_s: 300.0            # deadline for one refit collective, then each worker aborts its own
+                                      # communicator. Required for recovery, not cosmetic: without it a shard
+                                      # dying mid-refit leaves the trainers blocked in NCCL and the rebuild
+                                      # queues behind them, so the recovery wedges too. ~150x a healthy refit
+                                      # at this size (~1.9s); raise it for frontier-scale models (~500s at
+                                      # 405B). null disarms the watchdog entirely.
 
   # NeMo-Gym-facing router in front of the generation fleet. Gym picks an endpoint by
   # round-robin over a list fixed at process start and never fails over, so it is handed

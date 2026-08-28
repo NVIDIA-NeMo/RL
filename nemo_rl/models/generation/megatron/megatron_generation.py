@@ -26,6 +26,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    reject_unenforceable_refit_deadline,
 )
 from nemo_rl.models.generation.megatron.config import (
     MCoreGenerationConfig,
@@ -147,7 +148,6 @@ class MegatronGeneration(GenerationInterface):
         policy: Optional["Policy"] = None,
         name_prefix: str = "megatron_generation",
         processor: Optional[AutoProcessor] = None,
-        weights_path: Optional[str] = None,
         skip_weight_load: bool = False,
         reserved_http_server_port: Optional[int] = None,
     ):
@@ -162,7 +162,6 @@ class MegatronGeneration(GenerationInterface):
             policy: Existing training Policy to reuse for generation.
             name_prefix: Prefix for naming the worker group (non-colocated only).
             processor: Optional processor for VLMs (non-colocated only).
-            weights_path: Optional path to model weights (non-colocated only).
             skip_weight_load: Do not load the weights from the checkpoint; refit will do it.
             reserved_http_server_port: Driver-reserved OpenAI server port for non-colocated.
         """
@@ -214,16 +213,14 @@ class MegatronGeneration(GenerationInterface):
             processor=processor,
             init_optimizer=False,
             init_reference_model=False,
-            weights_path=weights_path,
             skip_weight_load=skip_weight_load,
             reserved_http_server_port=reserved_http_server_port,
         )
 
-        # MXFP8 inference re-quantizes weights at the first refit, so CUDA graphs must
-        # capture the post-refit buffers (#3731). Everything else starts the engine +
-        # HTTP server now: the NeMo-Gym overlap blocks on the server URL in setup (#3569).
-        gen_fp8_cfg = self.cfg["mcore_generation_config"].get("fp8_cfg")
-        if not (skip_weight_load and gen_fp8_cfg and gen_fp8_cfg["enabled"]):
+        # Skip-load models do not have their final refit weight buffers yet.
+        # Defer engine initialization so CUDA graphs capture the persistent buffers.
+        # The engine + HTTP server then first come up at the initial refit.
+        if not skip_weight_load:
             self.prepare_for_generation()
 
     def init_collective(
@@ -256,8 +253,11 @@ class MegatronGeneration(GenerationInterface):
             refit_backend=refit_backend,
         )
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
         """Receive updated weights from the training cluster via collective communication."""
+        reject_unenforceable_refit_deadline("Megatron", refit_timeout_s)
         return self._policy.swap_weights_via_reshard(is_source=False)
 
     def generate(

@@ -70,10 +70,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # parity checks should select raw_logprobs explicitly.
     logprobs_mode: Literal["processed_logprobs", "raw_logprobs"]
 
-    # FP8/MXFP8 for the dedicated (non-colocated) inference model; merged into its
-    # `megatron_cfg` by `merged_inference_megatron_cfg`. When enabled, the first
-    # refit re-quantizes the weight buffers, so engine construction (CUDA-graph
-    # capture) is deferred until after that refit (#3731).
+    # FP8/MXFP8 for the dedicated (non-colocated) inference model;
+    # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.
     fp8_cfg: NotRequired[Fp8Config]
 
 
