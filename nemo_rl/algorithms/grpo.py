@@ -5621,6 +5621,29 @@ def async_grpo_train(
                     num_log_samples,
                 )
 
+            # Release the completed step before assembling the next globally
+            # padded batch.  Several of these locals are aliases into tensors
+            # formerly owned by ``train_data``; deleting that container alone
+            # leaves the token mask, combined mask, and advantages reachable.
+            # The CPU allocator may retain their pages, but dropping all live
+            # references lets the next sharding pass reuse those allocations.
+            del (
+                advantages,
+                flat_advantages,
+                flat_token_mask,
+                mask,
+                per_prompt_batches,
+                repeated_batch,
+                response_advantages,
+                rewards,
+                sample_mask,
+                sample_result,
+                token_mask,
+                trajectories,
+                trajectory_teacher_logprobs,
+            )
+            gc.collect()
+
             timer.reset()
             step += 1
             if early_stop_message is not None:
