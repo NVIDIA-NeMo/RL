@@ -284,6 +284,210 @@ def test_native_mxfp8_dense_fc1_split_and_fc2_direct_refresh() -> None:
     assert torch.equal(second.view(torch.uint8), replacement)
 
 
+@pytest.mark.parametrize("owns_grouped_params", [True, False])
+def test_native_mxfp8_build_refit_tasks_bypasses_strict_grouped_names(
+    monkeypatch: pytest.MonkeyPatch,
+    owns_grouped_params: bool,
+) -> None:
+    from contextlib import nullcontext
+
+    from megatron.bridge.models.conversion import model_bridge
+    from megatron.bridge.models.conversion.param_mapping import (
+        FusedExpertMapping,
+        FusedGatedExpertMapping,
+    )
+    from megatron.core import fp8_utils
+
+    from nemo_rl.models.megatron import draft
+
+    fc1_name = "decoder.layers.0.mlp.experts.linear_fc1.weight"
+    fc2_name = "decoder.layers.0.mlp.experts.linear_fc2.weight"
+    fc1_param = object()
+    fc2_param = object()
+    params = (
+        [(fc1_name, fc1_param), (fc2_name, fc2_param)] if owns_grouped_params else []
+    )
+    mappings = {
+        f"{fc1_name}0": FusedGatedExpertMapping(
+            f"{fc1_name}0", "model.layers.0.mlp.experts.gate_up_proj"
+        ),
+        f"{fc2_name}0": FusedExpertMapping(
+            f"{fc2_name}0", "model.layers.0.mlp.experts.down_proj"
+        ),
+    }
+    lookups = []
+
+    class FakeRegistry:
+        def megatron_to_hf_lookup(self, name: str):
+            lookups.append(name)
+            return mappings.get(name)
+
+    class FakeBridge:
+        def _unwrap_name(self, name: str) -> str:
+            return name
+
+        def mapping_registry(self) -> FakeRegistry:
+            return FakeRegistry()
+
+        def _megatron_global_param_names_all_pp_ranks(self, _models):
+            return [fc1_name, fc2_name]
+
+    class FakeModel:
+        config = SimpleNamespace(moe_single_grouped_weight=True)
+
+        def named_parameters(self):
+            return iter(params)
+
+    strict_calls = []
+
+    def strict_get_conversion_tasks(_models):
+        strict_calls.append(True)
+        raise ValueError(f"No mapping found for {fc1_name}")
+
+    monkeypatch.setattr(draft, "draft_model_detached", lambda _models: nullcontext())
+    monkeypatch.setattr(
+        model_bridge,
+        "_megatron_local_name_to_global",
+        lambda _models, _config, local_name, _vp_stage: local_name,
+    )
+    monkeypatch.setattr(
+        fp8_utils,
+        "is_grouped_mxfp8tensor",
+        lambda param: param in (fc1_param, fc2_param),
+    )
+    worker = _native_worker([])
+    worker.model = FakeModel()
+    worker.megatron_bridge = SimpleNamespace(
+        _model_bridge=FakeBridge(),
+        get_conversion_tasks=strict_get_conversion_tasks,
+    )
+
+    tasks = worker._build_refit_conversion_tasks()
+
+    assert strict_calls == []
+    assert [task.global_param_name for task in tasks] == [fc1_name, fc2_name]
+    assert [task.param_weight for task in tasks] == (
+        [fc1_param, fc2_param] if owns_grouped_params else [None, None]
+    )
+    assert lookups == [f"{fc1_name}0", f"{fc2_name}0"]
+
+
+def test_native_mxfp8_simple_expert_fc1_up_projection_is_direct() -> None:
+    from megatron.bridge.models.conversion.param_mapping import AutoMapping
+
+    expert_name = "model.layers.0.mlp.experts.3.up_proj.weight"
+    source = _native_tensor((8, 64), value_marker=31, scale_marker=32)
+    worker = _native_worker(
+        [
+            SimpleNamespace(
+                mapping=AutoMapping(
+                    "decoder.layers.0.mlp.experts.local_experts.3.linear_fc1.weight",
+                    expert_name,
+                ),
+                param_weight=source,
+                global_param_name="decoder.layers.0.mlp.experts.local_experts.3.linear_fc1.weight",
+            )
+        ]
+    )
+
+    components = list(worker._iter_local_native_mxfp8_param_components())
+
+    assert [(name, role) for name, role, _ in components] == [
+        (expert_name, "weight"),
+        (expert_name, "weight_scale"),
+    ]
+    assert [tuple(tensor.shape) for _, _, tensor in components] == [
+        (8, 64),
+        (8, 2),
+    ]
+
+
+@pytest.mark.parametrize("with_weight_suffix", [False, True])
+def test_native_mxfp8_fused_expert_names_normalize_optional_weight_suffix(
+    with_weight_suffix: bool,
+) -> None:
+    from megatron.bridge.models.conversion.param_mapping import (
+        FusedExpertMapping,
+        FusedGatedExpertMapping,
+    )
+
+    prefix = "model.layers.0.mlp.experts"
+    suffix = ".weight" if with_weight_suffix else ""
+    worker = _native_worker([])
+    fc1 = SimpleNamespace(
+        mapping=FusedGatedExpertMapping(
+            "decoder.layers.0.mlp.experts.linear_fc1.weight0",
+            f"{prefix}.gate_up_proj{suffix}",
+        ),
+        global_param_name="decoder.layers.0.mlp.experts.linear_fc1.weight",
+    )
+    fc2 = SimpleNamespace(
+        mapping=FusedExpertMapping(
+            "decoder.layers.0.mlp.experts.linear_fc2.weight0",
+            f"{prefix}.down_proj{suffix}",
+        ),
+        global_param_name="decoder.layers.0.mlp.experts.linear_fc2.weight",
+    )
+
+    assert worker._native_task_projections(fc1, grouped=True) == (
+        (f"{prefix}.gate_proj.weight", "gate"),
+        (f"{prefix}.up_proj.weight", "up"),
+    )
+    assert worker._native_task_projections(fc2, grouped=True) == (
+        (f"{prefix}.down_proj.weight", "down"),
+    )
+
+
+def test_native_mxfp8_component_iterator_extracts_once_per_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from megatron.bridge.models.conversion.param_mapping import GatedMLPMapping
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    source = _native_tensor((16, 64), value_marker=1, scale_marker=2)
+    task = SimpleNamespace(
+        mapping=GatedMLPMapping(
+            "decoder.layers.0.mlp.linear_fc1.weight",
+            gate="model.layers.0.mlp.gate_proj.weight",
+            up="model.layers.0.mlp.up_proj.weight",
+        ),
+        param_weight=source,
+        global_param_name="decoder.layers.0.mlp.linear_fc1.weight",
+    )
+    worker = _native_worker([task])
+    real_extract = worker_module.extract_native_mxfp8_components
+    extracted = []
+
+    def record_extract(param: object):
+        extracted.append(param)
+        return real_extract(param)
+
+    monkeypatch.setattr(
+        worker_module, "extract_native_mxfp8_components", record_extract
+    )
+
+    assert len(list(worker._iter_local_native_mxfp8_param_components())) == 4
+    assert extracted == [source]
+
+
+def test_native_mxfp8_source_map_uses_shared_component_iterator() -> None:
+    name = "model.layers.0.mlp.down_proj.weight"
+    weight = torch.empty((64, 32), dtype=torch.float8_e4m3fn)
+    scale = torch.empty((64, 1), dtype=torch.uint8)
+    worker = _native_worker([])
+    worker._iter_local_native_mxfp8_param_components = lambda: iter(
+        [(name, "weight", weight), (name, "weight_scale", scale)]
+    )
+
+    source_map = worker.build_hf_to_local_param_map(
+        _refit_info([(name, (64, 32), None)])
+    )
+
+    assert source_map.get(name, role="weight").base is weight
+    assert source_map.get(name, role="weight_scale").base is scale
+
+
 def test_native_mxfp8_per_expert_fc1_fc2_group_both_roles_numerically() -> None:
     from megatron.bridge.models.conversion.param_mapping import (
         AutoMapping,
@@ -450,6 +654,121 @@ def test_native_mxfp8_grouped_members_refresh_without_aggregate_extraction(
     assert torch.equal(second[0].view(torch.uint8), replacement[:4])
     assert all(create_if_missing is False for _, create_if_missing in member_calls)
     assert extracted
+
+
+def test_native_mxfp8_grouped_validation_fails_before_any_collective(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from megatron.bridge.models.conversion.param_mapping import FusedExpertMapping
+    from megatron.core import fp8_utils
+
+    import nemo_rl.weight_sync.xferdtensor as xfer_module
+    from nemo_rl.weight_sync.nccl_reshard_utils import (
+        HFToLocalParamMap,
+        LocalParamSpec,
+    )
+
+    direct_name = "model.layers.0.mlp.down_proj.weight"
+    grouped_name = "model.layers.0.mlp.experts.down_proj.weight"
+    grouped_param = object()
+    invalid_member = _native_tensor((64, 32), value_marker=1, scale_marker=2)
+    invalid_member._metadata["rowwise_scale_inv"] = torch.ones(
+        (64, 1), dtype=torch.float32
+    )
+    grouped_task = SimpleNamespace(
+        mapping=FusedExpertMapping(
+            "decoder.layers.0.mlp.experts.linear_fc2.weight0",
+            "model.layers.0.mlp.experts.down_proj",
+        ),
+        param_weight=grouped_param,
+        global_param_name="decoder.layers.0.mlp.experts.linear_fc2.weight",
+    )
+    worker = _native_worker([], grouped_tasks=[grouped_task])
+    worker.my_pp_stage = 0
+    worker.pp_comm_group = object()
+    worker._broadcast_misc_params_packed = lambda **_: None
+
+    def grouped_pre(_base: object, *, role: str):
+        from nemo_rl.weight_sync.nccl_reshard_utils import RefitCtx
+
+        return RefitCtx(
+            buf=worker._materialize_native_grouped_component(grouped_task, "down", role)
+        )
+
+    worker.hf_to_local_param_map = HFToLocalParamMap(
+        specs={
+            (direct_name, "weight"): LocalParamSpec(base=torch.empty(64, 32)),
+            (grouped_name, "weight"): LocalParamSpec(
+                base=None,
+                pre=lambda base: grouped_pre(base, role="weight"),
+            ),
+            (grouped_name, "weight_scale"): LocalParamSpec(
+                base=None,
+                pre=lambda base: grouped_pre(base, role="weight_scale"),
+            ),
+        }
+    )
+    worker.nccl_reshard_refit_info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": direct_name,
+                    "pp_stage": 0,
+                    "src_mesh_info": "src",
+                    "dst_mesh_info": "dst",
+                    "components": [
+                        {
+                            "role": "weight",
+                            "global_shape": [64, 32],
+                            "src_placements": [],
+                            "dst_placements": [],
+                        }
+                    ],
+                },
+                {
+                    "name": grouped_name,
+                    "pp_stage": 0,
+                    "src_mesh_info": "src",
+                    "dst_mesh_info": "dst",
+                    "components": _native_components((2, 64, 32)),
+                },
+            ]
+        },
+    }
+    transfers = []
+
+    monkeypatch.setattr(
+        fp8_utils,
+        "get_grouped_quantized_members",
+        lambda param, *, create_if_missing: (
+            [invalid_member]
+            if param is grouped_param and create_if_missing is False
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        xfer_module,
+        "xferdtensor",
+        lambda *args: transfers.append(args),
+    )
+    monkeypatch.setattr(
+        xfer_module,
+        "DTensorRef",
+        lambda *, local_tensor, global_shape: SimpleNamespace(
+            local_tensor=local_tensor,
+            global_shape=global_shape,
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    with pytest.raises(ValueError, match=f"{grouped_name!r}.*role"):
+        worker.nccl_reshard_refit()
+
+    assert transfers == []
 
 
 def test_native_mxfp8_skips_pp_placeholders_and_misc_mappings() -> None:
