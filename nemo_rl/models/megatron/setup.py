@@ -1731,10 +1731,16 @@ def build_inference_model(
         and inference_provider.tensor_model_parallel_size > 1
     )
     # GTP shards weights to save training memory and rematerializes them on every
-    # forward/backward — pure overhead for inference, and the inference process
-    # groups carry no gtp_remat group anyway. Refit is what maps the training
-    # model's GTP shards onto these whole weights, so force the layout off here
-    # rather than inheriting it from the training provider snapshot.
+    # forward/backward — pure overhead for inference. Refit is what maps the
+    # training model's GTP shards onto these whole weights, so force the layout
+    # off here rather than inheriting it from the training provider snapshot.
+    #
+    # Forcing it off on the provider is necessary but not sufficient: megatron's
+    # layers resolve their GTP axis from the process-group collection, not from
+    # the provider, and `build_inference_pg_collection` must declare the axis
+    # explicitly off for that resolution to not fall back to the *training* MPU
+    # globals. That is NVIDIA/Megatron-LM#6940; until it merges, running with
+    # `tensor_parallel_num_weight_shards` < TP needs a megatron-core carrying it.
     inference_provider.tensor_parallel_num_weight_shards = (
         inference_provider.tensor_model_parallel_size
     )
