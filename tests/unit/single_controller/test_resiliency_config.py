@@ -745,3 +745,39 @@ class TestADropBudgetNeedsASamplerThatStamps:
             rollout_failure={"max_consecutive_dropped_prompts": 2},
         )
         validate_single_controller_config(cfg)
+
+
+class TestDropIncompleteTargetsOnRestore:
+    """The knob needs a stamping sampler: nothing else has a target step to drop."""
+
+    def test_default_is_off(self):
+        assert AsyncRLConfig().drop_incomplete_targets_on_restore is False
+
+    @pytest.mark.parametrize(
+        "sampler",
+        [
+            {"name": "windowed"},
+            {"name": "weight_fifo"},
+            {"name": "ready_first"},
+        ],
+        ids=lambda sampler: sampler["name"],
+    )
+    def test_rejected_under_every_built_in_but_in_order(self, sampler):
+        cfg = _master_config(
+            sampler=sampler,
+            drop_incomplete_targets_on_restore=True,
+        )
+        with pytest.raises(NotImplementedError, match="stamps no target step"):
+            validate_single_controller_config(cfg)
+
+    def test_accepted_under_in_order(self):
+        cfg = _master_config(drop_incomplete_targets_on_restore=True)
+        validate_single_controller_config(cfg)
+
+    def test_a_custom_sampler_is_not_second_guessed(self):
+        """Whether it stamps is its author's to know, as with the drop budget."""
+        cfg = _master_config(
+            sampler={"name": "custom", "target": "some_module:SomeSampler"},
+            drop_incomplete_targets_on_restore=True,
+        )
+        validate_single_controller_config(cfg)

@@ -454,6 +454,9 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
     max_buffered_rollouts: int = 64
+    # in_order only (setup raises otherwise): on resume, drop the restored groups
+    # of a target step short of a full batch instead of gap-filling it.
+    drop_incomplete_targets_on_restore: bool = False
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
 
@@ -974,6 +977,18 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "the ready_first sampler requires "
                 "loss_fn.force_on_policy_ratio=false so prev_logprobs are used"
             )
+
+    # Only a stamped target step can be short of a batch. "custom" is left alone
+    # as in _validate_failure_settings: only its author knows whether it stamps.
+    if (
+        async_config.drop_incomplete_targets_on_restore
+        and async_config.sampler.name not in ("in_order", "custom")
+    ):
+        raise NotImplementedError(
+            f"async_rl.sampler.name={async_config.sampler.name!r} stamps no target "
+            "step, so async_rl.drop_incomplete_targets_on_restore would change "
+            "nothing about the resume. Remove it, or switch to the in_order sampler."
+        )
 
     # Top-k retention keys off checkpointing.metric_name, but SC has no
     # validation loop yet (see _save_checkpoint), so a "val:" metric would
