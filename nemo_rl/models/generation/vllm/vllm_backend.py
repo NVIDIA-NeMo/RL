@@ -69,6 +69,20 @@ def _format_refit_key_error(label: str, keys: set[str]) -> str:
     return f"{label} ({len(ordered)}): {ordered[:8]}{suffix}"
 
 
+def _native_mxfp8_param_names(refit_info: dict[str, Any]) -> set[str]:
+    """Return logical parameters carrying canonical value and scale components."""
+    result: set[str] = set()
+    for layer_name in refit_info.get("layer_names", []):
+        for param_info in refit_info.get("per_layer_params", {}).get(layer_name, []):
+            components = param_info.get("components", [])
+            if [component.get("role") for component in components] == [
+                "weight",
+                "weight_scale",
+            ]:
+                result.add(param_info["name"])
+    return result
+
+
 class IPCWeightManifestError(RuntimeError):
     """An IPC transfer did not match the prepared state-dict manifest."""
 
@@ -262,6 +276,7 @@ class VllmInternalWorkerExtension:
     # None until init_collective builds it. Declared so a rebuild can release the
     # previous group without probing for the attribute's existence.
     model_update_group: Any = None
+    _nccl_reshard_refit_adapter: Any | None = None
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -1099,11 +1114,7 @@ class VllmInternalWorkerExtension:
         return self._get_sparse_delta_applier().finish_sparse_delta_refit()
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
-        """Restore per-layer param metadata and build the HF→vLLM mapping.
-
-        Done once ahead of refit; the cached mapping is reused by every
-        ``nccl_reshard_refit`` call.
-        """
+        """Restore metadata and preflight the selected destination route."""
         from nemo_rl.weight_sync.nccl_reshard_utils import (
             restore_refit_info_placements,
         )
@@ -1111,10 +1122,33 @@ class VllmInternalWorkerExtension:
         self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
             restore_refit_info_placements(refit_info)
         )
-        # Build HFToLocalParamMap (see nccl_reshard_utils)
-        self.hf_to_local_param_map = self.build_hf_to_local_param_map(  # pyrefly: ignore[implicitly-defined-attribute]
-            self.nccl_reshard_refit_info
-        )
+        if _native_mxfp8_param_names(self.nccl_reshard_refit_info):
+            adapter = self._get_nccl_reshard_refit_adapter()
+            adapter.validate_plan(self.nccl_reshard_refit_info)
+            adapter.prepare(self.nccl_reshard_refit_info)
+            # Active checkpoint tensors replace runtime tensors at begin_update,
+            # so the concrete map is intentionally rebuilt for every native refit.
+            self.hf_to_local_param_map = HFToLocalParamMap()
+        else:
+            self.hf_to_local_param_map = self.build_hf_to_local_param_map(
+                self.nccl_reshard_refit_info
+            )
+
+    def _get_nccl_reshard_refit_adapter(self):
+        adapter = self._nccl_reshard_refit_adapter
+        if adapter is None:
+            # Keep vLLM reload capability probing off legacy NCCL Reshard setup.
+            from nemo_rl.models.generation.vllm.refit_adapter import (
+                create_vllm_refit_adapter,
+            )
+
+            adapter = create_vllm_refit_adapter(
+                model_runner=self.model_runner,
+                model_config=self.model_config,
+                device=self.device,
+            )
+            self._nccl_reshard_refit_adapter = adapter
+        return adapter
 
     def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
         """Build the vLLM-backend ``hf_to_local_param_map`` (HFToLocalParamMap).
@@ -1169,17 +1203,33 @@ class VllmInternalWorkerExtension:
 
             return LocalParamSpec(base=value_param.data, pre=pre, post=post)
 
-        # Get dict of vllm_param and merged_slice for each hf_name
-        vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(refit_info)
         param_info_by_name = {
             param_info["name"]: param_info
             for layer_name in refit_info["layer_names"]
             for param_info in refit_info["per_layer_params"][layer_name]
         }
+        specs: dict[str | tuple[str, str], LocalParamSpec] = {}
+        native_names = _native_mxfp8_param_names(refit_info)
+        adapter = self._get_nccl_reshard_refit_adapter() if native_names else None
+        if adapter is not None:
+            for hf_name in native_names:
+                for component in param_info_by_name[hf_name]["components"]:
+                    role = component["role"]
+                    specs[(hf_name, role)] = adapter.resolve_destination(
+                        logical_name=hf_name,
+                        role=role,
+                    )
+        if native_names == set(param_info_by_name):
+            return HFToLocalParamMap(specs=specs)
+
+        # Legacy parameters retain the existing direct/merged/receiver-quantized
+        # mapping even when they share a refit plan with native components.
+        vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(refit_info)
         vllm_params = dict(self.model_runner.model.named_parameters())
         vllm_names_by_id = {id(param): name for name, param in vllm_params.items()}
-        specs = {}
         for hf_name, (vllm_param, merged_slice) in vllm_param_map_and_slices.items():
+            if hf_name in native_names:
+                continue
             wire_dtype_value = param_info_by_name[hf_name].get("dtype")
             wire_dtype = (
                 wire_dtype_value
@@ -1272,7 +1322,7 @@ class VllmInternalWorkerExtension:
           - dense MLP down       -> ``down_proj`` (direct 1:1).
         """
         vllm_params = dict(self.model_runner.model.named_parameters())
-        mapping = {}
+        mapping: dict[str, tuple[torch.Tensor, tuple[slice, ...] | None]] = {}
 
         # Collect FFN param names + global shapes from refit_info, plus the
         # grouped-expert tag (gate_proj/up_proj/down_proj) for MoE params.
@@ -1441,81 +1491,103 @@ class VllmInternalWorkerExtension:
         return result
 
     def _nccl_reshard_refit(self) -> bool:
+        """Receive ordered parameter components through NCCL Reshard."""
         import os
+        import time
         from collections import OrderedDict
 
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
-        def _recv_one_param(param_info, group, stream):
-            # Coverage guard: every bulk param must have a spec; a missing entry
-            # would silently discard its weights.
-            spec = self.hf_to_local_param_map.get(param_info["name"])
-            assert spec is not None, (
-                f"nccl_reshard_refit: {param_info['name']!r} has no spec in "
-                "hf_to_local_param_map (would silently discard its weights)"
-            )
-            # spec.pre/post run on the caller's current stream (this stage's
-            # stream); xferdtensor should use the same stream.
+        def _components(param_info: dict[str, Any]) -> list[dict[str, Any]]:
+            components = param_info.get("components")
+            if components is not None:
+                return components
+            return [
+                {
+                    "role": "weight",
+                    "global_shape": param_info["global_shape"],
+                    "src_placements": param_info["src_placements"],
+                    "dst_placements": param_info["dst_placements"],
+                }
+            ]
+
+        def _recv_one_component(
+            param_info: dict[str, Any],
+            component: dict[str, Any],
+            group: Any,
+            stream: torch.cuda.Stream,
+        ) -> None:
+            role = component["role"]
+            spec = self.hf_to_local_param_map.get(param_info["name"], role=role)
+            if spec is None:
+                raise RuntimeError(
+                    f"nccl_reshard_refit: {param_info['name']!r} role {role!r} "
+                    "has no destination spec"
+                )
             ctx = (
                 spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
             )
-            dst_tensor = DTensorRef(ctx.buf, param_info["global_shape"])
+            if not isinstance(ctx.buf, torch.Tensor):
+                raise RuntimeError(
+                    f"nccl_reshard_refit: {param_info['name']!r} role {role!r} "
+                    "did not produce a destination tensor"
+                )
+            dst_tensor = DTensorRef(ctx.buf, component["global_shape"])
             xferdtensor(
                 None,
                 param_info["src_mesh_info"],
-                param_info["src_placements"],
+                component.get("src_placements", param_info["src_placements"]),
                 dst_tensor,
                 param_info["dst_mesh_info"],
-                param_info["dst_placements"],
+                component.get("dst_placements", param_info["dst_placements"]),
                 group,
                 stream,
             )
             if spec.post is not None:
                 spec.post(ctx)
 
-        # Group params by PP stage so different stages' bulk reshards run
-        # concurrently on their own streams.  Non-PP = single stage 0 (params
-        # carry no "pp_stage" key), so this collapses to one stage / one stream.
-        stage_params = OrderedDict()
-        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
-            for p in self.nccl_reshard_refit_info["per_layer_params"][layer_name]:
-                stage_params.setdefault(p.get("pp_stage", 0), []).append(p)
-
-        num_streams = max(
-            1,
-            min(int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")), len(stage_params)),
-        )
-
-        # Narrowed once here rather than at each use: reaching this without the groups
-        # built is a wiring error, and a named failure beats a TypeError on a subscript.
-        pp_comm_groups = self.pp_comm_groups
-        if pp_comm_groups is None:
-            raise RuntimeError(
-                "nccl_reshard refit reached before init_nccl_reshard_comm_group built "
-                "the per-PP-stage groups"
+        def _receive_bulk_components() -> None:
+            stage_params: OrderedDict[int, list[dict[str, Any]]] = OrderedDict()
+            for layer_name in self.nccl_reshard_refit_info["layer_names"]:
+                for param_info in self.nccl_reshard_refit_info["per_layer_params"][
+                    layer_name
+                ]:
+                    stage_params.setdefault(param_info.get("pp_stage", 0), []).append(
+                        param_info
+                    )
+            pp_comm_groups = self.pp_comm_groups
+            if pp_comm_groups is None:
+                raise RuntimeError(
+                    "nccl_reshard refit reached before "
+                    "init_nccl_reshard_comm_group built the per-PP-stage groups"
+                )
+            num_streams = max(
+                1,
+                min(
+                    int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")),
+                    len(stage_params),
+                ),
             )
+            streams = [torch.cuda.Stream() for _ in range(num_streams)]
+            events: dict[int, torch.cuda.Event] = {}
+            for index, (stage, params) in enumerate(stage_params.items()):
+                if (index - num_streams) in events:
+                    events[index - num_streams].synchronize()
+                stage_stream = streams[index % num_streams]
+                with torch.cuda.stream(stage_stream):
+                    group = pp_comm_groups[stage]
+                    for param_info in params:
+                        for component in _components(param_info):
+                            _recv_one_component(
+                                param_info, component, group, stage_stream
+                            )
+                    event = torch.cuda.Event()
+                    event.record()
+                    events[index] = event
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
-        streams = [torch.cuda.Stream() for _ in range(num_streams)]
-        events = {}
-        for idx, (stage, params) in enumerate(stage_params.items()):
-            # synchronize the last run in the same stream
-            if (idx - num_streams) in events:
-                events[idx - num_streams].synchronize()
-            stage_stream = streams[idx % num_streams]
-            with torch.cuda.stream(stage_stream):
-                group = pp_comm_groups[stage]
-                for p in params:
-                    _recv_one_param(p, group, stage_stream)
-                ev = torch.cuda.Event()
-                ev.record()
-                events[idx] = ev
-
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-        import time
-
-        with self._weight_update_lifecycle("nccl_reshard") as finalize:
+        def _receive_misc() -> None:
             misc_t0 = time.perf_counter()
             self._receive_and_load_misc_params()
             torch.cuda.synchronize()
@@ -1527,13 +1599,30 @@ class VllmInternalWorkerExtension:
                 )
             torch.cuda.empty_cache()
 
-            # Finalize post-load weight processing: dense Linear + attention/MLA,
-            # the per-MoE-backend w13 layout (FlashInfer CUTLASS/TRTLLM) that the
-            # canonical [gate; up] bulk write above defers to here, and the MTP
-            # drafter's mirror of the same. The FP8 KV-cache per-layer k/v scales
-            # are finalized by the lifecycle on exit.
-            finalize()
+        native_names = _native_mxfp8_param_names(self.nccl_reshard_refit_info)
+        if native_names:
+            adapter = self._get_nccl_reshard_refit_adapter()
+            adapter.begin_update()
+            try:
+                # Resolving every destination up front ensures a missing role,
+                # alias, shape, dtype, or wrapped loader fails before NCCL starts.
+                self.hf_to_local_param_map = self.build_hf_to_local_param_map(
+                    self.nccl_reshard_refit_info
+                )
+                _receive_bulk_components()
+                _receive_misc()
+                adapter.finish_update()
+                self._maybe_process_mtp_drafter_after_loading()
+            except BaseException as error:
+                adapter.abort_update(error)
+                raise
+            torch.cuda.empty_cache()
+            return True
 
+        _receive_bulk_components()
+        with self._weight_update_lifecycle("nccl_reshard") as finalize:
+            _receive_misc()
+            finalize()
             torch.cuda.empty_cache()
         return True
 

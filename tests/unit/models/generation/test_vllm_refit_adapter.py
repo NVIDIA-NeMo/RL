@@ -705,6 +705,13 @@ def test_0251_adapter_binds_dense_and_routed_checkpoint_components(
     routed = ".experts." in logical_name
     expected_calls = expected_shape[0] if routed else 1
     assert len(retained_loads) == expected_calls
+    assert (
+        sum(
+            bound.arguments["loaded_weight"].numel()
+            for _parameter_name, bound in retained_loads
+        )
+        == ctx.buf.numel()
+    )
     for _parameter_name, bound in retained_loads:
         assert bound.arguments["logical_name"] == logical_name
         assert bound.arguments["role"] == role
@@ -724,7 +731,8 @@ def test_0251_adapter_binds_dense_and_routed_checkpoint_components(
         ("missing_runtime_alias", "scale_from_checkpoint"),
         ("missing_runtime_scale", "runtime scale"),
         ("wrong_runtime_scale_shape", "shape"),
-        ("wrong_runtime_scale_dtype", "torch.uint8"),
+        ("wrong_checkpoint_scale_dtype", "torch.uint8"),
+        ("wrong_runtime_scale_dtype", "runtime scale"),
         ("missing_runtime_loader", "weight_loader"),
         ("wrong_component_role", "unsupported component role"),
         ("wrong_component_shape", "scale shape"),
@@ -751,8 +759,10 @@ def test_0251_adapter_prepare_rejects_invalid_destinations_before_begin(
         model.model.layers[0].mlp.gate_up_proj._parameters.pop("weight_scale")
     elif case == "wrong_runtime_scale_shape":
         parameters[alias_name].data = torch.empty(64, 2, dtype=torch.uint8)
-    elif case == "wrong_runtime_scale_dtype":
+    elif case == "wrong_checkpoint_scale_dtype":
         parameters[alias_name].data = torch.empty(64, 1, dtype=torch.float32)
+    elif case == "wrong_runtime_scale_dtype":
+        parameters[runtime_scale_name].data = torch.empty(64, 1, dtype=torch.float32)
     elif case == "missing_runtime_loader":
         del parameters[alias_name].weight_loader
     else:

@@ -24,6 +24,7 @@ skipped where vllm is unavailable.
 """
 
 from contextlib import nullcontext
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 
@@ -120,6 +121,10 @@ def _native_down_refit_info() -> dict[str, Any]:
                 "shape": (64, 32),
                 "dtype": "torch.bfloat16",
             },
+            "model.layers.1.mtp.fc.weight": {
+                "shape": (32, 32),
+                "dtype": "torch.bfloat16",
+            },
         },
     }
 
@@ -189,11 +194,11 @@ def _patch_cpu_nccl_refit(
     ) -> None:
         role = (
             "weight_scale"
-            if destination.local_tensor.dtype == torch.uint8
+            if destination._local_tensor.dtype == torch.uint8
             else "weight"
         )
         events.append(f"bulk:{role}")
-        destination.local_tensor.fill_(7 if role == "weight_scale" else 3)
+        destination._local_tensor.fill_(7 if role == "weight_scale" else 3)
 
     monkeypatch.setattr(xferdtensor_module, "xferdtensor", transfer)
     monkeypatch.setattr(torch.cuda, "Stream", lambda: object())
@@ -807,6 +812,7 @@ def test_native_mxfp8_refit_rebuilds_destinations_and_loads_ordered_components(
     extension.pp_comm_groups = {0: object()}
     extension._nccl_reshard_refit_adapter = adapter
     extension._receive_and_load_misc_params = lambda: events.append("misc")
+    extension._maybe_process_mtp_drafter_after_loading = lambda: None
     _patch_cpu_nccl_refit(monkeypatch, events)
 
     assert extension.nccl_reshard_refit()
@@ -836,6 +842,7 @@ def test_native_mxfp8_refit_aborts_before_collective_on_destination_failure(
     extension.pp_comm_groups = {0: object()}
     extension._nccl_reshard_refit_adapter = adapter
     extension._receive_and_load_misc_params = lambda: events.append("misc")
+    extension._maybe_process_mtp_drafter_after_loading = lambda: None
     _patch_cpu_nccl_refit(monkeypatch, events)
 
     with pytest.raises(ValueError, match="wrong shape"):
@@ -854,6 +861,16 @@ def test_native_mxfp8_refit_keeps_bf16_misc_disjoint_from_adapter(
     adapter = _RecordingNativeAdapter(events)
     extension = _make_ext({})
     refit_info = _native_down_refit_info()
+    routed = refit_info["per_layer_params"]["model.layers.0"][0]
+    routed["name"] = "model.layers.0.mlp.experts.down_proj.weight"
+    routed["grouped_expert_proj"] = "down_proj"
+    routed["global_shape"] = (2, 32, 32)
+    routed["components"][0]["global_shape"] = (2, 32, 32)
+    routed["components"][1]["global_shape"] = (2, 32, 1)
+    routed_gate = deepcopy(routed)
+    routed_gate["name"] = "model.layers.0.mlp.experts.gate_proj.weight"
+    routed_gate["grouped_expert_proj"] = "gate_proj"
+    refit_info["per_layer_params"]["model.layers.0"].insert(0, routed_gate)
     extension.nccl_reshard_refit_info = refit_info
     extension.pp_comm_groups = {0: object()}
     extension._nccl_reshard_refit_adapter = adapter
@@ -864,11 +881,15 @@ def test_native_mxfp8_refit_keeps_bf16_misc_disjoint_from_adapter(
         misc_names.extend(refit_info["misc_meta"])
 
     extension._receive_and_load_misc_params = receive_misc
+    extension._maybe_process_mtp_drafter_after_loading = lambda: None
     _patch_cpu_nccl_refit(monkeypatch, events)
 
     extension.nccl_reshard_refit()
 
     native_names = {name for name, _role, _payload in adapter.loaded}
-    assert native_names == {"model.layers.0.mlp.down_proj.weight"}
+    assert native_names == {
+        "model.layers.0.mlp.experts.gate_proj.weight",
+        "model.layers.0.mlp.experts.down_proj.weight",
+    }
     assert set(misc_names) == set(refit_info["misc_meta"])
     assert native_names.isdisjoint(misc_names)
