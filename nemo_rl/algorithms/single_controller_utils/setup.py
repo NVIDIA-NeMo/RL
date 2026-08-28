@@ -393,8 +393,13 @@ def _build_generation(
             "defer_model_load is only supported for the vllm backend"
         )
         sglang_config = cast(SGLangConfig, generation_config)
-        sglang_config["sglang_cfg"].setdefault(
-            "model_path", master_config.policy["model_name"]
+        from nemo_rl.models.generation.sglang.quantization_utils import (
+            prepare_sglang_quantized_generation,
+        )
+
+        prepare_sglang_quantized_generation(
+            generation_config=sglang_config,
+            policy_config=master_config.policy,
         )
         gen = SGLangGeneration(
             cluster=inference_cluster,

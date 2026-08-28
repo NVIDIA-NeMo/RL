@@ -200,7 +200,9 @@ def test_build_generation_passes_sglang_config():
     """SGLangGeneration receives the complete generation config by keyword."""
     master_config = _make_master_config(backend="sglang")
     master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
-    master_config.policy["generation"]["sglang_cfg"] = {}
+    master_config.policy["generation"]["sglang_cfg"] = {
+        "quantization": {"scheme": "bf16"}
+    }
     inference_cluster = MagicMock(name="inference_cluster")
 
     with patch.object(sc_setup_mod, "SGLangGeneration") as mock_sglang:

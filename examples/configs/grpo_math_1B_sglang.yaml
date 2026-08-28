@@ -8,8 +8,6 @@ policy:
     backend: "sglang"
     use_async_rollouts: false
     sglang_cfg:
-      quantization:
-        scheme: bf16
       model_path: ${policy.model_name}
       dtype: ${policy.precision}
       context_length: 512
@@ -27,6 +25,15 @@ policy:
       # memory saver that needs_offload: true enables below.
       cuda_graph_backend_prefill: disabled
       disable_cuda_graph: false
+      # Weight precision for rollout/refit. scheme=bf16 (default) sends BF16
+      # HF tensors; scheme=mxfp8 boots SGLang from a matching quantized
+      # HF checkpoint and quantizes refit tensors online.
+      quantization:
+        scheme: bf16
+        extra_high_precision_layers_hf: []
+        num_layers_at_start_in_bf16: 0
+        num_layers_at_end_in_bf16: 0
+        modules_to_not_convert: []
       sglang_server_config:
         needs_offload: true
         cpu_weight_backup: true
@@ -37,6 +44,12 @@ policy:
         num_gpus_per_engine: ${policy.generation.sglang_cfg.tp_size}
       sglang_router_config:
         use_external_router: false
+      # Fault tolerance (RolloutHealthMonitor). Off by default; when enabled,
+      # a daemon thread health-checks each engine and restarts hung/dead actors.
+      use_fault_tolerance: false
+      rollout_health_check_interval: 60
+      rollout_health_check_timeout: 60
+      rollout_health_check_first_wait: 60
     colocated:
       enabled: true
 
