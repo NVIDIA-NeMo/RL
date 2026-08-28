@@ -619,12 +619,15 @@ class TestValueWarmStart:
         assert value_kwargs["optimizer_path"] is None
 
     @pytest.mark.parametrize(
-        "warm_start",
-        ["", "{tmp}/typo"],
+        ("warm_start", "message"),
+        [
+            ("", "warm_start_value_checkpoint is empty"),
+            ("{tmp}/typo", "would silently start cold"),
+        ],
         ids=["empty_string", "typo"],
     )
     def test_rejects_a_warm_start_that_does_not_resolve(
-        self, patched_ppo_factories, tmp_path, warm_start
+        self, patched_ppo_factories, tmp_path, warm_start, message
     ):
         """get_resume_paths never stats the path, so an unresolvable one would
         train a cold critic behind the line claiming a warm start. A Hydra
@@ -638,7 +641,7 @@ class TestValueWarmStart:
         )
         mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
 
-        with pytest.raises(ValueError, match="would silently start cold"):
+        with pytest.raises(ValueError, match=message):
             setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
 
         patched_ppo_factories["_build_value"].assert_not_called()
