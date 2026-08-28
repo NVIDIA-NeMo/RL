@@ -16,7 +16,7 @@
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Any, Literal
 
 
@@ -36,16 +36,6 @@ _MODEL_ROUTED_PROJECTIONS = {
     "qwen30": frozenset(("gate_proj", "up_proj", "down_proj")),
     "nano": frozenset(("up_proj", "down_proj")),
 }
-_EXPECTED_ROUTED_MODULES = {
-    model_scope: frozenset(
-        (layer, projection)
-        for layer in range(layer_count)
-        for projection in _MODEL_ROUTED_PROJECTIONS[model_scope]
-    )
-    for model_scope, layer_count in _MODEL_ROUTED_LAYER_COUNTS.items()
-}
-
-
 def _scope_for_name(name: str) -> str:
     if name.startswith("lm_head.") or ".lm_head." in name:
         return "lm_head"
@@ -100,6 +90,7 @@ def assert_native_mxfp8_storage_inventory(
     misc_metadata: Mapping[str, Mapping[str, Any]],
     model_scope: Literal["qwen30", "nano"],
     num_layers_at_end_in_bf16: int,
+    routed_layer_indices: Collection[int] | None = None,
 ) -> dict[str, dict[str, int | list[int]]]:
     """Validate and emit a compact inventory of native and BF16 refit entries.
 
@@ -142,18 +133,34 @@ def assert_native_mxfp8_storage_inventory(
         ):
             raise ValueError(f"Native MXFP8 inventory {scope} BF16 entries are missing")
 
-    expected_modules = _EXPECTED_ROUTED_MODULES[model_scope]
     layer_count = _MODEL_ROUTED_LAYER_COUNTS[model_scope]
     if not 0 <= num_layers_at_end_in_bf16 <= layer_count:
         raise ValueError(
             f"Native MXFP8 inventory final BF16 layer count must be in [0, {layer_count}]"
         )
+    all_layer_indices = frozenset(range(layer_count))
+    expected_routed_layers = (
+        all_layer_indices
+        if routed_layer_indices is None
+        else frozenset(routed_layer_indices)
+    )
+    invalid_routed_layers = expected_routed_layers - all_layer_indices
+    if invalid_routed_layers:
+        raise ValueError(
+            "Native MXFP8 inventory routed layer index is outside the model: "
+            f"{min(invalid_routed_layers)}"
+        )
+    expected_modules = frozenset(
+        (layer, projection)
+        for layer in expected_routed_layers
+        for projection in _MODEL_ROUTED_PROJECTIONS[model_scope]
+    )
     expected_last_layers = frozenset(
         range(layer_count - num_layers_at_end_in_bf16, layer_count)
     )
     expected_bf16_modules = frozenset(
         (layer, projection)
-        for layer in expected_last_layers
+        for layer in expected_last_layers & expected_routed_layers
         for projection in _MODEL_ROUTED_PROJECTIONS[model_scope]
     )
     expected_native_modules = expected_modules - expected_bf16_modules

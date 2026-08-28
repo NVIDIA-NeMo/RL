@@ -72,6 +72,27 @@ def _nano_inventory_inputs() -> tuple[OrderedDict[str, dict[str, object]], dict[
     return native, misc
 
 
+def _hybrid_nano_inventory_inputs(
+    routed_layers: frozenset[int],
+) -> tuple[OrderedDict[str, dict[str, object]], dict[str, dict[str, str]]]:
+    native = OrderedDict(
+        (
+            (_routed_name(layer, projection), _native_entry())
+            for layer in sorted(routed_layers & frozenset(range(44)))
+            for projection in ("up", "down")
+        )
+    )
+    misc = {
+        **{
+            _routed_name(layer, projection): {"dtype": "torch.bfloat16"}
+            for layer in sorted(routed_layers & frozenset(range(44, 52)))
+            for projection in ("up", "down")
+        },
+        **_bf16_non_routed_entries(include_shared_experts=True),
+    }
+    return native, misc
+
+
 def test_nano_inventory_requires_routed_native_and_last_eight_bf16() -> None:
     native, misc = _nano_inventory_inputs()
 
@@ -89,6 +110,26 @@ def test_nano_inventory_requires_routed_native_and_last_eight_bf16() -> None:
     assert inventory["router"]["bf16"] == 1
     assert inventory["qkvo"]["bf16"] == 2
     assert inventory["lm_head"]["bf16"] == 1
+
+
+def test_nano_inventory_only_requires_hybrid_expert_layers() -> None:
+    hybrid_pattern = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+    routed_layers = frozenset(
+        layer for layer, layer_type in enumerate(hybrid_pattern) if layer_type == "E"
+    )
+    native, misc = _hybrid_nano_inventory_inputs(routed_layers)
+
+    inventory = assert_native_mxfp8_storage_inventory(
+        native_metadata=native,
+        misc_metadata=misc,
+        model_scope="nano",
+        num_layers_at_end_in_bf16=8,
+        routed_layer_indices=routed_layers,
+    )
+
+    assert inventory["routed_experts"]["native"] == 38
+    assert inventory["routed_experts"]["bf16"] == 8
+    assert inventory["last_layers_bf16"]["layers"] == list(range(44, 52))
 
 
 def test_inventory_rejects_native_bf16_only_scope() -> None:

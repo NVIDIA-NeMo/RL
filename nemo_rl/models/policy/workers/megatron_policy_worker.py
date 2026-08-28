@@ -3640,6 +3640,18 @@ class MegatronPolicyWorkerImpl(
                 assert_native_mxfp8_storage_inventory,
             )
 
+            hybrid_layer_pattern = getattr(
+                self.model.config, "hybrid_layer_pattern", None
+            )
+            routed_layer_indices = (
+                frozenset(
+                    layer
+                    for layer, layer_type in enumerate(hybrid_layer_pattern)
+                    if layer_type == "E"
+                )
+                if isinstance(hybrid_layer_pattern, str)
+                else None
+            )
             assert_native_mxfp8_storage_inventory(
                 native_metadata=state_dict_metadata,
                 misc_metadata=misc_meta,
@@ -3648,6 +3660,7 @@ class MegatronPolicyWorkerImpl(
                     int,
                     self.cfg["megatron_cfg"].get("num_layers_at_end_in_bf16", 0),
                 ),
+                routed_layer_indices=routed_layer_indices,
             )
 
         pp_size = train_parallelism.get("pp_size", 1)
