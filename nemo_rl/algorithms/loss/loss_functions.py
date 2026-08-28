@@ -1302,12 +1302,20 @@ class MseValueLossFn(LossFunction):
             ).item()
 
             # Min/max are per-MB; ppo.py takes min/max across MBs.
+            # +/-inf, not 0.0, for an empty mask: 0.0 is a plausible value and
+            # would win the min against an all-positive critic, silently
+            # flooring the reported range. ClippedPGLossFn uses the same
+            # sentinel for the same reason, and both consumers skip it.
             masked_values = values[mask.bool()]
             values_min = (
-                masked_values.min().item() if masked_values.numel() > 0 else 0.0
+                masked_values.min().item()
+                if masked_values.numel() > 0
+                else float("inf")
             )
             values_max = (
-                masked_values.max().item() if masked_values.numel() > 0 else 0.0
+                masked_values.max().item()
+                if masked_values.numel() > 0
+                else float("-inf")
             )
 
             # Explained variance sufficient statistics.
