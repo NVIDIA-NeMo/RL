@@ -95,6 +95,10 @@ def _patch_qwen_vl_vision_key_mapping() -> None:
             result = dict(result or {})
             if not any(str(t).startswith("model.visual") for t in result.values()):
                 result[r"^visual\."] = "model.visual."
+            if not any(
+                str(t).startswith("model.language_model") for t in result.values()
+            ):
+                result[r"^model(?!\.(language_model|visual))"] = "model.language_model"
         return result or None
 
     _patched_get_combined_key_mapping._nrl_vision_patch = True
