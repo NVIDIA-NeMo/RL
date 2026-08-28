@@ -232,6 +232,97 @@ class TestReadyFirstConfig:
         assert sampler.required_buffer_capacity(groups_per_step=4) == 12
 
 
+class TestWarmupLookaheadWindow:
+    """The PPO critic warmup widens the gate, so capacity must cover the peak."""
+
+    def test_capacity_is_sized_from_the_warmup_window(self):
+        cfg = InOrderSamplerConfig(
+            max_lookahead_versions=1, warmup_lookahead_versions=3
+        )
+
+        # Steady state alone would be 4*(1+1)=8; the warmup peak needs 4*(3+1)=16.
+        assert required_buffer_capacity_for_config(cfg, groups_per_step=4) == 16
+        sampler = create_sampler(FakeBuffer(), cfg)
+        assert sampler.required_buffer_capacity(groups_per_step=4) == 16
+
+    def test_capacity_is_unchanged_without_a_warmup_window(self):
+        cfg = InOrderSamplerConfig(max_lookahead_versions=1)
+
+        assert required_buffer_capacity_for_config(cfg, groups_per_step=4) == 8
+        sampler = create_sampler(FakeBuffer(), cfg)
+        assert sampler.required_buffer_capacity(groups_per_step=4) == 8
+
+    def test_capacity_does_not_shrink_when_the_gate_is_retuned(self):
+        """Retuning must not let the reported requirement follow the live window."""
+        sampler = InOrderSampler(
+            FakeBuffer(), max_lookahead_versions=1, warmup_lookahead_versions=3
+        )
+
+        sampler.set_gate_window(1)
+
+        assert sampler.required_buffer_capacity(groups_per_step=4) == 16
+
+    def test_retuning_the_gate_reopens_admission(self):
+        """The live window is what admit gates on, so widening it admits more."""
+        s = InOrderSampler(
+            FakeBuffer(), max_lookahead_versions=1, warmup_lookahead_versions=3
+        )
+
+        # dispatch_index starts at -1; window 1 admits the live batch and one
+        # lookahead batch against a trainer parked at 0, then blocks.
+        assert _run(s.admit(trainer_version_fn=lambda: 0)) == 0
+        assert _run(s.admit(trainer_version_fn=lambda: 0)) == 1
+        with pytest.raises(asyncio.TimeoutError):
+            _run(asyncio.wait_for(s.admit(trainer_version_fn=lambda: 0), timeout=0.05))
+
+        s.set_gate_window(3)
+
+        assert _run(s.admit(trainer_version_fn=lambda: 0)) == 2
+        assert _run(s.admit(trainer_version_fn=lambda: 0)) == 3
+        with pytest.raises(asyncio.TimeoutError):
+            _run(asyncio.wait_for(s.admit(trainer_version_fn=lambda: 0), timeout=0.05))
+
+        # ...and shrinking it back closes the gate again: at dispatch_index 3 a
+        # trainer on version 2 is inside the warmup window but outside the steady one.
+        s.set_gate_window(1)
+
+        with pytest.raises(asyncio.TimeoutError):
+            _run(asyncio.wait_for(s.admit(trainer_version_fn=lambda: 2), timeout=0.05))
+
+    def test_set_gate_window_rejects_a_negative_window(self):
+        sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+
+        with pytest.raises(ValueError, match="gate_window must be non-negative"):
+            sampler.set_gate_window(-1)
+
+    def test_only_gated_samplers_can_be_retuned(self):
+        """WindowedSampler has no gate, so it deliberately has no setter.
+
+        SC PPO is validated to run under in_order, so the driver never reaches
+        a sampler that lacks it.
+        """
+        assert not hasattr(
+            WindowedSampler(FakeBuffer(), max_staleness_versions=1),
+            "set_gate_window",
+        )
+
+    def test_warmup_window_below_the_steady_window_is_rejected(self):
+        with pytest.raises(ValidationError):
+            InOrderSamplerConfig(max_lookahead_versions=2, warmup_lookahead_versions=1)
+
+    def test_discriminated_union_parses_the_warmup_window(self):
+        cfg = TypeAdapter(SamplerConfig).validate_python(
+            {
+                "name": "in_order",
+                "max_lookahead_versions": 1,
+                "warmup_lookahead_versions": 4,
+            }
+        )
+
+        assert isinstance(cfg, InOrderSamplerConfig)
+        assert cfg.warmup_lookahead_versions == 4
+
+
 class TestCustomFqnSampler:
     def test_custom_target_loads_out_of_repo_sampler(self):
         # A user sampler defined anywhere importable; here, this test module.

@@ -16,6 +16,7 @@ import gc
 import logging
 import os
 import re
+import socket
 import time
 import warnings
 from collections import OrderedDict, defaultdict
@@ -57,6 +58,7 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.held_port import receive_held_socket
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.megatron_worker import (
@@ -64,7 +66,10 @@ from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationRefitMixin,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
-from nemo_rl.models.megatron.common import get_moe_metrics
+from nemo_rl.models.megatron.common import (
+    get_aux_loss_track_names,
+    get_moe_metrics,
+)
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
@@ -98,7 +103,13 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    broadcast_hf_buckets_via_distributed_impl,
+    connect_rollout_engines_from_distributed,
+    disconnect_rollout_engines_from_distributed,
+    get_runtime_env_for_policy_worker,
+    send_hf_buckets_via_ipc_actor_impl,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.checkpoint_engine import (
     MegatronCheckpointEngineSendMixin,
@@ -421,6 +432,7 @@ class MegatronPolicyWorkerImpl(
         *,
         worker_sharding_annotations: NamedSharding,
         skip_weight_load: bool = False,
+        reserved_http_server_port: Optional[int] = None,
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
@@ -456,8 +468,17 @@ class MegatronPolicyWorkerImpl(
         self.rank = get_rank_safe()
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
 
+        # Adopt the driver-reserved OpenAI server socket before any heavy init.
+        # The port holder has kept it bound and listening since reservation, so
+        # there was no window in which the pre-published URL could be stolen.
+        self._reserved_http_server_socket: Optional[socket.socket] = None
+        if reserved_http_server_port is not None and self.rank == 0:
+            self._reserved_http_server_socket = receive_held_socket(
+                reserved_http_server_port
+            )
+
         # Step 1: Setup distributed
-        setup_distributed()
+        setup_distributed(config)
         log_gpu_memory_diagnostics(
             label="after_nccl_init", worker_type="MegatronPolicyWorker"
         )
@@ -496,14 +517,6 @@ class MegatronPolicyWorkerImpl(
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Step 3: Setup model configuration
-        # Training workers cannot use inference_optimized transformer spec.
-        if init_optimizer:
-            assert (
-                config["megatron_cfg"].get("transformer_impl") != "inference_optimized"
-            ), (
-                "transformer_impl=inference_optimized must not be set on training workers. "
-                "Use policy.generation.mcore_generation_config.transformer_impl=inference_optimized instead."
-            )
         runtime_config = validate_and_set_config(
             config,
             self.rank,
@@ -670,6 +683,7 @@ class MegatronPolicyWorkerImpl(
         self._held_gather_buffer = None
 
         self._init_inference_engine_state()
+        self._setup_colocated_cuda_graph_managers()
 
         log_gpu_memory_diagnostics(
             label="init_complete", worker_type="MegatronPolicyWorker"
@@ -1085,6 +1099,13 @@ class MegatronPolicyWorkerImpl(
             moe_metrics = get_moe_metrics(
                 loss_scale=moe_loss_scale,
                 per_layer_logging=self.cfg["megatron_cfg"]["moe_per_layer_logging"],
+                # Pre-initialize the aux-loss tracker on every PP rank so the
+                # cross-PP all_reduce inside get_moe_metrics does not hang when a
+                # rank recorded no aux loss this step (e.g. a stage with no MoE
+                # layer, or MTP MoE on the last stage).
+                num_layers=getattr(model_config, "num_layers", None),
+                mtp_num_layers=getattr(model_config, "mtp_num_layers", None),
+                track_names=get_aux_loss_track_names(model_config),
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
@@ -1650,6 +1671,16 @@ class MegatronPolicyWorkerImpl(
             num_zeros_in_grad, mp_group=pg_collection.mp
         )
 
+        # Mirrors train(): without re-enabling the pre-hook __init__ removed, the
+        # param all-gather never runs and each forward sees only its own shard.
+        if self._first_train_step_forward_pre_hook_disabled and update_successful:
+            self.enable_forward_pre_hook()
+            get_model_config(
+                self.model
+            ).param_sync_func = self._first_train_step_param_sync_func
+            self._first_train_step_param_sync_func = None
+            self._first_train_step_forward_pre_hook_disabled = False
+
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
             torch.cuda.empty_cache()
 
@@ -1780,6 +1811,13 @@ class MegatronPolicyWorkerImpl(
             moe_metrics = get_moe_metrics(
                 loss_scale=moe_loss_scale,
                 per_layer_logging=self.cfg["megatron_cfg"]["moe_per_layer_logging"],
+                # Pre-initialize the aux-loss tracker on every PP rank so the
+                # cross-PP all_reduce inside get_moe_metrics does not hang when a
+                # rank recorded no aux loss this step (e.g. a stage with no MoE
+                # layer, or MTP MoE on the last stage).
+                num_layers=getattr(model_config, "num_layers", None),
+                mtp_num_layers=getattr(model_config, "mtp_num_layers", None),
+                track_names=get_aux_loss_track_names(model_config),
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
@@ -2261,15 +2299,19 @@ class MegatronPolicyWorkerImpl(
         emits a *pair* of tasks per FP8 weight (the FP8 data and a ``*_scale_inv``
         scale tensor).
         """
-        if self._is_fp8_export():
-            return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
-                self.megatron_bridge.hf_pretrained, [self.model]
-            )
-        return [
-            task
-            for task in self.megatron_bridge.get_conversion_tasks([self.model])
-            if task is not None
-        ]
+        # Deferred import to avoid circular import issues.
+        from nemo_rl.models.megatron.draft import draft_model_detached
+
+        with draft_model_detached([self.model]):
+            if self._is_fp8_export():
+                return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
+                    self.megatron_bridge.hf_pretrained, [self.model]
+                )
+            return [
+                task
+                for task in self.megatron_bridge.get_conversion_tasks([self.model])
+                if task is not None
+            ]
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
@@ -2320,6 +2362,7 @@ class MegatronPolicyWorkerImpl(
         self,
         kv_scales: Optional[dict[str, float]] = None,
         conversion_tasks=None,
+        include_draft: bool = True,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
@@ -2329,6 +2372,10 @@ class MegatronPolicyWorkerImpl(
         ``conversion_tasks`` (optional) overrides ``self.refit_conversion_tasks``
         — used by the nccl_reshard_refit misc-refit path to pass a filtered subset so
         Bridge only does TP/EP all-gather for those tasks instead of the full model.
+
+        ``include_draft`` controls the ``draft.*`` EAGLE weights. SGLang refit
+        sets it False: the engine keeps draft weights via
+        ``enable_draft_weights_cpu_backup`` rather than receiving them.
         """
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
             get_vllm_qkv_scale_names,
@@ -2348,7 +2395,7 @@ class MegatronPolicyWorkerImpl(
         for name, tensor in base_iter:
             yield name, tensor
 
-        if self.draft_model is not None:
+        if include_draft and self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
 
             draft_weights = export_eagle_weights_to_hf(
@@ -2461,6 +2508,169 @@ class MegatronPolicyWorkerImpl(
             hf_param = task.mapping.hf_param
             if not isinstance(hf_param, dict) and is_nccl_reshard_param(str(hf_param)):
                 yield str(hf_param), local_tensor
+
+    # ------------------------------------------------------------------
+    # SGLang weight update (colocate IPC + disaggregate broadcast)
+    # ------------------------------------------------------------------
+    def _iter_sglang_hf_weight_buckets(
+        self,
+        *,
+        target_precision: str,
+        sglang_quantization_cfg: Optional[dict] = None,
+        buffer_size_bytes: int,
+    ) -> Iterator[list[tuple[str, torch.Tensor]]]:
+        """Yield HF tensor buckets for SGLang refit.
+
+        Reuses the same two pieces as every other transport: the
+        ``export_hf_weights`` walk in ``_iter_params_with_optional_kv_scales``
+        (without vLLM KV/Q scales or draft weights — SGLang keeps drafts
+        engine-side via ``enable_draft_weights_cpu_backup``) and the shared
+        ``iter_named_tensor_buckets`` packing.
+        """
+        from nemo_rl.models.policy.utils import iter_named_tensor_buckets
+
+        if sglang_quantization_cfg is None:
+            raise ValueError("SGLang refit requires an explicit quantization config.")
+        configured_precision = sglang_quantization_cfg["scheme"]
+        if target_precision != configured_precision:
+            raise ValueError(
+                "SGLang refit target precision does not match its quantization "
+                f"config: target={target_precision!r}, "
+                f"configured={configured_precision!r}."
+            )
+        if target_precision != "bf16":
+            raise ValueError(f"Unsupported SGLang target precision: {target_precision}")
+
+        if self.refit_conversion_tasks is None:
+            self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
+                [self.model]
+            )
+
+        return iter_named_tensor_buckets(
+            self._iter_params_with_optional_kv_scales(include_draft=False),
+            buffer_size_bytes=buffer_size_bytes,
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/update_weights_to_sglang_colocated")
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict] = None,
+    ) -> None:
+        """Send finalized HF tensor buckets to colocated SGLang engines.
+
+        Synchronous: each chunk is awaited via ``ray.get`` inside
+        :func:`send_hf_buckets_via_ipc_actor_impl` before the next chunk
+        is sent, so trainer-side IPC tensors stay alive until the engine
+        has copied them and per-chunk engine failures surface immediately.
+        Raises ``RuntimeError`` on any chunk failure.
+        """
+        bucket_iter = self._iter_sglang_hf_weight_buckets(
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
+            buffer_size_bytes=buffer_size_bytes,
+        )
+        state = self._refit_transport_state("sglang_ipc")
+        state["weight_version"] = state.get("weight_version", 0) + 1
+        send_hf_buckets_via_ipc_actor_impl(
+            bucket_iterator=bucket_iter,
+            rollout_engines=list(rollout_engines),
+            worker_state=state,
+            weight_version=state["weight_version"],
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name(
+        "megatron_policy_worker/connect_sglang_rollout_engines_distributed"
+    )
+    def connect_sglang_rollout_engines_distributed(
+        self,
+        *,
+        rollout_engines: list,
+        engine_gpu_counts: list[int],
+        group_name: Optional[str] = None,
+    ) -> None:
+        """Bring up the trainer-rank-0 NCCL group for SGLang disaggregate refit.
+
+        Only trainer rank 0 broadcasts to SGLang, so only rank 0 owns the
+        torch process group. Other ranks return immediately. Calling this
+        again after engines recover destroys the stale group first.
+        """
+        if self.rank != 0:
+            return
+
+        state = self._refit_transport_state("sglang_dist")
+        if group_name is not None:
+            state["group_name"] = group_name
+        state.setdefault("group_name", "nemo_rl_sglang")
+
+        if state.get("group") is not None:
+            disconnect_rollout_engines_from_distributed(
+                group_name=state["group_name"],
+                model_update_group=state["group"],
+                rollout_engines=state.get("engines", []),
+            )
+            state["group"] = None
+            state["engines"] = []
+
+        state["group"] = connect_rollout_engines_from_distributed(
+            group_name=state["group_name"],
+            rollout_engines=list(rollout_engines),
+            engine_gpu_counts=list(engine_gpu_counts),
+        )
+        state["engines"] = list(rollout_engines)
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/update_weights_to_sglang_distributed")
+    def update_weights_to_sglang_distributed(
+        self,
+        *,
+        rollout_engines: list,
+        rollout_engine_lock,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict] = None,
+    ) -> None:
+        """Broadcast finalized HF tensors to SGLang engines from trainer rank 0.
+
+        Non-rank-0 trainers still walk the AutoBridge iterator (Megatron
+        gather + AutoBridge restoration is a collective), but they do not
+        participate in the NCCL broadcast. This matches the design's "trainer
+        rank 0 as the only source" decision.
+        """
+        bucket_iter = self._iter_sglang_hf_weight_buckets(
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
+            buffer_size_bytes=buffer_size_bytes,
+        )
+
+        if self.rank != 0:
+            # Drain the iterator so AutoBridge collectives complete on every
+            # rank, but do not broadcast.
+            for _ in bucket_iter:
+                pass
+            return
+
+        state = self._refit_transport_state("sglang_dist")
+        if state.get("group") is None:
+            raise RuntimeError(
+                "connect_sglang_rollout_engines_distributed must be called "
+                "before update_weights_to_sglang_distributed."
+            )
+        state["weight_version"] = state.get("weight_version", 0) + 1
+
+        broadcast_hf_buckets_via_distributed_impl(
+            bucket_iterator=bucket_iter,
+            rollout_engines=list(rollout_engines),
+            rollout_engine_lock=rollout_engine_lock,
+            group_name=state["group_name"],
+            model_update_group=state["group"],
+            weight_version=state["weight_version"],
+        )
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
@@ -3169,7 +3379,18 @@ class MegatronPolicyWorkerImpl(
 
         no_grad = torch.no_grad()
         no_grad.__enter__()
-        self.model = self.move_model(self.model, "cpu")
+        # Non-reshard colocated serves both models from the same param buffers.
+        generation_cfg = self.cfg.get("generation")
+        keep_params_for_generation = (
+            generation_cfg is not None
+            and generation_cfg.get("backend") == "megatron"
+            and self.is_generation_colocated
+            and self.inference_model is None
+            and self._colocated_reshard_plan is None
+        )
+        self.model = self.move_model(
+            self.model, "cpu", move_params=not keep_params_for_generation
+        )
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function

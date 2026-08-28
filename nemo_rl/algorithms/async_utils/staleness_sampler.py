@@ -51,7 +51,7 @@ from typing import (
     runtime_checkable,
 )
 
-from pydantic import BaseModel, Field, NonNegativeInt
+from pydantic import BaseModel, Field, NonNegativeInt, model_validator
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data_plane import KVBatchMeta
@@ -327,6 +327,10 @@ class _GatedSampler(BaseSampler):
 
     def __init__(self, buffer: TQReplayBuffer, *, gate_window: int) -> None:
         super().__init__(buffer)
+        self._gate_window = 0
+        self.set_gate_window(gate_window)
+
+    def set_gate_window(self, gate_window: int) -> None:
         if gate_window < 0:
             raise ValueError(f"gate_window must be non-negative, got {gate_window}")
         self._gate_window = gate_window
@@ -439,11 +443,33 @@ class InOrderSampler(_GatedSampler):
     (the staleness window is not used for selection). ``evict`` is keyed on
     ``target_step`` — not the start weight — so a slot whose target step is still
     upcoming is never dropped early, and evict/select can't disagree.
+
+    warmup_lookahead_versions widens the gate while the PPO policy is frozen, so more
+    batches stay in flight during critic warmup. The driver retunes the window every
+    step and shrinks it back to max_lookahead_versions once the policy starts training,
+    so the widened lookahead does not turn into permanent extra staleness. Buffer
+    capacity is sized for the peak of the two.
     """
 
-    def __init__(self, buffer: TQReplayBuffer, *, max_lookahead_versions: int) -> None:
+    def __init__(
+        self,
+        buffer: TQReplayBuffer,
+        *,
+        max_lookahead_versions: int,
+        warmup_lookahead_versions: Optional[int] = None,
+    ) -> None:
         super().__init__(buffer, gate_window=max_lookahead_versions)
         self.max_lookahead_versions = max_lookahead_versions
+        self.warmup_lookahead_versions = warmup_lookahead_versions
+
+    def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
+        # Sized for the peak window: otherwise the buffer, not the gate, bounds
+        # the lookahead and widening it during warmup does nothing.
+        if self.warmup_lookahead_versions is None:
+            peak = self.max_lookahead_versions
+        else:
+            peak = self.warmup_lookahead_versions
+        return _gated_required_buffer_capacity(groups_per_step, gate_window=peak)
 
     def _stamp(self) -> Optional[int]:
         return self._dispatch_index
@@ -508,6 +534,27 @@ class InOrderSamplerConfig(BaseModel, extra="allow"):
     name: Literal["in_order"] = "in_order"
     # How far generation may run ahead of the trainer, in dispatch batches.
     max_lookahead_versions: NonNegativeInt = 1
+    # Widened lookahead while the PPO policy is frozen; None keeps the steady value.
+    warmup_lookahead_versions: Optional[NonNegativeInt] = None
+
+    @model_validator(mode="after")
+    def validate_warmup_lookahead(self) -> "InOrderSamplerConfig":
+        if (
+            self.warmup_lookahead_versions is not None
+            and self.warmup_lookahead_versions < self.max_lookahead_versions
+        ):
+            raise ValueError(
+                "warmup_lookahead_versions must be greater than or equal "
+                "to max_lookahead_versions"
+            )
+        return self
+
+    @property
+    def peak_lookahead_versions(self) -> int:
+        """Widest window the run can reach; what buffer capacity must cover."""
+        if self.warmup_lookahead_versions is None:
+            return self.max_lookahead_versions
+        return self.warmup_lookahead_versions
 
 
 class CustomSamplerConfig(BaseModel, extra="allow"):
@@ -550,7 +597,7 @@ def required_buffer_capacity_for_config(
     if isinstance(cfg, InOrderSamplerConfig):
         return _gated_required_buffer_capacity(
             groups_per_step,
-            gate_window=cfg.max_lookahead_versions,
+            gate_window=cfg.peak_lookahead_versions,
         )
     return None
 
@@ -576,7 +623,11 @@ def create_sampler(
             buffer, max_staleness_versions=cfg.max_staleness_versions
         )
     if isinstance(cfg, InOrderSamplerConfig):
-        return InOrderSampler(buffer, max_lookahead_versions=cfg.max_lookahead_versions)
+        return InOrderSampler(
+            buffer,
+            max_lookahead_versions=cfg.max_lookahead_versions,
+            warmup_lookahead_versions=cfg.warmup_lookahead_versions,
+        )
     if isinstance(cfg, CustomSamplerConfig):
         module_name, sep, class_name = cfg.target.partition(":")
         if not sep:

@@ -142,10 +142,41 @@ runs:
         echo -e "\033[1;34m│  script    : ${{ inputs.script }}\033[0m"
         echo -e "\033[1;34m│  runner    : ${{ inputs.runner }}\033[0m"
         echo -e "\033[1;34m│  container : ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }}\033[0m"
+        # Expose the host's RDMA devices so mooncake_cpu tests exercise the real
+        # transport instead of finding no verbs device and skipping. A container
+        # sees the host's /sys/class/infiniband but does NOT inherit
+        # /dev/infiniband/uverbs*, which is what libibverbs actually opens;
+        # ibv_reg_mr additionally needs IPC_LOCK and an unlimited memlock rlimit
+        # to pin its registrations.
+        #
+        # Requires an mlx5 device on the host, either fabric — rdma_devices()
+        # prefers InfiniBand and falls back to RoCE. When the host has one,
+        # NEMO_RL_REQUIRE_MOONCAKE promotes the tests' skip into a failure, so
+        # losing this passthrough surfaces as a red job rather than silently
+        # dropping mooncake coverage.
+        #
+        # --device against a missing path makes docker run itself fail, which
+        # would break every test rather than only the RDMA ones — hence the
+        # host-side check (see detect_rdma.sh for what it gates on).
+        source "${{ github.workspace }}/${{ github.run_id }}/${{ steps.uuid.outputs.id }}/nemo-rl/tests/scripts/detect_rdma.sh"
+        RDMA_FLAGS=()
+        # MC_ENABLE_DEST_DEVICE_AFFINITY is normally decided by
+        # configure_engine_env in nemo_rl/data_plane/adapters/transfer_queue_env.py,
+        # which sets it only on a RoCE-only fabric. Passing it here overrides that
+        # gate (an already-set value is left alone) and also covers processes that
+        # never run the data-plane factory, e.g. a bare pytest invocation.
+        if [[ "${{ inputs.is_doc_test }}" != "true" ]] && rdma_device_available; then
+          RDMA_FLAGS=(--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1
+                      --env NEMO_RL_REQUIRE_MOONCAKE=1
+                      --env MC_ENABLE_DEST_DEVICE_AFFINITY=1)
+        fi
+        echo -e "\033[1;34m│  rdma      : ${RDMA_FLAGS[*]:-none}\033[0m"
         echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
+
         echo "::group::Logs"
         docker run --rm -u root --runtime=nvidia --gpus all \
           --shm-size=64g \
+          "${RDMA_FLAGS[@]}" \
           --env TRANSFORMERS_OFFLINE=0 \
           --env GHA_RUNNER=${{ inputs.runner }} \
           --env HYDRA_FULL_ERROR=1 \

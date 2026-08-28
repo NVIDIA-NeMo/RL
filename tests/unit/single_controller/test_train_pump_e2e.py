@@ -69,11 +69,12 @@ def _simple_tq_cfg() -> dict:
         "enabled": True,
         "impl": "transfer_queue",
         "backend": "simple",
-        "storage_capacity": 1024,
-        "num_storage_units": 1,
         "claim_meta_poll_interval_s": 0.5,
-        "global_segment_size": 8589934592,  # 8 GiB
-        "local_buffer_size": 1073741824,  # 1 GiB
+        "simple": {"storage_capacity": 1024, "num_storage_units": 1},
+        "mooncake_cpu": {
+            "global_segment_size": 8589934592,  # 8 GiB
+            "local_buffer_size": 1073741824,  # 1 GiB
+        },
     }
 
 
@@ -198,6 +199,8 @@ class _RecordingLogger:
         metrics: dict[str, Any],
         step: int,
         prefix: str | None = "",
+        step_metric: str | None = None,
+        step_finished: bool = False,
     ) -> None:
         ray.get(
             self._log.record.remote(
@@ -206,6 +209,7 @@ class _RecordingLogger:
                     "metrics": dict(metrics),
                     "step": int(step),
                     "prefix": prefix,
+                    "step_finished": step_finished,
                 },
             )
         )
@@ -301,7 +305,10 @@ def test_train_pump_drives_mcore_training_step(
         )
 
         master_config = MasterConfig.model_construct(
-            policy={"train_global_batch_size": train_gbs},
+            policy={
+                "train_global_batch_size": train_gbs,
+                "generation": {"colocated": {"enabled": False}},
+            },
             # _sync_weights gates stale-abort on should_use_nemo_gym(env); empty
             # env -> native path (nemo_gym disabled).
             env={},
@@ -386,6 +393,21 @@ def test_train_pump_drives_mcore_training_step(
             assert math.isfinite(metrics["advantages/mean"])
             assert metrics["evicted_stale_prompt_groups"] == 0
             assert metrics["aborted_stale_inflight_groups"] == 0
+
+        # The final "timing/train" log of each step must carry step_finished=True
+        # (the behavior this restores) so W&B commits the step; the "train" log must not.
+        timing_finished = [
+            p["step_finished"]
+            for kind, p in entries
+            if kind == "metrics" and p["prefix"] == "timing/train"
+        ]
+        train_finished = [
+            p["step_finished"]
+            for kind, p in entries
+            if kind == "metrics" and p["prefix"] == "train"
+        ]
+        assert timing_finished == [True] * train_steps
+        assert train_finished == [False] * train_steps
 
     finally:
         trainer.shutdown()

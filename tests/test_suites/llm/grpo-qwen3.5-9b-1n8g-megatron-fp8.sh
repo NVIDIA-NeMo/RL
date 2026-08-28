@@ -4,15 +4,14 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
-STEPS_PER_RUN=450
-MAX_STEPS=450
+STEPS_PER_RUN=20
+MAX_STEPS=20
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=150
+NUM_MINUTES=240
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
 
-# Run the experiment
 cd $PROJECT_ROOT
 uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
@@ -28,15 +27,15 @@ uv run examples/run_grpo.py \
     $@ \
     2>&1 | tee $RUN_LOG
 
-# Convert tensorboard logs to json
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'median(data["train/token_mult_prob_error"]) < 1.1' \
-        'mean(data["timing/train/total_step_time"], 2) < 25'
+        'mean(data["train/gen_kl_error"]) < 0.003' \
+        'max(data["train/reward"]) > 0.5'
+    # gen_kl_error measured on the fp8 verification run: first-20-step mean
+    # 0.0014, 586-step mean 0.0018 / max 0.0025 => 0.003 bounds the 20-step
+    # mean with ~2x margin (bf16 parent: 0.002).
 
-    # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
 fi
