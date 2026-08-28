@@ -90,3 +90,37 @@ Linux environment was type checked locally.
   implemented here.
 - Existing BF16 and blockwise paths are unchanged: this task adds a standalone
   adapter and does not wire it into the backend.
+
+## Review Fixes
+
+The later-vLLM diagnostic probe now matches the v0.28.0 source contract:
+`TrainerWeightTransferEngine` in
+`vllm.distributed.weight_transfer.base`, with
+`trainer_init(init_info, *, client, source=None)` and `send_weights`. The fake
+contract verifies both the symbol and that `client` is keyword-only. This is
+still a source/API diagnostic: adapter selection remains capability-based and
+the only supported runtime lifecycle remains pinned vLLM 0.25.1.
+
+Failure-state tests were added before the adapter fix. The initial RED result
+showed a finalizer failure was passed to the held config context as `None`
+instead of the original `RuntimeError("finalizer failed")`. The adapter now
+passes that active exception through `__exit__`, clears the held context before
+calling it, and poisons the worker on either finalizer or context-exit failure.
+The tests verify one finalizer call, one context exit, no later lifecycle
+operation can initiate another finalization, and every later `prepare`,
+`begin_update`, `load_component`, and `finish_update` call raises the stable
+unusable-worker error chained from the original failure.
+
+Focused fake lifecycle verification after the review fixes:
+
+```text
+8 passed in 3.32s
+```
+
+Ruff, `py_compile`, and `git diff --check` succeeded. The configured
+source-only local Pyrefly invocation with `torch.*` replaced by `Any` reported
+`INFO 0 errors`. Pyrefly cannot type check the fake test module in this macOS
+checkout because the repository `.venv` is Linux-only, so its local site
+packages do not include pytest; the fake `SimpleNamespace` runner also
+intentionally does not statically satisfy the private runner protocol. Native
+Linux vLLM 0.25.1 runtime verification remains outstanding.
