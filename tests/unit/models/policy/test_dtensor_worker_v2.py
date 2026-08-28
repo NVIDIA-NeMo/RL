@@ -32,6 +32,8 @@ from tests.unit.test_utils import SimpleLossFn
 try:
     from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
         DTensorPolicyWorkerV2Impl,
+        _get_model_owned_grad_divisor,
+        _get_model_owned_process_group,
         _maybe_adapt_tensor_to_hf,
         dtensor_params_generator,
     )
@@ -55,6 +57,89 @@ class _FakeTrainableModel:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_get_model_owned_grad_divisor():
+    parameter = nn.Parameter(torch.zeros(1))
+
+    assert _get_model_owned_grad_divisor(parameter) is None
+
+    parameter._nemo_model_owned_grad_divisor = 64
+    assert _get_model_owned_grad_divisor(parameter) == 64.0
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize(
+    ("marker", "expected_error"),
+    [
+        (True, TypeError),
+        ("64", TypeError),
+        (0.0, ValueError),
+        (float("nan"), ValueError),
+    ],
+)
+def test_dtensor_v2_rejects_invalid_model_owned_grad_divisor(marker, expected_error):
+    parameter = nn.Parameter(torch.zeros(1))
+    parameter._nemo_model_owned_grad_divisor = marker
+
+    with pytest.raises(expected_error):
+        _get_model_owned_grad_divisor(parameter)
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_get_model_owned_process_group(monkeypatch):
+    class FakeDTensor:
+        pass
+
+    expected_group = object()
+    parameter = FakeDTensor()
+    parameter.device_mesh = Mock(ndim=1)
+    parameter.device_mesh.get_group.return_value = expected_group
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensor",
+        FakeDTensor,
+    )
+
+    assert _get_model_owned_process_group(parameter) is expected_group
+    parameter.device_mesh.get_group.assert_called_once_with()
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_move_to_device_preserves_model_owned_contract(monkeypatch):
+    class FakeDTensor:
+        pass
+
+    class ReplacingModel:
+        def __init__(self):
+            self.parameter = FakeDTensor()
+
+        def named_parameters(self):
+            return [("model.ple.weight", self.parameter)]
+
+        def to(self, _device):
+            self.parameter = FakeDTensor()
+            return self
+
+    model = ReplacingModel()
+    model.parameter._nemo_model_owned_grad_divisor = 64.0
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.move_buffer_to_device = lambda current_model, _device: current_model
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensor",
+        FakeDTensor,
+    )
+
+    converted = DTensorPolicyWorkerV2Impl.move_to_device(worker, model, "cpu")
+
+    assert converted is model
+    assert converted.parameter._nemo_model_owned_grad_divisor == 64.0
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 def test_dtensor_v2_prepare_for_training_restores_optimizer(monkeypatch):
     worker = object.__new__(DTensorPolicyWorkerV2Impl)
     model = _FakeTrainableModel()
@@ -63,6 +148,7 @@ def test_dtensor_v2_prepare_for_training_restores_optimizer(monkeypatch):
     worker.model = model
     worker.optimizer = object()
     worker.cpu_offload = False
+    worker.offload_optimizer_for_logprob = False
     worker.move_to_cuda = lambda model: model
     worker.move_optimizer_to_device = lambda device: restored_devices.append(device)
 
@@ -726,6 +812,34 @@ class TestDTensorParamsGenerator:
             assert tensor.dtype == target_dtype, (
                 f"Tensor {name} should be converted to {target_dtype}"
             )
+
+    def test_model_owned_dtensor_export_stays_local(self, monkeypatch):
+        class FakeDTensor:
+            def full_tensor(self):
+                raise AssertionError("model-owned parameter must not be full-gathered")
+
+        distributed_tensor = FakeDTensor()
+        distributed_tensor._nemo_model_owned_grad_divisor = 64.0
+        local_shard = torch.randn(2, 3)
+        adapter = Mock()
+        adapter.convert_single_tensor_to_hf.return_value = [
+            ("model.ple.shard_0.weight", local_shard)
+        ]
+        model = Mock()
+        model.state_dict.return_value = {"model.ple.weight": distributed_tensor}
+        model.named_modules.return_value = []
+        model.named_parameters.return_value = [("model.ple.weight", distributed_tensor)]
+        model.state_dict_adapter = adapter
+
+        monkeypatch.setattr(
+            "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensor",
+            FakeDTensor,
+        )
+
+        results = list(dtensor_params_generator(model, torch.bfloat16))
+
+        assert [name for name, _ in results] == ["model.ple.shard_0.weight"]
+        torch.testing.assert_close(results[0][1], local_shard.to(torch.bfloat16))
 
     def test_contiguous_output(self):
         """Test that output tensors are contiguous."""
