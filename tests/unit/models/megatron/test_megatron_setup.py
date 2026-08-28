@@ -2240,6 +2240,53 @@ class TestCreateMegatronConfigOptimizerOffload:
 
 
 @pytest.mark.mcore
+def test_create_megatron_config_passes_mxfp8_recipe_to_optimizer() -> None:
+    from nemo_rl.models.megatron.setup import _create_megatron_config
+
+    config = {
+        "megatron_cfg": {
+            "optimizer": {"use_distributed_optimizer": True},
+            "scheduler": {},
+            "distributed_data_parallel_config": {
+                "overlap_param_gather": True,
+                "grad_reduce_in_fp32": True,
+                "overlap_grad_reduce": True,
+                "data_parallel_sharding_strategy": "optim_grads_params",
+            },
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "mxfp8",
+                "fp8_param": True,
+            },
+            "train_iters": 10,
+        },
+        "train_global_batch_size": 8,
+    }
+    with (
+        patch("nemo_rl.models.megatron.setup.ConfigContainer"),
+        patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+        patch("nemo_rl.models.megatron.setup.OptimizerConfig") as optimizer,
+        patch("nemo_rl.models.megatron.setup.DistributedDataParallelConfig") as ddp,
+        patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+        patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+        patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+    ):
+        _create_megatron_config(
+            model_cfg=MagicMock(),
+            checkpoint_config=MagicMock(),
+            config=config,
+            hf_model_name="test-model",
+            dtype=torch.bfloat16,
+            fp8_param_enabled=True,
+        )
+
+    assert optimizer.call_args.kwargs["fp8_recipe"] == "mxfp8"
+    assert ddp.call_args.kwargs["fp8_param_gather"] is True
+    assert ddp.call_args.kwargs["reuse_grad_buf_for_mxfp8_param_ag"] is True
+
+
+@pytest.mark.mcore
 class TestValidateAndSetConfig:
     """Tests for validate_and_set_config function."""
 
