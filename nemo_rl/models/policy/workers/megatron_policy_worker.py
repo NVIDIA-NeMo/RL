@@ -4066,10 +4066,21 @@ class MegatronPolicyWorkerImpl(
             keep_train_buffers,
         )
         self._log_gpu_mem("lp_prep_enter")
-        self.model = self.move_model(self.model, "cuda", move_grads=False)
+        uses_mxfp8_shared_buffer = self._uses_mxfp8_overlap_shared_param_buffer()
+        restore_mxfp8_shared_buffer = (
+            uses_mxfp8_shared_buffer and not keep_train_buffers
+        )
+        self.model = self.move_model(
+            self.model,
+            "cuda",
+            move_grads=restore_mxfp8_shared_buffer,
+        )
         self.model.eval()
 
-        if not keep_train_buffers:
+        if restore_mxfp8_shared_buffer:
+            self.optimizer.prepare_model_params_for_param_sync()
+
+        if not keep_train_buffers and not uses_mxfp8_shared_buffer:
             # offload grads to cpu
             self.model = self.move_model(
                 self.model, "cpu", move_params=False, move_grads=True

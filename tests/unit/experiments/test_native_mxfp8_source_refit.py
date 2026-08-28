@@ -42,6 +42,8 @@ def test_nano_native_storage_recipe_enables_fp8_params_for_routed_experts() -> N
     assert "fp8_param: true" in recipe
     assert 'pattern: "*mlp.experts.linear_fc1"' in recipe
     assert 'pattern: "*mlp.experts.linear_fc2"' in recipe
+    assert 'pattern: "*mlp.experts.local_experts.*.linear_fc1"' in recipe
+    assert 'pattern: "*mlp.experts.local_experts.*.linear_fc2"' in recipe
 
 
 def test_ray_tmpdir_is_resolved_before_ray_head_and_workers_start() -> None:

@@ -21,6 +21,16 @@ matchers:
     type: glob
     pattern: "*mlp.experts.linear_fc2"
     enabled: true
+  routed_local_experts_fc1_mxfp8:
+    config: mxfp8
+    type: glob
+    pattern: "*mlp.experts.local_experts.*.linear_fc1"
+    enabled: true
+  routed_local_experts_fc2_mxfp8:
+    config: mxfp8
+    type: glob
+    pattern: "*mlp.experts.local_experts.*.linear_fc2"
+    enabled: true
   all_other_modules_bf16:
     config: bf16
     type: glob
