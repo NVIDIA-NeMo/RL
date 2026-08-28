@@ -1108,9 +1108,7 @@ class TestTQReplayBufferStateDict:
             )
         )
         group = _make_group_entry("g0", weight=1)
-        group["meta"].tags = [
-            {ROUTE_PLAN_TAG: plan} for _ in group["meta"].sample_ids
-        ]
+        group["meta"].tags = [{ROUTE_PLAN_TAG: plan} for _ in group["meta"].sample_ids]
         state = _make_metadata_envelope([group])
 
         restored = TQReplayBuffer(
@@ -1122,9 +1120,7 @@ class TestTQReplayBufferStateDict:
         assert _load(restored, state) == 1
 
         assert restored._rollout_ids_list == [list(group["meta"].sample_ids)]
-        assert restored._staging_keys_list == [
-            ["r0/on_chain", "r0/off_chain"]
-        ]
+        assert restored._staging_keys_list == [["r0/on_chain", "r0/off_chain"]]
 
     def test_round_trip_preserves_end_weight_and_target_step(self):
         # start != end and a non-None target_step must survive the round-trip:

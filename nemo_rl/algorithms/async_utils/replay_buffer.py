@@ -231,9 +231,7 @@ class DataPlaneCheckpointBarrier:
         self._checkpoint_active = False
         self._active_mutations = 0
         self._mutation_depth_by_task: dict[asyncio.Task[Any], int] = {}
-        self._mutation_cut_by_task: dict[
-            asyncio.Task[Any], DataPlaneMutationCut
-        ] = {}
+        self._mutation_cut_by_task: dict[asyncio.Task[Any], DataPlaneMutationCut] = {}
 
     @asynccontextmanager
     async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
