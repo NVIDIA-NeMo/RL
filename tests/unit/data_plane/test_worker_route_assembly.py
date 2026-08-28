@@ -17,26 +17,34 @@ from __future__ import annotations
 
 from collections import Counter
 
+import pytest
 import torch
-from nemo_gym.token_id_capture.staging.digest import compute_extras_digest
 
-from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import (
+nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
+
+from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
+    compute_extras_digest,
+)
+
+from nemo_rl.data_plane import KVBatchMeta  # noqa: E402
+from nemo_rl.data_plane.schema import (  # noqa: E402
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
 )
-from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.route_plan import (
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict  # noqa: E402
+from nemo_rl.experience.route_plan import (  # noqa: E402
     ROUTE_PLAN_SCHEMA_VERSION,
     RouteAssemblyPlan,
     RouteSpan,
     encode_route_plan,
 )
-from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts  # noqa: E402
+
+pytestmark = pytest.mark.nemo_gym
 
 
 class _Rows(dict):
