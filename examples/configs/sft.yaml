@@ -256,6 +256,12 @@ data:
     prompt_file: null
     system_prompt_file: null
     processor: "sft_processor"
+    chat_key: "messages" # Key containing the ordered conversation messages.
+    # Megatron-LM offline-packed SFT settings. These are ignored by other datasets.
+    megatron_sft_prompt_format: "identity"
+    megatron_sft_pad_token: null
+    megatron_sft_assistant_prefix_len: null
+    megatron_sft_context_parallel_size: ${policy.megatron_cfg.context_parallel_size}
 
   # You can also use multiple datasets by using a list of datasets.
   # See `examples/configs/grpo_multiple_datasets.yaml` for a full configuration example.

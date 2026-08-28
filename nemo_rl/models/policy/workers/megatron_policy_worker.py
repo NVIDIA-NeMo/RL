@@ -96,6 +96,8 @@ from nemo_rl.models.megatron.train import (
     TopkLogitsPostProcessor,
     aggregate_training_statistics,
     megatron_forward_backward,
+    should_reduce_loss_across_context_parallel,
+    strip_context_parallel_local_loss_metric,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -1036,8 +1038,8 @@ class MegatronPolicyWorkerImpl(
                         curr_wd = self.scheduler.get_wd()
                         loss_metrics["lr"] = curr_lr
                         loss_metrics["wd"] = curr_wd
-                        loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
-                        loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                        loss_metrics["global_valid_seqs"] = global_valid_seqs.detach()
+                        loss_metrics["global_valid_toks"] = global_valid_toks.detach()
                         mb_losses.append(loss_metrics["loss"])
 
                 else:
@@ -1051,7 +1053,12 @@ class MegatronPolicyWorkerImpl(
                     mb_losses = [x["loss"] for x in gb_loss_metrics]
 
                 all_mb_metrics.extend(gb_loss_metrics)
-                losses.append(torch.tensor(mb_losses).sum().item())
+                if all(isinstance(loss, torch.Tensor) for loss in mb_losses):
+                    losses.append(torch.stack(mb_losses).sum())
+                else:
+                    losses.append(
+                        torch.tensor(mb_losses, device=global_valid_toks.device).sum()
+                    )
 
         if saved_extra_state is not None:
             self._restore_model_extra_state_dict(saved_extra_state)
@@ -1074,10 +1081,17 @@ class MegatronPolicyWorkerImpl(
             self.scheduler.step(increment=gbs)
 
         # Aggregate metrics across all microbatches
+        reduce_loss_across_cp = should_reduce_loss_across_context_parallel(data)
+        loss_reduction_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=reduce_loss_across_cp
+        )
         mb_metrics, global_loss = aggregate_training_statistics(
             all_mb_metrics=all_mb_metrics,
             losses=losses,
-            data_parallel_group=parallel_state.get_data_parallel_group(),
+            data_parallel_group=loss_reduction_group,
+        )
+        mb_metrics = strip_context_parallel_local_loss_metric(
+            mb_metrics, enabled=reduce_loss_across_cp
         )
 
         metrics = {
@@ -1424,6 +1438,11 @@ class MegatronPolicyWorkerImpl(
         state: dict[str, Any],
         data: BatchedDataDict[Any],
     ) -> None:
+        if should_reduce_loss_across_context_parallel(data):
+            raise NotImplementedError(
+                "Direct packed SFT rows are not supported by the split training API"
+            )
+
         state["num_chunks"] += 1
         self._log_gpu_mem("chunk_enter")
         loss_fn = state["loss_fn"]

@@ -619,6 +619,27 @@ def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
     assert torch.allclose(scale_fn(), torch.tensor(1.0))
 
 
+def test_split_train_api_rejects_direct_packed_sft_rows():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    data = BatchedDataDict(
+        {
+            "packed_cu_seqlens": torch.tensor([[0, 4]], dtype=torch.int32),
+            "target_ids": torch.ones(1, 4, dtype=torch.long),
+        }
+    )
+
+    with pytest.raises(NotImplementedError, match="split training API"):
+        MegatronPolicyWorkerImpl._train_microbatch_body(
+            worker,
+            {"loss_fn": NLLLossFn()},
+            data,
+        )
+
+
 @pytest.mark.parametrize(
     ("kwargs", "expected_param_sync"),
     [({}, False), ({"param_sync": True}, True)],

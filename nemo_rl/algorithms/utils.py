@@ -15,6 +15,7 @@
 import math
 import random
 import warnings
+from copy import deepcopy
 from functools import partial, wraps
 from typing import Any, Optional
 
@@ -481,6 +482,37 @@ def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
     min_padding = (math.ceil(batch.size / (mbs * dp_size)) * mbs * dp_size) - batch.size
     if min_padding > 0:
         print(f"Padding last validation batch with {min_padding} padding samples")
+        if "packed_cu_seqlens" in batch:
+            original_size = batch.size
+            for key, value in list(batch.items()):
+                if torch.is_tensor(value):
+                    if value.ndim == 0 or value.shape[0] != original_size:
+                        raise ValueError(
+                            f"Direct packed SFT row-aligned field {key} has invalid "
+                            f"shape {tuple(value.shape)} for batch size {original_size}"
+                        )
+                    if key == "sample_mask":
+                        padding = torch.zeros_like(value[-1:]).repeat(min_padding)
+                    else:
+                        repeats = (min_padding,) + (1,) * (value.ndim - 1)
+                        padding = value[-1:].repeat(repeats)
+                    batch[key] = torch.cat([value, padding], dim=0)
+                elif isinstance(value, list):
+                    if len(value) != original_size:
+                        raise ValueError(
+                            f"Direct packed SFT row-aligned field {key} has length "
+                            f"{len(value)} for batch size {original_size}"
+                        )
+                    batch[key] = value + [
+                        deepcopy(value[-1]) for _ in range(min_padding)
+                    ]
+                else:
+                    raise ValueError(
+                        f"Direct packed SFT row-aligned field {key} has unsupported "
+                        f"type {type(value).__name__}"
+                    )
+            return batch
+
         # Pad input_ids
         batch["input_ids"] = torch.cat(
             [

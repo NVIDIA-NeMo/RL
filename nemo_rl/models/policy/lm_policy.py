@@ -64,6 +64,17 @@ from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
 
+_DIRECT_PACKED_SFT_REQUIRED_KEYS = {
+    "input_ids",
+    "target_ids",
+    "token_mask",
+    "position_ids",
+    "sample_mask",
+    "packed_cu_seqlens",
+    "packed_cu_seqlens_lengths",
+    "packed_max_seqlen",
+}
+
 
 def _aggregate_megatron_flops_metrics(
     results: list[dict],
@@ -518,6 +529,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self,
         data: BatchedDataDict[Any],
         batch_size: int,
+        *,
+        micro_batch_size: Optional[int] = None,
     ) -> list["SlicedDataDict"]:
         """Shard inputs for ``train``.
 
@@ -528,7 +541,50 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         scalar metrics (no per-row outputs to reorder).
         """
         dp_size = self.data_parallel_size
-        if self.use_dynamic_batches:
+        if "packed_cu_seqlens" in data:
+            missing = _DIRECT_PACKED_SFT_REQUIRED_KEYS.difference(data)
+            if missing:
+                raise ValueError(
+                    "Direct packed SFT batch is missing required fields: "
+                    f"{sorted(missing)}"
+                )
+            if (
+                "megatron_cfg" not in self.cfg
+                or not self.cfg["megatron_cfg"]["enabled"]
+            ):
+                raise ValueError("Direct packed SFT rows require the Megatron backend")
+            if "draft" in self.cfg and self.cfg["draft"]["enabled"]:
+                raise NotImplementedError(
+                    "Direct packed SFT rows do not support draft training"
+                )
+            effective_micro_batch_size = (
+                micro_batch_size
+                if micro_batch_size is not None
+                else self.cfg["train_micro_batch_size"]
+            )
+            if effective_micro_batch_size != 1:
+                raise ValueError("Direct packed SFT rows require micro batch size 1")
+            if self.cfg["dynamic_batching"]["enabled"]:
+                raise ValueError(
+                    "Direct packed SFT rows require dynamic batching to be disabled"
+                )
+            if batch_size != data.size:
+                raise ValueError(
+                    "Direct packed SFT global batch size must equal the packed row "
+                    f"count: gbs={batch_size}, rows={data.size}"
+                )
+            if batch_size % dp_size != 0:
+                raise ValueError(
+                    "Direct packed SFT global batch size must be divisible by data "
+                    f"parallel size: gbs={batch_size}, dp={dp_size}"
+                )
+            sharded_data = [
+                SlicedDataDict(
+                    data.select_indices(list(range(dp_rank, data.size, dp_size)))
+                )
+                for dp_rank in range(dp_size)
+            ]
+        elif self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
             ]["train_mb_tokens"]
@@ -798,7 +854,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
         with timer.time("policy_training/sharding_data") if timer else nullcontext():
-            sharded_data = self._shard_for_train(data, batch_size)
+            sharded_data = self._shard_for_train(
+                data,
+                batch_size,
+                micro_batch_size=micro_batch_size,
+            )
         self._report_sharded_payload(sharded_data, "policy_train")
 
         if self.flops_tracker is not None:

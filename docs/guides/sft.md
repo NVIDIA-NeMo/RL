@@ -168,6 +168,73 @@ self.val_dataset = None
 self.split_train_validation(split_validation_size, seed)
 ```
 
+### Megatron-LM offline-packed datasets
+
+Use `megatron_sft_packed` when each JSONL record groups one or more
+conversations that must remain in one training row and you want to bypass NeMo
+RL's generic online sequence-packing path. This dataset mode is available only
+with the Megatron backend.
+
+Each line must be a JSON object whose `messages` field is an ordered list of
+OpenAI-style messages. A packed row must start with a `system` message and end
+with an `assistant` message. To place multiple conversations in one row, start
+each additional conversation with another `system` message:
+
+```json
+{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"2+2?"},{"role":"assistant","content":"4"},{"role":"system","content":"You are concise."},{"role":"user","content":"Capital of France?"},{"role":"assistant","content":"Paris."}]}
+```
+
+The processor tokenizes each record, then pads or right-truncates it to
+`data.max_input_seq_length`.
+
+Configure the dataset and the direct packed path as follows:
+
+```yaml
+sft:
+  only_unmask_final: false
+  val_micro_batch_size: 1
+
+policy:
+  train_micro_batch_size: 1
+  dtensor_cfg:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    context_parallel_size: 1
+    use_fused_linear_logprobs: false
+
+data:
+  train:
+    dataset_name: megatron_sft_packed
+    data_path: /path/to/train.jsonl
+  validation:
+    dataset_name: megatron_sft_packed
+    data_path: /path/to/validation.jsonl
+  default:
+    chat_key: messages
+    megatron_sft_prompt_format: identity
+    megatron_sft_pad_token: null
+    megatron_sft_assistant_prefix_len: null
+    megatron_sft_context_parallel_size: ${policy.megatron_cfg.context_parallel_size}
+```
+
+`megatron_sft_prompt_format` accepts `identity`, `nemotron-nano-v2`, or
+`nemotron-h-aligned`. The optional pad-token and assistant-prefix settings
+override the selected format's defaults. `identity` does not support a nonzero
+assistant prefix length.
+
+For context parallelism, every conversation segment is padded to a multiple of
+`2 * context_parallel_size`. The data and policy context-parallel sizes must
+match. A direct-packed training or validation split cannot be mixed with
+regular datasets, and direct-packed SFT does not support dynamic batching,
+draft training, router replay, `sft.only_unmask_final=true`, or fused linear
+log-probability loss. The relevant training or validation micro batch size must
+be 1. At context-parallel size 1, online `policy.sequence_packing.enabled` is
+not required. For context-parallel size greater than 1, set it to `true` as
+required by the MCore context-parallel path.
+
 ### OpenAI Format Datasets (with Tool Calling Support)
 
 NeMo RL also supports datasets in the OpenAI conversation format, which is commonly used for chat models and function calling. This format is particularly useful for training models with tool-use capabilities.

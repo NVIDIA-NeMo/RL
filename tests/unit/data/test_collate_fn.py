@@ -14,11 +14,197 @@
 
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
-from nemo_rl.data.collate_fn import preference_collate_fn
+from nemo_rl.data.collate_fn import preference_collate_fn, rl_collate_fn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def _packed_datum(idx: int, cu_seqlens: list[int] | None = None) -> DatumSpec:
+    pack_length = 4
+    if cu_seqlens is None:
+        cu_seqlens = [0, 2, pack_length]
+    first_token = idx * 10
+    return DatumSpec(
+        message_log=[],
+        input_ids=torch.arange(
+            first_token, first_token + pack_length, dtype=torch.int64
+        ),
+        target_ids=torch.arange(
+            first_token + 100,
+            first_token + 100 + pack_length,
+            dtype=torch.int64,
+        ),
+        token_mask=torch.tensor([1.0, 0.0, 1.0, float(idx % 2)], dtype=torch.float32),
+        position_ids=torch.tensor([0, 1, 0, 1], dtype=torch.int64),
+        packed_cu_seqlens=torch.tensor(cu_seqlens, dtype=torch.int32),
+        packed_max_seqlen=max(b - a for a, b in zip(cu_seqlens, cu_seqlens[1:])),
+        packed_context_parallel_size=1,
+        length=pack_length,
+        extra_env_info=None,
+        loss_multiplier=1.0,
+        idx=idx,
+        task_name="megatron_sft_packed",
+    )
+
+
+def test_rl_collate_fn_preserves_packed_tensors() -> None:
+    data = [_packed_datum(0), _packed_datum(1)]
+
+    batch = rl_collate_fn(data)
+
+    assert torch.equal(
+        batch["input_ids"],
+        torch.tensor([[0, 1, 2, 3], [10, 11, 12, 13]], dtype=torch.int64),
+    )
+    assert torch.equal(
+        batch["target_ids"],
+        torch.tensor([[100, 101, 102, 103], [110, 111, 112, 113]], dtype=torch.int64),
+    )
+    assert torch.equal(
+        batch["token_mask"],
+        torch.tensor([[1.0, 0.0, 1.0, 0.0], [1.0, 0.0, 1.0, 1.0]]),
+    )
+    assert torch.equal(
+        batch["position_ids"],
+        torch.tensor([[0, 1, 0, 1], [0, 1, 0, 1]], dtype=torch.int64),
+    )
+
+
+def test_rl_collate_fn_preserves_ragged_packed_metadata() -> None:
+    data = [_packed_datum(0), _packed_datum(1, [0, 1, 3, 4])]
+
+    batch = rl_collate_fn(data)
+
+    assert torch.equal(
+        batch["packed_cu_seqlens"],
+        torch.tensor([[0, 2, 4, -1], [0, 1, 3, 4]], dtype=torch.int32),
+    )
+    assert torch.equal(batch["packed_cu_seqlens_lengths"], torch.tensor([3, 4]))
+    assert torch.equal(batch["packed_max_seqlen"], torch.tensor([2, 2]))
+    assert torch.equal(batch["input_lengths"], torch.tensor([4, 4]))
+    assert torch.equal(batch["sample_mask"], torch.tensor([1.0, 1.0]))
+    assert batch["idx"] == [0, 1]
+    assert batch["task_name"] == ["megatron_sft_packed", "megatron_sft_packed"]
+
+
+def test_rl_collate_fn_rejects_mixed_packed_and_non_packed_rows() -> None:
+    regular = DatumSpec(
+        message_log=[],
+        length=1,
+        loss_multiplier=1.0,
+        extra_env_info=None,
+        idx=1,
+    )
+
+    with pytest.raises(ValueError, match="all packed or all non-packed"):
+        rl_collate_fn([_packed_datum(0), regular])
+
+
+def test_rl_collate_fn_rejects_partial_packed_row() -> None:
+    partial = DatumSpec(
+        message_log=[],
+        packed_cu_seqlens=torch.tensor([0, 4]),
+        length=4,
+        loss_multiplier=1.0,
+        extra_env_info=None,
+        idx=0,
+    )
+
+    with pytest.raises(ValueError, match="partial Megatron SFT packed fields"):
+        rl_collate_fn([partial])
+
+
+def test_rl_collate_fn_does_not_treat_input_ids_extra_as_packed() -> None:
+    datum = DatumSpec(
+        message_log=[],
+        input_ids=torch.arange(4),
+        length=4,
+        loss_multiplier=1.0,
+        extra_env_info=None,
+        idx=0,
+    )
+
+    batch = rl_collate_fn([datum])
+
+    assert torch.equal(batch["length"], torch.tensor([4]))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        pytest.param(
+            "target_ids",
+            torch.arange(3),
+            "1D tensors of equal length",
+            id="mismatched-tensor-length",
+        ),
+        pytest.param(
+            "packed_cu_seqlens",
+            torch.tensor([0, 2, 3]),
+            "final value must equal input length",
+            id="wrong-final-cu-seqlen",
+        ),
+        pytest.param(
+            "packed_max_seqlen",
+            3,
+            r"must equal max\(diff\(packed_cu_seqlens\)\)",
+            id="wrong-max-seqlen",
+        ),
+        pytest.param(
+            "length",
+            3,
+            "length must match input_ids length",
+            id="wrong-pack-length",
+        ),
+    ],
+)
+def test_rl_collate_fn_rejects_invalid_packed_metadata(
+    field: str, value: object, error: str
+) -> None:
+    datum = _packed_datum(0)
+    datum[field] = value
+
+    with pytest.raises(ValueError, match=error):
+        rl_collate_fn([datum])
+
+
+def test_rl_collate_fn_rejects_context_parallel_mismatch() -> None:
+    datum = _packed_datum(0)
+    datum["packed_context_parallel_size"] = 2
+
+    with pytest.raises(ValueError, match="prepared for context_parallel_size=2"):
+        rl_collate_fn([datum], megatron_sft_context_parallel_size=1)
+
+
+def test_rl_collate_fn_preserves_source_order_before_megatron_dp_sharding() -> None:
+    data = [_packed_datum(idx) for idx in range(8)]
+
+    batch = rl_collate_fn(data)
+
+    assert list(zip(batch["idx"], batch["input_ids"][:, 0].tolist(), strict=True)) == [
+        (0, 0),
+        (1, 10),
+        (2, 20),
+        (3, 30),
+        (4, 40),
+        (5, 50),
+        (6, 60),
+        (7, 70),
+    ]
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 3])
+def test_rl_collate_fn_accepts_partial_packed_validation_batch(
+    batch_size: int,
+) -> None:
+    data = [_packed_datum(idx) for idx in range(batch_size)]
+
+    batch = rl_collate_fn(data)
+
+    assert batch["idx"] == list(range(batch_size))
 
 
 def test_preference_collate_fn():

@@ -36,6 +36,9 @@ from nemo_rl.data.datasets.response_datasets.intent import (
     IntentBenchDataset,
     IntentTrainDataset,
 )
+from nemo_rl.data.datasets.response_datasets.megatron_sft_packed import (
+    MegatronSFTPackedDataset,
+)
 from nemo_rl.data.datasets.response_datasets.mmpr_tiny import MMPRTinyDataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
 from nemo_rl.data.datasets.response_datasets.nemotron_cascade2_sft import (
@@ -79,6 +82,7 @@ DATASET_REGISTRY = {
     "HelpSteer3": HelpSteer3Dataset,
     "intent-train": IntentTrainDataset,
     "intent-bench": IntentBenchDataset,
+    "megatron_sft_packed": MegatronSFTPackedDataset,
     "open_assistant": OasstDataset,
     "OpenMathInstruct-2": OpenMathInstruct2Dataset,
     "NuminaMath-1.5": NuminaMath15Dataset,
@@ -157,6 +161,7 @@ __all__ = [
     "HelpSteer3Dataset",
     "IntentBenchDataset",
     "IntentTrainDataset",
+    "MegatronSFTPackedDataset",
     "MMPRTinyDataset",
     "NemoGymDataset",
     "NemotronCascade2SFTMathDataset",
