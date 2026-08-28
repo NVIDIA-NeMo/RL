@@ -25,8 +25,10 @@ These tests drive the real _setup_vllm_openai_api_server against a fake vLLM
 module tree and inspect what each consumer was constructed with.
 """
 
+import asyncio
 import sys
 import types
+from dataclasses import dataclass
 from unittest.mock import MagicMock
 
 import pytest
@@ -243,3 +245,105 @@ def test_absent_kwargs_render_as_empty_dict(monkeypatch):
 
     assert renderer[0].kwargs["default_chat_template_kwargs"] == {}
     assert tokenization[0].kwargs["default_chat_template_kwargs"] == {}
+
+
+# ---------------------------------------------------------------------------
+# preprocess_chat: multimodal placeholders after exact-prefix replacement
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _PlaceholderRange:
+    """Mirrors vllm.multimodal.inputs.PlaceholderRange (v0.25.1)."""
+
+    offset: int
+    length: int
+    is_embed: object | None = None
+
+
+class _Request:
+    """Enough of ChatCompletionRequest for the prefix-replacement branch."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+    def model_copy(self, update):
+        merged = dict(self.__dict__)
+        merged.update(update)
+        return _Request(**merged)
+
+
+# eos = 2. History re-tokenizes 1002,1003 as the single token 1001, so the
+# exact-token prompt is one longer than the template render and every media
+# span after the splice point slides by one.
+_TEMPLATE_PREFIX = [7, 8, 1001, 2]
+_TEMPLATE_TOKENS = [7, 8, 1001, 2, 30, 90, 90, 90, 31]
+_MODEL_PREFIX = [7, 8, 1002, 1003, 2]
+_EXACT_TOKENS = [7, 8, 1002, 1003, 2, 30, 90, 90, 90, 31]
+
+
+def _renderer_with_stubbed_super(monkeypatch, mm_placeholders):
+    """Build the real NeMoRLOnlineRenderer over a scripted vLLM base class."""
+    renderer, _, _ = _build_server(monkeypatch, {})
+    instance = renderer[0]
+    instance.renderer = MagicMock(tokenizer=MagicMock(eos_token_id=2))
+
+    engine_prompt = {"prompt_token_ids": list(_TEMPLATE_TOKENS)}
+    if mm_placeholders is not None:
+        engine_prompt["mm_placeholders"] = mm_placeholders
+
+    async def fake_preprocess_chat(self, *, request, messages, **_kwargs):
+        # The history-only call passes the truncated message list.
+        if len(messages) == len(_MESSAGES):
+            return [], [engine_prompt]
+        return [], [{"prompt_token_ids": list(_TEMPLATE_PREFIX)}]
+
+    monkeypatch.setattr(
+        _OnlineRenderer, "preprocess_chat", fake_preprocess_chat, raising=False
+    )
+    return instance, engine_prompt
+
+
+_MESSAGES = [
+    {"role": "user", "content": "first"},
+    {"role": "assistant", "content": "reply"},
+    {"role": "user", "content": "look at this"},
+]
+
+
+async def _run_preprocess_chat(instance):
+    return await instance.preprocess_chat(
+        request=_Request(required_prefix_token_ids=list(_MODEL_PREFIX)),
+        messages=[dict(m) for m in _MESSAGES],
+        default_template=None,
+        default_template_content_format="auto",
+        default_template_kwargs={},
+    )
+
+
+def test_preprocess_chat_moves_mm_placeholders_onto_the_exact_token_prompt(monkeypatch):
+    """The remap must actually land on engine_prompt, under vLLM's key name.
+
+    remap_multimodal_placeholders is unit-tested in isolation, but the whole
+    repair is a no-op if the call site reads a key vLLM does not populate --
+    ``mm_placeholders`` on MultiModalInput (vllm/inputs/engine.py, v0.25.1).
+    """
+    instance, engine_prompt = _renderer_with_stubbed_super(
+        monkeypatch, {"image": [_PlaceholderRange(offset=5, length=3)]}
+    )
+
+    asyncio.run(_run_preprocess_chat(instance))
+
+    assert engine_prompt["prompt_token_ids"] == _EXACT_TOKENS
+    assert [r.offset for r in engine_prompt["mm_placeholders"]["image"]] == [6]
+    assert [r.length for r in engine_prompt["mm_placeholders"]["image"]] == [3]
+
+
+def test_preprocess_chat_leaves_text_only_prompts_without_mm_placeholders(monkeypatch):
+    """A text-only request must not grow an empty mm_placeholders key."""
+    instance, engine_prompt = _renderer_with_stubbed_super(monkeypatch, None)
+
+    asyncio.run(_run_preprocess_chat(instance))
+
+    assert engine_prompt["prompt_token_ids"] == _EXACT_TOKENS
+    assert "mm_placeholders" not in engine_prompt

@@ -590,6 +590,10 @@ class VllmAsyncGenerationWorkerImpl(
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
 
+                # Must precede the reassignment below: the remap reads the
+                # current value of prompt_token_ids as the template-coordinate
+                # sequence the placeholders were computed against. Reordering
+                # these two statements silently degrades to a no-op.
                 if mm_placeholders := engine_prompt.get("mm_placeholders"):
                     engine_prompt["mm_placeholders"] = remap_multimodal_placeholders(
                         template_token_ids=engine_prompt["prompt_token_ids"],
