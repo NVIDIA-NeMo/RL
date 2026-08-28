@@ -312,7 +312,7 @@ class KVBatchMeta:
         )
 
     def concat(self, *others: "KVBatchMeta") -> "KVBatchMeta":
-        """Append ``others`` to ``self``. All metas must share ``partition_id``."""
+        """Append ``others`` and union their fields in first-seen order."""
         if any(o.partition_id != self.partition_id for o in others):
             raise ValueError("KVBatchMeta.concat: partition_ids must match")
         all_m = (self, *others)
@@ -325,9 +325,14 @@ class KVBatchMeta:
         )
         all_have_tags = all(m.tags is not None for m in all_m)
         tags = [t for m in all_m for t in (m.tags or [])] if all_have_tags else None
-        return self._replace(
+        merged_fields = list(
+            dict.fromkeys(field for meta in all_m for field in (meta.fields or []))
+        )
+        result = self._replace(
             sample_ids=sample_ids, sequence_lengths=seq_lens, tags=tags
         )
+        result.fields = merged_fields or None
+        return result
 
     def drop(self, indices: "Sequence[int]") -> "KVBatchMeta | None":
         """Complement of :meth:`subset`. Returns ``None`` when all rows are dropped."""

@@ -247,6 +247,34 @@ def test_tags_none_when_either_side_missing_in_concat():
     assert with_tags.concat(without).tags is None
 
 
+def test_concat_unions_payload_fields_in_first_seen_order():
+    text = KVBatchMeta(
+        partition_id="p",
+        task_name="train",
+        sample_ids=["a"],
+        fields=["input_ids", "input_lengths"],
+    )
+    multimodal = KVBatchMeta(
+        partition_id="p",
+        task_name="train",
+        sample_ids=["b"],
+        fields=[
+            "input_ids",
+            "pixel_values",
+            "__nrl_packed_tensor_meta__pixel_values",
+        ],
+    )
+
+    joined = text.concat(multimodal)
+
+    assert joined.fields == [
+        "input_ids",
+        "input_lengths",
+        "pixel_values",
+        "__nrl_packed_tensor_meta__pixel_values",
+    ]
+
+
 # ── Realistic tags from the rollout-shapes helper ──
 
 
