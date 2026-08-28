@@ -116,3 +116,65 @@ claimed from this macOS host.
 - CUDA Graph pointer preservation is asserted with fake finalization locally;
   the native GPU gate must confirm the same behavior with actual kernels and
   graph capture.
+
+## Producer Mixed Native/BF16 Critical Fix
+
+Implementation range: `b0ccb109..ff04d0ce`.
+
+- `600f8ad9 test(refit): cover mixed native BF16 producer storage`
+- `ff04d0ce fix(refit): partition native MXFP8 sources by storage`
+
+Both commits contain a `Signed-off-by` trailer. This report update is committed
+after the implementation commits.
+
+`MegatronPolicyWorkerImpl` now partitions candidate FFN tasks by actual source
+storage before native shape metadata, source-map construction, and misc export.
+The classifier accepts a direct task only when strict native E4M3/E8M0 component
+extraction succeeds. It validates every owned grouped member the same way and
+uses the mapping's PP object broadcast with a per-task cache key, so PP peers
+make the same native-versus-misc choice without divergent collectives. BF16
+ignored expert layers that share native mapping names therefore remain in the
+packed misc path.
+
+### RED Evidence
+
+The native repository command remained unavailable on macOS because the lockfile
+targets Linux only:
+
+```text
+uv run pytest -q tests/unit/models/megatron/test_group_experts.py -k metadata_keeps_bf16_ignored_experts_in_misc
+error: The current Python platform is not compatible with the lockfile's supported environments
+```
+
+The isolated Task 5 producer harness executed the new metadata-path test against
+the pre-fix source and failed during source-map construction as intended:
+
+```text
+ValueError: Native MXFP8 refit source must provide get_metadata()
+```
+
+The failing source was a BF16 ignored routed-expert task whose mapping name was
+otherwise eligible for the native FFN path.
+
+### GREEN Evidence
+
+The same isolated metadata-path regression passed after the fix. It contains
+native routed-expert FC1/FC2 storage for layer 0 and BF16 ignored routed-expert
+FC1/FC2 storage for layer 1, then asserts that only layer 0 reaches
+`per_layer_params` while all layer 1 projections and tasks remain misc.
+
+```text
+Task 5 source mapping: 21 passed in 0.18s
+Task 5 worker harness: passed
+Task 2 regressions: 80 passed in 1.03s
+Task 4 regressions: 27 passed in 0.60s
+ruff check: All checks passed
+ruff format --check: 2 files already formatted
+git diff --check: exit 0
+```
+
+Pyrefly was run with the isolated Python environment. Full clean output is
+blocked locally because the macOS environment does not provide the vendored
+Megatron Bridge packages; its remaining diagnostics are unavailable-import and
+pre-existing test-file diagnostics, with none in the new partitioning region.
+Linux locked-environment Pyrefly remains a downstream validation gate.
