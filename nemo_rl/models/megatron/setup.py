@@ -1121,6 +1121,8 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # Flash attention does not support the resulting padded multi-row layout,
     # so the canonical expanded-sequence contract must use backend dispatch.
     attention_backend = config["megatron_cfg"].get("attention_backend")
+    if "gdn_kernel_backend" in config["megatron_cfg"]:
+        model_cfg.gdn_kernel_backend = config["megatron_cfg"]["gdn_kernel_backend"]
     if (
         getattr(model_cfg, "nemotron_omni_contract", None)
         == _NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT
