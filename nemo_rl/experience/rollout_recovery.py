@@ -324,8 +324,14 @@ class RolloutRecoveryLedger:
         record.start_weight_version = start_weight_version
         record.phase = PromptGroupPhase.ADMITTED
 
-    def bind_runtime_prompt(self, group_id: str, prompt_payload: DatumSpec) -> None:
+    def bind_runtime_prompt(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+        prompt_payload: DatumSpec,
+    ) -> None:
         """Attach a dataset-reconstructed prompt after identity validation."""
+        cut.require_live()
         record = self._require_group(group_id)
         sample_id = prompt_payload.get("idx")
         if str(sample_id) != record.prompt_ref.sample_id:
@@ -341,8 +347,56 @@ class RolloutRecoveryLedger:
             )
         record.runtime_prompt_payload = prompt_payload
 
-    def prepare_incomplete_retry(self, group_id: str) -> PromptGroupRecoveryRecord:
+    def prepare_for_restart(self, cut: DataPlaneMutationCut) -> None:
+        """Turn crash-interrupted physical attempts into retryable state."""
+        cut.require_live()
+        self.assert_checkpoint_safe()
+        for record in self._groups.values():
+            if record.status is PromptGroupStatus.GENERATING:
+                self.abandon_unsealed(cut, record.group_id)
+
+    def assert_checkpoint_safe(self) -> None:
+        """Reject states whose publication or optimizer outcome is ambiguous."""
+        if self._open_train_step is not None:
+            raise RuntimeError(
+                "rollout recovery contains an open optimizer step; restoring "
+                "mid-step training ownership is not supported"
+            )
+        unsafe = [
+            record.group_id
+            for record in self._groups.values()
+            if record.status
+            in {
+                PromptGroupStatus.FINALIZING,
+                PromptGroupStatus.FINALIZATION_UNKNOWN,
+                PromptGroupStatus.CLAIMED_FOR_TRAINING,
+                PromptGroupStatus.APPLIED_UNCHECKPOINTED,
+            }
+        ]
+        if unsafe:
+            raise RuntimeError(
+                "rollout recovery contains checkpoint-unsafe group states: "
+                f"groups={unsafe!r}"
+            )
+
+    def expected_staging_keys(self) -> set[str]:
+        """Return staged token rows still owned by sealed sibling attempts."""
+        return {
+            staging_key
+            for record in self._groups.values()
+            for sibling in record.siblings
+            for attempt in sibling.attempts[-1:]
+            if attempt.status is RolloutAttemptStatus.SEALED
+            for staging_key in attempt.staging_keys
+        }
+
+    def prepare_incomplete_retry(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+    ) -> PromptGroupRecoveryRecord:
         """Mint fresh physical attempts only for siblings that are not sealed."""
+        cut.require_live()
         record = self._require_group(group_id)
         if record.status != PromptGroupStatus.GENERATING:
             raise ValueError(
@@ -367,9 +421,14 @@ class RolloutRecoveryLedger:
         return self._copy_group(record)
 
     def mark_group_dispatched(
-        self, group_id: str, *, generation_indices: Optional[list[int]] = None
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+        *,
+        generation_indices: Optional[list[int]] = None,
     ) -> None:
         """Move the selected current sibling attempts to dispatched."""
+        cut.require_live()
         record = self._require_group(group_id)
         if record.phase is not PromptGroupPhase.ADMITTED:
             raise ValueError(
@@ -447,8 +506,9 @@ class RolloutRecoveryLedger:
         ):
             record.status = PromptGroupStatus.READY_TO_FINALIZE
 
-    def abandon_unsealed(self, group_id: str) -> None:
+    def abandon_unsealed(self, cut: DataPlaneMutationCut, group_id: str) -> None:
         """Abandon failed attempts without destroying reusable sealed receipts."""
+        cut.require_live()
         record = self._require_group(group_id)
         if record.status not in {
             PromptGroupStatus.GENERATING,
@@ -503,7 +563,12 @@ class RolloutRecoveryLedger:
             rewards,
         )
 
-    def mark_finalization_started(self, group_id: str) -> None:
+    def mark_finalization_started(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+    ) -> None:
+        cut.require_live()
         record = self._require_group(group_id)
         self._require_group_status(
             record,
@@ -512,7 +577,12 @@ class RolloutRecoveryLedger:
         )
         record.status = PromptGroupStatus.FINALIZING
 
-    def mark_finalization_unknown(self, group_id: str) -> None:
+    def mark_finalization_unknown(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+    ) -> None:
+        cut.require_live()
         record = self._require_group(group_id)
         self._require_group_status(
             record,
@@ -679,6 +749,7 @@ class RolloutRecoveryLedger:
 
     def state_dict(self) -> dict[str, Any]:
         """Return the versioned metadata envelope used by later persistence."""
+        self.assert_checkpoint_safe()
         groups = []
         for record in self._groups.values():
             prompt_payload = record.runtime_prompt_payload
@@ -834,8 +905,13 @@ class RolloutRecoveryLedger:
                 )
         return ledger
 
-    def load_state_dict(self, state: RolloutRecoveryState) -> None:
+    def load_state_dict(
+        self,
+        cut: DataPlaneMutationCut,
+        state: RolloutRecoveryState,
+    ) -> None:
         """Replace this empty ledger from a validated checkpoint envelope."""
+        cut.require_live()
         if self._groups or self._open_train_step is not None:
             raise RuntimeError("cannot restore into a non-empty rollout recovery ledger")
         restored = self.from_state_dict(state)
@@ -1001,6 +1077,8 @@ class RolloutRecoveryLedger:
             sibling.current_attempt.status == RolloutAttemptStatus.SEALED
             for sibling in siblings
         )
+        if status is PromptGroupStatus.GENERATING and all_current_attempts_sealed:
+            raise ValueError("generating group must retain an unfinished sibling")
         if status in prefinalization_sealed_states and not all_current_attempts_sealed:
             raise ValueError(
                 f"group state {status.value!r} requires every sibling to be sealed"
