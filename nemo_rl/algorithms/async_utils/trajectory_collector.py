@@ -30,6 +30,7 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
+    _get_effort_config,
 )
 from nemo_rl.algorithms.grpo import (
     MasterConfig as GRPOMasterConfig,
@@ -1290,6 +1291,11 @@ class AsyncTrajectoryCollector:
                 ),
                 max_rollout_turns=None,
                 greedy=False,
+                effort_config=(
+                    _get_effort_config(self.master_config)
+                    if isinstance(self.master_config, GRPOMasterConfig)
+                    else None
+                ),
                 reward_penalty_config=self.master_config.reward_penalties,
                 length_penalty_config=self.master_config.grpo.model_dump(),
                 thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
