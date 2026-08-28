@@ -33,6 +33,17 @@ def test_native_smoke_overlays_enable_runtime_inventory_assertion() -> None:
     assert "num_layers_at_end_in_bf16: 8" in nano_config
 
 
+def test_nano_native_storage_recipe_enables_fp8_params_for_routed_experts() -> None:
+    config = (EXPERIMENT_DIR / "nano-fp8param-true.yaml").read_text()
+    recipe = (EXPERIMENT_DIR / "te_nano_routed_fp8param.yaml").read_text()
+
+    assert "te_nano_routed_fp8param.yaml" in config
+    assert "fp8_quantization_recipe: mxfp8" in recipe
+    assert "fp8_param: true" in recipe
+    assert 'pattern: "*mlp.experts.linear_fc1"' in recipe
+    assert 'pattern: "*mlp.experts.linear_fc2"' in recipe
+
+
 def test_ray_tmpdir_is_resolved_before_ray_head_and_workers_start() -> None:
     launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
     ray_sub = (REPO_ROOT / "ray.sub").read_text()
@@ -62,6 +73,15 @@ def test_launcher_uses_shared_storage_for_hf_to_megatron_conversion() -> None:
         in launcher
     )
     assert 'mkdir -p "${MEGATRON_CHECKPOINT_ROOT}/${MODEL}"' in launcher
+
+
+def test_launcher_uses_shared_storage_for_memory_mapped_datasets() -> None:
+    launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
+
+    assert "DATASET_ROOT=${DATASET_ROOT:-" in launcher
+    assert 'require_prefix "${DATASET_ROOT}" /lustre' in launcher
+    assert "export HF_DATASETS_CACHE=${DATASET_ROOT}" in launcher
+    assert 'mkdir -p "${DATASET_ROOT}"' in launcher
 
 
 def test_launcher_resolver_does_not_depend_on_original_path_for_fallback_tools() -> (

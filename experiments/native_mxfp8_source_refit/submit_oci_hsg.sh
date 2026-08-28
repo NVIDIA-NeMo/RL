@@ -196,13 +196,16 @@ if [[ "${ACTION}" == submit ]]; then
 fi
 SOURCE_SHA=$(git -C "${REPO}" rev-parse HEAD)
 MEGATRON_CHECKPOINT_ROOT=${MEGATRON_CHECKPOINT_ROOT:-${RESULT_ROOT}/pretrained-checkpoints/${SOURCE_SHA}}
+DATASET_ROOT=${DATASET_ROOT:-${RESULT_ROOT}/datasets/${SOURCE_SHA}}
 require_prefix "${MEGATRON_CHECKPOINT_ROOT}" /lustre MEGATRON_CHECKPOINT_ROOT
+require_prefix "${DATASET_ROOT}" /lustre DATASET_ROOT
 
 RUN_NAME="native-mxfp8-${MODEL}-fp8param-${FP8_PARAM}-${RUN_GROUP}"
 RUN_ROOT="${RESULT_ROOT}/${RUN_NAME}"
 if [[ "${ACTION}" == submit ]]; then
   mkdir -p "${RUN_ROOT}/logs"
   mkdir -p "${MEGATRON_CHECKPOINT_ROOT}/${MODEL}"
+  mkdir -p "${DATASET_ROOT}"
 fi
 
 NATIVE_OVERRIDES=()
@@ -227,7 +230,7 @@ cd ${REPO}
 export HOME=/root
 export HF_HOME_SOURCE=${HF_HOME}
 export HF_HOME=${LOCAL_SCRATCH}/hf-cache/${MODEL}
-export HF_DATASETS_CACHE=\${HF_HOME}/datasets
+export HF_DATASETS_CACHE=${DATASET_ROOT}
 export HUGGINGFACE_HUB_CACHE=\${HF_HOME}/hub
 export NRL_MEGATRON_CHECKPOINT_DIR=${MEGATRON_CHECKPOINT_ROOT}/${MODEL}
 export NEMO_RL_VENV_DIR=${LOCAL_SCRATCH}/nemo-rl-worker-cache/${SOURCE_SHA}
