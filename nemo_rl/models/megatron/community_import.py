@@ -103,6 +103,15 @@ def publish_megatron_conversion(
             break
         except OSError:
             if attempt == 1:
+                if not overwrite and megatron_conversion_is_complete(pretrained_path):
+                    # A peer published into the slot we freed; use its artifact.
+                    threading.Thread(
+                        target=shutil.rmtree,
+                        args=(staging_path,),
+                        kwargs={"ignore_errors": True},
+                        daemon=True,
+                    ).start()
+                    break
                 raise
         if not overwrite and megatron_conversion_is_complete(pretrained_path):
             # A complete artifact raced in between the probe and the rename;
