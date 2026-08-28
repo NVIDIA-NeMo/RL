@@ -66,14 +66,80 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
     _stale: bool = True
     _checkpoint_engine_ready: bool = False
     _bucket_size_bytes: int | None = None
+    _terminal_error: BaseException | None = None
 
     def init_communicator(self) -> None:
+        self._raise_if_terminal()
         # SGLang's checkpoint-engine path builds its topology below and does not
         # consume the legacy refit metadata.  Gathering it would needlessly
         # materialize every sharded policy tensor on every training rank.
         if not self._is_sglang():
             self._generation.prepare_refit_info(self._policy.prepare_refit_info())
-        self._ensure_checkpoint_engine_ready()
+        self._ensure_ready_and_consume_count()
+
+    def _set_terminal(self, exc: BaseException) -> None:
+        if self._terminal_error is None:
+            self._terminal_error = exc
+
+    def _raise_if_terminal(self) -> None:
+        # A failed rebind or a failure after a transfer started leaves NIXL
+        # state (and possibly the served model) in an unknown condition; the
+        # latch guarantees no later sync can issue RPCs over it.
+        if self._terminal_error is not None:
+            raise RuntimeError(
+                "Checkpoint-engine synchronizer is in a terminal error state "
+                "from a previous refit; restart the job. Original error: "
+                f"{self._terminal_error!r}"
+            ) from self._terminal_error
+
+    def _use_fault_tolerance(self) -> bool:
+        return bool(
+            self._generation.sglang_cfg["sglang_cfg"].get("use_fault_tolerance")
+        )
+
+    def _ensure_ready_and_consume_count(self) -> None:
+        """(Re)initialize the communicator; consume SGLang's new-engine count.
+
+        ``_start_engines`` reports both the startup fleet and every recovered
+        cohort through ``num_new_engines`` — consuming it only after a
+        successful setup keeps a failed setup retryable and stops the first
+        ordinary refit from being misclassified as crash recovery.
+        """
+        needs_init = not self._checkpoint_engine_ready
+        try:
+            self._ensure_checkpoint_engine_ready()
+        except BaseException as exc:
+            # NIXL prepare()/add_remote_agent() are not transactional: a retry
+            # over their partial state silently skips or double-registers, so a
+            # failed (re)bind is terminal until that is fixed upstream.
+            self._set_terminal(exc)
+            raise
+        if needs_init and self._is_sglang():
+            self._generation.clear_updatable_num_new_engines()
+
+    def _sglang_recover_and_rebind(self) -> None:
+        """Restart dead engines and rebind the paired NIXL fabric to them."""
+        if self._use_fault_tolerance():
+            from nemo_rl.models.generation.sglang.fault_tolerance import (
+                RecoveryRollbackError,
+            )
+
+            try:
+                # Always probe (it pauses the monitor and finds dead slots);
+                # a plain failure here rolled the cohort back inside
+                # ``_recover`` and is retryable on the next sync.
+                self._generation.recover_updatable_engines()
+            except RecoveryRollbackError as exc:
+                self._set_terminal(exc)
+                raise
+            (_, _, num_new_engines, _, _) = (
+                self._generation.get_updatable_engines_and_lock()
+            )
+            if num_new_engines > 0:
+                # Replacement actors have no receivers and their paired policy
+                # senders still bind the dead agents; force a full rebind.
+                self._checkpoint_engine_ready = False
+        self._ensure_ready_and_consume_count()
 
     @property
     def is_stale(self) -> bool:
@@ -232,8 +298,12 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        self._raise_if_terminal()
         self._stale = True
-        self._ensure_checkpoint_engine_ready()
+        if self._is_sglang():
+            self._sglang_recover_and_rebind()
+        else:
+            self._ensure_checkpoint_engine_ready()
         context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
@@ -248,7 +318,9 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
                     self._transfer(kv_scales)
                 self._stale = False
         finally:
-            if self._release_after_refit():
+            # Never finalize on the terminal path: NIXL may still have
+            # in-flight work, and finalizing would mask the primary error.
+            if self._terminal_error is None and self._release_after_refit():
                 self.shutdown()
 
     def _transfer(self, kv_scales: Optional[dict[str, float]]) -> None:
@@ -280,16 +352,24 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
         update lock on its own, so a request admitted between two buckets would
         run against a half-updated model.
 
-        The envelope is the one ``_SGLangWeightSynchronizer._refit`` uses; the
-        two SGLang transports differ only in how the weights travel, and the
-        sibling additionally rejects ``kv_scales``, which this transport
-        forwards to the policy.
+        The success-path envelope is the one ``_SGLangWeightSynchronizer._refit``
+        uses; the sibling additionally rejects ``kv_scales``, which this
+        transport forwards to the policy. The failure path deliberately
+        diverges from the sibling: once the transfer has started, a failure is
+        terminal and serving is NOT resumed (a NCCL broadcast can be safely
+        redone next refit; interrupted one-sided NIXL work cannot).
         """
         self._generation.prepare_for_generation(tags=["weights"])
-        # Every state acquired below is released in the finally, so a failure
-        # anywhere in the refit leaves the engines usable instead of wedged
-        # with no error pointing at why. Re-acquire the KV pool before
-        # readmitting requests, not after.
+        # Cleanup is two-phase, split at "did the transfer start":
+        # - Before any bucket moved, nothing changed the served weights, so a
+        #   failure releases every acquired state (KV pool re-acquired, monitor
+        #   resumed, serving readmitted) and stays retryable.
+        # - Once the transfer starts, a failure of the transfer OR of
+        #   end_weight_update leaves a half-updated model and possibly
+        #   in-flight NIXL work: latch terminal, keep serving and the health
+        #   monitor paused, and let the primary exception propagate. Job abort
+        #   is the recovery mechanism.
+        transfer_started = False
         try:
             self._generation.pause_generation(
                 mode=self._generation.pause_generation_mode
@@ -299,14 +379,39 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
 
             self._generation.begin_weight_update()
             try:
+                transfer_started = True
                 self._transfer(kv_scales)
-            finally:
-                # Only closes a session that actually opened: if
-                # begin_weight_update raised, this inner block never ran.
-                self._generation.end_weight_update()
-        finally:
-            self._generation.prepare_for_generation(tags=["kv_cache"])
-            self._generation.continue_generation()
+            except BaseException:
+                # Close the session without masking the transfer error.
+                try:
+                    self._generation.end_weight_update()
+                except Exception as end_exc:
+                    print(
+                        "[SGLang refit] end_weight_update also failed after a "
+                        f"failed transfer (suppressed): {end_exc!r}"
+                    )
+                raise
+            # A transfer that moved bytes but never finalized kernel layouts is
+            # as unusable as a failed transfer: end must succeed too.
+            self._generation.end_weight_update()
+        except BaseException as exc:
+            if transfer_started:
+                self._set_terminal(exc)
+                raise
+            # Pre-transfer failure: safe cleanup, then propagate the original.
+            try:
+                self._generation.prepare_for_generation(tags=["kv_cache"])
+                self._generation.continue_generation()
+            except Exception as cleanup_exc:
+                print(
+                    "[SGLang refit] cleanup after a pre-transfer failure also "
+                    f"failed (suppressed): {cleanup_exc!r}"
+                )
+            raise
+        # Success: re-acquire the KV pool (this also resumes the #3613 health
+        # monitor) before readmitting requests.
+        self._generation.prepare_for_generation(tags=["kv_cache"])
+        self._generation.continue_generation()
 
     def shutdown(self) -> None:
         if not self._checkpoint_engine_ready:

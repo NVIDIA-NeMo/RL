@@ -124,6 +124,33 @@ def create_weight_synchronizer(
                     "SGLang checkpoint-engine refit does not support "
                     "shard_expert_weights=true; use full-weight MoE refit instead."
                 )
+            if (
+                sglang_cfg.get("use_fault_tolerance")
+                and checkpoint_engine_config["backend"] != "nixl"
+            ):
+                # Engine recovery rebinds receivers through the built-in NIXL
+                # disconnect-before-connect path; custom checkpoint engines have
+                # no reconnect contract, so a restart would silently reuse
+                # stale transport state.
+                raise NotImplementedError(
+                    "SGLang checkpoint-engine refit with use_fault_tolerance=true "
+                    "supports only the built-in 'nixl' backend, got "
+                    f"{checkpoint_engine_config['backend']!r}. Disable fault "
+                    "tolerance or use refit_transport=nixl."
+                )
+            from nemo_rl.models.generation.sglang.config import (
+                get_sglang_quantization_scheme,
+            )
+
+            scheme = get_sglang_quantization_scheme(dict(sglang_cfg["quantization"]))
+            if scheme != "bf16":
+                # The checkpoint-engine sender streams raw BF16 tensors and does
+                # not run the quantized weight-group expansion, so a quantized
+                # scheme would silently ship wrong bytes.
+                raise NotImplementedError(
+                    "SGLang checkpoint-engine refit currently supports only the "
+                    f"'bf16' quantization scheme, got {scheme!r}."
+                )
             if generation.pause_generation_mode == "in_place":
                 # Same reason the sibling SGLang synchronizer rejects it: the
                 # refit pause has to drop in-flight decode state, and in_place
