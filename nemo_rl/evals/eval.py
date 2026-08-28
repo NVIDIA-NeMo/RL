@@ -349,26 +349,31 @@ async def _run_env_eval_impl(
                         videos[i][0] if len(videos[i]) == 1 else videos[i]
                     )
 
-            if multi_modal_data:
-                vllm_content = batch["vllm_content"][i]
-                if vllm_content is not None:
-                    prompt_dict = {"prompt": vllm_content}
-                    prompt_display = vllm_content
-                else:
-                    # Placeholder-style processors pass prompt_token_ids with media.
-                    prompt_token_ids = []
-                    for message in message_log:
-                        token_ids = message["token_ids"]
-                        prompt_token_ids.extend(
-                            token_ids.tolist()
-                            if isinstance(token_ids, torch.Tensor)
-                            else token_ids
-                        )
-                    prompt_dict = {"prompt_token_ids": prompt_token_ids}
-                    prompt_display = "\n".join(
-                        str(message["content"]) for message in message_log
+            vllm_content = batch["vllm_content"][i] if is_multimodal else None
+            if vllm_content is not None:
+                prompt_dict = {"prompt": vllm_content}
+                prompt_display = vllm_content
+                if multi_modal_data:
+                    prompt_dict["multi_modal_data"] = multi_modal_data
+                prompts.append(prompt_dict)
+                prompts_for_display.append(prompt_display)
+            elif multi_modal_data:
+                # Placeholder-style processors pass prompt_token_ids with media.
+                prompt_token_ids = []
+                for message in message_log:
+                    token_ids = message["token_ids"]
+                    prompt_token_ids.extend(
+                        token_ids.tolist()
+                        if isinstance(token_ids, torch.Tensor)
+                        else token_ids
                     )
-                prompt_dict["multi_modal_data"] = multi_modal_data
+                prompt_dict = {
+                    "prompt_token_ids": prompt_token_ids,
+                    "multi_modal_data": multi_modal_data,
+                }
+                prompt_display = "\n".join(
+                    str(message["content"]) for message in message_log
+                )
                 prompts.append(prompt_dict)
                 prompts_for_display.append(prompt_display)
             else:

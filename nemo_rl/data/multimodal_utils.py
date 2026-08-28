@@ -930,7 +930,9 @@ def extract_input_media_sources_from_responses_messages(
                 continue
             if isinstance(source, dict):
                 source = source.get("url") or source.get("path")
-            if source is not None:
+            # Skip non-str/non-Image sources: callers hand these straight to
+            # `resolve_to_image`, which would raise on e.g. an int `image_url`.
+            if isinstance(source, (str, Image.Image)):
                 sources.append((media_type, source))
     return sources
 

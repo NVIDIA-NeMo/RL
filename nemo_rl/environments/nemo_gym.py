@@ -41,6 +41,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym_multimodal import (
     _index_per_turn_images,
+    _is_trainable_output_item,
     _without_initial_media_sources,
     normalize_media_in_examples,
 )
@@ -300,16 +301,6 @@ def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
     if not nemo_gym_config:
         return False
     return bool(nemo_gym_config.get("pad_dynamic_image_shapes"))
-
-
-def _is_trainable_output_item(item: dict) -> bool:
-    """Report whether an output item becomes a trainable assistant turn.
-
-    The postprocess loop skips items whose ``generation_token_ids`` is missing
-    *or* empty, so per-turn image binning has to use the same predicate or the
-    two walks disagree and every later turn gets the wrong images.
-    """
-    return bool(item.get("generation_token_ids"))
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
