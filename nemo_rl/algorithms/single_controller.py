@@ -336,8 +336,9 @@ class SingleControllerActor:
 
     async def run(self) -> dict[str, Any]:
         """Main entry point. Runs until max_train_steps is reached."""
-        # Synchronize weights before starting the pumps
-        await self._sync_weights()
+        # Synchronize weights before starting the pumps, unless setup already delivered them.
+        if self._weight_synchronizer.is_stale:
+            await self._sync_weights()
         self._rollout_manager.set_weight_version(self._trainer_version)
 
         await self._maybe_restore_replay_buffer()
