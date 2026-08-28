@@ -50,8 +50,36 @@ def remap_multimodal_placeholders(
     multimodal features remain aligned.
 
     Ranges are matched in global prompt order because different media items can
-    accumulate different shifts. A missing span fails closed rather than
-    submitting token IDs with incorrect multimodal positions.
+    accumulate different shifts. Coincident ranges resolve to the same offset:
+    Qwen2.5-Omni derives an audio range from its paired video range with an
+    identical ``(offset, length)``, so a span is only consumed once.
+
+    A span that cannot be located fails closed rather than submitting token IDs
+    with incorrect multimodal positions. Note that an *ambiguous* match is not
+    detected: media spans are bare runs of one repeated pad token, so if a run
+    is longer in ``final_token_ids`` than in the template, a later item can
+    match inside an earlier item's run. Locating spans by search is only
+    necessary because the splice boundary computed by ``replace_prefix_tokens``
+    is not threaded through to here; passing it would make the suffix region
+    pure arithmetic and remove that ambiguity entirely.
+
+    Args:
+        template_token_ids: The chat-template token sequence vLLM used to
+            compute ``mm_placeholders``.
+        final_token_ids: The exact-token prompt produced by
+            ``replace_prefix_tokens``, which will be submitted to the engine.
+        mm_placeholders: vLLM's per-modality placeholder ranges, in
+            ``template_token_ids`` coordinates.
+
+    Returns:
+        A new per-modality mapping with the same item ordering, whose ranges are
+        expressed in ``final_token_ids`` coordinates.
+
+    Raises:
+        ValueError: If an input range is out of bounds for
+            ``template_token_ids``, or if a media span cannot be relocated in
+            ``final_token_ids``.
+        TypeError: If a range is neither a mapping nor a dataclass instance.
     """
     if template_token_ids == final_token_ids or not mm_placeholders:
         return {modality: list(ranges) for modality, ranges in mm_placeholders.items()}
@@ -76,25 +104,33 @@ def remap_multimodal_placeholders(
             entries.append((offset, modality, item_index, placeholder_range, length))
 
     search_start = 0
+    resolved: dict[tuple[int, int], int] = {}
     for old_offset, modality, item_index, placeholder_range, length in sorted(
         entries, key=lambda entry: entry[0]
     ):
-        expected = template_token_ids[old_offset : old_offset + length]
-        max_start = len(final_token_ids) - length
-        new_offset = next(
-            (
-                candidate
-                for candidate in range(search_start, max_start + 1)
-                if final_token_ids[candidate] == expected[0]
-                and final_token_ids[candidate : candidate + length] == expected
-            ),
-            None,
-        )
+        # Two modalities can describe the same span, so a resolved offset is
+        # reused instead of scanning past it. Only a newly located span
+        # advances the cursor.
+        new_offset = resolved.get((old_offset, length))
         if new_offset is None:
-            raise ValueError(
-                f"Could not locate {modality} placeholder range {item_index} "
-                f"from template offset {old_offset} in the final exact-token prompt"
+            expected = template_token_ids[old_offset : old_offset + length]
+            max_start = len(final_token_ids) - length
+            new_offset = next(
+                (
+                    candidate
+                    for candidate in range(search_start, max_start + 1)
+                    if final_token_ids[candidate] == expected[0]
+                    and final_token_ids[candidate : candidate + length] == expected
+                ),
+                None,
             )
+            if new_offset is None:
+                raise ValueError(
+                    f"Could not locate {modality} placeholder range {item_index} "
+                    f"from template offset {old_offset} in the final exact-token prompt"
+                )
+            resolved[(old_offset, length)] = new_offset
+            search_start = new_offset + length
 
         if isinstance(placeholder_range, Mapping):
             updated_range = dict(placeholder_range)
@@ -108,7 +144,6 @@ def remap_multimodal_placeholders(
             )
 
         remapped[modality][item_index] = updated_range
-        search_start = new_offset + length
 
     return remapped
 
