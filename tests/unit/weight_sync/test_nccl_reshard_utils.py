@@ -45,6 +45,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     make_nccl_reshard_refit_info_wire_safe,
     restore_refit_info_placements,
 )
+from nemo_rl.weight_sync.refit_components import component_plan_digest
 
 
 # --------------------------------------------------------------------------
@@ -786,6 +787,23 @@ def test_wire_safe_then_restore_reproduces_component_placements() -> None:
         assert (
             restored_component["dst_placements"] == original_component["dst_placements"]
         )
+
+
+def test_restore_refit_info_rejects_plan_digest_mismatch() -> None:
+    info = _native_refit_info_for_wire()
+    info["plan_digest"] = component_plan_digest(info)
+    wire = make_nccl_reshard_refit_info_wire_safe(info)
+    wire["per_layer_params"]["model.layers.0"][0]["components"][1]["dtype"] = (
+        "torch.float16"
+    )
+    recomputed_digest = component_plan_digest(wire)
+
+    with pytest.raises(ValueError, match="refit plan digest mismatch") as exc_info:
+        restore_refit_info_placements(wire)
+
+    message = str(exc_info.value)
+    assert info["plan_digest"] in message
+    assert recomputed_digest in message
 
 
 def test_wire_safe_pickle_is_independent_of_a_patched_storage_loader(monkeypatch):
