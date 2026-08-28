@@ -65,7 +65,7 @@ TRAIN_CMD=(
     checkpointing.checkpoint_dir="${CKPT_DIR}"
     checkpointing.metric_name=null
     checkpointing.save_period=1
-    checkpointing.save_data_plane=true
+    +checkpointing.save_data_plane=true
 )
 
 cd "${PROJECT_ROOT}"

@@ -455,6 +455,7 @@ def test_sync_weights_honors_recompute_kv_cache_config(
         requires_kv_scale_sync=False,
     )
     ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
     ctrl._master_config = SimpleNamespace(env={})
@@ -484,6 +485,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
         calibrate_qkv_fp8_scales=MagicMock(return_value={"layers": {"layer.0": 0.5}})
     )
     ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
     ctrl._master_config = SimpleNamespace(env={})
