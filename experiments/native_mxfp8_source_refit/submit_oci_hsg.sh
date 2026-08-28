@@ -10,6 +10,7 @@ RUN_GROUP=${RUN_GROUP:-$(date +%Y%m%d-%H%M%S)}
 WALLTIME=${WALLTIME:-04:00:00}
 PARTITION=${PARTITION:-batch}
 LOCAL_SCRATCH=${LOCAL_SCRATCH:-/raid/scratch/${USER}}
+SLURM_BATCH_PATH=${SLURM_BATCH_PATH:-/usr/local/bin:/usr/bin:/bin:/cm/shared/apps/slurm/current/bin:${PATH}}
 
 case "${ACTION}" in
   render|test-only|submit) ;;
@@ -221,6 +222,7 @@ SBATCH_ARGS=(
   --segment="${SEGMENT_SIZE}"
   --job-name="${SLURM_ACCOUNT}.${RUN_NAME}"
   --output="${RUN_ROOT}/slurm-%j.out"
+  --export="ALL,PATH=${SLURM_BATCH_PATH}"
   --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"120","reason":"model_loading","description":"native MXFP8 source refit"}}'
 )
 

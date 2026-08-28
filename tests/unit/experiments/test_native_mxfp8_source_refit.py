@@ -38,3 +38,11 @@ def test_ray_tmpdir_is_resolved_before_ray_head_and_workers_start() -> None:
     assert "export RAY_TMPDIR=" not in launcher
     assert ray_sub.index("export RAY_TMPDIR=") < ray_sub.index("ray start --head")
     assert ray_sub.index("export RAY_TMPDIR=") < ray_sub.index("ray start --address")
+
+
+def test_launcher_exports_slurm_helper_path_to_batch_shell() -> None:
+    launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
+
+    assert '--export="ALL,PATH=${SLURM_BATCH_PATH}"' in launcher
+    assert "/usr/local/bin" in launcher
+    assert "/cm/shared/apps/slurm/current/bin" in launcher
