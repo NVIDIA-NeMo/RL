@@ -25,6 +25,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.worker_mixin import _broadcast_batched_data_dict
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -45,6 +46,14 @@ def _worker(rank: int, world_size: int, tmp_init_file: str, q):
                 {
                     "input_ids": torch.arange(12, dtype=torch.long).reshape(3, 4),
                     "input_lengths": torch.tensor([4, 3, 2], dtype=torch.int32),
+                    "pixel_values": PackedTensor(
+                        [
+                            torch.ones(2, 4),
+                            None,
+                            torch.full((1, 4), 3.0),
+                        ],
+                        dim_to_pack=0,
+                    ),
                     "scalar_meta": "step_42",
                 }
             )
@@ -60,6 +69,12 @@ def _worker(rank: int, world_size: int, tmp_init_file: str, q):
         )
         assert torch.equal(
             out["input_lengths"], torch.tensor([4, 3, 2], dtype=torch.int32)
+        )
+        assert isinstance(out["pixel_values"], PackedTensor)
+        assert out["pixel_values"].logical_segment_counts_by_row() == [1, 0, 1]
+        assert torch.equal(
+            out["pixel_values"].as_tensor(),
+            torch.cat((torch.ones(2, 4), torch.full((1, 4), 3.0))),
         )
         assert out["scalar_meta"] == "step_42"
         q.put((rank, "ok"))

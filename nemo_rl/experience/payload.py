@@ -68,7 +68,7 @@ def record_to_train_batch(
     Returns:
         BatchedDataDict with input_ids, input_lengths, generation_logprobs, token_mask,
         sample_mask, prompt_ids_for_adv, total_reward, violation counts, and optional
-        routed_experts.
+        routed_experts, plus multimodal model inputs preserved as PackedTensor values.
     """
     # Lazy imports: grpo and llm_message_utils transitively pull
     # experience.rollouts, so importing at module top risks a cycle.
@@ -121,6 +121,7 @@ def record_to_train_batch(
     }
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
+    train_data.update(flat.get_multimodal_dict(as_tensors=False))
     return BatchedDataDict[Any](train_data)
 
 
@@ -145,10 +146,13 @@ def pack_payload(
     """
     lengths = train_batch["input_lengths"]
     n = int(lengths.shape[0])
-    tensor_fields: dict[str, torch.Tensor | np.ndarray] = {
+    from nemo_rl.data.multimodal_utils import PackedTensor
+
+    tensor_fields: dict[str, Any] = {
         k: v
         for k, v in train_batch.items()
         if isinstance(v, torch.Tensor)
+        or isinstance(v, PackedTensor)
         or (isinstance(v, np.ndarray) and v.dtype == object)
     }
     fields_td = pack_jagged_fields(

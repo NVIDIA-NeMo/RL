@@ -53,6 +53,8 @@ TOKEN_ALIGNED_FIELDS = frozenset(
         "token_mask",
         "sample_mask",
         "routed_experts",
+        "token_type_ids",
+        "mm_token_type_ids",
     }
 )
 
@@ -109,7 +111,7 @@ def read_columns(
 def write_columns(
     dp_client: DataPlaneClient,
     meta: KVBatchMeta,
-    fields: "dict[str, torch.Tensor | np.ndarray]",
+    fields: "dict[str, Any]",
 ) -> None:
     """``put_samples(meta.sample_ids, fields=...)``.
 
@@ -190,10 +192,13 @@ def kv_first_write(
             f"kv_first_write: tags ({len(tags)}) must match batch size ({n})"
         )
     lengths = final_batch_cpu["input_lengths"]
-    fields: dict[str, torch.Tensor | np.ndarray] = {
+    from nemo_rl.data.multimodal_utils import PackedTensor
+
+    fields: dict[str, Any] = {
         k: v
         for k, v in final_batch_cpu.items()
         if isinstance(v, torch.Tensor)
+        or isinstance(v, PackedTensor)
         or (isinstance(v, np.ndarray) and v.dtype == object)
     }
     td = pack_jagged_fields(

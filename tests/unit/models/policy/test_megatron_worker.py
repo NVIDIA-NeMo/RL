@@ -149,18 +149,24 @@ def test_model_cp_slicing_capability_is_detected():
     assert not _model_slices_context_parallel_inputs(object())
 
 
-def test_model_cp_slicing_rejects_transfer_queue_setup():
+def test_model_cp_slicing_supports_transfer_queue_setup():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.model_slices_context_parallel_inputs = True
+    worker._dp_client = None
+    cfg = MagicMock()
+    client = MagicMock()
 
-    with pytest.raises(
-        NotImplementedError, match="TransferQueue/SingleController does not yet support"
-    ):
-        worker.setup_data_plane(MagicMock())
+    with patch(
+        "nemo_rl.data_plane.build_data_plane_client", return_value=client
+    ) as build_client:
+        worker.setup_data_plane(cfg)
+
+    build_client.assert_called_once_with(cfg, bootstrap=False)
+    assert worker._dp_client is client
 
 
 def test_refit_size_estimate_preserves_integral_buffer_dtype():

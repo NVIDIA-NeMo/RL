@@ -35,6 +35,8 @@ import torch
 FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
+from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -80,6 +82,28 @@ def _broadcast_batched_data_dict(
                 descriptor.append(
                     (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
                 )
+            elif isinstance(v, PackedTensor):
+                descriptor.append(
+                    (
+                        k,
+                        "packed_tensor",
+                        v.dim_to_pack,
+                        v.pad_to_max_shape,
+                        v._row_offsets,
+                        v._segment_indices,
+                        v._segment_provenance,
+                        [
+                            None
+                            if tensor is None
+                            else (
+                                str(tensor.dtype),
+                                tuple(tensor.shape),
+                                str(tensor.device),
+                            )
+                            for tensor in v.tensors
+                        ],
+                    )
+                )
             else:
                 descriptor.append((k, "raw", v))
         payload: list[Any] = [descriptor]
@@ -114,6 +138,54 @@ def _broadcast_batched_data_dict(
                 and torch.device(src_device).type != torch.device(bcast_device).type
             ):
                 out[key] = tensor.to(src_device)
+        elif kind == "packed_tensor":
+            (
+                _,
+                _,
+                dim_to_pack,
+                pad_to_max_shape,
+                row_offsets,
+                segment_indices,
+                segment_provenance,
+                tensor_descriptors,
+            ) = entry
+            if is_leader:
+                packed_value = out[key]
+                tensors = packed_value.tensors
+            else:
+                tensors = [
+                    None
+                    if tensor_descriptor is None
+                    else torch.empty(
+                        tensor_descriptor[1],
+                        dtype=getattr(torch, tensor_descriptor[0].split(".")[-1]),
+                        device=bcast_device,
+                    )
+                    for tensor_descriptor in tensor_descriptors
+                ]
+            for index, tensor_descriptor in enumerate(tensor_descriptors):
+                if tensor_descriptor is None:
+                    continue
+                tensor = tensors[index]
+                assert tensor is not None
+                src_device = tensor_descriptor[2]
+                if tensor.device.type != torch.device(bcast_device).type:
+                    tensor = tensor.to(bcast_device)
+                torch.distributed.broadcast(tensor, src=src, group=group)
+                if (
+                    not is_leader
+                    and torch.device(src_device).type != torch.device(bcast_device).type
+                ):
+                    tensor = tensor.to(src_device)
+                tensors[index] = tensor
+            out[key] = PackedTensor(
+                tensors,
+                dim_to_pack=dim_to_pack,
+                pad_to_max_shape=pad_to_max_shape,
+                _row_offsets=row_offsets,
+                _segment_indices=segment_indices,
+                _segment_provenance=segment_provenance,
+            )
         else:
             if not is_leader:
                 out[key] = entry[2]
@@ -135,12 +207,6 @@ class TQWorkerMixin:
 
         Called once by the driver after worker construction. Idempotent.
         """
-        if getattr(self, "model_slices_context_parallel_inputs", False):
-            raise NotImplementedError(
-                "TransferQueue/SingleController does not yet support models that "
-                "insert media before context-parallel input selection. Use the "
-                "synchronous NeMo-RL policy path for Nemotron Omni."
-            )
         if self._dp_client is not None:
             return
         from nemo_rl.data_plane import build_data_plane_client
