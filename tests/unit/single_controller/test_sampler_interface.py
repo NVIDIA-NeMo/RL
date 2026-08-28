@@ -27,6 +27,7 @@ import asyncio
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     CustomSamplerConfig,
     InOrderSampler,
@@ -116,8 +117,26 @@ class TestAdmission:
         _run(sampler.wait_until_admissible(trainer_version_fn=lambda: 0))
 
         assert sampler.dispatch_index == -1
-        assert sampler.commit_admission() == 0
+
+        async def commit() -> int | None:
+            async with DataPlaneCheckpointBarrier().mutation() as cut:
+                return sampler.commit_admission(cut)
+
+        assert _run(commit()) == 0
         assert sampler.dispatch_index == 0
+
+    def test_expired_cut_cannot_advance_gated_dispatch_cursor(self):
+        sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+
+        async def commit_after_cut_expires() -> None:
+            async with DataPlaneCheckpointBarrier().mutation() as cut:
+                pass
+
+            with pytest.raises(RuntimeError, match="no longer active"):
+                sampler.commit_admission(cut)
+
+        _run(commit_after_cut_expires())
+        assert sampler.dispatch_index == -1
 
     def test_windowed_never_gates_and_never_stamps(self):
         s = WindowedSampler(FakeBuffer(), max_staleness_versions=2)

@@ -25,6 +25,7 @@ from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneMutationCut,
     PostWriteEnrichmentError,
     TQReplayBuffer,
 )
@@ -1225,6 +1226,7 @@ class RolloutManager:
 
     def reserve_prompt_group(
         self,
+        cut: DataPlaneMutationCut,
         input_sample: DatumSpec,
         *,
         target_step: Optional[int],
@@ -1239,6 +1241,7 @@ class RolloutManager:
                 f"a stable integer idx, got {prompt_idx!r}"
             )
         record = self._recovery_ledger.reserve_group(
+            cut,
             prompt_id=str(prompt_idx),
             prompt_payload=input_sample,
             expected_generations=self._num_generations_per_prompt,
@@ -1251,20 +1254,26 @@ class RolloutManager:
 
     def mark_prompt_group_admitted(
         self,
+        cut: DataPlaneMutationCut,
         group_id: str,
         *,
         target_step: Optional[int],
     ) -> None:
         """Attach sampler admission state to a pre-admission reservation."""
         self._recovery_ledger.mark_group_admitted(
+            cut,
             group_id,
             target_step=target_step,
             start_weight_version=self._weight_version,
         )
 
-    def discard_prompt_group(self, group_id: str) -> None:
+    def discard_prompt_group(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+    ) -> None:
         """Release a reservation that will intentionally never be dispatched."""
-        self._recovery_ledger.discard_group(group_id)
+        self._recovery_ledger.discard_group(cut, group_id)
 
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
@@ -1392,8 +1401,14 @@ class RolloutManager:
                         flush=True,
                     )
                 if cleanup_failed:
-                    # A retry cannot safely reuse the stable ID while the previous
-                    # slot may still exist. Re-raise the original rollout failure.
+                    # Fail fast for every caller, not only lineage-tracked ones:
+                    # the failed remove leaves an unready slot the retry cannot
+                    # reclaim (capacity accounting drifts), and a post-write
+                    # failure may have left TQ rows that no owner records -- the
+                    # next data-plane checkpoint's inventory check would reject
+                    # those later with a less useful error. A lineage-tracked
+                    # retry additionally must not reuse its stable ID while the
+                    # previous slot may still exist. Re-raise the rollout error.
                     raise
                 # The rollout itself succeeded. Re-running generation cannot repair
                 # a required downstream stage (for example MOPD teacher inference),
@@ -1461,7 +1476,10 @@ class RolloutManager:
             # succeeded on a retry also counts -- the fleet recovered either way.
             self._consecutive_infra_drops = 0
             if lineage_group_id is not None:
-                self._recovery_ledger.discard_group(lineage_group_id)
+                async with (
+                    self._tq_buffer.data_plane_checkpoint_barrier.mutation()
+                ) as cut:
+                    self._recovery_ledger.discard_group(cut, lineage_group_id)
             return RolloutOutcome.COMMITTED
 
         # The infrastructure budget ran out. The same failure followed the prompt across

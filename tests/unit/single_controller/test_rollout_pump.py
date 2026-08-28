@@ -29,6 +29,7 @@ import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
+    DataPlaneMutationCut,
     TQReplayBuffer,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
@@ -50,7 +51,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
-    RolloutRecoveryState,
+    RolloutRecoveryLedgerState,
 )
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
@@ -112,9 +113,9 @@ class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
         self.release_mutation = asyncio.Event()
 
     @asynccontextmanager
-    async def mutation(self) -> AsyncIterator[None]:
-        async with super().mutation():
-            yield
+    async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
+        async with super().mutation() as cut:
+            yield cut
             self.mutation_applied.set()
             await self.release_mutation.wait()
 
@@ -798,19 +799,22 @@ def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
         await asyncio.sleep(0)
 
         ledger = RolloutRecoveryLedger()
-        for group_id, prompt_idx, start_weight_version in (
-            ("fresh", 50, 5),
-            ("stale", 10, 1),
-        ):
-            ledger.reserve_group(
-                group_id=group_id,
-                prompt_id=str(prompt_idx),
-                prompt_payload={"idx": prompt_idx, "message_log": []},
-                expected_generations=2,
-                target_step=None,
-                start_weight_version=start_weight_version,
-                admitted=True,
-            )
+        barrier = DataPlaneCheckpointBarrier()
+        async with barrier.mutation() as cut:
+            for group_id, prompt_idx, start_weight_version in (
+                ("fresh", 50, 5),
+                ("stale", 10, 1),
+            ):
+                ledger.reserve_group(
+                    cut,
+                    group_id=group_id,
+                    prompt_id=str(prompt_idx),
+                    prompt_payload={"idx": prompt_idx, "message_log": []},
+                    expected_generations=2,
+                    target_step=None,
+                    start_weight_version=start_weight_version,
+                    admitted=True,
+                )
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
@@ -818,7 +822,7 @@ def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"fresh": (fresh, 5), "stale": (stale, 1)}
         ctrl._rollout_recovery_enabled = True
-        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        ctrl._data_plane_checkpoint_barrier = barrier
         ctrl._rollout_manager = SimpleNamespace(
             recovery_ledger=ledger,
             discard_prompt_group=ledger.discard_group,
@@ -845,15 +849,18 @@ def test_abort_stale_inflight_rechecks_registry_after_checkpoint_wait() -> None:
         completed = asyncio.create_task(asyncio.Event().wait())
         await asyncio.sleep(0)
         ledger = RolloutRecoveryLedger()
-        ledger.reserve_group(
-            group_id="completed",
-            prompt_id="10",
-            prompt_payload={"idx": 10, "message_log": []},
-            expected_generations=2,
-            target_step=None,
-            start_weight_version=1,
-            admitted=True,
-        )
+        barrier = DataPlaneCheckpointBarrier()
+        async with barrier.mutation() as cut:
+            ledger.reserve_group(
+                cut,
+                group_id="completed",
+                prompt_id="10",
+                prompt_payload={"idx": 10, "message_log": []},
+                expected_generations=2,
+                target_step=None,
+                start_weight_version=1,
+                admitted=True,
+            )
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
@@ -861,18 +868,18 @@ def test_abort_stale_inflight_rechecks_registry_after_checkpoint_wait() -> None:
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"completed": (completed, 1)}
         ctrl._rollout_recovery_enabled = True
-        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        ctrl._data_plane_checkpoint_barrier = barrier
         ctrl._rollout_manager = SimpleNamespace(
             recovery_ledger=ledger,
             discard_prompt_group=ledger.discard_group,
         )
 
-        async with ctrl._data_plane_checkpoint_barrier.checkpoint():
+        async with ctrl._data_plane_checkpoint_barrier.checkpoint() as cut:
             abort_task = asyncio.create_task(ctrl._abort_stale_inflight())
             await asyncio.sleep(0)
             assert not abort_task.done()
             ctrl._inflight_by_group_id.pop("completed")
-            ledger.discard_group("completed")
+            ledger.discard_group(cut, "completed")
 
         assert await asyncio.wait_for(abort_task, timeout=1.0) == 0
         assert not completed.cancelled()
@@ -891,15 +898,17 @@ def test_checkpoint_observes_stale_abort_ledger_discard() -> None:
         stale = asyncio.create_task(asyncio.Event().wait())
         await asyncio.sleep(0)
         ledger = RolloutRecoveryLedger()
-        ledger.reserve_group(
-            group_id="stale",
-            prompt_id="10",
-            prompt_payload={"idx": 10, "message_log": []},
-            expected_generations=2,
-            target_step=None,
-            start_weight_version=1,
-            admitted=True,
-        )
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            ledger.reserve_group(
+                cut,
+                group_id="stale",
+                prompt_id="10",
+                prompt_payload={"idx": 10, "message_log": []},
+                expected_generations=2,
+                target_step=None,
+                start_weight_version=1,
+                admitted=True,
+            )
         barrier = _PausingMutationBarrier()
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -919,7 +928,7 @@ def test_checkpoint_observes_stale_abort_ledger_discard() -> None:
 
         checkpoint_entered = asyncio.Event()
 
-        async def checkpoint_snapshot() -> RolloutRecoveryState:
+        async def checkpoint_snapshot() -> RolloutRecoveryLedgerState:
             async with barrier.checkpoint():
                 checkpoint_entered.set()
                 return ledger.state_dict()

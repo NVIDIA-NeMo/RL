@@ -14,16 +14,52 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
+from typing import Any, TypeVar
+
 import pytest
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+    DataPlaneMutationCut,
+)
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     PromptGroupPhase,
     RolloutRecoveryLedger,
+    build_rollout_recovery_state,
+    parse_rollout_recovery_state,
 )
+
+_T = TypeVar("_T")
+
+
+def _mutate(callback: Callable[[DataPlaneMutationCut], _T]) -> _T:
+    async def apply() -> _T:
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            return callback(cut)
+
+    return asyncio.run(apply())
+
+
+def _reserve(ledger: RolloutRecoveryLedger, **kwargs: Any):
+    return _mutate(lambda cut: ledger.reserve_group(cut, **kwargs))
+
+
+def _load(ledger: RolloutRecoveryLedger, state) -> None:
+    _mutate(lambda cut: ledger.load_state_dict(cut, state))
+
+
+def _mark(ledger: RolloutRecoveryLedger, group_id: str, **kwargs: Any) -> None:
+    _mutate(lambda cut: ledger.mark_group_admitted(cut, group_id, **kwargs))
+
+
+def _bind(ledger: RolloutRecoveryLedger, group_id: str, prompt: DatumSpec) -> None:
+    _mutate(lambda cut: ledger.bind_runtime_prompt(cut, group_id, prompt))
 
 
 def _prompt(idx: int = 7) -> DatumSpec:
@@ -75,7 +111,8 @@ def _group_state(
 
 def test_ledger_round_trip_preserves_group_ownership() -> None:
     ledger = RolloutRecoveryLedger()
-    ledger.reserve_group(
+    _reserve(
+        ledger,
         group_id="g7",
         admission_id="batch-7",
         prompt_id="7",
@@ -88,19 +125,120 @@ def test_ledger_round_trip_preserves_group_ownership() -> None:
 
     state = ledger.state_dict()
     restored = RolloutRecoveryLedger()
-    restored.load_state_dict(state)
+    _load(restored, state)
 
     with pytest.raises(RuntimeError, match="has not rehydrated prompt"):
         _ = restored.get_group("g7").prompt_payload
-    restored.bind_runtime_prompt("g7", _prompt())
+    _bind(restored, "g7", _prompt())
 
     assert restored.state_dict() == state
     assert restored.get_group("g7").phase is PromptGroupPhase.ADMITTED
 
 
+def test_checkpoint_state_round_trip_preserves_controller_and_ledger_state() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+
+    state = build_rollout_recovery_state(
+        ledger,
+        batch_shortfall={7: 1},
+        sampler_stamps_target_steps=True,
+    )
+    parsed = parse_rollout_recovery_state(state)
+    restored = RolloutRecoveryLedger()
+    _load(restored, parsed.ledger_state)
+
+    assert [group.group_id for group in restored.groups()] == ["g7"]
+    assert parsed.batch_shortfall == {7: 1}
+    assert parsed.sampler_stamps_target_steps is True
+
+
+def test_checkpoint_parser_defaults_fields_absent_from_older_state() -> None:
+    parsed = parse_rollout_recovery_state(RolloutRecoveryLedger().state_dict())
+
+    assert parsed.batch_shortfall == {}
+    assert parsed.sampler_stamps_target_steps is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error_type"),
+    [
+        ("batch_shortfall", [], TypeError),
+        ("batch_shortfall", {True: 1}, ValueError),
+        ("batch_shortfall", {7: -1}, ValueError),
+        ("sampler_stamps_target_steps", "yes", TypeError),
+    ],
+)
+def test_checkpoint_parser_rejects_malformed_controller_state(
+    field: str,
+    value: object,
+    error_type: type[Exception],
+) -> None:
+    state: dict[str, object] = dict(RolloutRecoveryLedger().state_dict())
+    state[field] = value
+
+    with pytest.raises(error_type):
+        parse_rollout_recovery_state(state)
+
+
+def test_ledger_rejects_an_expired_mutation_cut() -> None:
+    async def exercise() -> None:
+        barrier = DataPlaneCheckpointBarrier()
+        ledger = RolloutRecoveryLedger()
+        async with barrier.mutation() as cut:
+            ledger.reserve_group(
+                cut,
+                group_id="g7",
+                admission_id="batch-7",
+                prompt_id="7",
+                prompt_payload=_prompt(),
+                expected_generations=2,
+                target_step=7,
+                start_weight_version=6,
+                admitted=True,
+            )
+
+        with pytest.raises(RuntimeError, match="no longer active"):
+            ledger.discard_group(cut, "g7")
+
+    asyncio.run(exercise())
+
+
+def test_checkpoint_cut_can_guard_a_ledger_mutation() -> None:
+    async def exercise() -> None:
+        ledger = RolloutRecoveryLedger()
+        async with DataPlaneCheckpointBarrier().checkpoint() as cut:
+            ledger.reserve_group(
+                cut,
+                group_id="g7",
+                admission_id="batch-7",
+                prompt_id="7",
+                prompt_payload=_prompt(),
+                expected_generations=2,
+                target_step=7,
+                start_weight_version=6,
+                admitted=True,
+            )
+
+        assert [group.group_id for group in ledger.groups()] == ["g7"]
+
+    asyncio.run(exercise())
+
+
 def test_target_step_none_does_not_mean_unadmitted() -> None:
     ledger = RolloutRecoveryLedger()
-    record = ledger.reserve_group(
+    record = _reserve(
+        ledger,
         group_id="windowed",
         admission_id="batch-windowed",
         prompt_id="7",
@@ -117,7 +255,8 @@ def test_target_step_none_does_not_mean_unadmitted() -> None:
 
 def test_reserved_group_can_be_admitted_exactly_once() -> None:
     ledger = RolloutRecoveryLedger()
-    ledger.reserve_group(
+    _reserve(
+        ledger,
         group_id="g7",
         admission_id="batch-7",
         prompt_id="7",
@@ -128,7 +267,8 @@ def test_reserved_group_can_be_admitted_exactly_once() -> None:
         admitted=False,
     )
 
-    ledger.mark_group_admitted(
+    _mark(
+        ledger,
         "g7",
         target_step=7,
         start_weight_version=7,
@@ -139,7 +279,8 @@ def test_reserved_group_can_be_admitted_exactly_once() -> None:
     assert record.target_step == 7
     assert record.start_weight_version == 7
     with pytest.raises(ValueError, match="already admitted"):
-        ledger.mark_group_admitted(
+        _mark(
+            ledger,
             "g7",
             target_step=8,
             start_weight_version=8,
@@ -149,7 +290,8 @@ def test_reserved_group_can_be_admitted_exactly_once() -> None:
 def test_canonical_groups_are_discarded_without_touching_unfinished_groups() -> None:
     ledger = RolloutRecoveryLedger()
     for idx, group_id in enumerate(("canonical", "unfinished"), start=7):
-        ledger.reserve_group(
+        _reserve(
+            ledger,
             group_id=group_id,
             admission_id="batch-7",
             prompt_id=str(idx),
@@ -160,14 +302,17 @@ def test_canonical_groups_are_discarded_without_touching_unfinished_groups() -> 
             admitted=True,
         )
 
-    assert ledger.discard_canonical_groups({"canonical"}) == 1
+    assert _mutate(
+        lambda cut: ledger.discard_canonical_groups(cut, {"canonical"})
+    ) == 1
     assert [group.group_id for group in ledger.groups()] == ["unfinished"]
 
 
 def test_state_dict_stores_a_prompt_ref_without_the_full_payload() -> None:
     ledger = RolloutRecoveryLedger()
     prompt = _prompt()
-    ledger.reserve_group(
+    _reserve(
+        ledger,
         group_id="g7",
         admission_id="batch-7",
         prompt_id="7",
@@ -193,7 +338,8 @@ def test_state_dict_stores_a_prompt_ref_without_the_full_payload() -> None:
 def test_bind_runtime_prompt_accepts_changed_content_with_the_same_identity() -> None:
     ledger = RolloutRecoveryLedger()
     original = _prompt()
-    ledger.reserve_group(
+    _reserve(
+        ledger,
         group_id="g7",
         admission_id="batch-7",
         prompt_id="7",
@@ -204,18 +350,19 @@ def test_bind_runtime_prompt_accepts_changed_content_with_the_same_identity() ->
         admitted=True,
     )
     restored = RolloutRecoveryLedger()
-    restored.load_state_dict(ledger.state_dict())
+    _load(restored, ledger.state_dict())
 
     changed = _prompt()
     changed["message_log"][0]["content"] = "different prompt"
-    restored.bind_runtime_prompt("g7", changed)
+    _bind(restored, "g7", changed)
 
     assert restored.get_group("g7").prompt_payload == changed
 
 
 def test_bind_runtime_prompt_rejects_the_wrong_dataset_sample() -> None:
     ledger = RolloutRecoveryLedger()
-    ledger.reserve_group(
+    _reserve(
+        ledger,
         group_id="g7",
         admission_id="batch-7",
         prompt_id="7",
@@ -226,10 +373,10 @@ def test_bind_runtime_prompt_rejects_the_wrong_dataset_sample() -> None:
         admitted=True,
     )
     restored = RolloutRecoveryLedger()
-    restored.load_state_dict(ledger.state_dict())
+    _load(restored, ledger.state_dict())
 
     with pytest.raises(ValueError, match="expected '7'"):
-        restored.bind_runtime_prompt("g7", _prompt(8))
+        _bind(restored, "g7", _prompt(8))
 
 
 def test_prompt_ref_rehydrates_through_a_restored_shuffled_dataloader() -> None:
@@ -241,7 +388,8 @@ def test_prompt_ref_rehydrates_through_a_restored_shuffled_dataloader() -> None:
     owned_prompt = fetched[-1]
 
     ledger = RolloutRecoveryLedger()
-    ledger.reserve_group(
+    _reserve(
+        ledger,
         group_id="unfinished",
         admission_id="shuffled-batch",
         prompt_id=str(owned_prompt["idx"]),
@@ -260,12 +408,12 @@ def test_prompt_ref_rehydrates_through_a_restored_shuffled_dataloader() -> None:
     assert next(iter(restored_dataloader)) == expected_next_prompt
 
     restored_ledger = RolloutRecoveryLedger()
-    restored_ledger.load_state_dict(ledger_state)
+    _load(restored_ledger, ledger_state)
     restored_group = restored_ledger.get_group("unfinished")
     dataset_prompt = restored_dataloader.dataset[
         int(restored_group.prompt_ref.sample_id)
     ]
-    restored_ledger.bind_runtime_prompt("unfinished", dataset_prompt)
+    _bind(restored_ledger, "unfinished", dataset_prompt)
 
     assert restored_ledger.get_group("unfinished").prompt_payload == owned_prompt
 
@@ -293,4 +441,4 @@ def test_prompt_ref_rehydrates_through_a_restored_shuffled_dataloader() -> None:
 )
 def test_restore_rejects_incompatible_or_malformed_state(state: dict) -> None:
     with pytest.raises((TypeError, ValueError)):
-        RolloutRecoveryLedger().load_state_dict(state)  # type: ignore[arg-type]
+        _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]

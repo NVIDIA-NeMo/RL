@@ -36,7 +36,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import pytest
 import torch
@@ -44,6 +44,7 @@ import torch
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_FILENAME,
     DataPlaneCheckpointBarrier,
+    DataPlaneMutationCut,
     TQReplayBuffer,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
@@ -60,6 +61,7 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_STATE_FILENAME,
     PromptGroupPhase,
     RolloutRecoveryLedger,
+    build_rollout_recovery_state,
 )
 from tests.unit.single_controller._checkpoint_scenarios import (
     _record,
@@ -72,6 +74,15 @@ from tests.unit.single_controller.test_checkpointing import (
 )
 
 _ASYNC_TEST_TIMEOUT_S = 10.0
+_T = TypeVar("_T")
+
+
+def _with_mutation_cut(callback: Callable[[DataPlaneMutationCut], _T]) -> _T:
+    async def apply() -> _T:
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            return callback(cut)
+
+    return asyncio.run(apply())
 
 
 async def _wait_for_event_or_pump(
@@ -110,9 +121,9 @@ class _CountingInOrderSampler(InOrderSampler):
         self.admit_calls += 1
         return await super().admit(trainer_version_fn=trainer_version_fn)
 
-    def commit_admission(self):
+    def commit_admission(self, cut: DataPlaneMutationCut):
         self.admission_commits += 1
-        return super().commit_admission()
+        return super().commit_admission(cut)
 
 
 class _BlockingBeforeAdmissionSampler(_CountingInOrderSampler):
@@ -197,22 +208,35 @@ class _RecoveryRolloutManager:
         self.recovery_ledger = ledger
         self.recovered: list[tuple[str, int | None]] = []
 
-    async def complete_recovery(self, group_id: str) -> None:
+    async def complete_recovery(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+    ) -> None:
         group = self.recovery_ledger.get_group(group_id)
         self.recovered.append((group.group_id, group.target_step))
-        self.recovery_ledger.discard_group(group_id)
+        self.recovery_ledger.discard_group(cut, group_id)
 
     def mark_prompt_group_admitted(
-        self, group_id: str, *, target_step: int | None
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+        *,
+        target_step: int | None,
     ) -> None:
         self.recovery_ledger.mark_group_admitted(
+            cut,
             group_id,
             target_step=target_step,
             start_weight_version=7,
         )
 
-    def discard_prompt_group(self, group_id: str) -> None:
-        self.recovery_ledger.discard_group(group_id)
+    def discard_prompt_group(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+    ) -> None:
+        self.recovery_ledger.discard_group(cut, group_id)
 
 
 class _BlockingRolloutManager:
@@ -229,6 +253,7 @@ class _BlockingRolloutManager:
 
     def reserve_prompt_group(
         self,
+        cut: DataPlaneMutationCut | None,
         prompt: DatumSpec,
         *,
         target_step: int | None = None,
@@ -249,13 +274,23 @@ class _BlockingRolloutManager:
         return group_id
 
     def mark_prompt_group_admitted(
-        self, group_id: str, *, target_step: int | None
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+        *,
+        target_step: int | None,
     ) -> None:
+        del cut
         if target_step is None:
             return
         self.recovery_ledger.assign_target_step(group_id, target_step)
 
-    def discard_prompt_group(self, group_id: str) -> None:
+    def discard_prompt_group(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+    ) -> None:
+        del cut
         self.recovery_ledger.release(group_id)
 
     async def generate_and_push(
@@ -269,6 +304,7 @@ class _BlockingRolloutManager:
         del inflight_registry
         if lineage_group_id is None:
             lineage_group_id = self.reserve_prompt_group(
+                None,
                 prompt,
                 target_step=target_step,
             )
@@ -304,6 +340,7 @@ class _LedgerFacade:
 
     def reserve_prompt_group(
         self,
+        cut: DataPlaneMutationCut,
         prompt: DatumSpec,
         *,
         target_step: int | None = None,
@@ -311,6 +348,7 @@ class _LedgerFacade:
         admission_id: str | None = None,
     ) -> str:
         record = self.recovery_ledger.reserve_group(
+            cut,
             prompt_id=str(prompt["idx"]),
             prompt_payload=prompt,
             expected_generations=2,
@@ -322,16 +360,25 @@ class _LedgerFacade:
         return record.group_id
 
     def mark_prompt_group_admitted(
-        self, group_id: str, *, target_step: int | None
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+        *,
+        target_step: int | None,
     ) -> None:
         self.recovery_ledger.mark_group_admitted(
+            cut,
             group_id,
             target_step=target_step,
             start_weight_version=7,
         )
 
-    def discard_prompt_group(self, group_id: str) -> None:
-        self.recovery_ledger.discard_group(group_id)
+    def discard_prompt_group(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+    ) -> None:
+        self.recovery_ledger.discard_group(cut, group_id)
 
 
 def _reserve_prompt(idx: int) -> DatumSpec:
@@ -368,20 +415,26 @@ def _rehydration_controller(
     """Build a restored ledger whose prompt must be resolved from the dataset."""
     dataset_prompt = _reserve_prompt(7)
     saved_ledger = RolloutRecoveryLedger()
-    saved_ledger.reserve_group(
-        group_id="rehydrate-7",
-        prompt_id="7",
-        prompt_payload=dataset_prompt,
-        expected_generations=2,
-        target_step=7,
-        start_weight_version=7,
-        admitted=True,
+    _with_mutation_cut(
+        lambda cut: saved_ledger.reserve_group(
+            cut,
+            group_id="rehydrate-7",
+            prompt_id="7",
+            prompt_payload=dataset_prompt,
+            expected_generations=2,
+            target_step=7,
+            start_weight_version=7,
+            admitted=True,
+        )
     )
     restored_ledger = RolloutRecoveryLedger()
-    restored_ledger.load_state_dict(saved_ledger.state_dict())
+    _with_mutation_cut(
+        lambda cut: restored_ledger.load_state_dict(cut, saved_ledger.state_dict())
+    )
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
+    controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     controller._rollout_manager = SimpleNamespace(recovery_ledger=restored_ledger)
     controller._dataloader = SimpleNamespace(
         dataset={7: dataset_prompt},
@@ -390,10 +443,18 @@ def _rehydration_controller(
     return controller, restored_ledger
 
 
+def _run_rehydration(controller: Any) -> None:
+    async def rehydrate() -> None:
+        async with controller._data_plane_checkpoint_barrier.mutation() as cut:
+            await controller._rehydrate_rollout_recovery_prompts(cut)
+
+    asyncio.run(rehydrate())
+
+
 def test_recovery_rehydration_accepts_an_identity_dict_collator() -> None:
     controller, ledger = _rehydration_controller(_identity_dict_collator)
 
-    asyncio.run(controller._rehydrate_rollout_recovery_prompts())
+    _run_rehydration(controller)
 
     assert ledger.get_group("rehydrate-7").prompt_payload["length"] == 99
 
@@ -423,7 +484,7 @@ def test_recovery_rehydration_rejects_invalid_collator_results(
     controller, _ = _rehydration_controller(collate_fn)
 
     with pytest.raises(expected_error, match=match):
-        asyncio.run(controller._rehydrate_rollout_recovery_prompts())
+        _run_rehydration(controller)
 
 
 def _reserve_controller() -> Any:
@@ -815,19 +876,23 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
             {key: value[0] for key, value in prompt_batch.items()},
         )
         saved_ledger = RolloutRecoveryLedger()
-        saved_ledger.reserve_group(
-            group_id="batch-7-prompt-0",
-            admission_id="batch-7",
-            prompt_id="70",
-            prompt_payload=dispatched_prompt,
-            expected_generations=2,
-            target_step=7,
-            start_weight_version=7,
-            admitted=True,
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            saved_ledger.reserve_group(
+                cut,
+                group_id="batch-7-prompt-0",
+                admission_id="batch-7",
+                prompt_id="70",
+                prompt_payload=dispatched_prompt,
+                expected_generations=2,
+                target_step=7,
+                start_weight_version=7,
+                admitted=True,
+            )
+        saved_state = build_rollout_recovery_state(
+            saved_ledger,
+            batch_shortfall={6: 1},
+            sampler_stamps_target_steps=True,
         )
-        saved_state = saved_ledger.state_dict()
-        saved_state["batch_shortfall"] = {6: 1}
-        saved_state["sampler_stamps_target_steps"] = True
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
         torch.save(saved_state, recovery_path)
         payload_sha256 = hashlib.sha256(recovery_path.read_bytes()).hexdigest()
@@ -851,6 +916,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         )
         controller._buffer_capacity = asyncio.Semaphore(4)
         controller._trainer_version = 7
+        controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         controller._dataloader = SimpleNamespace(
             dataset={70: dataset_prompt},
             collate_fn=rl_collate_fn,
@@ -868,7 +934,8 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
             _target_step: int | None,
             group_id: str,
         ) -> None:
-            await rollout_manager.complete_recovery(group_id)
+            async with controller._data_plane_checkpoint_barrier.mutation() as cut:
+                await rollout_manager.complete_recovery(cut, group_id)
 
         await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
         await controller._redispatch_restored_rollouts(_recover)
@@ -883,22 +950,59 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
     asyncio.run(exercise())
 
 
+def test_recovery_rejects_an_unhandled_phase_before_redispatch() -> None:
+    """A future phase must fail loudly instead of remaining owned forever."""
+
+    async def exercise() -> None:
+        recovery_ledger = SimpleNamespace(
+            groups=lambda: [
+                SimpleNamespace(group_id="future-group", phase="future-phase")
+            ]
+        )
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        controller._rollout_manager = SimpleNamespace(
+            recovery_ledger=recovery_ledger
+        )
+        launched = False
+
+        async def _recover(
+            _prompt: dict[str, Any],
+            _target_step: int | None,
+            _group_id: str,
+        ) -> None:
+            nonlocal launched
+            launched = True
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"unrecognized rollout recovery phase.*future-group='future-phase'",
+        ):
+            await controller._redispatch_restored_rollouts(_recover)
+
+        assert not launched
+
+    asyncio.run(exercise())
+
+
 def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
     """Two prompts fetched together consume one sampler admission on restart."""
 
     async def exercise() -> None:
         saved_ledger = RolloutRecoveryLedger()
-        for prompt_idx in (70, 71):
-            saved_ledger.reserve_group(
-                group_id=f"batch-7-prompt-{prompt_idx}",
-                admission_id="batch-7",
-                prompt_id=str(prompt_idx),
-                prompt_payload={"idx": prompt_idx, "message_log": []},
-                expected_generations=2,
-                target_step=None,
-                start_weight_version=7,
-                admitted=False,
-            )
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            for prompt_idx in (70, 71):
+                saved_ledger.reserve_group(
+                    cut,
+                    group_id=f"batch-7-prompt-{prompt_idx}",
+                    admission_id="batch-7",
+                    prompt_id=str(prompt_idx),
+                    prompt_payload={"idx": prompt_idx, "message_log": []},
+                    expected_generations=2,
+                    target_step=None,
+                    start_weight_version=7,
+                    admitted=False,
+                )
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
         torch.save(saved_ledger.state_dict(), recovery_path)
 
@@ -943,7 +1047,8 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
             _target_step: int | None,
             group_id: str,
         ) -> None:
-            await rollout_manager.complete_recovery(group_id)
+            async with controller._data_plane_checkpoint_barrier.mutation() as cut:
+                await rollout_manager.complete_recovery(cut, group_id)
 
         await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
         await controller._redispatch_restored_rollouts(_recover)
@@ -966,26 +1071,30 @@ def test_recovery_launches_admitted_groups_before_waiting_to_readmit() -> None:
         sampler = _CountingInOrderSampler()
         sampler.restore_dispatch_index(7)
         ledger = RolloutRecoveryLedger()
-        ledger.reserve_group(
-            group_id="admitted-step-7",
-            admission_id="batch-7",
-            prompt_id="70",
-            prompt_payload={"idx": 70, "message_log": []},
-            expected_generations=2,
-            target_step=7,
-            start_weight_version=7,
-            admitted=True,
-        )
-        ledger.reserve_group(
-            group_id="reserved-step-8",
-            admission_id="batch-8",
-            prompt_id="80",
-            prompt_payload={"idx": 80, "message_log": []},
-            expected_generations=2,
-            target_step=None,
-            start_weight_version=7,
-            admitted=False,
-        )
+        barrier = DataPlaneCheckpointBarrier()
+        async with barrier.mutation() as cut:
+            ledger.reserve_group(
+                cut,
+                group_id="admitted-step-7",
+                admission_id="batch-7",
+                prompt_id="70",
+                prompt_payload={"idx": 70, "message_log": []},
+                expected_generations=2,
+                target_step=7,
+                start_weight_version=7,
+                admitted=True,
+            )
+            ledger.reserve_group(
+                cut,
+                group_id="reserved-step-8",
+                admission_id="batch-8",
+                prompt_id="80",
+                prompt_payload={"idx": 80, "message_log": []},
+                expected_generations=2,
+                target_step=None,
+                start_weight_version=7,
+                admitted=False,
+            )
         rollout_manager = _RecoveryRolloutManager(ledger)
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -993,7 +1102,7 @@ def test_recovery_launches_admitted_groups_before_waiting_to_readmit() -> None:
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._trainer_version = 6
-        controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        controller._data_plane_checkpoint_barrier = barrier
         controller._buffer = SimpleNamespace(
             count_for_target_step=lambda _target_step: 0,
         )
@@ -1006,7 +1115,8 @@ def test_recovery_launches_admitted_groups_before_waiting_to_readmit() -> None:
             group_id: str,
         ) -> None:
             launched.append((group_id, target_step))
-            await rollout_manager.complete_recovery(group_id)
+            async with controller._data_plane_checkpoint_barrier.mutation() as cut:
+                await rollout_manager.complete_recovery(cut, group_id)
             if group_id == "admitted-step-7":
                 # Model the concurrent train pump consuming recovered step 7. This
                 # opens the in-order gate so the reserved batch can become step 8.
@@ -1035,17 +1145,19 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
 
     async def exercise() -> None:
         saved_ledger = RolloutRecoveryLedger()
-        for prompt_idx in (70, 71):
-            saved_ledger.reserve_group(
-                group_id=f"batch-7-prompt-{prompt_idx}",
-                admission_id="batch-7",
-                prompt_id=str(prompt_idx),
-                prompt_payload={"idx": prompt_idx, "message_log": []},
-                expected_generations=2,
-                target_step=7,
-                start_weight_version=7,
-                admitted=True,
-            )
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            for prompt_idx in (70, 71):
+                saved_ledger.reserve_group(
+                    cut,
+                    group_id=f"batch-7-prompt-{prompt_idx}",
+                    admission_id="batch-7",
+                    prompt_id=str(prompt_idx),
+                    prompt_payload={"idx": prompt_idx, "message_log": []},
+                    expected_generations=2,
+                    target_step=7,
+                    start_weight_version=7,
+                    admitted=True,
+                )
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
         torch.save(saved_ledger.state_dict(), recovery_path)
 
@@ -1136,21 +1248,23 @@ def test_checkpoint_waits_for_replacement_pop_and_reownership() -> None:
     async def exercise() -> None:
         controller = _reserve_controller()
         manager = controller._rollout_manager
-        old_group_id = manager.reserve_prompt_group(
-            _reserve_prompt(20),
-            target_step=7,
-        )
+        async with controller._data_plane_checkpoint_barrier.mutation() as cut:
+            old_group_id = manager.reserve_prompt_group(
+                cut,
+                _reserve_prompt(20),
+                target_step=7,
+            )
         controller._replacement_reserve.append(_reserve_prompt(21))
         mutation_applied = asyncio.Event()
         release_mutation = asyncio.Event()
         checkpoint_entered = asyncio.Event()
 
         async def replace() -> None:
-            async with controller._data_plane_checkpoint_barrier.mutation():
+            async with controller._data_plane_checkpoint_barrier.mutation() as cut:
                 replacement = controller._take_replacement(7, 0)
                 assert replacement is not None
-                manager.discard_prompt_group(old_group_id)
-                manager.reserve_prompt_group(replacement, target_step=7)
+                manager.discard_prompt_group(cut, old_group_id)
+                manager.reserve_prompt_group(cut, replacement, target_step=7)
                 mutation_applied.set()
                 await release_mutation.wait()
 
@@ -1198,11 +1312,13 @@ def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
         ) -> tuple[int, list[str], int]:
             admission_started.set()
             await release_admission.wait()
-            for group_id in group_ids:
-                controller._rollout_manager.mark_prompt_group_admitted(
-                    group_id,
-                    target_step=7,
-                )
+            async with controller._data_plane_checkpoint_barrier.mutation() as cut:
+                for group_id in group_ids:
+                    controller._rollout_manager.mark_prompt_group_admitted(
+                        cut,
+                        group_id,
+                        target_step=7,
+                    )
             return 7, group_ids, 0
 
         async def launch(

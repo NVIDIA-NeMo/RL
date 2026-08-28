@@ -211,6 +211,22 @@ def _add_group(
 
 
 class TestDataPlaneCheckpointBarrier:
+    def test_mutation_and_checkpoint_cuts_expire_on_context_exit(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+
+            async with barrier.mutation() as mutation_cut:
+                mutation_cut.require_live()
+            with pytest.raises(RuntimeError, match="no longer active"):
+                mutation_cut.require_live()
+
+            async with barrier.checkpoint() as checkpoint_cut:
+                checkpoint_cut.require_live()
+            with pytest.raises(RuntimeError, match="no longer active"):
+                checkpoint_cut.require_live()
+
+        asyncio.run(exercise())
+
     def test_mutations_run_concurrently_without_checkpoint(self):
         async def exercise() -> None:
             barrier = DataPlaneCheckpointBarrier()

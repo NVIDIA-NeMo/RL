@@ -33,7 +33,10 @@ from copy import deepcopy
 import pytest
 import torch
 
-from nemo_rl.algorithms.async_utils.replay_buffer import PostWriteEnrichmentError
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+    PostWriteEnrichmentError,
+)
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
@@ -75,10 +78,19 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _with_cut(buffer, callback):
+    async def apply():
+        async with buffer.data_plane_checkpoint_barrier.mutation() as cut:
+            return callback(cut)
+
+    return _run(apply())
+
+
 class _FakeBuffer:
     """Minimal TQReplayBuffer stand-in that records reserve/commit calls."""
 
     def __init__(self) -> None:
+        self.data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         self.reserve_calls: list[int] = []  # weight_versions passed to reserve
         self.commit_calls: list[tuple[str, object, int, int]] = []
         self.remove_calls: list[str] = []
@@ -353,9 +365,13 @@ class TestGenerateAndPushFlow:
             _FakeImpl(on_run=_assert_ledger_owns_inflight_prompt),
         )
         prompt = {"idx": 0, "message_log": [], "prompt": "p"}
-        group_id = mgr.reserve_prompt_group(
-            prompt,
-            target_step=None,
+        group_id = _with_cut(
+            buf,
+            lambda cut: mgr.reserve_prompt_group(
+                cut,
+                prompt,
+                target_step=None,
+            ),
         )
 
         _run(
@@ -373,14 +389,19 @@ class TestGenerateAndPushFlow:
         async def _fail_rollout(_sample):
             raise RuntimeError("bad prompt")
 
+        buf = _FakeBuffer()
         mgr = _make_manager(
-            _FakeBuffer(),
+            buf,
             _FakeImpl(on_run=_fail_rollout),
             RolloutRetryPolicy.single_attempt(max_skipped_prompts=1),
         )
-        group_id = mgr.reserve_prompt_group(
-            {"idx": 7, "message_log": []},
-            target_step=7,
+        group_id = _with_cut(
+            buf,
+            lambda cut: mgr.reserve_prompt_group(
+                cut,
+                {"idx": 7, "message_log": []},
+                target_step=7,
+            ),
         )
 
         outcome = _run(
@@ -395,15 +416,20 @@ class TestGenerateAndPushFlow:
         assert mgr.recovery_ledger.get_group(group_id).target_step == 7
 
     def test_tracked_dispatch_rejects_changed_generations_per_prompt(self):
-        mgr = _make_manager(_FakeBuffer(), _FakeImpl())
-        mgr.recovery_ledger.reserve_group(
-            group_id="g0",
-            prompt_id="0",
-            prompt_payload={"idx": 0, "message_log": []},
-            expected_generations=2,
-            target_step=0,
-            start_weight_version=0,
-            admitted=True,
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl())
+        _with_cut(
+            buf,
+            lambda cut: mgr.recovery_ledger.reserve_group(
+                cut,
+                group_id="g0",
+                prompt_id="0",
+                prompt_payload={"idx": 0, "message_log": []},
+                expected_generations=2,
+                target_step=0,
+                start_weight_version=0,
+                admitted=True,
+            ),
         )
 
         with pytest.raises(ValueError, match="expects 2 generation"):

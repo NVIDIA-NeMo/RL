@@ -76,6 +76,8 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 - The normal model, dataloader, and controller state, plus optimizer state when configured.
 - A native TQ snapshot containing rollout tensor payloads and TQ state.
 - A metadata-only replay index describing the completed rollout groups stored in TQ.
+- A `rollout_recovery.pt` ownership ledger describing unfinished prompt groups that must be redispatched after a restart.
+- A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, when applicable.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 
 The TQ snapshot and replay index are captured under the same checkpoint barrier. Generation may continue while the snapshot is written, but completed-group commits and destructive TQ clears wait at the barrier. This ensures that the TQ snapshot and replay index describe the same set of groups.
@@ -84,8 +86,8 @@ On resume, Single-Controller validates the TQ snapshot against the trainer check
 
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
 
-:::{warning}
-This checkpointing path recovers completed groups that have been committed to TQ. It does not recover generations that were still in flight at the checkpoint boundary.
+:::{note}
+Completed groups are restored directly from the TQ snapshot. Prompt groups whose generations were still in flight at the checkpoint boundary are recovered by ownership: `rollout_recovery.pt` records them, and on resume they are redispatched and regenerated from the same dataset rows. Only rows already committed to TQ preserve their exact generated tokens; redispatched groups produce new samples from the same prompts.
 :::
 
 When a sampler does not support replay recovery, a requested data-plane checkpoint is written in `shadow` mode. The TQ snapshot is retained, but no authoritative replay index is written and its rows are not restored into the training replay buffer.

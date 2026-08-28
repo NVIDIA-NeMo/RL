@@ -23,6 +23,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
 if TYPE_CHECKING:
+    from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
 ROLLOUT_RECOVERY_SCHEMA_VERSION = 1
@@ -56,11 +57,16 @@ class PromptGroupRecoveryState(TypedDict):
     phase: str
 
 
-class RolloutRecoveryState(TypedDict):
-    """Versioned checkpoint sidecar for unfinished prompt groups."""
+class RolloutRecoveryLedgerState(TypedDict):
+    """Versioned prompt-group ownership state managed by the ledger."""
 
     schema_version: int
     groups: list[PromptGroupRecoveryState]
+
+
+class RolloutRecoveryState(RolloutRecoveryLedgerState):
+    """Complete checkpoint sidecar for unfinished rollout scheduling state."""
+
     batch_shortfall: NotRequired[dict[int, int]]
     sampler_stamps_target_steps: NotRequired[bool]
 
@@ -96,6 +102,15 @@ class PromptGroupRecoveryRecord:
                 f"sample_id={self.prompt_ref.sample_id!r}"
             )
         return self.runtime_prompt_payload
+
+
+@dataclass(frozen=True)
+class ParsedRolloutRecoveryState:
+    """Validated controller and ledger state loaded from one checkpoint sidecar."""
+
+    ledger_state: RolloutRecoveryLedgerState
+    batch_shortfall: dict[int, int]
+    sampler_stamps_target_steps: bool | None
 
 
 def _require_int(value: Any, *, field: str, minimum: int) -> int:
@@ -140,13 +155,18 @@ def _validate_prompt_identity(
 
 
 class RolloutRecoveryLedger:
-    """Own prompts after dataloader advance and before canonical TQ commit."""
+    """Own prompts after dataloader advance and before canonical TQ commit.
+
+    Every mutating operation requires a live data-plane cut so ownership cannot
+    change outside the checkpoint barrier's consistent snapshot boundary.
+    """
 
     def __init__(self) -> None:
         self._groups: dict[str, PromptGroupRecoveryRecord] = {}
 
     def reserve_group(
         self,
+        cut: DataPlaneMutationCut,
         *,
         prompt_id: str,
         prompt_payload: DatumSpec,
@@ -160,6 +180,7 @@ class RolloutRecoveryLedger:
         """Record ownership before the prompt can disappear from the dataloader.
 
         Args:
+            cut: Live capability yielded by the shared data-plane barrier.
             prompt_id: Dataset-level prompt identity used for diagnostics.
             prompt_payload: Runtime prompt used for whole-group regeneration. Only
                 its stable dataset reference is checkpointed.
@@ -175,6 +196,7 @@ class RolloutRecoveryLedger:
         Returns:
             A defensive copy of the new record.
         """
+        cut.require_live()
         if not prompt_id:
             raise ValueError("prompt_id must not be empty")
         sample_id = prompt_payload.get("idx")
@@ -230,12 +252,14 @@ class RolloutRecoveryLedger:
 
     def mark_group_admitted(
         self,
+        cut: DataPlaneMutationCut,
         group_id: str,
         *,
         target_step: int | None,
         start_weight_version: int,
     ) -> None:
         """Attach the sampler result to a previously reserved prompt group."""
+        cut.require_live()
         record = self._require_group(group_id)
         if record.phase is not PromptGroupPhase.RESERVED:
             raise ValueError(
@@ -262,10 +286,17 @@ class RolloutRecoveryLedger:
 
     def bind_runtime_prompt(
         self,
+        cut: DataPlaneMutationCut,
         group_id: str,
         prompt_payload: DatumSpec,
     ) -> None:
-        """Attach a dataset-rehydrated prompt after identity validation."""
+        """Attach a dataset-rehydrated prompt after identity validation.
+
+        The current reference is a positional index into a map-style dataset.
+        Recovery therefore requires dataset ordering to remain unchanged between
+        checkpoint and restart.
+        """
+        cut.require_live()
         record = self._require_group(group_id)
         _validate_prompt_identity(
             record.prompt_ref,
@@ -295,13 +326,19 @@ class RolloutRecoveryLedger:
         """Return record copies in reservation order without cloning prompts."""
         return [copy.copy(record) for record in self._groups.values()]
 
-    def discard_group(self, group_id: str) -> None:
+    def discard_group(self, cut: DataPlaneMutationCut, group_id: str) -> None:
         """Release ownership after canonical commit or intentional discard."""
+        cut.require_live()
         self._require_group(group_id)
         del self._groups[group_id]
 
-    def discard_canonical_groups(self, group_ids: set[str]) -> int:
+    def discard_canonical_groups(
+        self,
+        cut: DataPlaneMutationCut,
+        group_ids: set[str],
+    ) -> int:
         """Drop ledger copies already owned by canonical replay metadata."""
+        cut.require_live()
         discarded = 0
         for group_id in list(self._groups):
             if group_id in group_ids:
@@ -309,7 +346,7 @@ class RolloutRecoveryLedger:
                 discarded += 1
         return discarded
 
-    def state_dict(self) -> RolloutRecoveryState:
+    def state_dict(self) -> RolloutRecoveryLedgerState:
         """Return versioned references without serializing full prompt payloads."""
         groups: list[PromptGroupRecoveryState] = []
         for record in self._groups.values():
@@ -324,6 +361,9 @@ class RolloutRecoveryLedger:
                 prompt_payload,
                 group_id=record.group_id,
             )
+            # sample_id is currently a positional index into a map-style dataset,
+            # not a dataset-independent identity. The checkpoint is recoverable only
+            # when that dataset's ordering remains unchanged across the restart.
             groups.append(
                 {
                     "group_id": record.group_id,
@@ -344,8 +384,13 @@ class RolloutRecoveryLedger:
             "groups": groups,
         }
 
-    def load_state_dict(self, state: RolloutRecoveryState) -> None:
+    def load_state_dict(
+        self,
+        cut: DataPlaneMutationCut,
+        state: RolloutRecoveryLedgerState,
+    ) -> None:
         """Replace this empty ledger from a validated checkpoint payload."""
+        cut.require_live()
         if self._groups:
             raise RuntimeError(
                 "cannot restore into a non-empty rollout recovery ledger"
@@ -472,3 +517,79 @@ class RolloutRecoveryLedger:
 
     def __len__(self) -> int:
         return len(self._groups)
+
+
+def _validate_batch_shortfall(value: object) -> dict[int, int]:
+    """Return a defensive copy of per-step permanent rollout losses."""
+    if not isinstance(value, dict):
+        raise TypeError("rollout recovery batch_shortfall must be a dictionary")
+    batch_shortfall: dict[int, int] = {}
+    for step, count in value.items():
+        if (
+            isinstance(step, bool)
+            or not isinstance(step, int)
+            or step < 0
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+        ):
+            raise ValueError(
+                "rollout recovery batch_shortfall entries must contain "
+                f"non-negative integer steps and counts, got {step!r}: {count!r}"
+            )
+        batch_shortfall[step] = count
+    return batch_shortfall
+
+
+def build_rollout_recovery_state(
+    ledger: RolloutRecoveryLedger,
+    *,
+    batch_shortfall: dict[int, int],
+    sampler_stamps_target_steps: bool,
+) -> RolloutRecoveryState:
+    """Build the complete versioned sidecar from ledger and controller state."""
+    if not isinstance(sampler_stamps_target_steps, bool):
+        raise TypeError(
+            "rollout recovery sampler_stamps_target_steps must be a boolean"
+        )
+    ledger_state = ledger.state_dict()
+    return {
+        "schema_version": ledger_state["schema_version"],
+        "groups": ledger_state["groups"],
+        "batch_shortfall": _validate_batch_shortfall(batch_shortfall),
+        "sampler_stamps_target_steps": sampler_stamps_target_steps,
+    }
+
+
+def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
+    """Validate and split a complete checkpoint sidecar by runtime owner."""
+    if not isinstance(state, dict):
+        raise TypeError(
+            "rollout recovery sidecar must contain a dictionary, got "
+            f"{type(state).__name__}"
+        )
+    if state.get("schema_version") != ROLLOUT_RECOVERY_SCHEMA_VERSION:
+        raise ValueError(
+            "unsupported rollout recovery schema_version="
+            f"{state.get('schema_version')!r}; expected "
+            f"{ROLLOUT_RECOVERY_SCHEMA_VERSION}"
+        )
+    groups = state.get("groups")
+    if not isinstance(groups, list):
+        raise TypeError("rollout recovery groups must be a list")
+
+    raw_sampler_stamps = state.get("sampler_stamps_target_steps")
+    if raw_sampler_stamps is not None and not isinstance(raw_sampler_stamps, bool):
+        raise TypeError(
+            "rollout recovery sampler_stamps_target_steps must be a boolean"
+        )
+
+    ledger_state: RolloutRecoveryLedgerState = {
+        "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+        "groups": groups,
+    }
+    return ParsedRolloutRecoveryState(
+        ledger_state=ledger_state,
+        batch_shortfall=_validate_batch_shortfall(state.get("batch_shortfall", {})),
+        sampler_stamps_target_steps=raw_sampler_stamps,
+    )

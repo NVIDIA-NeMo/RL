@@ -54,7 +54,10 @@ from typing import (
 
 from pydantic import BaseModel, Field, NonNegativeInt, model_validator
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneMutationCut,
+    TQReplayBuffer,
+)
 from nemo_rl.data_plane import KVBatchMeta
 
 # Poll interval for the rollout-pump admission gate.
@@ -141,8 +144,8 @@ class TransactionalAdmissionSampler(Protocol):
         """Wait until one admission can commit without mutating sampler state."""
         ...
 
-    def commit_admission(self) -> Optional[int]:
-        """Advance the admission cursor and return the batch target-step stamp."""
+    def commit_admission(self, cut: DataPlaneMutationCut) -> Optional[int]:
+        """Advance the cursor under a live data-plane mutation cut."""
         ...
 
 
@@ -332,13 +335,14 @@ class WindowedSampler(BaseSampler):
         """Return immediately because buffer capacity is this policy's gate."""
         del trainer_version_fn
 
-    def commit_admission(self) -> Optional[int]:
+    def commit_admission(self, cut: DataPlaneMutationCut) -> Optional[int]:
         """Return the unstamped admission result without changing a cursor."""
+        cut.require_live()
         return None
 
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
         await self.wait_until_admissible(trainer_version_fn=trainer_version_fn)
-        return self.commit_admission()
+        return None
 
     async def select(
         self,
@@ -410,14 +414,19 @@ class _GatedSampler(BaseSampler):
         while self._dispatch_index >= trainer_version_fn() + self._gate_window:
             await asyncio.sleep(_GATE_POLL_SECONDS)
 
-    def commit_admission(self) -> Optional[int]:
+    def commit_admission(self, cut: DataPlaneMutationCut) -> Optional[int]:
         """Advance the cursor after the controller enters its mutation cut."""
+        cut.require_live()
+        return self._commit_admission()
+
+    def _commit_admission(self) -> Optional[int]:
+        """Advance admission for the legacy monolithic API."""
         self._dispatch_index += 1
         return self._stamp()
 
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
         await self.wait_until_admissible(trainer_version_fn=trainer_version_fn)
-        return self.commit_admission()
+        return self._commit_admission()
 
     def _stamp(self) -> Optional[int]:
         return None

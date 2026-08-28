@@ -15,8 +15,8 @@
 """Checkpoint recovery contract across the built-in async samplers.
 
 The six scenarios come from #3827. That PR covered windowed, weight_fifo, and
-in_order; ready_first is included here because it now advertises the same
-completed-buffer recovery capability.
+in_order; a zero-lag completed row and ready_first are included here to cover
+the complete built-in recovery contract.
 
 Unfinished rows are regenerated as whole prompt groups from the group-level
 ledger. Sibling-level continuation remains outside this recovery foundation.
@@ -29,7 +29,11 @@ import pytest
 from tests.unit.single_controller._checkpoint_scenarios import (
     ALL_SCENARIOS,
     FULLY_GENERATED,
+    GROUPS_PER_STEP,
     SAMPLERS,
+    S_ALL_COMPLETE,
+    S_LAG2,
+    S_ZERO_LAG_ALL_COMPLETE,
     WITH_IN_FLIGHT,
     Case,
     assert_completed_groups_survive,
@@ -46,6 +50,11 @@ COMPLETED_CASES = [
 ]
 UNFINISHED_CASES = [
     Case(scenario, sampler) for sampler in SAMPLERS for scenario in WITH_IN_FLIGHT
+]
+SELECTABLE_CASES = [
+    Case(scenario, sampler)
+    for sampler in SAMPLERS
+    for scenario in (S_ZERO_LAG_ALL_COMPLETE, S_ALL_COMPLETE, S_LAG2)
 ]
 
 
@@ -77,6 +86,14 @@ def test_unfinished_groups_are_owned_across_restart(case, tmp_path):
     assert_no_data_loss(case.scenario, case.sampler, tmp_path)
 
 
+@pytest.mark.parametrize("case", ALL_CASES, ids=lambda case: case.id)
+def test_restore_preserves_sampler_stamps(case, tmp_path):
+    """Every restored group retains the keys its sampler uses for selection."""
+    result = round_trip(case.scenario, case.sampler, tmp_path)
+
+    assert result.stamps == case.scenario.expected_stamps()
+
+
 @pytest.mark.parametrize("sampler", SAMPLERS)
 def test_restore_reuses_the_same_tq_rows(sampler, tmp_path):
     """The replay sidecar restores the index; it must not duplicate tensor rows."""
@@ -94,3 +111,29 @@ def test_intentionally_evicted_group_is_not_resurrected(sampler, tmp_path):
     result = round_trip(scenario, sampler, tmp_path)
 
     assert "g10" not in result.recovered
+
+
+@pytest.mark.parametrize("case", SELECTABLE_CASES, ids=lambda case: case.id)
+def test_restored_groups_are_selectable(case, tmp_path):
+    """Each sampler can select the restored batch at gate lags zero, one, and two."""
+    first_outstanding = next(
+        group
+        for group in case.scenario.groups
+        if group.gid not in case.scenario.trained and not group.evicted
+    )
+    current_train_weight = (
+        first_outstanding.target
+        if case.sampler == "in_order"
+        else first_outstanding.weight
+    )
+    assert current_train_weight is not None
+
+    result = round_trip(
+        case.scenario,
+        case.sampler,
+        tmp_path,
+        select_current_train_weight=current_train_weight,
+    )
+
+    assert result.selected_count == GROUPS_PER_STEP
+    assert result.selected == {"g12", "g13", "g14"}

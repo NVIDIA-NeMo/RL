@@ -54,6 +54,7 @@ from nemo_rl.utils.r3_trace import trace_rollout_payload
 DATA_PLANE_CHECKPOINT_DIR = "data_plane"
 REPLAY_BUFFER_METADATA_FILENAME = "replay_buffer_metadata.pt"
 LEGACY_REPLAY_BUFFER_FILENAME = "replay_buffer.pt"
+REPLACEMENT_RESERVE_FILENAME = "replacement_reserve.pt"
 REPLAY_BUFFER_METADATA_SCHEMA_VERSION = 1
 REPLAY_BUFFER_METADATA_STORAGE: Literal["tq_checkpoint"] = "tq_checkpoint"
 
@@ -182,6 +183,24 @@ def replay_manifest_digest(groups: list[TQReplayGroupMetadata]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+class DataPlaneMutationCut:
+    """Live capability proving code runs inside a data-plane barrier cut."""
+
+    __slots__ = ("_barrier", "_live")
+
+    def __init__(self, barrier: "DataPlaneCheckpointBarrier") -> None:
+        self._barrier = barrier
+        self._live = True
+
+    def require_live(self) -> None:
+        """Fail when a mutation tries to reuse an absent or expired cut."""
+        if not self._live:
+            raise RuntimeError("data-plane mutation cut is no longer active")
+
+    def _invalidate(self) -> None:
+        self._live = False
+
+
 class DataPlaneCheckpointBarrier:
     """Allow concurrent mutations while giving live checkpoints exclusivity.
 
@@ -197,22 +216,24 @@ class DataPlaneCheckpointBarrier:
         self._active_mutations = 0
 
     @asynccontextmanager
-    async def mutation(self) -> AsyncIterator[None]:
-        """Enter a commit/clear section, waiting only for an active checkpoint."""
+    async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
+        """Yield a live mutation capability after any active checkpoint exits."""
         async with self._condition:
             await self._condition.wait_for(lambda: not self._checkpoint_active)
             self._active_mutations += 1
+        cut = DataPlaneMutationCut(self)
         try:
-            yield
+            yield cut
         finally:
+            cut._invalidate()
             async with self._condition:
                 self._active_mutations -= 1
                 if self._active_mutations == 0:
                     self._condition.notify_all()
 
     @asynccontextmanager
-    async def checkpoint(self) -> AsyncIterator[None]:
-        """Block new mutations and wait for active ones before snapshotting."""
+    async def checkpoint(self) -> AsyncIterator[DataPlaneMutationCut]:
+        """Yield a live capability after blocking and draining all mutations."""
         async with self._condition:
             await self._condition.wait_for(lambda: not self._checkpoint_active)
             self._checkpoint_active = True
@@ -222,9 +243,11 @@ class DataPlaneCheckpointBarrier:
                 self._checkpoint_active = False
                 self._condition.notify_all()
                 raise
+        cut = DataPlaneMutationCut(self)
         try:
-            yield
+            yield cut
         finally:
+            cut._invalidate()
             async with self._condition:
                 self._checkpoint_active = False
                 self._condition.notify_all()
@@ -988,6 +1011,13 @@ class TQReplayBuffer:
         if self._data_plane_checkpoint_barrier is not None:
             raise RuntimeError("data-plane checkpoint barrier is already configured")
         self._data_plane_checkpoint_barrier = barrier
+
+    @property
+    def data_plane_checkpoint_barrier(self) -> DataPlaneCheckpointBarrier:
+        """Return the shared barrier used by controller and post-commit ownership."""
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError("data-plane checkpoint barrier is not configured")
+        return self._data_plane_checkpoint_barrier
 
     def set_post_write_enricher(
         self,

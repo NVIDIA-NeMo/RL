@@ -151,6 +151,14 @@ class Scenario:
             and g.done == ROLLOUTS_PER_GROUP
         }
 
+    def expected_stamps(self) -> dict[str, tuple[int | None, int]]:
+        """Target-step and start-weight stamps every restored group must retain."""
+        return {
+            _gid(group.gid): (group.target, group.weight)
+            for group in self.groups
+            if not group.evicted and group.gid not in self.trained
+        }
+
 
 def _gid(n: int) -> str:
     return f"g{n:02d}"
@@ -262,7 +270,10 @@ class RoundTrip:
     committed, or as a reserved slot waiting to be finished -- either way the
     run has not lost the prompt, and either way these tests notice.
     ``ready`` and ``pending`` are reported separately for diagnosis only;
-    nothing asserts on them.
+    nothing asserts on them. ``stamps`` records each restored group's
+    ``target_step`` and start weight. ``selected`` and ``selected_count`` report
+    the optional restore-then-select result used to verify each sampler's
+    recovery key at multiple gate lags.
     """
 
     recovered: set[str]
@@ -271,10 +282,17 @@ class RoundTrip:
     saved_sidecar: bool
     rows_before: set[str]
     rows_after: set[str]
+    stamps: dict[str, tuple[int | None, int]]
+    selected: set[str]
+    selected_count: int
 
 
 async def _round_trip(
-    scenario: Scenario, sampler_name: str, tmp_path: Path
+    scenario: Scenario,
+    sampler_name: str,
+    tmp_path: Path,
+    *,
+    select_current_train_weight: int | None = None,
 ) -> RoundTrip:
     dp_a = _fresh_client(register=True)
     buf_a = _new_buffer(dp_a)
@@ -289,23 +307,25 @@ async def _round_trip(
         else None
     )
     recovery_ledger_a = RolloutRecoveryLedger()
-    for group in scenario.groups:
-        if (
-            group.evicted
-            or group.gid in scenario.trained
-            or group.done == ROLLOUTS_PER_GROUP
-        ):
-            continue
-        recovery_ledger_a.reserve_group(
-            group_id=_gid(group.gid),
-            admission_id=f"batch-{group.target}",
-            prompt_id=str(group.gid),
-            prompt_payload={"idx": group.gid, "message_log": []},
-            expected_generations=ROLLOUTS_PER_GROUP,
-            target_step=group.target,
-            start_weight_version=group.weight,
-            admitted=True,
-        )
+    async with buf_a.data_plane_checkpoint_barrier.mutation() as cut:
+        for group in scenario.groups:
+            if (
+                group.evicted
+                or group.gid in scenario.trained
+                or group.done == ROLLOUTS_PER_GROUP
+            ):
+                continue
+            recovery_ledger_a.reserve_group(
+                cut,
+                group_id=_gid(group.gid),
+                admission_id=f"batch-{group.target}",
+                prompt_id=str(group.gid),
+                prompt_payload={"idx": group.gid, "message_log": []},
+                expected_generations=ROLLOUTS_PER_GROUP,
+                target_step=group.target,
+                start_weight_version=group.weight,
+                admitted=True,
+            )
     recovery_sidecar = recovery_ledger_a.state_dict()
     rows_before = set(dp_a.list_sample_ids(PARTITION))
     dp_a.save_checkpoint(tmp_path / "data_plane")
@@ -326,8 +346,9 @@ async def _round_trip(
             expected_manifest_digest=sidecar["manifest_digest"],
         )
         recovery_ledger_b = RolloutRecoveryLedger()
-        recovery_ledger_b.load_state_dict(recovery_sidecar)
-        recovery_ledger_b.discard_canonical_groups(set(buf_b._group_ids))
+        async with buf_b.data_plane_checkpoint_barrier.mutation() as cut:
+            recovery_ledger_b.load_state_dict(cut, recovery_sidecar)
+            recovery_ledger_b.discard_canonical_groups(cut, set(buf_b._group_ids))
         for group in recovery_ledger_b.groups():
             group_id = buf_b.reserve(
                 weight_version=group.start_weight_version,
@@ -340,24 +361,64 @@ async def _round_trip(
                 start_weight_version=group.start_weight_version,
                 end_weight_version=group.start_weight_version,
             )
-            recovery_ledger_b.discard_group(group_id)
+            async with buf_b.data_plane_checkpoint_barrier.mutation() as cut:
+                recovery_ledger_b.discard_group(cut, group_id)
 
     ready = {
         gid for gid, is_ready in zip(buf_b._group_ids, buf_b.ready_list) if is_ready
     }
+    recovered = set(buf_b._group_ids)
+    pending = recovered - ready
+    rows_after = set(dp_b.list_sample_ids(PARTITION))
+    stamps = {
+        group_id: (
+            buf_b.target_step_list[index],
+            buf_b.start_weight_list[index],
+        )
+        for index, group_id in enumerate(buf_b._group_ids)
+    }
+    selected: set[str] = set()
+    selected_count = 0
+    if select_current_train_weight is not None:
+        selected_meta, selected_count = await sampler_b.select(
+            current_train_weight=select_current_train_weight,
+            min_prompt_groups=GROUPS_PER_STEP,
+            max_prompt_groups=GROUPS_PER_STEP,
+        )
+        if selected_meta is not None:
+            selected = {
+                sample_id.rpartition("_g")[0]
+                for sample_id in selected_meta.sample_ids
+            }
     return RoundTrip(
-        recovered=set(buf_b._group_ids),
+        recovered=recovered,
         ready=ready,
-        pending=set(buf_b._group_ids) - ready,
+        pending=pending,
         saved_sidecar=sidecar is not None,
         rows_before=rows_before,
-        rows_after=set(dp_b.list_sample_ids(PARTITION)),
+        rows_after=rows_after,
+        stamps=stamps,
+        selected=selected,
+        selected_count=selected_count,
     )
 
 
-def round_trip(scenario: Scenario, sampler_name: str, tmp_path: Path) -> RoundTrip:
+def round_trip(
+    scenario: Scenario,
+    sampler_name: str,
+    tmp_path: Path,
+    *,
+    select_current_train_weight: int | None = None,
+) -> RoundTrip:
     """Save the scenario, restore it into a fresh buffer, report what came back."""
-    return asyncio.run(_round_trip(scenario, sampler_name, tmp_path))
+    return asyncio.run(
+        _round_trip(
+            scenario,
+            sampler_name,
+            tmp_path,
+            select_current_train_weight=select_current_train_weight,
+        )
+    )
 
 
 def assert_no_data_loss(
@@ -408,6 +469,21 @@ S_ALL_COMPLETE = Scenario(
     cursor=15,
     trained=frozenset({9, 10, 11}),
     lag=1,
+)
+
+S_ZERO_LAG_ALL_COMPLETE = Scenario(
+    name="lag0-current-step-complete",
+    groups=(
+        Group(9, 2, weight=4, target=4),
+        Group(10, 2, weight=4, target=4),
+        Group(11, 2, weight=4, target=4),
+        Group(12, 2, weight=5, target=5),
+        Group(13, 2, weight=5, target=5),
+        Group(14, 2, weight=5, target=5),
+    ),
+    cursor=15,
+    trained=frozenset({9, 10, 11}),
+    lag=0,
 )
 
 S_PARTIAL = Scenario(
@@ -485,7 +561,7 @@ S_STALE_ONLY = Scenario(
 )
 
 # Everything fully generated -- the case this PR set out to recover.
-FULLY_GENERATED = (S_ALL_COMPLETE, S_STALE_ONLY)
+FULLY_GENERATED = (S_ZERO_LAG_ALL_COMPLETE, S_ALL_COMPLETE, S_STALE_ONLY)
 # At least one group still generating when the snapshot was taken.
 WITH_IN_FLIGHT = (S_PARTIAL, S_LAG2, S_EVICTED, S_TRAINED_OUT_OF_ORDER)
 ALL_SCENARIOS = FULLY_GENERATED + WITH_IN_FLIGHT
