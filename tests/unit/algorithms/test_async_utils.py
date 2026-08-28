@@ -3666,3 +3666,26 @@ class TestMultimodalDedupCapability:
         with pytest.raises(Exception) as excinfo:
             self._run(self._config("vllm", dedup=True, data_plane_enabled=False))
         assert "deduplicate_multimodal_data" not in str(excinfo.value)
+
+    def test_a_real_config_without_a_data_plane_block_reaches_the_guard(self):
+        """No shipped PPO config carries a top-level ``data_plane``.
+
+        ``MasterConfig`` is ``extra="allow"``, which exposes only the keys a
+        config actually carried, so unless the field is declared, reading it
+        raises ``AttributeError`` instead of yielding the ``None`` this guard
+        expects -- and the knob is unusable on precisely the configuration it
+        is qualified for. The ``SimpleNamespace`` fixtures above cannot catch
+        that: they always have the attribute.
+        """
+        from nemo_rl.algorithms.ppo import (
+            MasterConfig,
+            _validate_multimodal_dedup_capability,
+        )
+
+        master_config = MasterConfig.model_construct(
+            policy={"generation": {"backend": "vllm"}},
+            ppo=SimpleNamespace(deduplicate_multimodal_data=True),
+        )
+        assert "data_plane" not in master_config.model_fields_set
+
+        _validate_multimodal_dedup_capability(master_config)

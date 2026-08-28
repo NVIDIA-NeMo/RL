@@ -65,6 +65,7 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
+from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     TOPO_RANK_UNKNOWN,
@@ -275,6 +276,12 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: PPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    # Declared so ``master_config.data_plane`` resolves. ``extra="allow"`` only
+    # exposes keys the config actually carried, and no shipped PPO config has a
+    # top-level ``data_plane`` block, so reading it undeclared is an
+    # AttributeError rather than the None this guard expects. grpo.py:424
+    # declares it the same way.
+    data_plane: Optional[DataPlaneConfig] = None
 
 
 # ===============================================================================
