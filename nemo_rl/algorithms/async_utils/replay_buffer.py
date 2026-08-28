@@ -1633,12 +1633,30 @@ class TQReplayBuffer:
 
         for group in groups:
             meta = group["meta"]
+            staging_keys: list[str] = []
+            for tag in meta.tags or []:
+                encoded_plan = tag.get(ROUTE_PLAN_TAG)
+                if encoded_plan is None:
+                    continue
+                from nemo_rl.experience.route_plan import decode_route_plan
+
+                staging_keys.extend(
+                    decode_route_plan(encoded_plan).cleanup_staging_keys
+                )
             self.meta_list.append(meta)
             self.start_weight_list.append(group["start_weight"])
             self.end_weight_list.append(group["end_weight"])
             self.target_step_list.append(group["target_step"])
             self.ready_list.append(True)
             self._group_ids.append(group["group_id"])
+            # Live token-capture reservations retain physical rollout IDs. Once a
+            # group is canonical, only stable sample IDs are durable and sufficient
+            # for replay ownership; staging cleanup is reconstructed from the route
+            # plans stored in canonical row tags.
+            self._rollout_ids_list.append(list(meta.sample_ids))
+            self._staging_keys_list.append(
+                list(dict.fromkeys(staging_keys)) if staging_keys else None
+            )
 
         print(
             f"📦 Restored {len(groups)} replay group(s) from checkpoint",
