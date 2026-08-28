@@ -565,14 +565,9 @@ class LossPostProcessor:
                 context_parallel_group=get_context_parallel_group(),
             )
             if "student_logits" in data_dict:
-                assert not (
-                    hasattr(self.loss_fn, "use_fused_linear_logprobs")
-                    and self.loss_fn.use_fused_linear_logprobs
-                ), (
-                    "Draft training needs full next-token logits for the "
-                    "teacher, which use_fused_linear_logprobs never "
-                    "materializes. Disable one of the two."
-                )
+                # draft + use_fused_linear_logprobs is rejected at setup in
+                # lm_policy.py (the fused path never materializes the full
+                # next-token logits the teacher needs), so no check here.
                 # Keep the draft head's packed logits out of the policy-loss
                 # data so the per-sequence packing slicers never see them.
                 student_logits = data_dict.pop("student_logits")

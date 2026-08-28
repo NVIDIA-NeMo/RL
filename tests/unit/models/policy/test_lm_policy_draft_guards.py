@@ -23,12 +23,14 @@ def _draft_config(
     context_parallel_size=1,
     pipeline_model_parallel_size=1,
     sequence_packing_enabled=True,
+    use_fused_linear_logprobs=False,
 ):
     return {
         "megatron_cfg": {
             "enabled": True,
             "context_parallel_size": context_parallel_size,
             "pipeline_model_parallel_size": pipeline_model_parallel_size,
+            "use_fused_linear_logprobs": use_fused_linear_logprobs,
         },
         "dtensor_cfg": {"enabled": False},
         "draft": {"enabled": True},
@@ -71,3 +73,16 @@ def test_draft_without_packing_allows_pipeline_parallelism_past_guard():
     except Exception:
         # Reaching config plumbing beyond the draft guards is sufficient.
         pass
+
+
+@pytest.mark.parametrize("sequence_packing_enabled", [True, False])
+def test_draft_with_fused_linear_logprobs_is_rejected(sequence_packing_enabled):
+    """Draft training must reject use_fused_linear_logprobs in both layouts:
+    the fused path never materializes the teacher's full next-token logits."""
+    with pytest.raises(ValueError, match="use_fused_linear_logprobs"):
+        _init_policy(
+            _draft_config(
+                sequence_packing_enabled=sequence_packing_enabled,
+                use_fused_linear_logprobs=True,
+            )
+        )

@@ -105,25 +105,16 @@ def pack_rolled_draft_token_mask(
     scaled by ``sample_mask``), laid out at each sequence's padded offset.
     Each sequence's last real slot (whose shifted target would cross the
     boundary) and all padding slots stay zero.
+
+    Reuses ``_pack_input_ids`` for the padded-offset layout (including its
+    clamp for bin-alignment padding absorbed into the last sequence's
+    effective length) and ``roll_packed_seq_dim`` for the boundary-safe
+    per-segment left shift.
     """
-    batch_size = token_mask.shape[0]
-    total_packed_len = int(cu_seqlens_padded[-1].item())
-    packed = torch.zeros(
-        total_packed_len, dtype=token_mask.dtype, device=token_mask.device
+    packed = _pack_input_ids(
+        token_mask * sample_mask.unsqueeze(-1), cu_seqlens, cu_seqlens_padded
     )
-    for i in range(batch_size):
-        actual_len = int((cu_seqlens[i + 1] - cu_seqlens[i]).item())
-        packed_start = int(cu_seqlens_padded[i].item())
-        # The packer absorbs bin-level alignment padding into the last
-        # sequence's effective length (see _pack_input_ids), so cu_seqlens can
-        # exceed the unpacked row width; only real tokens carry mask.
-        copy_len = min(actual_len, token_mask.shape[1])
-        if copy_len <= 1:
-            continue
-        packed[packed_start : packed_start + copy_len - 1] = (
-            token_mask[i, 1:copy_len] * sample_mask[i]
-        )
-    return packed.unsqueeze(0)
+    return roll_packed_seq_dim(packed, cu_seqlens_padded, seq_dim=1)
 
 
 def prepare_loss_input(

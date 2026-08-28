@@ -134,6 +134,27 @@ def test_roll_packed_seq_dim_respects_segment_boundaries():
     assert torch.equal(rolled, expected)
 
 
+def test_pack_rolled_draft_token_mask_clamps_inflated_last_segment():
+    """The packer absorbs bin-alignment padding into the last sequence's
+    effective length, so cu_seqlens can exceed the unpacked row width; only
+    the real tokens may carry mask."""
+    from nemo_rl.algorithms.loss.utils import pack_rolled_draft_token_mask
+
+    token_mask = torch.tensor([[0.0, 1.0, 1.0]])  # row width 3
+    sample_mask = torch.ones(1)
+    cu_seqlens = torch.tensor([0, 5])  # inflated past the row width
+    cu_seqlens_padded = torch.tensor([0, 8])
+
+    packed = pack_rolled_draft_token_mask(
+        token_mask, sample_mask, cu_seqlens, cu_seqlens_padded
+    )
+
+    # Left-shifted real mask at the segment start; every slot past the real
+    # tokens (including the inflated tail) stays zero.
+    expected = torch.tensor([[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    assert torch.equal(packed, expected)
+
+
 def _zero_policy_loss(
     next_token_logits, data, global_valid_seqs, global_valid_toks, **kwargs
 ):
