@@ -342,7 +342,12 @@ def test_single_controller_and_nemotron_service_ports_are_isolated(config_path):
         ),
     )
 
-    assert 1201 < router_range[0] < router_range[1] <= 1301
+    assert (
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+        <= router_range[0]
+        < router_range[1]
+        <= DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
+    )
     assert DEFAULT_MASTER_PORT_RANGE_LOW <= master_range[0] < master_range[1]
     assert master_range[1] <= DEFAULT_MASTER_PORT_RANGE_HIGH
     assert (
