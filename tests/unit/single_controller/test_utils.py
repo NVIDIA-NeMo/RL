@@ -220,7 +220,17 @@ class TestReduceAdvantagePumpMetrics:
         assert out["num_assistant_messages"] == pytest.approx(4.0)
 
     def test_no_assistant_messages_omits_violation_metrics(self) -> None:
-        assert reduce_advantage_pump_metrics([], [], [], [0], [0], [0]) == {}
+        assert (
+            reduce_advantage_pump_metrics(
+                [],
+                [],
+                [],
+                num_invalid_tool_calls=[0],
+                num_malformed_thinking=[0],
+                num_assistant_messages=[0],
+            )
+            == {}
+        )
 
 
 class TestFieldsForPut:
