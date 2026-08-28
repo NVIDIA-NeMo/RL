@@ -89,6 +89,7 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.sglang import SGLangGeneration
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
@@ -1667,6 +1668,22 @@ def test_async_resume_plumbs_frontier_metadata_into_collector(
             },
             False,
         ),
+        (
+            {
+                "backend": "sglang",
+                "use_async_rollouts": True,
+                "vllm_cfg": {"async_engine": False},
+            },
+            True,
+        ),
+        (
+            {
+                "backend": "sglang",
+                "use_async_rollouts": False,
+                "vllm_cfg": {"async_engine": True},
+            },
+            False,
+        ),
         ({"backend": "megatron", "mcore_generation_config": {}}, True),
     ],
 )
@@ -1697,6 +1714,58 @@ def test_should_use_nemo_gym_accepts_megatron_always_async():
     }
 
     assert should_use_nemo_gym(master_config)
+
+
+def test_sglang_async_grpo_reaches_training_and_refit(mock_grpo_components):
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"].update(
+        {
+            "backend": "sglang",
+            "use_async_rollouts": True,
+            # An inherited inactive block must not select vLLM behavior.
+            "vllm_cfg": {"async_engine": False},
+            "colocated": {"enabled": False},
+        }
+    )
+
+    policy_generation = MagicMock(spec=SGLangGeneration)
+    policy_generation.weight_synchronizer = None
+    policy_generation.requires_kv_scale_sync = False
+    policy_generation.get_logger_metrics.return_value = {}
+    policy_generation.blocks_training.return_value = False
+    policy_generation.wake_carries_weight_updates.return_value = False
+
+    with (
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        _patched_logprob_phase(policy),
+        patch("nemo_rl.algorithms.grpo.refit_policy_generation") as refit,
+    ):
+        async_grpo_train(
+            policy,
+            policy_generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    policy.train.assert_called_once()
+    assert refit.call_count >= 1
 
 
 @pytest.mark.parametrize("backend", ["dynamo", "vllm"])
@@ -2763,6 +2832,7 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
         env_configs=master_config.env,
         base_urls=["http://dynamo-wrapper.example/v1"],
         model_name=master_config.policy["model_name"],
+        generation_backend="dynamo",
         tokenizer=tokenizer,
         enable_router_replay=False,
         routed_experts_dtype="int16",
@@ -3137,6 +3207,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         env_configs=master_config.env,
         base_urls=["http://trtllm.example/v1"],
         model_name="test-model",
+        generation_backend="trtllm",
         tokenizer=tokenizer,
         enable_router_replay=False,
         routed_experts_dtype="int16",

@@ -27,6 +27,7 @@ Model: Qwen/Qwen3-0.6B
 
 import asyncio
 import gc
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -34,6 +35,9 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.generation.sglang import (
+    sglang_generation as sglang_generation_module,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 
 from .helpers import (
@@ -216,6 +220,7 @@ def _make_minimal_sglang_gen_for_clamp_test(
 ):
     sglang_gen = SGLangGeneration.__new__(SGLangGeneration)
     sglang_gen.all_engines = []
+    sglang_gen._health_monitor = None
     sglang_gen._router_actor = None
     sglang_gen._http_client = None
     sglang_gen.sglang_cfg = _make_sglang_generation_cfg()
@@ -226,6 +231,84 @@ def _make_minimal_sglang_gen_for_clamp_test(
     ] = 1
     sglang_gen._async_loop = _ImmediateAsyncLoop()
     return sglang_gen
+
+
+def test_nemo_gym_url_uses_stable_router():
+    generation = SGLangGeneration.__new__(SGLangGeneration)
+    generation.router_ip = "[2001:db8::1]"
+    generation.router_port = 31000
+
+    assert generation.dp_openai_server_base_urls == ["http://[2001:db8::1]:31000"]
+
+
+def test_pickle_copy_cannot_shutdown_driver_runtime(monkeypatch):
+    class _LocalLoop:
+        def __init__(self):
+            self.closed = False
+
+        def run(self, coroutine):
+            return asyncio.run(coroutine)
+
+        def close(self):
+            self.closed = True
+
+    class _LocalClient:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    owner = SGLangGeneration.__new__(SGLangGeneration)
+    owner.sglang_cfg = _make_sglang_generation_cfg()
+    owner.cfg = owner.sglang_cfg
+    owner._owns_runtime = True
+    owner._http_client = object()
+    owner._async_loop = object()
+    owner._health_monitor = MagicMock()
+    owner.weight_synchronizer = MagicMock()
+    owner.rollout_engine_lock = MagicMock()
+    owner.all_engines = [MagicMock()]
+    owner._router_actor = MagicMock()
+
+    state = owner.__getstate__()
+
+    assert state["_owns_runtime"] is False
+    assert state["_http_client"] is None
+    assert state["_async_loop"] is None
+    assert state["_health_monitor"] is None
+    assert state["weight_synchronizer"] is None
+    assert state["rollout_engine_lock"] is None
+    assert owner._owns_runtime is True
+
+    local_loop = _LocalLoop()
+    local_client = _LocalClient()
+    monkeypatch.setattr(
+        sglang_generation_module,
+        "AsyncLoopThread",
+        lambda: local_loop,
+    )
+    monkeypatch.setattr(
+        sglang_generation_module,
+        "HttpClient",
+        lambda _config: local_client,
+    )
+
+    restored = SGLangGeneration.__new__(SGLangGeneration)
+    restored.__setstate__(state)
+
+    assert restored.shutdown()
+    owner._health_monitor.stop.assert_not_called()
+    owner.weight_synchronizer.shutdown.assert_not_called()
+    owner.all_engines[0].shutdown.remote.assert_not_called()
+    owner._router_actor.stop.remote.assert_not_called()
+    assert local_client.closed
+    assert local_loop.closed
+
+    # Prevent this synthetic owner from touching actor mocks during GC.
+    owner._owns_runtime = False
+    owner._http_client = None
+    owner._async_loop = None
 
 
 # ===================================================================

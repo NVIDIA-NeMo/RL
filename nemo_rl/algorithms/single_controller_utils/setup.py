@@ -529,6 +529,7 @@ def _spinup_gym(
         env_configs=master_config.env,
         base_urls=base_urls,
         model_name=generation_config["model_name"],
+        generation_backend=generation_config["backend"],
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,

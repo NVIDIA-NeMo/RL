@@ -960,6 +960,10 @@ class AsyncTrajectoryCollector:
                 "synchronous engine path (async_engine=false) is no longer supported."
             )
             is_async_engine = True
+        elif backend == "sglang":
+            # SGLang collects asynchronously, but its refit protocol pauses the
+            # rollout engines and cannot overlap pending generation requests.
+            is_async_engine = False
         elif backend == "dynamo":
             # Dynamo's native layerwise reload temporarily materializes model
             # parameters while the NCCL update is in progress.  It is not safe
