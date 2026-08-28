@@ -645,6 +645,7 @@ def test_single_rank_vllm_model_parallel_cleans_partial_setup_failures(
     [
         (True, False, False),
         (False, True, False),
+        (False, False, True),
         (False, True, True),
     ],
 )
@@ -677,6 +678,31 @@ def test_single_rank_vllm_model_parallel_refuses_caller_owned_state(
     assert state["pg_initialized"] is preexisting_process_group
     assert state["vllm_dist_initialized"] is preexisting_vllm_distributed
     assert state["model_parallel_initialized"] is preexisting_model_parallel
+    assert not state["rendezvous_path"].exists()
+
+
+def test_single_rank_vllm_model_parallel_cleans_fixture_owned_state_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = _install_fake_vllm_model_parallel_modules(
+        monkeypatch,
+        tmp_path=tmp_path,
+    )
+
+    with _single_rank_vllm_model_parallel(tmp_path=tmp_path, vllm_config=object()):
+        assert state["pg_initialized"]
+        assert state["vllm_dist_initialized"]
+        assert state["model_parallel_initialized"]
+        assert state["rendezvous_path"].exists()
+
+    assert state["cleanup_calls"] == 1
+    assert state["destroy_process_group_calls"] == 0
+    assert state["config_entries"] == 1
+    assert state["config_exits"] == 1
+    assert not state["pg_initialized"]
+    assert not state["vllm_dist_initialized"]
+    assert not state["model_parallel_initialized"]
     assert not state["rendezvous_path"].exists()
 
 
