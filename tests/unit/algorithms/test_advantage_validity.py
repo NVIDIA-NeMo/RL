@@ -16,12 +16,16 @@
 
 import torch
 
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    GRPOAdvantageEstimator,
+)
 
 
 def _estimator(**overrides) -> GRPOAdvantageEstimator:
-    config = {"use_leave_one_out_baseline": False, "normalize_rewards": False}
-    config.update(overrides)
+    config = AdvEstimatorConfig.model_construct(
+        use_leave_one_out_baseline=False, normalize_rewards=False, **overrides
+    )
     return GRPOAdvantageEstimator(config, loss_config=None)
 
 
