@@ -60,6 +60,7 @@ def _native_refit_info() -> dict[str, Any]:
 def _native_binding_refit_info() -> dict[str, Any]:
     hidden_size = 32
     intermediate_size = 64
+    expert_intermediate_size = 32
     num_experts = 4
     destination_mesh = SimpleNamespace(mesh=torch.arange(2))
 
@@ -116,17 +117,17 @@ def _native_binding_refit_info() -> dict[str, Any]:
                 ),
                 parameter(
                     f"{prefix}.experts.gate_proj.weight",
-                    (num_experts, intermediate_size, hidden_size),
+                    (num_experts, expert_intermediate_size, hidden_size),
                     grouped_expert_proj="gate_proj",
                 ),
                 parameter(
                     f"{prefix}.experts.up_proj.weight",
-                    (num_experts, intermediate_size, hidden_size),
+                    (num_experts, expert_intermediate_size, hidden_size),
                     grouped_expert_proj="up_proj",
                 ),
                 parameter(
                     f"{prefix}.experts.down_proj.weight",
-                    (num_experts, hidden_size, intermediate_size),
+                    (num_experts, hidden_size, expert_intermediate_size),
                     grouped_expert_proj="down_proj",
                 ),
             ]

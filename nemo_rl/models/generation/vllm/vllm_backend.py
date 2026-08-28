@@ -1478,6 +1478,7 @@ class VllmInternalWorkerExtension:
                 _receive_misc()
                 adapter.finish_update()
                 self._maybe_process_mtp_drafter_after_loading()
+                torch.cuda.synchronize()
             except BaseException as error:
                 adapter.abort_update(error)
                 raise

@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 import torch
+from torch.distributed._tensor import Shard
+from torch.distributed.tensor.placement_types import Replicate
 
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     LocalParamSpec,
@@ -126,6 +128,7 @@ class Vllm0251RefitAdapter:
         self._model_config = model_config
         self._device = device
         self._expected_components: frozenset[tuple[str, str]] = frozenset()
+        self._expected_local_shapes: dict[tuple[str, str], tuple[int, ...]] = {}
         self._loaded_components: set[tuple[str, str]] = set()
         self._native_bindings: dict[str, _NativeDestinationBinding] = {}
         self._bridged_target_ids: set[int] = set()
@@ -157,6 +160,9 @@ class Vllm0251RefitAdapter:
                 # metadata for concrete Task 7 destination binding.
                 self._expected_components = frozenset(component_keys)
             self._native_bindings = self._prepare_native_bindings(
+                refit_info, native_names
+            )
+            self._expected_local_shapes = _expected_local_component_shapes(
                 refit_info, native_names
             )
         except BaseException as error:
@@ -252,7 +258,13 @@ class Vllm0251RefitAdapter:
                     f"vLLM checkpoint destination {target_name!r} for {component!r} "
                     f"has dtype {target.dtype}, expected {expected_dtype}"
                 )
-            self._validate_local_component_shape(binding, role, region)
+            expected_shape = self._expected_local_shapes.get(component)
+            if expected_shape is None:
+                raise ValueError(
+                    f"vLLM refit component {component!r} has no destination "
+                    "shape derived from Task 2 metadata"
+                )
+            self._validate_local_component_shape(binding, role, region, expected_shape)
             self._install_local_loader_bridge(target_name, target)
         except BaseException as error:
             self.abort_update(error)
@@ -451,25 +463,13 @@ class Vllm0251RefitAdapter:
         binding: _NativeDestinationBinding,
         role: str,
         region: torch.Tensor,
+        expected_shape: tuple[int, ...],
     ) -> None:
-        value_target = dict(self._model_runner.model.named_parameters()).get(
-            binding.value_name
-        )
-        if value_target is None:
-            raise ValueError(
-                f"vLLM checkpoint value {binding.value_name!r} is missing for "
-                f"{binding.logical_name!r}"
-            )
-        value_region = _destination_region(value_target, binding.merged_slice)
-        expected_shape = (
-            tuple(value_region.shape)
-            if role == "weight"
-            else (*value_region.shape[:-1], value_region.shape[-1] // 32)
-        )
-        if tuple(region.shape) != tuple(expected_shape):
+        if tuple(region.shape) != expected_shape:
             raise ValueError(
                 f"vLLM checkpoint destination for {(binding.logical_name, role)!r} "
-                f"has shape {tuple(region.shape)}, expected {tuple(expected_shape)}"
+                f"has local shape {tuple(region.shape)}, expected {expected_shape} "
+                "from Task 2 destination geometry"
             )
 
     def _install_local_loader_bridge(
@@ -825,6 +825,72 @@ def _shape_tuple(value: Any, logical_name: str, role: str) -> tuple[int, ...]:
     return tuple(value)
 
 
+def _expected_local_component_shapes(
+    refit_info: Mapping[str, Any],
+    native_names: set[str],
+) -> dict[tuple[str, str], tuple[int, ...]]:
+    """Derive local receive shapes only from Task 2 mesh metadata."""
+    components = _component_metadata(refit_info)
+    parameters = _parameter_info_by_name(refit_info)
+    result: dict[tuple[str, str], tuple[int, ...]] = {}
+    for logical_name in native_names:
+        param_info = parameters[logical_name]
+        mesh = param_info.get("dst_mesh_info")
+        mesh_tensor = getattr(mesh, "mesh", None)
+        if mesh_tensor is None:
+            mesh_tensor = getattr(mesh, "_mesh", None)
+        if not isinstance(mesh_tensor, torch.Tensor) or mesh_tensor.numel() == 0:
+            raise ValueError(f"{logical_name!r} has no valid Task 2 destination mesh")
+        mesh_shape = tuple(int(size) for size in mesh_tensor.shape)
+        for role in ("weight", "weight_scale"):
+            component = components[(logical_name, role)]
+            global_shape = _shape_tuple(
+                component.get("global_shape"), logical_name, role
+            )
+            placements = component.get(
+                "dst_placements", param_info.get("dst_placements")
+            )
+            if not isinstance(placements, Sequence) or isinstance(
+                placements, (str, bytes)
+            ):
+                raise ValueError(
+                    f"{logical_name!r} {role} has no Task 2 destination placements"
+                )
+            if len(placements) != len(mesh_shape):
+                raise ValueError(
+                    f"{logical_name!r} {role} has {len(placements)} destination "
+                    f"placements for a rank-{len(mesh_shape)} mesh"
+                )
+            shard_counts: dict[int, int] = {}
+            for mesh_dim, placement in enumerate(placements):
+                if isinstance(placement, Replicate):
+                    continue
+                if not isinstance(placement, Shard):
+                    raise ValueError(
+                        f"{logical_name!r} {role} has unsupported destination "
+                        f"placement {placement!r}"
+                    )
+                if not 0 <= placement.dim < len(global_shape):
+                    raise ValueError(
+                        f"{logical_name!r} {role} shards dimension "
+                        f"{placement.dim} outside rank {len(global_shape)}"
+                    )
+                shard_counts[placement.dim] = (
+                    shard_counts.get(placement.dim, 1) * mesh_shape[mesh_dim]
+                )
+            local_shape = list(global_shape)
+            for tensor_dim, shard_count in shard_counts.items():
+                if local_shape[tensor_dim] % shard_count:
+                    raise ValueError(
+                        f"{logical_name!r} {role} global dimension "
+                        f"{local_shape[tensor_dim]} is not evenly divisible by "
+                        f"destination shard count {shard_count}"
+                    )
+                local_shape[tensor_dim] //= shard_count
+            result[(logical_name, role)] = tuple(local_shape)
+    return result
+
+
 def _parameter_info_by_name(
     refit_info: Mapping[str, Any],
 ) -> dict[str, Mapping[str, Any]]:
@@ -957,9 +1023,13 @@ def _resolve_vllm_value_destinations(
             value_name = to_vllm_name(f"{prefix}gate_up_proj.weight")
             value = vllm_params.get(value_name)
             if value is not None:
-                tp_size = refit_info.get("gen_tp_size", 1)
-                gate_local = hf_shapes[f"{prefix}gate_proj.weight"][0] // tp_size
-                up_local = hf_shapes[f"{prefix}up_proj.weight"][0] // tp_size
+                if value.shape[0] % 2:
+                    raise ValueError(
+                        f"vLLM fused destination {value_name!r} has odd output "
+                        f"dimension {value.shape[0]}"
+                    )
+                gate_local = value.shape[0] // 2
+                up_local = value.shape[0] - gate_local
                 output_slice = (
                     slice(0, gate_local)
                     if is_gate
