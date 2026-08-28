@@ -3132,7 +3132,12 @@ class SingleControllerActor:
     async def _value_train_epochs(
         self, meta: KVBatchMeta, *, num_epochs: int
     ) -> dict[str, Any]:
-        """Run consecutive critic epochs under one model onload/offload cycle."""
+        """Run consecutive critic epochs under one model onload/offload cycle.
+
+        Returns:
+            The final epoch's ``train_from_meta`` output; earlier epochs'
+            results are discarded.
+        """
         if num_epochs < 1:
             raise ValueError("num_epochs must be at least 1")
 

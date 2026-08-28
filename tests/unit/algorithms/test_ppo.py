@@ -665,6 +665,13 @@ def test_ppo_config_rejects_fewer_critic_epochs_than_actor_epochs():
         PPOConfig(ppo_epochs=2, critic_ppo_epochs=1)
 
 
+def test_ppo_config_rejects_zero_ppo_epochs():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="ppo_epochs must be at least 1"):
+        PPOConfig(ppo_epochs=0)
+
+
 def test_create_advantage_estimator_rejects_unsupported_name():
     """The factory still guards names that skipped schema validation.
 
@@ -1134,6 +1141,28 @@ def test_ppo_train_runs_extra_critic_epochs_without_extra_actor_updates(
         "policy_train",
         "policy_train",
     ]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ppo_train_critic_keeps_extra_epochs_during_policy_warmup(
+    monkeypatch, async_mode
+):
+    harness = _run_mock_ppo_train(
+        monkeypatch,
+        async_mode=async_mode,
+        max_num_steps=2,
+        ppo_epochs=2,
+        critic_ppo_epochs=3,
+        seq_logprob_error_threshold=None,
+        policy_training_start_step=1,
+    )
+
+    # Step 0 is critic-only warmup; step 1 trains both. The critic always
+    # runs all 3 epochs, independent of the policy warmup gate.
+    assert harness.value_model.train.call_count == 6
+    assert harness.policy.train.call_count == 2
+    assert harness.value_model.prepare_for_training.call_count == 2
+    assert harness.policy.prepare_for_training.call_count == 1
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
