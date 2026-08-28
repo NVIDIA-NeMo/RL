@@ -30,6 +30,17 @@ _QKVO_RE = re.compile(
 )
 
 _BF16_ONLY_SCOPES = ("shared_experts", "router", "qkvo", "lm_head")
+_OPTIONAL_BF16_SCOPES = {"qwen30": frozenset(("shared_experts",)), "nano": frozenset()}
+_MODEL_ROUTED_LAYER_COUNTS = {"qwen30": 48, "nano": 52}
+_ROUTED_MODULES = frozenset(("FC1", "FC2"))
+_EXPECTED_ROUTED_MODULES = {
+    model_scope: frozenset(
+        (layer, module)
+        for layer in range(layer_count)
+        for module in _ROUTED_MODULES
+    )
+    for model_scope, layer_count in _MODEL_ROUTED_LAYER_COUNTS.items()
+}
 
 
 def _scope_for_name(name: str) -> str:
@@ -49,6 +60,21 @@ def _scope_for_name(name: str) -> str:
 def _layer_number(name: str) -> int | None:
     match = _LAYER_RE.search(name)
     return int(match.group(1)) if match is not None else None
+
+
+def _routed_module_key(name: str) -> tuple[int, str]:
+    layer = _layer_number(name)
+    if layer is None:
+        raise ValueError(f"Routed-expert entry {name!r} has no layer number")
+    if name.endswith((".gate_proj.weight", ".up_proj.weight", ".linear_fc1.weight")):
+        return layer, "FC1"
+    if name.endswith((".down_proj.weight", ".linear_fc2.weight")):
+        return layer, "FC2"
+    raise ValueError(f"Routed-expert entry {name!r} is not an FC1 or FC2 weight")
+
+
+def _format_routed_module(module: tuple[int, str]) -> str:
+    return f"layer {module[0]} {module[1]}"
 
 
 def _validate_native_components(name: str, metadata: Mapping[str, Any]) -> None:
@@ -82,18 +108,15 @@ def assert_native_mxfp8_storage_inventory(
         scope: {"native": 0, "bf16": 0}
         for scope in (*_BF16_ONLY_SCOPES, "routed_experts", "other")
     }
-    routed_native_layers: set[int] = set()
-    routed_bf16_layers: set[int] = set()
+    routed_native_modules: set[tuple[int, str]] = set()
+    routed_bf16_modules: set[tuple[int, str]] = set()
 
     for name, metadata in native_metadata.items():
         scope = _scope_for_name(name)
         _validate_native_components(name, metadata)
         scope_counts[scope]["native"] += 1
         if scope == "routed_experts":
-            layer = _layer_number(name)
-            if layer is None:
-                raise ValueError(f"Native routed-expert entry {name!r} has no layer number")
-            routed_native_layers.add(layer)
+            routed_native_modules.add(_routed_module_key(name))
 
     for name, metadata in misc_metadata.items():
         scope = _scope_for_name(name)
@@ -101,39 +124,66 @@ def assert_native_mxfp8_storage_inventory(
             continue
         scope_counts[scope]["bf16"] += 1
         if scope == "routed_experts":
-            layer = _layer_number(name)
-            if layer is None:
-                raise ValueError(f"BF16 routed-expert entry {name!r} has no layer number")
-            routed_bf16_layers.add(layer)
+            routed_bf16_modules.add(_routed_module_key(name))
 
     if scope_counts["other"]["native"]:
         raise ValueError("Native MXFP8 inventory contains an unsupported module scope")
     if not scope_counts["routed_experts"]["native"]:
         raise ValueError("Native MXFP8 inventory has no routed experts")
 
-    required_bf16_scopes = set(_BF16_ONLY_SCOPES)
-    if model_scope == "qwen30":
-        required_bf16_scopes.remove("shared_experts")
-    for scope in required_bf16_scopes:
+    for scope in _BF16_ONLY_SCOPES:
         if scope_counts[scope]["native"]:
             raise ValueError(f"Native MXFP8 inventory {scope} entries must remain BF16")
-        if not scope_counts[scope]["bf16"]:
+        if (
+            scope not in _OPTIONAL_BF16_SCOPES[model_scope]
+            and not scope_counts[scope]["bf16"]
+        ):
             raise ValueError(f"Native MXFP8 inventory {scope} BF16 entries are missing")
 
-    all_routed_layers = routed_native_layers | routed_bf16_layers
-    if num_layers_at_end_in_bf16:
-        if not all_routed_layers:
-            raise ValueError("Native MXFP8 inventory cannot determine routed-expert layers")
-        last_layer = max(all_routed_layers)
-        expected_last_layers = set(
-            range(last_layer - num_layers_at_end_in_bf16 + 1, last_layer + 1)
+    expected_modules = _EXPECTED_ROUTED_MODULES[model_scope]
+    layer_count = _MODEL_ROUTED_LAYER_COUNTS[model_scope]
+    if not 0 <= num_layers_at_end_in_bf16 <= layer_count:
+        raise ValueError(
+            f"Native MXFP8 inventory final BF16 layer count must be in [0, {layer_count}]"
         )
-        if expected_last_layers & routed_native_layers:
-            raise ValueError("Native MXFP8 inventory final routed-expert layers must remain BF16")
-        if not expected_last_layers <= routed_bf16_layers:
-            raise ValueError("Native MXFP8 inventory final BF16 routed-expert layers are missing")
-    else:
-        expected_last_layers = set()
+    expected_last_layers = frozenset(
+        range(layer_count - num_layers_at_end_in_bf16, layer_count)
+    )
+    expected_bf16_modules = frozenset(
+        (layer, module)
+        for layer in expected_last_layers
+        for module in _ROUTED_MODULES
+    )
+    expected_native_modules = expected_modules - expected_bf16_modules
+    observed_modules = routed_native_modules | routed_bf16_modules
+    unexpected_modules = observed_modules - expected_modules
+    if unexpected_modules:
+        raise ValueError(
+            "Native MXFP8 inventory has an unexpected routed module "
+            f"{_format_routed_module(min(unexpected_modules))}"
+        )
+
+    for expected_storage, required_modules, observed_modules_for_storage in (
+        ("native", expected_native_modules, routed_native_modules),
+        ("BF16", expected_bf16_modules, routed_bf16_modules),
+    ):
+        missing_modules = required_modules - observed_modules_for_storage
+        if missing_modules:
+            raise ValueError(
+                "Native MXFP8 inventory routed "
+                f"{_format_routed_module(min(missing_modules))} must be {expected_storage}"
+            )
+
+    for forbidden_storage, forbidden_modules, observed_modules_for_storage in (
+        ("BF16", expected_native_modules, routed_bf16_modules),
+        ("native", expected_bf16_modules, routed_native_modules),
+    ):
+        wrong_modules = forbidden_modules & observed_modules_for_storage
+        if wrong_modules:
+            raise ValueError(
+                "Native MXFP8 inventory routed "
+                f"{_format_routed_module(min(wrong_modules))} must not be {forbidden_storage}"
+            )
 
     inventory: dict[str, dict[str, int | list[int]]] = {}
     for scope, counts in scope_counts.items():

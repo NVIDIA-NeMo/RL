@@ -94,8 +94,9 @@ with E4M3 values and `torch.uint8` E8M0 scales. It must also prove one vLLM
 reload initialization and finalization per refit, no BF16 receiver
 quantization for native components, and a Qwen value-changing second refit.
 
-The current worker validates native source tensor dtype, compact scale layout,
-and swizzled-scale rejection before the collective. It does not yet emit a
-complete per-module BF16/native storage inventory. Record the inspected
-routed-FC1/FC2 native entries and BF16 ignored entries in the Task 10 results
-artifact before treating a smoke as evidence.
+The worker validates native source tensor dtype, compact scale layout, and
+swizzled-scale rejection before the collective. For the true-arm smoke it also
+emits `[native-mxfp8-inventory]` with the complete task-owned routed FC1/FC2
+and BF16 ignored-scope inventory, and exits nonzero on any mismatch. Preserve
+that JSON record in the Task 10 results artifact; no manual reconstruction of
+the module storage scope is required.
