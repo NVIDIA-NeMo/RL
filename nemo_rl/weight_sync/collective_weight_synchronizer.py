@@ -87,6 +87,10 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         train_cluster: RayVirtualCluster for the training workers, used to
             obtain the master address/port and world size for collective init.
         inference_cluster: RayVirtualCluster for the inference workers.
+        refit_timeout_s: Deadline for one refit collective. Each participating worker
+            arms a watchdog and aborts its own communicator when it expires, which is
+            what lets the controller rebuild over the survivors instead of blocking in
+            NCCL forever. ``None`` disarms it entirely, so the hang protection is lost.
     """
 
     def __init__(
