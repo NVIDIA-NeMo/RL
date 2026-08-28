@@ -15,7 +15,8 @@
 """Unit tests for automodel setup utilities."""
 
 import os
-from unittest.mock import MagicMock, Mock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, create_autospec, patch
 
 import pytest
 
@@ -26,7 +27,9 @@ except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
 import torch
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
+from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.config import DistributedContext
 from nemo_rl.models.automodel.setup import (
     ModelAndOptimizerState,
@@ -40,6 +43,7 @@ from nemo_rl.models.automodel.setup import (
 )
 
 
+@pytest.mark.automodel
 def test_token_classification_backport_still_required():
     with pytest.raises(ImportError):
         from nemo_automodel import NeMoAutoModelForTokenClassification  # noqa: F401
@@ -955,6 +959,32 @@ class TestSetupModelAndOptimizer:
         )
         # Verify config= is NOT passed (avoids duplicate arg for custom models)
         assert "config" not in call_kwargs
+
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    def test_restore_from_without_lora_enabled_raises(
+        self,
+        mock_get_rank,
+        mock_config,
+        mock_runtime_config,
+        mock_distributed_context,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+    ):
+        """restore_from with LoRA disabled must fail loudly, not silently no-op."""
+        mock_get_rank.return_value = 0
+        mock_config["dtensor_cfg"]["lora_cfg"] = {
+            "enabled": False,
+            "restore_from": "/donor/step_5/policy/weights",
+        }
+
+        with pytest.raises(ValueError, match="lora_cfg.restore_from is set"):
+            setup_model_and_optimizer(
+                config=mock_config,
+                tokenizer=mock_tokenizer,
+                runtime_config=mock_runtime_config,
+                distributed_context=mock_distributed_context,
+                checkpoint_manager=mock_checkpoint_manager,
+            )
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
@@ -2129,6 +2159,7 @@ class TestGetTokenizer:
         mock_nemo_auto_tokenizer.from_pretrained.assert_called_once()
 
 
+@pytest.mark.automodel
 class TestMaybeSetForceHf:
     """Tests for _maybe_set_force_hf adapter compatibility check."""
 
@@ -2290,3 +2321,590 @@ def test_automodel_dtype_restore_workaround_still_needed(monkeypatch):
         "_disable_automodel_checkpoint_dtype_restore() workaround in setup.py is obsolete - "
         "remove it and this test."
     )
+
+
+class _TinyLoraModel(torch.nn.Module):
+    """Tiny module with one LoRA-adapted linear for warm-start tests."""
+
+    def __init__(self):
+        from nemo_automodel.components._peft.lora import LinearLoRA
+
+        super().__init__()
+        self.layer = LinearLoRA(torch.nn.Linear(4, 8), dim=2, alpha=4)
+
+
+class _IdentityStateDictAdapter:
+    """Minimal custom adapter that preserves state-dict keys."""
+
+    @staticmethod
+    def to_hf(state_dict, **kwargs):
+        return state_dict
+
+
+class _TinyQwen3MoeLoraModel(torch.nn.Module):
+    """Minimal native Qwen3-MoE LoRA key layout for adapter-key tests."""
+
+    def __init__(self, *, ep_size=1):
+        from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import (
+            Qwen3MoeStateDictAdapter,
+        )
+
+        super().__init__()
+        experts = torch.nn.Module()
+        experts.ep_size = ep_size
+        experts.register_parameter(
+            "lora_gate_and_up_A", torch.nn.Parameter(torch.empty(2, 4, 2))
+        )
+        experts.register_parameter(
+            "lora_gate_and_up_B", torch.nn.Parameter(torch.empty(2, 2, 6))
+        )
+        experts.register_parameter(
+            "lora_down_A", torch.nn.Parameter(torch.empty(2, 3, 2))
+        )
+        experts.register_parameter(
+            "lora_down_B", torch.nn.Parameter(torch.empty(2, 2, 4))
+        )
+        mlp = torch.nn.Module()
+        mlp.add_module("experts", experts)
+        layer = torch.nn.Module()
+        layer.add_module("mlp", mlp)
+        inner_model = torch.nn.Module()
+        inner_model.add_module("layers", torch.nn.ModuleList([layer]))
+        self.add_module("model", inner_model)
+        self.state_dict_adapter = Qwen3MoeStateDictAdapter(
+            config=SimpleNamespace(),
+            moe_config=SimpleNamespace(n_routed_experts=2),
+            backend=SimpleNamespace(),
+        )
+
+
+_QWEN3_MOE_HF_LORA_KEYS = (
+    "base_model.model.model.layers.0.mlp.experts.base_layer.lora_B.weight",
+    "base_model.model.model.layers.0.mlp.experts.base_layer.lora_A.weight",
+    "base_model.model.model.layers.0.mlp.experts.lora_B.weight",
+    "base_model.model.model.layers.0.mlp.experts.lora_A.weight",
+)
+
+
+def _write_adapter_checkpoint(
+    adapter_dir,
+    *,
+    dim=2,
+    alpha=4,
+    base_model_name_or_path="tiny-model",
+    keys=("layer.lora_A.weight", "layer.lora_B.weight"),
+    peft_type="LORA",
+    fill=1.0,
+):
+    """Write a minimal HF-PEFT-style adapter checkpoint (config + safetensors).
+
+    Tensors are filled with a non-zero value so a test cannot confuse
+    "loaded the donor" with "left the zero-init adapters alone".
+    """
+    import json as _json
+
+    from safetensors.torch import save_file
+
+    os.makedirs(adapter_dir, exist_ok=True)
+    tensors = {}
+    for key in keys:
+        shape = (2, 4) if "lora_A" in key else (8, 2)
+        tensors[key] = torch.full(shape, fill)
+    save_file(tensors, os.path.join(adapter_dir, "adapter_model.safetensors"))
+    with open(os.path.join(adapter_dir, "adapter_config.json"), "w") as f:
+        _json.dump(
+            {
+                "peft_type": peft_type,
+                "r": dim,
+                "lora_alpha": alpha,
+                "base_model_name_or_path": base_model_name_or_path,
+                "target_modules": ["layer"],
+            },
+            f,
+        )
+
+
+def _lora_cfg(dim=2, alpha=4):
+    return {
+        "enabled": True,
+        "target_modules": [],
+        "exclude_modules": [],
+        "match_all_linear": True,
+        "dim": dim,
+        "alpha": alpha,
+        "dropout": 0.0,
+        "dropout_position": "post",
+        "lora_A_init": "xavier",
+    }
+
+
+@pytest.mark.automodel
+class TestResolveLoraAdapterDir:
+    def test_direct_adapter_dir(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _resolve_lora_adapter_dir
+
+        _write_adapter_checkpoint(tmp_path / "adapter")
+        assert _resolve_lora_adapter_dir(str(tmp_path / "adapter")) == str(
+            tmp_path / "adapter"
+        )
+
+    def test_weights_dir_with_model_subdir(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _resolve_lora_adapter_dir
+
+        weights_dir = tmp_path / "step_5" / "policy" / "weights"
+        _write_adapter_checkpoint(weights_dir / "model")
+        assert _resolve_lora_adapter_dir(str(weights_dir)) == str(weights_dir / "model")
+
+    def test_missing_adapter_file_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _resolve_lora_adapter_dir
+
+        with pytest.raises(FileNotFoundError, match="adapter_model.safetensors"):
+            _resolve_lora_adapter_dir(str(tmp_path))
+
+
+@pytest.mark.automodel
+class TestValidateLoraAdapterConfig:
+    def test_matching_config_passes(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_config
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir)
+        _validate_lora_adapter_config(
+            str(adapter_dir), _lora_cfg(), "tiny-model"
+        )  # should not raise
+
+    def test_peft_type_mismatch_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_config
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, peft_type="IA3")
+        with pytest.raises(ValueError, match="peft_type"):
+            _validate_lora_adapter_config(str(adapter_dir), _lora_cfg(), "tiny-model")
+
+    def test_rank_mismatch_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_config
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, dim=8)
+        with pytest.raises(ValueError, match="r=8"):
+            _validate_lora_adapter_config(str(adapter_dir), _lora_cfg(), "tiny-model")
+
+    def test_alpha_mismatch_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_config
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, alpha=16)
+        with pytest.raises(ValueError, match="lora_alpha"):
+            _validate_lora_adapter_config(str(adapter_dir), _lora_cfg(), "tiny-model")
+
+    def test_base_model_mismatch_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_config
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, base_model_name_or_path="other-model")
+        with pytest.raises(ValueError, match="other-model"):
+            _validate_lora_adapter_config(str(adapter_dir), _lora_cfg(), "tiny-model")
+
+    def test_unknown_base_model_does_not_raise(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_config
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, base_model_name_or_path="N/A")
+        _validate_lora_adapter_config(str(adapter_dir), _lora_cfg(), "tiny-model")
+
+    def test_missing_config_file_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_config
+
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        with pytest.raises(FileNotFoundError, match="adapter_config.json"):
+            _validate_lora_adapter_config(str(adapter_dir), _lora_cfg(), "tiny-model")
+
+
+@pytest.mark.automodel
+class TestValidateLoraAdapterKeys:
+    def test_prefixed_keys_match(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(
+            adapter_dir,
+            keys=(
+                "base_model.model.layer.lora_A.weight",
+                "base_model.model.layer.lora_B.weight",
+            ),
+        )
+        _validate_lora_adapter_keys(str(adapter_dir), _TinyLoraModel())
+
+    def test_missing_key_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(
+            adapter_dir, keys=("base_model.model.layer.lora_A.weight",)
+        )
+        with pytest.raises(ValueError, match="Missing from donor"):
+            _validate_lora_adapter_keys(str(adapter_dir), _TinyLoraModel())
+
+    def test_unexpected_key_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(
+            adapter_dir,
+            keys=(
+                "layer.lora_A.weight",
+                "layer.lora_B.weight",
+                "layer2.lora_A.weight",
+            ),
+        )
+        with pytest.raises(ValueError, match="unexpected in donor"):
+            _validate_lora_adapter_keys(str(adapter_dir), _TinyLoraModel())
+
+    def test_state_dict_adapter_model_still_validated(self, tmp_path):
+        """A custom state_dict_adapter must not disable the coverage check.
+
+        Regression test: the escape hatch used to be gated on
+        ``state_dict_adapter``, which 26/33 Automodel architectures set
+        (including plain LlamaForCausalLM) -- so the check silently passed
+        while the non-strict PEFT load left donor-uncovered adapters at fresh
+        init. The validator must instead compare keys after the adapter's HF
+        conversion.
+        """
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(
+            adapter_dir, keys=("base_model.model.layer.lora_A.weight",)
+        )
+        model = _TinyLoraModel()
+        model.state_dict_adapter = _IdentityStateDictAdapter()
+        with pytest.raises(ValueError, match="Missing from donor"):
+            _validate_lora_adapter_keys(str(adapter_dir), model)
+
+    def test_qwen3_moe_hf_keys_match_at_ep1(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, keys=_QWEN3_MOE_HF_LORA_KEYS)
+        _validate_lora_adapter_keys(str(adapter_dir), _TinyQwen3MoeLoraModel(ep_size=1))
+
+    def test_expert_parallel_model_with_incomplete_donor_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, keys=_QWEN3_MOE_HF_LORA_KEYS[:-1])
+        with pytest.raises(ValueError, match="Missing from donor"):
+            _validate_lora_adapter_keys(
+                str(adapter_dir), _TinyQwen3MoeLoraModel(ep_size=2)
+            )
+
+
+@pytest.mark.automodel
+class TestLoadInitialLoraAdapter:
+    def test_loads_through_checkpointer(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
+
+        weights_dir = tmp_path / "step_5" / "policy" / "weights"
+        adapter_dir = weights_dir / "model"
+        _write_adapter_checkpoint(
+            adapter_dir,
+            keys=(
+                "base_model.model.layer.lora_A.weight",
+                "base_model.model.layer.lora_B.weight",
+            ),
+        )
+        model = _TinyLoraModel()
+        # autospec binds the mocks to the real signatures, so a wrong kwarg
+        # name in setup.py fails the test instead of silently recording a call.
+        manager = create_autospec(AutomodelCheckpointManager, instance=True)
+        manager.checkpointer = create_autospec(Checkpointer, instance=True)
+        _load_initial_lora_adapter(
+            model=model,
+            checkpoint_manager=manager,
+            restore_from=str(weights_dir),
+            lora_cfg=_lora_cfg(),
+            model_name="tiny-model",
+        )
+        manager.update_checkpointer_config.assert_called_once()
+        config_updates = manager.update_checkpointer_config.call_args.kwargs[
+            "config_updates"
+        ]
+        assert config_updates["is_peft"] is True
+        manager.checkpointer.load_model.assert_called_once_with(
+            model=model, model_path=str(adapter_dir)
+        )
+
+    def test_invalid_donor_fails_before_load(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
+
+        adapter_dir = tmp_path / "adapter"
+        # dim=8 donor vs dim=2 run -> validation must fail before any load.
+        _write_adapter_checkpoint(adapter_dir, dim=8)
+        manager = MagicMock()
+        with pytest.raises(ValueError, match="r=8"):
+            _load_initial_lora_adapter(
+                model=_TinyLoraModel(),
+                checkpoint_manager=manager,
+                restore_from=str(adapter_dir),
+                lora_cfg=_lora_cfg(),
+                model_name="tiny-model",
+            )
+        manager.checkpointer.load_model.assert_not_called()
+
+    def test_bare_adapter_dir_loaded_via_model_path(self, tmp_path):
+        """A bare adapter dir must still take the checkpointer's PEFT branch.
+
+        Automodel selects its PEFT safetensors read by a substring test on the
+        path ("/model" in path), so the bare layout is staged under a
+        temporary "model" path component before loading.
+        """
+        from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(
+            adapter_dir,
+            keys=(
+                "base_model.model.layer.lora_A.weight",
+                "base_model.model.layer.lora_B.weight",
+            ),
+        )
+        model = _TinyLoraModel()
+        manager = create_autospec(AutomodelCheckpointManager, instance=True)
+        manager.checkpointer = create_autospec(Checkpointer, instance=True)
+
+        seen = {}
+
+        def fake_load_model(*, model, model_path, **kwargs):
+            # Inspected mid-call: the staging symlink is cleaned up after load.
+            seen["model_path"] = model_path
+            seen["resolves"] = os.path.isfile(
+                os.path.join(model_path, "adapter_model.safetensors")
+            )
+
+        manager.checkpointer.load_model.side_effect = fake_load_model
+        _load_initial_lora_adapter(
+            model=model,
+            checkpoint_manager=manager,
+            restore_from=str(adapter_dir),
+            lora_cfg=_lora_cfg(),
+            model_name="tiny-model",
+        )
+        assert os.path.basename(seen["model_path"]) == "model"
+        # The staged path still resolved to the donor's adapter file.
+        assert seen["resolves"]
+        # The staging directory was cleaned up after the load.
+        assert not os.path.exists(os.path.dirname(seen["model_path"]))
+
+    @pytest.mark.parametrize("relative_path", ["adapter", "model"])
+    def test_relative_adapter_path_is_canonicalized(
+        self, tmp_path, monkeypatch, relative_path
+    ):
+        from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
+
+        adapter_dir = tmp_path / relative_path
+        _write_adapter_checkpoint(
+            adapter_dir,
+            keys=(
+                "base_model.model.layer.lora_A.weight",
+                "base_model.model.layer.lora_B.weight",
+            ),
+        )
+        monkeypatch.chdir(tmp_path)
+        manager = create_autospec(AutomodelCheckpointManager, instance=True)
+        manager.checkpointer = create_autospec(Checkpointer, instance=True)
+        seen = {}
+
+        def fake_load_model(*, model, model_path, **kwargs):
+            seen["model_path"] = model_path
+            seen["resolves"] = os.path.isfile(
+                os.path.join(model_path, "adapter_model.safetensors")
+            )
+
+        manager.checkpointer.load_model.side_effect = fake_load_model
+        _load_initial_lora_adapter(
+            model=_TinyLoraModel(),
+            checkpoint_manager=manager,
+            restore_from=relative_path,
+            lora_cfg=_lora_cfg(),
+            model_name="tiny-model",
+        )
+
+        assert os.path.isabs(seen["model_path"])
+        assert seen["resolves"]
+
+
+@pytest.fixture
+def _init_gloo_pg():
+    """Single-process gloo PG so the real Automodel Checkpointer can run on CPU."""
+    if not torch.distributed.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29517")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
+    yield
+
+
+class _TwoLinearModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            [torch.nn.Linear(4, 4), torch.nn.Linear(4, 1)]
+        )
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+@pytest.mark.automodel
+class TestLoadInitialLoraAdapterEndToEnd:
+    """Warm start must actually put the donor's weights into the model."""
+
+    def test_donor_adapter_weights_land_in_model(self, _init_gloo_pg, tmp_path):
+        from nemo_automodel.components._peft.lora import (
+            PeftConfig,
+            apply_lora_to_linear_modules,
+        )
+
+        from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
+
+        peft_config = PeftConfig(
+            target_modules=[],
+            match_all_linear=True,
+            dim=2,
+            alpha=4,
+            dropout=0.0,
+            dropout_position="post",
+            lora_A_init="xavier",
+            use_triton=False,
+        )
+
+        # Donor: distinctive non-zero adapter weights, so "loaded the donor"
+        # cannot be confused with "left the zero-init adapters alone".
+        donor = _TwoLinearModel()
+        apply_lora_to_linear_modules(donor, peft_config)
+        for name, param in donor.named_parameters():
+            if "lora_" in name:
+                torch.nn.init.normal_(param, mean=3.0, std=1.0)
+        donor_lora = {
+            k: v.clone() for k, v in donor.state_dict().items() if "lora_" in k
+        }
+        assert donor_lora
+
+        mesh = torch.distributed.device_mesh.init_device_mesh(
+            "cpu", (1,), mesh_dim_names=("dp",)
+        )
+        manager = AutomodelCheckpointManager(dp_mesh=mesh, tp_mesh=mesh)
+        manager.init_checkpointer(
+            config_updates={"model_save_format": "safetensors", "is_peft": True}
+        )
+        weights_path = str(tmp_path / "step_5" / "policy" / "weights")
+        manager.save_checkpoint(
+            model=donor,
+            weights_path=weights_path,
+            checkpointing_cfg={
+                "enabled": True,
+                "model_save_format": "safetensors",
+                "is_peft": True,
+            },
+            lora_enabled=True,
+            peft_config=peft_config,
+        )
+
+        # Fresh run: adapters start at zero, like a cold LoRA init.
+        model = _TwoLinearModel()
+        apply_lora_to_linear_modules(model, peft_config)
+        for name, param in model.named_parameters():
+            if "lora_" in name:
+                param.data.zero_()
+
+        _load_initial_lora_adapter(
+            model=model,
+            checkpoint_manager=manager,
+            restore_from=weights_path,
+            lora_cfg=_lora_cfg(),
+            model_name="tiny-model",
+        )
+
+        loaded = {k: v for k, v in model.state_dict().items() if "lora_" in k}
+        assert set(loaded) == set(donor_lora)
+        for key, expected in donor_lora.items():
+            assert torch.allclose(loaded[key], expected), f"{key} was not warm-started"
+            assert not torch.allclose(loaded[key], torch.zeros_like(loaded[key]))
+
+    def test_donor_covering_fewer_modules_raises(self, _init_gloo_pg, tmp_path):
+        """A donor targeting fewer modules than the run must fail closed.
+
+        Regression test for the state_dict_adapter escape hatch: the PEFT load
+        is unconditionally non-strict, so without key validation this donor
+        would load partially (one layer warm-started, the other silently left
+        at fresh init) and still print a success message.
+        """
+        from nemo_automodel.components._peft.lora import (
+            PeftConfig,
+            apply_lora_to_linear_modules,
+        )
+
+        from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
+
+        donor_peft_config = PeftConfig(
+            target_modules=["*layers.0*"],
+            match_all_linear=False,
+            dim=2,
+            alpha=4,
+            dropout=0.0,
+            dropout_position="post",
+            lora_A_init="xavier",
+            use_triton=False,
+        )
+        donor = _TwoLinearModel()
+        apply_lora_to_linear_modules(donor, donor_peft_config)
+        donor_lora_names = [n for n, _ in donor.named_parameters() if "lora_" in n]
+        # Sanity: the donor adapter covers layers.0 only, not layers.1.
+        assert donor_lora_names
+        assert all("layers.0" in n for n in donor_lora_names)
+
+        mesh = torch.distributed.device_mesh.init_device_mesh(
+            "cpu", (1,), mesh_dim_names=("dp",)
+        )
+        manager = AutomodelCheckpointManager(dp_mesh=mesh, tp_mesh=mesh)
+        manager.init_checkpointer(
+            config_updates={"model_save_format": "safetensors", "is_peft": True}
+        )
+        weights_path = str(tmp_path / "step_5" / "policy" / "weights")
+        manager.save_checkpoint(
+            model=donor,
+            weights_path=weights_path,
+            checkpointing_cfg={
+                "enabled": True,
+                "model_save_format": "safetensors",
+                "is_peft": True,
+            },
+            lora_enabled=True,
+            peft_config=donor_peft_config,
+        )
+
+        run_peft_config = PeftConfig(
+            target_modules=[],
+            match_all_linear=True,
+            dim=2,
+            alpha=4,
+            dropout=0.0,
+            dropout_position="post",
+            lora_A_init="xavier",
+            use_triton=False,
+        )
+        model = _TwoLinearModel()
+        apply_lora_to_linear_modules(model, run_peft_config)
+
+        with pytest.raises(ValueError, match="Missing from donor"):
+            _load_initial_lora_adapter(
+                model=model,
+                checkpoint_manager=manager,
+                restore_from=weights_path,
+                lora_cfg=_lora_cfg(),
+                model_name="tiny-model",
+            )

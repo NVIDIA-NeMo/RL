@@ -76,6 +76,7 @@ policy:
       dropout_position: "post"  # Where to apply dropout: "pre" (before LoRA) or "post" (after LoRA)
       lora_A_init: "xavier"  # Initialization method for LoRA A matrix: "xavier" or "uniform"
       use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
 
   dynamic_batching:
     enabled: false
@@ -184,6 +185,7 @@ policy:
       lora_B_init_method: "zero"
       a2a_experimental: false
       lora_dtype: None
+      restore_from: null  # Warm start: path to a native Megatron PEFT checkpoint (iter_XXXXXXX dir or its root) to initialize this run's LoRA weights from, e.g. a previous SFT run
 
 
     optimizer:
