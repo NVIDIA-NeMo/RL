@@ -24,6 +24,8 @@
 
 set -eoux pipefail
 
+export PATH="${SLURM_HELPER_PATH:-/usr/local/bin:/usr/bin:/bin:/cm/shared/apps/slurm/current/bin}:${PATH:-}"
+
 # Record job-start epoch so Python can measure pre-Python overhead
 export NRL_JOB_START_EPOCH=$(date +%s.%N)
 

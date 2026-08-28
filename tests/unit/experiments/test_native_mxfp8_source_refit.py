@@ -46,3 +46,11 @@ def test_launcher_exports_slurm_helper_path_to_batch_shell() -> None:
     assert '--export="ALL,PATH=${SLURM_BATCH_PATH}"' in launcher
     assert "/usr/local/bin" in launcher
     assert "/cm/shared/apps/slurm/current/bin" in launcher
+
+
+def test_ray_sub_bootstraps_slurm_helper_path_before_queries() -> None:
+    ray_sub = (REPO_ROOT / "ray.sub").read_text()
+
+    path_bootstrap = 'export PATH="${SLURM_HELPER_PATH:-/usr/local/bin:/usr/bin:/bin:/cm/shared/apps/slurm/current/bin}:${PATH:-}"'
+    assert path_bootstrap in ray_sub
+    assert ray_sub.index(path_bootstrap) < ray_sub.index("maybe_gres_arg()")
