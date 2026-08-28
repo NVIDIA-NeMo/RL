@@ -515,7 +515,9 @@ def test_init_fp8_rejects_mxfp8_without_fp8_precision(
         )
 
 
-def test_quantize_mxfp8_weight_restores_grouped_expert_shape(fp8_module, monkeypatch):
+def test_quantize_mxfp8_weight_preserves_grouped_shape_and_scale_bytes(
+    fp8_module, monkeypatch
+):
     fp8 = fp8_module
     weight = torch.zeros(2, 3, 32, dtype=torch.bfloat16)
 
@@ -537,7 +539,7 @@ def test_quantize_mxfp8_weight_restores_grouped_expert_shape(fp8_module, monkeyp
     assert value.shape == weight.shape
     assert scale.shape == (2, 3, 1)
     assert torch.equal(
-        scale.flatten(), torch.tensor([1, 2, 1, 127, 255, 5], dtype=torch.uint8)
+        scale.flatten(), torch.tensor([0, 2, 0, 127, 255, 5], dtype=torch.uint8)
     )
 
 
