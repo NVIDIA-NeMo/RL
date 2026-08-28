@@ -752,6 +752,29 @@ def test_update_weights_from_collective_processes_weights_after_loading(
 
 
 @pytest.mark.vllm
+def test_checkpoint_engine_lifecycle_processes_weights_once(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _state_info = _make_collective_update_extension(vllm_backend)
+    process_weights = MagicMock()
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process_weights,
+    )
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+
+    with ext._weight_update_lifecycle("checkpoint_engine") as finalize:
+        finalize()
+
+    process_weights.assert_called_once_with(
+        ext.model_runner.model, ext.model_config, ext.device
+    )
+    ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
+    ext._maybe_process_fp8_kv_cache.assert_not_called()
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize(
     "method_name",
     ["update_weights_via_ipc_zmq", "update_weights_from_collective"],
