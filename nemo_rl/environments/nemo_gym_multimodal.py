@@ -16,6 +16,7 @@ import copy
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, TypeVar, cast
@@ -60,13 +61,16 @@ _NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS = 8
 
 def _encode_single_image_source(source: str) -> str:
     """Resolve, encode, and close one local image source."""
-    with resolve_to_image(source) as image:
+    # `closing` (not a bare `with`): PIL's Image.__exit__ is a no-op, so only an
+    # explicit close() releases the buffer.
+    with closing(resolve_to_image(source)) as image:
         return image_to_data_url(image)
 
 
 def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
     """Replace local media paths in NeMo Gym examples with data URLs."""
     local_image_sources: dict[str, None] = {}
+    local_video_sources: dict[str, None] = {}
     pending_mutations: list[
         tuple[dict, tuple[str, str, str], str, str, bool, Any, str]
     ] = []
@@ -124,7 +128,7 @@ def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
                     if is_image:
                         local_image_sources.setdefault(url, None)
                     else:
-                        url = video_path_to_data_url(url)
+                        local_video_sources.setdefault(url, None)
 
                 pending_mutations.append(
                     (
@@ -152,6 +156,14 @@ def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
                 )
             )
 
+    # Encode each unique video once. A video shared by G generations then points
+    # every part at the same string, instead of G separate base64 copies of the
+    # same file. Kept sequential: these payloads are large enough that encoding
+    # several at once would spike driver memory.
+    encoded_video_by_source: dict[str, str] = {
+        source: video_path_to_data_url(source) for source in local_video_sources
+    }
+
     # Apply mutations only after every local source was encoded successfully.
     for (
         part,
@@ -166,7 +178,8 @@ def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
             if key != canonical_key:
                 part.pop(key, None)
         part["type"] = canonical_type
-        part[canonical_key] = encoded_by_source.get(url, url)
+        encoded = encoded_by_source if is_image else encoded_video_by_source
+        part[canonical_key] = encoded.get(url, url)
         if is_image and nested_detail is not None:
             part.setdefault("detail", nested_detail)
     return nemo_gym_examples
@@ -220,6 +233,16 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     return images
 
 
+def _is_trainable_output_item(item: dict) -> bool:
+    """Report whether an output item becomes a trainable assistant turn.
+
+    The postprocess loop skips items whose ``generation_token_ids`` is missing
+    *or* empty, so per-turn image binning has to use the same predicate or the
+    two walks disagree and every later turn gets the wrong images.
+    """
+    return bool(item.get("generation_token_ids"))
+
+
 def _index_per_turn_images(
     output: list[dict],
     input_messages: list[dict] | None = None,
@@ -250,9 +273,7 @@ def _index_per_turn_images(
         if isinstance(item, dict) and item.get("role") != "assistant":
             pending.extend(_extract_input_images_from_message(item))
     for item in output:
-        if item.get(
-            "generation_token_ids"
-        ):  # trainable turn; empty generation_token_ids is skipped by the postprocess loop and must not consume a bucket
+        if _is_trainable_output_item(item):
             per_turn.append(pending)
             pending = []
         elif item.get("role") != "assistant":

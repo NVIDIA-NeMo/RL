@@ -62,6 +62,7 @@ data:
   _override_: true
   max_input_seq_length: null
   shuffle: false
+  num_workers: 0
   train:
     data_path: 3rdparty/Gym-workspace/Gym/resources_servers/circle_count/data/example.jsonl
   validation:

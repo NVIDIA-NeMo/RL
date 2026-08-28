@@ -60,6 +60,7 @@ policy:
         gpus_per_node: 2
         num_nodes: 1
 data:
+  num_workers: 0
   default:
     prompt_file: examples/prompts/clevr_cogent_cot_nemotron_omni.txt
 logger:

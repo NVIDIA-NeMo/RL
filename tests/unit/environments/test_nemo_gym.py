@@ -32,6 +32,7 @@ from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
     PackedTensor,
     image_to_data_url,
+    video_path_to_data_url,
 )
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -211,6 +212,31 @@ def test_gym_local_video_path_is_inlined_as_data_url(tmp_path):
         "video_url"
     ]
     assert video_url.startswith("data:video/mp4;base64,")
+
+
+def test_video_path_to_data_url_rejects_unsupported_and_missing_paths(tmp_path):
+    """Bad local video sources must fail loudly rather than inline garbage."""
+    unsupported = tmp_path / "clip.gif"
+    unsupported.write_bytes(b"test")
+    with pytest.raises(ValueError, match="Unsupported video extension"):
+        video_path_to_data_url(str(unsupported))
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        video_path_to_data_url(str(tmp_path / "missing.mp4"))
+
+
+def test_video_path_to_data_url_passes_through_data_urls_and_accepts_file_scheme(
+    tmp_path,
+):
+    already_inlined = "data:video/mp4;base64,dG95"
+    assert video_path_to_data_url(already_inlined) == already_inlined
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"toy-video")
+    from_plain = video_path_to_data_url(str(video_path))
+    from_scheme = video_path_to_data_url(f"file://{video_path}")
+    assert from_plain.startswith("data:video/mp4;base64,")
+    assert from_plain == from_scheme
 
 
 def test_extract_static_video_message_rejects_multiple_videos(tmp_path):
@@ -1606,6 +1632,9 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             head_server_config = SimpleNamespace(backend="megatron")
             _tokenizer = _Tokenizer()
             _processor = None
+            # Bind the real postprocess: the assertions below are about its
+            # message_log output, not about run_rollouts' dispatch alone.
+            _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
 
             def _require_spinup(self):
                 pass

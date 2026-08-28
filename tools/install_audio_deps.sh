@@ -24,14 +24,27 @@ if ! python -c "import torchcodec" 2>/dev/null; then
         "torchcodec==0.11.1"
 fi
 
-# PyAV is intentionally absent from the base image and must be installed into
-# the isolated Megatron policy worker environment that imports it.
+# PyAV is intentionally absent from the base image (pyproject excludes it via
+# `av; sys_platform == 'never'` because it bundles CVE-carrying codec libs), so it
+# must be installed after the fact into the isolated Megatron policy worker
+# environment that imports it. `--no-config` bypasses that exclusion; the version
+# floor is therefore restated here to keep pyproject's CVE-2026-40962 constraint.
+#
+# The worker venv is created lazily at worker start, so run this AFTER the
+# Megatron worker has been created at least once (or point RAY_MEGATRON_PYTHON at
+# an existing venv).
 RAY_MEGATRON_PYTHON="${RAY_MEGATRON_PYTHON:-/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/bin/python}"
-if [[ -x "$RAY_MEGATRON_PYTHON" ]]; then
-    echo "[audio-deps] Force-reinstalling PyAV in the Megatron worker environment..."
-    "$RAY_MEGATRON_PYTHON" -m pip install --no-cache-dir --force-reinstall av
-else
-    echo "[audio-deps] Megatron worker environment not found; skipping PyAV: $RAY_MEGATRON_PYTHON"
+if [[ ! -x "$RAY_MEGATRON_PYTHON" ]]; then
+    echo "[audio-deps] ERROR: Megatron worker environment not found: $RAY_MEGATRON_PYTHON" >&2
+    echo "[audio-deps] It is created on first worker start. Run this script after that," >&2
+    echo "[audio-deps] or set RAY_MEGATRON_PYTHON to an existing worker interpreter." >&2
+    exit 1
+fi
+if ! "$RAY_MEGATRON_PYTHON" -c "import av" 2>/dev/null; then
+    # `uv pip install --python` targets the venv directly; these venvs are built
+    # by `uv venv` without `--seed`, so they have no pip to invoke.
+    echo "[audio-deps] Installing PyAV in the Megatron worker environment..."
+    uv pip install --no-config --python "$RAY_MEGATRON_PYTHON" "av>=17.1.0"
 fi
 
 echo "[audio-deps] Done."
