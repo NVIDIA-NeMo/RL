@@ -21,6 +21,10 @@ from typing import Any
 
 import torch
 
+_PINNED_TE_DTYPE_MODULE = "transformer_engine_torch"
+_PINNED_TE_DTYPE_NAME = "DType"
+_PINNED_TE_E4M3_DTYPE = "DType.kFloat8E4M3"
+
 
 @dataclass(frozen=True)
 class NativeMXFP8Components:
@@ -84,8 +88,16 @@ def _logical_shape(value: object) -> tuple[int, ...]:
 
 def _validate_e4m3_format(metadata: Mapping[str, Any]) -> None:
     fp8_dtype = metadata.get("fp8_dtype")
-    if fp8_dtype is not None and "e4m3" not in str(fp8_dtype).lower():
-        raise ValueError("Native MXFP8 refit requires E4M3 rowwise values")
+    dtype_type = type(fp8_dtype)
+    if (
+        dtype_type.__module__ != _PINNED_TE_DTYPE_MODULE
+        or dtype_type.__name__ != _PINNED_TE_DTYPE_NAME
+        or str(fp8_dtype) != _PINNED_TE_E4M3_DTYPE
+    ):
+        raise ValueError(
+            "Native MXFP8 refit fp8_dtype must be "
+            "transformer_engine_torch.DType.kFloat8E4M3"
+        )
 
 
 def _validate_native_storage(
