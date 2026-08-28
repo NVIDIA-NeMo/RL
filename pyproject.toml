@@ -71,7 +71,13 @@ dependencies = [
   "awscrt>=0.35.0",                                                                                           # for parallel S3 refit transport
   "zstandard",                                                                                                # for sparse refit body compression
   "fastokens-b10>=0.1.1",                                                                                     # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
-  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                   # for transformer-engine no build isolation
+  # OpenTelemetry instrumentation. Base (not extra) so it reaches every worker
+  # venv; `telemetry.enabled` in the config is the on/off switch. Sourced from
+  # git in [tool.uv.sources] — see the note there; the floor is above the
+  # newest PyPI release so a dropped pin fails to resolve instead of silently
+  # falling back to 0.1.0.
+  "nemo-lens[sdk]>=0.2.0",
+  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'", # for transformer-engine no build isolation
   # tilelang — required by fused DSA TileLang kernels on Blackwell and by the
   # replacement Triton kernel mamba-ssm requires when Triton >= 3.4.0 on Hopper;
   # see https://github.com/state-spaces/mamba/issues/640.
@@ -290,6 +296,11 @@ nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = t
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge", editable = true }
 nemo_gym = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
+# Must stay on the rev megatron-core pins for its dev/otel extras: the workspace
+# resolves a single nemo-lens, and PyPI's newest release (0.1.0) is older than
+# that rev, so declaring this dependency without the pin downgrades lens for
+# megatron-core too.
+nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "b85578fc2b736a1804705e537001b5f45e9c715d" }
 sglang = { git = "https://github.com/sgl-project/sglang.git", rev = "3003d70f680d41c59d1b7acbf65cb47795dfd19e", subdirectory = "python" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [

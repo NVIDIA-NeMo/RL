@@ -80,6 +80,7 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
 from nemo_rl.models.policy.workers.patches import (
     apply_transformer_engine_patch,
 )
+from nemo_rl.telemetry.setup import init_telemetry_worker
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -262,6 +263,10 @@ class DTensorPolicyWorkerV2Impl(
         # ray.get_gpu_ids()[0] is the physical GPU index that keys the affinity
         # file, and reading it does not initialize CUDA.
         bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
+
+        # OTel providers are process-global, so the driver's setup does not
+        # reach this actor. No-op unless telemetry is enabled.
+        init_telemetry_worker()
 
         # Store configuration
         self.cfg = config

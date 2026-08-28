@@ -4312,6 +4312,13 @@ dependencies = [
     { name = "opentelemetry-api" },
 ]
 
+[package.optional-dependencies]
+sdk = [
+    { name = "opentelemetry-exporter-otlp-proto-grpc" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-sdk" },
+]
+
 [[package]]
 name = "nemo-rl"
 source = { editable = "." }
@@ -4331,6 +4338,7 @@ dependencies = [
     { name = "mlflow" },
     { name = "mooncake-transfer-engine-cuda13" },
     { name = "nccl4py" },
+    { name = "nemo-lens", extra = ["sdk"] },
     { name = "ninja" },
     { name = "nixl" },
     { name = "num2words" },
@@ -4550,6 +4558,7 @@ requires-dist = [
     { name = "nccl4py", marker = "sys_platform != 'darwin'" },
     { name = "nemo-automodel", extras = ["moe"], marker = "extra == 'automodel'", editable = "3rdparty/Automodel-workspace/Automodel" },
     { name = "nemo-gym", marker = "extra == 'nemo-gym'", editable = "3rdparty/Gym-workspace/Gym" },
+    { name = "nemo-lens", extras = ["sdk"], git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
     { name = "ninja" },
     { name = "nixl", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==1.3.0" },
     { name = "num2words", specifier = ">=0.5.14" },

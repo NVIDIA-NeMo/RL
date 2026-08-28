@@ -47,6 +47,10 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
+from nemo_rl.telemetry.instrumentation import trace_fn
+from nemo_rl.telemetry.metrics import warn_once
+from nemo_rl.telemetry.setup import get_telemetry_handle
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
     collect_sharded_multimodal_payload_metrics,
@@ -56,6 +60,40 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.membership import RefitMembership
 
 logger = logging.getLogger(__name__)
+
+
+def _record_vllm_generation_metrics(
+    model_name: str | None,
+    data: BatchedDataDict,
+    combined: BatchedDataDict,
+) -> None:
+    """Record vLLM token-usage metrics to nemo-lens (no-op unless exporting)."""
+    telemetry = get_telemetry_handle()
+    if telemetry is None or not telemetry.is_exporting:
+        return
+    from nemo.lens.instruments.inference import record_inference_metrics
+
+    # Guards only the recording: this runs per generation call, so it must not
+    # break generation, but a permanently dead metric should still be visible
+    # once at default verbosity rather than only under debug.
+    try:
+        input_tokens = (
+            int(data["input_lengths"].sum()) if "input_lengths" in data else None
+        )
+        output_tokens = (
+            int(combined["generation_lengths"].sum())
+            if "generation_lengths" in combined
+            else None
+        )
+        record_inference_metrics(
+            telemetry.meter,
+            model=model_name or "",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            provider_name="vllm",
+        )
+    except Exception:
+        warn_once("vllm_inference_metrics", "nemo-lens: failed to record vLLM metrics")
 
 
 class VllmGeneration(GenerationInterface):
@@ -720,6 +758,7 @@ class VllmGeneration(GenerationInterface):
             )
         return futures
 
+    @trace_fn(RLSpanGroup.GENERATION, "rl.vllm.generate")
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -773,8 +812,10 @@ class VllmGeneration(GenerationInterface):
                 f"Missing required keys for GenerationOutputSpec: {missing_keys}"
             )
 
+        _record_vllm_generation_metrics(self.cfg.get("model_name"), data, combined)
         return combined
 
+    @trace_fn(RLSpanGroup.GENERATION, "rl.vllm.generate_text")
     def generate_text(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -826,6 +867,7 @@ class VllmGeneration(GenerationInterface):
                 f"Missing required keys for GenerationOutputSpec: {missing_keys}"
             )
 
+        _record_vllm_generation_metrics(self.cfg.get("model_name"), data, combined)
         return combined
 
     async def _async_generate_base(
