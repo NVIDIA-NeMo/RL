@@ -286,7 +286,20 @@ class AsyncTrajectoryCollector:
                 )
             ]
 
-        return [generation_weight_version + i for i in range(1, generation_lead + 1)]
+        # A permanently-failed prompt group (e.g. deterministic
+        # context-overflow rejections) leaves an unconsumed target at or below
+        # the current weight version short; starting the window at current+1
+        # would make gap-filling skip that hole forever and stall training.
+        # Start at the first target training has not consumed instead. Callers
+        # still skip targets <= last_consumed_target, so only genuine holes
+        # surface.
+        last_consumed_target = ray.get(
+            self.replay_buffer.get_last_target_weight_already_generated.remote()
+        )
+        target_start = min(generation_weight_version + 1, last_consumed_target + 1)
+        return list(
+            range(target_start, generation_weight_version + generation_lead + 1)
+        )
 
     def _get_next_target_for_generation(
         self, generation_weight_version: int
@@ -482,9 +495,30 @@ class AsyncTrajectoryCollector:
                         )
                         self._last_limit_warning_version = self.current_weight_version
 
-                    # Efficiently wait for generation limits to be cleared (no polling!)
+                    # Wait for generation limits to clear, but re-check the
+                    # pause condition periodically: an unbounded wait deadlocks
+                    # when a prompt group fails permanently (e.g. deterministic
+                    # context-overflow 500s) after the pause leaves the buffer
+                    # short forever — training can't step, so no weight update
+                    # ever fires this event. Re-evaluating lets the loop wake
+                    # up and gap-fill the shortfall with new prompts.
                     with self._efficiency_timer.time("idle/generation_limit_pause"):
-                        self._generation_limit_cleared.wait()
+                        while (
+                            not self._generation_limit_cleared.is_set() and self.running
+                        ):
+                            self._generation_limit_cleared.wait(timeout=60.0)
+                            if (
+                                self._generation_limit_cleared.is_set()
+                                or not self.running
+                            ):
+                                break
+                            if not self._should_pause_for_generation_limits():
+                                print(
+                                    "🔓 Generation-limit pause released by re-check: "
+                                    "a target needs more trajectories (likely a "
+                                    "failed prompt group) — resuming to gap-fill"
+                                )
+                                break
 
                     # Double-check we're still running after being woken up
                     if not self.running:
