@@ -234,8 +234,8 @@ def _apply_dynamic_sampling(
     # Rebuild them after cache concatenation so groups from different generation
     # batches cannot collide. Dynamic sampling may retain only part of a group,
     # so validate the sample-ID format without requiring a complete group here.
-    pending_carry["prompt_ids_for_adv"] = (
-        build_rollout_group_ids_from_sample_ids(pending_meta.sample_ids)
+    pending_carry["prompt_ids_for_adv"] = build_rollout_group_ids_from_sample_ids(
+        pending_meta.sample_ids
     )
 
     unfiltered_for_log = torch.cat(pending_unfiltered_rewards)[:train_prompts_size]
