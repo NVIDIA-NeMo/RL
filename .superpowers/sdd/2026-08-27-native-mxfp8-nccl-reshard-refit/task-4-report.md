@@ -126,3 +126,44 @@ commit.
 
 - `c775bb32 test(refit): require pinned MXFP8 dtype metadata`
 - `2480c0c4 fix(refit): validate pinned MXFP8 dtype metadata`
+
+## Review Fix: Bind E4M3 Metadata by Identity
+
+The structural module/name/string validation above was forgeable by a non-TE
+class. This repair resolves the installed Transformer Engine binding lazily at
+extraction time and requires identity with
+`transformer_engine_torch.DType.kFloat8E4M3`.
+
+### RED Evidence
+
+The focused isolated CPU harness was run after adding a forged object whose
+class reported the same module/name/string as the old predicate but was not the
+mocked binding member. It failed before production changed:
+
+```text
+FAILED ...test_extract_native_mxfp8_components_rejects_invalid_storage[source16-fp8_dtype]
+Failed: DID NOT RAISE ValueError
+```
+
+### GREEN Evidence
+
+The test fixture installs a minimal `transformer_engine_torch` module only
+during test execution. Its `DType.kFloat8E4M3` member is the accepted object;
+the forged object, bare string, and lookalike string are rejected. A separate
+test removes the binding and verifies an actionable `ValueError` at extraction
+time. Module import remains TE-free.
+
+The isolated focused suite exited 0 with `27 passed in 1.01s`.
+
+```text
+uvx ruff check nemo_rl/models/policy/workers/mxfp8_refit_source.py tests/unit/models/policy/test_mxfp8_refit_source.py
+uvx ruff format --check nemo_rl/models/policy/workers/mxfp8_refit_source.py tests/unit/models/policy/test_mxfp8_refit_source.py
+```
+
+Both Ruff commands exited 0, as did `git diff --check` before each repair
+commit.
+
+### Review Fix Commits
+
+- `3da8f846 test(refit): reject forged MXFP8 dtype bindings`
+- `004c0de2 fix(refit): bind MXFP8 dtype to transformer engine`
