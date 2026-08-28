@@ -1964,7 +1964,7 @@ class SingleControllerActor:
         """
         for tag in meta.tags or []:
             for key in VIOLATION_TAG_KEYS:
-                self._step_log_dict[key].append(int(tag.get(key, 0)))
+                self._step_log_dict.setdefault(key, []).append(int(tag.get(key, 0)))
 
         if self._advantage_estimator is None:
             return meta, True

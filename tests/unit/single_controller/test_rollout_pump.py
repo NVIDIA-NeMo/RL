@@ -1143,5 +1143,10 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     for tag in tags:
         assert tag["weight_version"] == 0
-        # Slim tag schema: weight_version is the only field producers stamp.
-        assert set(tag) == {"weight_version"}
+        # Tag schema: weight_version plus per-row violation counts.
+        assert set(tag) == {
+            "weight_version",
+            "num_invalid_tool_calls",
+            "num_malformed_thinking",
+            "num_assistant_messages",
+        }
