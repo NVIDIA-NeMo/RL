@@ -51,20 +51,35 @@ def _single_rank_vllm_model_parallel(
     from vllm.distributed import parallel_state
 
     init_method = f"file://{tmp_path / 'vllm_pg_init'}"
+    preexisting_process_group = dist.is_initialized()
+    preexisting_vllm_distributed = getattr(parallel_state, "_WORLD", None) is not None
+    model_parallel_is_initialized = getattr(
+        parallel_state,
+        "model_parallel_is_initialized",
+        lambda: False,
+    )
+    preexisting_model_parallel = bool(model_parallel_is_initialized())
+    if (
+        preexisting_process_group
+        or preexisting_vllm_distributed
+        or preexisting_model_parallel
+    ):
+        raise RuntimeError(
+            "single-rank vLLM model-parallel fixture requires clean caller-owned "
+            "distributed state"
+        )
     torch.cuda.set_device(0)
-    parallel_state.cleanup_dist_env_and_memory()
-    cleanup_needed = False
+    created_process_group = False
+    created_vllm_distributed = False
     try:
         with set_current_vllm_config(vllm_config):
-            if not dist.is_initialized():
-                cleanup_needed = True
-                dist.init_process_group(
-                    backend="nccl",
-                    rank=0,
-                    world_size=1,
-                    init_method=init_method,
-                )
-            cleanup_needed = True
+            dist.init_process_group(
+                backend="nccl",
+                rank=0,
+                world_size=1,
+                init_method=init_method,
+            )
+            created_process_group = True
             parallel_state.init_distributed_environment(
                 world_size=1,
                 rank=0,
@@ -72,14 +87,19 @@ def _single_rank_vllm_model_parallel(
                 distributed_init_method=init_method,
                 backend="nccl",
             )
+            created_vllm_distributed = True
             parallel_state.initialize_model_parallel(
                 tensor_model_parallel_size=1,
                 pipeline_model_parallel_size=1,
             )
             yield
     finally:
-        if cleanup_needed:
+        if created_vllm_distributed:
             parallel_state.cleanup_dist_env_and_memory()
+        elif created_process_group and dist.is_initialized():
+            dist.destroy_process_group()
+        if created_process_group:
+            (tmp_path / "vllm_pg_init").unlink(missing_ok=True)
 
 
 def _native_refit_info() -> dict[str, Any]:
@@ -104,15 +124,19 @@ def _install_fake_vllm_model_parallel_modules(
     monkeypatch: pytest.MonkeyPatch,
     *,
     tmp_path: Path,
-    fail_stage: str,
+    fail_stage: str | None = None,
+    preexisting_process_group: bool = False,
+    preexisting_vllm_distributed: bool = False,
+    preexisting_model_parallel: bool = False,
 ) -> dict[str, Any]:
     state = {
         "cleanup_calls": 0,
+        "destroy_process_group_calls": 0,
         "config_entries": 0,
         "config_exits": 0,
-        "pg_initialized": False,
-        "vllm_dist_initialized": False,
-        "model_parallel_initialized": False,
+        "pg_initialized": preexisting_process_group,
+        "vllm_dist_initialized": preexisting_vllm_distributed,
+        "model_parallel_initialized": preexisting_model_parallel,
     }
     rendezvous_path = tmp_path / "vllm_pg_init"
 
@@ -129,11 +153,23 @@ def _install_fake_vllm_model_parallel_modules(
             del exc_type, exc_value, traceback
             state["config_exits"] += 1
 
+    def sync_parallel_state() -> None:
+        parallel_state_module._WORLD = (
+            object() if state["vllm_dist_initialized"] else None
+        )
+        parallel_state_module._TP = (
+            object() if state["model_parallel_initialized"] else None
+        )
+        parallel_state_module._PP = (
+            object() if state["model_parallel_initialized"] else None
+        )
+
     def fake_cleanup_dist_env_and_memory() -> None:
         state["cleanup_calls"] += 1
         state["pg_initialized"] = False
         state["vllm_dist_initialized"] = False
         state["model_parallel_initialized"] = False
+        sync_parallel_state()
         rendezvous_path.unlink(missing_ok=True)
 
     def fake_init_process_group(
@@ -149,6 +185,10 @@ def _install_fake_vllm_model_parallel_modules(
         assert init_method == f"file://{rendezvous_path}"
         rendezvous_path.touch()
         state["pg_initialized"] = True
+
+    def fake_destroy_process_group() -> None:
+        state["destroy_process_group_calls"] += 1
+        state["pg_initialized"] = False
 
     def fake_init_distributed_environment(
         *,
@@ -166,6 +206,7 @@ def _install_fake_vllm_model_parallel_modules(
         if fail_stage == "after_process_group":
             raise RuntimeError("fail after process group init")
         state["vllm_dist_initialized"] = True
+        sync_parallel_state()
 
     def fake_initialize_model_parallel(
         *,
@@ -175,6 +216,7 @@ def _install_fake_vllm_model_parallel_modules(
         assert tensor_model_parallel_size == 1
         assert pipeline_model_parallel_size == 1
         state["model_parallel_initialized"] = True
+        sync_parallel_state()
         if fail_stage == "after_model_parallel":
             raise RuntimeError("fail after model parallel init")
 
@@ -188,9 +230,13 @@ def _install_fake_vllm_model_parallel_modules(
         fake_init_distributed_environment
     )
     parallel_state_module.initialize_model_parallel = fake_initialize_model_parallel
+    parallel_state_module.model_parallel_is_initialized = lambda: state[
+        "model_parallel_initialized"
+    ]
     distributed_module.parallel_state = parallel_state_module
     vllm_module.config = config_module
     vllm_module.distributed = distributed_module
+    sync_parallel_state()
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
     monkeypatch.setitem(sys.modules, "vllm.config", config_module)
     monkeypatch.setitem(sys.modules, "vllm.distributed", distributed_module)
@@ -202,6 +248,7 @@ def _install_fake_vllm_model_parallel_modules(
     monkeypatch.setattr(torch.cuda, "set_device", lambda _index: None)
     monkeypatch.setattr(dist, "is_initialized", lambda: state["pg_initialized"])
     monkeypatch.setattr(dist, "init_process_group", fake_init_process_group)
+    monkeypatch.setattr(dist, "destroy_process_group", fake_destroy_process_group)
     state["rendezvous_path"] = rendezvous_path
     return state
 
@@ -546,10 +593,15 @@ def _assert_unusable_after_failure(
 
 
 @pytest.mark.parametrize(
-    ("fail_stage", "expected_message"),
+    (
+        "fail_stage",
+        "expected_message",
+        "expected_cleanup_calls",
+        "expected_destroy_process_group_calls",
+    ),
     [
-        ("after_process_group", "fail after process group init"),
-        ("after_model_parallel", "fail after model parallel init"),
+        ("after_process_group", "fail after process group init", 0, 1),
+        ("after_model_parallel", "fail after model parallel init", 1, 0),
     ],
 )
 def test_single_rank_vllm_model_parallel_cleans_partial_setup_failures(
@@ -557,6 +609,8 @@ def test_single_rank_vllm_model_parallel_cleans_partial_setup_failures(
     tmp_path: Path,
     fail_stage: str,
     expected_message: str,
+    expected_cleanup_calls: int,
+    expected_destroy_process_group_calls: int,
 ) -> None:
     state = _install_fake_vllm_model_parallel_modules(
         monkeypatch,
@@ -568,12 +622,60 @@ def test_single_rank_vllm_model_parallel_cleans_partial_setup_failures(
         with _single_rank_vllm_model_parallel(tmp_path=tmp_path, vllm_config=object()):
             pytest.fail("setup failure should prevent entering the context body")
 
-    assert state["cleanup_calls"] == 2
+    assert state["cleanup_calls"] == expected_cleanup_calls
+    assert (
+        state["destroy_process_group_calls"]
+        == expected_destroy_process_group_calls
+    )
     assert state["config_entries"] == 1
     assert state["config_exits"] == 1
     assert not state["pg_initialized"]
     assert not state["vllm_dist_initialized"]
     assert not state["model_parallel_initialized"]
+    assert not state["rendezvous_path"].exists()
+
+
+@pytest.mark.parametrize(
+    (
+        "preexisting_process_group",
+        "preexisting_vllm_distributed",
+        "preexisting_model_parallel",
+    ),
+    [
+        (True, False, False),
+        (False, True, False),
+        (False, True, True),
+    ],
+)
+def test_single_rank_vllm_model_parallel_refuses_caller_owned_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    preexisting_process_group: bool,
+    preexisting_vllm_distributed: bool,
+    preexisting_model_parallel: bool,
+) -> None:
+    state = _install_fake_vllm_model_parallel_modules(
+        monkeypatch,
+        tmp_path=tmp_path,
+        preexisting_process_group=preexisting_process_group,
+        preexisting_vllm_distributed=preexisting_vllm_distributed,
+        preexisting_model_parallel=preexisting_model_parallel,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="requires clean caller-owned distributed state",
+    ):
+        with _single_rank_vllm_model_parallel(tmp_path=tmp_path, vllm_config=object()):
+            pytest.fail("caller-owned state should refuse setup before context entry")
+
+    assert state["cleanup_calls"] == 0
+    assert state["destroy_process_group_calls"] == 0
+    assert state["config_entries"] == 0
+    assert state["config_exits"] == 0
+    assert state["pg_initialized"] is preexisting_process_group
+    assert state["vllm_dist_initialized"] is preexisting_vllm_distributed
+    assert state["model_parallel_initialized"] is preexisting_model_parallel
     assert not state["rendezvous_path"].exists()
 
 
