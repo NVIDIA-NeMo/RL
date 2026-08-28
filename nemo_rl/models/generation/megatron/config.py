@@ -44,8 +44,6 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # - 'block': graphs are owned at the enclosing block (TransformerBlock / HybridBlock).
     # Only meaningful when cuda_graph_impl='local'.
     inference_cuda_graph_scope: NotRequired[str]
-    # Required for EP>1 + local CUDA graphs.
-    moe_pad_experts_for_cuda_graph_inference: NotRequired[bool]
 
     materialize_only_last_token_logits: bool
     enable_chunked_prefill: bool
@@ -53,7 +51,6 @@ class MCoreGenerationSpecificArgs(TypedDict):
     async_sched_mode: NotRequired[Literal["legacy", "async"]]
     vision_embedding_cache_max_bytes: NotRequired[int]
     allow_stale_multimodal_embeddings: NotRequired[bool]
-    logprobs_mode: NotRequired[Literal["raw_logprobs", "processed_logprobs"]]
 
     refit_backend: Literal["gloo", "nccl", "nvshmem"]
     num_speculative_tokens: int
@@ -61,12 +58,24 @@ class MCoreGenerationSpecificArgs(TypedDict):
     mamba_inference_ssm_states_dtype: NotRequired[str]
     mamba_inference_conv_states_dtype: NotRequired[str]
 
-    # Raw media preprocessing used by the OpenAI-compatible HTTP endpoint.
+    # Raw media preprocessing. Each key is read only on the path that needs it;
+    # when omitted, MCore's own dataclass default applies (see
+    # ImageProcessingConfig / VideoProcessingConfig).
+    # `image_dynamic_resolution` requires an inference wrapper that supports
+    # images. The `video_*` keys are read only when `video_temporal_patch_size`
+    # is set, and `video_num_frames` is then required.
     image_dynamic_resolution: NotRequired[bool]
-    video_num_frames: NotRequired[int]
-    video_temporal_patch_size: NotRequired[int]
-    video_target_num_patches: NotRequired[int]
+    video_num_frames: NotRequired[int]  # Frames sampled per video.
+    video_temporal_patch_size: NotRequired[int]  # Frames per temporal patch.
+    video_target_num_patches: NotRequired[int]  # Overrides the image max-patch budget.
     video_maintain_aspect_ratio: NotRequired[bool]
+
+    # Fully-qualified class path of the MCore inference wrapper, e.g.
+    # "megatron.core.inference.model_inference_wrappers.multimodal.
+    # nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper".
+    # Resolved by `_get_megatron_inference_wrapper_cls`; its `supports_*`
+    # attributes gate which modalities are preprocessed. Not media preprocessing
+    # itself, and used on the direct generate path as well as the HTTP endpoint.
     megatron_inference_wrapper: NotRequired[str]
 
     # KV cache lifecycle across suspend/resume:

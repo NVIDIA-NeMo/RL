@@ -23,9 +23,15 @@ from megatron.core.inference.utils import device_memory_summary
 def build_image_preprocessing_config(
     image_processor: Any,
     *,
-    dynamic_resolution: bool,
+    dynamic_resolution: bool | None = None,
 ) -> ImageProcessingConfig:
-    """Translate an HF image processor to an MCore config."""
+    """Translate an HF image processor to an MCore config.
+
+    Args:
+        image_processor: HF image processor to read patch/normalization fields from.
+        dynamic_resolution: Override for `ImageProcessingConfig.dynamic_resolution`.
+            `None` leaves MCore's own default in place.
+    """
 
     def read(*names: str) -> Any:
         for name in names:
@@ -74,7 +80,11 @@ def build_image_preprocessing_config(
 
     return ImageProcessingConfig(
         patch_dim=int(patch_dim),
-        dynamic_resolution=dynamic_resolution,
+        **(
+            {}
+            if dynamic_resolution is None
+            else {"dynamic_resolution": dynamic_resolution}
+        ),
         use_tiling=False,
         pixel_shuffle=merge_size > 1,
         spatial_merge_size=merge_size,
@@ -90,12 +100,19 @@ def build_video_preprocessing_config(
     generation_config: dict[str, Any],
     *,
     frame_manifest_magic: bytes,
-    video_maintain_aspect_ratio: bool = True,
 ) -> VideoProcessingConfig | None:
     """Build video preprocessing when explicitly enabled by generation config."""
     temporal_patch_size = generation_config.get("video_temporal_patch_size")
     if image_config is None or temporal_patch_size is None:
         return None
+
+    # Read past the early return so text-only and image-only configs never need
+    # video keys; omit when absent so MCore's own default applies.
+    video_kwargs: dict[str, Any] = {}
+    if "video_maintain_aspect_ratio" in generation_config:
+        video_kwargs["video_maintain_aspect_ratio"] = bool(
+            generation_config["video_maintain_aspect_ratio"]
+        )
 
     target_num_patches = generation_config.get("video_target_num_patches")
     if target_num_patches is not None:
@@ -104,12 +121,18 @@ def build_video_preprocessing_config(
             dynamic_resolution_max_patches=int(target_num_patches),
         )
 
+    video_num_frames = generation_config.get("video_num_frames")
+    if video_num_frames is None:
+        raise ValueError(
+            "video_num_frames must be set when video_temporal_patch_size is set."
+        )
+
     return VideoProcessingConfig(
         image_config=image_config,
-        num_frames=int(generation_config["video_num_frames"]),
+        num_frames=int(video_num_frames),
         temporal_patch_size=int(temporal_patch_size),
-        video_maintain_aspect_ratio=video_maintain_aspect_ratio,
         frame_manifest_magic=frame_manifest_magic,
+        **video_kwargs,
     )
 
 

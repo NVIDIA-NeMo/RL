@@ -40,6 +40,7 @@ from tests.unit.test_utils import SimpleLossFn
 model_name = "Qwen/Qwen3-0.6B"
 
 
+@pytest.mark.mcore
 def test_direct_megatron_media_request_preserves_preexpanded_prompt():
     worker = object.__new__(MegatronGenerationMixin)
     worker.cfg = {"generation": {"mcore_generation_config": {}}}
@@ -68,6 +69,7 @@ def test_direct_megatron_media_request_preserves_preexpanded_prompt():
     assert "image" in multi_modal_data
 
 
+@pytest.mark.mcore
 def test_direct_megatron_video_request_marks_preexpanded_prompt():
     worker = object.__new__(MegatronGenerationMixin)
     worker.cfg = {"generation": {"mcore_generation_config": {}}}
@@ -100,6 +102,7 @@ def test_direct_megatron_video_request_marks_preexpanded_prompt():
     assert "video" in multi_modal_data
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize(
     ("modality", "num_frames"),
     [("image", torch.tensor([1])), ("video", torch.tensor([4]))],

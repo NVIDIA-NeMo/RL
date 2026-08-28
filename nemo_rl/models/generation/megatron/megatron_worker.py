@@ -117,22 +117,42 @@ class MegatronGenerationMixin:
         self._inference_loop = None
         self._inference_thread = None
 
-    def _get_megatron_inference_wrapper_cls(self):
-        """Resolve the configured Megatron inference wrapper, if any."""
+    def _get_megatron_inference_wrapper_cls(self) -> Optional[type]:
+        """Resolve the configured Megatron inference wrapper, if any.
+
+        Returns:
+            The wrapper class, or None when no wrapper is configured.
+        """
         class_path = self.cfg["generation"]["mcore_generation_config"].get(
             "megatron_inference_wrapper"
         )
         if class_path is None:
             return None
+        # Resolved once per worker: this is called per sample during generation.
+        cached = getattr(self, "_megatron_inference_wrapper_cls", None)
+        if cached is not None:
+            return cached
         module_name, _, class_name = class_path.rpartition(".")
         if not module_name:
             raise ValueError(
-                "megatron_inference_wrapper must be a fully qualified class name."
+                "megatron_inference_wrapper must be a fully qualified class name, "
+                f"got {class_path!r}."
             )
-        return getattr(importlib.import_module(module_name), class_name)
+        try:
+            wrapper_cls = getattr(importlib.import_module(module_name), class_name)
+        except (ImportError, AttributeError) as e:
+            raise ValueError(
+                f"Could not resolve megatron_inference_wrapper {class_path!r} "
+                f"(from policy.generation.mcore_generation_config): {e}"
+            ) from e
+        self._megatron_inference_wrapper_cls = wrapper_cls
+        return wrapper_cls
 
     @staticmethod
-    def _wrapper_supports_modality(inference_wrapper_cls, modality: str) -> bool:
+    def _wrapper_supports_modality(
+        inference_wrapper_cls: Optional[type], modality: str
+    ) -> bool:
+        """Whether the configured inference wrapper advertises `modality` support."""
         return bool(
             inference_wrapper_cls is not None
             and getattr(inference_wrapper_cls, f"supports_{modality}", False)
@@ -164,11 +184,16 @@ class MegatronGenerationMixin:
             raise ValueError(
                 "Megatron multimodal generation requires the policy processor."
             )
+        # Omit absent keys entirely so MCore's own dataclass defaults apply;
+        # passing None would override them (these fields are `bool`, not `Optional`).
+        image_kwargs: dict[str, Any] = {}
+        if "image_dynamic_resolution" in generation_config:
+            image_kwargs["dynamic_resolution"] = bool(
+                generation_config["image_dynamic_resolution"]
+            )
         return build_image_preprocessing_config(
             processor.image_processor,
-            dynamic_resolution=bool(
-                generation_config.get("image_dynamic_resolution", False)
-            ),
+            **image_kwargs,
         )
 
     def _setup_colocated_cuda_graph_managers(self) -> None:
@@ -348,10 +373,23 @@ class MegatronGenerationMixin:
             image_preprocessing_config,
             mcore_generation_config,
             frame_manifest_magic=CACHED_VIDEO_FRAME_MANIFEST_MAGIC,
-            video_maintain_aspect_ratio=bool(
-                mcore_generation_config.get("video_maintain_aspect_ratio", True)
-            ),
         )
+
+        # Only forward keys the config actually sets, so MCore's InferenceConfig
+        # defaults stay the single source of truth for the ones it omits.
+        inference_overrides: dict[str, Any] = {}
+        if "async_sched_mode" in mcore_generation_config:
+            inference_overrides["async_sched_mode"] = AsyncScheduleMode(
+                mcore_generation_config["async_sched_mode"]
+            )
+        if "vision_embedding_cache_max_bytes" in mcore_generation_config:
+            inference_overrides["vision_embedding_cache_max_bytes"] = int(
+                mcore_generation_config["vision_embedding_cache_max_bytes"]
+            )
+        if "allow_stale_multimodal_embeddings" in mcore_generation_config:
+            inference_overrides["allow_stale_multimodal_embeddings"] = bool(
+                mcore_generation_config["allow_stale_multimodal_embeddings"]
+            )
 
         inference_config = InferenceConfig(
             block_size_tokens=block_size_tokens,
@@ -364,19 +402,11 @@ class MegatronGenerationMixin:
             use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
             use_flashinfer_fused_rope=use_flashinfer_fused_rope,
             sampling_backend="flashinfer",
-            async_sched_mode=AsyncScheduleMode(
-                mcore_generation_config.get("async_sched_mode", "legacy")
-            ),
             use_synchronous_zmq_collectives=True,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             enable_chunked_prefill=enable_chunked_prefill,
             enable_prefix_caching=mcore_generation_config["enable_prefix_caching"],
-            vision_embedding_cache_max_bytes=int(
-                mcore_generation_config.get("vision_embedding_cache_max_bytes", 0)
-            ),
-            allow_stale_multimodal_embeddings=bool(
-                mcore_generation_config.get("allow_stale_multimodal_embeddings", False)
-            ),
+            **inference_overrides,
             prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(
                 "first_prefix_block"
             ),
@@ -388,9 +418,7 @@ class MegatronGenerationMixin:
             ),
             logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
-            logprobs_mode=mcore_generation_config.get(
-                "logprobs_mode", "processed_logprobs"
-            ),
+            logprobs_mode=mcore_generation_config["logprobs_mode"],
             max_requests=max_requests,
             image_preprocessing_config=image_preprocessing_config,
             video_preprocessing_config=video_preprocessing_config,
@@ -786,6 +814,25 @@ class MegatronGenerationMixin:
                 "per-sample PackedTensor value."
             )
 
+        # `.tensors` is the *physical* segment list. It only lines up with the
+        # logical row index while media are un-deduplicated (`_row_offsets is
+        # None`); once `repeat_interleave(..., share_immutable_media=True)` packs
+        # N rows onto fewer segments, row `index` would silently read another
+        # row's image. `_validate_multimodal_dedup_capability` rejects
+        # `deduplicate_multimodal_data` for non-vLLM backends, so this is
+        # currently unreachable — assert it here, where the assumption is used.
+        for name, packed in (
+            ("pixel_values", pixel_values),
+            ("imgs_sizes", imgs_sizes),
+            ("num_frames", packed_num_frames),
+        ):
+            if packed is not None and packed._row_offsets is not None:
+                raise ValueError(
+                    f"Megatron generation cannot index deduplicated {name}; "
+                    "set deduplicate_multimodal_data=false (it is only supported "
+                    "for the vLLM backend)."
+                )
+
         imgs = pixel_values.tensors[index]
         sizes = imgs_sizes.tensors[index]
         num_frames = (
@@ -932,9 +979,10 @@ class MegatronGenerationMixin:
         )
         for i in range(batch_size):
             # Take the prompt from the request we submitted rather than from the
-            # engine's reply: mcore only echoes prompt_tokens back when
-            # SamplingParams.return_prompt_tokens is set, and asking for them would
-            # ship the whole prompt over ZMQ for data we already hold.
+            # engine's reply. Multimodal requests do set
+            # SamplingParams.return_prompt_tokens, but only so the echoed tokens
+            # can be length-checked below; the padded output is still built from
+            # the prompt we already hold rather than shipped back over ZMQ.
             prompt_len = input_lengths[i].item()
             generated_tokens = result[i].generated_tokens
             seq_len = prompt_len + len(generated_tokens)
