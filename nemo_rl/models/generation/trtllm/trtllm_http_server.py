@@ -33,6 +33,14 @@ from nemo_rl.models.generation.openai_server_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _tokenizer_backend_name(tokenizer: Any) -> str:
+    """Return the concrete backend that performs encode/decode operations."""
+    backend = getattr(tokenizer, "_tokenizer", None)
+    implementation = backend if backend is not None else tokenizer
+    implementation_type = type(implementation)
+    return f"{implementation_type.__module__}.{implementation_type.__name__}"
+
+
 def _request_matches_profile(body: dict[str, Any], profile: dict[str, Any]) -> bool:
     """Whether every sampling param the request pins equals *profile*'s value.
 
@@ -303,7 +311,6 @@ def create_app(
             stop_token_ids=stop_token_ids,
             max_tokens=max_tokens,
         )
-
         try:
             output = await llm.generate_async(
                 {"prompt_token_ids": adj_prompt},
