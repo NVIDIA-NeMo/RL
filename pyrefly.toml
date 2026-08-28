@@ -213,6 +213,7 @@ project-includes = [
   "nemo_rl/models/generation/vllm/quantization/fp8_train_utils.py",
   "nemo_rl/models/generation/vllm/quantization/mxfp8_utils.py",
   "nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py",
+  "nemo_rl/models/generation/vllm/refit_adapter.py",
   "nemo_rl/models/generation/vllm/refit_layout.py",
   "nemo_rl/models/generation/vllm/refit_loader.py",
   "nemo_rl/models/generation/vllm/utils.py",
