@@ -32,12 +32,15 @@ _QKVO_RE = re.compile(
 _BF16_ONLY_SCOPES = ("shared_experts", "router", "qkvo", "lm_head")
 _OPTIONAL_BF16_SCOPES = {"qwen30": frozenset(("shared_experts",)), "nano": frozenset()}
 _MODEL_ROUTED_LAYER_COUNTS = {"qwen30": 48, "nano": 52}
-_ROUTED_MODULES = frozenset(("FC1", "FC2"))
+_MODEL_ROUTED_PROJECTIONS = {
+    "qwen30": frozenset(("gate_proj", "up_proj", "down_proj")),
+    "nano": frozenset(("up_proj", "down_proj")),
+}
 _EXPECTED_ROUTED_MODULES = {
     model_scope: frozenset(
-        (layer, module)
+        (layer, projection)
         for layer in range(layer_count)
-        for module in _ROUTED_MODULES
+        for projection in _MODEL_ROUTED_PROJECTIONS[model_scope]
     )
     for model_scope, layer_count in _MODEL_ROUTED_LAYER_COUNTS.items()
 }
@@ -66,11 +69,10 @@ def _routed_module_key(name: str) -> tuple[int, str]:
     layer = _layer_number(name)
     if layer is None:
         raise ValueError(f"Routed-expert entry {name!r} has no layer number")
-    if name.endswith((".gate_proj.weight", ".up_proj.weight", ".linear_fc1.weight")):
-        return layer, "FC1"
-    if name.endswith((".down_proj.weight", ".linear_fc2.weight")):
-        return layer, "FC2"
-    raise ValueError(f"Routed-expert entry {name!r} is not an FC1 or FC2 weight")
+    for projection in _MODEL_ROUTED_PROJECTIONS["qwen30"]:
+        if name.endswith(f".{projection}.weight"):
+            return layer, projection
+    raise ValueError(f"Routed-expert entry {name!r} is not a supported projection weight")
 
 
 def _format_routed_module(module: tuple[int, str]) -> str:
@@ -150,9 +152,9 @@ def assert_native_mxfp8_storage_inventory(
         range(layer_count - num_layers_at_end_in_bf16, layer_count)
     )
     expected_bf16_modules = frozenset(
-        (layer, module)
+        (layer, projection)
         for layer in expected_last_layers
-        for module in _ROUTED_MODULES
+        for projection in _MODEL_ROUTED_PROJECTIONS[model_scope]
     )
     expected_native_modules = expected_modules - expected_bf16_modules
     observed_modules = routed_native_modules | routed_bf16_modules

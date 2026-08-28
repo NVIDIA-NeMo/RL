@@ -123,7 +123,7 @@ def test_qwen_inventory_rejects_native_shared_expert() -> None:
         (
             (_routed_name(layer, projection), _native_entry())
             for layer in range(48)
-            for projection in ("up", "down")
+            for projection in ("gate", "up", "down")
         )
     )
     native["model.layers.0.mlp.shared_experts.linear_fc1.weight"] = _native_entry()
@@ -137,12 +137,54 @@ def test_qwen_inventory_rejects_native_shared_expert() -> None:
         )
 
 
-def test_qwen_inventory_allows_absent_shared_expert_when_no_native_entry() -> None:
+def test_qwen_inventory_rejects_missing_all_gate_proj_entries() -> None:
     native = OrderedDict(
         (
             (_routed_name(layer, projection), _native_entry())
             for layer in range(48)
             for projection in ("up", "down")
+        )
+    )
+
+    with pytest.raises(ValueError, match="layer 0 gate_proj.*native"):
+        assert_native_mxfp8_storage_inventory(
+            native_metadata=native,
+            misc_metadata=_bf16_non_routed_entries(include_shared_experts=False),
+            model_scope="qwen30",
+            num_layers_at_end_in_bf16=0,
+        )
+
+
+def test_qwen_inventory_rejects_linear_fc1_alias_for_missing_gate_proj() -> None:
+    native = OrderedDict(
+        (
+            (_routed_name(layer, projection), _native_entry())
+            for layer in range(48)
+            for projection in ("up", "down")
+        )
+    )
+    native.update(
+        (
+            (f"model.layers.{layer}.mlp.experts.0.linear_fc1.weight", _native_entry())
+            for layer in range(48)
+        )
+    )
+
+    with pytest.raises(ValueError, match="not a supported projection"):
+        assert_native_mxfp8_storage_inventory(
+            native_metadata=native,
+            misc_metadata=_bf16_non_routed_entries(include_shared_experts=False),
+            model_scope="qwen30",
+            num_layers_at_end_in_bf16=0,
+        )
+
+
+def test_qwen_inventory_allows_absent_shared_expert_when_no_native_entry() -> None:
+    native = OrderedDict(
+        (
+            (_routed_name(layer, projection), _native_entry())
+            for layer in range(48)
+            for projection in ("gate", "up", "down")
         )
     )
 
@@ -160,7 +202,7 @@ def test_nano_inventory_rejects_early_bf16_routed_expert() -> None:
     misc[early_fc1] = {"dtype": "torch.bfloat16"}
     native.pop(early_fc1)
 
-    with pytest.raises(ValueError, match="layer 3 FC1.*native"):
+    with pytest.raises(ValueError, match="layer 3 up_proj.*native"):
         assert_native_mxfp8_storage_inventory(
             native_metadata=native,
             misc_metadata=misc,
@@ -173,7 +215,7 @@ def test_nano_inventory_rejects_omitted_final_bf16_routed_expert() -> None:
     native, misc = _nano_inventory_inputs()
     misc.pop(_routed_name(51, "down"))
 
-    with pytest.raises(ValueError, match="layer 51 FC2.*BF16"):
+    with pytest.raises(ValueError, match="layer 51 down_proj.*BF16"):
         assert_native_mxfp8_storage_inventory(
             native_metadata=native,
             misc_metadata=misc,
