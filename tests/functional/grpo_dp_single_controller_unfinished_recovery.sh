@@ -27,6 +27,12 @@ COMMON_OVERRIDES=(
     async_rl.sampler.max_lookahead_versions=1
     async_rl.max_inflight_prompts=4
     async_rl.max_buffered_rollouts=4
+    # A recovery-ordering regression otherwise leaves zero rollouts in flight and
+    # only warns forever. Bound both slow generation and whole-run stalls in CI.
+    ++async_rl.rollout_failure.native.generation_timeout_s=60
+    ++async_rl.stall_watchdog.interval_s=10
+    ++async_rl.stall_watchdog.stall_timeout_s=180
+    ++async_rl.stall_watchdog.stall_action=abort
 )
 
 echo "=== Phase 1: checkpoint one admitted rollout before its TQ commit ==="

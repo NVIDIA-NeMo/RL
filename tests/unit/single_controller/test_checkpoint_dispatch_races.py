@@ -32,6 +32,7 @@ import asyncio
 import hashlib
 import threading
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -341,6 +342,88 @@ def _reserve_prompt(idx: int) -> DatumSpec:
         "extra_env_info": None,
         "loss_multiplier": 1.0,
     }
+
+
+def _identity_dict_collator(batch: list[DatumSpec]) -> DatumSpec:
+    """Return one directly usable prompt rather than a BatchedDataDict."""
+    assert len(batch) == 1
+    prompt = dict(batch[0])
+    prompt["length"] = 99
+    return cast(DatumSpec, prompt)
+
+
+def _two_row_collator(_batch: list[DatumSpec]) -> BatchedDataDict:
+    """Return an invalid two-row recovery batch."""
+    return BatchedDataDict({"idx": [7, 8]})
+
+
+def _non_mapping_collator(_batch: list[DatumSpec]) -> list[str]:
+    """Return an invalid collator result type."""
+    return ["not-a-prompt"]
+
+
+def _rehydration_controller(
+    collate_fn: Callable[[list[DatumSpec]], Any],
+) -> tuple[Any, RolloutRecoveryLedger]:
+    """Build a restored ledger whose prompt must be resolved from the dataset."""
+    dataset_prompt = _reserve_prompt(7)
+    saved_ledger = RolloutRecoveryLedger()
+    saved_ledger.reserve_group(
+        group_id="rehydrate-7",
+        prompt_id="7",
+        prompt_payload=dataset_prompt,
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=7,
+        admitted=True,
+    )
+    restored_ledger = RolloutRecoveryLedger()
+    restored_ledger.load_state_dict(saved_ledger.state_dict())
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    controller = object.__new__(controller_cls)
+    controller._rollout_manager = SimpleNamespace(recovery_ledger=restored_ledger)
+    controller._dataloader = SimpleNamespace(
+        dataset={7: dataset_prompt},
+        collate_fn=collate_fn,
+    )
+    return controller, restored_ledger
+
+
+def test_recovery_rehydration_accepts_an_identity_dict_collator() -> None:
+    controller, ledger = _rehydration_controller(_identity_dict_collator)
+
+    asyncio.run(controller._rehydrate_rollout_recovery_prompts())
+
+    assert ledger.get_group("rehydrate-7").prompt_payload["length"] == 99
+
+
+@pytest.mark.parametrize(
+    ("collate_fn", "expected_error", "match"),
+    [
+        pytest.param(
+            _two_row_collator,
+            ValueError,
+            "must return exactly one prompt",
+            id="multiple-prompts",
+        ),
+        pytest.param(
+            _non_mapping_collator,
+            TypeError,
+            "expected a mapping",
+            id="non-mapping",
+        ),
+    ],
+)
+def test_recovery_rehydration_rejects_invalid_collator_results(
+    collate_fn: Callable[[list[DatumSpec]], Any],
+    expected_error: type[Exception],
+    match: str,
+) -> None:
+    controller, _ = _rehydration_controller(collate_fn)
+
+    with pytest.raises(expected_error, match=match):
+        asyncio.run(controller._rehydrate_rollout_recovery_prompts())
 
 
 def _reserve_controller() -> Any:

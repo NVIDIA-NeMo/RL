@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -46,7 +48,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
-from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
+from nemo_rl.experience.rollout_recovery import (
+    RolloutRecoveryLedger,
+    RolloutRecoveryState,
+)
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
 from tests.unit.experience.test_rollout_manager import (
@@ -96,6 +101,22 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._batch_promotions = {}
     ctrl._replacement_reserve = deque()
     ctrl._rollout_recovery_enabled = False
+
+
+class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
+    """Hold a mutation after its body so a concurrent checkpoint can be observed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mutation_applied = asyncio.Event()
+        self.release_mutation = asyncio.Event()
+
+    @asynccontextmanager
+    async def mutation(self) -> AsyncIterator[None]:
+        async with super().mutation():
+            yield
+            self.mutation_applied.set()
+            await self.release_mutation.wait()
 
 
 class _RecordingBuffer:
@@ -813,6 +834,105 @@ def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
         fresh.cancel()
         with pytest.raises(asyncio.CancelledError):
             await fresh
+
+    asyncio.run(_main())
+
+
+def test_abort_stale_inflight_rechecks_registry_after_checkpoint_wait() -> None:
+    """A group completed while checkpoint-blocked is not subsequently aborted."""
+
+    async def _main() -> None:
+        completed = asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+        ledger = RolloutRecoveryLedger()
+        ledger.reserve_group(
+            group_id="completed",
+            prompt_id="10",
+            prompt_payload={"idx": 10, "message_log": []},
+            expected_generations=2,
+            target_step=None,
+            start_weight_version=1,
+            admitted=True,
+        )
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
+        ctrl._trainer_version = 5
+        ctrl._inflight_by_group_id = {"completed": (completed, 1)}
+        ctrl._rollout_recovery_enabled = True
+        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        ctrl._rollout_manager = SimpleNamespace(
+            recovery_ledger=ledger,
+            discard_prompt_group=ledger.discard_group,
+        )
+
+        async with ctrl._data_plane_checkpoint_barrier.checkpoint():
+            abort_task = asyncio.create_task(ctrl._abort_stale_inflight())
+            await asyncio.sleep(0)
+            assert not abort_task.done()
+            ctrl._inflight_by_group_id.pop("completed")
+            ledger.discard_group("completed")
+
+        assert await asyncio.wait_for(abort_task, timeout=1.0) == 0
+        assert not completed.cancelled()
+
+        completed.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await completed
+
+    asyncio.run(_main())
+
+
+def test_checkpoint_observes_stale_abort_ledger_discard() -> None:
+    """A checkpoint waiting on stale abort cannot persist its discarded owner."""
+
+    async def _main() -> None:
+        stale = asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+        ledger = RolloutRecoveryLedger()
+        ledger.reserve_group(
+            group_id="stale",
+            prompt_id="10",
+            prompt_payload={"idx": 10, "message_log": []},
+            expected_generations=2,
+            target_step=None,
+            start_weight_version=1,
+            admitted=True,
+        )
+        barrier = _PausingMutationBarrier()
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
+        ctrl._trainer_version = 5
+        ctrl._inflight_by_group_id = {"stale": (stale, 1)}
+        ctrl._rollout_recovery_enabled = True
+        ctrl._data_plane_checkpoint_barrier = barrier
+        ctrl._rollout_manager = SimpleNamespace(
+            recovery_ledger=ledger,
+            discard_prompt_group=ledger.discard_group,
+        )
+
+        abort_task = asyncio.create_task(ctrl._abort_stale_inflight())
+        await asyncio.wait_for(barrier.mutation_applied.wait(), timeout=1.0)
+
+        checkpoint_entered = asyncio.Event()
+
+        async def checkpoint_snapshot() -> RolloutRecoveryState:
+            async with barrier.checkpoint():
+                checkpoint_entered.set()
+                return ledger.state_dict()
+
+        checkpoint_task = asyncio.create_task(checkpoint_snapshot())
+        await asyncio.sleep(0)
+        assert not checkpoint_entered.is_set()
+
+        barrier.release_mutation.set()
+        checkpoint_state = await asyncio.wait_for(checkpoint_task, timeout=1.0)
+        assert await asyncio.wait_for(abort_task, timeout=1.0) == 1
+        assert checkpoint_state["groups"] == []
+        assert stale.cancelled()
 
     asyncio.run(_main())
 
