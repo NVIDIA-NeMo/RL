@@ -20,7 +20,7 @@ import time
 import urllib.parse
 import urllib.request
 from collections import Counter
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, Protocol, Self, TypedDict
@@ -73,6 +73,74 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+NEMO_GYM_POPPED_VALUE_SENTINEL_KEY = "__nemo_rl_popped__"
+
+
+def _popped_training_value_sentinel(
+    *, field: str, dtype: str, shape: Optional[Sequence[int]]
+) -> dict[str, Any]:
+    """Describe a large value intentionally omitted from a sample artifact."""
+    sentinel = {
+        NEMO_GYM_POPPED_VALUE_SENTINEL_KEY: True,
+        "field": field,
+        "reason": "large_training_value_omitted",
+        "dtype": dtype,
+    }
+    if shape is not None:
+        sentinel["shape"] = [int(dimension) for dimension in shape]
+    return sentinel
+
+
+def _large_training_value_shape(value: Any, *, max_dimensions: int) -> list[int] | None:
+    """Infer JSON-list or routed-experts-envelope shape without copying data."""
+    if isinstance(value, str) and value.startswith("nrlre1:"):
+        parts = value.split(":", 3)
+        if len(parts) == 4:
+            try:
+                return [int(dimension) for dimension in parts[2].split("x")]
+            except ValueError:
+                return None
+    if not isinstance(value, (list, tuple)):
+        return None
+
+    shape: list[int] = []
+    current = value
+    while isinstance(current, (list, tuple)) and len(shape) < max_dimensions:
+        shape.append(len(current))
+        if not current:
+            break
+        current = current[0]
+    return shape
+
+
+def _replace_remaining_large_training_values_with_sentinels(
+    output_items: Sequence[dict[str, Any]],
+    *,
+    routed_experts_dtype: str,
+) -> None:
+    """Redact large fields on skipped output items as well as trainable ones."""
+    field_dtypes_and_dimensions = {
+        "prompt_token_ids": ("int64", 1),
+        "generation_token_ids": ("int64", 1),
+        "generation_log_probs": ("float32", 1),
+        "routed_experts": (routed_experts_dtype, 3),
+    }
+    for output_item in output_items:
+        for field, (dtype, max_dimensions) in field_dtypes_and_dimensions.items():
+            value = output_item.get(field)
+            if value is None or (
+                isinstance(value, Mapping)
+                and value.get(NEMO_GYM_POPPED_VALUE_SENTINEL_KEY) is True
+            ):
+                continue
+            output_item[field] = _popped_training_value_sentinel(
+                field=field,
+                dtype=dtype,
+                shape=_large_training_value_shape(
+                    value,
+                    max_dimensions=max_dimensions,
+                ),
+            )
 
 
 class NemoGymCompatibleConfig(Protocol):
@@ -155,6 +223,15 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
     )
 
     return True
+
+
+def should_log_nemo_gym_training_samples(env_config: Mapping[str, Any]) -> bool:
+    """Read ``env.nemo_gym.log_training_samples``; absent means disabled."""
+    nemo_gym_config = env_config.get("nemo_gym")
+    return bool(
+        isinstance(nemo_gym_config, Mapping)
+        and nemo_gym_config.get("log_training_samples", False)
+    )
 
 
 def _has_nan_generation_logprobs(result: dict) -> bool:
@@ -820,6 +897,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
+        log_training_samples: bool = False,
     ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
         self._require_spinup()
@@ -878,6 +956,7 @@ Depending on your data shape, you may want to change these values."""
                     nemo_gym_result,
                     tokenizer,
                     include_initial_multimodal_data=not deduplicate_multimodal_data,
+                    log_training_sample=log_training_samples,
                 )
                 if _has_nan_generation_logprobs(nemo_rl_result):
                     raise RuntimeError("Generation logprobs contain NaN")
@@ -919,6 +998,7 @@ Depending on your data shape, you may want to change these values."""
         tokenizer: PreTrainedTokenizerBase,
         *,
         include_initial_multimodal_data: bool = True,
+        log_training_sample: bool = False,
     ) -> dict:
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
@@ -1015,6 +1095,27 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             routed_experts_raw = output_item_dict.pop("routed_experts", None)
             new_prompt_token_ids = prompt_token_ids[len(seen_token_ids) :]
 
+            if log_training_sample:
+                output_item_dict["prompt_token_ids"] = _popped_training_value_sentinel(
+                    field="prompt_token_ids",
+                    dtype="int64",
+                    shape=(len(prompt_token_ids),),
+                )
+                output_item_dict["generation_token_ids"] = (
+                    _popped_training_value_sentinel(
+                        field="generation_token_ids",
+                        dtype="int64",
+                        shape=(len(generation_token_ids),),
+                    )
+                )
+                output_item_dict["generation_log_probs"] = (
+                    _popped_training_value_sentinel(
+                        field="generation_log_probs",
+                        dtype="float32",
+                        shape=(len(generation_log_probs),),
+                    )
+                )
+
             routed_experts = None
             if routed_experts_raw is not None:
                 routed_experts_dtype = _ROUTED_EXPERTS_DTYPES[
@@ -1036,6 +1137,14 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                         "trainable output item: "
                         f"routes={routed_experts.shape[0]}, expected_at_least="
                         f"{expected_tokens}."
+                    )
+                if log_training_sample:
+                    output_item_dict["routed_experts"] = (
+                        _popped_training_value_sentinel(
+                            field="routed_experts",
+                            dtype=str(routed_experts.dtype).removeprefix("torch."),
+                            shape=routed_experts.shape,
+                        )
                     )
             elif self.cfg.get("require_routed_experts", False):
                 raise ValueError(
@@ -1132,6 +1241,12 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             ):
                 output_item_dict["prompt_str"] = prompt_str
                 output_item_dict["generation_str"] = generation_str
+
+        if log_training_sample:
+            _replace_remaining_large_training_values_with_sentinels(
+                nemo_gym_result["response"]["output"],
+                routed_experts_dtype=self.cfg.get("routed_experts_dtype", "int16"),
+            )
 
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]
@@ -1326,6 +1441,10 @@ def spinup_nemo_gym_actor(
         The spun-up NemoGym Ray actor handle (_spinup already awaited).
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
+
+    # Driver-only persistence control. It is forwarded per rollout so training
+    # can retain responses while validation keeps the flag-off payload shape.
+    nemo_gym_dict.pop("log_training_samples", None)
 
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
