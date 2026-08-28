@@ -42,6 +42,14 @@ from nemo_rl.models.generation.openai_server_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _tokenizer_backend_name(tokenizer: Any) -> str:
+    """Return the concrete backend that performs encode/decode operations."""
+    backend = getattr(tokenizer, "_tokenizer", None)
+    implementation = backend if backend is not None else tokenizer
+    implementation_type = type(implementation)
+    return f"{implementation_type.__module__}.{implementation_type.__name__}"
+
+
 def _context_leg_response(
     model_name: str,
     prompt_token_ids: list[int],
@@ -407,7 +415,6 @@ def create_app(
             stop_token_ids=stop_token_ids,
             max_tokens=max_tokens,
         )
-
         try:
             output = await llm.generate_async(
                 {"prompt_token_ids": adj_prompt},
