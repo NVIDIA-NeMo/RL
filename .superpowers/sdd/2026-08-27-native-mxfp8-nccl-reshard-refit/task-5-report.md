@@ -108,3 +108,70 @@ Both implementation commits are signed off with `git commit -s`.
   validation remain external verification gates.
 - The intentionally excluded model surfaces and the vLLM destination adapter
   remain for their planned follow-on tasks.
+
+## Review Fix
+
+Review-fix implementation range: `8a5ed16e..788dba42`.
+
+- `2640c98d test(refit): cover native MXFP8 review failures`
+- `788dba42 fix(refit): repair native MXFP8 grouped sources`
+
+Both commits are signed off with `git commit -s`.
+
+The grouped native setup now builds singular grouped FC1/FC2 tasks through
+their suffixed registry entries before Bridge validates the remaining ordinary
+tasks. This makes the path reachable for owner and non-owner PP ranks while
+preserving placeholders and global transfer order. Simple routed-expert FC1
+`AutoMapping` sources now use a direct, unsplit `up_proj.weight` descriptor for
+both local-expert and numeric-suffix Megatron names. Fused expert names accept
+an optional input `.weight` suffix and emit one canonical suffix.
+
+Before any transfer loop, every owned grouped member is reopened with
+`create_if_missing=False`, extracted, and view-validated for both roles. The
+per-parameter `pre` hook still performs the current refit's split and stack.
+Direct components are extracted once per task refresh and exposed through the
+shared source iterator.
+
+### Review RED Evidence
+
+The new production-path tests initially failed with:
+
+```text
+ValueError: No mapping found for decoder.layers.0.mlp.experts.linear_fc1.weight
+```
+
+This occurred for both owner and non-owner PP cases because strict Bridge task
+construction ran before the custom grouped builder. Additional focused RED
+failures were:
+
+```text
+ValueError: Unsupported native MXFP8 source 'model.layers.0.mlp.experts.3.up_proj.weight' role 'weight' with mapping AutoMapping
+AssertionError: emitted model.layers.0.mlp.experts.gate_u.gate_proj.weight
+AssertionError: expected one component extraction, observed four
+AttributeError: 'NoneType' object has no attribute 'base'
+AssertionError: expected no transfer before grouped validation, observed one
+```
+
+The numeric-suffix `linear_fc1.weight3` form also failed with the same
+unsupported `AutoMapping` error before its fix.
+
+### Review GREEN Evidence
+
+Final isolated verification results:
+
+```text
+Task 5 grouped/source suite: 20 passed in 0.18s
+Task 5 worker harness: Task 5 worker harness passed
+Task 2 regressions: 80 passed in 2.37s
+Task 4 regressions: 27 passed in 0.72s
+Focused test Pyrefly: INFO 0 errors
+Ruff check: All checks passed!
+Ruff format: 3 files already formatted
+git diff --check: exit 0
+```
+
+Native repository pytest remains blocked before collection by the Linux-only
+lockfile on this macOS host, so no native pytest success is claimed. Focused
+Pyrefly for the changed test file is clean. Whole-file Pyrefly on the worker
+still reports 43 pre-existing diagnostics outside the Task 5 implementation
+region; this review fix did not broaden scope to repair that baseline.
