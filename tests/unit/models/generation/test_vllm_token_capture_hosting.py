@@ -263,6 +263,8 @@ def test_request_capture_round_trip_stages_and_rides_coords():
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
     content = _served_content([13, 14], [-0.1, -0.2])
+    # Full-length routes on the served response must not survive the strip.
+    content["choices"][0]["message"]["routed_experts"] = [[[0]]] * 5
     content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
         worker, request, content
     )
@@ -276,11 +278,12 @@ def test_request_capture_round_trip_stages_and_rides_coords():
     assert "token_ids_delta" not in coords
     assert coords["chain_hash"] == sink.records[0].chain_hash
     assert coords["cumulative_hash"] == sink.records[0].cumulative_hash
-    # Logprobs never transit worker -> gate; state map is drained.
+    # Logprobs and routes never transit worker -> gate; state map is drained.
     assert (
         "logprobs" not in content["choices"][0]
         or content["choices"][0]["logprobs"] is None
     )
+    assert "routed_experts" not in content["choices"][0]["message"]
     assert worker._capture_calls == {}
 
 
