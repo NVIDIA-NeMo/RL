@@ -40,12 +40,15 @@ def test_ray_tmpdir_is_resolved_before_ray_head_and_workers_start() -> None:
     assert ray_sub.index("export RAY_TMPDIR=") < ray_sub.index("ray start --address")
 
 
-def test_launcher_exports_slurm_helper_path_to_batch_shell() -> None:
+def test_launcher_exports_resolved_slurm_helper_path_to_batch_shell() -> None:
     launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
 
-    assert '--export="ALL,PATH=${SLURM_BATCH_PATH}"' in launcher
-    assert "/usr/local/bin" in launcher
-    assert "/cm/shared/apps/slurm/current/bin" in launcher
+    assert "resolve_slurm_helper_path()" in launcher
+    assert 'readlink -f "${helper_path}"' in launcher
+    assert "realpath" in launcher
+    assert "SLURM_HELPER_PATH=$(resolve_slurm_helper_path)" in launcher
+    assert '--export="ALL,SLURM_HELPER_PATH=${SLURM_HELPER_PATH}"' in launcher
+    assert "Required Slurm helper ${helper} not found" in launcher
 
 
 def test_ray_sub_bootstraps_slurm_helper_path_before_queries() -> None:

@@ -10,7 +10,7 @@ RUN_GROUP=${RUN_GROUP:-$(date +%Y%m%d-%H%M%S)}
 WALLTIME=${WALLTIME:-04:00:00}
 PARTITION=${PARTITION:-batch}
 LOCAL_SCRATCH=${LOCAL_SCRATCH:-/raid/scratch/${USER}}
-SLURM_BATCH_PATH=${SLURM_BATCH_PATH:-/usr/local/bin:/usr/bin:/bin:/cm/shared/apps/slurm/current/bin:${PATH}}
+SLURM_HELPER_CANDIDATE_DIRS=${SLURM_HELPER_CANDIDATE_DIRS:-/usr/local/bin:/usr/bin:/bin}
 
 case "${ACTION}" in
   render|test-only|submit) ;;
@@ -103,6 +103,53 @@ require_prefix "${HF_HOME}" /lustre HF_HOME
 require_prefix "${WANDB_HOME}" /home WANDB_HOME
 require_prefix "${RESULT_ROOT}" /lustre RESULT_ROOT
 require_prefix "${LOCAL_SCRATCH}" /raid/scratch LOCAL_SCRATCH
+
+resolve_helper_path() {
+  local helper=$1
+  local helper_path candidate_dirs=()
+  helper_path=$(command -v "${helper}" 2>/dev/null || true)
+  if [[ -z "${helper_path}" ]]; then
+    local candidate_dir
+    IFS=: read -r -a candidate_dirs <<< "${SLURM_HELPER_CANDIDATE_DIRS}"
+    for candidate_dir in "${candidate_dirs[@]}"; do
+      if [[ -x "${candidate_dir}/${helper}" ]]; then
+        helper_path="${candidate_dir}/${helper}"
+        break
+      fi
+    done
+  fi
+  if [[ -z "${helper_path}" ]]; then
+    echo "Required Slurm helper ${helper} not found on PATH or SLURM_HELPER_CANDIDATE_DIRS" >&2
+    exit 2
+  fi
+  if [[ "${helper_path}" != /* ]]; then
+    echo "Required Slurm helper ${helper} resolved to a non-absolute path: ${helper_path}" >&2
+    exit 2
+  fi
+
+  local resolved_path
+  resolved_path=$(readlink -f "${helper_path}" 2>/dev/null || realpath "${helper_path}" 2>/dev/null || printf '%s\n' "${helper_path}")
+  if [[ ! -x "${resolved_path}" ]]; then
+    echo "Required Slurm helper ${helper} is not executable: ${resolved_path}" >&2
+    exit 2
+  fi
+  dirname "${resolved_path}"
+}
+
+resolve_slurm_helper_path() {
+  local helper helper_dir joined=
+  for helper in sinfo scontrol srun; do
+    helper_dir=$(resolve_helper_path "${helper}")
+    case ":${joined}:" in
+      *":${helper_dir}:"*) ;;
+      *) joined="${joined:+${joined}:}${helper_dir}" ;;
+    esac
+  done
+  printf '%s\n' "${joined}"
+}
+
+SLURM_HELPER_PATH=$(resolve_slurm_helper_path)
+export SLURM_HELPER_PATH
 
 for path in "${REPO}/${CONFIG}" "${REPO}/ray.sub" "${CONTAINER}" "${HF_HOME}" "${WANDB_HOME}/.netrc"; do
   test -e "${path}"
@@ -222,7 +269,7 @@ SBATCH_ARGS=(
   --segment="${SEGMENT_SIZE}"
   --job-name="${SLURM_ACCOUNT}.${RUN_NAME}"
   --output="${RUN_ROOT}/slurm-%j.out"
-  --export="ALL,PATH=${SLURM_BATCH_PATH}"
+  --export="ALL,SLURM_HELPER_PATH=${SLURM_HELPER_PATH}"
   --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"120","reason":"model_loading","description":"native MXFP8 source refit"}}'
 )
 
