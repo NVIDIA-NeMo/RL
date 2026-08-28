@@ -178,3 +178,81 @@ blocked locally because the macOS environment does not provide the vendored
 Megatron Bridge packages; its remaining diagnostics are unavailable-import and
 pre-existing test-file diagnostics, with none in the new partitioning region.
 Linux locked-environment Pyrefly remains a downstream validation gate.
+
+## Destination Geometry and Completion-Fence Review Fixes
+
+Implementation range before this report update: `740e9704..be4d3a07`.
+
+- `a41ed378 test(refit): cover destination geometry and completion fence`
+- `be4d3a07 fix(refit): validate native destination geometry`
+
+Both commits contain a `Signed-off-by` trailer.
+
+The adapter now derives each native component's expected local shape solely
+from its Task 2 `global_shape`, `dst_mesh_info`, and `dst_placements`. It
+validates the placement rank and shard dimensions, requires equal vLLM-native
+shards, and compares that independently derived shape with the resolved
+checkpoint target region before any receive. Dense gate/up regions are split
+from the actual fused vLLM tensor rather than from wire-provided output sizes.
+
+The native backend success path now performs a device-wide CUDA synchronization
+after `finish_update()` and optional MTP post-processing, before cache cleanup
+and the success return.
+
+### Review RED Evidence
+
+The tests-only commit produced both intended failures against `740e9704`:
+
+```text
+FAILED test_0251_adapter_rejects_consistent_dense_metadata_that_misses_fused_target
+Failed: DID NOT RAISE ValueError
+
+FAILED test_native_mxfp8_refit_fences_after_finalize_and_mtp
+AssertionError: MTP was the final lifecycle event
+```
+
+The shape case changed both dense gate and up value/scale metadata to mutually
+consistent global shapes whose TP2 local output is `(64, 32)`, while the real
+fused target has two `(32, 32)` halves. No wrapped loader call is allowed before
+the mismatch is rejected.
+
+### Review GREEN Evidence
+
+Final focused macOS evidence:
+
+```text
+test_vllm_refit_adapter.py: 33 passed, 1 skipped in 3.01s
+test_nccl_reshard_backend.py: 19 passed, 1 warning in 0.07s
+ruff check: All checks passed
+ruff format --check: 4 files already formatted
+python3 -m py_compile: success
+pyrefly refit_adapter.py: INFO 0 errors
+pyrefly vllm_backend.py: INFO 0 errors (6 suppressed, 1 warning not shown)
+git diff --check: success
+```
+
+The backend suite used the documented minimal vLLM import stubs on macOS. The
+warning is the expected missing `nccl.m2n.reshard` CPU fallback. Pyrefly used
+the same unavailable-import replacements documented above.
+
+### Pinned Native Integration Gate
+
+`test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers` is a
+real integration gate. It requires exactly vLLM 0.25.1, CUDA, and SM100 or
+newer; otherwise it skips. It constructs vLLM's actual
+`MergedColumnParallelLinear` and `FusedMoE`/`RoutedExperts` MXFP8 modules,
+applies the production NeMo-RL MXFP8 processing patches, and uses vLLM's real
+`record_metadata_for_reloading`, wrapped loaders, initialization, and finalizer.
+It performs two changed-byte dense/routed refits and checks final value/scale
+pointer identity. The test does not substitute a wrapper or finalizer.
+
+Task 9/10 Linux SM100 command:
+
+```bash
+uv run pytest -q \
+  tests/unit/models/generation/test_vllm_refit_adapter.py \
+  -k native_cuda_dense_and_routed_refit_preserves_runtime_pointers
+```
+
+The gate collected and skipped locally only because vLLM is unavailable on
+macOS. No native vLLM/CUDA success is claimed in this report.
