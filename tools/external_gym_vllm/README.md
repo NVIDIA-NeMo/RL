@@ -185,7 +185,11 @@ Each pool container must provide:
 from the matching source checkout and applies it before importing the vLLM API
 server. This avoids importing NeMo RL's policy modules and training dependency
 stack into a purpose-built serving container. If the source checkout is not
-available, the wrapper falls back to the installed `nemo_rl` package.
+available, the wrapper falls back to the installed `nemo_rl` package. The
+wrapper applies an explicit external-server allowlist: OpenAI `NamespaceTool`
+compatibility plus the RayExecutorV2 TCPStore and MessageQueue port-race fixes.
+It does not apply model-, worker-, or policy-refit-specific patches because
+these servers are inference-only.
 `CONTAINER` must provide
 `EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
 

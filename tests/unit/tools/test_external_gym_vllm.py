@@ -48,7 +48,8 @@ def test_serve_wrapper_loads_patches_without_importing_nemo_rl_package():
 
         sys.modules["ray"] = types.ModuleType("ray")
         namespace = runpy.run_path({str(script)!r})
-        namespace["_load_apply_vllm_patches"]()
+        apply_external_patches = namespace["_load_apply_external_vllm_patches"]()
+        assert apply_external_patches.__name__ == "_apply_external_vllm_patches"
         assert "nemo_rl.models.generation" not in sys.modules
         assert "nemo_rl.models.policy" not in sys.modules
         """
