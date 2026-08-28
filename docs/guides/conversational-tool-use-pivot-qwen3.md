@@ -16,9 +16,7 @@ Unlike the [Two-Stage SWE RL guide](swe-rl-qwen3.md), this recipe currently only
 | **Data (open source)** | [`nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-Pivot-v1`](https://huggingface.co/datasets/nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-Pivot-v1) |
 | **Algorithm** | Colocated synchronous GRPO on Megatron, 64 prompts x 16 generations, leave-one-out baseline, decoupled clip 0.2/0.2, no KL penalty, lr 1e-6, 32k context |
 
-The recipe follows the original PivotRL training configuration as closely as possible. It differs
-from [SWE1](swe-rl-qwen3.md) in that it uses the model's default chat template rather than a custom
-interleaved-thinking template.
+The recipe follows the original PivotRL training configuration as closely as possible.
 
 ## Prepare the data
 
