@@ -73,6 +73,7 @@ from nemo_rl.models.automodel.config import (
 )
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
+from nemo_rl.models.sequence_length import validate_sequence_length_divisibility
 
 STRING_TO_DTYPE = {
     "float32": torch.float32,
@@ -327,14 +328,38 @@ def validate_and_prepare_config(
         "Please use the Megatron backend (policy.megatron_cfg.enabled=True) for YaRN."
     )
 
+    tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
+    cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
+    sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
+
+    if cp_size > 1 and enable_seq_packing:
+        raise ValueError(
+            "Context parallel is not supported for sequence packing. "
+            "Refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
+        )
+
+    if cp_size > 1 and tp_size > 1 and sequence_parallel_enabled:
+        raise ValueError(
+            "Context parallel cannot be used together with TP sequence parallel "
+            "in the DTensor backend. Please either set context_parallel_size=1 "
+            "or disable sequence_parallel. See "
+            "https://github.com/NVIDIA-NeMo/RL/issues/659 for more details."
+        )
+
+    validate_sequence_length_divisibility(
+        config["make_sequence_length_divisible_by"],
+        context_parallel_size=cp_size,
+        tensor_parallel_size=tp_size,
+        sequence_parallel=sequence_parallel_enabled,
+    )
+
     # NeMoAutoModelForCausalLM uses flash_attention_2 by default
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
-    cp_size_cfg = config["dtensor_cfg"]["context_parallel_size"]
     attn_impl = (
         "flash_attention_2"
-        if (enable_seq_packing and cp_size_cfg == 1)
-        else ("sdpa" if cp_size_cfg > 1 else None)
+        if (enable_seq_packing and cp_size == 1)
+        else ("sdpa" if cp_size > 1 else None)
     )
 
     # Load model config
@@ -387,18 +412,6 @@ def validate_and_prepare_config(
             raise ValueError(f"Unknown reward model type: {rm_type}")
     else:
         model_class = resolve_model_class(model_config.model_type)
-
-    # Get parallelization sizes
-    tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
-    cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
-    sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
-
-    # Validate parallelization configuration
-    if cp_size > 1 and enable_seq_packing:
-        raise ValueError(
-            "Context parallel is not supported for sequence packing. "
-            "Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
-        )
 
     if sequence_parallel_enabled and tp_size == 1:
         print(

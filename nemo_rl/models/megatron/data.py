@@ -32,6 +32,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
+from nemo_rl.models.sequence_length import validate_sequence_length_divisibility
 from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
@@ -1350,18 +1351,11 @@ def _get_pack_sequence_parameters_for_megatron(
     pp_size = megatron_cfg["pipeline_model_parallel_size"]
     cp_size = megatron_cfg["context_parallel_size"]
 
-    # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled.
-    minimum_pad_factor = 1
-    if cp_size > 1:
-        minimum_pad_factor *= cp_size * 2
-    if tp_size > 1 and sp:
-        minimum_pad_factor *= tp_size
-    assert pad_individual_seqs_to_multiple_of % minimum_pad_factor == 0, (
-        f"make_sequence_length_divisible_by ({pad_individual_seqs_to_multiple_of}) is not a multiple of minimum_pad_factor ({minimum_pad_factor}).\n"
-        f"Please set policy.make_sequence_length_divisible_by to a multiple of {minimum_pad_factor}.\n"
-        f"    - If CP is enabled, the minimum pad factor is `cp_size * 2`.\n"
-        f"    - If TP+SP is enabled, the minimum pad factor is `tp_size`.\n"
-        f"    - If both are enabled, the minimum pad factor is `cp_size * 2 * tp_size`."
+    validate_sequence_length_divisibility(
+        pad_individual_seqs_to_multiple_of,
+        context_parallel_size=cp_size,
+        tensor_parallel_size=tp_size,
+        sequence_parallel=sp,
     )
 
     # packed sequence length, after sharding to TP and CP domains, needs to be divisible
