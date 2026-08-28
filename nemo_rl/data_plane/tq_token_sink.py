@@ -34,16 +34,21 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import ray
 import torch
-from nemo_gym.token_id_capture.staging.records import (
-    StagedCallRecord,
-    StagedCallSnapshot,
-    StageResult,
-)
 from tensordict import TensorDict
+
+if TYPE_CHECKING:
+    # Deferred: nemo_gym is an optional extra absent in non-gym runs; runtime
+    # uses import locally so this module (and the finalizer actor importing
+    # it) stays importable without it.
+    from nemo_gym.token_id_capture.staging.records import (
+        StagedCallRecord,
+        StagedCallSnapshot,
+        StageResult,
+    )
 
 from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_ENCODING_FIELD,
@@ -133,6 +138,9 @@ class TQTokenSink:
         self._staging_partition = staging_partition
 
     def stage(self, record: StagedCallRecord) -> StageResult:
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.records import StageResult
+
         key = record.staging_key
         try:
             field_dict = {
@@ -442,6 +450,9 @@ def _select_row(rows: TensorDict, index: int) -> dict[str, torch.Tensor]:
 
 
 def _row_to_snapshot(row: Any, *, include_routes: bool) -> StagedCallSnapshot:
+    # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+    from nemo_gym.token_id_capture.staging.records import StagedCallSnapshot
+
     def _leaf(name: str) -> torch.Tensor:
         value = row[name]
         tensor = value[0] if value.dim() > 1 or value.numel() > 1 else value
