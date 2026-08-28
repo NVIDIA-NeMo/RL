@@ -437,6 +437,11 @@ data_plane:
     local_buffer_size:    4294967296   # 4 GiB/process
     reuse_registered_buffers: true     # reuse RDMA-registered buffers
     staging_buffer_size:   268435456   # 256 MiB/pool slot; bigger transfers bypass the pool
+    checkpoint:
+      enabled: false
+      storage_root: null               # absolute shared-filesystem path when enabled
+      durability_timeout_s: 300.0
+      poll_interval_s: 0.1
   # observability:                     # NotRequired
   #   enabled: false
 ```
@@ -452,6 +457,34 @@ Backend choice:
   and small runs.
 - **`mooncake_cpu`** — Mooncake transfer engine; higher throughput at
   scale. Required for multi-node clusters with large bulk volume.
+
+### Experimental Mooncake storage checkpoints
+
+When `mooncake_cpu.checkpoint.enabled=true`, NeMo-RL starts Mooncake with a
+shared-filesystem DISK replica. Each producer client writes its own objects to
+Lustre and waits for that replica before its PUT completes. TQ's existing
+`save_checkpoint` then copies every produced field referenced by the controller
+snapshot into an immutable payload manifest; `load_checkpoint` restores those
+raw objects before TQ restores controller metadata.
+
+Waiting after every PUT is the initial correctness-first tradeoff; benchmark
+its Lustre latency before enabling it for production. A later optimization can
+move the durability fence to checkpoint and key-clear/reuse boundaries.
+
+This module supplies storage capability only. A caller such as Single
+Controller remains responsible for choosing the checkpoint boundary and must
+quiesce TQ writes and clears while `tq.save_checkpoint` runs. The checkpoint
+contains all TQ fields, including non-tensor values and GDR chunks, but not
+model weights, unfinished generations, vLLM KV cache, or Gym state. The active
+`storage_root` must not equal or sit inside the TQ checkpoint destination.
+
+Restore requires a fresh, empty Mooncake/TQ system. Attach every client that
+contributes Mooncake memory capacity first, keep the saved GDR mode and staging
+size unchanged, call `tq.load_checkpoint` before starting producers, and restart
+from an empty master before retrying a failed load. Release validation must
+exercise this order across a 2-node/16-GPU save, process restart, load, and read.
+Abnormal exits can leave old `storage_root/live/<session>` directories; cleanup
+and retention are currently an operator responsibility.
 
 Capacity rule of thumb (any backend):
 

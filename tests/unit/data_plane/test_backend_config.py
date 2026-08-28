@@ -96,6 +96,36 @@ def test_partial_nested_block_keeps_other_defaults() -> None:
     assert resolved.global_segment_size == MooncakeCpuConfig().global_segment_size
 
 
+def test_mooncake_checkpoint_requires_an_absolute_storage_root() -> None:
+    with pytest.raises(pydantic.ValidationError, match="storage_root"):
+        backend_config(
+            _cfg(
+                "mooncake_cpu",
+                mooncake_cpu={"checkpoint": {"enabled": True, "storage_root": None}},
+            )
+        )
+    with pytest.raises(pydantic.ValidationError, match="storage_root"):
+        backend_config(
+            _cfg(
+                "mooncake_cpu",
+                mooncake_cpu={
+                    "checkpoint": {"enabled": True, "storage_root": "relative"}
+                },
+            )
+        )
+
+    resolved = backend_config(
+        _cfg(
+            "mooncake_cpu",
+            mooncake_cpu={
+                "checkpoint": {"enabled": True, "storage_root": "/shared/tq"}
+            },
+        )
+    )
+    assert resolved.checkpoint.enabled is True
+    assert resolved.checkpoint.storage_root == "/shared/tq"
+
+
 def test_simple_backend_nested_block_is_used() -> None:
     cfg = _cfg("simple", simple={"storage_capacity": 7, "num_storage_units": 3})
     resolved = backend_config(cfg)

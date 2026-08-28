@@ -560,6 +560,11 @@ data_plane:
     local_buffer_size:    4294967296 # 4 GiB/process
     reuse_registered_buffers: true   # reuse RDMA-registered buffers
     staging_buffer_size:   268435456 # 256 MiB/pool slot; bigger transfers bypass the pool
+    checkpoint:                       # experimental direct-DISK checkpoint support
+      enabled: false
+      storage_root: null              # absolute shared-filesystem path when enabled
+      durability_timeout_s: 300.0
+      poll_interval_s: 0.1
   # observability:                    # NotRequired
   #   enabled: false
 
