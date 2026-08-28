@@ -18,7 +18,7 @@ import os
 import threading
 import time
 import warnings
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Literal, Optional
 
 import requests
 import torch
@@ -604,6 +604,20 @@ class MegatronGenerationMixin:
     def report_dp_openai_server_base_url(self) -> Optional[str]:
         """Return this worker's OpenAI server base URL (None if not the leader)."""
         return self.base_url
+
+    def set_logprobs_mode(
+        self, logprobs_mode: Literal["raw_logprobs", "processed_logprobs"]
+    ) -> None:
+        """Switch the engine's logprob reporting mode."""
+        assert self._inference_engine_initialized, (
+            "set_logprobs_mode requires the persistent inference engine; call "
+            "prepare_for_generation() first"
+        )
+        assert not self.inference_context.has_unfinished_requests(), (
+            "logprobs_mode can only be switched while the engine has no requests "
+            "in flight"
+        )
+        self.inference_context.config.logprobs_mode = logprobs_mode
 
     def _build_sampling_params(
         self, greedy: bool, stop_words: Optional[list[str]]

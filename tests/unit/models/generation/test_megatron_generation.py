@@ -515,32 +515,33 @@ def test_megatron_generation_colocated(
             # 3490-review follow-up: bound token mult-prob error on the
             # matched-impl leg — generation and recomputed policy logprobs
             # run the same inference kernels on the same shared weights.
-            # Greedy must be off: processed logprobs are ~0 under top_k=1.
-            sampled = mg.generate(test_input_data, greedy=False)
+            # Greedy generation reports RAW logprobs (processed logprobs are
+            # identically 0.0 under greedy's top_k=1), so the greedy outputs
+            # above are directly comparable to the policy's fprop logprobs.
             fprop_data = BatchedDataDict(
                 {
-                    "input_ids": sampled["output_ids"],
-                    "input_lengths": sampled["unpadded_sequence_lengths"],
+                    "input_ids": outputs["output_ids"],
+                    "input_lengths": outputs["unpadded_sequence_lengths"],
                 }
             )
             # Production ordering: the engine stands down before any training-path forward.
             mg.finish_generation(release_gpu=True)
             policy.prepare_for_lp_inference()
             lp_logprobs = policy.get_logprobs(fprop_data)["logprobs"]
-            gen_mask = torch.zeros_like(sampled["logprobs"], dtype=torch.bool)
+            gen_mask = torch.zeros_like(outputs["logprobs"], dtype=torch.bool)
             for i, (start, end) in enumerate(
                 zip(
                     test_input_data["input_lengths"],
-                    sampled["unpadded_sequence_lengths"],
+                    outputs["unpadded_sequence_lengths"],
                 )
             ):
                 gen_mask[i, start:end] = True
-            abs_diff = (sampled["logprobs"] - lp_logprobs).abs().masked_select(gen_mask)
+            abs_diff = (outputs["logprobs"] - lp_logprobs).abs().masked_select(gen_mask)
             avg_prob_mult_error = torch.exp(abs_diff).mean()
             assert avg_prob_mult_error <= 1.05, (
-                f"matched-impl inference_optimized: generation logprobs "
-                f"diverge from policy logprobs (avg prob mult error "
-                f"{avg_prob_mult_error:.4f})"
+                f"matched-impl inference_optimized: greedy generation logprobs "
+                f"diverge from policy fprop logprobs (avg prob mult error "
+                f"{avg_prob_mult_error:.4f}); greedy should report raw logprobs"
             )
             # Wake the engine again for the post-shutdown generation check.
             mg.prepare_for_generation()
