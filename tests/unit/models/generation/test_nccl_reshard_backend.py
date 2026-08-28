@@ -23,7 +23,9 @@ no GPU).
 skipped where vllm is unavailable.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -35,6 +37,8 @@ from nemo_rl.models.generation.vllm.vllm_backend import (  # noqa: E402
 )
 from nemo_rl.weight_sync.nccl_reshard_utils import (  # noqa: E402
     HFToLocalParamMap,
+    LocalParamSpec,
+    RefitCtx,
 )
 
 pytestmark = pytest.mark.vllm
@@ -59,6 +63,145 @@ def _make_ext(vllm_params):
 
 def _param(*shape):
     return torch.empty(*shape)
+
+
+def _native_down_refit_info() -> dict[str, Any]:
+    logical_name = "model.layers.0.mlp.down_proj.weight"
+    return {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": logical_name,
+                    "global_shape": (32, 32),
+                    "dtype": "torch.float8_e4m3fn",
+                    "src_mesh_info": object(),
+                    "dst_mesh_info": object(),
+                    "src_placements": [],
+                    "dst_placements": [],
+                    "components": [
+                        {
+                            "role": "weight",
+                            "dtype": "torch.float8_e4m3fn",
+                            "global_shape": (32, 32),
+                            "src_placements": [],
+                            "dst_placements": [],
+                        },
+                        {
+                            "role": "weight_scale",
+                            "dtype": "torch.uint8",
+                            "global_shape": (32, 1),
+                            "src_placements": [],
+                            "dst_placements": [],
+                        },
+                    ],
+                }
+            ]
+        },
+        "misc_meta": {
+            "model.layers.0.self_attn.q_proj.weight": {
+                "shape": (32, 32),
+                "dtype": "torch.bfloat16",
+            },
+            "model.embed_tokens.weight": {
+                "shape": (64, 32),
+                "dtype": "torch.bfloat16",
+            },
+            "model.layers.0.mlp.shared_experts.up_proj.weight": {
+                "shape": (32, 32),
+                "dtype": "torch.bfloat16",
+            },
+            "model.layers.0.mlp.gate.weight": {
+                "shape": (4, 32),
+                "dtype": "torch.bfloat16",
+            },
+            "lm_head.weight": {
+                "shape": (64, 32),
+                "dtype": "torch.bfloat16",
+            },
+        },
+    }
+
+
+class _RecordingNativeAdapter:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        resolve_error: BaseException | None = None,
+    ) -> None:
+        self.events = events
+        self.resolve_error = resolve_error
+        self.loaded: list[tuple[str, str, torch.Tensor]] = []
+        self.aborted_with: BaseException | None = None
+
+    def begin_update(self) -> None:
+        self.events.append("begin")
+
+    def resolve_destination(self, *, logical_name: str, role: str) -> LocalParamSpec:
+        self.events.append(f"resolve:{role}")
+        if self.resolve_error is not None:
+            raise self.resolve_error
+        dtype = torch.float8_e4m3fn if role == "weight" else torch.uint8
+        shape = (32, 32) if role == "weight" else (32, 1)
+        target = torch.empty(shape, dtype=dtype)
+
+        def pre(_base: torch.Tensor) -> RefitCtx:
+            return RefitCtx(buf=torch.empty_like(target))
+
+        def post(ctx: RefitCtx) -> None:
+            self.events.append(f"load:{role}")
+            self.loaded.append((logical_name, role, ctx.buf.clone()))
+
+        return LocalParamSpec(base=target, pre=pre, post=post)
+
+    def finish_update(self) -> None:
+        self.events.append("finish")
+
+    def abort_update(self, error: BaseException) -> None:
+        self.events.append("abort")
+        self.aborted_with = error
+
+
+def _patch_cpu_nccl_refit(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[str],
+) -> None:
+    from nemo_rl.weight_sync import xferdtensor as xferdtensor_module
+
+    class Event:
+        def record(self) -> None:
+            events.append("event")
+
+        def synchronize(self) -> None:
+            events.append("event_sync")
+
+    def transfer(
+        _source: object,
+        _source_mesh: object,
+        _source_placements: object,
+        destination: Any,
+        _destination_mesh: object,
+        _destination_placements: object,
+        _group: object,
+        _stream: object,
+    ) -> None:
+        role = (
+            "weight_scale"
+            if destination.local_tensor.dtype == torch.uint8
+            else "weight"
+        )
+        events.append(f"bulk:{role}")
+        destination.local_tensor.fill_(7 if role == "weight_scale" else 3)
+
+    monkeypatch.setattr(xferdtensor_module, "xferdtensor", transfer)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: object())
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
 
 
 def test_build_mapping_ffn_only():
@@ -652,3 +795,80 @@ def test_build_hf_to_local_param_map_rejects_invalid_mxfp8_metadata(
 
     with pytest.raises(ValueError, match=error):
         _make_ext(vllm_params).build_hf_to_local_param_map(refit_info)
+
+
+def test_native_mxfp8_refit_rebuilds_destinations_and_loads_ordered_components(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    adapter = _RecordingNativeAdapter(events)
+    extension = _make_ext({})
+    extension.nccl_reshard_refit_info = _native_down_refit_info()
+    extension.pp_comm_groups = {0: object()}
+    extension._nccl_reshard_refit_adapter = adapter
+    extension._receive_and_load_misc_params = lambda: events.append("misc")
+    _patch_cpu_nccl_refit(monkeypatch, events)
+
+    assert extension.nccl_reshard_refit()
+
+    assert events.index("begin") < events.index("resolve:weight")
+    assert events.index("resolve:weight_scale") < events.index("bulk:weight")
+    assert events.index("bulk:weight") < events.index("load:weight")
+    assert events.index("load:weight_scale") < events.index("misc")
+    assert events.index("misc") < events.index("finish")
+    assert events.count("finish") == 1
+    assert [(name, role) for name, role, _payload in adapter.loaded] == [
+        ("model.layers.0.mlp.down_proj.weight", "weight"),
+        ("model.layers.0.mlp.down_proj.weight", "weight_scale"),
+    ]
+    assert torch.all(adapter.loaded[0][2].float() == 3)
+    assert torch.all(adapter.loaded[1][2] == 7)
+
+
+def test_native_mxfp8_refit_aborts_before_collective_on_destination_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    failure = ValueError("checkpoint scale has wrong shape")
+    adapter = _RecordingNativeAdapter(events, resolve_error=failure)
+    extension = _make_ext({})
+    extension.nccl_reshard_refit_info = _native_down_refit_info()
+    extension.pp_comm_groups = {0: object()}
+    extension._nccl_reshard_refit_adapter = adapter
+    extension._receive_and_load_misc_params = lambda: events.append("misc")
+    _patch_cpu_nccl_refit(monkeypatch, events)
+
+    with pytest.raises(ValueError, match="wrong shape"):
+        extension.nccl_reshard_refit()
+
+    assert not any(event.startswith("bulk:") for event in events)
+    assert "misc" not in events
+    assert "finish" not in events
+    assert adapter.aborted_with is failure
+
+
+def test_native_mxfp8_refit_keeps_bf16_misc_disjoint_from_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    adapter = _RecordingNativeAdapter(events)
+    extension = _make_ext({})
+    refit_info = _native_down_refit_info()
+    extension.nccl_reshard_refit_info = refit_info
+    extension.pp_comm_groups = {0: object()}
+    extension._nccl_reshard_refit_adapter = adapter
+    misc_names: list[str] = []
+
+    def receive_misc() -> None:
+        events.append("misc")
+        misc_names.extend(refit_info["misc_meta"])
+
+    extension._receive_and_load_misc_params = receive_misc
+    _patch_cpu_nccl_refit(monkeypatch, events)
+
+    extension.nccl_reshard_refit()
+
+    native_names = {name for name, _role, _payload in adapter.loaded}
+    assert native_names == {"model.layers.0.mlp.down_proj.weight"}
+    assert set(misc_names) == set(refit_info["misc_meta"])
+    assert native_names.isdisjoint(misc_names)
