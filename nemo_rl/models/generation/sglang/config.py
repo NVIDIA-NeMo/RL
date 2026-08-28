@@ -240,10 +240,11 @@ class SGLangConfig(GenerationConfig):
 
     sglang_cfg: SglangSpecificArgs
     sglang_kwargs: NotRequired[dict[str, Any]]
-    # Null selects the default refit path: Ray CUDA-IPC when colocated,
-    # SGLang's NCCL weight-update group when non-colocated. ``nixl`` and custom
+    # Null selects the default refit path: Ray CUDA-IPC when colocated, and
+    # SGLang's own NCCL weight-update group when non-colocated -- which today
+    # is Megatron-policy only (see weight_sync/factory.py). ``nixl`` and custom
     # ``module:ClassName`` checkpoint engines are supported for non-colocated
-    # generation.
+    # generation with any policy backend.
     refit_transport: NotRequired[str | None]
     # Normalized by the same schema as vLLM's: ``checkpoint_engine_refit_config``
     # runs ``normalize_vllm_refit_config`` and writes the validated model back.

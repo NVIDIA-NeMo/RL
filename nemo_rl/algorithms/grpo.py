@@ -1555,8 +1555,9 @@ def setup(
                 raise NotImplementedError(
                     f"SGLang does not support refit_transport={refit_transport!r}. "
                     "Use 'nixl', a custom 'module:ClassName' checkpoint "
-                    "engine, or null for the default path (Ray CUDA-IPC when "
-                    "colocated, SGLang's NCCL weight-update group when not)."
+                    "engine, or null for the default path: Ray CUDA-IPC when "
+                    "colocated, and SGLang's own NCCL weight-update group when "
+                    "not, which today requires a Megatron policy."
                 )
 
         # Set model_path if not already set

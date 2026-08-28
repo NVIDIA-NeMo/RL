@@ -274,14 +274,18 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
         reason it does on the sibling path: the buckets land as several
         ``update_weights_from_tensor`` calls, each taking the server's model
         update lock on its own, so a request admitted between two buckets would
-        run against a half-updated model. This mirrors
-        ``_SGLangWeightSynchronizer._refit``; the two SGLang transports differ
-        only in how the weights travel.
+        run against a half-updated model.
+
+        The envelope is the one ``_SGLangWeightSynchronizer._refit`` uses; the
+        two SGLang transports differ only in how the weights travel, and the
+        sibling additionally rejects ``kv_scales``, which this transport
+        forwards to the policy.
         """
         self._generation.prepare_for_generation(tags=["weights"])
-        # Each acquired state gets its own guard, so a failure between pausing
-        # and the transfer still resumes generation instead of leaving every
-        # engine wedged with no error pointing at why.
+        # Every state acquired below is released in the finally, so a failure
+        # anywhere in the refit leaves the engines usable instead of wedged
+        # with no error pointing at why. Re-acquire the KV pool before
+        # readmitting requests, not after.
         try:
             self._generation.pause_generation(
                 mode=self._generation.pause_generation_mode
@@ -296,8 +300,8 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
                 # Only closes a session that actually opened: if
                 # begin_weight_update raised, this inner block never ran.
                 self._generation.end_weight_update()
-            self._generation.prepare_for_generation(tags=["kv_cache"])
         finally:
+            self._generation.prepare_for_generation(tags=["kv_cache"])
             self._generation.continue_generation()
 
     def shutdown(self) -> None:

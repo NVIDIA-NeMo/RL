@@ -521,28 +521,53 @@ def test_refit_rejects_a_sender_that_shipped_nothing():
     assert not hasattr(worker, "_checkpoint_engine_weight_version")
 
 
-def test_mixin_defines_no_coroutine_members():
-    """No coroutine may become a member of this mixin.
+def test_refit_raises_when_the_engine_reports_failure():
+    """A server that answers ``success: false`` must not read as a good refit."""
 
-    ``SGLangGenerationWorker`` mixes it in and is a ``@ray.remote`` actor. Ray
-    picks between a threaded and an asyncio actor with ``has_async_methods``,
-    which is ``inspect.getmembers(cls, is_async_func)`` over the whole MRO --
-    so one ``async def`` here flips every pre-existing worker RPC into
-    asyncio-actor semantics, and because Ray then runs *sync* methods on that
-    event loop, the ``asyncio.run`` in the refit entry point raises
+    class _FailingWorker(_Worker):
+        def update_weights_from_tensor(self, **kwargs):
+            assert self.weight_update_in_progress, _NO_SESSION
+            self.update_calls.append(kwargs)
+            return {"success": False, "error_message": "bucket rejected"}
+
+    worker = _FailingWorker()
+    worker.checkpoint_engines = [_Engine(batches=[[("a", torch.ones(1))]])]
+    worker._checkpoint_engine_target_devices = [torch.device("cpu")]
+
+    with pytest.raises(RuntimeError, match="bucket rejected"):
+        _refit(worker)
+
+
+def test_worker_actor_is_not_an_asyncio_actor():
+    """Ask Ray the same question Ray asks, about the class Ray asks it about.
+
+    Ray flips an actor into asyncio mode when ``has_async_methods`` is true for
+    the actor class, and it then runs *sync* methods on that event loop -- so
+    the ``asyncio.run`` in the refit entry point would raise
     ``asyncio.run() cannot be called from a running event loop`` on the first
     refit. The receive loop lives at module scope for exactly that reason.
-    """
-    coroutines = [
-        name
-        for name, _member in inspect.getmembers(
-            SGLangCheckpointEngineMixin, inspect.iscoroutinefunction
-        )
-    ]
 
-    assert coroutines == [], (
-        f"{coroutines} would make SGLangGenerationWorker an asyncio actor; "
-        "keep the receive loop at module scope"
+    Two details are load-bearing and easy to get wrong by restating the rule by
+    hand. Ray's predicate is ``iscoroutinefunction(f) or isasyncgenfunction(f)``
+    -- an async *generator* flips the actor just as a coroutine does, and this
+    module already has one (``_aligned_checkpoint_engine_batches``), which is
+    precisely the thing someone might move back onto the class. And Ray asks
+    about the whole actor class, not this mixin, so an ``async def`` added to
+    ``SGLangGenerationWorker`` itself counts too. Import Ray's own function
+    rather than reimplementing half of it.
+    """
+    from ray._private.async_compat import has_async_methods, is_async_func
+
+    from nemo_rl.models.generation.sglang.sglang_worker import (
+        SGLangGenerationWorker,
+    )
+
+    actor_class = SGLangGenerationWorker.__ray_metadata__.modified_class
+    offenders = [name for name, _m in inspect.getmembers(actor_class, is_async_func)]
+
+    assert not has_async_methods(actor_class), (
+        f"{offenders} would make SGLangGenerationWorker an asyncio actor; "
+        "keep the refit receive loop at module scope"
     )
 
 

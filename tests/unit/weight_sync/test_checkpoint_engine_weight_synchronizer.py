@@ -269,6 +269,11 @@ class TestCheckpointEngineWeightSynchronizer:
         generation.begin_weight_update.assert_called_once_with()
         generation.end_weight_update.assert_called_once_with()
         generation.continue_generation.assert_called_once_with()
+        # Resuming without the KV pool back would leave the engines admitting
+        # requests they cannot serve.
+        assert [
+            item.kwargs for item in generation.prepare_for_generation.call_args_list
+        ] == [{"tags": ["weights"]}, {"tags": ["kv_cache"]}]
         assert sync.is_stale
 
     @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
@@ -286,6 +291,48 @@ class TestCheckpointEngineWeightSynchronizer:
         sync._checkpoint_engine_ready = True
 
         with pytest.raises(RuntimeError, match="KV cache invalidation failed"):
+            sync.sync_weights()
+
+        generation.begin_weight_update.assert_not_called()
+        generation.end_weight_update.assert_not_called()
+        generation.continue_generation.assert_called_once_with()
+
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_sglang_resumes_when_opening_the_session_itself_fails(self, mock_ray):
+        """``end_weight_update`` must not close a session that never opened."""
+        policy = _mock_policy()
+        policy.worker_group = _CheckpointWorkerGroup()
+        generation = _mock_generation(cfg={"backend": SGLANG_BACKEND})
+        generation.prepare_for_generation.return_value = None
+        generation.pause_generation_mode = "retract"
+        generation.invalidate_kv_cache.return_value = True
+        generation.begin_weight_update.side_effect = RuntimeError("engine refused")
+        sync = CheckpointEngineWeightSynchronizer(
+            policy, generation, _checkpoint_engine_cfg()
+        )
+        sync._checkpoint_engine_ready = True
+
+        with pytest.raises(RuntimeError, match="engine refused"):
+            sync.sync_weights()
+
+        generation.end_weight_update.assert_not_called()
+        generation.continue_generation.assert_called_once_with()
+
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_sglang_resumes_when_the_pause_itself_fails(self, mock_ray):
+        """A pause that raises must not leave the engines half-paused."""
+        policy = _mock_policy()
+        policy.worker_group = _CheckpointWorkerGroup()
+        generation = _mock_generation(cfg={"backend": SGLANG_BACKEND})
+        generation.prepare_for_generation.return_value = None
+        generation.pause_generation_mode = "retract"
+        generation.pause_generation.side_effect = RuntimeError("pause failed")
+        sync = CheckpointEngineWeightSynchronizer(
+            policy, generation, _checkpoint_engine_cfg()
+        )
+        sync._checkpoint_engine_ready = True
+
+        with pytest.raises(RuntimeError, match="pause failed"):
             sync.sync_weights()
 
         generation.begin_weight_update.assert_not_called()
@@ -559,6 +606,21 @@ class TestCheckpointEngineFactory:
                 generation_backend=SGLANG_BACKEND,
                 colocated=False,
             )
+
+    def test_checkpoint_engine_in_place_guard_is_sglang_only(self):
+        """``pause_generation_mode`` is an SGLang concept; vLLM has no pause."""
+        gen = _mock_generation(cfg=_nixl_refit_cfg())
+        gen.pause_generation_mode = "in_place"
+
+        assert isinstance(
+            create_weight_synchronizer(
+                policy=_mock_policy(cfg={}),
+                generation=gen,
+                generation_backend=VLLM_BACKEND,
+                colocated=False,
+            ),
+            CheckpointEngineWeightSynchronizer,
+        )
 
     def test_checkpoint_engine_rejects_sglang_pipeline_parallelism(self):
         """One receiver is created per engine GPU, but SGLang indexes the

@@ -22,12 +22,15 @@ handed to the SGLang server subprocess over same-node CUDA IPC, reusing the same
 The per-refit timing line is logged as `[SGLang refit]`.
 
 Because it reuses that contract, it also reuses the engine-side lifecycle that
-guards it. Each refit runs `pause_generation` -> `invalidate_kv_cache` ->
-`begin_weight_update` -> transfer -> `end_weight_update` -> `continue_generation`,
-the same envelope as SGLang's NCCL path: `update_weights_from_tensor` is rejected
-outside an open session, `end_weight_update` is what rebuilds quantized kernel
-layouts after the last bucket, and the pause keeps requests from being admitted
-between buckets, where they would run against a half-updated model.
+guards it — the same envelope as SGLang's NCCL path. Each refit runs
+`prepare_for_generation(["weights"])` -> `pause_generation` ->
+`invalidate_kv_cache` -> `begin_weight_update` -> transfer ->
+`end_weight_update` -> `prepare_for_generation(["kv_cache"])` ->
+`continue_generation`, with everything from the pause onward released on the
+failure path too. `update_weights_from_tensor` is rejected outside an open
+session; `end_weight_update` is what rebuilds quantized kernel layouts after
+the last bucket; and the pause keeps requests from being admitted between
+buckets, where they would run against a half-updated model.
 `pause_generation_mode: in_place` is rejected because it would keep KV entries
 built from the outgoing weights.
 

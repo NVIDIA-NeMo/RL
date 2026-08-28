@@ -132,11 +132,13 @@ async def _load_checkpoint_engine_weights(
     """Drain every checkpoint engine and push the batches into SGLang.
 
     Deliberately a module-level coroutine rather than a method: Ray flips an
-    actor into asyncio mode when *any* member of the class is a coroutine
-    function (``has_async_methods`` walks the MRO), and inside that event loop
-    the ``asyncio.run`` below raises. Keeping the loop off
-    ``SGLangCheckpointEngineMixin`` leaves ``SGLangGenerationWorker`` a threaded
-    actor, which is what every one of its other RPCs was written against.
+    actor into asyncio mode when *any* member of the class is a coroutine or
+    async-generator function (``has_async_methods`` walks the MRO), and it then
+    runs even the actor's sync methods on that event loop, where the
+    ``asyncio.run`` below raises. Keeping the loop off
+    ``SGLangCheckpointEngineMixin`` leaves ``SGLangGenerationWorker`` an
+    ordinary actor, which is what every one of its other RPCs was written
+    against.
     """
     loaded_batches = 0
     loaded_tensors = 0
