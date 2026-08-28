@@ -100,13 +100,13 @@ def create_weight_synchronizer(
             checkpoint_engine_config["backend"]
         ]
         if generation_backend == SGLANG_BACKEND:
-            sglang_cfg = generation.cfg.get("sglang_cfg", {})
-            if sglang_cfg.get("dp_size", 1) != 1:
+            sglang_cfg = generation.cfg["sglang_cfg"]
+            if sglang_cfg["dp_size"] != 1:
                 raise NotImplementedError(
                     "SGLang checkpoint-engine refit currently requires "
                     "sglang_cfg.dp_size=1."
                 )
-            if sglang_cfg.get("pp_size", 1) != 1:
+            if sglang_cfg["pp_size"] != 1:
                 # One receiver is created per engine GPU, but SGLang indexes
                 # ``serialized_named_tensors`` by TP rank, and with pp_size>1
                 # the engine has tp_size = num_gpus_per_engine // pp_size TP
@@ -115,10 +115,19 @@ def create_weight_synchronizer(
                     "SGLang checkpoint-engine refit currently requires "
                     "sglang_cfg.pp_size=1."
                 )
-            if engine_kwargs.get("shard_expert_weights", False):
+            if engine_kwargs.get("shard_expert_weights"):
                 raise NotImplementedError(
                     "SGLang checkpoint-engine refit does not support "
                     "shard_expert_weights=true; use full-weight MoE refit instead."
+                )
+            if generation.pause_generation_mode == "in_place":
+                # Same reason the sibling SGLang synchronizer rejects it: the
+                # refit pause has to drop in-flight decode state, and in_place
+                # keeps KV entries produced by the outgoing weights.
+                raise ValueError(
+                    "pause_generation_mode='in_place' is unsafe for weight refit "
+                    "because it preserves KV cache entries created by the "
+                    "previous weights."
                 )
 
         from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (

@@ -239,30 +239,66 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
         try:
             with context:
                 if self._is_sglang():
-                    self._generation.prepare_for_generation(tags=["weights"])
-                policy_refs = self._run_policy(
-                    "send_weights_via_checkpoint_engine", kv_scales=kv_scales
-                )
-                results = ray.get(
-                    policy_refs
-                    + self._run_generation("update_weights_from_checkpoint_engine")
-                )
-                if not all(
-                    result
-                    for result in results[len(policy_refs) :]
-                    if result is not None
-                ):
-                    raise RuntimeError(
-                        "Weight transfer failed during "
-                        f"{self._checkpoint_engine_config['backend']} "
-                        "checkpoint-engine sync."
-                    )
-                if self._is_sglang():
-                    self._generation.prepare_for_generation(tags=["kv_cache"])
+                    self._sglang_transfer(kv_scales)
+                else:
+                    self._transfer(kv_scales)
                 self._stale = False
         finally:
             if self._release_after_refit():
                 self.shutdown()
+
+    def _transfer(self, kv_scales: Optional[dict[str, float]]) -> None:
+        """Run one policy->rollout checkpoint-engine transfer."""
+        policy_refs = self._run_policy(
+            "send_weights_via_checkpoint_engine", kv_scales=kv_scales
+        )
+        results = ray.get(
+            policy_refs + self._run_generation("update_weights_from_checkpoint_engine")
+        )
+        if not all(
+            result for result in results[len(policy_refs) :] if result is not None
+        ):
+            raise RuntimeError(
+                "Weight transfer failed during "
+                f"{self._checkpoint_engine_config['backend']} "
+                "checkpoint-engine sync."
+            )
+
+    def _sglang_transfer(self, kv_scales: Optional[dict[str, float]]) -> None:
+        """Transfer inside the engine-side weight-update session.
+
+        SGLang gates ``update_weights_from_tensor`` on a session opened by
+        ``begin_weight_update``, and only ``end_weight_update`` rebuilds the
+        quantized kernel layouts afterwards, so the transfer has to sit inside
+        that envelope however the bytes arrive. The pause matters for the same
+        reason it does on the sibling path: the buckets land as several
+        ``update_weights_from_tensor`` calls, each taking the server's model
+        update lock on its own, so a request admitted between two buckets would
+        run against a half-updated model. This mirrors
+        ``_SGLangWeightSynchronizer._refit``; the two SGLang transports differ
+        only in how the weights travel.
+        """
+        self._generation.prepare_for_generation(tags=["weights"])
+        # Each acquired state gets its own guard, so a failure between pausing
+        # and the transfer still resumes generation instead of leaving every
+        # engine wedged with no error pointing at why.
+        try:
+            self._generation.pause_generation(
+                mode=self._generation.pause_generation_mode
+            )
+            if not self._generation.invalidate_kv_cache():
+                raise RuntimeError("SGLang KV cache invalidation failed before refit.")
+
+            self._generation.begin_weight_update()
+            try:
+                self._transfer(kv_scales)
+            finally:
+                # Only closes a session that actually opened: if
+                # begin_weight_update raised, this inner block never ran.
+                self._generation.end_weight_update()
+            self._generation.prepare_for_generation(tags=["kv_cache"])
+        finally:
+            self._generation.continue_generation()
 
     def shutdown(self) -> None:
         if not self._checkpoint_engine_ready:

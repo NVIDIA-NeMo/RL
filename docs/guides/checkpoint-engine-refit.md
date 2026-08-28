@@ -13,13 +13,23 @@ Use it only for non-colocated generation:
 | Generation backend | Supported | Notes |
 | --- | --- | --- |
 | vLLM | yes | Includes sharded EP refit (`shard_expert_weights`). |
-| SGLang | yes | One node per logical engine, `dp_size=1`, `pp_size=1`; `shard_expert_weights` not supported. |
+| SGLang | yes | One node per logical engine, `dp_size=1`, `pp_size=1`, `pause_generation_mode` other than `in_place`; `shard_expert_weights` not supported. |
 | Megatron | no | Tracked by [issue #3288](https://github.com/NVIDIA-NeMo/RL/issues/3288). |
 
 For SGLang, NIXL terminates in the generation worker actor and the weights are
 handed to the SGLang server subprocess over same-node CUDA IPC, reusing the same
 `flattened_bucket` / `update_weights_from_tensor` contract as colocated refit.
 The per-refit timing line is logged as `[SGLang refit]`.
+
+Because it reuses that contract, it also reuses the engine-side lifecycle that
+guards it. Each refit runs `pause_generation` -> `invalidate_kv_cache` ->
+`begin_weight_update` -> transfer -> `end_weight_update` -> `continue_generation`,
+the same envelope as SGLang's NCCL path: `update_weights_from_tensor` is rejected
+outside an open session, `end_weight_update` is what rebuilds quantized kernel
+layouts after the last bucket, and the pause keeps requests from being admitted
+between buckets, where they would run against a half-updated model.
+`pause_generation_mode: in_place` is rejected because it would keep KV entries
+built from the outgoing weights.
 
 Without checkpoint-engine refit, colocated vLLM uses ZMQ/CUDA IPC and
 non-colocated vLLM uses NCCL. SGLang uses Ray CUDA IPC when colocated and its
