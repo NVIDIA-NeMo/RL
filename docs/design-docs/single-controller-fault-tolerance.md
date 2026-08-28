@@ -16,7 +16,7 @@ Know these limits before enabling it.
 | `policy.generation.refit_transport` | Recovers a lost shard |
 |---|---|
 | `collective` (packed broadcast) | ✅ full |
-| `nccl_reshard` | ⚠️ dead process only — see [A wedged engine is different](#a-wedged-engine-is-different) |
+| `nccl_reshard` | ⚠️ only between syncs — any fault mid-transfer ends the run, fast and with a named cause. See [A mid-sync fault on nccl_reshard](#a-mid-sync-fault-on-nccl_reshard-is-different) |
 | colocated IPC, HTTP, checkpoint-engine, `vllm_remote_sparse` | ❌ no communicator to rebuild |
 
 **Generation backends** — only vLLM implements the fleet-health hooks:
@@ -48,27 +48,34 @@ began, and how the sync then went.
 |---|---|---|---|
 | `HEALTHY` | succeeds | ✅ continues | The ordinary step. |
 | `HEALTHY` | hangs | 🛑 run ends | Every process is alive and nothing was suspect, so there is nobody to drop. Guessing would condemn a healthy shard and leave the real culprit in the group. |
-| `HEALTHY` | crashes | ✅ recovers | The crash names the shard. Mark it dead, rebuild without it, retry once. |
+| `HEALTHY` | crashes | ⚠️ depends | The crash names the shard: mark it dead, rebuild without it, retry once. Works on `collective`; ends the run on `nccl_reshard`. |
 | `SUSPECT` | succeeds | ✅ continues | A wedged engine can still do NCCL. It keeps failing generations and reaches `DEAD` on its own. |
 | `SUSPECT` | hangs | ⚠️ depends | The one suspect is condemned, the group shrinks, retry once. Works on `collective`; ends the run on `nccl_reshard`. |
-| `SUSPECT` | crashes | ✅ recovers | The dead process is visible, so no attribution is needed. |
+| `SUSPECT` | crashes | ⚠️ depends | The dead process is visible, so no attribution is needed. Same split: works on `collective`; ends the run on `nccl_reshard`. |
 | `DEAD` | any | ✅ continues | Already excluded before the collective started, so it cannot affect this refit at all. |
 
 Recovery is **rebuild, then retry once** — and the rebuild needs a shard to drop. That is
-why a crash recovers and a hang only recovers when the ledger already held a suspect.
+why a crash can recover and a hang only recovers when the ledger already held a suspect.
 Retrying without shrinking would rebuild over the same fleet and hang on the same silent
-rank.
+rank. On `nccl_reshard` there is a second requirement: the fault must land outside the
+bulk transfer — see below.
 
 A second failure during the retry ends the run: at that point it is a fault, not a
 membership problem.
 
-### A wedged engine is different
+### A mid-sync fault on `nccl_reshard` is different
 
-An engine whose process is alive but which has stopped generating is the hardest case, and
-`nccl_reshard` cannot recover from it. Aborting a communicator does not retire CUDA work
-already queued on a stream, and on that transport the orphaned kernels sit on the
-**trainers'** devices — so nothing done to the wedged shard retires them. The run ends
-attributably in seconds rather than stalling. On `collective` the same case recovers.
+On `nccl_reshard`, any fault while the bulk transfer is in flight — a crash *or* a wedge —
+cannot be recovered in-process. Aborting a communicator does not retire CUDA work already
+queued on a stream, and on that transport the orphaned kernels sit on the **trainers'**
+devices — so nothing done to the failed shard retires them, and no communicator can be
+rebuilt on a device in that state. The run detects this (the abort carries a dedicated
+marker) and ends in seconds with a message naming the limit, rather than stalling or
+wedging in a rebuild that cannot complete.
+
+A fault that lands **between** syncs is fine on both transports: the shard is dropped
+before the next collective starts, which is the `DEAD` row above. On `collective` the
+mid-sync cases recover too.
 
 ## Configuration
 
