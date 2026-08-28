@@ -1164,6 +1164,7 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
         rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         controller._rollout_manager = rollout_manager
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
