@@ -1074,8 +1074,9 @@ def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers() ->
         pointers = {name: runtime_parameters[name].data_ptr() for name in tracked_names}
         snapshots: list[dict[str, torch.Tensor]] = []
 
-        for fill_value in (2, 3):
+        for refit_seed in (2, 18):
             adapter.begin_update()
+            component_seed = refit_seed
             for param_info in refit_info["per_layer_params"]["model.layers.0"]:
                 for component in param_info["components"]:
                     role = component["role"]
@@ -1084,8 +1085,9 @@ def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers() ->
                     )
                     assert spec.pre is not None and spec.post is not None
                     ctx = spec.pre(spec.base)
-                    ctx.buf.fill_(fill_value if role == "weight" else fill_value + 8)
+                    ctx.buf.fill_(component_seed)
                     spec.post(ctx)
+                    component_seed += 1
             adapter.finish_update()
             torch.cuda.synchronize()
             snapshots.append(
@@ -1095,7 +1097,7 @@ def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers() ->
                 name: runtime_parameters[name].data_ptr() for name in tracked_names
             } == pointers
 
-        assert any(
+        assert all(
             not torch.equal(snapshots[0][name], snapshots[1][name])
             for name in tracked_names
         )
