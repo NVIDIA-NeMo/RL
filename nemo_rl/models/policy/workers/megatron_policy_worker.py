@@ -692,6 +692,8 @@ class MegatronPolicyWorkerImpl(
         # local expert id etc.
         self.refit_conversion_tasks: Optional[list[Any]] = None
         self._native_grouped_mxfp8_tasks: list[Any] = []
+        self._native_mxfp8_conversion_tasks: Optional[list[Any]] = None
+        self._misc_conversion_tasks: list[Any] = []
         self._native_direct_component_specs: dict[tuple[str, str], LocalParamSpec] = {}
         self.refit_conversion_tasks_current_index = None
         self.refit_param_info_mcore = None
@@ -2835,6 +2837,68 @@ class MegatronPolicyWorkerImpl(
             f"with mapping {type(mapping).__name__}"
         )
 
+    def _task_uses_native_mxfp8_storage(self, task: Any, *, grouped: bool) -> bool:
+        """Return whether every local source component uses native MXFP8 storage."""
+        if not self._native_task_projections(task, grouped=grouped):
+            return False
+
+        local_uses_native: bool | None = None
+        if task.param_weight is not None:
+            if grouped:
+                from megatron.core.fp8_utils import get_grouped_quantized_members
+
+                members = get_grouped_quantized_members(
+                    task.param_weight, create_if_missing=False
+                )
+                if not members:
+                    logical_name = self._native_task_projections(task, grouped=True)[0][
+                        0
+                    ]
+                    raise ValueError(
+                        f"Grouped MXFP8 source {logical_name!r} role 'weight' "
+                        "has no members"
+                    )
+                for member in members:
+                    extract_native_mxfp8_components(member)
+                local_uses_native = True
+            else:
+                metadata_getter = getattr(task.param_weight, "get_metadata", None)
+                if callable(metadata_getter):
+                    extract_native_mxfp8_components(task.param_weight)
+                    local_uses_native = True
+                else:
+                    local_uses_native = False
+
+        broadcaster = getattr(task.mapping, "broadcast_obj_from_pp_rank", None)
+        if callable(broadcaster):
+            return bool(
+                broadcaster(
+                    local_uses_native,
+                    cache_key=f"native-mxfp8-storage:{task.global_param_name}",
+                )
+            )
+        return bool(local_uses_native)
+
+    def _partition_native_mxfp8_conversion_tasks(
+        self,
+        conversion_tasks: list[Any],
+    ) -> tuple[list[Any], list[Any], list[Any]]:
+        """Partition native MXFP8, grouped native, and misc tasks by source storage."""
+        grouped_names = {
+            task.global_param_name
+            for task in getattr(self, "_native_grouped_mxfp8_tasks", [])
+        }
+        native_tasks: list[Any] = []
+        native_grouped_tasks: list[Any] = []
+        misc_tasks: list[Any] = []
+        for task in conversion_tasks:
+            grouped = task.global_param_name in grouped_names
+            if self._task_uses_native_mxfp8_storage(task, grouped=grouped):
+                (native_grouped_tasks if grouped else native_tasks).append(task)
+            else:
+                misc_tasks.append(task)
+        return native_tasks, native_grouped_tasks, misc_tasks
+
     @staticmethod
     def _native_projection_component(
         components: NativeMXFP8Components,
@@ -2865,7 +2929,9 @@ class MegatronPolicyWorkerImpl(
             task.global_param_name
             for task in getattr(self, "_native_grouped_mxfp8_tasks", [])
         }
-        conversion_tasks = self.refit_conversion_tasks
+        conversion_tasks = getattr(self, "_native_mxfp8_conversion_tasks", None)
+        if conversion_tasks is None:
+            conversion_tasks = self.refit_conversion_tasks
         if conversion_tasks is None:
             raise RuntimeError("Native MXFP8 conversion tasks are not initialized")
         for task in conversion_tasks:
@@ -3060,7 +3126,9 @@ class MegatronPolicyWorkerImpl(
                 )
             return local_entries
 
-        conversion_tasks = self.refit_conversion_tasks
+        conversion_tasks = getattr(self, "_native_mxfp8_conversion_tasks", None)
+        if conversion_tasks is None:
+            conversion_tasks = self.refit_conversion_tasks
         if conversion_tasks is None:
             raise RuntimeError("Native MXFP8 conversion tasks are not initialized")
         direct_tasks = [
@@ -3496,6 +3564,12 @@ class MegatronPolicyWorkerImpl(
         if conversion_tasks is None:
             raise RuntimeError("Refit conversion tasks are not initialized")
         native_mxfp8 = self._is_native_mxfp8_export()
+        if native_mxfp8:
+            (
+                self._native_mxfp8_conversion_tasks,
+                self._native_grouped_mxfp8_tasks,
+                self._misc_conversion_tasks,
+            ) = self._partition_native_mxfp8_conversion_tasks(conversion_tasks)
 
         # Single pass over Bridge's stream: classify each param as major
         # (xferdtensor) or misc (packed_broadcast), preserve yield order so
@@ -3536,15 +3610,6 @@ class MegatronPolicyWorkerImpl(
         mtp_hf_layers_names = _collect_mtp_hf_layer_names(conversion_tasks)
 
         if native_mxfp8:
-            grouped_names = {
-                task.global_param_name for task in self._native_grouped_mxfp8_tasks
-            }
-            self._misc_conversion_tasks = [
-                task
-                for task in conversion_tasks
-                if task.global_param_name not in grouped_names
-                and not self._native_task_projections(task)
-            ]
             metadata_conversion_tasks = self._misc_conversion_tasks
         else:
             metadata_conversion_tasks = None
