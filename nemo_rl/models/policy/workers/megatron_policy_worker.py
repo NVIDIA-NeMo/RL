@@ -2701,11 +2701,45 @@ class MegatronPolicyWorkerImpl(
     def broadcast_weights_for_collective(
         self,
         kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
     ) -> None:
-        """Broadcast the weights for collective communication."""
+        """Broadcast the weights for collective communication.
+
+        A generation rank that dies mid-broadcast leaves this call blocked in NCCL with no
+        timeout and no error -- observed as both policy workers stuck in
+        ``packed_broadcast_producer -> cuda stream synchronize`` while the run sat wedged.
+        The watchdog is the only way out, because the controller cannot reach this actor
+        while its event loop is inside the collective. Disarmed unless refit_timeout_s is
+        set, so the default path is unchanged.
+        """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+        )
+
+        with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
+            self._broadcast_weights_for_collective(
+                kv_scales=kv_scales,
+                buffer_size_bytes=buffer_size_bytes,
+                num_buffers=num_buffers,
+            )
+        if guard.fired:
+            # The aborted collective returned cleanly, so this is the only signal there is.
+            raise RefitAborted(
+                f"refit broadcast exceeded {refit_timeout_s}s and was aborted; "
+                "a generation rank most likely stopped participating"
+            )
+
+    def _broadcast_weights_for_collective(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
+    ) -> None:
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
             iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
@@ -3036,22 +3070,77 @@ class MegatronPolicyWorkerImpl(
                     mapping[name] = LocalParamSpec(base=param_map.get(name))
         return HFToLocalParamMap(specs=mapping)
 
-    @torch.no_grad()
-    def nccl_reshard_refit(self, kv_scales=None):
-        """Transfer weights to generation workers via xferdtensor.
+    async def nccl_reshard_refit(self, kv_scales=None, refit_timeout_s=None):
+        """Run the refit off this actor's event loop; see _nccl_reshard_refit_guarded.
 
-        Uses TP-local shards directly from Megatron parameters, bypassing
-        the Bridge's PP broadcast + TP gather.  The modified xferdtensor
-        reconstructs the full tensor from per-rank shards internally.
+        Async purely so the blocking transfer does not occupy the loop. While it runs,
+        this actor can still service the recovery's ``init_collective`` -- which is the
+        whole reason the rebuild can happen at all when a generation rank goes silent.
+
+        THE DEVICE IS CARRIED ACROSS EXPLICITLY. CUDA's current device is thread-local, so
+        a fresh thread starts on device 0 rather than this worker's, and NCCL on the wrong
+        device fails with ``UnhandledCudaError`` -- job 6510914 died that way on its first
+        healthy refit, before any fault was injected. ``torch.cuda.current_stream()``
+        inside the transfer reads the same thread-local state, so setting the device also
+        puts the transfer back on the intended stream.
+        """
+        from nemo_rl.distributed.refit_watchdog import await_off_loop
+
+        # Read on the loop thread, where it is correct, and applied on the worker thread.
+        device = torch.cuda.current_device()
+
+        def _on_this_workers_device():
+            torch.cuda.set_device(device)
+            return self._nccl_reshard_refit_guarded(
+                kv_scales=kv_scales, refit_timeout_s=refit_timeout_s
+            )
+
+        return await await_off_loop(_on_this_workers_device)
+
+    @torch.no_grad()
+    def _nccl_reshard_refit_guarded(self, kv_scales=None, refit_timeout_s=None):
+        """Transfer weights to generation workers via xferdtensor, under a deadline.
+
+        Guarded exactly like the collective producer, and for the same reason: a
+        generation rank that dies mid-refit leaves this blocked inside NCCL with no
+        error and no progress, and the controller cannot reach this actor to break it
+        because its event loop is inside the transfer.
+
+        BOTH communicator families are handed to the watchdog. This transport moves the
+        bulk over the per-PP-stage ``pp_comm_group`` and then broadcasts the remainder
+        over the shared ``model_update_group``, so the hang can be in either and nothing
+        here can tell which. Aborting both is safe -- abort() is idempotent -- and the
+        recovery rebuilds both anyway.
+
+        Disarmed unless refit_timeout_s is set, so the default path is unchanged.
 
         ``kv_scales`` (FP8 KV cache): the per-layer k/v(/q) scales ride the misc
         packed-broadcast as plain scale tensors (the is_nccl_reshard_param whitelist
         excludes ``.k_scale``/``.v_scale``/``.q_scale`` -> misc); the gen side finalizes
         them via ``_maybe_process_fp8_kv_cache``.  No out-of-band channel needed.
         """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+        )
+
+        groups = [self.pp_comm_group, self.model_update_group]
+        with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
+            self._nccl_reshard_refit(
+                kv_scales=kv_scales, refit_timeout_s=refit_timeout_s
+            )
+        if guard.fired:
+            # The aborted transfer returned cleanly, so this is the only signal there is.
+            raise RefitAborted(
+                f"refit nccl_reshard exceeded {refit_timeout_s}s and was aborted; "
+                "a generation rank most likely stopped participating"
+            )
+
+    def _nccl_reshard_refit(self, kv_scales=None, refit_timeout_s=None):
         # hf_to_local_param_map is built once in prepare_nccl_reshard_refit_info;
         # weight values change but the name → spec mapping is stable across
         # refits.
+        from nemo_rl.distributed.refit_watchdog import sync_stream_within
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
         # spec.pre (grouped-MoE expert stacking) and spec.post enqueue on this
@@ -3100,14 +3189,18 @@ class MegatronPolicyWorkerImpl(
                 # memory returns to the caching allocator
                 del ctx, src_tensor
 
-        torch.cuda.synchronize()
+        sync_stream_within(
+            nccl_reshard_stream, refit_timeout_s, "the bulk parameter transfer"
+        )
         torch.cuda.empty_cache()
 
         import time
 
         misc_t0 = time.perf_counter()
         self._broadcast_misc_params_packed(kv_scales=kv_scales)
-        torch.cuda.synchronize()
+        sync_stream_within(
+            torch.cuda.current_stream(), refit_timeout_s, "the misc broadcast"
+        )
         if torch.distributed.get_rank() == 0:
             print(
                 f"[nccl_reshard_refit] misc broadcast (train side): "

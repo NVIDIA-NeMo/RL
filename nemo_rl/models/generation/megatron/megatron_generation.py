@@ -26,6 +26,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    reject_unenforceable_refit_deadline,
 )
 from nemo_rl.models.generation.megatron.config import (
     MCoreGenerationConfig,
@@ -309,8 +310,11 @@ class MegatronGeneration(GenerationInterface):
             refit_backend=refit_backend,
         )
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
         """Receive updated weights from the training cluster via collective communication."""
+        reject_unenforceable_refit_deadline("Megatron", refit_timeout_s)
         return self._policy.swap_weights_via_reshard(is_source=False)
 
     def generate(

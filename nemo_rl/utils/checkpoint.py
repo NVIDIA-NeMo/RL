@@ -61,6 +61,36 @@ def _load_megatron_common_state_dict(iteration_dir: Path) -> dict[str, Any]:
     return load_common_state_dict(str(iteration_dir))
 
 
+def validate_warm_start_checkpoint(
+    warm_start: PathLike, model_component: str = "value"
+) -> None:
+    """Reject a warm-start checkpoint whose model subtree does not exist.
+
+    This is the one checkpoint path that comes straight from user config, and
+    get_resume_paths never stats it -- an unresolvable path would train a cold
+    model behind a line claiming a warm start. Callers must gate this on a fresh
+    run, since a resume ignores the warm start entirely.
+
+    Args:
+        warm_start: step_<n> directory the user pointed the warm start at. A Hydra
+            override written as ``key=`` with an unset variable arrives as "".
+        model_component: Subtree the seed must carry, matching get_resume_paths.
+    """
+    if not str(warm_start).strip():
+        raise ValueError(
+            "warm_start_value_checkpoint is empty. A Hydra override written as "
+            "`ppo.warm_start_value_checkpoint=` with an unset variable produces "
+            "this; point it at a step_<n> directory or drop the override."
+        )
+    if not (Path(warm_start) / model_component / "weights").exists():
+        raise ValueError(
+            f"warm_start_value_checkpoint={str(warm_start)!r} has no "
+            f"{model_component}/weights subtree, so the {model_component} model "
+            "would silently start cold. Point it at a step_<n> directory from a "
+            "critic-pretrain or PPO run."
+        )
+
+
 class PretrainedCheckpointConfig(TypedDict):
     """Configuration for restoring initial weights from a pre-existing Megatron checkpoint.
 

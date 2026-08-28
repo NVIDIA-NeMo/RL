@@ -102,7 +102,10 @@ from nemo_rl.models.megatron.router_replay import (
 )
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointManager,
+    validate_warm_start_checkpoint,
+)
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
@@ -585,7 +588,7 @@ def _clamp_max_num_steps(
     """Clamp max_num_steps to max_num_epochs * len(dataloader)."""
     algo_cfg = algo_config(master_config)
     max_num_epochs = algo_cfg.max_num_epochs
-    if max_num_epochs is None or max_num_epochs <= 0:
+    if max_num_epochs is None:
         return
     algo_cfg.max_num_steps = min(
         algo_cfg.max_num_steps,
@@ -777,6 +780,24 @@ def setup_single_controller(
     generation_config = policy_config["generation"]
     data_config = master_config.data
 
+    # Every nccl_reshard precondition, checked once, here, before any GPU work.
+    #
+    # This guard existed but had exactly one production caller -- grpo.setup -- which the
+    # single-controller path does not go through: run_grpo_single_controller goes straight
+    # to setup_single_controller. So on SC none of it was enforced, and a config violating
+    # e.g. colocated.enabled or enable_eplb got as far as the first refit before anything
+    # noticed. This PR makes that worse rather than better: recovery rebuilds the reshard
+    # communicators, so a bad config now has a second, later chance to fail.
+    #
+    # Deliberately after validate_single_controller_config, so the SC-specific errors a
+    # reader is more likely to have caused come first.
+    if generation_config.get("refit_transport") == "nccl_reshard":
+        from nemo_rl.weight_sync.nccl_reshard_utils import (
+            check_nccl_reshard_refit_support,
+        )
+
+        check_nccl_reshard_refit_support(master_config)
+
     if algo_cfg.val_period > 0 or algo_cfg.val_at_start or algo_cfg.val_at_end:
         raise NotImplementedError(
             "SingleController doesn't support validation now, will support "
@@ -820,10 +841,17 @@ def setup_single_controller(
     )
     save_state = _get_grpo_save_state(loaded_state)
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
-    value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
-        last_checkpoint_path,
-        model_component="value",
-    )
+    if is_ppo_run(master_config):
+        # Only a fresh run reads this; a resume ignores it and restores the critic
+        # from its own checkpoint, so the key can stay in the config.
+        warm_start = master_config.ppo.warm_start_value_checkpoint
+        if last_checkpoint_path is None and warm_start is not None:
+            validate_warm_start_checkpoint(warm_start)
+            print(f"🔥 Warm-starting the value model from {warm_start}")
+        value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
+            last_checkpoint_path or warm_start,
+            model_component="value",
+        )
 
     # ==========================
     # Setup Dataset & Environments
@@ -1187,6 +1215,7 @@ def setup_single_controller(
             train_cluster=train_cluster,
             inference_cluster=inference_cluster,
             refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+            refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
         )
         weight_synchronizer.init_communicator()
         setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0

@@ -71,7 +71,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       use_importance_sampling_correction: true
     ```
 
-5. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step.
+5. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step. `ppo.warm_start_value_checkpoint` seeds that critic from another run's checkpoint instead, so a fresh run can skip the online warmup entirely — see [Warm-Starting the Critic](./ppo.md#warm-starting-the-critic).
 
 ## Async-RL Knobs and Sampler Modes
 
@@ -176,6 +176,8 @@ The [legacy async GRPO](./async-grpo.md) (`grpo.async_grpo.enabled: true` under 
 ### Migrating a legacy async config
 
 SC reads its async knobs from `async_rl:` and **requires `grpo.async_grpo: null`** (or `ppo.async_ppo: null` on a PPO run) — `run_grpo_single_controller.py` raises if a legacy block is still present, so null it out when porting rather than leaving it in place.
+
+Do not carry `max_num_epochs: -1` across either. [ppo.md](./ppo.md#asynchronous-ppo) requires that value for legacy async PPO, but SC has no `-1` convention: the rollout pump gates on `_current_epoch < max_num_epochs`, so any non-positive value trains zero steps and exits successfully. Setup rejects it — set a positive `max_num_epochs` and bound the run with `max_num_steps`.
 
 | Legacy `grpo.async_grpo.*` / `ppo.async_ppo.*` | SC equivalent `async_rl.*` |
 | -------------------------- | -------------------------- |
