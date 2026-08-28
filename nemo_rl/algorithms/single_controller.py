@@ -1180,8 +1180,13 @@ class SingleControllerActor:
             )
         self._buffer.abort(request.group_id)
 
-    async def _finalize_with_actor(self, request: "FinalizationRequest") -> None:
-        """Submit one metadata request to the bounded fixed actor pool."""
+    async def _finalize_with_actor(self, request: "FinalizationRequest") -> bool:
+        """Submit one metadata request to the bounded fixed actor pool.
+
+        Returns True once the group is committed to the replay buffer, or
+        False when the finalizer dropped it as a policy outcome (ownership
+        already cleaned up; the caller credits the step short).
+        """
         self._finalizer_waiters += 1
         queue_depth = max(
             0,
@@ -1224,10 +1229,12 @@ class SingleControllerActor:
                     "finalizer dropped the group and known-key cleanup failed "
                     f"for group {request.group_id}"
                 ) from cleanup_error
-            raise RuntimeError(
-                f"token capture: group {request.group_id} dropped "
-                "(min_valid_fraction_per_group)"
+            print(
+                f"  finalize: group {request.group_id} dropped "
+                f"({finalized.drop_reason or 'unspecified reason'})",
+                flush=True,
             )
+            return False
         if finalized.meta is None:
             try:
                 await self._cleanup_known_finalization_request(request)
@@ -1266,6 +1273,7 @@ class SingleControllerActor:
             }
         )
         self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
+        return True
 
     async def _cleanup_consumed_metas(self, metas: list[KVBatchMeta]) -> None:
         """Clear canonical rows and full-manifest staging keys after train success."""
@@ -1393,7 +1401,16 @@ class SingleControllerActor:
                             self._buffer_capacity.release()
                             self._credit_shortfall(target_step)
                             return
-                        await self._finalize_with_actor(request)
+                        committed = await self._finalize_with_actor(request)
+                        if not committed:
+                            # Finalizer dropped the group as a policy outcome;
+                            # ownership was already cleaned up, so like the
+                            # dropped-prompt path above the train pump will
+                            # never release this permit and the step must be
+                            # allowed to close short.
+                            self._buffer_capacity.release()
+                            self._credit_shortfall(target_step)
+                            return
                         ownership_transferred = True
                     except BaseException:
                         # On success ownership transfers to the train pump, which
