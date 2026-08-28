@@ -43,8 +43,8 @@ contains Qwen3.8-Flash-Next support.
 
 Sources:
 
-- **AutoModel** — the
-  [`huiyingl/feat/qwen3-8-flash-next-rl` branch](https://github.com/NVIDIA-NeMo/Automodel/tree/huiyingl/feat/qwen3-8-flash-next-rl),
+- **AutoModel** — upstream commit
+  [`8c954f67`](https://github.com/NVIDIA-NeMo/Automodel/commit/8c954f67d2977b401b06f98ab8b7a218ce07363f),
   pinned by this repository's AutoModel submodule.
 - **vLLM** — the Qwen3.8-Flash-Next support branch from
   [vLLM PR #53896](https://github.com/vllm-project/vllm/pull/53896).

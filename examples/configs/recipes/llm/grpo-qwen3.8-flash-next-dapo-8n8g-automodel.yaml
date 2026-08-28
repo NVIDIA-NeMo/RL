@@ -83,7 +83,7 @@ policy:
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.BackendConfig
-        attn: tilelang
+        attn: flex
         linear: torch
         rms_norm: torch_fp32
         experts: torch_mm

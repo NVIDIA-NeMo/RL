@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import math
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional
@@ -25,7 +26,6 @@ from nemo_automodel.components.distributed.tensor_utils import (
     to_local_if_dtensor,
 )
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
-from nemo_automodel.shared.owner_sharding import get_model_owned_dtensor_spec
 from torch import nn
 from torch.distributed.tensor import DTensor
 
@@ -80,6 +80,47 @@ from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.timer import Timer
+
+
+_MODEL_OWNED_GRAD_DIVISOR_ATTR = "_nemo_model_owned_grad_divisor"
+
+
+def _get_model_owned_grad_divisor(parameter: nn.Parameter | None) -> float | None:
+    """Read and validate AutoModel's model-owned DTensor marker."""
+    if parameter is None:
+        return None
+    raw_divisor = getattr(parameter, _MODEL_OWNED_GRAD_DIVISOR_ATTR, None)
+    if raw_divisor is None:
+        return None
+    if isinstance(raw_divisor, bool) or not isinstance(raw_divisor, (int, float)):
+        raise TypeError(
+            f"{_MODEL_OWNED_GRAD_DIVISOR_ATTR} must be a positive number, "
+            f"got {type(raw_divisor).__name__}"
+        )
+    divisor = float(raw_divisor)
+    if not math.isfinite(divisor) or divisor <= 0:
+        raise ValueError(
+            f"{_MODEL_OWNED_GRAD_DIVISOR_ATTR} must be finite and positive, "
+            f"got {raw_divisor!r}"
+        )
+    return divisor
+
+
+def _get_model_owned_process_group(
+    parameter: nn.Parameter,
+) -> torch.distributed.ProcessGroup:
+    """Resolve the owner group from a marked model-owned DTensor's mesh."""
+    if not isinstance(parameter, DTensor):
+        raise TypeError(
+            f"A parameter marked with {_MODEL_OWNED_GRAD_DIVISOR_ATTR} must be "
+            f"a DTensor, got {type(parameter).__name__}"
+        )
+    if parameter.device_mesh.ndim != 1:
+        raise ValueError(
+            "Model-owned DTensor refit requires a one-dimensional owner mesh, "
+            f"got ndim={parameter.device_mesh.ndim}"
+        )
+    return parameter.device_mesh.get_group()
 
 
 def _gather_model_owned_manifest(
@@ -242,10 +283,8 @@ def dtensor_params_generator(
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
         parameter = parameter_map.get(name)
-        model_owned_spec = (
-            get_model_owned_dtensor_spec(parameter) if parameter is not None else None
-        )
-        is_model_owned_dtensor = model_owned_spec is not None
+        model_owned_grad_divisor = _get_model_owned_grad_divisor(parameter)
+        is_model_owned_dtensor = model_owned_grad_divisor is not None
         if is_model_owned_dtensor:
             if not isinstance(tensor, DTensor):
                 raise TypeError(
@@ -264,10 +303,10 @@ def dtensor_params_generator(
                     f"{name!r} as rank-local tensors"
                 )
             if replicate_model_owned_dtensors:
-                assert model_owned_spec is not None
+                assert parameter is not None
                 yield from _replicate_model_owned_hf_tensors(
                     adapted_fqn_tensors,
-                    process_group=model_owned_spec.process_group,
+                    process_group=_get_model_owned_process_group(parameter),
                     target_dtype=target_dtype,
                     device=tensor.to_local().device,
                 )
@@ -1262,12 +1301,8 @@ class DTensorPolicyWorkerV2Impl(
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
                 continue
             parameter = parameter_map.get(name)
-            model_owned_spec = (
-                get_model_owned_dtensor_spec(parameter)
-                if parameter is not None
-                else None
-            )
-            is_model_owned_dtensor = model_owned_spec is not None
+            model_owned_grad_divisor = _get_model_owned_grad_divisor(parameter)
+            is_model_owned_dtensor = model_owned_grad_divisor is not None
             if is_model_owned_dtensor and not isinstance(tensor, DTensor):
                 raise TypeError(
                     f"Model-owned parameter {name!r} must remain a DTensor in state_dict()"
@@ -1295,10 +1330,11 @@ class DTensorPolicyWorkerV2Impl(
                 )
                 for adapted_fqn, adapted_tensor in adapted_fqn_tensors
             }
-            if model_owned_spec is not None and replicate_model_owned_dtensors:
+            if is_model_owned_dtensor and replicate_model_owned_dtensors:
+                assert parameter is not None
                 adapted_manifest = _gather_model_owned_manifest(
                     adapted_manifest,
-                    model_owned_spec.process_group,
+                    _get_model_owned_process_group(parameter),
                 )
             for adapted_fqn, metadata in adapted_manifest.items():
                 if adapted_fqn in state_dict_info:
@@ -1543,21 +1579,22 @@ class DTensorPolicyWorkerV2Impl(
         # ``Module.to`` may replace or swap tensor-subclass Parameters. Arbitrary
         # Python attributes are not guaranteed to survive that conversion, but
         # model-owned DTensors rely on their attached contract to stay outside
-        # ordinary FSDP gathering (Qwen4-Exp's PLE table is 190 GiB globally).
+        # ordinary FSDP gathering (Qwen3.8-Flash-Next's PLE table is 190 GiB
+        # globally).
         # Snapshot the model-agnostic contract by stable FQN and restore it on
         # the converted Parameter before any subsequent gradient or refit path
         # inspects the model.
-        model_owned_specs = {
-            name: spec
+        model_owned_grad_divisors = {
+            name: divisor
             for name, parameter in model.named_parameters()
-            if (spec := get_model_owned_dtensor_spec(parameter)) is not None
+            if (divisor := _get_model_owned_grad_divisor(parameter)) is not None
         }
         model = self.move_buffer_to_device(model, device)
         model = model.to(device)
 
-        if model_owned_specs:
+        if model_owned_grad_divisors:
             parameter_map = dict(model.named_parameters())
-            for name, spec in model_owned_specs.items():
+            for name, divisor in model_owned_grad_divisors.items():
                 parameter = parameter_map.get(name)
                 if parameter is None:
                     raise RuntimeError(
@@ -1569,7 +1606,7 @@ class DTensorPolicyWorkerV2Impl(
                         "Model-owned parameter must remain a DTensor after device "
                         f"conversion: {name!r} became {type(parameter).__name__}"
                     )
-                parameter._nemo_model_owned_dtensor_spec = spec
+                setattr(parameter, _MODEL_OWNED_GRAD_DIVISOR_ATTR, divisor)
 
         return model
 
