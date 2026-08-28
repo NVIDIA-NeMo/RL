@@ -25,7 +25,10 @@ def test_native_smoke_overlays_enable_runtime_inventory_assertion() -> None:
         assert f"native_mxfp8_storage_assertion: {model_scope}" in config
 
     nano_config = (EXPERIMENT_DIR / "nano-fp8param-false.yaml").read_text()
-    assert "te_precision_config_file: experiments/native_mxfp8_source_refit/te_nano_routed.yaml" in nano_config
+    assert (
+        "te_precision_config_file: experiments/native_mxfp8_source_refit/te_nano_routed.yaml"
+        in nano_config
+    )
     assert "first_last_layers_bf16: true" in nano_config
     assert "num_layers_at_end_in_bf16: 8" in nano_config
 
@@ -49,7 +52,21 @@ def test_launcher_exports_resolved_slurm_helper_path_to_batch_shell() -> None:
     assert "Required Slurm helper ${helper} not found" in launcher
 
 
-def test_launcher_resolver_does_not_depend_on_original_path_for_fallback_tools() -> None:
+def test_launcher_uses_shared_storage_for_hf_to_megatron_conversion() -> None:
+    launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
+
+    assert "MEGATRON_CHECKPOINT_ROOT=${MEGATRON_CHECKPOINT_ROOT:-" in launcher
+    assert 'require_prefix "${MEGATRON_CHECKPOINT_ROOT}" /lustre' in launcher
+    assert (
+        "export NRL_MEGATRON_CHECKPOINT_DIR=${MEGATRON_CHECKPOINT_ROOT}/${MODEL}"
+        in launcher
+    )
+    assert 'mkdir -p "${MEGATRON_CHECKPOINT_ROOT}/${MODEL}"' in launcher
+
+
+def test_launcher_resolver_does_not_depend_on_original_path_for_fallback_tools() -> (
+    None
+):
     launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
 
     assert "/usr/bin/readlink" in launcher
@@ -59,7 +76,7 @@ def test_launcher_resolver_does_not_depend_on_original_path_for_fallback_tools()
     assert 'readlink -f "${helper_path}"' not in launcher
     assert 'realpath "${helper_path}"' not in launcher
     assert 'dirname "${resolved_path}"' not in launcher
-    assert 'helper_dir=${resolved_path%/*}' in launcher
+    assert "helper_dir=${resolved_path%/*}" in launcher
 
 
 def test_ray_sub_bootstraps_slurm_helper_path_before_queries() -> None:

@@ -195,11 +195,14 @@ if [[ "${ACTION}" == submit ]]; then
   fi
 fi
 SOURCE_SHA=$(git -C "${REPO}" rev-parse HEAD)
+MEGATRON_CHECKPOINT_ROOT=${MEGATRON_CHECKPOINT_ROOT:-${RESULT_ROOT}/pretrained-checkpoints/${SOURCE_SHA}}
+require_prefix "${MEGATRON_CHECKPOINT_ROOT}" /lustre MEGATRON_CHECKPOINT_ROOT
 
 RUN_NAME="native-mxfp8-${MODEL}-fp8param-${FP8_PARAM}-${RUN_GROUP}"
 RUN_ROOT="${RESULT_ROOT}/${RUN_NAME}"
 if [[ "${ACTION}" == submit ]]; then
   mkdir -p "${RUN_ROOT}/logs"
+  mkdir -p "${MEGATRON_CHECKPOINT_ROOT}/${MODEL}"
 fi
 
 NATIVE_OVERRIDES=()
@@ -226,6 +229,7 @@ export HF_HOME_SOURCE=${HF_HOME}
 export HF_HOME=${LOCAL_SCRATCH}/hf-cache/${MODEL}
 export HF_DATASETS_CACHE=\${HF_HOME}/datasets
 export HUGGINGFACE_HUB_CACHE=\${HF_HOME}/hub
+export NRL_MEGATRON_CHECKPOINT_DIR=${MEGATRON_CHECKPOINT_ROOT}/${MODEL}
 export NEMO_RL_VENV_DIR=${LOCAL_SCRATCH}/nemo-rl-worker-cache/${SOURCE_SHA}
 export VLLM_CACHE_ROOT=${LOCAL_SCRATCH}/vllm-cache/${SOURCE_SHA}/fp8param-${FP8_PARAM}
 export TORCHINDUCTOR_CACHE_DIR=${LOCAL_SCRATCH}/inductor-cache/${SOURCE_SHA}/fp8param-${FP8_PARAM}
