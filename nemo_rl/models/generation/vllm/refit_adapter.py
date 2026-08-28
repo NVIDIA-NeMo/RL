@@ -225,7 +225,7 @@ class Vllm0251RefitAdapter:
         self._failure = error
         self._state = "poisoned"
         try:
-            self._exit_config_context()
+            self._exit_config_context(error)
         except BaseException:
             pass
 
@@ -240,11 +240,15 @@ class Vllm0251RefitAdapter:
         if self._state != "active":
             raise RuntimeError("vLLM refit adapter has no active update")
 
-    def _exit_config_context(self) -> None:
+    def _exit_config_context(self, error: BaseException | None = None) -> None:
         config_context = self._config_context
         self._config_context = None
         if config_context is not None:
-            config_context.__exit__(None, None, None)
+            config_context.__exit__(
+                type(error) if error is not None else None,
+                error,
+                error.__traceback__ if error is not None else None,
+            )
 
 
 class VllmRefitCompatibilityError(RuntimeError):
@@ -374,17 +378,25 @@ def _has_trainer_weight_transfer() -> bool:
     except ModuleNotFoundError:
         return False
     worker_engine = getattr(base_module, "WeightTransferEngine", None)
-    trainer_engine = getattr(base_module, "WeightTransferTrainer", None)
-    return all(
-        callable(getattr(worker_engine, method_name, None))
-        for method_name in (
-            "start_weight_update",
-            "update_weights",
-            "finish_weight_update",
+    trainer_engine = getattr(base_module, "TrainerWeightTransferEngine", None)
+    return (
+        all(
+            callable(getattr(worker_engine, method_name, None))
+            for method_name in (
+                "start_weight_update",
+                "update_weights",
+                "finish_weight_update",
+            )
         )
-    ) and all(
-        callable(getattr(trainer_engine, method_name, None))
-        for method_name in ("trainer_init", "send_weights")
+        and _accepts_arguments(
+            getattr(trainer_engine, "trainer_init", None),
+            (object(),),
+            keyword_arguments={"client": object()},
+        )
+        and _has_keyword_only_parameter(
+            getattr(trainer_engine, "trainer_init", None), "client"
+        )
+        and callable(getattr(trainer_engine, "send_weights", None))
     )
 
 
@@ -401,12 +413,30 @@ def _accepts_one_argument_shape(
 def _accepts_arguments(
     callable_object: Callable[..., Any] | None,
     arguments: tuple[object, ...],
+    *,
+    keyword_arguments: Mapping[str, object] | None = None,
 ) -> bool:
     """Return whether a callable can bind the positional arguments used by refit."""
     if not callable(callable_object):
         return False
     try:
-        inspect.signature(callable_object).bind(*arguments)
+        inspect.signature(callable_object).bind(
+            *arguments, **dict(keyword_arguments or {})
+        )
     except (TypeError, ValueError):
         return False
     return True
+
+
+def _has_keyword_only_parameter(
+    callable_object: Callable[..., Any] | None,
+    parameter_name: str,
+) -> bool:
+    """Return whether a callable exposes the named keyword-only parameter."""
+    if not callable(callable_object):
+        return False
+    try:
+        parameter = inspect.signature(callable_object).parameters.get(parameter_name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind is inspect.Parameter.KEYWORD_ONLY
