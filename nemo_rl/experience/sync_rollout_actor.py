@@ -54,6 +54,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
+    should_mask_flagged_samples,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
@@ -263,6 +264,7 @@ class SyncRolloutActor:
                 thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
                 deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
                 debug_payload_metrics=cfg.grpo.debug_payload_metrics,
+                mask_env_flagged_samples=should_mask_flagged_samples(cfg.env),
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
         else:
@@ -365,6 +367,16 @@ class SyncRolloutActor:
             # apply_reward_shaping on the driver without a TQ fetch.
             "response_token_lengths": decomposed["response_token_lengths"],
         }
+        # Env-flagged samples, for the driver's mask_sample filter. It is a
+        # bool tensor, so the pass-through loop above skips it, and the driver
+        # cannot recover it from a TQ slice fetch. Absent when the env opted
+        # out via ``env.should_mask_flagged_samples=false`` or when the
+        # rollout path is not NeMo Gym.
+        if "mask_sample" in fb:
+            mask_sample = fb["mask_sample"]
+            if not isinstance(mask_sample, torch.Tensor):
+                mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
+            driver_carry["mask_sample"] = mask_sample
         # GDPO multi-reward components: scale_rewards iterates these
         # keys driver-side and the GDPO advantage estimator reads them
         # from ``adv_inputs``. Plumb them through ``driver_carry``

@@ -233,6 +233,25 @@ class TestMaskSampleFilter:
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.0, 0.0])
         )
 
+    def test_operates_on_the_plain_dict_the_sync_driver_carries(self):
+        """grpo_sync reuses this on ``driver_carry``, which is a plain dict.
+
+        The annotation says ``BatchedDataDict``; sharing one implementation
+        across both drivers is the point, so pin that a dict works rather than
+        letting someone restate the rule a third time.
+        """
+        driver_carry = {
+            "loss_multiplier": torch.tensor([1.0, 1.0, 1.0]),
+            "mask_sample": torch.tensor([False, True, False]),
+        }
+
+        num_masked = _apply_mask_sample_filter(driver_carry)
+
+        assert num_masked == 1
+        assert torch.equal(
+            driver_carry["loss_multiplier"], torch.tensor([1.0, 0.0, 1.0])
+        )
+
     def test_masks_list_valued_mask_sample(self):
         repeated_batch = BatchedDataDict(
             {
@@ -1310,7 +1329,7 @@ def mock_async_grpo_infrastructure(
     return stack
 
 
-def mock_sync_grpo_infrastructure(policy):
+def mock_sync_grpo_infrastructure(policy, driver_carry_extra=None):
     """Context manager that mocks the TQ/data-plane infrastructure of grpo_train_sync.
 
     Mirrors ``mock_async_grpo_infrastructure``: the Ray rollout actor and the
@@ -1331,6 +1350,7 @@ def mock_sync_grpo_infrastructure(policy):
             "loss_multiplier": torch.tensor([1.0]),
             "truncated": torch.tensor([False]),
             "length": torch.tensor([3]),
+            **(driver_carry_extra or {}),
         }
     )
     meta = MagicMock()
@@ -4088,6 +4108,86 @@ def _enter_stop_test_mocks(
         )
     )
     return "nemo_rl.algorithms.grpo.validate"
+
+
+def test_grpo_sync_drops_env_flagged_samples_from_the_loss(mock_grpo_components):
+    """``data_plane.enabled`` picks the trainer; it must not pick the objective.
+
+    ``run_grpo.py`` presents grpo.py and grpo_sync.py as two implementations of
+    one synchronous algorithm. grpo.py drops env-flagged rollouts from the loss
+    (``_apply_mask_sample_filter``, called at grpo.py:3313 and :4955); before
+    this fix grpo_sync.py never called it, so a rollout the environment marked
+    unusable still contributed its full policy-gradient term there.
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_end = False
+    logger = mock_grpo_components["logger"]
+
+    with ExitStack() as stack:
+        master_config.data_plane = {"enabled": True}
+        stack.enter_context(
+            mock_sync_grpo_infrastructure(
+                mock_grpo_components["policy"],
+                driver_carry_extra={"mask_sample": torch.tensor([True])},
+            )
+        )
+        stack.enter_context(
+            patch("nemo_rl.algorithms.grpo_sync.validate_sync", return_value=({}, {}))
+        )
+        grpo_train_sync(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            logger,
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    metrics = _logged_train_metrics_with_key(logger, "num_mask_sample_filtered")
+    assert metrics["num_mask_sample_filtered"] == 1
+
+
+def test_grpo_sync_reports_zero_when_nothing_is_flagged(mock_grpo_components):
+    """The metric has to exist on every step, or a dashboard reads a gap as zero."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_end = False
+    logger = mock_grpo_components["logger"]
+
+    with ExitStack() as stack:
+        master_config.data_plane = {"enabled": True}
+        stack.enter_context(
+            mock_sync_grpo_infrastructure(mock_grpo_components["policy"])
+        )
+        stack.enter_context(
+            patch("nemo_rl.algorithms.grpo_sync.validate_sync", return_value=({}, {}))
+        )
+        grpo_train_sync(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            logger,
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    metrics = _logged_train_metrics_with_key(logger, "num_mask_sample_filtered")
+    assert metrics["num_mask_sample_filtered"] == 0
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
