@@ -242,7 +242,7 @@ policy:
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: true
       max_tokens: ${policy.max_total_sequence_length} # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
-      kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload". To select "recompute", set grpo.async_grpo.recompute_kv_cache_after_weight_updates=true.
+      kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload", "recompute".
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
       logprobs_mode: processed_logprobs

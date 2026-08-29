@@ -232,6 +232,7 @@ from nemo_rl.models.generation.megatron.config import (
 from nemo_rl.models.megatron.community_import import (
     import_model_from_hf_name,
     iter_vlm_config_overrides,
+    megatron_conversion_is_complete,
 )
 from nemo_rl.models.megatron.config import (
     ColocatedReshardPlan,
@@ -342,6 +343,8 @@ def validate_and_set_config(
     pretrained_path,
     weights_path,
     optimizer_path,
+    *,
+    skip_weight_load: bool = False,
 ):
     # inference_optimized layers hard-require SP with TP>1; fail here with the config key.
     # This guards the training cfg; the inference cfg is guarded in
@@ -418,6 +421,7 @@ def validate_and_set_config(
         pretrained_path,
         weights_path,
         optimizer_path,
+        skip_weight_load=skip_weight_load,
     )
 
     final_padded_vocab_size = calculate_padded_vocab_size(
@@ -584,9 +588,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
         overrides_hash = _get_hf_config_overrides_hash(hf_config_overrides)
         hf_model_subdir = f"{hf_model_subdir}__hfovr_{overrides_hash}"
     pretrained_path = os.path.join(get_megatron_checkpoint_dir(), hf_model_subdir)
-    pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
-        os.path.join(pretrained_path, "iter_0000000")
-    )
+    pt_checkpoint_exists = megatron_conversion_is_complete(pretrained_path)
     return hf_model_name, pretrained_path, pt_checkpoint_exists
 
 
@@ -598,16 +600,30 @@ def setup_model_config(
     pretrained_path: str,
     weights_path: Optional[str] = None,
     optimizer_path: Optional[str] = None,
+    *,
+    skip_weight_load: bool = False,
 ) -> tuple[ConfigContainer, Any]:
-    """Handle all the model configuration logic."""
+    """Handle all the model configuration logic.
+
+    Args:
+        config: Policy config.
+        rank: Global rank (used in error messages).
+        dtype: Training dtype.
+        hf_model_name: HF model id (or local path).
+        pretrained_path: Path to the pretrained Megatron checkpoint.
+        weights_path: Path to save/load training weights.
+        optimizer_path: Path to the optimizer state (None if not resuming).
+        skip_weight_load: This policy never loads the checkpoint (weights arrive via refit).
+    """
     pretrained_ckpt = config.get("pretrained_checkpoint")
     fmt = pretrained_ckpt["format"] if pretrained_ckpt is not None else None
     validate_router_replay_config(config)
 
-    if fmt == "megatron_lm":
-        # For megatron_lm format: build the model config from the HF architecture.
-        # pretrained_path has already been resolved to a specific iter dir by
-        # validate_model_paths, so no conversion step is needed.
+    derive_provider_from_hf = fmt == "megatron_lm" or (
+        skip_weight_load and fmt != "megatron_bridge"
+    )
+
+    if derive_provider_from_hf:
         from transformers import AutoConfig
 
         hf_config_overrides = config.get("hf_config_overrides", {}) or {}
@@ -717,8 +733,8 @@ def setup_model_config(
 
     # Reconstructed providers must be finalized so derived fields reflect the
     # merged config. Without overrides, preserve the existing checkpoint-load
-    # behavior: only megatron_lm providers need finalization here.
-    if fmt == "megatron_lm" or model_overrides:
+    # behavior: only HF-derived providers need finalization here.
+    if derive_provider_from_hf or model_overrides:
         model_cfg.finalize()
 
     model_cfg.__post_init__()
@@ -730,23 +746,26 @@ def setup_model_config(
         fp8_cfg and fp8_cfg.get("enabled", False) and fp8_cfg.get("fp8_param", False)
     )
 
+    # Refit-fed policies never read the pretrained checkpoint (weights arrive via refit).
+    ckpt_pretrained_path: Optional[str] = None if skip_weight_load else pretrained_path
+
     # When fp8_param starts from a pretrained checkpoint, model params may already
     # be quantized before optimizer main params are initialized. Load main params
     # from the checkpoint state dict to preserve the original checkpoint precision.
     load_main_params_from_ckpt = (
         fp8_param_enabled
-        and pretrained_path is not None
+        and ckpt_pretrained_path is not None
         and weights_path is None
         and optimizer_path is None
     )
 
-    # Create checkpoint configs
+    # Create checkpoint configs. A refit-fed policy neither saves nor loads checkpoints.
     checkpoint_config = _create_checkpoint_config(
-        pretrained_path,
+        ckpt_pretrained_path,
         weights_path,
         optimizer_path,
         load_main_params_from_ckpt,
-        ckpt_cfg=config["megatron_cfg"].get("checkpoint"),
+        ckpt_cfg=None if skip_weight_load else config["megatron_cfg"].get("checkpoint"),
     )
 
     # Validate training configuration
@@ -1257,7 +1276,7 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
 
 
 def _create_checkpoint_config(
-    pretrained_path: str,
+    pretrained_path: Optional[str],
     weights_path: Optional[str],
     optimizer_path: Optional[str],
     load_main_params_from_ckpt: bool = False,
@@ -2052,6 +2071,7 @@ def handle_model_import(
         model_post_wrap_hook=model_post_wrap_hook,
         transformer_layer_spec=transformer_layer_spec,
         mamba_stack_spec=mamba_stack_spec,
+        overwrite=force_reconvert,
         **hf_config_overrides,
     )
 
