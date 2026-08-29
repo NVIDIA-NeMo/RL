@@ -644,6 +644,9 @@ class GenerationInterface(ABC):
     def get_step_metrics(self) -> dict[str, float]:
         """Finish the current metric window and return generation metrics.
 
-        Backends without per-step generation metrics return an empty dictionary.
+        Returns:
+            Metrics accumulated since the matching ``snapshot_step_metrics``
+            call, not running totals. Backends without per-step generation
+            metrics return an empty dictionary.
         """
         return {}
