@@ -21,6 +21,7 @@ mkdir -p "$TEST_DIR"
 COMMON_OVERRIDES=(
     checkpointing.enabled=true
     checkpointing.checkpoint_dir="$CHECKPOINT_DIR"
+    checkpointing.metric_name=null
     checkpointing.save_period=1
     +checkpointing.save_data_plane=true
     ++token_capture.enabled=true
@@ -29,7 +30,7 @@ COMMON_OVERRIDES=(
     async_rl.sampler.max_lookahead_versions=1
     async_rl.max_inflight_prompts=8
     async_rl.max_buffered_rollouts=8
-    ++async_rl.rollout_failure.native.generation_timeout_s=120
+    ++async_rl.rollout_failure.nemo_gym.rollout_timeout_s=120
     ++async_rl.stall_watchdog.interval_s=10
     ++async_rl.stall_watchdog.stall_timeout_s=300
     ++async_rl.stall_watchdog.stall_action=abort
