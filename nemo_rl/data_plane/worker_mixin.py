@@ -36,7 +36,6 @@ FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
-from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,

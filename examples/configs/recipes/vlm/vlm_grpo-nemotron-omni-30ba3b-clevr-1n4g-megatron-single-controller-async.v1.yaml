@@ -17,12 +17,12 @@ data_plane:
 
 async_rl:
   sampler:
-    name: windowed
-    max_staleness_versions: 2
+    name: in_order
+    max_lookahead_versions: 1
   recompute_kv_cache_after_weight_updates: false
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
-  max_inflight_prompts: ${grpo.num_prompts_per_step}
-  max_buffered_rollouts: 32
+  max_inflight_prompts: ${mul:${grpo.num_prompts_per_step}, 2}
+  max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 2}
   diagnostics: true
 
 policy:

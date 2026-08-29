@@ -189,6 +189,7 @@ def test_multimodal_packed_tensor_round_trips_through_tq_payload() -> None:
         train_batch,
         weight_version=3,
         group_id="group",
+        prompt_idx=17,
     )
     assert "pixel_values" in fields
     assert f"{PACKED_TENSOR_META_PREFIX}pixel_values" in fields

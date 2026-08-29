@@ -1287,6 +1287,7 @@ def setup_single_controller(
                     train_cluster=train_cluster,
                     inference_cluster=inference_cluster,
                     refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+                    refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
                 )
                 generation.weight_synchronizer = weight_synchronizer
                 weight_synchronizer.init_communicator()
