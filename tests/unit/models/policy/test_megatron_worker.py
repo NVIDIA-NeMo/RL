@@ -762,6 +762,31 @@ def test_prepare_for_generation_disables_param_gather_hook_before_wake(
     assert model.config.flash_decode is False
 
 
+def test_move_retained_vlm_media_preserves_shared_tensors() -> None:
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationMixin,
+    )
+
+    shared_imgs = torch.ones(2)
+    first_request = SimpleNamespace(imgs=shared_imgs)
+    second_request = SimpleNamespace(imgs=shared_imgs)
+    text_request = SimpleNamespace()
+    worker = MegatronGenerationMixin()
+    worker.dynamic_inference_engine = SimpleNamespace(
+        requests={
+            1: SimpleNamespace(record=[first_request]),
+            2: SimpleNamespace(record=[second_request]),
+            3: SimpleNamespace(record=[text_request]),
+        }
+    )
+
+    worker._move_retained_vlm_media(torch.device("meta"))
+
+    assert first_request.imgs.device.type == "meta"
+    assert second_request.imgs is first_request.imgs
+    assert not hasattr(text_request, "imgs")
+
+
 def create_megatron_test_config(
     model_name: str,
     tp: int = 1,
