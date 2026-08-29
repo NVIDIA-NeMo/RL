@@ -45,6 +45,7 @@ class _NativeDestinationBinding:
     runtime_value_ptr: int
     runtime_scale_name: str
     runtime_scale_ptr: int
+    runtime_scale_shape: tuple[int, ...]
     checkpoint_alias_name: str
 
 
@@ -168,18 +169,22 @@ class Vllm0251RefitAdapter:
                 key for key in component_keys if key[0] in native_names
             )
             if not self._expected_components:
-                # Task 6's lifecycle-only contract deliberately uses abbreviated
-                # metadata. Keep that fake-compatible path while requiring complete
-                # metadata for concrete Task 7 destination binding.
-                self._expected_components = frozenset(component_keys)
+                raise ValueError(
+                    "vLLM native refit plan has no canonical MXFP8 value/scale pair"
+                )
             self._native_bindings = self._prepare_native_bindings(
                 refit_info, native_names
             )
             self._expected_local_shapes = _expected_local_component_shapes(
                 refit_info, native_names
             )
-        except BaseException as error:
-            self.abort_update(error)
+        except BaseException:
+            self._expected_components = frozenset()
+            self._expected_local_shapes.clear()
+            self._native_bindings.clear()
+            self._loaded_components.clear()
+            self._bridged_target_ids.clear()
+            self._state = "new"
             raise
         self._loaded_components.clear()
         self._bridged_target_ids.clear()
@@ -444,6 +449,7 @@ class Vllm0251RefitAdapter:
                 runtime_value_ptr=value_param.data_ptr(),
                 runtime_scale_name=runtime_scale_name,
                 runtime_scale_ptr=runtime_scale.data_ptr(),
+                runtime_scale_shape=tuple(runtime_scale.shape),
                 checkpoint_alias_name=checkpoint_alias_name,
             )
         return bindings
@@ -623,9 +629,12 @@ class Vllm0251RefitAdapter:
             if (
                 runtime_scale is None
                 or runtime_scale.data_ptr() != binding.runtime_scale_ptr
+                or runtime_scale.dtype != _NATIVE_SCALE_DTYPE
+                or tuple(runtime_scale.shape) != binding.runtime_scale_shape
             ):
                 raise RuntimeError(
-                    f"vLLM refit changed CUDA Graph-visible scale storage for "
+                    f"vLLM refit changed CUDA Graph-visible scale storage, dtype, "
+                    f"or shape for "
                     f"{binding.logical_name!r}"
                 )
             if checkpoint_alias is None:

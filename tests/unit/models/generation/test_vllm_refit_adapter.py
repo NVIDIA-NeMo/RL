@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import sys
+from copy import deepcopy
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace, TracebackType
@@ -119,15 +120,30 @@ def _single_rank_vllm_model_parallel(
 
 def _native_refit_info() -> dict[str, Any]:
     logical_name = "model.layers.0.mlp.down_proj.weight"
+    mesh = SimpleNamespace(mesh=torch.arange(1))
+    placements = [Replicate()]
     return {
         "layer_names": ["model.layers.0"],
         "per_layer_params": {
             "model.layers.0": [
                 {
                     "name": logical_name,
+                    "global_shape": (2, 32),
+                    "dst_mesh_info": mesh,
+                    "dst_placements": placements,
                     "components": [
-                        {"role": "weight"},
-                        {"role": "weight_scale"},
+                        {
+                            "role": "weight",
+                            "dtype": "torch.float8_e4m3fn",
+                            "global_shape": (2, 32),
+                            "dst_placements": placements,
+                        },
+                        {
+                            "role": "weight_scale",
+                            "dtype": "torch.uint8",
+                            "global_shape": (2, 1),
+                            "dst_placements": placements,
+                        },
                     ],
                 }
             ]
@@ -573,15 +589,33 @@ def _make_adapter(
     )
     model = SimpleNamespace(parameter=parameter)
     runner = SimpleNamespace(model=model, vllm_config=object())
+    adapter = refit_adapter.Vllm0251RefitAdapter(
+        model_runner=runner,
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    monkeypatch.setattr(adapter, "_prepare_native_bindings", lambda *_args: {})
     return (
-        refit_adapter.Vllm0251RefitAdapter(
-            model_runner=runner,
-            model_config=object(),
-            device=torch.device("cpu"),
-        ),
+        adapter,
         parameter,
         config_context,
     )
+
+
+def test_0251_adapter_prepare_failure_allows_corrected_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _parameter, _config_context = _make_adapter(monkeypatch, [])
+    invalid = deepcopy(_native_refit_info())
+    invalid["per_layer_params"]["model.layers.0"][0]["components"][1]["dtype"] = (
+        "torch.float32"
+    )
+
+    with pytest.raises(ValueError, match="weight_scale dtype"):
+        adapter.prepare(invalid)
+
+    adapter.prepare(_native_refit_info())
+    assert adapter._state == "prepared"
 
 
 def _assert_unusable_after_failure(
@@ -1089,7 +1123,7 @@ def test_0251_adapter_rejects_consistent_dense_metadata_that_misses_fused_target
     [
         ("missing_runtime_alias", "scale_from_checkpoint"),
         ("missing_runtime_scale", "runtime scale"),
-        ("wrong_runtime_scale_shape", "shape"),
+        ("wrong_checkpoint_scale_shape", "shape"),
         ("wrong_checkpoint_scale_dtype", "torch.uint8"),
         ("wrong_runtime_scale_dtype", "runtime scale"),
         ("missing_runtime_loader", "weight_loader"),
@@ -1116,7 +1150,7 @@ def test_0251_adapter_prepare_rejects_invalid_destinations_before_begin(
         )
     elif case == "missing_runtime_scale":
         model.model.layers[0].mlp.gate_up_proj._parameters.pop("weight_scale")
-    elif case == "wrong_runtime_scale_shape":
+    elif case == "wrong_checkpoint_scale_shape":
         parameters[alias_name].data = torch.empty(64, 2, dtype=torch.uint8)
     elif case == "wrong_checkpoint_scale_dtype":
         parameters[alias_name].data = torch.empty(64, 1, dtype=torch.float32)
@@ -1138,6 +1172,20 @@ def test_0251_adapter_prepare_rejects_invalid_destinations_before_begin(
         adapter.prepare(refit_info)
 
     assert runtime_scale_name not in getattr(adapter, "_active_scale_names", {})
+
+
+def test_0251_adapter_detects_runtime_scale_shape_change_after_prepare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, model, _retained_loads = _make_binding_adapter(monkeypatch, [])
+    adapter.prepare(_native_binding_refit_info())
+    runtime_scale = dict(model.named_parameters())[
+        "model.layers.0.mlp.gate_up_proj.weight_scale"
+    ]
+    runtime_scale.data = torch.empty(64, 2, dtype=torch.uint8)
+
+    with pytest.raises(RuntimeError, match="scale storage, dtype, or shape"):
+        adapter._verify_runtime_bindings()
 
 
 def test_0251_adapter_rejects_missing_checkpoint_alias_and_loader_before_receive(

@@ -41,6 +41,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     RefitCtx,
     _extract_layer_prefix,
 )
+from nemo_rl.weight_sync.refit_components import native_mxfp8_param_names
 
 logger = logging.getLogger(__name__)
 
@@ -67,20 +68,6 @@ def _format_refit_key_error(label: str, keys: set[str]) -> str:
     ordered = sorted(keys)
     suffix = " ..." if len(ordered) > 8 else ""
     return f"{label} ({len(ordered)}): {ordered[:8]}{suffix}"
-
-
-def _native_mxfp8_param_names(refit_info: dict[str, Any]) -> set[str]:
-    """Return logical parameters carrying canonical value and scale components."""
-    result: set[str] = set()
-    for layer_name in refit_info.get("layer_names", []):
-        for param_info in refit_info.get("per_layer_params", {}).get(layer_name, []):
-            components = param_info.get("components", [])
-            if [component.get("role") for component in components] == [
-                "weight",
-                "weight_scale",
-            ]:
-                result.add(param_info["name"])
-    return result
 
 
 class IPCWeightManifestError(RuntimeError):
@@ -1122,7 +1109,7 @@ class VllmInternalWorkerExtension:
         )
 
         self.nccl_reshard_refit_info = restore_refit_info_placements(refit_info)
-        if _native_mxfp8_param_names(self.nccl_reshard_refit_info):
+        if native_mxfp8_param_names(self.nccl_reshard_refit_info):
             adapter = self._get_nccl_reshard_refit_adapter()
             adapter.validate_plan(self.nccl_reshard_refit_info)
             adapter.prepare(self.nccl_reshard_refit_info)
@@ -1150,7 +1137,35 @@ class VllmInternalWorkerExtension:
             self._nccl_reshard_refit_adapter = adapter
         return adapter
 
-    def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
+    def _build_native_destination_specs(
+        self,
+        refit_info: dict[str, Any],
+    ) -> dict[tuple[str, str], LocalParamSpec]:
+        """Resolve native destinations while vLLM checkpoint storage is active."""
+        native_names = native_mxfp8_param_names(refit_info)
+        if not native_names:
+            return {}
+        param_info_by_name = {
+            param_info["name"]: param_info
+            for layer_name in refit_info["layer_names"]
+            for param_info in refit_info["per_layer_params"][layer_name]
+        }
+        adapter = self._get_nccl_reshard_refit_adapter()
+        return {
+            (hf_name, component["role"]): adapter.resolve_destination(
+                logical_name=hf_name,
+                role=component["role"],
+            )
+            for hf_name in native_names
+            for component in param_info_by_name[hf_name]["components"]
+        }
+
+    def build_hf_to_local_param_map(
+        self,
+        refit_info: dict,
+        *,
+        include_native: bool = True,
+    ) -> HFToLocalParamMap:
         """Build the vLLM-backend ``hf_to_local_param_map`` (HFToLocalParamMap).
 
         Wraps the ``(vllm_param, merged_slice)`` resolution from
@@ -1209,16 +1224,9 @@ class VllmInternalWorkerExtension:
             for param_info in refit_info["per_layer_params"][layer_name]
         }
         specs: dict[str | tuple[str, str], LocalParamSpec] = {}
-        native_names = _native_mxfp8_param_names(refit_info)
-        adapter = self._get_nccl_reshard_refit_adapter() if native_names else None
-        if adapter is not None:
-            for hf_name in native_names:
-                for component in param_info_by_name[hf_name]["components"]:
-                    role = component["role"]
-                    specs[(hf_name, role)] = adapter.resolve_destination(
-                        logical_name=hf_name,
-                        role=role,
-                    )
+        native_names = native_mxfp8_param_names(refit_info)
+        if include_native:
+            specs.update(self._build_native_destination_specs(refit_info))
         if native_names == set(param_info_by_name):
             return HFToLocalParamMap(specs=specs)
 
@@ -1599,19 +1607,36 @@ class VllmInternalWorkerExtension:
                 )
             torch.cuda.empty_cache()
 
-        native_names = _native_mxfp8_param_names(self.nccl_reshard_refit_info)
+        native_names = native_mxfp8_param_names(self.nccl_reshard_refit_info)
         if native_names:
             adapter = self._get_nccl_reshard_refit_adapter()
+            # vLLM's layerwise initializer replaces checkpoint parameters with
+            # meta tensors. Keep legacy/BF16 destinations bound to the saved
+            # runtime tensors before entering that window; native components
+            # are resolved against active checkpoint tensors afterwards.
+            destination_map = self.build_hf_to_local_param_map(
+                self.nccl_reshard_refit_info,
+                include_native=False,
+            )
             adapter.begin_update()
             try:
                 # Resolving every destination up front ensures a missing role,
                 # alias, shape, dtype, or wrapped loader fails before NCCL starts.
-                self.hf_to_local_param_map = self.build_hf_to_local_param_map(
+                native_specs = self._build_native_destination_specs(
                     self.nccl_reshard_refit_info
                 )
+                duplicate_keys = set(destination_map.specs) & set(native_specs)
+                if duplicate_keys:
+                    raise ValueError(
+                        "vLLM refit destination plan has duplicate components: "
+                        f"{sorted(duplicate_keys)!r}"
+                    )
+                destination_map.specs.update(native_specs)
+                self.hf_to_local_param_map = destination_map
                 _receive_bulk_components()
                 _receive_misc()
                 adapter.finish_update()
+                _refresh_hpc_modules_after_layerwise_reload(self.model_runner.model)
                 self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
             except BaseException as error:

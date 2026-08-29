@@ -36,6 +36,7 @@ pytest.importorskip("vllm")  # module-top `import vllm` in vllm_backend
 from nemo_rl.models.generation.vllm.vllm_backend import (  # noqa: E402
     VllmInternalWorkerExtension,
 )
+import nemo_rl.models.generation.vllm.vllm_backend as vllm_backend_module  # noqa: E402
 from nemo_rl.weight_sync.nccl_reshard_utils import (  # noqa: E402
     HFToLocalParamMap,
     LocalParamSpec,
@@ -207,6 +208,11 @@ def _patch_cpu_nccl_refit(
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(
+        vllm_backend_module,
+        "_refresh_hpc_modules_after_layerwise_reload",
+        lambda _model: None,
+    )
 
 
 def test_build_mapping_ffn_only():
@@ -842,11 +848,73 @@ def test_native_mxfp8_refit_fences_after_finalize_and_mtp(
     extension._receive_and_load_misc_params = lambda: events.append("misc")
     extension._maybe_process_mtp_drafter_after_loading = lambda: events.append("mtp")
     _patch_cpu_nccl_refit(monkeypatch, events)
+    monkeypatch.setattr(
+        vllm_backend_module,
+        "_refresh_hpc_modules_after_layerwise_reload",
+        lambda _model: events.append("hpc"),
+    )
 
     assert extension.nccl_reshard_refit()
 
-    assert events.index("finish") < events.index("mtp") < len(events) - 1
+    assert events.index("finish") < events.index("hpc") < events.index("mtp")
+    assert events.index("mtp") < len(events) - 1
     assert events[-1] == "sync"
+
+
+def test_native_mxfp8_refit_captures_bf16_destination_before_meta_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    native_param = torch.empty((32, 32), dtype=torch.float8_e4m3fn)
+    bf16_param = torch.zeros((32, 32), dtype=torch.bfloat16)
+    bf16_runtime_storage = bf16_param.data
+    extension = _make_ext(
+        {
+            "model.layers.0.mlp.down_proj.weight": native_param,
+            "model.layers.1.mlp.down_proj.weight": bf16_param,
+        }
+    )
+    refit_info = _native_down_refit_info()
+    refit_info["layer_names"].append("model.layers.1")
+    refit_info["per_layer_params"]["model.layers.1"] = [
+        {
+            "name": "model.layers.1.mlp.down_proj.weight",
+            "global_shape": (32, 32),
+            "dtype": "torch.bfloat16",
+            "pp_stage": 0,
+            "src_mesh_info": object(),
+            "dst_mesh_info": object(),
+            "src_placements": [],
+            "dst_placements": [],
+            "components": [
+                {
+                    "role": "weight",
+                    "dtype": "torch.bfloat16",
+                    "global_shape": (32, 32),
+                    "src_placements": [],
+                    "dst_placements": [],
+                }
+            ],
+        }
+    ]
+    extension.nccl_reshard_refit_info = refit_info
+    extension.pp_comm_groups = {0: object()}
+    adapter = _RecordingNativeAdapter(events)
+
+    def begin_update() -> None:
+        events.append("begin")
+        bf16_param.data = torch.empty((32, 32), device="meta", dtype=torch.bfloat16)
+
+    adapter.begin_update = begin_update
+    extension._nccl_reshard_refit_adapter = adapter
+    extension._receive_and_load_misc_params = lambda: events.append("misc")
+    extension._maybe_process_mtp_drafter_after_loading = lambda: events.append("mtp")
+    _patch_cpu_nccl_refit(monkeypatch, events)
+
+    assert extension.nccl_reshard_refit()
+
+    assert not bf16_runtime_storage.is_meta
+    assert torch.all(bf16_runtime_storage == 3)
 
 
 def test_native_mxfp8_refit_aborts_before_collective_on_destination_failure(
