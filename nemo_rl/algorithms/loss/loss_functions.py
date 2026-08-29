@@ -1197,7 +1197,16 @@ class DistillationLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks,
             )
         else:
-            kl_loss = per_token_kl.mean()
+            # Enforced rather than assumed: the non-distributed top-k gather in
+            # ``get_distillation_topk_logprobs_from_logits`` accumulates its
+            # backward on the duplicate indices that padded positions carry, and
+            # is only equivalent to the pre-gather-upcast formulation because
+            # those positions reduce to exactly 0.0. An unmasked mean would give
+            # them nonzero gradient and quietly break that equivalence.
+            raise ValueError(
+                "DistillationLossFn requires 'token_mask' and 'sample_mask' in "
+                "data; got keys: " + str(sorted(data.keys()))
+            )
 
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,

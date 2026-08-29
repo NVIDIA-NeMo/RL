@@ -2264,6 +2264,48 @@ def test_distillation_loss_topk_filtering(k, zero_outside_topk):
         assert loss.item() != 0.0  # Should have some meaningful loss
 
 
+def test_distillation_loss_requires_masks():
+    """Missing masks must raise, not silently fall back to an unmasked mean.
+
+    The non-distributed top-k gather in
+    ``get_distillation_topk_logprobs_from_logits`` accumulates its backward on
+    the duplicate indices that padded positions carry, and matches the
+    pre-gather-upcast formulation only because those positions reduce to
+    exactly 0.0. An unmasked mean gives them real gradient and breaks that.
+    """
+    batch, seq_minus_one, k = 2, 3, 4
+    student = torch.log_softmax(torch.randn(batch, seq_minus_one, k), dim=-1)
+    teacher = torch.log_softmax(torch.randn(batch, seq_minus_one, k), dim=-1)
+    loss_fn = DistillationLossFn(
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
+    )
+    full = {
+        "input_ids": torch.zeros(batch, seq_minus_one + 1, dtype=torch.long),
+        "token_mask": torch.ones(batch, seq_minus_one + 1),
+        "sample_mask": torch.ones(batch),
+    }
+    global_seqs = torch.tensor(float(batch))
+    global_toks = torch.tensor(float(batch * seq_minus_one))
+
+    # Both masks present: reduces normally.
+    loss, _ = loss_fn(
+        student, teacher, None, BatchedDataDict(full), global_seqs, global_toks
+    )
+    assert torch.isfinite(loss)
+
+    # Either one missing: refuse rather than fall back.
+    for missing in ("token_mask", "sample_mask"):
+        stripped = BatchedDataDict(
+            {key: value for key, value in full.items() if key != missing}
+        )
+        with pytest.raises(ValueError, match="requires 'token_mask'"):
+            loss_fn(student, teacher, None, stripped, global_seqs, global_toks)
+
+
 def test_distillation_loss_invalid_k_zero():
     """Test that k=0 should raise a ValueError."""
     # Test with k=0 which should be invalid

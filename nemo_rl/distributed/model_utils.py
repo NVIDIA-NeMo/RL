@@ -2183,10 +2183,12 @@ def get_distillation_topk_logprobs_from_logits(
             # there rather than scattering. The equality holds anyway, because
             # DistillationLossFn masks those positions to exactly 0.0 before
             # reduction, so the accumulated gradient is zero either way.
-            # ``DistillationLossDataDict`` declares both masks as required and
-            # every in-tree caller passes them. ``cp_sharder.shard_token_tensor(
-            # ..., fill=0)`` above is a second source of duplicate indices, on
-            # the padded tail, and those positions are masked the same way.
+            # That is enforced, not assumed: DistillationLossFn rejects data
+            # without ``token_mask``/``sample_mask`` rather than falling back to
+            # an unmasked mean, which would give those positions real gradient.
+            # ``cp_sharder.shard_token_tensor(..., fill=0)`` above is a second
+            # source of duplicate indices, on the padded tail; the same masking
+            # covers them.
             student_topk_logits = student_logits.gather(
                 dim=-1, index=indices_for_logits
             ).to(torch.float32)
