@@ -456,7 +456,7 @@ constraint-dependencies = [
   # whose [tool.uv.sources] pins them to git. uv requires such URL deps to also appear as a
   # direct requirement or constraint of the root project. Keep these URLs/revs in sync with
   # Megatron-LM's [tool.uv.sources] (uv errors loudly on mismatch after a submodule bump).
-  "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0",
+  "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.3.0",
   "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca",
   # Same story for megatron-fsdp, which nemo-automodel (r0.6.0) resolves from a
   # Megatron-LM fork via its own [tool.uv.sources] instead of PyPI. Keep this URL/rev
