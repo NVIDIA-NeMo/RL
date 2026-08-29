@@ -594,6 +594,11 @@ fast-hadamard-transform = [{ requirement = "torch", match-runtime = true }]
 nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
 flash_mla = [{ requirement = "torch", match-runtime = true }]
 
+# torch-memory-saver's build backend reads TMS_CUDA_MAJOR at build time. Keep this in
+# sync with docker/Dockerfile's BASE_IMAGE CUDA major version (currently cuda13.x).
+[tool.uv.extra-build-variables]
+torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
+
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
