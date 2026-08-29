@@ -2327,7 +2327,8 @@ class MegatronPolicyWorkerImpl(
         generation_cfg = cast(dict[str, Any], self.cfg["generation"])
         vllm_cfg = cast(dict[str, Any], generation_cfg.get("vllm_cfg", {}))
         return bool(
-            self.fp8_cfg.get("fp8_param", False)
+            self.fp8_cfg.get("enabled", False)
+            and self.fp8_cfg.get("fp8_param", False)
             and self.fp8_cfg.get("fp8_recipe") == "mxfp8"
             and vllm_cfg.get("precision") == "fp8"
             and vllm_cfg.get("is_mx") is True

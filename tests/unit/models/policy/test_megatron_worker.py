@@ -226,17 +226,19 @@ class _ModelWithNonSerializableExtraState(torch.nn.Module):
 
 
 @pytest.mark.parametrize(
-    ("fp8_param", "fp8_recipe", "precision", "is_mx", "expected"),
+    ("enabled", "fp8_param", "fp8_recipe", "precision", "is_mx", "expected"),
     [
-        (True, "mxfp8", "fp8", True, True),
-        (False, "mxfp8", "fp8", True, False),
-        (True, "blockwise", "fp8", True, False),
-        (True, "mxfp8", "bf16", True, False),
-        (True, "mxfp8", "fp8", False, False),
-        (True, "mxfp8", "fp8", None, False),
+        (True, True, "mxfp8", "fp8", True, True),
+        (False, True, "mxfp8", "fp8", True, False),
+        (True, False, "mxfp8", "fp8", True, False),
+        (True, True, "blockwise", "fp8", True, False),
+        (True, True, "mxfp8", "bf16", True, False),
+        (True, True, "mxfp8", "fp8", False, False),
+        (True, True, "mxfp8", "fp8", None, False),
     ],
 )
 def test_native_mxfp8_export_selection(
+    enabled: bool,
     fp8_param: bool,
     fp8_recipe: str,
     precision: str,
@@ -249,6 +251,7 @@ def test_native_mxfp8_export_selection(
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.fp8_cfg = {
+        "enabled": enabled,
         "fp8_param": fp8_param,
         "fp8_recipe": fp8_recipe,
     }
