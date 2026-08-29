@@ -1638,6 +1638,8 @@ class VllmInternalWorkerExtension:
                 adapter.finish_update()
                 _refresh_hpc_modules_after_layerwise_reload(self.model_runner.model)
                 self._maybe_process_mtp_drafter_after_loading()
+                # vLLM's layerwise finalizer already reprocesses attention
+                # modules, including static FP8 KV-cache scales.
                 torch.cuda.synchronize()
             except BaseException as error:
                 adapter.abort_update(error)
