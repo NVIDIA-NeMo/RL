@@ -363,6 +363,7 @@ def test_native_mxfp8_build_refit_tasks_bypasses_strict_grouped_names(
         "_megatron_local_name_to_global",
         lambda _models, _config, local_name, _vp_stage: local_name,
     )
+    monkeypatch.setattr(model_bridge, "_get_pp_rank", lambda _models: 0)
     monkeypatch.setattr(
         fp8_utils,
         "is_grouped_mxfp8tensor",
@@ -683,6 +684,42 @@ def test_native_mxfp8_grouped_members_refresh_without_aggregate_extraction(
     assert extracted
 
 
+def test_native_mxfp8_grouped_partition_initializes_missing_member_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from megatron.bridge.models.conversion.param_mapping import FusedExpertMapping
+    from megatron.core import fp8_utils
+
+    grouped_param = object()
+    member = _native_tensor((64, 32), value_marker=1, scale_marker=2)
+    task = SimpleNamespace(
+        mapping=FusedExpertMapping(
+            "decoder.layers.0.mlp.experts.linear_fc2.weight0",
+            "model.layers.0.mlp.experts.down_proj",
+        ),
+        param_weight=grouped_param,
+        global_param_name="decoder.layers.0.mlp.experts.linear_fc2.weight",
+    )
+    worker = _native_worker([], grouped_tasks=[task])
+    calls: list[bool] = []
+
+    def get_members(param: object, *, create_if_missing: bool):
+        assert param is grouped_param
+        calls.append(create_if_missing)
+        if not create_if_missing:
+            raise RuntimeError("member cache is not initialized")
+        return [member]
+
+    monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", get_members)
+
+    native, grouped, misc = worker._partition_native_mxfp8_conversion_tasks([task])
+
+    assert native == []
+    assert grouped == [task]
+    assert misc == []
+    assert calls == [False, True]
+
+
 def test_native_mxfp8_grouped_validation_fails_before_any_collective(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -793,7 +830,7 @@ def test_native_mxfp8_grouped_validation_fails_before_any_collective(
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
 
     with pytest.raises(ValueError, match=f"{grouped_name!r}.*role"):
-        worker.nccl_reshard_refit()
+        worker._nccl_reshard_refit()
 
     assert transfers == []
 
@@ -1015,6 +1052,114 @@ def test_native_grouped_task_builder_leaves_bf16_experts_for_misc(
     )
 
     assert tasks == []
+
+
+def test_native_conversion_builder_expands_bf16_grouped_experts_for_misc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from megatron.bridge.models.conversion import model_bridge
+    from megatron.bridge.models.conversion import utils as conversion_utils
+    from megatron.core import fp8_utils
+
+    global_name = "decoder.layers.0.mlp.experts.linear_fc1.weight"
+    members = [
+        torch.zeros((8, 64), dtype=torch.bfloat16),
+        torch.ones((8, 64), dtype=torch.bfloat16),
+    ]
+
+    class GroupedWeight:
+        shape = (2, 8, 64)
+        quantized_tensors: list[torch.Tensor] | None = None
+
+        def split_into_quantized_tensors(self) -> list[torch.Tensor]:
+            return members
+
+        def __getitem__(self, _index: int) -> torch.Tensor:
+            raise AssertionError("TE GroupedTensor does not support indexing")
+
+    parameter = GroupedWeight()
+    owner = SimpleNamespace(config=SimpleNamespace())
+    mapping = SimpleNamespace()
+    validated_names: list[str] = []
+
+    class Registry:
+        def set_process_groups_from_pg_collection(self, _groups: object) -> None:
+            pass
+
+        def megatron_to_hf_lookup(self, name: str) -> object | None:
+            return mapping if name in {f"{global_name}0", f"{global_name}1"} else None
+
+    registry = Registry()
+
+    class Bridge:
+        hf_pretrained = SimpleNamespace(config=SimpleNamespace())
+
+        def mapping_registry(self) -> Registry:
+            return registry
+
+        def _megatron_global_param_names_all_pp_ranks(
+            self, _models: list[object]
+        ) -> list[str]:
+            return [global_name]
+
+        def _share_embeddings_and_output_weights(self, _config: object) -> bool:
+            return False
+
+        def _validate_conversion_mappings(
+            self,
+            _registry: Registry,
+            names: list[str],
+            _hf_keys: object,
+        ) -> dict[str, object]:
+            validated_names.extend(names)
+            return {name: mapping for name in names}
+
+        def _unwrap_name(self, name: str) -> str:
+            return name
+
+        def _is_adapter_param_name(self, _name: str) -> bool:
+            return False
+
+    worker = _native_worker([])
+    worker.model = SimpleNamespace(
+        config=SimpleNamespace(
+            moe_single_grouped_weight=True,
+            num_moe_experts=2,
+            expert_model_parallel_size=1,
+        ),
+        named_parameters=lambda: [(global_name, parameter)],
+    )
+    worker.megatron_bridge = SimpleNamespace(
+        _model_bridge=Bridge(),
+        hf_pretrained=Bridge.hf_pretrained,
+    )
+    monkeypatch.setattr(fp8_utils, "is_grouped_mxfp8tensor", lambda _param: False)
+    monkeypatch.setattr(model_bridge, "_get_pg_collection_from_model", lambda _m: None)
+    monkeypatch.setattr(model_bridge, "_get_pp_rank", lambda _m: 0)
+    monkeypatch.setattr(
+        model_bridge,
+        "_megatron_local_name_to_global",
+        lambda _models, _config, name, _vp_stage: name,
+    )
+    monkeypatch.setattr(
+        conversion_utils,
+        "get_module_and_param_from_name",
+        lambda _models, _name, _vp_stage: (owner, parameter),
+    )
+    monkeypatch.setattr(conversion_utils, "persistent_buffers", lambda _model: [])
+
+    tasks = worker._build_native_mxfp8_conversion_tasks()
+
+    assert validated_names == [f"{global_name}0", f"{global_name}1"]
+    assert [task.global_param_name for task in tasks] == [
+        f"{global_name}0",
+        f"{global_name}1",
+    ]
+    assert tasks[0].param_weight is not None
+    assert tasks[1].param_weight is not None
+    assert tasks[0].param_weight is members[0]
+    assert tasks[1].param_weight is members[1]
+    assert parameter.quantized_tensors is members
 
 
 def test_native_grouped_task_builder_skips_mtp_experts_before_mapping_lookup(

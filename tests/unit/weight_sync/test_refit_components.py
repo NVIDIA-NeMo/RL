@@ -233,6 +233,27 @@ def test_native_mxfp8_param_names_requires_canonical_dtype_pair() -> None:
     assert native_mxfp8_param_names(refit_info) == set()
 
 
+def test_native_mxfp8_param_names_rejects_invalid_scale_shape() -> None:
+    refit_info = _native_refit_info()
+    refit_info["per_layer_params"]["model.layers.0"][0]["components"][1][
+        "global_shape"
+    ] = (64, 9)
+
+    assert native_mxfp8_param_names(refit_info) == set()
+
+    with pytest.raises(ValueError, match="scale shape"):
+        native_mxfp8_param_names(refit_info, strict=True)
+
+
+def test_native_mxfp8_param_names_strict_accepts_legacy_weight() -> None:
+    refit_info = _native_refit_info()
+    param_info = refit_info["per_layer_params"]["model.layers.0"][0]
+    param_info.pop("components")
+    param_info["dtype"] = "torch.bfloat16"
+
+    assert native_mxfp8_param_names(refit_info, strict=True) == set()
+
+
 @pytest.mark.parametrize("missing", ["shape", "dtype"])
 def test_normalize_refit_components_reports_missing_required_metadata(
     missing: str,
@@ -242,3 +263,23 @@ def test_normalize_refit_components_reports_missing_required_metadata(
 
     with pytest.raises(ValueError, match=missing):
         normalize_refit_components("model.layers.0.weight", metadata)
+
+
+@pytest.mark.parametrize("missing", ["shape", "dtype"])
+def test_build_refit_info_reports_missing_required_metadata(missing: str) -> None:
+    metadata = {
+        "model.layers.0.mlp.down_proj.weight": {
+            "shape": [32, 64],
+            "dtype": "torch.bfloat16",
+        }
+    }
+    del metadata["model.layers.0.mlp.down_proj.weight"][missing]
+
+    with pytest.raises(ValueError, match=missing):
+        build_nccl_reshard_refit_info(
+            metadata,
+            train_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": 1},
+            gen_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": 1},
+            train_world_size=1,
+            gen_world_size=1,
+        )

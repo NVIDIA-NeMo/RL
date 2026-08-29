@@ -248,6 +248,19 @@ def _is_mtp_megatron_param(param_name: str) -> bool:
     return param_name.startswith("mtp.") or ".mtp." in param_name
 
 
+def _grouped_expert_member_views(weight: torch.Tensor) -> list[torch.Tensor]:
+    """Return cached TE grouped members without invoking unsupported indexing."""
+    storage = weight.data if isinstance(weight, torch.nn.Parameter) else weight
+    splitter = getattr(storage, "split_into_quantized_tensors", None)
+    if callable(splitter):
+        members = getattr(storage, "quantized_tensors", None)
+        if members is None:
+            members = splitter()
+            storage.quantized_tensors = members
+        return list(members)
+    return list(storage.unbind(0))
+
+
 def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
     """Return HF layer names whose weights originate from Megatron's MTP module.
 
@@ -2474,6 +2487,44 @@ class MegatronPolicyWorkerImpl(
         )
         self._native_grouped_mxfp8_tasks = grouped_tasks
         grouped_names = {task.global_param_name for task in grouped_tasks}
+        grouped_suffixes = (
+            ".mlp.experts.linear_fc1.weight",
+            ".mlp.experts.linear_fc2.weight",
+        )
+        num_experts = int(getattr(self.model.config, "num_moe_experts", 0) or 0)
+        ep_size = int(getattr(self.model.config, "expert_model_parallel_size", 1) or 1)
+        if num_experts and num_experts % ep_size:
+            raise ValueError(
+                f"num_moe_experts={num_experts} must be divisible by "
+                f"expert_model_parallel_size={ep_size}"
+            )
+        local_expert_count = num_experts // ep_size if num_experts else 0
+        grouped_misc_names: dict[str, list[str]] = {}
+        expanded_global_names: list[str] = []
+        for global_name in global_names:
+            if (
+                global_name.endswith(grouped_suffixes)
+                and global_name not in grouped_names
+            ):
+                if _is_mtp_megatron_param(global_name):
+                    raise ValueError(
+                        "native MXFP8 refit does not yet support co-trained MTP "
+                        "grouped experts"
+                    )
+                if local_expert_count <= 0:
+                    raise ValueError(
+                        f"Cannot expand grouped expert parameter {global_name!r} "
+                        "without num_moe_experts"
+                    )
+                expanded = [
+                    f"{global_name}{expert_id}"
+                    for expert_id in range(local_expert_count)
+                ]
+                grouped_misc_names[global_name] = expanded
+                expanded_global_names.extend(expanded)
+            else:
+                expanded_global_names.append(global_name)
+        global_names = expanded_global_names
         remaining_names = [name for name in global_names if name not in grouped_names]
         if not remaining_names:
             return grouped_tasks
@@ -2501,6 +2552,35 @@ class MegatronPolicyWorkerImpl(
             global_name = _megatron_local_name_to_global(
                 models, self.model.config, local_name, 0
             )
+            expanded_names = grouped_misc_names.get(global_name)
+            if expanded_names is not None:
+                local_module, local_weight = get_module_and_param_from_name(
+                    models, local_name, 0
+                )
+                members = (
+                    []
+                    if local_weight is None
+                    else _grouped_expert_member_views(local_weight)
+                )
+                if len(members) != len(expanded_names):
+                    raise ValueError(
+                        f"Grouped expert parameter {global_name!r} has local shape "
+                        f"{getattr(local_weight, 'shape', None)}, expected "
+                        f"{len(expanded_names)} local experts"
+                    )
+                if local_module is not None and not hasattr(local_module, "config"):
+                    setattr(local_module, "config", self.model.config)
+                for expert_id, expanded_name in enumerate(expanded_names):
+                    local_tasks[expanded_name] = WeightConversionTask(
+                        pp_rank=pp_rank,
+                        vp_stage=0,
+                        param_name=f"{local_name}{expert_id}",
+                        global_param_name=expanded_name,
+                        megatron_module=local_module,
+                        param_weight=members[expert_id],
+                        mapping=mappings[expanded_name],
+                    )
+                continue
             if global_name not in remaining_set:
                 continue
             local_module, local_weight = get_module_and_param_from_name(
@@ -2887,8 +2967,18 @@ class MegatronPolicyWorkerImpl(
                     members = get_grouped_quantized_members(
                         task.param_weight, create_if_missing=False
                     )
-                except (RuntimeError, ValueError):
-                    return False
+                except RuntimeError:
+                    members = get_grouped_quantized_members(
+                        task.param_weight, create_if_missing=True
+                    )
+                except ValueError as error:
+                    logical_name = self._native_task_projections(task, grouped=True)[0][
+                        0
+                    ]
+                    raise ValueError(
+                        f"Invalid grouped MXFP8 source {logical_name!r} role "
+                        f"'weight': {error}"
+                    ) from error
                 if not members:
                     logical_name = self._native_task_projections(task, grouped=True)[0][
                         0

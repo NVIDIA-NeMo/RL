@@ -371,7 +371,7 @@ def test_native_mxfp8_transfer_uses_metadata_component_order(monkeypatch) -> Non
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
 
-    worker.nccl_reshard_refit()
+    worker._nccl_reshard_refit()
 
     assert [ref.global_shape for ref in refs] == [[64, 8], [64, 256]]
     assert [ref.local_tensor for ref in refs] == [scale, weight]
@@ -434,7 +434,7 @@ def test_native_mxfp8_missing_role_fails_before_collective(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
 
     with pytest.raises(RuntimeError, match=f"{name!r}.*'weight_scale'"):
-        worker.nccl_reshard_refit()
+        worker._nccl_reshard_refit()
 
     assert transfers == []
 
