@@ -146,7 +146,8 @@ checkpointing:
   save_data_plane: true
 
 # Frequent rollout-only snapshots are disabled unless interval_s is set. They
-# reuse the latest durable trainer checkpoint and native TQ checkpoint support.
+# require a durable trainer checkpoint for the current completed step and native
+# TQ checkpoint support. save_period=1 provides an anchor after every train step.
 rollout_checkpointing:
   interval_s: null
   keep_latest_k: 2
