@@ -1024,7 +1024,7 @@ def test_native_grouped_task_builder_skips_mtp_experts_before_mapping_lookup(
     from megatron.core import fp8_utils
 
     global_name = "mtp.layers.0.transformer_layer.mlp.experts.linear_fc1.weight"
-    parameter = torch.nn.Parameter(torch.zeros((8, 64), dtype=torch.uint8))
+    parameter = torch.zeros((8, 64), dtype=torch.uint8)
     worker = _native_worker([])
     worker.model = SimpleNamespace(
         config=SimpleNamespace(moe_single_grouped_weight=True),
