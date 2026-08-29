@@ -907,6 +907,17 @@ class TestReplayManifestDigest:
 
         assert replay_manifest_digest([first]) == replay_manifest_digest([second])
 
+    def test_ignores_rollout_metrics_logging_sidecar(self):
+        first = _make_group_entry("group-1", weight=1)
+        second = _make_group_entry("group-1", weight=1)
+        first["meta"].extra_info = {
+            "packing": [1, 2],
+            ROLLOUT_METRICS: [{"per_worker_token_counts": {0: 7}}],
+        }
+        second["meta"].extra_info = {"packing": [1, 2]}
+
+        assert replay_manifest_digest([first]) == replay_manifest_digest([second])
+
 
 class TestTQReplayBufferStateDict:
     def test_metadata_state_dict_omits_tensors_and_data_plane_reads(self):
@@ -934,7 +945,11 @@ class TestTQReplayBufferStateDict:
             _add_group(
                 buf,
                 weight=1,
-                rollout_metrics={"gen_tokens/min": 3, "total_turns": 2},
+                rollout_metrics={
+                    "gen_tokens/min": 3,
+                    "total_turns": 2,
+                    "per_worker_token_counts": {0: 7},
+                },
             ),
             _add_group(buf, weight=2),
         ]
@@ -955,7 +970,11 @@ class TestTQReplayBufferStateDict:
             list(meta.sample_ids) for meta in metas
         ]
         assert restored_buf.meta_list[0].extra_info[ROLLOUT_METRICS] == [
-            {"gen_tokens/min": 3, "total_turns": 2}
+            {
+                "gen_tokens/min": 3,
+                "total_turns": 2,
+                "per_worker_token_counts": {0: 7},
+            }
         ]
         assert restored_dp.put_calls == []
 
