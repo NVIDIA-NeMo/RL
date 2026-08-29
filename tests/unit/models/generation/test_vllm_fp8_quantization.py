@@ -242,6 +242,37 @@ def test_init_fp8_loads_remote_model_config(fp8_module, monkeypatch):
     assert config_loads == [(("remote-code-model",), {"trust_remote_code": True})]
 
 
+def test_init_fp8_defaults_missing_nemotron_h_moe_latent_size(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    config = types.SimpleNamespace(model_type="nemotron_h", num_hidden_layers=52)
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: config,
+    )
+
+    def create_model(model_config):
+        assert hasattr(model_config, "moe_latent_size")
+        assert model_config.moe_latent_size is None
+        return types.SimpleNamespace(named_parameters=lambda: [])
+
+    monkeypatch.setattr(fp8.AutoModel, "from_config", create_model)
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+            "num_last_layers_in_bf16": 8,
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+
 def test_init_fp8_deduplicates_explicit_ignore_pattern(fp8_module, monkeypatch):
     fp8 = fp8_module
 

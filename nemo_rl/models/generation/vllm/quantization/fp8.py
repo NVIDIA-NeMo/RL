@@ -225,6 +225,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     if vllm_cfg.get("is_mx") and not use_fp8_weights:
         raise ValueError("is_mx=True requires precision='fp8'")
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    if getattr(config, "model_type", None) == "nemotron_h" and not hasattr(
+        config, "moe_latent_size"
+    ):
+        config.moe_latent_size = None
     kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
 
     # Validate configuration: kv_cache_dtype
