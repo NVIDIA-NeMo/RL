@@ -279,7 +279,7 @@ class BaseSampler(abc.ABC):
         requested_groups = min(len(valid_idxs), max_prompt_groups)
         selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
-        await self._buffer.remove(selected_idxs, remove_in_dp=False)
+        await self._buffer.claim_for_training(selected_idxs)
         return (
             selected_metas[0].concat(*selected_metas[1:]),  # type: ignore
             len(selected_idxs),
