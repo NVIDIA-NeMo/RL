@@ -18,13 +18,19 @@ import pytest
 import ray
 import torch
 
-from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
+from nemo_rl.algorithms.logits_sampling_utils import (
+    SamplingMask,
+    apply_sampling_mask,
+    apply_top_k_top_p,
+)
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedGatherLogprob,
     ChunkedDistributedLogprob,
     ChunkedDistributedLogprobWithSampling,
+    ChunkedDistributedLogprobWithSamplingMask,
     DistributedLogprob,
     DistributedLogprobWithSampling,
+    DistributedLogprobWithSamplingMask,
     _compute_distributed_log_softmax,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
@@ -1342,6 +1348,84 @@ class SamplingParamsTestActor:
             "chunk_size": chunk_size,
         }
 
+    def test_distributed_logprob_with_sampling_mask(self, chunk_size):
+        """Exact rollout supports match a full-vocabulary fp32 baseline."""
+        tp_group = self.tp_group
+        tp_rank = torch.distributed.get_rank(tp_group)
+        batch_size, seq_len, vocab_size, support_width = 4, 16, 256, 4
+        vocab_part_size = vocab_size // self.tp_size
+        vocab_start = tp_rank * vocab_part_size
+        vocab_end = (tp_rank + 1) * vocab_part_size
+
+        torch.manual_seed(142)
+        full_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
+        vocab_parallel_logits = (
+            full_logits[:, :, vocab_start:vocab_end].clone().requires_grad_(True)
+        )
+        torch.manual_seed(143)
+        target = torch.randint(0, vocab_size, (batch_size, seq_len), device="cuda")
+
+        # Every support contains its target and IDs on multiple TP shards. The
+        # unused padded slots are zero, exercising token-ID-0 padding safety.
+        token_ids = torch.zeros(
+            batch_size,
+            seq_len,
+            support_width,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        token_ids[..., 0] = target.to(torch.int32)
+        token_ids[..., 1] = ((target + vocab_part_size) % vocab_size).to(torch.int32)
+        token_ids[..., 2] = ((target + 1) % vocab_size).to(torch.int32)
+        sizes = torch.full((batch_size, seq_len), 3, dtype=torch.int32, device="cuda")
+        sizes[:, ::3] = 2
+
+        expected_logits = full_logits.clone().requires_grad_(True)
+        expected_filtered, _ = apply_sampling_mask(
+            expected_logits,
+            target,
+            SamplingMask(token_ids=token_ids, sizes=sizes),
+        )
+        expected_logprobs = (
+            torch.log_softmax(expected_filtered, dim=-1)
+            .gather(-1, target.unsqueeze(-1))
+            .squeeze(-1)
+        )
+
+        if chunk_size is None:
+            actual_logprobs = DistributedLogprobWithSamplingMask.apply(
+                vocab_parallel_logits,
+                target,
+                tp_group,
+                token_ids,
+                sizes,
+                False,
+            )
+        else:
+            actual_logprobs = ChunkedDistributedLogprobWithSamplingMask.apply(
+                vocab_parallel_logits,
+                target,
+                tp_group,
+                token_ids,
+                sizes,
+                chunk_size,
+                False,
+            )
+
+        torch.testing.assert_close(
+            actual_logprobs, expected_logprobs, rtol=1e-4, atol=1e-4
+        )
+
+        torch.manual_seed(144)
+        output_grad = torch.randn_like(actual_logprobs)
+        expected_logprobs.backward(output_grad)
+        actual_logprobs.backward(output_grad)
+        expected_grad = expected_logits.grad[:, :, vocab_start:vocab_end]
+        torch.testing.assert_close(
+            vocab_parallel_logits.grad, expected_grad, rtol=1e-4, atol=1e-4
+        )
+        return {"success": True, "chunk_size": chunk_size}
+
 
 SAMPLING_PARAMS_TEST_ACTOR_FQN = (
     f"{SamplingParamsTestActor.__module__}.SamplingParamsTestActor"
@@ -1443,6 +1527,41 @@ def test_sampling_params_distributed_logprob(
         results = ray.get(futures)
         for i, result in enumerate(results):
             assert result["success"], f"Worker {i} failed: {result['error']}"
+        worker_group.shutdown(force=True)
+    finally:
+        cluster.shutdown()
+
+
+@pytest.mark.parametrize("chunk_size", [None, 4])
+def test_sampling_mask_distributed_logprob(
+    register_sampling_params_test_actor, chunk_size
+):
+    """Replay exact supports through TP, with and without rematerialization."""
+    tp_size = 2
+    if not torch.cuda.is_available() or torch.cuda.device_count() < tp_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {tp_size}, got {torch.cuda.device_count()}"
+        )
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[tp_size], use_gpus=True)
+    try:
+        sharding = NamedSharding(layout=list(range(tp_size)), names=["tp"])
+        builder = RayWorkerBuilder(
+            register_sampling_params_test_actor, tp_size, sharding
+        )
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+        results = ray.get(
+            worker_group.run_all_workers_single_data(
+                "test_distributed_logprob_with_sampling_mask",
+                chunk_size=chunk_size,
+            )
+        )
+        for result in results:
+            assert result["success"]
         worker_group.shutdown(force=True)
     finally:
         cluster.shutdown()

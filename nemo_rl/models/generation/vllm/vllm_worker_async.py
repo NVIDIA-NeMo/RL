@@ -43,12 +43,14 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
+from nemo_rl.models.generation.vllm.config import resolve_vllm_sampling_mask_top_k
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
+    pad_and_align_sampling_mask,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
@@ -1019,6 +1021,13 @@ class VllmAsyncGenerationWorkerImpl(
                 "generate_async can only be used when async_engine is enabled in vLLM config."
             )
 
+        sampling_mask_top_k = resolve_vllm_sampling_mask_top_k(self.cfg)
+        if sampling_mask_top_k is not None and greedy:
+            raise ValueError(
+                "vLLM sampling-mask replay requires temperature > 0 and does not "
+                "support greedy generation"
+            )
+
         # Handle empty input case
         if len(data["input_ids"]) == 0:
             return
@@ -1110,6 +1119,17 @@ class VllmAsyncGenerationWorkerImpl(
                         "truncated": truncated_tensor,
                     }
                 )
+                if sampling_mask_top_k is not None:
+                    result_batch["sampling_mask_token_ids"] = torch.zeros(
+                        (1, current_input_actual_length, sampling_mask_top_k),
+                        dtype=torch.int32,
+                        device=input_ids_single_row.device,
+                    )
+                    result_batch["sampling_mask_sizes"] = torch.zeros(
+                        (1, current_input_actual_length),
+                        dtype=torch.int32,
+                        device=input_ids_single_row.device,
+                    )
 
                 return (sample_idx, result_batch)
 
@@ -1223,6 +1243,21 @@ class VllmAsyncGenerationWorkerImpl(
                 "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
                 "truncated": truncated_tensor,
             }
+            if sampling_mask_top_k is not None:
+                sampling_mask_token_ids, sampling_mask_sizes = (
+                    pad_and_align_sampling_mask(
+                        generation_details,
+                        generated_token_ids,
+                        prompt_length=current_input_actual_length,
+                        padded_length=final_output_tensor_len,
+                        top_k=sampling_mask_top_k,
+                        device=original_input_ids_single_row.device,
+                    )
+                )
+                result_dict["sampling_mask_token_ids"] = (
+                    sampling_mask_token_ids.unsqueeze(0)
+                )
+                result_dict["sampling_mask_sizes"] = sampling_mask_sizes.unsqueeze(0)
             routed_experts, r3_stats = pad_and_align_routed_expert_indices(
                 final_request_output,
                 generation_details,

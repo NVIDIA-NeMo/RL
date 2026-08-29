@@ -191,6 +191,21 @@ class VllmConfig(GenerationConfig):
     real_quant_ignore: NotRequired[list[str]]
 
 
+def resolve_vllm_sampling_mask_top_k(config: VllmConfig) -> int | None:
+    """Return the fixed sampling-mask width when vLLM mask replay is enabled."""
+    vllm_kwargs = config.get("vllm_kwargs")
+    if vllm_kwargs is None or not vllm_kwargs.get("return_sampling_mask"):
+        return None
+
+    top_k = config["top_k"]
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+        raise ValueError(
+            "policy.generation.top_k must be a positive integer when "
+            "policy.generation.vllm_kwargs.return_sampling_mask is true"
+        )
+    return top_k
+
+
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:
     """Validate and return the optional vLLM video sampling contract."""
     raw_video_config = config["vllm_cfg"].get("video")

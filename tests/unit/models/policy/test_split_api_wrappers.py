@@ -32,7 +32,12 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import (
+    DP_TRAIN_FIELDS,
+    LP_SEED_FIELDS,
+    ROUTED_EXPERTS_FIELD,
+    SAMPLING_MASK_FIELDS,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.models.policy.tq_policy import TQPolicy
 
@@ -117,6 +122,7 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
     p = object.__new__(TQPolicy)
     p.cfg = {"train_global_batch_size": 8, "train_micro_batch_size": 2}
     p._router_replay_enabled = False
+    p._sampling_mask_replay_enabled = False
     p.flops_tracker = None
     wg = MagicMock()
     wg.run_all_workers_single_data.return_value = ["f0", "f1"]
@@ -180,6 +186,35 @@ class TestTQPolicySplitFanout:
 
         train_meta = mock_shard.call_args.args[0]
         assert train_meta.fields == [*DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD]
+
+    def test_sampling_mask_replay_fields_reach_prev_and_train_but_not_reference(self):
+        p, _ = _make_tq_policy()
+        p._sampling_mask_replay_enabled = True
+        meta = _meta()
+        captured_fields: list[list[str]] = []
+
+        def capture_shard(stage_meta, **kwargs):
+            del kwargs
+            captured_fields.append(stage_meta.fields)
+            return [meta, meta], None
+
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                side_effect=capture_shard,
+            ),
+        ):
+            p.get_logprobs_from_meta(meta)
+            p.get_reference_policy_logprobs_from_meta(meta)
+            p.train_microbatches_from_meta(meta)
+
+        assert captured_fields == [
+            [*LP_SEED_FIELDS, *SAMPLING_MASK_FIELDS],
+            list(LP_SEED_FIELDS),
+            [*DP_TRAIN_FIELDS, *SAMPLING_MASK_FIELDS],
+        ]
 
     def test_finish_dedupes_replica_twins(self):
         """TP/CP twins return identical metric copies; aggregating without

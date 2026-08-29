@@ -38,6 +38,10 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 
 from nemo_rl.algorithms.loss.interfaces import LossInputType
+from nemo_rl.algorithms.logits_sampling_utils import (
+    SamplingMask,
+    apply_sampling_mask,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     get_cp_sharded_next_token_logprobs,
@@ -267,6 +271,57 @@ def test_grpo_logprobs_follow_automodel_sequence_layout() -> None:
     actual.sum().backward()
     assert local_logits.grad is not None
     assert torch.isfinite(local_logits.grad).all()
+
+
+@pytest.mark.automodel
+def test_sampling_mask_replay_follows_automodel_sequence_layout() -> None:
+    order = torch.tensor([0, 3, 1, 2])
+    layout = _PermutationTokenLayout(order)
+    input_ids = torch.tensor([[0, 1, 2, 3]])
+    canonical_logits = torch.tensor(
+        [
+            [
+                [0.0, 0.4, -1.0, -2.0, 1.2, 2.1],
+                [1.8, -1.0, 0.3, -2.0, -3.0, 1.4],
+                [-0.2, 1.7, -3.0, 0.5, -2.0, -1.0],
+                [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ]
+        ]
+    )
+    local_logits = canonical_logits.index_select(1, order).requires_grad_()
+    sampling_mask = SamplingMask(
+        token_ids=torch.tensor([[[0, 0], [1, 4], [2, 5], [3, 0]]], dtype=torch.int32),
+        sizes=torch.tensor([[0, 2, 2, 2]], dtype=torch.int32),
+    )
+
+    actual = get_cp_sharded_next_token_logprobs(
+        local_logits,
+        input_ids,
+        layout,
+        sampling_mask=sampling_mask,
+    )
+
+    targets = input_ids[:, 1:]
+    expected_logits, expected_keep = apply_sampling_mask(
+        canonical_logits[:, :-1],
+        targets,
+        SamplingMask(
+            token_ids=sampling_mask.token_ids[:, 1:, :],
+            sizes=sampling_mask.sizes[:, 1:],
+        ),
+    )
+    expected = (
+        torch.log_softmax(expected_logits, dim=-1)
+        .gather(-1, targets.unsqueeze(-1))
+        .squeeze(-1)
+    )
+
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    assert local_logits.grad is not None
+    canonical_grad = layout.gather_token_tensor(local_logits.grad, seq_dim=1, trim=True)
+    assert torch.equal(canonical_grad[:, :-1] != 0, expected_keep)
+    assert torch.count_nonzero(canonical_grad[:, -1]) == 0
 
 
 @pytest.mark.automodel

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import operator
 from collections import defaultdict
 from typing import Any, Optional
 
@@ -31,6 +32,133 @@ VLLM_LOGPROB_FLOOR = -9999.0
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
+
+
+def pad_and_align_sampling_mask(
+    completion_output: Any,
+    generated_token_ids: list[int],
+    *,
+    prompt_length: int,
+    padded_length: int,
+    top_k: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Validate and align a vLLM sampling mask to full sequence positions.
+
+    Returns an int32 token-id tensor shaped ``[S, K]`` and an int32 sizes
+    tensor shaped ``[S]``. Prompt and padding positions are zero-filled.
+    """
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+        raise ValueError(f"sampling mask top_k must be positive, got {top_k!r}")
+    if prompt_length < 0 or padded_length < prompt_length:
+        raise ValueError(
+            "invalid sampling mask alignment lengths: "
+            f"prompt_length={prompt_length}, padded_length={padded_length}"
+        )
+    if prompt_length + len(generated_token_ids) > padded_length:
+        raise ValueError(
+            "sampling mask does not fit in the padded output: "
+            f"prompt_length={prompt_length}, "
+            f"generated_tokens={len(generated_token_ids)}, "
+            f"padded_length={padded_length}"
+        )
+
+    sampling_mask = getattr(completion_output, "sampling_mask", None)
+    if sampling_mask is None:
+        raise RuntimeError(
+            "vLLM was asked to return a sampling mask but the generation "
+            "output did not include sampling_mask"
+        )
+    raw_supports = getattr(sampling_mask, "token_ids", None)
+    if raw_supports is None:
+        raise ValueError("vLLM sampling_mask did not include token_ids")
+    try:
+        supports = list(raw_supports)
+    except TypeError as error:
+        raise ValueError("vLLM sampling_mask.token_ids must be a sequence") from error
+
+    if len(supports) != len(generated_token_ids):
+        raise ValueError(
+            "vLLM returned a sampling mask whose token count does not match "
+            "the generated output: "
+            f"mask_positions={len(supports)}, "
+            f"generated_tokens={len(generated_token_ids)}"
+        )
+
+    aligned_token_ids = torch.zeros(
+        (padded_length, top_k), dtype=torch.int32, device=device
+    )
+    aligned_sizes = torch.zeros(padded_length, dtype=torch.int32, device=device)
+    int32_max = torch.iinfo(torch.int32).max
+
+    for position, (raw_support, sampled_token_id) in enumerate(
+        zip(supports, generated_token_ids)
+    ):
+        if isinstance(raw_support, (str, bytes)):
+            raise ValueError(
+                f"vLLM sampling support at generated position {position} "
+                "must be a sequence of token IDs"
+            )
+        try:
+            support_values = list(raw_support)
+        except TypeError as error:
+            raise ValueError(
+                f"vLLM sampling support at generated position {position} "
+                "must be a sequence of token IDs"
+            ) from error
+        if not support_values:
+            raise ValueError(
+                f"vLLM returned an empty sampling support at generated position {position}"
+            )
+        if len(support_values) > top_k:
+            raise ValueError(
+                "vLLM sampling support exceeds the configured top_k: "
+                f"position={position}, support_size={len(support_values)}, "
+                f"top_k={top_k}"
+            )
+
+        support_token_ids: list[int] = []
+        for raw_token_id in support_values:
+            if isinstance(raw_token_id, bool):
+                raise ValueError(
+                    "vLLM sampling support contains a non-integer token ID: "
+                    f"position={position}, token_id={raw_token_id!r}"
+                )
+            try:
+                token_id = operator.index(raw_token_id)
+            except TypeError as error:
+                raise ValueError(
+                    "vLLM sampling support contains a non-integer token ID: "
+                    f"position={position}, token_id={raw_token_id!r}"
+                ) from error
+            if token_id < 0 or token_id > int32_max:
+                raise ValueError(
+                    "vLLM sampling support token ID is outside the int32 range: "
+                    f"position={position}, token_id={token_id}"
+                )
+            support_token_ids.append(token_id)
+
+        try:
+            sampled_token = operator.index(sampled_token_id)
+        except TypeError as error:
+            raise ValueError(
+                "vLLM generated a non-integer token ID at position "
+                f"{position}: {sampled_token_id!r}"
+            ) from error
+        if sampled_token not in support_token_ids:
+            raise ValueError(
+                "vLLM sampling support does not contain the sampled token: "
+                f"position={position}, sampled_token_id={sampled_token}"
+            )
+
+        sequence_position = prompt_length + position
+        support_size = len(support_token_ids)
+        aligned_token_ids[sequence_position, :support_size] = torch.tensor(
+            support_token_ids, dtype=torch.int32, device=device
+        )
+        aligned_sizes[sequence_position] = support_size
+
+    return aligned_token_ids, aligned_sizes
 
 
 def _as_routed_experts_tensor(

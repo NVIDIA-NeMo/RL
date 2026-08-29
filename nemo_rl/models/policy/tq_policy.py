@@ -45,8 +45,10 @@ from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     LP_SEED_FIELDS,
     fields_with_optional_routed_experts,
+    fields_with_optional_sampling_mask,
 )
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.sampling_mask_replay import sampling_mask_replay_enabled
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
 
@@ -119,6 +121,7 @@ class TQPolicy(TQDriverMixin, Policy):
         self._router_replay_enabled = bool(
             (self.cfg.get("router_replay") or {}).get("enabled", False)
         )
+        self._sampling_mask_replay_enabled = sampling_mask_replay_enabled(self.cfg)
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -162,8 +165,11 @@ class TQPolicy(TQDriverMixin, Policy):
         """
         self.dp_client.register_partition(
             partition_id=self.tq_partition_id,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            fields=fields_with_optional_sampling_mask(
+                fields_with_optional_routed_experts(
+                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                ),
+                enabled=self._sampling_mask_replay_enabled,
             ),
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
@@ -181,8 +187,11 @@ class TQPolicy(TQDriverMixin, Policy):
         """
         self.dp_client.register_partition(
             partition_id=partition_id,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            fields=fields_with_optional_sampling_mask(
+                fields_with_optional_routed_experts(
+                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                ),
+                enabled=self._sampling_mask_replay_enabled,
             ),
             num_samples=num_samples,
             consumer_tasks=[partition_id],
@@ -213,6 +222,7 @@ class TQPolicy(TQDriverMixin, Policy):
         timer: Optional[Timer],
         common_kwargs: dict[str, Any],
         include_router_replay: bool = False,
+        include_sampling_mask_replay: bool = False,
     ) -> None:
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
@@ -226,9 +236,14 @@ class TQPolicy(TQDriverMixin, Policy):
         spa, dba = self._packing_args("logprob_mb_tokens")
         lp_meta = self._isolated_meta(
             meta,
-            fields=fields_with_optional_routed_experts(
-                LP_SEED_FIELDS,
-                enabled=self._router_replay_enabled and include_router_replay,
+            fields=fields_with_optional_sampling_mask(
+                fields_with_optional_routed_experts(
+                    LP_SEED_FIELDS,
+                    enabled=self._router_replay_enabled and include_router_replay,
+                ),
+                enabled=(
+                    self._sampling_mask_replay_enabled and include_sampling_mask_replay
+                ),
             ),
             task_name=task_name,
         )
@@ -274,6 +289,7 @@ class TQPolicy(TQDriverMixin, Policy):
             timer=timer,
             common_kwargs={"micro_batch_size": micro_batch_size},
             include_router_replay=True,
+            include_sampling_mask_replay=True,
         )
 
     def get_reference_policy_logprobs_from_meta(
@@ -333,8 +349,11 @@ class TQPolicy(TQDriverMixin, Policy):
         # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
         train_meta = self._isolated_meta(
             meta,
-            fields=fields_with_optional_routed_experts(
-                train_fields, enabled=self._router_replay_enabled
+            fields=fields_with_optional_sampling_mask(
+                fields_with_optional_routed_experts(
+                    train_fields, enabled=self._router_replay_enabled
+                ),
+                enabled=self._sampling_mask_replay_enabled,
             ),
             task_name="train",
         )
@@ -456,8 +475,11 @@ class TQPolicy(TQDriverMixin, Policy):
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._isolated_meta(
             meta,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            fields=fields_with_optional_sampling_mask(
+                fields_with_optional_routed_experts(
+                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                ),
+                enabled=self._sampling_mask_replay_enabled,
             ),
             task_name="train",
         )

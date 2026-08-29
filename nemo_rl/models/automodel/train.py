@@ -43,9 +43,13 @@ from transformers.models.gemma3.modeling_gemma3 import (
 )
 
 from nemo_rl.algorithms.logits_sampling_utils import (
+    SamplingMask,
     TrainingSamplingParams,
+    apply_sampling_mask,
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
+    sampling_mask_from_data,
+    validate_sampling_mask_for_active_tokens,
 )
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
@@ -722,6 +726,27 @@ class LogprobsPostProcessor:
             Token log probabilities tensor [batch_size, seq_length]
         """
         input_lengths = data_dict["input_lengths"]
+        sampling_mask = None
+        if (
+            self.sampling_params is not None
+            and self.sampling_params.replay_sampling_mask
+        ):
+            sampling_mask = sampling_mask_from_data(data_dict)
+            if sampling_mask is None:
+                raise ValueError(
+                    "Sampling-mask replay is enabled, but its fields are missing "
+                    "from the prev-logprob batch."
+                )
+            validate_sampling_mask_for_active_tokens(
+                sampling_mask,
+                data_dict["input_ids"],
+                data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1),
+            )
+            if self.enable_seq_packing:
+                raise NotImplementedError(
+                    "Sampling-mask replay is not yet supported for packed "
+                    "Automodel prev-logprob computation. Disable sequence packing."
+                )
 
         if cp_sharder is not None:
             # ``data_dict`` stays canonical under CP: ``_build_model_batch`` clones
@@ -736,6 +761,7 @@ class LogprobsPostProcessor:
                 cp_sharder,
                 chunk_size=self.logprob_chunk_size,
                 sampling_params=self.sampling_params,  # top-k and top-p filtering
+                sampling_mask=sampling_mask,
             )
 
             assert token_logprobs.shape[1] == seq_len - 1
@@ -748,11 +774,12 @@ class LogprobsPostProcessor:
                     processed_inputs.input_ids,
                     chunk_size=self.logprob_chunk_size,
                     sampling_params=self.sampling_params,  # top-k and top-p filtering
+                    sampling_mask=sampling_mask,
                 )
             else:
                 # Non-DTensor path (no TP sharding)
                 token_logprobs = self._compute_local_logprobs(
-                    logits, processed_inputs.input_ids
+                    logits, processed_inputs.input_ids, sampling_mask
                 )
 
         # Prepend 0 for first token to maintain sequence length
@@ -788,7 +815,9 @@ class LogprobsPostProcessor:
             token_logprobs = token_logprobs * post_attention_mask
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
-        if need_top_k_or_top_p_filtering(self.sampling_params):
+        if sampling_mask is not None or need_top_k_or_top_p_filtering(
+            self.sampling_params
+        ):
             mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
             token_logprobs = mask_out_neg_inf_logprobs(
                 token_logprobs, mask, "prev_logprobs"
@@ -800,6 +829,7 @@ class LogprobsPostProcessor:
         self,
         logits: torch.Tensor,
         input_ids: torch.Tensor,
+        sampling_mask: Optional[SamplingMask] = None,
     ) -> torch.Tensor:
         """Compute logprobs locally without distributed processing.
 
@@ -831,9 +861,19 @@ class LogprobsPostProcessor:
 
         if self.logprob_chunk_size is None:
             logits = logits.to(torch.float32).contiguous()
-            logits = apply_top_k_top_p_filtering_for_local_logits(
-                logits, self.sampling_params
-            )
+            if sampling_mask is not None:
+                logits, _ = apply_sampling_mask(
+                    logits,
+                    next_tokens,
+                    SamplingMask(
+                        token_ids=sampling_mask.token_ids[:, 1:, :],
+                        sizes=sampling_mask.sizes[:, 1:],
+                    ),
+                )
+            else:
+                logits = apply_top_k_top_p_filtering_for_local_logits(
+                    logits, self.sampling_params
+                )
             log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
             token_logprobs = log_probs.gather(
                 dim=-1, index=next_tokens.unsqueeze(-1)
@@ -846,9 +886,21 @@ class LogprobsPostProcessor:
             chunk_end = min(chunk_start + self.logprob_chunk_size, target_seq_len)
             chunk_logits = logits[:, chunk_start:chunk_end, :].to(torch.float32)
             chunk_logits = chunk_logits.contiguous()
-            chunk_logits = apply_top_k_top_p_filtering_for_local_logits(
-                chunk_logits, self.sampling_params
-            )
+            if sampling_mask is not None:
+                chunk_logits, _ = apply_sampling_mask(
+                    chunk_logits,
+                    next_tokens[:, chunk_start:chunk_end],
+                    SamplingMask(
+                        token_ids=sampling_mask.token_ids[
+                            :, chunk_start + 1 : chunk_end + 1, :
+                        ],
+                        sizes=sampling_mask.sizes[:, chunk_start + 1 : chunk_end + 1],
+                    ),
+                )
+            else:
+                chunk_logits = apply_top_k_top_p_filtering_for_local_logits(
+                    chunk_logits, self.sampling_params
+                )
             chunk_log_probs = torch.nn.functional.log_softmax(chunk_logits, dim=-1)
             chunk_token_logprobs = chunk_log_probs.gather(
                 dim=-1,

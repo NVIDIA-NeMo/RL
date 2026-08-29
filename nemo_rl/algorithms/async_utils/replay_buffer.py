@@ -41,7 +41,10 @@ import torch
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import (
+    ROUTED_EXPERTS_FIELD,
+    SAMPLING_MASK_FIELDS,
+)
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -982,11 +985,13 @@ class TQReplayBuffer:
         *,
         pad_value_dict: Mapping[str, int],
         require_routed_experts: bool = False,
+        require_sampling_mask: bool = False,
     ):
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
         self._require_routed_experts = require_routed_experts
+        self._require_sampling_mask = require_sampling_mask
         self.meta_list: list[Optional[KVBatchMeta]] = []
         self.start_weight_list: list[int] = []
         self.end_weight_list: list[int] = []
@@ -1076,7 +1081,7 @@ class TQReplayBuffer:
 
         Raises:
             ValueError: group_id has no live slot (removed or never reserved).
-            RuntimeError: router replay is enabled but the payload has no routes.
+            RuntimeError: replay is enabled but its required payload is absent.
         """
         # Precondition: reserve() must have registered this group_id. Raise
         # before any side effects so a stray commit doesn't leak orphan DP rows.
@@ -1102,6 +1107,22 @@ class TQReplayBuffer:
                 "policy.router_replay.enabled=true requires routed_experts in "
                 "the SingleController rollout payload, but payload packing did "
                 "not produce that field. Check vLLM routed-expert capture and "
+                "the async message-log flattening path."
+            )
+        sampling_fields_present = tuple(
+            field in fields for field in SAMPLING_MASK_FIELDS
+        )
+        if any(sampling_fields_present) and not all(sampling_fields_present):
+            raise RuntimeError(
+                "The SingleController rollout payload contains only one "
+                "sampling-mask field; sampling_mask_token_ids and "
+                "sampling_mask_sizes must be present together."
+            )
+        if self._require_sampling_mask and not all(sampling_fields_present):
+            raise RuntimeError(
+                "policy.sampling_mask_replay.enabled=true requires "
+                "sampling_mask_token_ids and sampling_mask_sizes in the "
+                "SingleController rollout payload. Check vLLM mask capture and "
                 "the async message-log flattening path."
             )
         trace_rollout_payload(keys=sample_ids, data=train_batch)

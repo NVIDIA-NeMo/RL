@@ -766,6 +766,7 @@ class TestSetup:
         assert actor_args.partition_id == "rollout_data"
         assert actor_args.tq_buffer._partition_id == "rollout_data"
         assert actor_args.tq_buffer._require_routed_experts is False
+        assert actor_args.tq_buffer._require_sampling_mask is False
         actor_args.dp_client.register_partition.assert_called_once()
         warmup = actor_args.dp_client.register_partition.call_args.kwargs
         assert warmup["partition_id"] == "rollout_data"
@@ -855,6 +856,17 @@ class TestSetup:
         actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert actor_args.tq_buffer._require_routed_experts is True
+
+    def test_sampling_mask_replay_wires_tq_schema_and_buffer(self, patched_factories):
+        mc = _make_master_config()
+        mc.policy["sampling_mask_replay"] = {"enabled": True}
+
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.tq_buffer._require_sampling_mask is True
+        warmup = actor_args.dp_client.register_partition.call_args.kwargs
+        assert "sampling_mask_token_ids" in warmup["fields"]
+        assert "sampling_mask_sizes" in warmup["fields"]
 
     def test_env_handles_sourced_from_setup_response_data(self, patched_factories):
         """setup_response_data receives master_config.env and supplies env handles."""

@@ -30,7 +30,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    SamplingMask,
+    TrainingSamplingParams,
+)
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 
 pytestmark = pytest.mark.mcore
@@ -1234,6 +1237,83 @@ class TestLogprobsPostProcessor:
             [torch.zeros_like(mock_logprobs[:, :1]), mock_logprobs], dim=1
         )[:, :5]
         assert torch.equal(result["logprobs"], expected)
+
+    def test_prev_logprobs_sampling_mask_wiring_actor_vs_reference(self):
+        """Replay rollout support for pi_old, but not the reference policy."""
+        import nemo_rl.models.megatron.train as megatron_train
+
+        mock_tp_group = MagicMock()
+
+        input_ids = torch.tensor([[1, 2, 3]])
+        sampling_mask_token_ids = torch.tensor(
+            [[[0, 0], [2, 4], [3, 5]]], dtype=torch.int32
+        )
+        sampling_mask_sizes = torch.tensor([[0, 2, 2]], dtype=torch.int32)
+        data = {
+            "input_ids": input_ids,
+            "token_mask": torch.tensor([[0, 1, 1]], dtype=torch.bool),
+            "sample_mask": torch.tensor([1], dtype=torch.bool),
+            "sampling_mask_token_ids": sampling_mask_token_ids,
+            "sampling_mask_sizes": sampling_mask_sizes,
+        }
+        cfg = {"sequence_packing": {"enabled": False}}
+
+        actor_sampling_params = TrainingSamplingParams(
+            top_k=2,
+            top_p=0.8,
+            replay_sampling_mask=True,
+        )
+        reference_sampling_params = TrainingSamplingParams(
+            top_k=None,
+            top_p=1.0,
+            replay_sampling_mask=False,
+        )
+
+        with (
+            patch.object(
+                megatron_train,
+                "from_parallel_logits_to_logprobs",
+                side_effect=[torch.zeros(1, 2), torch.zeros(1, 2)],
+            ) as mock_from_logits,
+            patch.object(
+                megatron_train, "get_tensor_model_parallel_rank", return_value=0
+            ),
+            patch.object(
+                megatron_train,
+                "get_tensor_model_parallel_group",
+                return_value=mock_tp_group,
+            ),
+        ):
+            actor_processor = megatron_train.LogprobsPostProcessor(
+                cfg=cfg,
+                sampling_params=actor_sampling_params,
+            )
+            actor_processor(
+                data_dict=data,
+                input_ids=input_ids,
+                cu_seqlens_padded=None,
+                original_seq_length=3,
+            )(torch.randn(1, 3, 8))
+
+            reference_processor = megatron_train.LogprobsPostProcessor(
+                cfg=cfg,
+                sampling_params=reference_sampling_params,
+            )
+            reference_processor(
+                data_dict=data,
+                input_ids=input_ids,
+                cu_seqlens_padded=None,
+                original_seq_length=3,
+            )(torch.randn(1, 3, 8))
+
+            actor_call, reference_call = mock_from_logits.call_args_list
+        actor_mask = actor_call.kwargs["sampling_mask"]
+        assert isinstance(actor_mask, SamplingMask)
+        assert torch.equal(actor_mask.token_ids, sampling_mask_token_ids)
+        assert torch.equal(actor_mask.sizes, sampling_mask_sizes)
+        assert actor_call.kwargs["sampling_params"] is actor_sampling_params
+        assert reference_call.kwargs["sampling_mask"] is None
+        assert reference_call.kwargs["sampling_params"] is reference_sampling_params
 
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(

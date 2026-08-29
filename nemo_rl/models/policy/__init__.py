@@ -14,6 +14,8 @@
 
 from typing import Any, Literal, NotRequired, TypedDict, Union
 
+from pydantic import BaseModel
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
@@ -559,6 +561,12 @@ class RouterReplayConfig(TypedDict):
     enabled: Literal[True]
 
 
+class SamplingMaskReplayConfig(BaseModel, extra="allow"):
+    """Replay vLLM's generation-time sampling support during policy training."""
+
+    enabled: bool = False
+
+
 class PolicyConfig(TypedDict):
     model_name: str
     tokenizer: TokenizerConfig
@@ -580,6 +588,7 @@ class PolicyConfig(TypedDict):
     draft: NotRequired[DraftConfig | DraftConfigDisabled]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     router_replay: NotRequired[RouterReplayConfig | RouterReplayConfigDisabled]
+    sampling_mask_replay: NotRequired[SamplingMaskReplayConfig]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]

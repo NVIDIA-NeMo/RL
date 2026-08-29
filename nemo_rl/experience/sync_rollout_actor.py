@@ -45,7 +45,10 @@ import torch
 
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import (
+    ROUTED_EXPERTS_FIELD,
+    SAMPLING_MASK_FIELDS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
@@ -56,6 +59,7 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.policy.sampling_mask_replay import sampling_mask_replay_enabled
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
@@ -81,11 +85,15 @@ def _flatten_rollout_message_log_for_tq(
     )
     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
     from nemo_rl.experience.rollouts import backfill_missing_routed_experts
+    from nemo_rl.models.policy.sampling_mask_replay import (
+        backfill_missing_sampling_masks,
+    )
 
     pad = {"pad_value_dict": {"token_ids": pad_token_id}}
     # Must precede the prompt extraction: it reuses the same message dicts, so
     # backfilling here also covers the prompt flatten below.
     backfill_missing_routed_experts(message_logs)
+    backfill_missing_sampling_masks(message_logs)
     prompt_message_logs = extract_initial_prompt_messages(
         message_logs,
         prompt_lengths,
@@ -303,6 +311,22 @@ class SyncRolloutActor:
                 "message-log flattening path."
             )
 
+        sampling_fields_present = tuple(field in flat for field in SAMPLING_MASK_FIELDS)
+        if any(sampling_fields_present) and not all(sampling_fields_present):
+            raise RuntimeError(
+                "The rollout bulk payload contains only one sampling-mask field; "
+                "sampling_mask_token_ids and sampling_mask_sizes must be present "
+                "together."
+            )
+        if sampling_mask_replay_enabled(cfg.policy) and not all(
+            sampling_fields_present
+        ):
+            raise RuntimeError(
+                "policy.sampling_mask_replay.enabled=true requires "
+                "sampling_mask_token_ids and sampling_mask_sizes in the rollout "
+                "bulk payload. Check vLLM mask capture and message-log flattening."
+            )
+
         # TQ bulk payload — DP_TRAIN_FIELDS + multimodal extras.
         bulk_batch = BatchedDataDict[Any](
             {
@@ -315,6 +339,9 @@ class SyncRolloutActor:
         )
         if ROUTED_EXPERTS_FIELD in flat:
             bulk_batch[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
+        for field in SAMPLING_MASK_FIELDS:
+            if field in flat:
+                bulk_batch[field] = flat[field]
         for k, v in flat.get_multimodal_dict(as_tensors=False).items():
             if isinstance(v, torch.Tensor):
                 bulk_batch[k] = v

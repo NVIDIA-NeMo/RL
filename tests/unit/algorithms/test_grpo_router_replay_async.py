@@ -118,6 +118,41 @@ def test_build_async_grpo_train_data_preserves_routed_experts_for_r3(
         assert "routed_experts" not in train_data
 
 
+def test_build_async_grpo_train_data_preserves_sampling_masks_for_train_and_prev_logprobs():
+    """Legacy async GRPO reuses this batch for prev logprobs and training."""
+    sampling_mask_token_ids = torch.tensor(
+        [[[0, 0], [2, 4], [3, 0]]], dtype=torch.int32
+    )
+    sampling_mask_sizes = torch.tensor([[0, 2, 1]], dtype=torch.int32)
+    flat_messages = BatchedDataDict(
+        {
+            "token_ids": torch.tensor([[1, 2, 3]]),
+            "generation_logprobs": torch.zeros(1, 3),
+            "token_loss_mask": torch.tensor([[0, 1, 1]]),
+            "sampling_mask_token_ids": sampling_mask_token_ids,
+            "sampling_mask_sizes": sampling_mask_sizes,
+        }
+    )
+
+    train_and_prev_logprob_data = _build_async_grpo_train_data(
+        flat_messages,
+        torch.tensor([3]),
+        BatchedDataDict({"loss_multiplier": torch.tensor([1.0])}),
+        {
+            "precision": "bfloat16",
+            "sampling_mask_replay": {"enabled": True},
+        },
+    )
+
+    assert torch.equal(
+        train_and_prev_logprob_data["sampling_mask_token_ids"],
+        sampling_mask_token_ids,
+    )
+    assert torch.equal(
+        train_and_prev_logprob_data["sampling_mask_sizes"], sampling_mask_sizes
+    )
+
+
 def test_build_async_grpo_train_data_accepts_all_text_vlm_replay_batch():
     flat_messages = BatchedDataDict(
         {

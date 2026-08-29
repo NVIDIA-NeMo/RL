@@ -1004,6 +1004,7 @@ class DTensorPolicyWorkerV2Impl(
                     top_k=None,
                     top_p=1.0,
                     temperature=saved_sampling_params.temperature,
+                    replay_sampling_mask=False,
                 )
             else:
                 self.sampling_params = None

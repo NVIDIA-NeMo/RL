@@ -16,6 +16,7 @@ import itertools
 import pytest
 import torch
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
@@ -41,6 +42,49 @@ from nemo_rl.distributed.model_utils import (
     cp_shift_next,
     vocab_parallel_gather_columns,
 )
+
+
+def test_prepare_loss_input_requires_sampling_mask_when_replay_is_enabled() -> None:
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[0, 1, 2]]),
+            "token_mask": torch.tensor([[0, 1, 1]]),
+            "sample_mask": torch.tensor([1]),
+        }
+    )
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.0))
+
+    with pytest.raises(ValueError, match="missing from the actor batch"):
+        prepare_loss_input(
+            torch.zeros(1, 3, 4),
+            data,
+            loss_fn,
+            sampling_params=TrainingSamplingParams(replay_sampling_mask=True),
+        )
+
+
+def test_prepare_loss_input_reference_mode_ignores_sampling_mask_fields() -> None:
+    """Reference contexts force replay off even while actor metadata remains."""
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[0, 1, 2]]),
+            "token_mask": torch.tensor([[0, 1, 1]]),
+            "sample_mask": torch.tensor([1]),
+            # Deliberately incomplete: replay-disabled reference computation must
+            # not inspect actor-only metadata.
+            "sampling_mask_token_ids": torch.zeros(1, 3, 2, dtype=torch.int32),
+        }
+    )
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.0))
+
+    loss_input, _ = prepare_loss_input(
+        torch.zeros(1, 3, 4),
+        data,
+        loss_fn,
+        sampling_params=TrainingSamplingParams(replay_sampling_mask=False),
+    )
+
+    assert loss_input["next_token_logprobs"].shape == (1, 2)
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):

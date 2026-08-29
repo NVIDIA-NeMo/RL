@@ -342,6 +342,11 @@ class GenerationOutputSpec(TypedDict):
     - generation_lengths: Tensor containing the actual length of each generated sequence
     - unpadded_sequence_lengths: Tensor containing the actual length of each input + generated sequence (without padding)
     - logprobs: Tensor of log probabilities for each generated token (right padded with zeros)
+    - sampling_mask_token_ids: Optional int32 tensor containing the rollout
+      sampling support for each sequence position, shaped ``[B, S, K]`` and
+      zero-filled for prompt and padding positions
+    - sampling_mask_sizes: Optional int32 tensor containing each position's
+      valid support width, shaped ``[B, S]`` and zero for prompt/padding
     - truncated: Boolean tensor indicating if each sequence was truncated (hit max_tokens limit)
     - __extra__: Additional model-specific data fields
 
@@ -383,6 +388,8 @@ class GenerationOutputSpec(TypedDict):
         torch.Tensor
     )  # Length of full valid sequence (input + generated response)
     logprobs: torch.Tensor
+    sampling_mask_token_ids: NotRequired[torch.Tensor]
+    sampling_mask_sizes: NotRequired[torch.Tensor]
     routed_experts: NotRequired[torch.Tensor]
     r3_routed_experts_missing_routes: NotRequired[torch.Tensor]
     r3_routed_experts_expected_routes: NotRequired[torch.Tensor]

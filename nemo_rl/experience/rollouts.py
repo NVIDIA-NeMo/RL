@@ -68,6 +68,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     GenerationSamplingParams,
 )
+from nemo_rl.models.policy.sampling_mask_replay import (
+    attach_sampling_mask_to_assistant_message,
+    backfill_missing_sampling_masks,
+)
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
@@ -567,7 +571,16 @@ def generate_responses(
                 input_length:total_length
             ]
 
+        attach_sampling_mask_to_assistant_message(
+            assistant_message,
+            generation_outputs,
+            batch_index=i,
+            input_length=int(input_length.item()),
+            total_length=int(total_length.item()),
+        )
+
         batch["message_log"][i].append(assistant_message)
+        backfill_missing_sampling_masks([batch["message_log"][i]])
 
     # Generation metrics
     gen_metrics = {
@@ -658,7 +671,12 @@ async def generate_responses_async(
 
     generation_outputs = BatchedDataDict.from_batches(
         ordered_batched_data_dicts,
-        pad_value_dict={"output_ids": tokenizer.pad_token_id, "logprobs": 0.0},
+        pad_value_dict={
+            "output_ids": tokenizer.pad_token_id,
+            "logprobs": 0.0,
+            "sampling_mask_token_ids": 0,
+            "sampling_mask_sizes": 0,
+        },
     )
 
     # Extract everything we need from the generation outputs
@@ -708,7 +726,16 @@ async def generate_responses_async(
                 input_length:total_length
             ]
 
+        attach_sampling_mask_to_assistant_message(
+            assistant_message,
+            generation_outputs,
+            batch_index=i,
+            input_length=int(input_length.item()),
+            total_length=int(total_length.item()),
+        )
+
         batch["message_log"][i].append(assistant_message)
+        backfill_missing_sampling_masks([batch["message_log"][i]])
 
     # Generation metrics
     gen_metrics = {
@@ -1049,6 +1076,7 @@ def run_multi_turn_rollout(
                     _dummy_routed_experts_for_tokens(tokenized_obs, routed_template)
                 )
             current_batch["message_log"][global_idx].append(tokenized_env_obs_message)
+            backfill_missing_sampling_masks([current_batch["message_log"][global_idx]])
 
             # Record token usage - environment
             sample_env_token_counts[global_idx] += len(tokenized_obs)
@@ -1372,6 +1400,7 @@ async def run_sample_multi_turn_rollout(
                 tokenized_obs, routed_template
             )
         current_message_log.append(env_message)
+        backfill_missing_sampling_masks([current_message_log])
 
         # Update token counts
         env_token_count += len(tokenized_obs)

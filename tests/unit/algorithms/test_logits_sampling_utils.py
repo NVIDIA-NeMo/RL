@@ -15,7 +15,82 @@
 import pytest
 import torch
 
-from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
+from nemo_rl.algorithms.logits_sampling_utils import (
+    SamplingMask,
+    apply_sampling_mask,
+    apply_top_k_top_p,
+    validate_sampling_mask_for_active_tokens,
+)
+
+
+def test_apply_sampling_mask_preserves_valid_token_zero_with_padded_zero_slots():
+    """Invalid padded slots must not overwrite a valid support entry for ID 0."""
+    logits = torch.tensor([[[2.0, 1.0, -1.0, 0.5]]], requires_grad=True)
+    target = torch.tensor([[0]])
+    sampling_mask = SamplingMask(
+        token_ids=torch.tensor([[[0, 0, 0]]], dtype=torch.int32),
+        sizes=torch.tensor([[1]], dtype=torch.int32),
+    )
+
+    filtered, keep = apply_sampling_mask(logits, target, sampling_mask)
+
+    assert torch.equal(keep, torch.tensor([[[True, False, False, False]]]))
+    assert filtered[0, 0, 0] == logits[0, 0, 0]
+    assert torch.isneginf(filtered[0, 0, 1:]).all()
+
+
+def test_apply_sampling_mask_preserves_nonempty_target_and_restricts_gradient():
+    """The empty-row fallback must not clear targets from nonempty rows."""
+    logits = torch.tensor(
+        [[[0.1, 0.7, -0.4, 1.2], [1.0, 0.5, -0.5, 0.0]]],
+        requires_grad=True,
+    )
+    target = torch.tensor([[3, 1]])
+    sampling_mask = SamplingMask(
+        token_ids=torch.tensor([[[1, 3, 0], [0, 0, 0]]], dtype=torch.int32),
+        sizes=torch.tensor([[2, 0]], dtype=torch.int32),
+    )
+
+    filtered, keep = apply_sampling_mask(logits, target, sampling_mask)
+    expected_keep = torch.tensor(
+        [[[False, True, False, True], [False, True, False, False]]]
+    )
+    assert torch.equal(keep, expected_keep)
+
+    selected = (
+        torch.log_softmax(filtered, dim=-1).gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    )
+    selected.sum().backward()
+    assert logits.grad is not None
+    expected_nonzero_grad = torch.tensor(
+        [[[False, True, False, True], [False, False, False, False]]]
+    )
+    assert torch.equal(logits.grad != 0, expected_nonzero_grad)
+
+
+def test_validate_sampling_mask_rejects_missing_active_support_and_target():
+    target = torch.tensor([[5, 7]])
+    active = torch.tensor([[True, False]])
+
+    with pytest.raises(ValueError, match="nonempty support"):
+        validate_sampling_mask_for_active_tokens(
+            SamplingMask(
+                token_ids=torch.zeros((1, 2, 2), dtype=torch.int32),
+                sizes=torch.zeros((1, 2), dtype=torch.int32),
+            ),
+            target,
+            active,
+        )
+
+    with pytest.raises(ValueError, match="does not contain"):
+        validate_sampling_mask_for_active_tokens(
+            SamplingMask(
+                token_ids=torch.tensor([[[1, 2], [0, 0]]], dtype=torch.int32),
+                sizes=torch.tensor([[2, 0]], dtype=torch.int32),
+            ),
+            target,
+            active,
+        )
 
 
 @pytest.mark.parametrize(

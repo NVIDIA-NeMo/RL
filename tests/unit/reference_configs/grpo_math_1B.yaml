@@ -135,6 +135,8 @@ checkpointing:
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
+  sampling_mask_replay:
+    enabled: false
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true

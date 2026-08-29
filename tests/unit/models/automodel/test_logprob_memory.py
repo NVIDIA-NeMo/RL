@@ -20,7 +20,12 @@ try:
 except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    SamplingMask,
+    TrainingSamplingParams,
+)
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.automodel.data import ProcessedInputs
 from nemo_rl.models.automodel.train import LogprobsPostProcessor
 
 
@@ -150,6 +155,82 @@ def test_local_logprobs_chunking_preserves_top_k_top_p_filtering():
     )
 
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.automodel
+def test_prev_logprobs_sampling_mask_wiring_actor_vs_reference(monkeypatch):
+    input_ids = torch.tensor([[1, 2, 3]])
+    sampling_mask_token_ids = torch.tensor(
+        [[[0, 0], [2, 4], [3, 5]]], dtype=torch.int32
+    )
+    sampling_mask_sizes = torch.tensor([[0, 2, 2]], dtype=torch.int32)
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([3]),
+            "token_mask": torch.tensor([[0, 1, 1]], dtype=torch.bool),
+            "sample_mask": torch.tensor([1], dtype=torch.bool),
+            "sampling_mask_token_ids": sampling_mask_token_ids,
+            "sampling_mask_sizes": sampling_mask_sizes,
+        }
+    )
+    processed_inputs = ProcessedInputs(input_ids=input_ids, seq_len=3)
+    observed_masks: list[SamplingMask | None] = []
+
+    def compute_local_logprobs(
+        logits: torch.Tensor,
+        computed_input_ids: torch.Tensor,
+        sampling_mask: SamplingMask | None = None,
+    ) -> torch.Tensor:
+        assert torch.equal(computed_input_ids, input_ids)
+        observed_masks.append(sampling_mask)
+        return logits.new_zeros((1, 2), dtype=torch.float32)
+
+    actor_processor = _make_processor(
+        chunk_size=None,
+        sampling_params=TrainingSamplingParams(
+            top_k=2,
+            top_p=0.8,
+            replay_sampling_mask=True,
+        ),
+    )
+    monkeypatch.setattr(
+        actor_processor, "_compute_local_logprobs", compute_local_logprobs
+    )
+    actor_processor(
+        logits=torch.randn(1, 3, 8),
+        data_dict=data,
+        processed_inputs=processed_inputs,
+        original_batch_size=1,
+        original_seq_len=3,
+        cp_sharder=None,
+    )
+
+    reference_processor = _make_processor(
+        chunk_size=None,
+        sampling_params=TrainingSamplingParams(
+            top_k=None,
+            top_p=1.0,
+            replay_sampling_mask=False,
+        ),
+    )
+    monkeypatch.setattr(
+        reference_processor, "_compute_local_logprobs", compute_local_logprobs
+    )
+    reference_processor(
+        logits=torch.randn(1, 3, 8),
+        data_dict=data,
+        processed_inputs=processed_inputs,
+        original_batch_size=1,
+        original_seq_len=3,
+        cp_sharder=None,
+    )
+
+    actor_mask, reference_mask = observed_masks
+    assert isinstance(actor_mask, SamplingMask)
+    assert torch.equal(actor_mask.token_ids, sampling_mask_token_ids)
+    assert torch.equal(actor_mask.sizes, sampling_mask_sizes)
+    assert reference_mask is None
 
 
 def test_local_logprobs_chunking_limits_log_softmax_sequence_size(monkeypatch):

@@ -64,6 +64,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
 )
+from nemo_rl.models.policy.sampling_mask_replay import (
+    attach_sampling_mask_to_assistant_message,
+    backfill_missing_sampling_masks,
+)
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -489,6 +493,7 @@ class AsyncRolloutImpl:
                 ) from e
 
             current_message_log.append(assistant_message)
+            backfill_missing_sampling_masks([current_message_log])
 
             # Check if response was truncated (hit max_tokens without stop token)
             response_truncated = gen_metrics.pop("_response_truncated", None)
@@ -568,6 +573,7 @@ class AsyncRolloutImpl:
                     tokenized_obs, routed_template
                 )
             current_message_log.append(env_message)
+            backfill_missing_sampling_masks([current_message_log])
 
             # Update token counts
             env_token_count += len(tokenized_obs)
@@ -660,6 +666,14 @@ class AsyncRolloutImpl:
                     f"({prefix_length} != {input_len})."
                 )
             assistant_message["routed_experts"] = routed_experts[input_len:total_len]
+
+        attach_sampling_mask_to_assistant_message(
+            assistant_message,
+            output,
+            batch_index=0,
+            input_length=input_len,
+            total_length=total_len,
+        )
 
         # Calculate generation metrics
         gen_metrics: dict[str, Any] = {}
