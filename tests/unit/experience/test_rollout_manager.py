@@ -33,6 +33,10 @@ from copy import deepcopy
 import pytest
 import torch
 
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+    PostWriteEnrichmentError,
+)
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
@@ -42,9 +46,11 @@ from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutManager,
+    RolloutOutcome,
     RolloutRetryPolicy,
     RolloutStats,
 )
+from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -72,10 +78,19 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _with_cut(buffer, callback):
+    async def apply():
+        async with buffer.data_plane_checkpoint_barrier.mutation() as cut:
+            return callback(cut)
+
+    return _run(apply())
+
+
 class _FakeBuffer:
     """Minimal TQReplayBuffer stand-in that records reserve/commit calls."""
 
     def __init__(self) -> None:
+        self.data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         self.reserve_calls: list[int] = []  # weight_versions passed to reserve
         self.commit_calls: list[tuple[str, object, int, int]] = []
         self.remove_calls: list[str] = []
@@ -140,6 +155,7 @@ def _make_manager(
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = 1
     mgr._tq_buffer = buffer
+    mgr._recovery_ledger = RolloutRecoveryLedger()
     mgr._weight_version = 0
     mgr._retry_policy = (
         retry_policy
@@ -148,10 +164,101 @@ def _make_manager(
     )
     mgr._stats = RolloutStats()
     mgr._skipped_prompts = 0
+    mgr._consecutive_infra_drops = 0
     return mgr
 
 
 class TestGenerateAndPushFlow:
+    def test_post_write_failure_does_not_regenerate_the_rollout(self):
+        class _EnrichmentFailBuffer(_FakeBuffer):
+            async def commit(
+                self,
+                group_id: str,
+                record,
+                start_weight_version: int,
+                end_weight_version: int,
+            ):
+                await super().commit(
+                    group_id,
+                    record,
+                    start_weight_version,
+                    end_weight_version,
+                )
+                raise PostWriteEnrichmentError("teacher stage failed")
+
+        rollout_calls = 0
+
+        async def _count_rollout(_sample):
+            nonlocal rollout_calls
+            rollout_calls += 1
+
+        buf = _EnrichmentFailBuffer()
+        mgr = _make_manager(
+            buf,
+            _FakeImpl(on_run=_count_rollout),
+            retry_policy=RolloutRetryPolicy(
+                max_infra_attempts=3,
+                max_data_attempts=3,
+                max_gym_row_attempts=1,
+            ),
+        )
+
+        with pytest.raises(PostWriteEnrichmentError, match="teacher stage failed"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert rollout_calls == 1
+        assert len(buf.reserve_calls) == 1
+        assert len(buf.remove_calls) == 1
+
+    def test_grouped_post_write_failure_does_not_regenerate_the_rollout(self):
+        """Rollback failures do not hide the post-write failure classification."""
+
+        class _GroupedEnrichmentFailBuffer(_FakeBuffer):
+            async def commit(
+                self,
+                group_id: str,
+                record,
+                start_weight_version: int,
+                end_weight_version: int,
+            ):
+                await super().commit(
+                    group_id,
+                    record,
+                    start_weight_version,
+                    end_weight_version,
+                )
+                raise ExceptionGroup(
+                    "commit and rollback both failed",
+                    [
+                        PostWriteEnrichmentError("teacher stage failed"),
+                        RuntimeError("rollback failed"),
+                    ],
+                )
+
+        rollout_calls = 0
+
+        async def _count_rollout(_sample):
+            nonlocal rollout_calls
+            rollout_calls += 1
+
+        buf = _GroupedEnrichmentFailBuffer()
+        mgr = _make_manager(
+            buf,
+            _FakeImpl(on_run=_count_rollout),
+            retry_policy=RolloutRetryPolicy(
+                max_infra_attempts=3,
+                max_data_attempts=3,
+                max_gym_row_attempts=1,
+            ),
+        )
+
+        with pytest.raises(ExceptionGroup, match="commit and rollback"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert rollout_calls == 1
+        assert len(buf.reserve_calls) == 1
+        assert len(buf.remove_calls) == 1
+
     def test_explicit_registry_tracks_only_inflight_generation(self):
         registry: dict[str, tuple[asyncio.Task[None], int]] = {}
         buf = _FakeBuffer()
@@ -243,6 +350,96 @@ class TestGenerateAndPushFlow:
         assert record == "r0"
         assert start_v == 0
         assert end_v == 0
+        assert len(mgr.recovery_ledger) == 0
+
+    def test_ledger_hands_ownership_to_canonical_buffer_on_commit(self):
+        buf = _FakeBuffer()
+
+        async def _assert_ledger_owns_inflight_prompt(_sample):
+            groups = mgr.recovery_ledger.groups()
+            assert len(groups) == 1
+            assert groups[0].group_id in buf._slots
+
+        mgr = _make_manager(
+            buf,
+            _FakeImpl(on_run=_assert_ledger_owns_inflight_prompt),
+        )
+        prompt = {"idx": 0, "message_log": [], "prompt": "p"}
+        group_id = _with_cut(
+            buf,
+            lambda cut: mgr.reserve_prompt_group(
+                cut,
+                prompt,
+                target_step=None,
+            ),
+        )
+
+        _run(
+            mgr.generate_and_push(
+                prompt,
+                lineage_group_id=group_id,
+            )
+        )
+
+        assert len(mgr.recovery_ledger) == 0
+        assert buf._slots == [group_id]
+        assert buf.commit_calls[0][0] == group_id
+
+    def test_skipped_tracked_prompt_remains_owned_for_controller_handoff(self):
+        async def _fail_rollout(_sample):
+            raise RuntimeError("bad prompt")
+
+        buf = _FakeBuffer()
+        mgr = _make_manager(
+            buf,
+            _FakeImpl(on_run=_fail_rollout),
+            RolloutRetryPolicy.single_attempt(max_skipped_prompts=1),
+        )
+        group_id = _with_cut(
+            buf,
+            lambda cut: mgr.reserve_prompt_group(
+                cut,
+                {"idx": 7, "message_log": []},
+                target_step=7,
+            ),
+        )
+
+        outcome = _run(
+            mgr.generate_and_push(
+                {"idx": 7, "message_log": []},
+                target_step=7,
+                lineage_group_id=group_id,
+            )
+        )
+
+        assert outcome is RolloutOutcome.SKIPPED
+        assert mgr.recovery_ledger.get_group(group_id).target_step == 7
+
+    def test_tracked_dispatch_rejects_changed_generations_per_prompt(self):
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl())
+        _with_cut(
+            buf,
+            lambda cut: mgr.recovery_ledger.reserve_group(
+                cut,
+                group_id="g0",
+                prompt_id="0",
+                prompt_payload={"idx": 0, "message_log": []},
+                expected_generations=2,
+                target_step=0,
+                start_weight_version=0,
+                admitted=True,
+            ),
+        )
+
+        with pytest.raises(ValueError, match="expects 2 generation"):
+            _run(
+                mgr.generate_and_push(
+                    {"idx": 0, "message_log": []},
+                    target_step=0,
+                    lineage_group_id="g0",
+                )
+            )
 
     def test_start_weight_version_pinned_at_reserve_time(self):
         """If set_weight_version is called mid-rollout, start != end."""

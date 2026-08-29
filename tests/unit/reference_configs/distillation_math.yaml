@@ -151,6 +151,7 @@ policy: &POLICY_BASE
             # optimizer cpu offload
             optimizer_cpu_offload: false
             optimizer_offload_fraction: 0.0
+            overlap_cpu_optimizer_d2h_h2d: false
 
             clip_grad: ${policy.max_grad_norm}
 
@@ -287,3 +288,7 @@ cluster:
     master_port_range_low: 1400
     master_port_range_high: 1999
     segment_size: null
+
+# OpenTelemetry instrumentation; null = disabled (default). Mirrors the optional
+# field on the MasterConfig, which stays None unless a run opts in.
+telemetry: null

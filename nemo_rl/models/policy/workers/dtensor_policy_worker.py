@@ -93,6 +93,7 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     PolicyCheckpointEngineMixin,
     maybe_preinit_nixl_checkpoint_engine,
 )
+from nemo_rl.telemetry.setup import init_telemetry_worker
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
@@ -228,6 +229,10 @@ class DTensorPolicyWorkerImpl(
         # benefit. ray.get_gpu_ids()[0] is the physical GPU index that keys the
         # affinity file, and reading it does not initialize CUDA.
         bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
+
+        # OTel providers are process-global, so the driver's setup does not
+        # reach this actor. No-op unless telemetry is enabled.
+        init_telemetry_worker()
 
         self.tokenizer = tokenizer
         self.processor = processor
@@ -1900,9 +1905,45 @@ class DTensorPolicyWorkerImpl(
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
     ) -> None:
-        """Broadcast the weights for collective communication."""
+        """Broadcast the weights for collective communication.
+
+        Guarded exactly as the Megatron worker is, and for the same reason: a generation
+        rank that dies mid-broadcast leaves this call blocked in NCCL with no timeout and
+        no error. Disarmed unless refit_timeout_s is set, so the default path is
+        unchanged.
+        """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+        )
+
+        with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
+            self._broadcast_weights_for_collective(
+                kv_scales=kv_scales,
+                buffer_size_bytes=buffer_size_bytes,
+                num_buffers=num_buffers,
+            )
+        if guard.fired:
+            # The aborted collective returned cleanly, so this is the only signal there is.
+            raise RefitAborted(
+                f"refit broadcast exceeded {refit_timeout_s}s and was aborted; "
+                "a generation rank most likely stopped participating"
+            )
+
+    def _broadcast_weights_for_collective(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
+    ) -> None:
         if kv_scales is not None:
             raise NotImplementedError(
                 "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
@@ -1930,6 +1971,8 @@ class DTensorPolicyWorkerImpl(
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,
+            buffer_size_bytes=buffer_size_bytes,
+            num_buffers=num_buffers,
         )
 
         # Manually move model to cpu for cpu offload case
@@ -1938,7 +1981,16 @@ class DTensorPolicyWorkerImpl(
             self.model = self.move_to_cpu(self.model)
 
     @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_lp_inference")
-    def prepare_for_lp_inference(self) -> None:
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        """Put the model in eval mode for logprob inference.
+
+        Args:
+            keep_train_buffers: Leave the optimizer state on CUDA because a train
+                step is already open. This backend accumulates gradients in
+                ``param.grad`` and never offloads them, so unlike the Megatron
+                backend there is nothing here that could discard them; the flag
+                only suppresses the per-chunk optimizer round trip.
+        """
         # onload model to cuda
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
@@ -1949,7 +2001,11 @@ class DTensorPolicyWorkerImpl(
 
         # offload optimizer to cpu
         torch.randn(1).cuda()  # wake up torch allocator
-        if self.optimizer is not None and self.offload_optimizer_for_logprob:
+        if (
+            not keep_train_buffers
+            and self.optimizer is not None
+            and self.offload_optimizer_for_logprob
+        ):
             self.move_optimizer_to_device("cpu")
 
         gc.collect()

@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.advantage_estimator import (
+    GAEConfig,
     GeneralizedAdvantageEstimator,
     RawRewardAdvantageEstimator,
 )
@@ -28,6 +29,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     MseValueLossConfig,
     MseValueLossFn,
 )
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -50,32 +52,6 @@ def _make_loss_config(
     )
 
 
-def _make_gae_config(
-    gae_lambda: float = 0.95,
-    gae_gamma: float = 1.0,
-    normalize_advantages: bool = False,
-    length_adaptive_alpha: float = 0.0,
-    gae_lambda_value: float | None = None,
-    gae_lambda_policy: float | None = None,
-    **overrides,
-) -> dict:
-    """Build an estimator_config dict with all GAE-required keys populated.
-
-    ``GeneralizedAdvantageEstimator.__init__`` requires every field to be
-    present (no hidden ``.get()`` defaults). VAPO fields default to ``None``
-    (standard GAE, no decoupling) and can be overridden via kwargs.
-    """
-    return {
-        "gae_lambda": gae_lambda,
-        "gae_gamma": gae_gamma,
-        "normalize_advantages": normalize_advantages,
-        "length_adaptive_alpha": length_adaptive_alpha,
-        "gae_lambda_value": gae_lambda_value,
-        "gae_lambda_policy": gae_lambda_policy,
-        **overrides,
-    }
-
-
 # ============================================================================
 # Tests for GeneralizedAdvantageEstimator
 # ============================================================================
@@ -87,7 +63,7 @@ def test_gae_basic_computation():
     With gamma=1.0 and lambda=1.0, GAE reduces to Monte Carlo returns
     minus values, so advantages = cumulative_rewards_from_t - V(s_t).
     """
-    estimator_config = _make_gae_config(gae_lambda=1.0, gae_gamma=1.0)
+    estimator_config = GAEConfig(gae_lambda=1.0, normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -117,7 +93,7 @@ def test_gae_gamma_lambda_zero():
     With lambda=0: A_t = delta_t = r_t + gamma * V(s_{t+1}) - V(s_t).
     Only immediate TD error, no bootstrapping.
     """
-    estimator_config = _make_gae_config(gae_lambda=0.0, gae_gamma=1.0)
+    estimator_config = GAEConfig(gae_lambda=0.0, normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -144,7 +120,7 @@ def test_gae_gamma_lambda_zero():
 
 def test_gae_shape_and_masking():
     """Test that GAE correctly handles masked (padding) positions."""
-    estimator_config = _make_gae_config(gae_lambda=0.95, gae_gamma=1.0)
+    estimator_config = GAEConfig(normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -175,9 +151,7 @@ def test_gae_shape_and_masking():
 
 def test_gae_normalize_advantages():
     """Test that advantage normalization produces zero mean and unit variance."""
-    estimator_config = _make_gae_config(
-        gae_lambda=0.95, gae_gamma=1.0, normalize_advantages=True
-    )
+    estimator_config = GAEConfig(normalize_advantages=True)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -204,7 +178,7 @@ def test_gae_normalize_advantages():
 
 def test_gae_kl_penalty_in_rewards():
     """Test KL penalty injection into token-level rewards (gated + applied)."""
-    estimator_config = _make_gae_config(gae_lambda=1.0, gae_gamma=1.0)
+    estimator_config = GAEConfig(gae_lambda=1.0, normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.1, kl_type="k1", use_kl_in_reward=True)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -223,8 +197,8 @@ def test_gae_kl_penalty_in_rewards():
         mask=mask,
         lengths=lengths,
         values=values,
-        logprobs=logprobs,
-        reference_logprobs=reference_logprobs_same,
+        logprobs_policy=logprobs,
+        logprobs_reference=reference_logprobs_same,
     )
     adv_no_kl, _ = estimator.compute_advantage(
         prompt_ids=torch.tensor([[0]]),
@@ -244,8 +218,8 @@ def test_gae_kl_penalty_in_rewards():
         mask=mask,
         lengths=lengths,
         values=values,
-        logprobs=logprobs,
-        reference_logprobs=reference_logprobs_divergent,
+        logprobs_policy=logprobs,
+        logprobs_reference=reference_logprobs_divergent,
     )
     assert not torch.allclose(adv_kl_positive, adv_no_kl), (
         "Non-zero KL should change advantages relative to the no-KL baseline"
@@ -265,19 +239,16 @@ def test_gae_kl_penalty_in_rewards():
         mask=mask,
         lengths=lengths,
         values=values,
-        logprobs=logprobs,
-        reference_logprobs=reference_logprobs_divergent,
+        logprobs_policy=logprobs,
+        logprobs_reference=reference_logprobs_divergent,
     )
     torch.testing.assert_close(adv_gate_off, adv_no_kl)
 
 
 def test_gae_vapo_decoupled_lambda():
     """Test VAPO decoupled GAE: separate lambda for value vs policy."""
-    base_config = _make_gae_config(
-        gae_lambda=0.95,
-        gae_gamma=1.0,
-        gae_lambda_value=1.0,
-        gae_lambda_policy=0.5,
+    base_config = GAEConfig(
+        gae_lambda_value=1.0, gae_lambda_policy=0.5, normalize_advantages=False
     )
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(base_config, loss_config)
@@ -307,9 +278,7 @@ def test_gae_vapo_decoupled_lambda():
 
 def test_gae_length_adaptive_lambda():
     """Test VAPO length-adaptive lambda: lambda_policy = 1 - 1/(alpha * length)."""
-    config = _make_gae_config(
-        gae_lambda=0.95, gae_gamma=1.0, length_adaptive_alpha=0.05
-    )
+    config = GAEConfig(length_adaptive_alpha=0.05, normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(config, loss_config)
 
@@ -337,7 +306,7 @@ def test_gae_carry_forward_interior_gap():
     corrupt the GAE accumulators: the advantages at the valid tokens must
     match the case where the gap is simply removed from the sequence.
     """
-    estimator_config = _make_gae_config(gae_lambda=0.95, gae_gamma=0.99)
+    estimator_config = GAEConfig(gae_gamma=0.99, normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -386,7 +355,7 @@ def test_raw_reward_basic_broadcast_and_masking():
     masked-out trailing pads — the downstream loss masking is responsible
     for zeroing those out). ``returns`` is None since there is no value head.
     """
-    estimator_config = {"normalize_advantages": False}
+    estimator_config = GAEConfig(name="raw_reward", normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = RawRewardAdvantageEstimator(estimator_config, loss_config)
 
@@ -633,19 +602,12 @@ def test_create_advantage_estimator_gae():
 
     from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
-    # adv_estimator dict needs every GAE-required key (no hidden .get() defaults
-    # in the estimator __init__); loss_fn must be a real ClippedPGLossConfig
-    # because the estimator accesses .use_kl_in_reward / .reference_policy_kl_*
-    # as attributes, not dict keys.
+    # loss_fn must be a real ClippedPGLossConfig: the estimator reads
+    # .use_kl_in_reward / .reference_policy_kl_* off it.
     master_config = SimpleNamespace(
-        ppo={
-            "adv_estimator": {
-                "name": "gae",
-                **_make_gae_config(
-                    gae_lambda=0.95, gae_gamma=1.0, normalize_advantages=True
-                ),
-            },
-        },
+        ppo=PPOConfig(
+            adv_estimator=GAEConfig(),
+        ),
         loss_fn=_make_loss_config(kl_penalty=0.0),
     )
 
@@ -661,9 +623,9 @@ def test_create_advantage_estimator_raw_reward():
     from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
     master_config = SimpleNamespace(
-        ppo={
-            "adv_estimator": {"name": "raw_reward", "normalize_advantages": True},
-        },
+        ppo=PPOConfig(
+            adv_estimator={"name": "raw_reward", "normalize_advantages": True},
+        ),
         loss_fn={"reference_policy_kl_penalty": 0.0},
     )
 
@@ -671,14 +633,32 @@ def test_create_advantage_estimator_raw_reward():
     assert isinstance(estimator, RawRewardAdvantageEstimator)
 
 
+def test_ppo_schema_rejects_unsupported_estimator_name():
+    """PPO consumes (advantages, returns), which only GAE/raw_reward return.
+
+    The schema is the real gate, so a group-relative name fails at config load
+    rather than at the factory.
+    """
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        PPOConfig(adv_estimator={"name": "grpo"})
+
+
 def test_create_advantage_estimator_rejects_unsupported_name():
-    """PPO loop only consumes (advantages, returns) from GAE/raw_reward — others must error."""
+    """The factory still guards names that skipped schema validation.
+
+    model_construct bypasses the Literal, so this branch is reachable and is
+    what turns a bad name into a message instead of an UnboundLocalError.
+    """
     from types import SimpleNamespace
 
     from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
     master_config = SimpleNamespace(
-        ppo={"adv_estimator": {"name": "grpo"}},
+        ppo=PPOConfig.model_construct(
+            adv_estimator=GAEConfig.model_construct(name="grpo")
+        ),
         loss_fn={"reference_policy_kl_penalty": 0.0},
     )
 
@@ -686,19 +666,17 @@ def test_create_advantage_estimator_rejects_unsupported_name():
         _create_advantage_estimator(master_config)
 
 
-def test_create_advantage_estimator_requires_adv_estimator_key():
-    """No more silent default — missing `adv_estimator` should KeyError."""
+def test_create_advantage_estimator_uses_ppo_config_default():
+    """The PPO schema provides the centralized default estimator config."""
     from types import SimpleNamespace
 
     from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
-    master_config = SimpleNamespace(
-        ppo={},
-        loss_fn={},
-    )
+    master_config = SimpleNamespace(ppo=PPOConfig(), loss_fn=_make_loss_config())
 
-    with pytest.raises(KeyError):
-        _create_advantage_estimator(master_config)
+    assert isinstance(
+        _create_advantage_estimator(master_config), GeneralizedAdvantageEstimator
+    )
 
 
 def _make_ppo_loop_batch(
@@ -743,10 +721,13 @@ def _make_ppo_loop_batch(
 def _run_mock_ppo_train(
     monkeypatch,
     *,
+    async_mode: bool = False,
+    checkpoint_path: str | None = None,
     max_num_steps: int,
     ppo_epochs: int,
     seq_logprob_error_threshold: float | None,
     policy_training_start_step: int = 0,
+    warmup_generation_lead_steps: int | None = None,
     overlong_filtering: bool = False,
     truncated_samples: tuple[bool, bool] = (False, False),
 ):
@@ -787,11 +768,23 @@ def _run_mock_ppo_train(
             return mask.clone(), mask.clone()
 
     class DummyTimer:
+        def __init__(self, *_args, **_kwargs):
+            self._timers = {}
+
         def time(self, *_args, **_kwargs):
             return nullcontext()
 
+        def start(self, *_args, **_kwargs):
+            pass
+
+        def stop(self, *_args, **_kwargs):
+            pass
+
         def get_timing_metrics(self, **_kwargs):
             return {"total_step_time": 1.0}
+
+        def reduce(self, *_args, **_kwargs):
+            return 0.0
 
         def reset(self):
             pass
@@ -847,6 +840,12 @@ def _run_mock_ppo_train(
     }
 
     value_model = MagicMock()
+    value_model.prepare_for_inference.side_effect = lambda: events.append(
+        "value_inference_prep"
+    )
+    value_model.finish_inference.side_effect = lambda: events.append(
+        "value_inference_finish"
+    )
     value_model.finish_training.side_effect = lambda: events.append("value_finish")
     value_model.get_values.return_value = {"values": torch.zeros(2, 3, 1)}
     value_model.train.side_effect = lambda *_args, **_kwargs: (
@@ -872,10 +871,15 @@ def _run_mock_ppo_train(
     monkeypatch.setattr(ppo_mod, "TimeoutChecker", DummyTimeoutChecker)
     monkeypatch.setattr(ppo_mod, "MemoryTracker", DummyMemoryTracker)
     monkeypatch.setattr(ppo_mod, "maybe_gpu_profile_step", lambda *_args: None)
-    monkeypatch.setattr(ppo_mod, "print_performance_metrics", lambda *_args: {})
+    monkeypatch.setattr(
+        ppo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        ppo_mod, "print_efficiency_summary", lambda *_args, **_kwargs: {}
+    )
     monkeypatch.setattr(ppo_mod, "scale_rewards", lambda batch, _config: batch)
-    monkeypatch.setattr(ppo_mod, "_should_use_nemo_gym", lambda _config: False)
-    monkeypatch.setattr(ppo_mod, "_should_use_async_rollouts", lambda _config: False)
+    monkeypatch.setattr(ppo_mod, "should_use_nemo_gym", lambda _config: False)
+    monkeypatch.setattr(ppo_mod, "should_use_async_rollouts", lambda _config: False)
     monkeypatch.setattr(ppo_mod, "run_multi_turn_rollout", fake_rollout)
     monkeypatch.setattr(ppo_mod, "refit_policy_generation", refit)
     monkeypatch.setattr(ppo_mod, "batched_message_log_to_flat_message", fake_flatten)
@@ -891,22 +895,26 @@ def _run_mock_ppo_train(
     )
 
     master_config = SimpleNamespace(
-        ppo={
-            "max_num_steps": max_num_steps,
-            "max_num_epochs": 1,
-            "max_rollout_turns": 1,
-            "num_prompts_per_step": 2,
-            "num_generations_per_prompt": 1,
-            "overlong_filtering": overlong_filtering,
-            "policy_training_start_step": policy_training_start_step,
-            "ppo_epochs": ppo_epochs,
-            "reward_scaling": {"enabled": False},
-            "reward_shaping": RewardShapingConfig(enabled=False),
-            "seq_logprob_error_threshold": seq_logprob_error_threshold,
-            "val_at_start": False,
-            "val_at_end": False,
-            "val_period": 0,
-        },
+        ppo=PPOConfig(
+            async_ppo={
+                "enabled": async_mode,
+                "warmup_generation_lead_steps": warmup_generation_lead_steps,
+            },
+            max_num_steps=max_num_steps,
+            max_num_epochs=-1 if async_mode else 1,
+            max_rollout_turns=1,
+            num_prompts_per_step=2,
+            num_generations_per_prompt=1,
+            overlong_filtering=overlong_filtering,
+            policy_training_start_step=policy_training_start_step,
+            ppo_epochs=ppo_epochs,
+            reward_scaling={"enabled": False},
+            reward_shaping=RewardShapingConfig(enabled=False),
+            seq_logprob_error_threshold=seq_logprob_error_threshold,
+            val_at_start=False,
+            val_at_end=False,
+            val_period=0,
+        ),
         policy={
             "generation": {
                 "backend": "vllm",
@@ -918,7 +926,7 @@ def _run_mock_ppo_train(
         },
         loss_fn=_make_loss_config(),
         checkpointing={
-            "enabled": False,
+            "enabled": checkpoint_path is not None,
             "checkpoint_must_save_by": None,
             "save_period": 100,
             "metric_name": None,
@@ -929,27 +937,89 @@ def _run_mock_ppo_train(
     logger = MagicMock()
     checkpointer = MagicMock()
     checkpointer.save_optimizer = False
+    checkpointer.get_latest_checkpoint_path.return_value = checkpoint_path
+    checkpointer.init_tmp_checkpoint.return_value = checkpoint_path
     dataloader = DummyLoader(
         [_make_ppo_loop_batch(truncated_samples) for _ in range(max_num_steps)]
     )
     tokenizer = SimpleNamespace(pad_token_id=0)
+    replay_actor = None
 
-    ppo_mod.ppo_train(
-        policy,
-        policy_generation,
-        value_model,
-        dataloader,
-        None,
-        tokenizer,
-        MagicMock(),
-        MagicMock(),
-        {},
-        None,
-        logger,
-        checkpointer,
-        ppo_mod._default_ppo_save_state(),
-        master_config,
-    )
+    if async_mode:
+        from nemo_rl.algorithms import async_utils
+
+        master_config.policy["generation"]["vllm_cfg"]["async_engine"] = True
+        master_config.loss_fn.use_importance_sampling_correction = True
+
+        replay_actor = MagicMock()
+        replay_actor.has_complete_batch.remote.return_value = True
+        replay_actor.sample.remote.return_value = {
+            "trajectories": [
+                {
+                    "batch": _make_ppo_loop_batch(truncated_samples).slice(i, i + 1),
+                    "rollout_metrics": {},
+                }
+                for i in range(2)
+            ],
+            "avg_trajectory_age": 0.0,
+        }
+        replay_actor.size.remote.return_value = 2
+        replay_actor.save_to_path.remote.return_value = 2
+
+        collector_actor = MagicMock()
+        collector_actor.check_health.remote.return_value = None
+        collector_actor.get_status.remote.return_value = {
+            "errored": False,
+            "running": True,
+            "inflight_workers": 0,
+            "data_exhausted": False,
+        }
+        collector_actor.get_efficiency_metrics.remote.return_value = {}
+        collector_actor.get_dataloader_state.remote.return_value = {}
+
+        replay_type = MagicMock()
+        replay_type.options.return_value.remote.return_value = replay_actor
+        collector_type = MagicMock()
+        collector_type.options.return_value.remote.return_value = collector_actor
+        monkeypatch.setattr(async_utils, "ReplayBuffer", replay_type)
+        monkeypatch.setattr(async_utils, "AsyncTrajectoryCollector", collector_type)
+        monkeypatch.setattr(ppo_mod, "make_actor_runtime_env", lambda _actor: {})
+        monkeypatch.setattr(ppo_mod.ray, "get", lambda value, **_kwargs: value)
+        monkeypatch.setattr(ppo_mod.ray, "kill", lambda _actor: None)
+
+        ppo_mod.async_ppo_train(
+            policy,
+            policy_generation,
+            value_model,
+            dataloader,
+            None,
+            tokenizer,
+            MagicMock(),
+            MagicMock(),
+            {},
+            None,
+            logger,
+            checkpointer,
+            ppo_mod._default_ppo_save_state(),
+            master_config,
+        )
+    else:
+        ppo_mod.ppo_train(
+            policy,
+            policy_generation,
+            value_model,
+            dataloader,
+            None,
+            tokenizer,
+            MagicMock(),
+            MagicMock(),
+            {},
+            None,
+            logger,
+            checkpointer,
+            ppo_mod._default_ppo_save_state(),
+            master_config,
+        )
 
     return SimpleNamespace(
         policy=policy,
@@ -959,6 +1029,7 @@ def _run_mock_ppo_train(
         checkpointer=checkpointer,
         advantage_estimator=advantage_estimator,
         refit=refit,
+        replay_actor=replay_actor,
         events=events,
     )
 
@@ -996,33 +1067,91 @@ def test_ppo_train_noncolocated_refit_offload_lifecycle(monkeypatch):
         ]
 
 
-def test_ppo_train_critic_warmup_reuses_generation_until_policy_update(monkeypatch):
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ppo_train_critic_warmup_reuses_generation_until_policy_update(
+    monkeypatch, async_mode
+):
     harness = _run_mock_ppo_train(
         monkeypatch,
+        async_mode=async_mode,
         max_num_steps=2,
         ppo_epochs=1,
         seq_logprob_error_threshold=None,
         policy_training_start_step=1,
     )
 
-    assert harness.refit.call_count == 1
-    assert harness.policy_generation.prepare_for_generation.call_count == 1
+    assert harness.refit.call_count == (2 if async_mode else 1)
+    assert harness.policy_generation.prepare_for_generation.call_count == (
+        0 if async_mode else 1
+    )
     assert harness.policy.train.call_count == 1
     assert harness.value_model.train.call_count == 2
-    assert harness.policy_generation.finish_generation.call_count == 2
+    assert harness.policy_generation.finish_generation.call_count == (
+        0 if async_mode else 2
+    )
 
-    rollout_indices = [
-        index for index, event in enumerate(harness.events) if event == "rollout"
-    ]
-    assert harness.events[rollout_indices[1] - 1 : rollout_indices[1] + 1] == [
-        "generation_prepare",
-        "rollout",
-    ]
+    if not async_mode:
+        rollout_indices = [
+            index for index, event in enumerate(harness.events) if event == "rollout"
+        ]
+        assert harness.events[rollout_indices[1] - 1 : rollout_indices[1] + 1] == [
+            "generation_prepare",
+            "rollout",
+        ]
 
 
-def test_ppo_train_excludes_overlong_samples_from_advantage(monkeypatch):
+@pytest.mark.parametrize(
+    (
+        "policy_training_start_step",
+        "warmup_generation_lead_steps",
+        "expected_restore_max_age",
+    ),
+    [
+        (0, None, 1),
+        (2, 3, 3),
+    ],
+)
+def test_async_ppo_checkpoints_replay_buffer_inside_actor(
+    monkeypatch,
+    tmp_path,
+    policy_training_start_step,
+    warmup_generation_lead_steps,
+    expected_restore_max_age,
+):
+    checkpoint_path = tmp_path / "step_0"
+    checkpoint_path.mkdir()
+    replay_buffer_path = checkpoint_path / "replay_buffer.pt"
+    replay_buffer_path.touch()
+
     harness = _run_mock_ppo_train(
         monkeypatch,
+        async_mode=True,
+        checkpoint_path=str(checkpoint_path),
+        max_num_steps=1,
+        ppo_epochs=1,
+        seq_logprob_error_threshold=None,
+        policy_training_start_step=policy_training_start_step,
+        warmup_generation_lead_steps=warmup_generation_lead_steps,
+    )
+
+    harness.replay_actor.load_from_path.remote.assert_called_once_with(
+        str(replay_buffer_path),
+        num_prompts_per_step=2,
+        current_training_step=0,
+        max_age_steps=expected_restore_max_age,
+    )
+    harness.replay_actor.load_state_dict.remote.assert_not_called()
+    harness.replay_actor.save_to_path.remote.assert_called_once_with(
+        str(replay_buffer_path)
+    )
+    harness.replay_actor.state_dict.remote.assert_not_called()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ppo_train_excludes_overlong_samples_from_advantage(monkeypatch, async_mode):
+    harness = _run_mock_ppo_train(
+        monkeypatch,
+        async_mode=async_mode,
         max_num_steps=1,
         ppo_epochs=1,
         seq_logprob_error_threshold=None,
@@ -1036,13 +1165,15 @@ def test_ppo_train_excludes_overlong_samples_from_advantage(monkeypatch):
     )
 
 
-def test_ppo_train_rejects_all_masked_batch(monkeypatch):
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ppo_train_rejects_all_masked_batch(monkeypatch, async_mode):
     with pytest.raises(
         RuntimeError,
         match="no valid response tokens after filtering",
     ):
         _run_mock_ppo_train(
             monkeypatch,
+            async_mode=async_mode,
             max_num_steps=1,
             ppo_epochs=1,
             seq_logprob_error_threshold=None,
@@ -1051,9 +1182,13 @@ def test_ppo_train_rejects_all_masked_batch(monkeypatch):
         )
 
 
-def test_ppo_train_wires_logprob_mask_to_advantage_training_and_metrics(monkeypatch):
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ppo_train_wires_logprob_mask_to_advantage_training_and_metrics(
+    monkeypatch, async_mode
+):
     harness = _run_mock_ppo_train(
         monkeypatch,
+        async_mode=async_mode,
         max_num_steps=1,
         ppo_epochs=1,
         seq_logprob_error_threshold=1.5,
@@ -1082,6 +1217,67 @@ def test_ppo_train_wires_logprob_mask_to_advantage_training_and_metrics(monkeypa
     assert final_train_metrics[0]["advantages/mean"] == pytest.approx(1.0)
     assert final_train_metrics[0]["advantages/min"] == pytest.approx(1.0)
     assert final_train_metrics[0]["advantages/max"] == pytest.approx(1.0)
+
+
+def test_compute_critic_metrics_aggregates_and_namespaces_results():
+    from nemo_rl.algorithms.ppo import _compute_critic_metrics
+
+    metrics = _compute_critic_metrics(
+        {
+            "grad_norm": torch.tensor(1.5),
+            "loss": torch.tensor(0.25),
+            "all_mb_metrics": {
+                "lr": [0.1, 0.3],
+                "values_min": [-2.0, -1.0],
+                "values_max": [1.0, 3.0],
+                "num_valid_tokens": [2, 3],
+                "returns_mean": [1.0],
+                "values_mean": [0.5],
+                "returns_sq_mean": [5.0],
+                "residual_sq_mean": [1.25],
+            },
+        }
+    )
+
+    assert metrics["critic/grad_norm"] == pytest.approx(1.5)
+    assert metrics["critic/loss"] == pytest.approx(0.25)
+    assert metrics["critic/lr"] == pytest.approx(0.2)
+    assert metrics["critic/values_min"] == pytest.approx(-2.0)
+    assert metrics["critic/values_max"] == pytest.approx(3.0)
+    assert metrics["critic/num_valid_tokens"] == 5
+    assert metrics["critic/explained_var"] == pytest.approx(0.75)
+
+
+def test_compute_critic_metrics_handles_zero_return_variance():
+    from nemo_rl.algorithms.ppo import _compute_critic_metrics
+
+    metrics = _compute_critic_metrics(
+        {
+            "grad_norm": torch.tensor(0.0),
+            "loss": torch.tensor(0.0),
+            "all_mb_metrics": {
+                "returns_mean": [2.0],
+                "values_mean": [2.0],
+                "returns_sq_mean": [4.0],
+                "residual_sq_mean": [0.0],
+            },
+        }
+    )
+
+    assert metrics["critic/explained_var"] == pytest.approx(1.0)
+
+
+def test_compute_critic_metrics_rejects_unsupported_metric_type():
+    from nemo_rl.algorithms.ppo import _compute_critic_metrics
+
+    with pytest.raises(ValueError, match="Unsupported value-model metric"):
+        _compute_critic_metrics(
+            {
+                "grad_norm": torch.tensor(0.0),
+                "loss": torch.tensor(0.0),
+                "all_mb_metrics": {"unexpected": 1.0},
+            }
+        )
 
 
 # ============================================================================
@@ -1144,7 +1340,7 @@ def _make_noncolocated_setup_config(
                     "pipeline_parallel_size": 1,
                 },
                 "vllm_kwargs": {},
-                "sglang_cfg": {},
+                "sglang_cfg": {"quantization": {"scheme": "bf16"}},
             },
         },
         value={
@@ -1158,27 +1354,27 @@ def _make_noncolocated_setup_config(
         value_loss_fn=MseValueLossConfig(),
         env=env_config,
         data=data_config,
-        ppo={
-            "max_num_steps": 1,
-            "max_num_epochs": 1,
-            "num_prompts_per_step": 1,
-            "num_generations_per_prompt": 1,
-            "max_rollout_turns": 1,
-            "val_period": 0,
-            "val_batch_size": 1,
-            "val_at_start": False,
-            "val_at_end": False,
-            "max_val_samples": 1,
-            "seed": 42,
-            "overlong_filtering": False,
-            "use_dynamic_sampling": False,
-            "batch_multiplier": 1,
-            "ppo_epochs": 1,
-            "policy_training_start_step": 0,
-            "reward_shaping": {"enabled": False},
-            "reward_scaling": {"enabled": False},
-            "adv_estimator": {"name": "raw_reward"},
-        },
+        ppo=PPOConfig(
+            max_num_steps=1,
+            max_num_epochs=1,
+            num_prompts_per_step=1,
+            num_generations_per_prompt=1,
+            max_rollout_turns=1,
+            val_period=0,
+            val_batch_size=1,
+            val_at_start=False,
+            val_at_end=False,
+            max_val_samples=1,
+            seed=42,
+            overlong_filtering=False,
+            use_dynamic_sampling=False,
+            batch_multiplier=1,
+            ppo_epochs=1,
+            policy_training_start_step=0,
+            reward_shaping={"enabled": False},
+            reward_scaling={"enabled": False},
+            adv_estimator={"name": "raw_reward"},
+        ),
         logger={"num_val_samples_to_print": 0},
         cluster={
             "num_nodes": total_nodes,
@@ -1270,12 +1466,22 @@ def _run_noncolocated_setup(monkeypatch, config):
     policy_factory = MagicMock(return_value=policy)
     value_factory = MagicMock(return_value=value_model)
     generation_factory = MagicMock(return_value=generation)
+    weight_sync = MagicMock()
+    weight_sync_factory = MagicMock(return_value=weight_sync)
+    generation_factory.weight_sync = weight_sync
+    generation_factory.weight_sync_factory = weight_sync_factory
     ray_get = MagicMock(side_effect=lambda futures: futures)
 
     monkeypatch.setattr(ppo_mod, "RayVirtualCluster", DummyCluster)
     monkeypatch.setattr(ppo_mod, "Policy", policy_factory)
     monkeypatch.setattr(ppo_mod, "Value", value_factory)
-    monkeypatch.setattr(ppo_mod, "VllmGeneration", generation_factory)
+    generation_cls = (
+        "SGLangGeneration"
+        if config.policy["generation"]["backend"] == "sglang"
+        else "VllmGeneration"
+    )
+    monkeypatch.setattr(ppo_mod, generation_cls, generation_factory)
+    monkeypatch.setattr(ppo_mod, "create_weight_synchronizer", weight_sync_factory)
     monkeypatch.setattr(ppo_mod.ray, "get", ray_get)
 
     result = ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
@@ -1740,6 +1946,39 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
     generation.prepare_refit_info.assert_called_once_with({"state": "dict"})
 
 
+@pytest.mark.parametrize(
+    ("async_enabled", "expected_train_iters"),
+    [(False, 3), (True, 30)],
+)
+def test_megatron_train_iters_matches_ppo_training_limit(
+    monkeypatch, async_enabled, expected_train_iters
+):
+    """Async PPO cycles data until max_num_steps; sync PPO also honors epochs."""
+    from nemo_rl.algorithms.ppo import AsyncPPOConfig
+
+    config = _make_noncolocated_setup_config()
+    config.policy["dtensor_cfg"]["enabled"] = False
+    config.policy["megatron_cfg"]["enabled"] = True
+    config.ppo.max_num_steps = 10
+    config.ppo.max_num_epochs = -1 if async_enabled else 1
+    config.ppo.ppo_epochs = 3
+    config.ppo.async_ppo = AsyncPPOConfig(enabled=async_enabled)
+
+    _run_noncolocated_setup(monkeypatch, config)
+
+    assert config.policy["megatron_cfg"]["train_iters"] == expected_train_iters
+    assert config.value["megatron_cfg"]["train_iters"] == expected_train_iters
+
+
+def test_ppo_setup_rejects_a_warm_start_that_does_not_resolve(monkeypatch, tmp_path):
+    """A fresh run's warm-start checkpoint must resolve, or the critic would silently start cold."""
+    config = _make_noncolocated_setup_config()
+    config.ppo.warm_start_value_checkpoint = str(tmp_path / "typo")
+
+    with pytest.raises(ValueError, match="would silently start cold"):
+        _run_noncolocated_setup(monkeypatch, config)
+
+
 def test_colocated_setup_keeps_single_cluster_and_skips_collective(monkeypatch):
     """The default colocated setup remains unchanged by the cluster split."""
     config = _make_noncolocated_setup_config()
@@ -1760,6 +1999,39 @@ def test_colocated_setup_keeps_single_cluster_and_skips_collective(monkeypatch):
     policy.init_collective.assert_not_called()
     generation.init_collective.assert_not_called()
     ray_get.assert_not_called()
+
+
+def test_colocated_sglang_setup_attaches_weight_synchronizer(monkeypatch):
+    """PPO uses the SGLang synchronizer instead of the legacy refit branch."""
+    from nemo_rl.algorithms import ppo as ppo_mod
+
+    config = _make_noncolocated_setup_config(backend="sglang")
+    config.policy["generation"]["colocated"] = {
+        "enabled": True,
+        "resources": {"num_nodes": None, "gpus_per_node": None},
+    }
+    config.policy["refit_buffer_size_gb"] = 1.5
+
+    result, _, policy, generation, _, _, generation_factory, _ = (
+        _run_noncolocated_setup(monkeypatch, config)
+    )
+
+    synchronizer = generation_factory.weight_sync
+    generation_factory.weight_sync_factory.assert_called_once_with(
+        policy=policy,
+        generation=generation,
+        generation_backend="sglang",
+        colocated=True,
+        refit_buffer_size_gb=1.5,
+    )
+    assert generation.weight_synchronizer is synchronizer
+    synchronizer.init_communicator.assert_called_once_with()
+    policy.prepare_refit_info.assert_not_called()
+    generation.prepare_refit_info.assert_not_called()
+    assert result[3][0] is result[3][1]
+
+    ppo_mod.refit_policy_generation(policy, generation, True)
+    synchronizer.sync_weights.assert_called_once_with(timer=None, kv_scales=None)
 
 
 def test_noncolocated_vllm_multi_node_cluster_and_collective_sizes(monkeypatch):
@@ -1823,3 +2095,529 @@ def test_noncolocated_reward_model_node_leaves_shared_train_inference_node(
     generation.init_collective.assert_called_once_with(
         "127.0.0.1", 1234, 8, train_world_size=6
     )
+
+
+def _make_async_ppo_config() -> SimpleNamespace:
+    from nemo_rl.algorithms.ppo import AsyncPPOConfig
+
+    return SimpleNamespace(
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "colocated": {"enabled": False},
+                "vllm_cfg": {"async_engine": True},
+            }
+        },
+        loss_fn=ClippedPGLossConfig(
+            use_importance_sampling_correction=True,
+            reference_policy_kl_penalty=0,
+        ),
+        ppo=PPOConfig(
+            async_ppo=AsyncPPOConfig(enabled=True),
+            max_num_epochs=-1,
+            policy_training_start_step=0,
+            ppo_epochs=1,
+            use_dynamic_sampling=False,
+            reward_scaling={"enabled": False},
+            reward_shaping=RewardShapingConfig(enabled=False),
+        ),
+        data={"use_multiple_dataloader": False},
+        env={},
+        checkpointing={"checkpoint_must_save_by": None},
+    )
+
+
+def _call_async_ppo_until_guard(
+    master_config: SimpleNamespace, *, requires_kv_scale_sync: bool = False
+) -> None:
+    from nemo_rl.algorithms.ppo import async_ppo_train
+
+    generation = MagicMock()
+    generation.requires_kv_scale_sync = requires_kv_scale_sync
+    async_ppo_train(
+        policy=MagicMock(),
+        policy_generation=generation,
+        value_model=MagicMock(),
+        dataloader=MagicMock(),
+        val_dataloader=None,
+        tokenizer=MagicMock(),
+        loss_fn=MagicMock(),
+        value_loss_fn=MagicMock(),
+        task_to_env={},
+        val_task_to_env=None,
+        logger=MagicMock(),
+        checkpointer=MagicMock(),
+        ppo_save_state=MagicMock(),
+        master_config=master_config,
+    )
+
+
+def _validate_async_ppo_entry_config(
+    master_config: SimpleNamespace, *, requires_kv_scale_sync: bool = False
+) -> None:
+    from examples.run_ppo import _validate_async_ppo_config
+
+    generation = MagicMock()
+    generation.requires_kv_scale_sync = requires_kv_scale_sync
+    _validate_async_ppo_config(master_config, generation)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda cfg: cfg.policy["generation"].update(backend="sglang"),
+            "backend=vllm.*async_engine=true",
+        ),
+        (
+            lambda cfg: cfg.policy["generation"]["vllm_cfg"].update(async_engine=False),
+            "backend=vllm.*async_engine=true",
+        ),
+        (
+            lambda cfg: setattr(
+                cfg.loss_fn, "use_importance_sampling_correction", False
+            ),
+            "importance_sampling_correction",
+        ),
+        (
+            lambda cfg: setattr(cfg.loss_fn, "force_on_policy_ratio", True),
+            "force_on_policy_ratio",
+        ),
+        (
+            lambda cfg: cfg.policy["generation"]["colocated"].update(enabled=True),
+            "non-colocated",
+        ),
+    ],
+)
+def test_async_ppo_launcher_entry_guards(mutate, message):
+    config = _make_async_ppo_config()
+    mutate(config)
+    with pytest.raises(ValueError, match=message):
+        _validate_async_ppo_entry_config(config)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda cfg: setattr(cfg.ppo, "ppo_epochs", 0), "ppo_epochs"),
+        (
+            lambda cfg: (
+                setattr(cfg.ppo, "skip_reference_policy_logprobs_calculation", True),
+                setattr(cfg.loss_fn, "reference_policy_kl_penalty", 0.1),
+            ),
+            "Skipping reference logprobs",
+        ),
+    ],
+)
+def test_async_ppo_training_loop_guards(mutate, message):
+    config = _make_async_ppo_config()
+    mutate(config)
+    with pytest.raises(ValueError, match=message):
+        _call_async_ppo_until_guard(config)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda cfg: setattr(cfg.ppo, "use_dynamic_sampling", True),
+            "Dynamic sampling",
+        ),
+        (
+            lambda cfg: setattr(cfg.ppo.reward_scaling, "enabled", True),
+            "Reward scaling",
+        ),
+        (
+            lambda cfg: setattr(cfg.ppo.reward_shaping, "enabled", True),
+            "Reward shaping",
+        ),
+        (
+            lambda cfg: cfg.data.update(use_multiple_dataloader=True),
+            "Multiple dataloaders",
+        ),
+        (
+            lambda cfg: cfg.env.update(should_use_nemo_gym=True),
+            "NeMo Gym",
+        ),
+        (
+            lambda cfg: setattr(cfg.ppo, "max_num_epochs", 2),
+            "max_num_epochs=-1",
+        ),
+    ],
+)
+def test_async_ppo_rejects_unsupported_features(mutate, message):
+    config = _make_async_ppo_config()
+    mutate(config)
+    with pytest.raises(NotImplementedError, match=message):
+        _validate_async_ppo_entry_config(config)
+
+
+def test_async_ppo_rejects_fp8_kv_scale_sync():
+    config = _make_async_ppo_config()
+    with pytest.raises(NotImplementedError, match="FP8 KV-scale"):
+        _validate_async_ppo_entry_config(config, requires_kv_scale_sync=True)
+
+
+def test_async_ppo_config_allows_kv_cache_recompute_without_inflight_updates():
+    from nemo_rl.algorithms.ppo import AsyncPPOConfig
+
+    config = AsyncPPOConfig(
+        in_flight_weight_updates=False,
+        recompute_kv_cache_after_weight_updates=True,
+    )
+
+    assert not config.in_flight_weight_updates
+    assert config.recompute_kv_cache_after_weight_updates
+
+
+def test_async_ppo_config_defaults():
+    from nemo_rl.algorithms.ppo import AsyncPPOConfig
+
+    config = AsyncPPOConfig()
+
+    assert not config.in_flight_weight_updates
+    assert not config.drop_incomplete_targets_on_restore
+
+
+def test_async_ppo_config_warmup_lead_defaults_to_training_age():
+    from nemo_rl.algorithms.ppo import AsyncPPOConfig
+
+    config = AsyncPPOConfig(max_trajectory_age_steps=3)
+
+    assert config.warmup_generation_lead_steps is None
+    assert config.resolved_warmup_generation_lead_steps == 3
+
+
+def test_async_ppo_config_rejects_warmup_lead_below_training_age():
+    from pydantic import ValidationError
+
+    from nemo_rl.algorithms.ppo import AsyncPPOConfig
+
+    with pytest.raises(ValidationError, match="warmup_generation_lead_steps"):
+        AsyncPPOConfig(
+            max_trajectory_age_steps=2,
+            warmup_generation_lead_steps=1,
+        )
+
+
+def test_ppo_config_rejects_warmup_lead_without_critic_warmup():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="policy_training_start_step > 0"):
+        PPOConfig(
+            policy_training_start_step=0,
+            async_ppo={
+                "enabled": True,
+                "warmup_generation_lead_steps": 2,
+            },
+        )
+
+
+def test_ppo_config_allows_warmup_lead_with_critic_warmup():
+    config = PPOConfig(
+        policy_training_start_step=1,
+        async_ppo={
+            "enabled": True,
+            "warmup_generation_lead_steps": 2,
+        },
+    )
+
+    assert config.async_ppo.warmup_generation_lead_steps == 2
+
+
+@pytest.mark.parametrize(
+    ("step", "expected_lead", "expected_buffer_age"),
+    [
+        (0, 4, 4),
+        (1, 4, 4),
+        (2, 3, 4),
+        (3, 2, 4),
+        (4, 1, 4),
+        (5, 1, 4),
+        (6, 1, 1),
+    ],
+)
+def test_async_ppo_warmup_window_has_fixed_safe_frontier(
+    step, expected_lead, expected_buffer_age
+):
+    from nemo_rl.algorithms.ppo import (
+        _async_ppo_buffer_max_age,
+        _async_ppo_generation_lead_steps,
+    )
+
+    generation_lead = _async_ppo_generation_lead_steps(
+        step=step,
+        policy_training_start_step=4,
+        max_trajectory_age_steps=1,
+        warmup_generation_lead_steps=4,
+    )
+    buffer_age = _async_ppo_buffer_max_age(
+        step=step,
+        policy_training_start_step=4,
+        max_trajectory_age_steps=1,
+        warmup_generation_lead_steps=4,
+    )
+
+    assert generation_lead == expected_lead
+    if step <= 4:
+        assert step + generation_lead <= 5
+    assert buffer_age == expected_buffer_age
+
+
+def test_async_ppo_warmup_window_is_disabled_without_critic_warmup():
+    from nemo_rl.algorithms.ppo import (
+        _async_ppo_buffer_max_age,
+        _async_ppo_generation_lead_steps,
+    )
+
+    assert (
+        _async_ppo_generation_lead_steps(
+            step=0,
+            policy_training_start_step=0,
+            max_trajectory_age_steps=1,
+            warmup_generation_lead_steps=4,
+        )
+        == 1
+    )
+    assert (
+        _async_ppo_buffer_max_age(
+            step=0,
+            policy_training_start_step=0,
+            max_trajectory_age_steps=1,
+            warmup_generation_lead_steps=4,
+        )
+        == 1
+    )
+
+
+def test_async_ppo_consumes_frozen_policy_rollout_at_safe_warmup_frontier():
+    """A rollout banked at version 0 remains usable through the W+A frontier."""
+    from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
+    from nemo_rl.algorithms.ppo import (
+        _async_ppo_buffer_max_age,
+        _async_ppo_generation_lead_steps,
+    )
+
+    policy_training_start_step = 2
+    max_trajectory_age_steps = 1
+    warmup_generation_lead_steps = 3
+    frontier = policy_training_start_step + max_trajectory_age_steps
+
+    assert (
+        _async_ppo_generation_lead_steps(
+            step=0,
+            policy_training_start_step=policy_training_start_step,
+            max_trajectory_age_steps=max_trajectory_age_steps,
+            warmup_generation_lead_steps=warmup_generation_lead_steps,
+        )
+        == frontier
+    )
+
+    buffer = ReplayBufferImpl(
+        max_size=4,
+        drop_incomplete_targets_on_restore=False,
+    )
+    frozen_rollout = {
+        "batch": {"data": "frozen-policy"},
+        "rollout_metrics": {},
+    }
+    assert (
+        buffer.add(
+            frozen_rollout,
+            weight_version=0,
+            target_weight_version=frontier,
+        )
+        == "success"
+    )
+
+    frontier_max_age = _async_ppo_buffer_max_age(
+        step=frontier,
+        policy_training_start_step=policy_training_start_step,
+        max_trajectory_age_steps=max_trajectory_age_steps,
+        warmup_generation_lead_steps=warmup_generation_lead_steps,
+    )
+    sample = buffer.sample(
+        num_prompt_groups=1,
+        current_weight_version=frontier,
+        max_age_steps=frontier_max_age,
+    )
+
+    assert sample is not None
+    assert sample["trajectories"] == [frozen_rollout]
+    assert sample["avg_trajectory_age"] == frontier
+    assert buffer.size() == 0
+
+
+def test_async_ppo_completed_resume_exits_before_actor_start(monkeypatch):
+    from nemo_rl.algorithms import ppo
+
+    config = _make_async_ppo_config()
+    config.ppo.max_num_steps = 10
+    config.ppo.max_num_epochs = -1
+    config.ppo.val_period = 0
+    config.ppo.val_at_start = False
+    config.ppo.val_at_end = False
+    config.ppo.num_prompts_per_step = 1
+    config.ppo.skip_reference_policy_logprobs_calculation = False
+    config.checkpointing = {
+        "checkpoint_must_save_by": None,
+        "ft_save_period": None,
+    }
+    policy = MagicMock()
+    generation = MagicMock()
+    generation.requires_kv_scale_sync = False
+    value_model = MagicMock()
+    checkpointer = MagicMock()
+    refit = MagicMock()
+    monkeypatch.setattr(ppo, "refit_policy_generation", refit)
+
+    ppo.async_ppo_train(
+        policy=policy,
+        policy_generation=generation,
+        value_model=value_model,
+        dataloader=[MagicMock()],
+        val_dataloader=None,
+        tokenizer=MagicMock(),
+        loss_fn=MagicMock(),
+        value_loss_fn=MagicMock(),
+        task_to_env={},
+        val_task_to_env=None,
+        logger=MagicMock(),
+        checkpointer=checkpointer,
+        ppo_save_state={
+            "total_steps": 10,
+            "consumed_samples": 10,
+            "current_epoch": 1,
+            "current_step": 0,
+            "total_valid_tokens": 0,
+        },
+        master_config=config,
+    )
+
+    refit.assert_not_called()
+    checkpointer.shutdown.assert_called_once()
+    generation.shutdown.assert_called_once()
+    policy.shutdown.assert_called_once()
+    value_model.shutdown.assert_called_once()
+
+
+def test_async_ppo_initial_refit_failure_cleans_up_actors(monkeypatch):
+    from unittest.mock import call
+
+    from nemo_rl.algorithms import async_utils, ppo
+
+    config = _make_async_ppo_config()
+    config.policy["make_sequence_length_divisible_by"] = 1
+    config.ppo.max_num_steps = 2
+    config.ppo.max_num_epochs = -1
+    config.ppo.val_period = 0
+    config.ppo.val_at_start = False
+    config.ppo.val_at_end = False
+    config.ppo.num_prompts_per_step = 1
+    config.ppo.max_rollout_turns = 1
+    config.ppo.skip_reference_policy_logprobs_calculation = False
+    config.ppo.adv_estimator = GAEConfig(name="raw_reward", normalize_advantages=False)
+    config.checkpointing = {
+        "checkpoint_must_save_by": None,
+        "ft_save_period": None,
+    }
+
+    replay_actor = MagicMock()
+    collector_actor = MagicMock()
+    replay_type = MagicMock()
+    replay_type.options.return_value.remote.return_value = replay_actor
+    collector_type = MagicMock()
+    collector_type.options.return_value.remote.return_value = collector_actor
+    monkeypatch.setattr(async_utils, "ReplayBuffer", replay_type)
+    monkeypatch.setattr(async_utils, "AsyncTrajectoryCollector", collector_type)
+    monkeypatch.setattr(
+        ppo,
+        "make_actor_runtime_env",
+        lambda _actor: {"py_executable": "/tmp/fake-venv/bin/python"},
+    )
+    monkeypatch.setattr(
+        ppo,
+        "refit_policy_generation",
+        MagicMock(side_effect=RuntimeError("initial refit failed")),
+    )
+    ray_kill = MagicMock()
+    monkeypatch.setattr(ppo.ray, "kill", ray_kill)
+
+    policy = MagicMock()
+    generation = MagicMock()
+    generation.requires_kv_scale_sync = False
+    value_model = MagicMock()
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = None
+
+    with pytest.raises(RuntimeError, match="initial refit failed"):
+        ppo.async_ppo_train(
+            policy=policy,
+            policy_generation=generation,
+            value_model=value_model,
+            dataloader=[MagicMock()],
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            value_loss_fn=MagicMock(),
+            task_to_env={},
+            val_task_to_env=None,
+            logger=MagicMock(),
+            checkpointer=checkpointer,
+            ppo_save_state={
+                "total_steps": 0,
+                "consumed_samples": 0,
+                "current_epoch": 0,
+                "current_step": 0,
+                "total_valid_tokens": 0,
+            },
+            master_config=config,
+        )
+
+    ray_kill.assert_has_calls(
+        [call(collector_actor), call(replay_actor)], any_order=True
+    )
+    checkpointer.shutdown.assert_called_once()
+    generation.shutdown.assert_called_once()
+    policy.shutdown.assert_called_once()
+    value_model.shutdown.assert_called_once()
+
+
+@pytest.mark.parametrize("async_engine", [False, True])
+def test_validate_dispatches_rollout_by_engine_mode(monkeypatch, async_engine):
+    from nemo_rl.algorithms import ppo
+
+    rollout_result = (
+        {
+            "total_reward": torch.tensor([1.0]),
+            "message_log": [[{"role": "assistant", "content": "ok"}]],
+        },
+        {"mean_gen_tokens_per_sample": 1.0},
+    )
+    async_rollout = MagicMock(return_value=rollout_result)
+    sync_rollout = MagicMock(return_value=rollout_result)
+    monkeypatch.setattr(ppo, "run_async_multi_turn_rollout", async_rollout)
+    monkeypatch.setattr(ppo, "run_multi_turn_rollout", sync_rollout)
+
+    config = _make_async_ppo_config()
+    config.policy["generation"]["vllm_cfg"]["async_engine"] = async_engine
+    config.policy["max_total_sequence_length"] = 16
+    config.ppo.max_val_samples = 1
+    config.ppo.val_batch_size = 1
+    config.ppo.max_rollout_turns = 1
+    config.logger = {"num_val_samples_to_print": 0}
+
+    ppo.validate(
+        policy_generation=MagicMock(),
+        val_dataloader=[MagicMock()],
+        tokenizer=MagicMock(),
+        val_task_to_env={},
+        step=1,
+        master_config=config,
+        logger=None,
+    )
+
+    selected_rollout = async_rollout if async_engine else sync_rollout
+    unselected_rollout = sync_rollout if async_engine else async_rollout
+    selected_rollout.assert_called_once()
+    unselected_rollout.assert_not_called()

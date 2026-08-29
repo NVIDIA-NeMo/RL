@@ -10,6 +10,8 @@ For the full list of supported models, see
 
 ## Families
 
+- **[GLM](glm/index.md)** — GLM-5.1 and GLM-5.2 GRPO recipes on the Megatron
+  backend, colocated and non-colocated with vLLM.
 - **[Nemotron](nemotron/index.md)** — post-training recipes for Nemotron 3
   Nano, Nano Omni, Super, Ultra, and Nemotron 3.5 Lightning, spanning the
   Megatron and AutoModel backends.
@@ -20,3 +22,11 @@ For the full list of supported models, see
 Other model-specific guides currently live directly under
 [Guides](../../index.md) (for example, [DeepSeek](../deepseek.md)) and are
 migrated into this hub as their guidance grows.
+
+```{toctree}
+:hidden:
+
+glm/index.md
+nemotron/index.md
+qwen/index.md
+```
