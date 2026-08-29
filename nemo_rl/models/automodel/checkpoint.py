@@ -18,6 +18,7 @@ for saving and loading model checkpoints in DTensor-based policy workers.
 """
 
 import os
+from dataclasses import fields, replace
 from typing import Any, Optional
 
 import torch
@@ -41,6 +42,18 @@ from transformers import AutoTokenizer
 
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.native_checkpoint import save_tokenizer_on_rank0
+
+
+_CHECKPOINTER_CONSTRUCTION_FIELDS = frozenset(
+    {
+        "consolidation_timeout_minutes",
+        "is_async",
+        "is_peft",
+        "model_save_format",
+        "save_consolidated",
+        "single_rank_consolidation",
+    }
+)
 
 
 def _normalize_supported_save_consolidated(
@@ -179,10 +192,6 @@ class AutomodelCheckpointManager:
         if config_updates is None:
             config_updates = {}
 
-        dp_rank = self._get_dp_rank()
-        tp_rank = self._get_tp_rank()
-        pp_rank = 0
-
         # Initialize a base config with sensible defaults
         base_cfg = AutomodelCheckpointingConfig(
             enabled=True,
@@ -195,6 +204,12 @@ class AutomodelCheckpointManager:
             ),
             is_peft=config_updates.get("is_peft", False),
             is_async=config_updates.get("is_async", False),
+            single_rank_consolidation=config_updates.get(
+                "single_rank_consolidation", False
+            ),
+            consolidation_timeout_minutes=config_updates.get(
+                "consolidation_timeout_minutes", 30
+            ),
             dequantize_base_checkpoint=config_updates.get(
                 "dequantize_base_checkpoint", False
             ),
@@ -203,13 +218,69 @@ class AutomodelCheckpointManager:
             ),
         )
         self.checkpoint_config = base_cfg
-        self.checkpointer = Checkpointer(
-            config=base_cfg,
-            dp_rank=dp_rank,
-            tp_rank=tp_rank,
-            pp_rank=pp_rank,
+        self.checkpointer = self._build_checkpointer(base_cfg)
+
+    def _build_checkpointer(self, config: AutomodelCheckpointingConfig) -> Checkpointer:
+        """Build an Automodel Checkpointer for this worker's mesh ranks."""
+        return Checkpointer(
+            config=config,
+            dp_rank=self._get_dp_rank(),
+            tp_rank=self._get_tp_rank(),
+            pp_rank=0,
             moe_mesh=self.moe_mesh,
         )
+
+    @staticmethod
+    def _updated_config(
+        config: AutomodelCheckpointingConfig,
+        config_updates: dict[str, Any],
+        checkpoint_root: Optional[str],
+    ) -> AutomodelCheckpointingConfig:
+        """Create and validate the prospective Automodel configuration."""
+        updates = dict(config_updates)
+        if checkpoint_root is not None:
+            updates["checkpoint_dir"] = checkpoint_root
+
+        model_save_format = updates.get("model_save_format", config.model_save_format)
+        if isinstance(model_save_format, SerializationFormat):
+            model_save_format = model_save_format.value
+        updates["model_save_format"] = model_save_format
+
+        if "save_consolidated" in updates:
+            updates["save_consolidated"] = _normalize_supported_save_consolidated(
+                updates["save_consolidated"]
+            )
+
+        updated_config = replace(config, **updates)
+        _normalize_supported_save_consolidated(updated_config.save_consolidated)
+        return updated_config
+
+    @staticmethod
+    def _requires_checkpointer_rebuild(
+        current_config: AutomodelCheckpointingConfig,
+        updated_config: AutomodelCheckpointingConfig,
+    ) -> bool:
+        """Return whether an update changes Checkpointer-owned resources."""
+        return any(
+            getattr(current_config, field_name) != getattr(updated_config, field_name)
+            for field_name in _CHECKPOINTER_CONSTRUCTION_FIELDS
+        )
+
+    @staticmethod
+    def _apply_config_in_place(
+        target: AutomodelCheckpointingConfig,
+        source: AutomodelCheckpointingConfig,
+    ) -> None:
+        """Copy a validated config while preserving Checkpointer references."""
+        for field in fields(source):
+            setattr(target, field.name, getattr(source, field.name))
+
+    def _replace_checkpointer(self, config: AutomodelCheckpointingConfig) -> None:
+        """Close the current Checkpointer and rebuild its owned resources."""
+        assert self.checkpointer is not None
+        self.checkpointer.close()
+        self.checkpointer = self._build_checkpointer(config)
+        self.checkpoint_config = config
 
     def update_checkpointer_config(
         self,
@@ -221,8 +292,9 @@ class AutomodelCheckpointManager:
         This method updates the mutable config fields on the existing Checkpointer instance.
         If no checkpointer exists, this method does nothing.
 
-        Note: Some config changes (like model_save_format) require rebuilding the
-        checkpointer's internal addons list. This method handles that automatically.
+        Checkpointer construction creates async stagers and dedicated process groups.
+        Changes to fields that own those resources close and rebuild the Checkpointer on
+        every rank. Other changes are copied onto the existing config after validation.
 
         Args:
             config_updates: Dict of CheckpointingConfig fields to update.
@@ -234,20 +306,16 @@ class AutomodelCheckpointManager:
         if config_updates is None:
             config_updates = {}
 
-        cfg = self.checkpointer.config
-        if checkpoint_root is not None:
-            cfg.checkpoint_dir = checkpoint_root
-        for k, v in config_updates.items():
-            if k == "model_save_format":
-                # Ensure enum type
-                v = SerializationFormat[v.upper()] if isinstance(v, str) else v
-            elif k == "save_consolidated":
-                # Automodel normalizes legacy bools/strings to SaveConsolidatedMode in
-                # CheckpointingConfig.__post_init__, which setattr bypasses. Without this
-                # a bool True would silently compare unequal to SaveConsolidatedMode.EVERY
-                # and disable consolidated HF export.
-                v = _normalize_supported_save_consolidated(v)
-            setattr(cfg, k, v)
+        assert self.checkpoint_config is not None
+        cfg = self.checkpoint_config
+        updated_cfg = self._updated_config(cfg, config_updates, checkpoint_root)
+
+        if self._requires_checkpointer_rebuild(cfg, updated_cfg):
+            self._replace_checkpointer(updated_cfg)
+            return
+
+        self._apply_config_in_place(cfg, updated_cfg)
+        self.checkpoint_config = cfg
 
         # Rebuild _addons list based on updated config
         # This is necessary because _addons is populated during __init__ based on config
@@ -260,7 +328,7 @@ class AutomodelCheckpointManager:
         When config changes (e.g., model_save_format or is_peft), we need to rebuild
         the addons list to match the new config.
         """
-        if self.checkpointer is None:
+        if self.checkpointer is None or self.checkpoint_config is None:
             return
 
         from nemo_automodel.components.checkpoint.addons import (
@@ -272,9 +340,9 @@ class AutomodelCheckpointManager:
         )
 
         self.checkpointer._addons = []
-        if _should_write_hf_metadata(self.checkpointer.config):
+        if _should_write_hf_metadata(self.checkpoint_config):
             self.checkpointer._addons.append(ConsolidatedHFAddon())
-        if self.checkpointer.config.is_peft:
+        if self.checkpoint_config.is_peft:
             self.checkpointer._addons.append(PeftAddon())
 
     def finalize_async_save(self) -> None:
@@ -346,6 +414,8 @@ class AutomodelCheckpointManager:
                 "model_cache_dir",
                 "model_repo_id",
                 "is_async",
+                "single_rank_consolidation",
+                "consolidation_timeout_minutes",
                 "dequantize_base_checkpoint",
             }
         }
