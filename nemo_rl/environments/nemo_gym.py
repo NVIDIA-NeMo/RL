@@ -55,6 +55,11 @@ from nemo_rl.experience.failures import (
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
+from nemo_rl.utils.routed_experts_ref import (
+    is_routed_experts_ref,
+    slice_routed_experts_ref,
+    validate_routed_experts_ref,
+)
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
@@ -1070,6 +1075,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         batch_decode_items = []
+        routed_experts_ref_items = 0
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -1117,33 +1123,71 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 )
 
             routed_experts = None
+            routed_experts_ref = None
             if routed_experts_raw is not None:
-                routed_experts_dtype = _ROUTED_EXPERTS_DTYPES[
-                    self.cfg.get("routed_experts_dtype", "int16")
-                ]
-                routed_experts = decode_routed_experts(
-                    routed_experts_raw, dtype=routed_experts_dtype
-                )
-                if routed_experts.dim() != 3:
-                    raise ValueError(
-                        "NeMo Gym returned routed_experts with invalid shape. "
-                        "Expected [tokens, num_moe_layers, topk], got "
-                        f"{tuple(routed_experts.shape)}."
-                    )
                 expected_tokens = len(prompt_token_ids) + len(generation_token_ids)
-                if routed_experts.shape[0] < expected_tokens:
-                    raise ValueError(
-                        "NeMo Gym returned too few routed_experts rows for a "
-                        "trainable output item: "
-                        f"routes={routed_experts.shape[0]}, expected_at_least="
-                        f"{expected_tokens}."
+                if is_routed_experts_ref(routed_experts_raw):
+                    routed_experts_ref = validate_routed_experts_ref(routed_experts_raw)
+                    routed_experts_ref_items += 1
+                    if routed_experts_ref_items > 1 or seen_token_ids:
+                        raise NotImplementedError(
+                            "router_replay.transport=ray currently supports "
+                            "one routed-experts-bearing model output per sample. "
+                            "Multi-turn prompt/generation reference splitting is "
+                            "deferred."
+                        )
+                    if (
+                        routed_experts_ref["offset"] != 0
+                        or routed_experts_ref["length"]
+                        != routed_experts_ref["shape"][0]
+                    ):
+                        raise ValueError(
+                            "NeMo Gym expects the vLLM boundary to return one "
+                            "full routed-experts object reference."
+                        )
+                    if routed_experts_ref["shape"][0] < expected_tokens:
+                        raise ValueError(
+                            "NeMo Gym returned too few routed-experts rows for a "
+                            "trainable output item: "
+                            f"routes={routed_experts_ref['shape'][0]}, "
+                            f"expected_at_least={expected_tokens}."
+                        )
+                else:
+                    routed_experts_dtype = _ROUTED_EXPERTS_DTYPES[
+                        self.cfg.get("routed_experts_dtype", "int16")
+                    ]
+                    routed_experts = decode_routed_experts(
+                        routed_experts_raw, dtype=routed_experts_dtype
                     )
+                    if routed_experts.dim() != 3:
+                        raise ValueError(
+                            "NeMo Gym returned routed_experts with invalid shape. "
+                            "Expected [tokens, num_moe_layers, topk], got "
+                            f"{tuple(routed_experts.shape)}."
+                        )
+                    if routed_experts.shape[0] < expected_tokens:
+                        raise ValueError(
+                            "NeMo Gym returned too few routed_experts rows for a "
+                            "trainable output item: "
+                            f"routes={routed_experts.shape[0]}, expected_at_least="
+                            f"{expected_tokens}."
+                        )
                 if log_training_sample:
+                    route_shape = (
+                        routed_experts_ref["shape"]
+                        if routed_experts_ref is not None
+                        else routed_experts.shape
+                    )
+                    route_dtype = (
+                        routed_experts_ref["dtype"]
+                        if routed_experts_ref is not None
+                        else str(routed_experts.dtype).removeprefix("torch.")
+                    )
                     output_item_dict["routed_experts"] = (
                         _popped_training_value_sentinel(
                             field="routed_experts",
-                            dtype=str(routed_experts.dtype).removeprefix("torch."),
-                            shape=routed_experts.shape,
+                            dtype=route_dtype,
+                            shape=route_shape,
                         )
                     )
             elif self.cfg.get("require_routed_experts", False):
@@ -1174,6 +1218,12 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             }
             if routed_experts is not None:
                 user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
+            elif routed_experts_ref is not None:
+                user_message["routed_experts"] = slice_routed_experts_ref(
+                    routed_experts_ref,
+                    offset=prompt_start,
+                    length=prompt_end - prompt_start,
+                )
             nemo_rl_message_log.append(user_message)
 
             if processor is not None:
@@ -1217,6 +1267,12 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 assistant_message["routed_experts"] = routed_experts[
                     generation_start:generation_end
                 ]
+            elif routed_experts_ref is not None:
+                assistant_message["routed_experts"] = slice_routed_experts_ref(
+                    routed_experts_ref,
+                    offset=generation_start,
+                    length=generation_end - generation_start,
+                )
             nemo_rl_message_log.append(assistant_message)
 
             seen_token_ids.extend(new_prompt_token_ids)

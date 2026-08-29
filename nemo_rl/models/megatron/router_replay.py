@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import uuid
 from collections.abc import Iterable
 from functools import wraps
 from typing import Any, Optional
@@ -30,6 +31,7 @@ from nemo_rl.utils.r3_trace import (
     trace_router_replay_action,
     trace_router_replay_assignment,
 )
+from nemo_rl.utils.routed_experts_ref import ROUTED_EXPERTS_REF_TRANSPORT
 
 _ROUTER_REPLAY_VALIDATE_ENV = "NRL_ROUTER_REPLAY_VALIDATE"
 _MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
@@ -38,6 +40,50 @@ _MISSING_ROUTE_FALLBACK_PATCH_ATTR = "_nrl_missing_route_fallback_patch"
 
 def router_replay_enabled(config: PolicyConfig) -> bool:
     return bool((config.get("router_replay") or {}).get("enabled", False))
+
+
+def router_replay_transport(config: PolicyConfig) -> str:
+    return str((config.get("router_replay") or {}).get("transport", "inline"))
+
+
+def validate_router_replay_transport_path(
+    config: PolicyConfig,
+    *,
+    data_plane_enabled: bool,
+    async_grpo_enabled: bool,
+    nemo_gym_enabled: bool,
+) -> None:
+    """Reject transport/backend combinations that are not implemented yet."""
+    if (
+        router_replay_enabled(config)
+        and router_replay_transport(config) == ROUTED_EXPERTS_REF_TRANSPORT
+        and data_plane_enabled
+    ):
+        # TODO: Let TQ schemas carry opaque route-reference tags and resolve them
+        # in the selected policy microbatch, without materializing on the driver.
+        raise NotImplementedError(
+            "policy.router_replay.transport=ray is not supported with "
+            "data_plane.enabled=true yet. Use transport=inline for the existing "
+            "TransferQueue routing-replay path, or set data_plane.enabled=false "
+            "for the Ray-reference path."
+        )
+    if not (
+        router_replay_enabled(config)
+        and router_replay_transport(config) == ROUTED_EXPERTS_REF_TRANSPORT
+    ):
+        return
+    if not async_grpo_enabled:
+        raise NotImplementedError(
+            "policy.router_replay.transport=ray currently requires async GRPO; "
+            "its weight-version GC is tied to completion of an async optimizer "
+            "step."
+        )
+    if not nemo_gym_enabled:
+        raise NotImplementedError(
+            "policy.router_replay.transport=ray currently requires "
+            "env.should_use_nemo_gym=true because tags are emitted by the vLLM "
+            "Chat Completions endpoint."
+        )
 
 
 def configure_vllm_for_router_replay(config: PolicyConfig) -> None:
@@ -49,6 +95,15 @@ def configure_vllm_for_router_replay(config: PolicyConfig) -> None:
     vllm_kwargs = generation.setdefault("vllm_kwargs", {})
     vllm_kwargs["enable_return_routed_experts"] = True
 
+    if router_replay_transport(config) == ROUTED_EXPERTS_REF_TRANSPORT:
+        router_replay = config["router_replay"]
+        run_instance_id = router_replay.setdefault(
+            "_store_run_instance_id", uuid.uuid4().hex
+        )
+        vllm_cfg = generation.setdefault("vllm_cfg", {})
+        vllm_cfg["_routed_experts_transport"] = ROUTED_EXPERTS_REF_TRANSPORT
+        vllm_cfg["_routed_experts_store_run_instance_id"] = run_instance_id
+
 
 def validate_router_replay_config(config: PolicyConfig) -> None:
     if not router_replay_enabled(config):
@@ -56,11 +111,24 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
 
     generation = config.get("generation") or {}
     megatron_cfg = config.get("megatron_cfg") or {}
+    transport = router_replay_transport(config)
+
+    if transport not in {"inline", ROUTED_EXPERTS_REF_TRANSPORT}:
+        raise ValueError(
+            f"router_replay.transport must be 'inline' or 'ray', got {transport!r}."
+        )
 
     if generation.get("backend") != "vllm":
         raise ValueError("router_replay.enabled requires vLLM generation.")
     if not megatron_cfg.get("enabled", False):
         raise ValueError("router_replay.enabled requires the Megatron policy backend.")
+    if transport == ROUTED_EXPERTS_REF_TRANSPORT and not (
+        generation.get("vllm_cfg") or {}
+    ).get("async_engine", False):
+        raise ValueError(
+            "router_replay.transport=ray currently requires the vLLM "
+            "async engine used by the NeMo-Gym chat endpoint."
+        )
 
     vpp_size = megatron_cfg.get("virtual_pipeline_model_parallel_size")
     if vpp_size not in (None, 1):

@@ -40,6 +40,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.environments.nemo_gym import (
     ExternalServiceReadinessConfig,
+    NEMO_GYM_POPPED_VALUE_SENTINEL_KEY,
     NemoGym,
     NemoGymConfig,
     _wait_for_external_services,
@@ -47,6 +48,7 @@ from nemo_rl.environments.nemo_gym import (
     extract_external_service_readiness,
     extract_reward_components,
     setup_nemo_gym_config,
+    should_log_nemo_gym_training_samples,
     validate_reward_components_match_scalar,
 )
 from nemo_rl.environments.nemo_gym_video import (
@@ -65,6 +67,12 @@ from nemo_rl.experience.rollouts import (
     attach_static_multimodal_payload,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+from nemo_rl.utils.routed_experts_ref import (
+    ROUTED_EXPERTS_REF_DTYPE,
+    ROUTED_EXPERTS_REF_KEY,
+    ROUTED_EXPERTS_REF_SCHEMA,
+)
 
 # cluster and tokenizer are fixture imports
 from tests.unit.models.generation.test_vllm_generation import (
@@ -1262,6 +1270,133 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
+
+
+def test_nemo_gym_training_sample_replaces_large_values_with_sentinels():
+    routes = torch.arange(3 * 2 * 2, dtype=torch.int16).reshape(3, 2, 2)
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3],
+                    "generation_log_probs": [-0.1],
+                    "routed_experts": encode_routed_experts(routes),
+                },
+                {
+                    # Empty generations are skipped for training, but their
+                    # large response fields must still be omitted from logging.
+                    "prompt_token_ids": [9, 10],
+                    "generation_token_ids": [],
+                    "generation_log_probs": [],
+                    "routed_experts": encode_routed_experts(routes[:2]),
+                },
+            ]
+        },
+        "responses_create_params": {"input": []},
+        "reward": 1.0,
+    }
+
+    class _Tokenizer:
+        def batch_decode(self, batch):
+            return ["decoded"] * len(batch)
+
+    class _MockSelf:
+        cfg = {"routed_experts_dtype": "int16"}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(),
+            {},
+            nemo_gym_result,
+            _Tokenizer(),
+            log_training_sample=True,
+        )
+    )
+
+    output_item = result["full_result"]["response"]["output"][0]
+    expected = {
+        "prompt_token_ids": ("int64", [2]),
+        "generation_token_ids": ("int64", [1]),
+        "generation_log_probs": ("float32", [1]),
+        "routed_experts": ("int16", [3, 2, 2]),
+    }
+    for field, (dtype, shape) in expected.items():
+        sentinel = output_item[field]
+        assert sentinel[NEMO_GYM_POPPED_VALUE_SENTINEL_KEY] is True
+        assert sentinel["field"] == field
+        assert sentinel["dtype"] == dtype
+        assert sentinel["shape"] == shape
+
+    skipped_output_item = result["full_result"]["response"]["output"][1]
+    assert skipped_output_item["prompt_token_ids"]["shape"] == [2]
+    assert skipped_output_item["generation_token_ids"]["shape"] == [0]
+    assert skipped_output_item["generation_log_probs"]["shape"] == [0]
+    assert skipped_output_item["routed_experts"]["shape"] == [2, 2, 2]
+
+    # The omitted values still drive the actual policy message log.
+    assert result["message_log"][0]["token_ids"].tolist() == [1, 2]
+    assert result["message_log"][1]["token_ids"].tolist() == [3]
+    assert torch.equal(result["message_log"][1]["routed_experts"], routes[2:])
+
+
+def test_nemo_gym_postprocess_keeps_ray_routes_as_two_views_of_one_object():
+    full_ref = {
+        "schema": ROUTED_EXPERTS_REF_SCHEMA,
+        "store": "store-a",
+        "store_instance_id": "instance-a",
+        "request_id": "request-a",
+        "key": ROUTED_EXPERTS_REF_KEY,
+        "task_index": 7,
+        "rollout_index": 2,
+        "target_weight_version": 4,
+        "offset": 0,
+        "length": 3,
+        "shape": [3, 2, 2],
+        "dtype": ROUTED_EXPERTS_REF_DTYPE,
+    }
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3],
+                    "generation_log_probs": [-0.1],
+                    "routed_experts": full_ref,
+                }
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+    class _Tokenizer:
+        def batch_decode(self, batch):
+            return ["decoded"] * len(batch)
+
+    class _MockSelf:
+        cfg = {"require_routed_experts": True}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    prompt_ref = result["message_log"][0]["routed_experts"]
+    generation_ref = result["message_log"][1]["routed_experts"]
+    assert prompt_ref == full_ref | {"offset": 0, "length": 2}
+    assert generation_ref == full_ref | {"offset": 2, "length": 1}
+
+
+def test_nemo_gym_training_sample_logging_config_defaults_off():
+    assert should_log_nemo_gym_training_samples({}) is False
+    assert should_log_nemo_gym_training_samples({"nemo_gym": {}}) is False
+    assert (
+        should_log_nemo_gym_training_samples(
+            {"nemo_gym": {"log_training_samples": True}}
+        )
+        is True
+    )
 
 
 @pytest.mark.parametrize("include_initial_multimodal_data", [False, True])

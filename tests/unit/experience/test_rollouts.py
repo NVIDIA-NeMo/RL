@@ -35,6 +35,9 @@ from nemo_rl.data.multimodal_utils import (
     attach_image_model_inputs_to_message,
     image_to_data_url,
 )
+from nemo_rl.data.nemo_gym_sample_artifacts import (
+    NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY,
+)
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -46,6 +49,10 @@ from nemo_rl.environments.games.sliding_puzzle import (
 )
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
+)
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutTimeouts,
@@ -1946,10 +1953,9 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     monkeypatch.setattr(
         rollouts_mod,
         "collect_multimodal_payload_metrics",
-        lambda payload, boundary, enabled: payload_calls.append(
-            (payload, boundary, enabled)
-        )
-        or {},
+        lambda payload, boundary, enabled: (
+            payload_calls.append((payload, boundary, enabled)) or {}
+        ),
     )
     monkeypatch.setattr(
         rollouts_mod, "print_multimodal_payload_metrics", lambda metrics: None
@@ -1983,6 +1989,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
             log_full_result_tables=False,
             deduplicate_multimodal_data=True,
             debug_payload_metrics=True,
+            target_weight_version=27,
         ):
             results.append(result)
             if len(results) == 1:
@@ -1999,6 +2006,8 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     assert boundary == "nemo_gym_request"
     assert enabled is True
     assert ray_arguments[0] is rows
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 0, 1]
+    assert [row[NEMO_GYM_TARGET_WEIGHT_VERSION_KEY] for row in rows] == [27] * 4
     # (rows, timer_prefix, deduplicate_multimodal_data) -- the tokenizer is no longer
     # among the arguments crossing to the actor, which is the point of set_tokenizer.
     assert ray_arguments[2:] == (True,)
@@ -2058,10 +2067,23 @@ def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group():
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
-def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
+@pytest.mark.parametrize("log_training_samples", [False, True])
+def test_postprocess_nemo_gym_group_returns_task_index(
+    log_full_result_tables, log_training_samples
+):
     rows = [
-        {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
-        {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
+        {
+            "agent_ref": {"name": "agent"},
+            "_ng_task_index": 42,
+            "_ng_rollout_index": 0,
+            "_rowidx": 0,
+        },
+        {
+            "agent_ref": {"name": "agent"},
+            "_ng_task_index": 42,
+            "_ng_rollout_index": 1,
+            "_rowidx": 1,
+        },
     ]
     results = []
     for reward in (1.0, 2.0):
@@ -2099,6 +2121,7 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
         input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=log_full_result_tables,
+        log_training_samples=log_training_samples,
     )
 
     assert rollout_result.task_index == 42
@@ -2106,6 +2129,13 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
+    assert (
+        NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY in rollout_result.final_batch
+    ) is log_training_samples
+    if log_training_samples:
+        samples = rollout_result.final_batch[NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY]
+        assert [sample["_ng_rollout_index"] for sample in samples] == [0, 1]
+        assert [sample["full_result"]["reward"] for sample in samples] == [1.0, 2.0]
 
 
 def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):

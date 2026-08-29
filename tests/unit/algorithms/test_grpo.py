@@ -49,6 +49,7 @@ from nemo_rl.algorithms.grpo import (
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
     _startup_pipeline_ready,
+    _take_nemo_gym_training_samples_for_log,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
@@ -70,6 +71,9 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.nemo_gym_sample_artifacts import (
+    NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -258,6 +262,32 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
+
+
+def test_take_nemo_gym_training_samples_detaches_selected_snapshots():
+    full_results = [{"reward": 1.0}, {"reward": 2.0}]
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([1.0, 0.0]),
+            "mask_sample": torch.tensor([False, True]),
+            "total_reward": torch.tensor([1.0, 2.0]),
+            "truncated": torch.tensor([False, True]),
+            NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY: [
+                {"full_result": full_results[0], "_ng_rollout_index": 0},
+                {"full_result": full_results[1], "_ng_rollout_index": 1},
+            ],
+        }
+    )
+
+    samples = _take_nemo_gym_training_samples_for_log(repeated_batch, enabled=True)
+
+    assert NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY not in repeated_batch
+    assert samples is not None
+    assert samples == [
+        {"full_result": full_results[0], "_ng_rollout_index": 0},
+        {"full_result": full_results[1], "_ng_rollout_index": 1},
+    ]
+    assert all("training" not in sample for sample in samples)
 
 
 def test_initial_policy_generation_stale() -> None:

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -45,7 +45,7 @@ def _as_routed_experts_tensor(
     # global G_ROUTED_EXPERTS_RANGE_CHECKED
     tensor = torch.as_tensor(value, device=device)
     if False:
-    # if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
+        # if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
         max_id = int(tensor.max())
         limit = torch.iinfo(dtype).max
         if max_id > limit:
@@ -243,6 +243,9 @@ def attach_routed_experts_to_chat_response_choices(
     device: torch.device,
     logger: Any = None,
     routed_experts_dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
+    routed_experts_ref_factory: Optional[
+        Callable[[torch.Tensor], dict[str, Any]]
+    ] = None,
 ) -> Any:
     """Attach aligned routed experts to OpenAI chat response choices."""
     outputs_by_index = {
@@ -253,6 +256,13 @@ def attach_routed_experts_to_chat_response_choices(
     )
 
     choices = list(getattr(response, "choices", []))
+    if routed_experts_ref_factory is not None and (
+        len(choices) != 1 or choices[0].index != 0
+    ):
+        raise RuntimeError(
+            "Ray-reference router replay currently requires exactly one chat "
+            "choice with index 0."
+        )
     attached_choice_indices = set()
     for choice in choices:
         generation_details = outputs_by_index.get(choice.index)
@@ -295,13 +305,16 @@ def attach_routed_experts_to_chat_response_choices(
                 r3_stats["actual_routes"],
                 r3_stats["expected_routes"],
             )
-        # Base64 envelope instead of .tolist(): nested JSON int lists cost
-        # ~1s of CPU per serialize/parse hop at long context lengths and get
-        # re-validated at every gym HTTP hop; a single string passes through
-        # the gym chain opaquely.
-        choice.message.routed_experts = encode_routed_experts(
-            routed_experts.to(dtype=routed_experts_dtype)
-        )
+        if routed_experts_ref_factory is not None:
+            choice.message.routed_experts = routed_experts_ref_factory(routed_experts)
+        else:
+            # Base64 envelope instead of .tolist(): nested JSON int lists cost
+            # ~1s of CPU per serialize/parse hop at long context lengths and get
+            # re-validated at every gym HTTP hop; a single string passes through
+            # the gym chain opaquely.
+            choice.message.routed_experts = encode_routed_experts(
+                routed_experts.to(dtype=routed_experts_dtype)
+            )
 
     if len(attached_choice_indices) != len(choices):
         missing_choice_indices = sorted(

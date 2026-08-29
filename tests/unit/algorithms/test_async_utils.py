@@ -2930,6 +2930,9 @@ class TestAsyncTrajectoryCollector:
             "stop_token_ids": [1],
             "stop_strings": ["stop"],
         }
+        collector.master_config.env.setdefault("nemo_gym", {})[
+            "log_training_samples"
+        ] = True
         target_weight = 15
         collector._generating_targets.add(target_weight)
         repeated_batch = BatchedDataDict(
@@ -2957,6 +2960,8 @@ class TestAsyncTrajectoryCollector:
             assert kwargs["generation_config"]["stop_token_ids"] is None
             assert kwargs["generation_config"]["stop_strings"] is None
             assert kwargs["log_full_result_tables"] is False
+            assert kwargs["target_weight_version"] == target_weight
+            assert kwargs["log_training_samples"] is True
             rollout_calls += 1
             yield _rollout_result(7)
             if rollout_calls == 1:
