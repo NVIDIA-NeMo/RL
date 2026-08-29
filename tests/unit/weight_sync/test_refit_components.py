@@ -210,6 +210,16 @@ def test_component_plan_digest_includes_mesh_shape_and_misc_metadata() -> None:
     assert component_plan_digest(first) != component_plan_digest(second)
 
 
+@pytest.mark.parametrize("placements", [None, "replicate"])
+def test_component_plan_digest_rejects_invalid_placements(placements: object) -> None:
+    refit_info = _native_refit_info()
+    component = refit_info["per_layer_params"]["model.layers.0"][0]["components"][0]
+    component["src_placements"] = placements
+
+    with pytest.raises(ValueError, match="refit placements must be a sequence"):
+        component_plan_digest(refit_info)
+
+
 def test_native_mxfp8_param_names_requires_canonical_dtype_pair() -> None:
     refit_info = _native_refit_info()
 
