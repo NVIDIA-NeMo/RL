@@ -1044,15 +1044,101 @@ matchers:
 
         _apply_precision_config(model_cfg, config, torch.bfloat16)
 
-        assert model_cfg.quant_recipe.match_to_config_key(
-            MatchContext("decoder.layers.3.mlp.experts.linear_fc1", 3)
-        ) == "mxfp8"
-        assert model_cfg.quant_recipe.match_to_config_key(
-            MatchContext("decoder.layers.3.self_attention.linear_qkv", 3)
-        ) == "bf16"
+        assert (
+            model_cfg.quant_recipe.match_to_config_key(
+                MatchContext("decoder.layers.3.mlp.experts.linear_fc1", 3)
+            )
+            == "mxfp8"
+        )
+        assert (
+            model_cfg.quant_recipe.match_to_config_key(
+                MatchContext("decoder.layers.3.self_attention.linear_qkv", 3)
+            )
+            == "bf16"
+        )
         assert model_cfg.first_last_layers_bf16 is True
         assert model_cfg.num_layers_at_start_in_bf16 == 0
         assert model_cfg.num_layers_at_end_in_bf16 == 8
+
+    def test_specializes_final_bf16_recipe_matchers_for_pipeline_local_names(
+        self, tmp_path
+    ):
+        """Only the last PP rank maps its local tail to the global BF16 tail."""
+        from megatron.core.quantization.quant_config import MatchContext
+        from megatron.core.quantization.utils import load_quantization_recipe
+
+        from nemo_rl.models.megatron.quantization_recipe import (
+            _specialize_first_last_bf16_quant_recipe,
+        )
+
+        recipe_path = tmp_path / "routed-experts.yaml"
+        recipe_path.write_text(
+            """\
+configs:
+  bf16:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      override_quantized_autocast: true
+  mxfp8:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      fp8_quantization_recipe: mxfp8
+      fp8_param: true
+      override_quantized_autocast: true
+matchers:
+  routed_fc1:
+    config: mxfp8
+    type: glob
+    pattern: "*mlp.experts.linear_fc1"
+    enabled: true
+  all_other_modules:
+    config: bf16
+    type: glob
+    pattern: "*"
+    enabled: true
+"""
+        )
+
+        rank_zero_recipe = load_quantization_recipe(recipe_path)
+        rank_one_recipe = load_quantization_recipe(recipe_path)
+        model_cfg = SimpleNamespace(
+            first_last_layers_bf16=True,
+            num_layers=52,
+            num_layers_at_start_in_bf16=0,
+            num_layers_at_end_in_bf16=8,
+        )
+
+        model_cfg.quant_recipe = rank_zero_recipe
+        _specialize_first_last_bf16_quant_recipe(
+            model_cfg, global_layer_offset=0, local_layer_count=26
+        )
+        assert (
+            rank_zero_recipe.match_to_config_key(
+                MatchContext("decoder.layers.18.mlp.experts.linear_fc1", 18)
+            )
+            == "mxfp8"
+        )
+
+        model_cfg.quant_recipe = rank_one_recipe
+        _specialize_first_last_bf16_quant_recipe(
+            model_cfg, global_layer_offset=26, local_layer_count=26
+        )
+        assert (
+            rank_one_recipe.match_to_config_key(
+                MatchContext("decoder.layers.17.mlp.experts.linear_fc1", 17)
+            )
+            == "mxfp8"
+        )
+        for local_layer in range(18, 26):
+            assert (
+                rank_one_recipe.match_to_config_key(
+                    MatchContext(
+                        f"decoder.layers.{local_layer}.mlp.experts.linear_fc1",
+                        local_layer,
+                    )
+                )
+                == "bf16"
+            )
 
     def test_resolves_te_recipe_relative_to_repo_root(self, tmp_path, monkeypatch):
         """Ray workers can load repo-relative recipes from another cwd."""
