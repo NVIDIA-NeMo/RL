@@ -404,7 +404,8 @@ class TestGenerateAndPushFlow:
         assert buf.commit_calls[0][0] == group_id
 
     def test_reservation_persists_the_resolved_agent_recovery_policy(self):
-        mgr = _make_manager(_FakeBuffer(), _FakeImpl())
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl())
         mgr._rollout_recovery_config = RolloutRecoveryConfig(
             agent_granularity_overrides={
                 "genrm_agent": RecoveryGranularity.PROMPT_GROUP
@@ -417,11 +418,28 @@ class TestGenerateAndPushFlow:
             "extra_env_info": {"agent_ref": {"name": "genrm_agent"}},
         }
 
-        group_id = mgr.reserve_prompt_group(prompt, target_step=0)
+        group_id = _with_cut(
+            buf,
+            lambda cut: mgr.reserve_prompt_group(cut, prompt, target_step=0),
+        )
         group = mgr.recovery_ledger.get_group(group_id)
 
         assert group.agent_name == "genrm_agent"
         assert group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+
+    def test_recovery_mutation_requires_the_controller_barrier(self):
+        mgr = _make_manager(_FakeBuffer(), _FakeImpl())
+        mgr._data_plane_checkpoint_barrier = None
+
+        async def mutate() -> None:
+            async with mgr._recovery_mutation():
+                pass
+
+        with pytest.raises(
+            RuntimeError,
+            match="must be bound to the SingleController data-plane checkpoint barrier",
+        ):
+            _run(mutate())
 
     def test_skipped_tracked_prompt_remains_owned_for_controller_handoff(self):
         async def _fail_rollout(_sample):

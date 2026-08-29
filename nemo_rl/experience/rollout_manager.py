@@ -1356,7 +1356,7 @@ class RolloutManager:
         self._rollout_recovery_config = rollout_recovery_config
         self._tq_buffer = tq_buffer
         self._recovery_ledger = RolloutRecoveryLedger()
-        self._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         self._env_handles = task_to_env
         self._weight_version: int = 0
         # Run-wide, shared across concurrent generate_and_push calls. Safe as a plain
@@ -1381,12 +1381,22 @@ class RolloutManager:
         self, barrier: DataPlaneCheckpointBarrier
     ) -> None:
         """Join streamed sibling transitions to the SC snapshot barrier."""
+        if self._data_plane_checkpoint_barrier is not None:
+            raise RuntimeError(
+                "RolloutManager data-plane checkpoint barrier is already bound"
+            )
         self._data_plane_checkpoint_barrier = barrier
 
     @asynccontextmanager
     async def _recovery_mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
         """Serialize short lineage transitions with native TQ snapshots."""
-        async with self._data_plane_checkpoint_barrier.mutation() as cut:
+        barrier = self._data_plane_checkpoint_barrier
+        if barrier is None:
+            raise RuntimeError(
+                "RolloutManager must be bound to the SingleController data-plane "
+                "checkpoint barrier before mutating rollout recovery state"
+            )
+        async with barrier.mutation() as cut:
             yield cut
 
     def reserve_prompt_group(
@@ -1868,13 +1878,12 @@ class RolloutManager:
             finally:
                 if inflight_registry is not None:
                     inflight_registry.pop(group_id, None)
-            async with self._recovery_mutation():
-                (
-                    physical_rollout_ids,
-                    canonical_sample_ids,
-                    receipts,
-                    rewards,
-                ) = self._recovery_ledger.finalization_inputs(group_id)
+            (
+                physical_rollout_ids,
+                canonical_sample_ids,
+                receipts,
+                rewards,
+            ) = self._recovery_ledger.finalization_inputs(group_id)
             request = FinalizationRequest(
                 group_id=group_id,
                 prompt_idx=int(recovery_group.prompt_id),
