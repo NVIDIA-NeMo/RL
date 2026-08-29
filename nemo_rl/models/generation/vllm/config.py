@@ -66,6 +66,11 @@ class VllmSpecificArgs(TypedDict):
     cap_max_tokens_to_context: NotRequired[bool]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
+    # Deprecated in 0.8. Use quantization_ignore_patterns instead.
+    quantization_ignored_layer_kws: NotRequired[list[str]]
+    # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
+    # Supports exact names, substrings, and fnmatch wildcards.
+    quantization_ignore_patterns: NotRequired[list[str]]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]

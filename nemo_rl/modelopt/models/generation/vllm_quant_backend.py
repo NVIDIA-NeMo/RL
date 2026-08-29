@@ -38,6 +38,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         "v_bmm_quantizer._amax",
     )
 
+    def _supports_unquantized_flashinfer_trtllm_refit(self) -> bool:
+        return False
+
     def maybe_init_zmq(self) -> None:
         """Use a longer timeout only for ModelOpt real-quant refits."""
         super().maybe_init_zmq()

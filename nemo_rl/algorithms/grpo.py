@@ -57,6 +57,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
+    WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
@@ -130,6 +131,17 @@ from nemo_rl.models.megatron.router_replay import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.instrumentation import (
+    Bucket,
+    bucket_scope,
+    current_trace_carrier,
+    efficiency_span,
+    managed_span,
+    trace_fn,
+)
+from nemo_rl.telemetry.setup import get_telemetry_handle
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
     Logger,
@@ -374,10 +386,16 @@ class GRPOSaveState:
     total_steps: int
     total_valid_tokens: int  # Track total number of non-padding tokens during training
     val_reward: float  # May be removed when no validation metrics are available
+    # SC may advance the policy version independently from the optimizer-step
+    # counter. None preserves compatibility with checkpoints predating it.
+    trainer_version: Optional[int] = None
     # SingleController only: name of the sampler that wrote the replay buffer,
     # used to gate the SC buffer restore. None on checkpoints from the other
     # algorithms and from SC runs that predate this field.
     sampler_name: Optional[str] = None
+    # SingleController only: exact last admitted dispatch batch. None preserves
+    # compatibility with checkpoints that only recorded the trainer version.
+    sampler_dispatch_index: Optional[int] = None
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:
@@ -388,7 +406,9 @@ def _initial_grpo_save_state() -> GRPOSaveState:
         total_steps=0,
         total_valid_tokens=0,
         val_reward=-99999999.0,
+        trainer_version=None,
         sampler_name=None,
+        sampler_dispatch_index=None,
     )
 
 
@@ -423,6 +443,7 @@ class MasterConfig(BaseModel, extra="allow"):
     reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: Optional[DataPlaneConfig] = None
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
+    telemetry: Optional[TelemetryConfig] = None
 
 
 # ===============================================================================
@@ -1180,18 +1201,26 @@ def setup(
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
-        # When the user opts into recompute-after-refit on the megatron side,
-        # override mcore's kv_cache_management_mode to "recompute" directly.
+    # Megatron generation expresses recompute-after-refit engine-side via
+    # `kv_cache_management_mode="recompute"`; the loop-level flag must agree.
+    if generation_config["backend"] == "megatron":
         async_grpo_config = grpo_config.async_grpo
-        if async_grpo_config.recompute_kv_cache_after_weight_updates:
-            mcore_cfg = policy_config["generation"]["mcore_generation_config"]
-            prior_mode = mcore_cfg.get("kv_cache_management_mode", "persist")
-            if prior_mode != "recompute":
-                print(
-                    f"kv_cache_management_mode overridden '{prior_mode}' -> 'recompute' by "
-                    f"grpo.async_grpo.recompute_kv_cache_after_weight_updates=True."
-                )
-            mcore_cfg["kv_cache_management_mode"] = "recompute"
+        recompute_kv_cache = bool(
+            async_grpo_config is not None
+            and async_grpo_config.recompute_kv_cache_after_weight_updates
+        )
+        kv_cache_mode = generation_config["mcore_generation_config"][
+            "kv_cache_management_mode"
+        ]
+        if recompute_kv_cache != (kv_cache_mode == "recompute"):
+            raise ValueError(
+                "grpo.async_grpo.recompute_kv_cache_after_weight_updates="
+                f"{recompute_kv_cache} conflicts with policy.generation."
+                f"mcore_generation_config.kv_cache_management_mode={kv_cache_mode!r}: "
+                "with policy.generation.backend='megatron' the two must agree. "
+                "Either set the flag to true with kv_cache_management_mode="
+                "'recompute', or leave the flag false with 'persist'/'offload'."
+            )
 
     # Define initialization functions that will be used in all paths
     init_reference_model = loss_config.reference_policy_kl_penalty > 0
@@ -1268,11 +1297,38 @@ def setup(
             cluster=None if colocated_inference else inference_cluster,
             policy=policy if colocated_inference else None,
             processor=processor,
-            weights_path=weights_path,
             skip_weight_load=not colocated_inference,
             reserved_http_server_port=reserved_http_server_port,
         )
         return mg, time.perf_counter() - t0
+
+    def init_megatron_weight_synchronizer(
+        policy: ColocatablePolicyInterface,
+        policy_generation: MegatronGeneration,
+    ) -> None:
+        """Initialize Megatron weight synchronizer.
+
+        For non-colocated inference, also performs the initial weight sync.
+        """
+        t0 = time.perf_counter()
+        weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend="megatron",
+            colocated=colocated_inference,
+            train_cluster=train_cluster,
+            inference_cluster=None if colocated_inference else inference_cluster,
+        )
+        policy_generation.weight_synchronizer = weight_synchronizer
+        weight_synchronizer.init_communicator()
+        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
+        if not colocated_inference:
+            # The skip-load inference engine gets its final weight buffers here.
+            # Its first prepare_for_generation also starts the HTTP server only after the refit,
+            # so CUDA graphs can capture those persistent buffers.
+            t0 = time.perf_counter()
+            weight_synchronizer.sync_weights()
+            setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
 
     def initialize_generation_with_policy(
         init_generation_fn,
@@ -1349,41 +1405,55 @@ def setup(
             setup_timing_metrics.generation_init_reserve_time_s = reserve_time
             print(f"  ✓ Reserved Megatron server URL: {reserved_url}", flush=True)
 
-            def init_megatron_stack():
-                """Init policy then generation; rank 0 holds the reserved port."""
-                p, policy_t = init_policy(
-                    reserved_http_server_port=reserved_http_server_port
-                    if colocated_inference
-                    else None
-                )
-                pg, gen_t = init_megatron_generation(
-                    p,
-                    reserved_http_server_port=None
-                    if colocated_inference
-                    else reserved_http_server_port,
-                )
-                return p, policy_t, pg, gen_t
-
             def init_nemo_gym():
                 """Spin up NeMo Gym servers against the reserved URL."""
                 return _spinup_nemo_gym([reserved_url], generation_config["model_name"])
 
-            init_tasks = {
-                "megatron": init_megatron_stack,
-                "nemo_gym": init_nemo_gym,
-            }
-            print(f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}", flush=True)
+            # Exactly one task adopts the reserved port: the policy when colocated
+            # (generation wraps it), else the dedicated generation policy.
+            policy_port, generation_port = (
+                (reserved_http_server_port, None)
+                if colocated_inference
+                else (None, reserved_http_server_port)
+            )
+
+            def init_megatron_generation_task(policy_future):
+                """Colocated generation waits; non-colocated inits in parallel."""
+                if colocated_inference:
+                    p, _ = policy_future.result()
+                    return init_megatron_generation(p)
+                return init_megatron_generation(
+                    reserved_http_server_port=generation_port
+                )
+
+            print("  ⚡ Init tasks: policy, megatron_generation, nemo_gym", flush=True)
+            init_tasks_t0 = time.perf_counter()
             try:
-                with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
-                    submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
-                    results = {k: f.result() for k, f in submitted.items()}
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    policy_future = executor.submit(
+                        init_policy, reserved_http_server_port=policy_port
+                    )
+                    generation_future = executor.submit(
+                        init_megatron_generation_task, policy_future
+                    )
+                    nemo_gym_future = executor.submit(init_nemo_gym)
+                    policy, policy_time = policy_future.result()
+                    policy_generation, megatron_gen_time = generation_future.result()
+                    if not colocated_inference:
+                        setup_timing_metrics.parallel_wall_time_s = (
+                            time.perf_counter() - init_tasks_t0
+                        )
+                        setup_timing_metrics.parallel_init_enabled = 1.0
+                        # NeMo Gym probes the pre-published endpoint before its future completes.
+                        # A skip-load Megatron endpoint starts only during this initial refit,
+                        # so it must happen while Gym is waiting rather than after it resolves.
+                        init_megatron_weight_synchronizer(policy, policy_generation)
+                    nemo_gym_actor, nemo_gym_time = nemo_gym_future.result()
             finally:
                 ray.kill(port_holder)
 
-            policy, policy_time, policy_generation, megatron_gen_time = results[
-                "megatron"
-            ]
-            nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
+            if colocated_inference:
+                setup_timing_metrics.parallel_init_enabled = 0.0
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.generation_init_time_s = (
                 reserve_time + megatron_gen_time
@@ -1391,20 +1461,21 @@ def setup(
             setup_timing_metrics.generation_init_load_time_s = megatron_gen_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
-            served_urls = policy_generation.dp_openai_server_base_urls
-            if served_urls != [reserved_url]:
-                raise RuntimeError(
-                    "Megatron server came up at a different address than the one "
-                    f"pre-published to NeMo Gym: reserved {reserved_url}, serving {served_urls}."
-                )
         else:
-            # Initialize training first so checkpoint conversion completes before inference starts.
-            policy, policy_time = init_policy()
-            setup_timing_metrics.policy_init_time_s = policy_time
+            if not colocated_inference:
+                policy_generation, policy = initialize_generation_with_policy(
+                    init_megatron_generation,
+                    colocated_inference,
+                    setup_timing_metrics,
+                )
+            else:
+                # Colocated generation wraps the training policy.
+                policy, policy_time = init_policy()
+                setup_timing_metrics.policy_init_time_s = policy_time
 
-            # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
-            policy_generation, megatron_gen_time = init_megatron_generation(policy)
-            setup_timing_metrics.generation_init_time_s = megatron_gen_time
+                policy_generation, megatron_gen_time = init_megatron_generation(policy)
+                setup_timing_metrics.generation_init_time_s = megatron_gen_time
+                setup_timing_metrics.parallel_init_enabled = 0.0
 
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
@@ -1580,9 +1651,6 @@ def setup(
             setup_timing_metrics=setup_timing_metrics,
         )
 
-        # Capture rollout TP size on the policy once; refit calls no longer need it.
-        policy.set_rollout_num_gpus_per_engine(policy_generation.num_gpus_per_engine)
-
         print(
             f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
             flush=True,
@@ -1673,25 +1741,16 @@ def setup(
         )
 
     if backend == "megatron":
-        t0 = time.perf_counter()
-        policy_generation.weight_synchronizer = create_weight_synchronizer(
-            policy=policy,
-            generation=policy_generation,
-            generation_backend=backend,
-            colocated=colocated_inference,
-            train_cluster=train_cluster,
-            inference_cluster=None if colocated_inference else inference_cluster,
-        )
-        policy_generation.weight_synchronizer.init_communicator()
-        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
-        if not colocated_inference:
-            # Load the model weights now.
-            t0 = time.perf_counter()
-            policy_generation.weight_synchronizer.sync_weights()
-            setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
+        if policy_generation.weight_synchronizer is None:
+            init_megatron_weight_synchronizer(policy, policy_generation)
+        if enable_nemo_gym:
+            MegatronGeneration.verify_served_address(
+                policy_generation.dp_openai_server_base_urls, reserved_url
+            )
     # if it is not colocated inference, initialize collective communication for update weights
     elif (
         not colocated_inference
+        and backend != "sglang"
         and remote_transport is None
         and checkpoint_engine_config is None
     ):
@@ -1763,6 +1822,21 @@ def setup(
         print(
             f"Using checkpoint-engine refit backend: {checkpoint_engine_config['backend']}",
             flush=True,
+        )
+    elif backend == "sglang":
+        t0 = time.perf_counter()
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+        )
+        # Only exchanges refit metadata. SGLang's own weight-update group is
+        # established lazily on the first refit.
+        policy_generation.weight_synchronizer.init_communicator()
+        setup_timing_metrics.extras["sglang_weight_sync_init_time_s"] = (
+            time.perf_counter() - t0
         )
     else:
         if getattr(
@@ -2476,9 +2550,21 @@ def refit_policy_generation(
     Returns:
         Scalar metrics reported by the selected weight synchronizer.
     """
+    # Every SGLang deployment reaches its refit through this hook: `setup`
+    # attaches an SGLang synchronizer that owns the whole lifecycle (phase
+    # transitions, engine recovery, pause/flush, transport), so SGLang never
+    # touches the branches below.
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
+
+    if isinstance(policy_generation, SGLangGeneration):
+        # Fail loudly rather than falling through to the vLLM branches, which
+        # would call methods the SGLang path does not implement.
+        raise RuntimeError(
+            "SGLang refits require policy_generation.weight_synchronizer to be "
+            "set. Attach one with create_weight_synchronizer(...) during setup."
+        )
 
     if colocated_inference:
         policy.offload_before_refit()
@@ -2505,36 +2591,21 @@ def refit_policy_generation(
                     policy.get_free_memory_bytes() * float(memory_ratio)
                 )
 
-            if isinstance(policy_generation, SGLangGeneration):
-                # Stream weights to colocated SGLang engines via CUDA IPC over HTTP.
-                futures_train = policy.stream_weights_via_http(
-                    rollout_engine_urls=policy_generation.get_rollout_engine_urls(),
-                    buffer_size_bytes=buffer_size_bytes,
-                )
-                # Wait for all workers to complete
-                ray.get(futures_train)
-                update_success = True
-            else:
-                # ZMQ IPC path: shared by vLLM and TRT-LLM colocated. Trainer
-                # streams CUDA IPC handles in chunks; receiver reconstructs
-                # tensors in-place and feeds them into the inference engine's
-                # loader.
-                futures_train = policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes,
-                    kv_scales=kv_scales,
-                )
-                futures_inference = policy_generation.update_weights_via_ipc_zmq()
-                # wait for all futures to complete
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
-                update_success = all(result for result in results if result is not None)
+            # ZMQ IPC path: shared by vLLM and TRT-LLM colocated. Trainer
+            # streams CUDA IPC handles in chunks; receiver reconstructs
+            # tensors in-place and feeds them into the inference engine's
+            # loader.
+            futures_train = policy.stream_weights_via_ipc_zmq(
+                buffer_size_bytes=buffer_size_bytes,
+                kv_scales=kv_scales,
+            )
+            futures_inference = policy_generation.update_weights_via_ipc_zmq()
+            # wait for all futures to complete
+            ray.get(futures_train)
+            results = ray.get(futures_inference)
+            update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl (vLLM) or megatron reshard
-            # SGLang haven't implemented non-colocated inference mode.
-            if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
-                )
+            # update weights through nccl (vLLM)
             futures_train = policy.broadcast_weights_for_collective(
                 kv_scales=kv_scales,
             )
@@ -2821,6 +2892,7 @@ def _validation_early_stop_message(
     )
 
 
+@trace_fn(RLSpanGroup.JOB, "rl.grpo.job")
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -2838,6 +2910,8 @@ def grpo_train(
 ) -> None:
     """Run GRPO training algorithm."""
     timer = Timer(context={"worker": "driver"})
+    _telemetry = get_telemetry_handle()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -2971,10 +3045,25 @@ def grpo_train(
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
 
-            with timer.time("total_step_time"):
+            with (
+                timer.time("total_step_time"),
+                managed_span(
+                    RLSpanGroup.STEP,
+                    "rl.grpo.step",
+                    tracer=_tracer,
+                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                ),
+            ):
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
-                with timer.time("data_processing"):
+                with (
+                    timer.time("data_processing"),
+                    managed_span(
+                        RLSpanGroup.DATA_PROCESSING,
+                        "rl.grpo.data_processing",
+                        tracer=_tracer,
+                    ),
+                ):
                     if (
                         master_config.grpo.deduplicate_multimodal_data
                         and should_use_nemo_gym(master_config)
@@ -3068,7 +3157,17 @@ def grpo_train(
                     policy_generation, "snapshot_step_metrics"
                 ):
                     policy_generation.snapshot_step_metrics()
-                with timer.time("generation"):
+                with (
+                    timer.time("generation"),
+                    managed_span(
+                        RLSpanGroup.ROLLOUT,
+                        "rl.grpo.generation",
+                        tracer=_tracer,
+                        **{
+                            "rl.num_generations_per_prompt": master_config.grpo.num_generations_per_prompt,
+                        },
+                    ),
+                ):
                     # Clear logger metrics for each generation step
                     if policy_generation is not None:
                         policy_generation.clear_logger_metrics()
@@ -3175,7 +3274,12 @@ def grpo_train(
                 # Calculate rewards & advantages
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
                 print("▶ Processing rewards...,", flush=True)
-                with timer.time("reward_calculation"):
+                with (
+                    timer.time("reward_calculation"),
+                    managed_span(
+                        RLSpanGroup.REWARD, "rl.grpo.reward_calculation", tracer=_tracer
+                    ),
+                ):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
 
@@ -3274,7 +3378,14 @@ def grpo_train(
                     del baseline
                     del std
 
-                with timer.time("data_processing"):
+                with (
+                    timer.time("data_processing"),
+                    managed_span(
+                        RLSpanGroup.DATA_PROCESSING,
+                        "rl.grpo.data_processing",
+                        tracer=_tracer,
+                    ),
+                ):
                     use_overlong_filtering = master_config.grpo.overlong_filtering
                     if use_overlong_filtering:
                         loss_multiplier = repeated_batch["loss_multiplier"].clone()
@@ -3355,7 +3466,14 @@ def grpo_train(
                         policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
-                with timer.time("policy_and_reference_logprobs"):
+                with (
+                    timer.time("policy_and_reference_logprobs"),
+                    managed_span(
+                        RLSpanGroup.LOGPROB,
+                        "rl.grpo.policy_and_reference_logprobs",
+                        tracer=_tracer,
+                    ),
+                ):
                     # Custom create this logprob_data so we avoid Ray comm overheads sending unused data to workers.
                     logprob_data = BatchedDataDict[ClippedPGLossDataDict](
                         {
@@ -3426,7 +3544,14 @@ def grpo_train(
                         ] = seq_logprob_error_metrics.pop("num_masked_seqs")
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
-                with timer.time("advantage_calculation"):
+                with (
+                    timer.time("advantage_calculation"),
+                    managed_span(
+                        RLSpanGroup.ADVANTAGE,
+                        "rl.grpo.advantage_calculation",
+                        tracer=_tracer,
+                    ),
+                ):
                     print("▶ Computing advantages...", flush=True)
                     # Get token-level mask: token_mask * sample_mask
                     token_mask = train_data["token_mask"]
@@ -3471,7 +3596,15 @@ def grpo_train(
                     POLICY_GENERATION_STALE = True
 
                 print("▶ Training policy...", flush=True)
-                with timer.time("policy_training"):
+                with (
+                    timer.time("policy_training"),
+                    managed_span(
+                        RLSpanGroup.POLICY_UPDATE,
+                        "rl.grpo.policy_training",
+                        tracer=_tracer,
+                        **{"rl.iteration": total_steps + 1},
+                    ),
+                ):
                     train_results = policy.train(
                         train_data,
                         loss_fn,
@@ -3708,7 +3841,14 @@ def grpo_train(
                                 metrics_source[metric_name],
                             )
 
-                    with timer.time("checkpointing"):
+                    with (
+                        timer.time("checkpointing"),
+                        managed_span(
+                            RLSpanGroup.CHECKPOINT,
+                            "rl.grpo.checkpointing",
+                            tracer=_tracer,
+                        ),
+                    ):
                         # Finalize the previous (possibly async) checkpoint before
                         # starting a new one. No-op with sync save / nothing pending.
                         checkpointer.finalize_pending()
@@ -3966,7 +4106,26 @@ def validate(
         return {}, {}
 
     timer = Timer(context={"worker": "validator"})
-    with timer.time("total_validation_time"):
+    _telemetry = get_telemetry_handle()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
+    with (
+        timer.time("total_validation_time"),
+        managed_span(
+            RLSpanGroup.EVALUATE,
+            "rl.grpo.evaluate",
+            tracer=_tracer,
+            **{"rl.step": step},
+        ),
+        # Validation generates through the same path as training rollouts, but
+        # its tokens are scored and thrown away — no weights advance. Without
+        # this the generate spans below land in productive and a validation
+        # pass reads as goodput. Effective on the sync rollout path, which is
+        # where those spans exist; async validation goes through
+        # generate_async, which carries no span yet (see the coverage gaps in
+        # nemo_rl/telemetry/README.md). The scope is set regardless so it
+        # applies as soon as that path is instrumented.
+        bucket_scope(Bucket.OVERHEAD),
+    ):
         print(f"▶ Starting validation at step {step}...", flush=True)
         # >= 1 is validated in setup().
         val_num_generations_per_prompt = (
@@ -4202,6 +4361,7 @@ def aggregate_rollout_metrics(
     return aggregated
 
 
+@trace_fn(RLSpanGroup.JOB, "rl.grpo.job")
 def async_grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -4283,6 +4443,8 @@ def async_grpo_train(
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
     timer = Timer(context={"worker": "driver"})
+    _telemetry = get_telemetry_handle()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
     training_wall_start = time.perf_counter()
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
@@ -4475,8 +4637,15 @@ def async_grpo_train(
             **os.environ,
             "VIRTUAL_ENV": _tc_py_venv,
             "UV_PROJECT_ENVIRONMENT": _tc_py_venv,
+            # Names this actor's spans the way RayWorkerGroup names its groups'.
+            "NRL_WORKER_GROUP": "trajectory_collector",
         },
     }
+
+    # Captured inside rl.grpo.job, so the collector's spans join this run's
+    # trace instead of starting their own roots. Empty unless the job group is
+    # enabled (per_step omits it) — see docs/observability/span-groups.md.
+    _tc_trace_carrier = current_trace_carrier()
 
     # Initialize trajectory collector with synchronized collection
     trajectory_collector = AsyncTrajectoryCollector.options(
@@ -4492,8 +4661,28 @@ def async_grpo_train(
         alias_to_group_alias=alias_to_group_alias,
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
         processor=processor,
+        trace_carrier=_tc_trace_carrier,
         **collector_start_kwargs,
     )
+
+    def _flush_collector_telemetry() -> None:
+        """Export the collector's buffered spans before the actor is reaped.
+
+        ``ray.kill`` runs no atexit handler, so whatever the span processor has
+        not sent yet goes with the actor -- including the last rollout batches
+        of the run. Every path that reaps the collector needs this, not only the
+        normal one, and collection is already running by the time this is
+        defined. The timeout covers the callee's quiesce budget *plus* its 5s
+        export; too short and it gives up mid-export, dropping the very spans
+        it exists to save.
+        """
+        try:
+            ray.get(
+                trajectory_collector.flush_telemetry.remote(quiesce_timeout_s=3.0),
+                timeout=15,
+            )
+        except Exception as e:
+            print(f"Error flushing trajectory collector telemetry: {e}")
 
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, "
@@ -4517,6 +4706,7 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
+            _flush_collector_telemetry()
             return
     else:
         print("🔄 Preparing policy generation for inference...")
@@ -4528,6 +4718,7 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
+            _flush_collector_telemetry()
             return
 
     # Generation must hold the policy's real weights before any backend starts
@@ -4598,6 +4789,7 @@ def async_grpo_train(
             # generation; the remaining actors are reaped when the driver
             # exits right after this return.
             checkpointer.shutdown()
+            _flush_collector_telemetry()
             try:
                 ray.kill(trajectory_collector)
             except Exception as e:
@@ -4690,7 +4882,9 @@ def async_grpo_train(
         wait_iterations += 1
         time.sleep(1.0)
 
-    timer.stop("init/total")
+    # Retained because the per-step timer.reset() below discards it; the
+    # efficiency snapshot re-supplies it every step.
+    init_total_s = timer.stop("init/total")
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
@@ -4708,7 +4902,15 @@ def async_grpo_train(
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
-            with timer.time("total_step_time"):
+            with (
+                timer.time("total_step_time"),
+                managed_span(
+                    RLSpanGroup.STEP,
+                    "rl.grpo.step",
+                    tracer=_tracer,
+                    **{"rl.iteration": step + 1},
+                ),
+            ):
                 num_mask_sample_filtered = 0
 
                 # Sample trajectories from replay buffer
@@ -4803,7 +5005,10 @@ def async_grpo_train(
                                 f"Increase data.train.max_num_epochs or use a larger dataset."
                             )
 
-                        with timer.time("idle/buffer_starvation"):
+                        with (
+                            timer.time("idle/buffer_starvation"),
+                            efficiency_span("idle/buffer_starvation", tracer=_tracer),
+                        ):
                             time.sleep(0.5)
                         continue
 
@@ -4886,7 +5091,12 @@ def async_grpo_train(
                     policy_generation.snapshot_step_metrics()
 
                 print("▶ Processing rewards...")
-                with timer.time("reward_calculation"):
+                with (
+                    timer.time("reward_calculation"),
+                    managed_span(
+                        RLSpanGroup.REWARD, "rl.grpo.reward_calculation", tracer=_tracer
+                    ),
+                ):
                     # Must precede prompt extraction: it reuses the same message
                     # dicts, so this also protects the prompt flatten below.
                     backfill_missing_routed_experts(repeated_batch["message_log"])
@@ -4913,7 +5123,14 @@ def async_grpo_train(
                     )
 
                 # Prepare training data (same as sync version)
-                with timer.time("data_processing"):
+                with (
+                    timer.time("data_processing"),
+                    managed_span(
+                        RLSpanGroup.DATA_PROCESSING,
+                        "rl.grpo.data_processing",
+                        tracer=_tracer,
+                    ),
+                ):
                     # Apply overlong filtering - mask out truncated sequences from loss computation
                     with timer.time("overlong_filter"):
                         use_overlong_filtering = master_config.grpo.overlong_filtering
@@ -4986,7 +5203,14 @@ def async_grpo_train(
                         policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
-                with timer.time("policy_and_reference_logprobs"):
+                with (
+                    timer.time("policy_and_reference_logprobs"),
+                    managed_span(
+                        RLSpanGroup.LOGPROB,
+                        "rl.grpo.policy_and_reference_logprobs",
+                        tracer=_tracer,
+                    ),
+                ):
                     if not skip_prev_logprobs:
                         train_data["prev_logprobs"] = policy.get_logprobs(
                             train_data, timer=timer
@@ -5035,7 +5259,14 @@ def async_grpo_train(
                     )
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
-                with timer.time("advantage_calculation"):
+                with (
+                    timer.time("advantage_calculation"),
+                    managed_span(
+                        RLSpanGroup.ADVANTAGE,
+                        "rl.grpo.advantage_calculation",
+                        tracer=_tracer,
+                    ),
+                ):
                     print("▶ Computing advantages...", flush=True)
                     # Get token-level mask: token_mask * sample_mask
                     token_mask = train_data["token_mask"]
@@ -5096,7 +5327,15 @@ def async_grpo_train(
                     POLICY_GENERATION_STALE = True
 
                 print("▶ Training policy...")
-                with timer.time("policy_training"):
+                with (
+                    timer.time("policy_training"),
+                    managed_span(
+                        RLSpanGroup.POLICY_UPDATE,
+                        "rl.grpo.policy_training",
+                        tracer=_tracer,
+                        **{"rl.iteration": step + 1},
+                    ),
+                ):
                     train_results = policy.train(
                         train_data,
                         loss_fn,
@@ -5145,41 +5384,45 @@ def async_grpo_train(
                         trajectory_collector.set_weight_version.remote(weight_version)
                     )
                 else:
-                    timer.start("idle/refit_bubble")
-
-                    # Measure pending-generation wait as exposed_generation time
-                    print("🔄 Coordinating with trajectory collector before refit...")
-                    with timer.time("exposed_generation"):
-                        ray.get(trajectory_collector.prepare_for_refit.remote())
-
-                    # Collect generation logger metrics for performance reporting
-                    # inflight batch sizes and num pending samples are collected from each worker
-                    # (colocated collects them before the engine sleeps for training).
-                    if generation_logger_metrics is None:
-                        generation_logger_metrics = (
-                            policy_generation.get_logger_metrics()
+                    # A context manager rather than start/stop, so the timer is
+                    # stopped and the span closed even if the refit raises.
+                    with (
+                        timer.time("idle/refit_bubble"),
+                        efficiency_span("idle/refit_bubble", tracer=_tracer),
+                    ):
+                        # Measure pending-generation wait as exposed_generation time
+                        print(
+                            "🔄 Coordinating with trajectory collector before refit..."
                         )
+                        with timer.time("exposed_generation"):
+                            ray.get(trajectory_collector.prepare_for_refit.remote())
 
-                    # Only the actual refit/weight transfer should be counted as weight_sync
-                    print("🔄 Performing policy generation refit...")
-                    with timer.time("weight_sync"):
-                        refit_metrics = refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
-                        )
-                        POLICY_GENERATION_STALE = False
-
-                        # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
-                        weight_version += 1
-                        ray.get(
-                            trajectory_collector.set_weight_version.remote(
-                                weight_version
+                        # Collect generation logger metrics for performance reporting
+                        # inflight batch sizes and num pending samples are collected from each worker
+                        # (colocated collects them before the engine sleeps for training).
+                        if generation_logger_metrics is None:
+                            generation_logger_metrics = (
+                                policy_generation.get_logger_metrics()
                             )
-                        )
-                        ray.get(trajectory_collector.resume_after_refit.remote())
 
-                    timer.stop("idle/refit_bubble")
+                        # Only the actual refit/weight transfer should be counted as weight_sync
+                        print("🔄 Performing policy generation refit...")
+                        with timer.time("weight_sync"):
+                            refit_metrics = refit_policy_generation(
+                                policy,
+                                policy_generation,
+                                colocated_inference,
+                            )
+                            POLICY_GENERATION_STALE = False
+
+                            # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
+                            weight_version += 1
+                            ray.get(
+                                trajectory_collector.set_weight_version.remote(
+                                    weight_version
+                                )
+                            )
+                            ray.get(trajectory_collector.resume_after_refit.remote())
 
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:
@@ -5210,6 +5453,13 @@ def async_grpo_train(
 
                 # Run validation if it's a validation step or last step with val_at_end
                 if should_run_validation:
+                    # Timer only, no efficiency_span: validate() accounts this
+                    # window as overhead (see the bucket_scope in validate), so
+                    # an idle-bucketed span over the same interval would both
+                    # contradict that label and, on the sync rollout path where
+                    # the generate spans below carry it, be double-counted by a
+                    # rollup that sums durations by rl.bucket. The metric has no
+                    # such hierarchy and stays correct.
                     with timer.time("idle/validation"):
                         # No-op on an already-running engine;
                         # wakes the colocated engine when it stayed asleep for a save-bound step.
@@ -5387,7 +5637,14 @@ def async_grpo_train(
                                 metrics_source[metric_name],
                             )
 
-                    with timer.time("checkpointing"):
+                    with (
+                        timer.time("checkpointing"),
+                        managed_span(
+                            RLSpanGroup.CHECKPOINT,
+                            "rl.grpo.checkpointing",
+                            tracer=_tracer,
+                        ),
+                    ):
                         # Finalize the previous (possibly async) checkpoint before
                         # starting a new one. No-op with sync save / nothing pending.
                         checkpointer.finalize_pending()
@@ -5579,21 +5836,28 @@ def async_grpo_train(
             )
             driver_efficiency = {
                 cat: timer.reduce(cat, "sum")
-                for cat in [
-                    "init/total",
-                    "idle/buffer_starvation",
-                    "idle/refit_bubble",
-                    "idle/validation",
-                ]
+                for cat in WALL_CLOCK_EFFICIENCY_CATEGORIES
                 if cat in timer._timers
             }
+            # init/total is measured once, before the loop, and the timer.reset()
+            # at the end of every step drops it -- so re-supply the captured
+            # value, or the series reports the real startup cost at step 1 and
+            # zero for the rest of the run.
+            driver_efficiency["init/total"] = init_total_s
             merged_efficiency = {**driver_efficiency}
             for cat, dur in collector_efficiency.items():
                 merged_efficiency[cat] = merged_efficiency.get(cat, 0.0) + dur
 
             total_wall_time = time.perf_counter() - training_wall_start
             efficiency_loggable = print_efficiency_summary(
-                merged_efficiency, total_wall_time, step + 1
+                merged_efficiency,
+                total_wall_time,
+                step + 1,
+                # The driver's idle categories are per-step (timer.reset()
+                # below), so the efficiency ratio needs a per-step denominator;
+                # against the run's elapsed time it would climb toward 100%
+                # whatever the idle time did.
+                step_wall_time_s=total_time,
             )
 
             if master_config.grpo.debug_payload_metrics and not should_run_validation:
@@ -5651,6 +5915,7 @@ def async_grpo_train(
             print(f"Error finalizing pending checkpoint: {e}")
 
         print("🛑 Stopping trajectory collection...")
+        _flush_collector_telemetry()
         try:
             ray.kill(trajectory_collector)
         except Exception as e:

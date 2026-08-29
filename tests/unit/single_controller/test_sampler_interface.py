@@ -27,19 +27,23 @@ import asyncio
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    CustomSamplerConfig,
     InOrderSampler,
     InOrderSamplerConfig,
     PromptGroupSampler,
     ReadyFirstSampler,
     ReadyFirstSamplerConfig,
     SamplerConfig,
+    TransactionalAdmissionSampler,
     WeightFifoSampler,
     WeightFifoSamplerConfig,
     WindowedSampler,
     WindowedSamplerConfig,
     create_sampler,
     required_buffer_capacity_for_config,
+    sampler_supports_buffer_checkpoint,
 )
 from nemo_rl.data_plane import KVBatchMeta
 
@@ -103,9 +107,37 @@ class TestBuiltinsImplementInterface:
     )
     def test_isinstance_protocol(self, sampler):
         assert isinstance(sampler, PromptGroupSampler)
+        assert isinstance(sampler, TransactionalAdmissionSampler)
 
 
 class TestAdmission:
+    def test_wait_does_not_advance_gated_dispatch_cursor(self):
+        sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+
+        _run(sampler.wait_until_admissible(trainer_version_fn=lambda: 0))
+
+        assert sampler.dispatch_index == -1
+
+        async def commit() -> int | None:
+            async with DataPlaneCheckpointBarrier().mutation() as cut:
+                return sampler.commit_admission(cut)
+
+        assert _run(commit()) == 0
+        assert sampler.dispatch_index == 0
+
+    def test_expired_cut_cannot_advance_gated_dispatch_cursor(self):
+        sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+
+        async def commit_after_cut_expires() -> None:
+            async with DataPlaneCheckpointBarrier().mutation() as cut:
+                pass
+
+            with pytest.raises(RuntimeError, match="no longer active"):
+                sampler.commit_admission(cut)
+
+        _run(commit_after_cut_expires())
+        assert sampler.dispatch_index == -1
+
     def test_windowed_never_gates_and_never_stamps(self):
         s = WindowedSampler(FakeBuffer(), max_staleness_versions=2)
         # trainer stuck at 0, but over-sampled admission returns immediately.
@@ -181,6 +213,23 @@ class TestInOrderEvictMatchesSelect:
 
 
 class TestFactory:
+    @pytest.mark.parametrize(
+        ("config", "expected"),
+        [
+            (WindowedSamplerConfig(), True),
+            (ReadyFirstSamplerConfig(), True),
+            (WeightFifoSamplerConfig(), True),
+            (InOrderSamplerConfig(), True),
+            (
+                CustomSamplerConfig(target=f"{__name__}:EchoSampler"),
+                False,
+            ),
+        ],
+    )
+    def test_capability_comes_from_sampler_class(self, config, expected):
+        assert sampler_supports_buffer_checkpoint(config) is expected
+        assert "supports_buffer_checkpoint" not in config.model_dump()
+
     def test_windowed_config_builds_windowed(self):
         s = create_sampler(
             FakeBuffer(), WindowedSamplerConfig(max_staleness_versions=3)
@@ -199,6 +248,26 @@ class TestFactory:
         )
         assert isinstance(s, WeightFifoSampler)
         assert s.max_staleness_versions == 4
+
+    def test_factory_rejects_dynamic_capability_before_construction(self):
+        PropertyCapabilitySampler.constructed = False
+        with pytest.raises(TypeError, match="boolean class attribute"):
+            create_sampler(
+                FakeBuffer(),
+                CustomSamplerConfig(
+                    target=f"{__name__}:PropertyCapabilitySampler",
+                ),
+            )
+        assert not PropertyCapabilitySampler.constructed
+
+    def test_custom_checkpoint_capability_is_discoverable_without_construction(self):
+        CheckpointingEchoSampler.constructed = False
+        assert sampler_supports_buffer_checkpoint(
+            CustomSamplerConfig(
+                target=f"{__name__}:CheckpointingEchoSampler",
+            )
+        )
+        assert not CheckpointingEchoSampler.constructed
 
     def test_ready_first_config_builds_ready_first_sampler(self):
         s = create_sampler(
@@ -324,12 +393,17 @@ class TestWarmupLookaheadWindow:
 
 
 class TestCustomFqnSampler:
+    def test_custom_target_must_be_a_class(self):
+        with pytest.raises(TypeError, match="not a class"):
+            create_sampler(
+                FakeBuffer(),
+                CustomSamplerConfig(
+                    target=f"{__name__}:NOT_A_SAMPLER_CLASS",
+                ),
+            )
+
     def test_custom_target_loads_out_of_repo_sampler(self):
         # A user sampler defined anywhere importable; here, this test module.
-        from nemo_rl.algorithms.async_utils.staleness_sampler import (
-            CustomSamplerConfig,
-        )
-
         s = create_sampler(
             FakeBuffer(),
             CustomSamplerConfig(
@@ -487,20 +561,19 @@ class TestDefaultEvictSkipsUnready:
 
 
 class TestDispatchCursorRestore:
-    """Checkpoint resume calls set_dispatch_index(current_step), restoring the
-    fresh-start invariant _dispatch_index == trainer_version - 1. Without it,
-    a restored InOrderSampler would stamp target_steps starting at 0 and every
-    dispatched batch would be instantly evicted (target < trainer_version)."""
+    """Checkpoint resume restores the exact last admitted dispatch batch."""
 
-    def test_resumed_in_order_stamps_from_trainer_version(self):
+    def test_resumed_in_order_stamps_after_exact_cursor(self):
         s = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
-        s.set_dispatch_index(7)
+        s.restore_dispatch_index(6)
+        assert s.dispatch_index == 6
         assert _run(s.admit(trainer_version_fn=lambda: 7)) == 7
         assert _run(s.admit(trainer_version_fn=lambda: 8)) == 8
+        assert s.dispatch_index == 8
 
     def test_resumed_gate_admits_window_then_blocks(self):
         s = WeightFifoSampler(FakeBuffer(), max_staleness_versions=0)
-        s.set_dispatch_index(7)
+        s.restore_dispatch_index(6)
         # Resumed at step 7, window 0: one batch admitted, then the gate
         # closes exactly as it would on a fresh run at step 0.
         assert _run(s.admit(trainer_version_fn=lambda: 7)) is None
@@ -512,13 +585,13 @@ class TestDispatchCursorRestore:
         s.set_dispatch_index(0)
         assert _run(s.admit(trainer_version_fn=lambda: 0)) == 0
 
-    def test_negative_resume_step_rejected(self):
-        with pytest.raises(ValueError, match="resume_from_step"):
-            WindowedSampler(FakeBuffer(), max_staleness_versions=1).set_dispatch_index(
-                -1
-            )
+    def test_dispatch_index_below_initial_value_rejected(self):
+        with pytest.raises(ValueError, match="dispatch_index"):
+            WindowedSampler(
+                FakeBuffer(), max_staleness_versions=1
+            ).restore_dispatch_index(-2)
 
-    def test_custom_fqn_sampler_supports_seeding(self):
+    def test_custom_fqn_sampler_supports_exact_restore(self):
         from nemo_rl.algorithms.async_utils.staleness_sampler import (
             CustomSamplerConfig,
         )
@@ -529,7 +602,7 @@ class TestDispatchCursorRestore:
                 target=f"{__name__}:EchoSampler", max_lookahead_versions=1
             ),
         )
-        s.set_dispatch_index(6)
+        s.restore_dispatch_index(5)
         assert _run(s.admit(trainer_version_fn=lambda: 6)) == 6
 
 
@@ -565,3 +638,30 @@ class TestInflightAbortPolicy:
 
 class EchoSampler(InOrderSampler):
     """Stand-in for a user-defined sampler loaded by FQN."""
+
+
+class CheckpointingEchoSampler(EchoSampler):
+    """Custom sampler with a static replay-checkpoint capability."""
+
+    supports_buffer_checkpoint = True
+    constructed = False
+
+    def __init__(self, *args, **kwargs) -> None:
+        type(self).constructed = True
+        super().__init__(*args, **kwargs)
+
+
+class PropertyCapabilitySampler:
+    """Invalid custom sampler whose capability requires construction."""
+
+    constructed = False
+
+    def __init__(self, *args, **kwargs) -> None:
+        type(self).constructed = True
+
+    @property
+    def supports_buffer_checkpoint(self) -> bool:
+        return True
+
+
+NOT_A_SAMPLER_CLASS = object()
