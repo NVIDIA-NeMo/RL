@@ -212,11 +212,13 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         rollout_ids,
         [receipt, None],  # second rollout lost its receipt -> placeholder
         [1.0, 0.0],
+        prompt_idx=17,
         fallback_weight_version=9,
     )
     assert not finalized.dropped
     assert finalized.meta is not None
     assert finalized.meta.sample_ids == rollout_ids
+    assert [tag["prompt_idx"] for tag in finalized.meta.tags] == [17, 17]
     # Group staleness comes from the valid rollout's calls (wv 4), not the fallback.
     assert (finalized.group_min_wv, finalized.group_max_wv) == (4, 4)
     assert finalized.metrics["finalize/invalid_row_rate"] == 0.5
@@ -265,6 +267,7 @@ def test_finalize_group_maps_physical_attempt_to_stable_canonical_id(
         [physical_id],
         [receipt],
         [1.0],
+        prompt_idx=17,
         fallback_weight_version=4,
         canonical_sample_ids=[canonical_id],
     )
@@ -283,6 +286,7 @@ def test_finalize_group_min_valid_fraction_drops(tq_client, partitions):
         rollout_ids,
         [None, None],
         [0.0, 0.0],
+        prompt_idx=17,
         fallback_weight_version=3,
     )
     assert finalized.dropped
@@ -434,6 +438,7 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
         rollout_ids,
         [receipt, None],  # second rollout -> placeholder
         [1.0, 0.0],
+        prompt_idx=17,
         fallback_weight_version=9,
     )
     assert not finalized.dropped
@@ -493,6 +498,7 @@ def test_finalize_group_router_replay_without_routes_fails_loudly(
             [rollout_id],
             [receipt.model_dump()],
             [1.0],
+            prompt_idx=17,
             fallback_weight_version=9,
         )
 
@@ -584,6 +590,7 @@ def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
         rollout_ids,
         [receipt, None],
         [1.0, 0.0],
+        prompt_idx=17,
         fallback_weight_version=9,
     )
 

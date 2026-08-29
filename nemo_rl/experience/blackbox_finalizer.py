@@ -506,6 +506,7 @@ class BlackboxFinalizer:
         receipts: list[Optional[dict[str, Any]]],
         rewards: list[float],
         *,
+        prompt_idx: int,
         fallback_weight_version: int,
         canonical_sample_ids: Optional[list[str]] = None,
     ) -> FinalizedGroup:
@@ -696,7 +697,10 @@ class BlackboxFinalizer:
                 rows, max_len=max_len, metrics=metrics
             )
         sample_ids, fields, tags = pack_payload(
-            train_batch, weight_version=group_min_wv, group_id=group_id
+            train_batch,
+            weight_version=group_min_wv,
+            group_id=group_id,
+            prompt_idx=prompt_idx,
         )
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
