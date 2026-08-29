@@ -771,7 +771,7 @@ def grpo_train_sync(
                     lm[driver_carry["truncated"]] = 0
                     driver_carry["loss_multiplier"] = lm
 
-                # Same order grpo.py uses (:3304-3314): overlong filtering,
+                # Same order grpo.py uses: overlong filtering,
                 # then the env flag. The two trainers are selected by
                 # ``data_plane.enabled`` alone, so an infrastructure switch
                 # must not change which samples reach the loss. Shares

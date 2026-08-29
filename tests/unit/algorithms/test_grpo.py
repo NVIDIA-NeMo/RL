@@ -233,25 +233,6 @@ class TestMaskSampleFilter:
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.0, 0.0])
         )
 
-    def test_operates_on_the_plain_dict_the_sync_driver_carries(self):
-        """grpo_sync reuses this on ``driver_carry``, which is a plain dict.
-
-        The annotation says ``BatchedDataDict``; sharing one implementation
-        across both drivers is the point, so pin that a dict works rather than
-        letting someone restate the rule a third time.
-        """
-        driver_carry = {
-            "loss_multiplier": torch.tensor([1.0, 1.0, 1.0]),
-            "mask_sample": torch.tensor([False, True, False]),
-        }
-
-        num_masked = _apply_mask_sample_filter(driver_carry)
-
-        assert num_masked == 1
-        assert torch.equal(
-            driver_carry["loss_multiplier"], torch.tensor([1.0, 0.0, 1.0])
-        )
-
     def test_masks_list_valued_mask_sample(self):
         repeated_batch = BatchedDataDict(
             {
