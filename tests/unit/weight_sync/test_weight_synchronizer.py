@@ -37,10 +37,10 @@ from nemo_rl.weight_sync.megatron_weight_synchronizer import (
     MegatronWeightSynchronizer,
 )
 from nemo_rl.weight_sync.nccl_reshard_utils import build_nccl_reshard_refit_info
-from nemo_rl.weight_sync.refit_components import component_plan_digest
 from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
     NcclReshardWeightSynchronizer,
 )
+from nemo_rl.weight_sync.refit_components import component_plan_digest
 from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
     SGLangDisaggregatedWeightSynchronizer,
