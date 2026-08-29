@@ -285,6 +285,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            original_seq_length=3,
         )
 
         data_iterator = iter([processed_mb])
@@ -319,6 +320,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            original_seq_length=3,
         )
 
         data_iterator = iter([processed_mb])
@@ -421,6 +423,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            original_seq_length=3,
         )
 
         cfg = {
@@ -465,6 +468,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            original_seq_length=3,
         )
 
         cfg = {
@@ -616,6 +620,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            original_seq_length=3,
         )
         post_processor = LogprobsPostProcessor(
             cfg={"sequence_packing": {"enabled": False}}
@@ -678,6 +683,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            original_seq_length=3,
         )
         post_processor = LogprobsPostProcessor(
             cfg={"sequence_packing": {"enabled": False}}
@@ -1203,27 +1209,31 @@ class TestLogprobsPostProcessor:
 
         mock_data_dict = MagicMock()
         mock_data_dict.__getitem__ = MagicMock(
-            return_value=torch.tensor([[1, 2, 3, 4, 5]])
+            return_value=torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0]])
         )
 
-        mock_logprobs = torch.randn(1, 4)  # One less than input length
+        mock_logprobs = torch.randn(1, 7)  # One less than padded input length
         mock_from_logits.return_value = mock_logprobs
 
         wrapped_fn = processor(
             data_dict=mock_data_dict,
-            input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
+            input_ids=torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0]]),
             cu_seqlens_padded=None,
+            original_seq_length=5,
         )
 
-        output_tensor = torch.randn(1, 5, 100)
+        output_tensor = torch.randn(1, 8, 100)
         loss, result = wrapped_fn(output_tensor)
 
         # Loss should be 0
         assert loss.item() == 0.0
         # Result should have logprobs key
         assert "logprobs" in result
-        # Logprobs should be prepended with a 0
-        assert result["logprobs"].shape[1] == 5
+        # Logprobs should be prepended with a 0 and dense padding removed
+        expected = torch.cat(
+            [torch.zeros_like(mock_logprobs[:, :1]), mock_logprobs], dim=1
+        )[:, :5]
+        assert torch.equal(result["logprobs"], expected)
 
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(
@@ -1258,6 +1268,7 @@ class TestLogprobsPostProcessor:
             data_dict=mock_data_dict,
             input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
             cu_seqlens_padded=torch.tensor([0, 5]),
+            original_seq_length=5,
         )
 
         output_tensor = torch.randn(1, 5, 100)
@@ -1292,27 +1303,27 @@ class TestTopkLogitsPostProcessor:
         mock_data_dict = MagicMock()
         mock_data_dict.__getitem__ = MagicMock(
             side_effect=lambda key: (
-                torch.tensor([[1, 2, 3, 4, 5]])
+                torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0]])
                 if key == "input_ids"
                 else torch.tensor([5])
             )
         )
 
-        mock_topk_vals = torch.randn(1, 5, k)
-        mock_topk_idx = torch.randint(0, 100, (1, 5, k))
+        mock_topk_vals = torch.randn(1, 8, k)
+        mock_topk_idx = torch.randint(0, 100, (1, 8, k))
         mock_topk.return_value = (mock_topk_vals, mock_topk_idx)
 
         wrapped_fn = processor(
             data_dict=mock_data_dict,
             cu_seqlens_padded=None,
+            original_seq_length=5,
         )
 
-        output_tensor = torch.randn(1, 5, 100)
+        output_tensor = torch.randn(1, 8, 100)
         loss, result = wrapped_fn(output_tensor)
 
-        assert "topk_logits" in result
-        assert "topk_indices" in result
-        assert result["topk_logits"].shape[-1] == k
+        assert torch.equal(result["topk_logits"], mock_topk_vals[:, :5])
+        assert torch.equal(result["topk_indices"], mock_topk_idx[:, :5])
 
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(
@@ -1353,6 +1364,7 @@ class TestTopkLogitsPostProcessor:
         wrapped_fn = processor(
             data_dict=mock_data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
+            original_seq_length=8,
         )
 
         output_tensor = torch.randn(1, 8, 100)
@@ -1397,7 +1409,11 @@ class TestTopkLogitsPostProcessor:
             torch.randint(0, 100, (1, 3, 5)),
         )
 
-        wrapped_fn = processor(data_dict=mock_data_dict, cu_seqlens_padded=None)
+        wrapped_fn = processor(
+            data_dict=mock_data_dict,
+            cu_seqlens_padded=None,
+            original_seq_length=3,
+        )
 
         output_tensor = torch.randn(1, 3, 100)
 
@@ -1457,6 +1473,7 @@ class TestTopkLogitsPostProcessor:
         wrapped_fn = processor(
             data_dict=mock_data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
+            original_seq_length=8,
         )
 
         output_tensor = torch.randn(1, local_seq_len, 100)
@@ -1527,6 +1544,7 @@ class TestTopkLogitsPostProcessor:
         wrapped_fn = processor(
             data_dict=mock_data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
+            original_seq_length=unpacked_seqlen,
         )
 
         output_tensor = torch.randn(1, local_packed_len, 100)

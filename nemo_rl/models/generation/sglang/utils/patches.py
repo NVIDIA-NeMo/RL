@@ -58,38 +58,6 @@ def _write_and_verify(
         )
 
 
-def _patch_sglang_file_replacements(
-    relative_path: str,
-    replacements: tuple[tuple[str, str, str], ...],
-    description: str,
-) -> None:
-    file_to_patch = _get_sglang_file(relative_path)
-
-    with open(file_to_patch, "r") as f:
-        content = f.read()
-
-    missing_replacements = [
-        (sentinel, anchor, replacement)
-        for sentinel, anchor, replacement in replacements
-        if sentinel not in content
-    ]
-    if not missing_replacements:
-        return
-
-    for sentinel, anchor, replacement in missing_replacements:
-        if anchor not in content:
-            raise RuntimeError(
-                f"{description} anchor for sentinel '{sentinel}' not found in "
-                f"{file_to_patch}."
-            )
-        content = content.replace(anchor, replacement, 1)
-
-    _write_and_verify(
-        file_to_patch, content, tuple(sentinel for sentinel, _, _ in replacements)
-    )
-    logger.info("Patched %s in %s.", description, file_to_patch)
-
-
 def _patch_sglang_safe_unpickler() -> None:
     file_to_patch = _get_sglang_file("srt/utils/common.py")
 
@@ -203,53 +171,8 @@ def _patch_megatron_training_hook_mode() -> None:
     _patch_megatron_hook_mode_in(file_path)
 
 
-def _patch_sglang_custom_all_reduce_v2_tms_cudagraph() -> None:
-    """Backport sglang#27948 for colocated TMS CUDA graph capture.
-
-    With ``SGLANG_MEMORY_SAVER_CUDA_GRAPH=true``, custom all-reduce v2 must
-    not flag the kernel as capturing. TMS replaces the IPC addresses during
-    capture, so the addresses registered while ``set_cuda_graph_capture`` is
-    on become stale and custom_all_reduce.cuh can fail at replay time. Passing
-    ``not self.tms_cudagraph`` keeps the capture flag off in that mode.
-    """
-    _patch_sglang_file_replacements(
-        "srt/distributed/device_communicators/custom_all_reduce_v2.py",
-        (
-            (
-                "from sglang.srt.environ import envs\n",
-                "from sglang.srt.utils import is_sm100_supported, log_info_on_rank0\n",
-                "from sglang.srt.environ import envs\n"
-                "from sglang.srt.utils import is_sm100_supported, log_info_on_rank0\n",
-            ),
-            (
-                "        self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()\n",
-                "        self.override_algo: Optional[AllReduceAlgo] = None\n"
-                "        self.obj = get_custom_all_reduce_cls()(\n",
-                "        self.override_algo: Optional[AllReduceAlgo] = None\n"
-                "        self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()\n"
-                "        self.obj = get_custom_all_reduce_cls()(\n",
-            ),
-            (
-                "            self.obj.set_cuda_graph_capture(not self.tms_cudagraph)\n",
-                "        try:\n            self.obj.set_cuda_graph_capture(True)\n",
-                "        try:\n"
-                "            self.obj.set_cuda_graph_capture(not self.tms_cudagraph)\n",
-            ),
-            (
-                "                self.obj.set_cuda_graph_capture(not self.tms_cudagraph)\n",
-                "            finally:\n"
-                "                self.obj.set_cuda_graph_capture(True)\n",
-                "            finally:\n"
-                "                self.obj.set_cuda_graph_capture(not self.tms_cudagraph)\n",
-            ),
-        ),
-        "custom all-reduce v2 TMS CUDA graph capture path",
-    )
-
-
 def _apply_sglang_compat_patches() -> None:
     _patch_sglang_safe_unpickler()
-    _patch_sglang_custom_all_reduce_v2_tms_cudagraph()
     _override_sglang_imbalance_check_env()
     _patch_megatron_dynamic_context_hook_mode()
     _patch_megatron_training_hook_mode()

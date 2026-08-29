@@ -76,6 +76,17 @@ class TestPrintSetupTimingSummary:
         assert "NeMo-Gym init: 8.0s" in out
         assert "Teacher init: 6.0s" in out
 
+    def test_value_init_line_only_on_a_ppo_run(self, capsys):
+        """Without it the summary does not add up: the critic's time is missing
+        between Policy init and Total setup."""
+        metrics = self._common_setup(generation_init_time_s=15.0)
+        print_setup_timing_summary(metrics)
+        assert "Value init" not in capsys.readouterr().out
+
+        metrics = self._common_setup(generation_init_time_s=15.0, value_init_time_s=7.0)
+        print_setup_timing_summary(metrics)
+        assert "Value init: 7.0s" in capsys.readouterr().out
+
 
 class TestSetupTimingMetricsToDict:
     """to_metrics_dict serializes into a dict for Logger.log_metrics."""

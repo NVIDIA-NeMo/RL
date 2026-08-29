@@ -16,12 +16,44 @@ from typing import cast
 
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
 from nemo_rl.models.generation.trtllm import TrtllmConfig
 from nemo_rl.models.generation.vllm import VllmConfig
 from nemo_rl.models.generation.vllm.config import VLLM_SPARSE_REFIT_TRANSPORTS
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+def resolve_generation_class(
+    generation_config: GenerationConfig,
+) -> type[GenerationInterface]:
+    """Map `generation_config` to its GenerationInterface class."""
+    backend = generation_config["backend"]
+    if backend == "vllm":
+        from nemo_rl.models.generation.vllm import VllmGeneration
+
+        return VllmGeneration
+    if backend == "sglang":
+        from nemo_rl.models.generation.sglang.sglang_generation import (
+            SGLangGeneration,
+        )
+
+        return SGLangGeneration
+    if backend == "megatron":
+        from nemo_rl.models.generation.megatron.megatron_generation import (
+            MegatronGeneration,
+        )
+
+        return MegatronGeneration
+    if backend == "trtllm":
+        from nemo_rl.models.generation.trtllm import TrtllmGeneration
+
+        return TrtllmGeneration
+    if backend == "dynamo":
+        from nemo_rl.models.generation.dynamo import DynamoGeneration
+
+        return DynamoGeneration
+    raise ValueError(f"Unknown generation backend: {backend!r}")
 
 
 def configure_generation_config(

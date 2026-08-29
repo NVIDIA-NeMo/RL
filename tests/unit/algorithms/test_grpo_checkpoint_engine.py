@@ -101,28 +101,31 @@ def test_refit_policy_generation_uses_attached_checkpoint_engine_synchronizer():
     assert result == {"transfer_s": 1.0}
 
 
-def test_refit_policy_generation_sglang_uses_standard_refit(monkeypatch):
+def test_refit_policy_generation_sglang_uses_attached_synchronizer(monkeypatch):
+    """SGLang always refits through its synchronizer, never the inline branches."""
     from nemo_rl.algorithms import grpo as grpo_mod
     from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 
     policy = MagicMock()
-    policy.stream_weights_via_http.return_value = [object()]
-
     generation = MagicMock(spec=SGLangGeneration)
-    generation.get_rollout_engine_urls.return_value = ["http://rollout"]
+    generation.weight_synchronizer = MagicMock()
+    generation.weight_synchronizer.sync_weights.return_value = None
     ray_get = MagicMock()
     monkeypatch.setattr(grpo_mod.ray, "get", ray_get)
 
-    grpo_mod.refit_policy_generation(
+    result = grpo_mod.refit_policy_generation(
         policy=policy,
         policy_generation=generation,
         colocated_inference=True,
         _refit_buffer_size_gb=2,
     )
 
-    policy.stream_weights_via_http.assert_called_once_with(
-        rollout_engine_urls=["http://rollout"],
-        buffer_size_bytes=2 * 1024**3,
+    generation.weight_synchronizer.sync_weights.assert_called_once_with(
+        timer=None, kv_scales=None
     )
-    ray_get.assert_called_once_with(policy.stream_weights_via_http.return_value)
-    assert generation.prepare_for_generation.call_count == 2
+    assert result == {}
+    # The synchronizer owns every phase transition; grpo must not drive them.
+    policy.offload_before_refit.assert_not_called()
+    policy.offload_after_refit.assert_not_called()
+    generation.prepare_for_generation.assert_not_called()
+    ray_get.assert_not_called()
