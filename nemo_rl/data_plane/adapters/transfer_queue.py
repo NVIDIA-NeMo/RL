@@ -46,6 +46,7 @@ import transfer_queue as tq
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
+from nemo_rl.data_plane.codec import timed_codec
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
     DataPlaneConfig,
@@ -638,39 +639,41 @@ def _from_wire(td: TensorDict) -> TensorDict:
     """
     # Same top-level iteration as `_promote_1d_leaves`: NonTensorData /
     # NonTensorStack leaves are only visible via td.keys(), not leaves_only.
-    new_dict: dict[str, Any] = {}
-    changed = False
-    for k in td.keys():
-        v = td.get(k)
-        field_name = str(k)
-        if isinstance(v, torch.Tensor) and v.is_nested:
-            rows = list(v.unbind())
-            if rows and all(row.shape == rows[0].shape for row in rows[1:]):
-                v = torch.stack(rows)
-                changed = True
-        if field_name in PROMOTE_1D_FIELDS:
-            if not isinstance(v, torch.Tensor) or v.is_nested:
-                raise ValueError(
-                    f"Mooncake scalar field {field_name!r} could not be "
-                    "restored as a dense tensor."
-                )
-            if v.dim() == 1:
-                new_dict[field_name] = v
-            elif v.dim() == 2 and v.shape[-1] == 1:
-                new_dict[field_name] = v.squeeze(-1).contiguous()
-                changed = True
+    with timed_codec("unpack"):
+        new_dict: dict[str, Any] = {}
+        changed = False
+        for k in td.keys():
+            v = td.get(k)
+            field_name = str(k)
+            if isinstance(v, torch.Tensor) and v.is_nested:
+                rows = list(v.unbind())
+                if rows and all(row.shape == rows[0].shape for row in rows[1:]):
+                    v = torch.stack(rows)
+                    changed = True
+            if field_name in PROMOTE_1D_FIELDS:
+                if not isinstance(v, torch.Tensor) or v.is_nested:
+                    raise ValueError(
+                        f"Mooncake scalar field {field_name!r} could not be "
+                        "restored as a dense tensor."
+                    )
+                if v.dim() == 1:
+                    new_dict[field_name] = v
+                elif v.dim() == 2 and v.shape[-1] == 1:
+                    new_dict[field_name] = v.squeeze(-1).contiguous()
+                    changed = True
+                else:
+                    raise ValueError(
+                        f"Mooncake scalar field {field_name!r} must decode as "
+                        f"(N,) or (N, 1), got shape {tuple(v.shape)}."
+                    )
             else:
-                raise ValueError(
-                    f"Mooncake scalar field {field_name!r} must decode as "
-                    f"(N,) or (N, 1), got shape {tuple(v.shape)}."
-                )
-        else:
-            new_dict[field_name] = v
-    if not changed:
-        return td
-    new_td = TensorDict(new_dict, batch_size=td.batch_size)
-    _assert_no_key_loss(new_dict, new_td, "_from_wire")
-    return new_td
+                new_dict[field_name] = v
+        if not changed:
+            # The traversal still ran; only the rebuild was skipped.
+                return td
+        new_td = TensorDict(new_dict, batch_size=td.batch_size)
+        _assert_no_key_loss(new_dict, new_td, "_from_wire")
+        return new_td
 
 
 class TQDataPlaneClient(DataPlaneClient):

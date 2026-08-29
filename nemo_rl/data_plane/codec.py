@@ -35,6 +35,9 @@ to ``np.ndarray(dtype=object)`` for the trainer.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -42,6 +45,76 @@ import torch
 from tensordict import TensorDict, TensorDictBase
 
 from nemo_rl.data_plane.schema import Layout
+from nemo_rl.utils.timer import ThreadSafeTimer
+
+# Pad/unpad cost, which the per-op metrics cannot see: packing runs in the
+# caller before ``put_samples`` is entered, and ``_from_wire`` runs inside the
+# adapter's ``get_samples``, where it is billed as transport. Both are real CPU
+# work proportional to payload size.
+#
+# Module-level, not threaded through: every call site does have a client handle
+# (``column_io`` takes ``dp_client``; ``_from_wire`` is reached from an instance
+# method), so threading is possible at roughly fifteen lines across four sites.
+# The global buys reach for a free function at the cost of process-scoped state
+# that only one reader per process may drain.
+_CODEC_TIMER = ThreadSafeTimer()
+
+
+def record_codec_s(phase: str, elapsed_s: float) -> None:
+    """Record one pad/unpad measurement, in seconds.
+
+    Prefer :func:`timed_codec`; this is for callers that already measured.
+
+    Args:
+        phase: ``"pack"`` or ``"unpack"``.
+        elapsed_s: Seconds spent, as returned by ``time.perf_counter()`` deltas.
+    """
+    # should_log=False: Timer._fmt builds a timestamp and joins the context on
+    # every call, which costs more than the measurement itself on this path.
+    _CODEC_TIMER.record(phase, elapsed_s, should_log=False)
+
+
+@contextmanager
+def timed_codec(phase: str) -> Iterator[None]:
+    """Time a pad/unpad block, recording on every exit path.
+
+    Records in ``finally`` because the blocks it wraps return from more than
+    one place -- an early return once slipped past a hand-written bracket and
+    silently dropped every no-op unpack from the metric.
+
+    Not :meth:`Timer.time`: ``Timer.start`` raises if the label is already
+    running, and both phases run concurrently (the single-controller loop
+    dispatches through ``asyncio.to_thread``).
+    """
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        record_codec_s(phase, time.perf_counter() - started)
+
+
+def drain_codec_ms() -> dict[str, float]:
+    """Milliseconds spent packing and unpacking since the last drain.
+
+    ``Timer.drain`` pops and sums under one lock: ``reduce`` then ``reset``
+    would drop any sample recorded between them, and both phases run
+    concurrently.
+
+    Not every packing process has a reader -- the rollout actor calls
+    ``pack_jagged_fields`` but is not on the policy worker group, so nothing
+    drains it. Its samples accumulate unread, which is why the caller that
+    *does* drain should do so every step.
+
+    Returns:
+        ``{"pack": ms, "unpack": ms}``, omitting a phase that did not run.
+    """
+    out: dict[str, float] = {}
+    for phase in ("pack", "unpack"):
+        total = _CODEC_TIMER.drain(phase)
+        if total:
+            out[phase] = total * 1e3
+    return out
+
 
 if TYPE_CHECKING:
     # Type-only import. At runtime, BatchedDataDict is loaded lazily
@@ -159,27 +232,29 @@ def pack_jagged_fields(
         ``TensorDict`` with ``batch_size=[N]`` (N from ``lengths`` if
         given, else 0) ready for ``put_samples``.
     """
-    n = int(lengths.shape[0]) if lengths is not None else 0
-    token_aligned_fields = token_aligned_fields or frozenset()
-    packed: dict[str, Any] = {}
-    for k, v in fields.items():
-        if isinstance(v, np.ndarray) and v.dtype == object:
-            # tensordict==0.12.2 wire bug: a NonTensorStack stored as a
-            # TensorDict leaf returns as a LinkedList on parent
-            # __getitem__, losing identity. ndarray(dtype=object)
-            # round-trips intact.
-            packed[k] = v
-        elif isinstance(v, torch.Tensor):
-            if lengths is not None and k in token_aligned_fields:
-                packed[k] = pack_per_token_field(v, lengths)
+    with timed_codec("pack"):
+        n = int(lengths.shape[0]) if lengths is not None else 0
+        token_aligned_fields = token_aligned_fields or frozenset()
+        packed: dict[str, Any] = {}
+        for k, v in fields.items():
+            if isinstance(v, np.ndarray) and v.dtype == object:
+                # tensordict==0.12.2 wire bug: a NonTensorStack stored as a
+                # TensorDict leaf returns as a LinkedList on parent
+                # __getitem__, losing identity. ndarray(dtype=object)
+                # round-trips intact.
+                packed[k] = v
+            elif isinstance(v, torch.Tensor):
+                if lengths is not None and k in token_aligned_fields:
+                    packed[k] = pack_per_token_field(v, lengths)
+                else:
+                    packed[k] = v.detach().contiguous()
             else:
-                packed[k] = v.detach().contiguous()
-        else:
-            raise TypeError(
-                f"pack_jagged_fields: unsupported value type for {k!r}: {type(v)}. "
-                "Use torch.Tensor or np.ndarray(dtype=object)."
-            )
-    return TensorDict(packed, batch_size=[n])
+                raise TypeError(
+                    f"pack_jagged_fields: unsupported value type for {k!r}: {type(v)}. "
+                    "Use torch.Tensor or np.ndarray(dtype=object)."
+                )
+        out = TensorDict(packed, batch_size=[n])
+        return out
 
 
 def pack_per_token_field(val: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
