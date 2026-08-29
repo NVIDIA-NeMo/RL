@@ -68,6 +68,15 @@ _QUARANTINED_BUFFERS: list[mmap.mmap] = []
 _REGISTRY_ACTOR_CLASS: Any = None
 
 
+def _fsync_directory(path: Path) -> None:
+    """Make prior entry creation/rename operations durable in ``path``."""
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _checkpoint_settings(config: Any) -> Mapping[str, Any]:
     if not isinstance(config, Mapping):
         raise TypeError("MooncakeStore config must be a mapping")
@@ -805,6 +814,7 @@ class _CheckpointParticipant:
             output.flush()
             os.fsync(output.fileno())
         partial.rename(target)
+        _fsync_directory(storage_dir)
         return {
             "ok": True,
             "request_id": request_id,
@@ -957,18 +967,15 @@ def _live_participants(manager: Any) -> list[_ParticipantInfo]:
 
     participants: list[_ParticipantInfo] = []
     ids: set[str] = set()
-    endpoints: set[str] = set()
     for raw in raw_participants:
         if not isinstance(raw, Mapping):
             continue
         participant = _ParticipantInfo.from_mapping(raw)
-        if (
-            participant.participant_id in ids
-            or participant.transport_endpoint in endpoints
-        ):
-            raise RuntimeError("Mooncake checkpoint registry contains duplicate owners")
+        if participant.participant_id in ids:
+            raise RuntimeError(
+                "Mooncake checkpoint registry contains duplicate participant IDs"
+            )
         ids.add(participant.participant_id)
-        endpoints.add(participant.transport_endpoint)
         participants.append(participant)
 
     ping_requests = [
@@ -1001,6 +1008,10 @@ def _live_participants(manager: Any) -> list[_ParticipantInfo]:
         ]
         with suppress(Exception):
             ray.get(refs, timeout=timeout_s)
+    if len({participant.transport_endpoint for participant in live}) != len(live):
+        raise RuntimeError(
+            "Live Mooncake checkpoint participants have duplicate endpoints"
+        )
     return sorted(live, key=lambda participant: participant.participant_id)
 
 
@@ -1106,6 +1117,7 @@ def _write_manifest(
         output.flush()
         os.fsync(output.fileno())
     partial.rename(storage_dir / _MANIFEST_FILE)
+    _fsync_directory(storage_dir)
 
 
 def _save_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
@@ -1117,6 +1129,7 @@ def _save_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
     )
     storage_dir = checkpoint_root / _STORAGE_DIR
     storage_dir.mkdir(parents=True, exist_ok=False)
+    _fsync_directory(checkpoint_root)
 
     if not objects:
         _write_manifest(

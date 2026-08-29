@@ -20,6 +20,7 @@ import hashlib
 import json
 import pickle
 from collections.abc import Iterator
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -269,6 +270,14 @@ def _wire_participants(
     return calls
 
 
+class _RemoteMethod:
+    def __init__(self, function: Any) -> None:
+        self.function = function
+
+    def remote(self, *args: Any) -> Any:
+        return self.function(*args)
+
+
 _SOURCE_IDENTITIES = [
     ("manager-a", "10.0.0.1:12301"),
     ("manager-b", "10.0.0.2:12302"),
@@ -374,6 +383,158 @@ def test_physical_keys_include_all_produced_fields_and_gdr_chunks() -> None:
         "1@metadata",
         "1@tokens",
     ]
+
+
+def test_live_participants_prunes_a_stale_owner_before_endpoint_deduplication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ray
+
+    manager = _manager(_FakeStore(_FakeCluster({}, {}), "10.0.0.9:12309"))
+    session = checkpoint_plugin._controller_session(manager)
+    endpoint = "10.0.0.1:12301"
+    stale = checkpoint_plugin._ParticipantInfo(
+        participant_id="stale-owner",
+        incarnation="old-incarnation",
+        controller_session=session,
+        control_endpoint="tcp://10.0.0.1:22001",
+        segment_name=endpoint,
+        transport_endpoint=endpoint,
+    )
+    replacement = checkpoint_plugin._ParticipantInfo(
+        participant_id="replacement-owner",
+        incarnation="new-incarnation",
+        controller_session=session,
+        control_endpoint="tcp://10.0.0.1:22002",
+        segment_name=endpoint,
+        transport_endpoint=endpoint,
+    )
+    unregistered: list[tuple[str, str]] = []
+    registry = SimpleNamespace(
+        participants=_RemoteMethod(
+            lambda controller_session: (
+                [asdict(stale), asdict(replacement)]
+                if controller_session == session
+                else []
+            )
+        ),
+        unregister=_RemoteMethod(
+            lambda participant_id, incarnation: unregistered.append(
+                (participant_id, incarnation)
+            )
+        ),
+    )
+    monkeypatch.setattr(checkpoint_plugin, "_registry_actor", lambda: registry)
+    monkeypatch.setattr(ray, "get", lambda value, **_kwargs: value)
+
+    def fanout(requests: list[Any], **kwargs: Any) -> dict[str, Any]:
+        assert kwargs["allow_failures"] is True
+        assert {request.participant for request in requests} == {stale, replacement}
+        return {
+            replacement.participant_id: {"participant": asdict(replacement)},
+        }
+
+    monkeypatch.setattr(checkpoint_plugin, "_fanout_requests", fanout)
+
+    assert checkpoint_plugin._live_participants(manager) == [replacement]
+    assert unregistered == [(stale.participant_id, stale.incarnation)]
+
+
+def test_live_participants_rejects_duplicate_endpoints_that_are_both_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ray
+
+    manager = _manager(_FakeStore(_FakeCluster({}, {}), "10.0.0.9:12309"))
+    session = checkpoint_plugin._controller_session(manager)
+    participants = [
+        checkpoint_plugin._ParticipantInfo(
+            participant_id=f"owner-{index}",
+            incarnation=f"incarnation-{index}",
+            controller_session=session,
+            control_endpoint=f"tcp://10.0.0.{index + 1}:22001",
+            segment_name="10.0.0.1:12301",
+            transport_endpoint="10.0.0.1:12301",
+        )
+        for index in range(2)
+    ]
+    registry = SimpleNamespace(
+        participants=_RemoteMethod(lambda _session: list(map(asdict, participants))),
+        unregister=_RemoteMethod(lambda *_args: None),
+    )
+    monkeypatch.setattr(checkpoint_plugin, "_registry_actor", lambda: registry)
+    monkeypatch.setattr(ray, "get", lambda value, **_kwargs: value)
+    monkeypatch.setattr(
+        checkpoint_plugin,
+        "_fanout_requests",
+        lambda requests, **_kwargs: {
+            request.participant.participant_id: {
+                "participant": asdict(request.participant)
+            }
+            for request in requests
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="duplicate endpoints"):
+        checkpoint_plugin._live_participants(manager)
+
+
+def test_save_fsyncs_the_storage_directory_and_published_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    synced: list[tuple[Path, set[str]]] = []
+
+    def observe_directory(path: Path) -> None:
+        path = Path(path)
+        synced.append((path, {entry.name for entry in path.iterdir()}))
+
+    monkeypatch.setattr(
+        checkpoint_plugin,
+        "_fsync_directory",
+        observe_directory,
+    )
+
+    checkpoint_dir, _, _, _ = _save_distributed_checkpoint(monkeypatch, tmp_path)
+    storage_dir = checkpoint_dir / "mooncake_storage"
+    storage_snapshots = [entries for path, entries in synced if path == storage_dir]
+
+    assert [path for path, _ in synced].count(checkpoint_dir) == 1
+    assert [path for path, _ in synced].count(storage_dir) == (
+        len(_SOURCE_IDENTITIES) + 1
+    )
+    assert [
+        len({name for name in entries if name.endswith(".bin")})
+        for entries in storage_snapshots
+    ] == [1, 2, 2]
+    assert all(
+        not any(name.endswith(".partial") for name in entries)
+        for entries in storage_snapshots
+    )
+    assert "manifest.json" not in storage_snapshots[-2]
+    assert "manifest.json" in storage_snapshots[-1]
+
+
+def test_save_does_not_commit_a_manifest_when_directory_fsync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir = _checkpoint_dir(tmp_path)
+    storage_dir = checkpoint_dir / "mooncake_storage"
+    cluster = _source_cluster()
+    managers = _managers(cluster, _SOURCE_IDENTITIES)
+    _wire_participants(monkeypatch, [_participant(manager) for manager in managers])
+
+    def fail_storage_sync(path: Path) -> None:
+        if Path(path) == storage_dir:
+            raise OSError("directory fsync failed")
+
+    monkeypatch.setattr(checkpoint_plugin, "_fsync_directory", fail_storage_sync)
+
+    with pytest.raises(OSError, match="directory fsync failed"):
+        _save_storage_checkpoint(managers[0], str(checkpoint_dir))
+
+    assert not (storage_dir / "manifest.json").exists()
 
 
 @pytest.mark.parametrize(
