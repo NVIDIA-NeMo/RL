@@ -1,4 +1,4 @@
-# NeMo-RL v2 SingleController overlay for one-node, non-colocated Omni VSTAT.
+# NeMo-RL v2 SingleController overlay for eight-node, non-colocated Omni VSTAT.
 defaults: ./vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml
 
 grpo:
@@ -15,7 +15,7 @@ data_plane:
   backend: simple
   claim_meta_poll_interval_s: 0.5
   simple:
-    num_storage_units: 2
+    num_storage_units: 16
 
 async_rl:
   sampler:
@@ -25,7 +25,7 @@ async_rl:
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
   max_inflight_prompts: ${mul:${grpo.num_prompts_per_step}, 2}
   max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 2}
-  diagnostics: true
+  diagnostics: false
 
 policy:
   generation:
@@ -33,8 +33,8 @@ policy:
     colocated:
       enabled: false
       resources:
-        num_nodes: 1
-        gpus_per_node: 2
+        num_nodes: 6
+        gpus_per_node: 4
     mcore_generation_config:
       transformer_impl: inference_optimized
       moe_router_dtype: fp32
@@ -44,10 +44,11 @@ policy:
       num_cuda_graphs: -1
       use_cuda_graphs_for_non_decode_steps: false
       enable_chunked_prefill: true
+      enable_prefix_caching: false
       async_sched_mode: async
       kv_cache_management_mode: persist
       refit_backend: nccl
 
 cluster:
-  num_nodes: 1
+  num_nodes: 8
   gpus_per_node: 4
