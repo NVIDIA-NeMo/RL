@@ -2995,8 +2995,17 @@ def test_sampling_importance_ratio_is_reported_untruncated():
     raw = _sampling_importance_ratio(None)
 
     assert raw == pytest.approx(4.5359, abs=1e-3)
-    for tis_type in ("tis", "icepop", "seq-mask-tis"):
-        assert _sampling_importance_ratio(tis_type) == pytest.approx(raw, abs=1e-3), (
+    # Bounds are per-mode so each branch actually truncates on this fixture:
+    # tis/icepop compare per-token weights (max 12.18), seq-mask-tis compares
+    # the sequence geometric mean (1.82), so a shared [0.5, 5.0] would leave
+    # the seq-mask-tis multiply a no-op and that leg would prove nothing.
+    for tis_type, ratio, ratio_min in (
+        ("tis", 5.0, 0.5),
+        ("icepop", 5.0, 0.5),
+        ("seq-mask-tis", 1.5, 0.5),
+    ):
+        got = _sampling_importance_ratio(tis_type, ratio=ratio, ratio_min=ratio_min)
+        assert got == pytest.approx(raw, abs=1e-3), (
             f"{tis_type} moved sampling_importance_ratio away from its definition"
         )
 
@@ -3013,5 +3022,4 @@ def test_icepop_does_not_invert_the_sampling_importance_ratio():
     reported = _sampling_importance_ratio("icepop")
 
     assert reported > 1.0
-    # The value the truncated weights would have given, for the record.
-    assert reported != pytest.approx(0.4751, abs=1e-3)
+    assert reported == pytest.approx(4.5359, abs=1e-3)
