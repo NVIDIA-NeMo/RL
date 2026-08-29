@@ -83,6 +83,10 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     BOOTSTRAP_DIRNAME,
     ROLLOUT_SNAPSHOT_COMMITTED_FILENAME,
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
+    ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+    RolloutSnapshotManifest,
+    commit_snapshot,
+    prepare_snapshot_paths,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
@@ -448,11 +452,14 @@ class _FakeTQBuffer:
     def training_owned_replay_groups(self) -> list[dict[str, Any]]:
         return list(self.training_claims)
 
+    def training_owned_group_ids(self) -> set[str]:
+        return {group["group_id"] for group in self.training_claims}
+
     def release_training_claims(self, group_ids: list[str]) -> None:
         claimed = {group["group_id"] for group in self.training_claims}
-        if claimed:
-            assert set(group_ids) == claimed
-            self.training_claims = []
+        assert len(group_ids) == len(set(group_ids))
+        assert set(group_ids) == claimed
+        self.training_claims = []
 
     def count_for_target_step(self, target_step: int) -> int:
         """Return the number of ready fake groups owned by one gated step."""
@@ -1051,9 +1058,21 @@ class TestSaveTrigger:
 
 
 class TestPeriodicRolloutCheckpoint:
-    def test_restore_mode_rejects_inconsistent_trainer_only_resume(self):
+    def test_restore_mode_rejects_removed_none_value(self):
         with pytest.raises(ValidationError, match="restore_mode"):
             RolloutCheckpointConfig.model_validate({"restore_mode": "none"})
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"interval_s": 0},
+            {"keep_latest_k": 0},
+            {"unknown_option": True},
+        ],
+    )
+    def test_rejects_invalid_periodic_checkpoint_config(self, config):
+        with pytest.raises(ValidationError):
+            RolloutCheckpointConfig.model_validate(config)
 
     def _actor(self, tmp_path: Path):
         config = _actor_master_config(
@@ -1070,6 +1089,7 @@ class TestPeriodicRolloutCheckpoint:
     def test_pre_step_snapshot_contains_only_rollout_state(self, tmp_path: Path):
         actor = self._actor(tmp_path)
         try:
+            actor._sampler.restore_dispatch_index(5)
             assert asyncio.run(actor._save_rollout_checkpoint(force=True))
         finally:
             actor._checkpointer.shutdown()
@@ -1083,6 +1103,10 @@ class TestPeriodicRolloutCheckpoint:
         )
         assert (snapshot / ROLLOUT_SNAPSHOT_COMMITTED_FILENAME).is_file()
         assert (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).is_file()
+        manifest = json.loads(
+            (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).read_text()
+        )
+        assert manifest["sampler_dispatch_index"] == 5
         assert (snapshot / "data_plane" / "metadata.json").is_file()
         assert (snapshot / "train_dataloader.pt").is_file()
         assert (snapshot / REPLAY_BUFFER_METADATA_FILENAME).is_file()
@@ -1143,6 +1167,43 @@ class TestPeriodicRolloutCheckpoint:
             assert actor._dp_client.save_calls == []
         finally:
             actor._checkpointer.shutdown()
+
+    def test_periodic_pump_reports_each_consecutive_failure(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        actor = self._actor(tmp_path)
+        actor._master_config.rollout_checkpointing.interval_s = 0.001
+        actor._train_steps = 1
+
+        async def _main() -> None:
+            two_failures = asyncio.Event()
+            calls = 0
+
+            async def _failing_save(*, force: bool = False) -> bool:
+                nonlocal calls
+                del force
+                calls += 1
+                if calls == 2:
+                    two_failures.set()
+                raise OSError("storage unavailable")
+
+            actor._save_rollout_checkpoint = _failing_save
+            pump = asyncio.create_task(actor._rollout_checkpoint_pump())
+            await asyncio.wait_for(two_failures.wait(), timeout=1.0)
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+
+        try:
+            asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
+        output = capsys.readouterr().out
+        assert output.count("Periodic rollout checkpoint failed") == 2
+        assert "consecutive_failures=1" in output
+        assert "consecutive_failures=2" in output
 
 
 class TestDataPlaneCheckpoint:
@@ -1588,6 +1649,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     checkpoint_path.mkdir(parents=True, exist_ok=True)
 
     actor._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    actor._checkpoint_save_lock = asyncio.Lock()
     actor._save_state = SimpleNamespace()
     actor._train_steps = 1
     actor._trainer_version = 1
@@ -1884,6 +1946,45 @@ class TestSetupResumeWiring:
         # (missing fields backfilled with the GRPOSaveState defaults).
         assert actor_args.save_state == _get_grpo_save_state(dict(_STEP_3_SAVE_STATE))
         assert actor_args.last_checkpoint_path == str(step_3)
+
+    def test_periodic_snapshot_restores_exact_dispatch_cursor(
+        self,
+        patched_factories,  # noqa: F811
+        tmp_path,
+    ):
+        ckpt_dir = tmp_path / "ckpts"
+        step_3 = _write_checkpoint(
+            ckpt_dir,
+            3,
+            _STEP_3_SAVE_STATE,
+            dataloader_state={"fake_position": 3},
+        )
+        tmp_snapshot, final_snapshot, _ = prepare_snapshot_paths(step_3)
+        torch.save(
+            {"fake_position": 7},
+            tmp_snapshot / "train_dataloader.pt",
+        )
+        manifest = RolloutSnapshotManifest(
+            schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+            base_train_step=3,
+            trainer_version=3,
+            current_epoch=4,
+            sampler_dispatch_index=6,
+            mutation_version=9,
+            rolled_back_train_group_count=0,
+            bootstrap_fingerprint=None,
+        )
+        (tmp_snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text(
+            json.dumps(manifest.to_dict())
+        )
+        commit_snapshot(tmp_snapshot, final_snapshot, keep_latest_k=2)
+        mc = _setup_master_config(str(ckpt_dir))
+
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.save_state.current_epoch == 4
+        assert actor_args.save_state.sampler_dispatch_index == 6
+        assert actor_args.last_checkpoint_path == str(final_snapshot)
 
     def test_setup_fresh_start_passes_none_paths(
         self,

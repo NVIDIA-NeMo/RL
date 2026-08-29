@@ -153,6 +153,7 @@ class _RolloutCheckpointCut:
     """Controller sidecars captured with one native TQ snapshot."""
 
     dataloader_state: dict[str, Any]
+    sampler_dispatch_index: int
     replacement_reserve: list[DatumSpec]
     replay_metadata: Optional[TQReplayMetadataState]
     rollout_recovery_payload: Optional[bytes]
@@ -531,7 +532,18 @@ class SingleControllerActor:
                         "rollout checkpoint pump exited without requesting stop"
                     )
                 stop_after_rollout_checkpoint = True
-            if probe_task is not None and probe_task in done:
+            if stop_after_rollout_checkpoint:
+                # FIRST_COMPLETED may return several tasks. Do not let the
+                # orderly pre-step checkpoint stop hide a rollout/train failure
+                # that completed in the same event-loop turn.
+                for task in done:
+                    if task is not rollout_checkpoint_task:
+                        await task
+            if (
+                not stop_after_rollout_checkpoint
+                and probe_task is not None
+                and probe_task in done
+            ):
                 # Loops forever like the watchdog, so finishing at all means it raised.
                 await probe_task
             if not stop_after_rollout_checkpoint and watchdog_task in done:
@@ -2176,7 +2188,7 @@ class SingleControllerActor:
             # Always True off the PPO path: the start step is pinned to 0 there.
             is_policy_training_step = self._train_steps >= policy_training_start_step
             consumed_metas: list[KVBatchMeta] = []
-            consumed_group_ids: list[str] = []
+            consumed_training_claim_ids: list[str] = []
             consumed_group_count = 0
             step_finalizer_metrics: dict[str, list[float]] = {}
 
@@ -2222,15 +2234,53 @@ class SingleControllerActor:
                             max_prompt_groups,
                         )
                         selected_group_ids: list[str] = []
+                        selected_training_claim_ids: list[str] = []
                         async with self._data_plane_checkpoint_barrier.mutation():
+                            training_claim_ids_before = (
+                                self._buffer.training_owned_group_ids()
+                            )
                             train_meta, num_groups = await self._sampler.select(
                                 current_train_weight=self._trainer_version,
                                 min_prompt_groups=min_prompt_groups,
                                 max_prompt_groups=max_prompt_groups,
                             )
+                            training_claim_ids_after = (
+                                self._buffer.training_owned_group_ids()
+                            )
+                            removed_training_claim_ids = (
+                                training_claim_ids_before - training_claim_ids_after
+                            )
+                            if removed_training_claim_ids:
+                                raise RuntimeError(
+                                    "sampler selection removed existing training "
+                                    "claims: "
+                                    f"{sorted(removed_training_claim_ids)!r}"
+                                )
+                            new_training_claim_ids = (
+                                training_claim_ids_after - training_claim_ids_before
+                            )
                             if train_meta is not None:
                                 selected_group_ids = self._group_ids_from_meta(
                                     train_meta
+                                )
+                                if new_training_claim_ids:
+                                    if (
+                                        set(selected_group_ids)
+                                        != new_training_claim_ids
+                                    ):
+                                        raise RuntimeError(
+                                            "sampler selection does not match its new "
+                                            "training claims: "
+                                            f"selected={selected_group_ids!r}, "
+                                            "claimed="
+                                            f"{sorted(new_training_claim_ids)!r}"
+                                        )
+                                    selected_training_claim_ids = selected_group_ids
+                            elif new_training_claim_ids:
+                                raise RuntimeError(
+                                    "sampler selection created training claims without "
+                                    "returning batch metadata: "
+                                    f"{sorted(new_training_claim_ids)!r}"
                                 )
 
                         # If no batch is selectable, sleep and retry
@@ -2259,7 +2309,7 @@ class SingleControllerActor:
                             continue
 
                         consumed_metas.append(train_meta)
-                        consumed_group_ids.extend(selected_group_ids)
+                        consumed_training_claim_ids.extend(selected_training_claim_ids)
                         consumed_group_count += num_groups
                         for group_id in selected_group_ids:
                             for name, value in self._finalizer_metrics_by_group.pop(
@@ -2475,7 +2525,7 @@ class SingleControllerActor:
 
                 async with self._data_plane_checkpoint_barrier.mutation():
                     await self._cleanup_consumed_metas_unlocked(consumed_metas)
-                    self._buffer.release_training_claims(consumed_group_ids)
+                    self._buffer.release_training_claims(consumed_training_claim_ids)
                 for _ in range(consumed_group_count):
                     self._buffer_capacity.release()
                 step_metrics.update(
@@ -3275,6 +3325,7 @@ class SingleControllerActor:
         )
         return _RolloutCheckpointCut(
             dataloader_state=dataloader_state,
+            sampler_dispatch_index=self._sampler.dispatch_index,
             replacement_reserve=replacement_reserve,
             replay_metadata=replay_metadata,
             rollout_recovery_payload=recovery_payload,
@@ -3393,7 +3444,7 @@ class SingleControllerActor:
                         or self._train_steps != expected_train_step
                         or self._trainer_version != expected_trainer_version
                     ):
-                        await asyncio.to_thread(shutil.rmtree, tmp_path)
+                        await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
                         return False
                     snapshot_epoch = self._current_epoch
                     cut = await self._capture_rollout_checkpoint_cut(tmp_path)
@@ -3404,6 +3455,7 @@ class SingleControllerActor:
                     base_train_step=expected_train_step,
                     trainer_version=expected_trainer_version,
                     current_epoch=snapshot_epoch,
+                    sampler_dispatch_index=cut.sampler_dispatch_index,
                     mutation_version=cut.mutation_version,
                     rolled_back_train_group_count=(cut.rolled_back_train_group_count),
                     bootstrap_fingerprint=snapshot_fingerprint,
@@ -3422,7 +3474,7 @@ class SingleControllerActor:
                 )
             except BaseException:
                 if tmp_path.exists():
-                    await asyncio.to_thread(shutil.rmtree, tmp_path)
+                    await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
                 raise
 
             self._last_rollout_snapshot_mutation_version = cut.mutation_version
@@ -3441,6 +3493,7 @@ class SingleControllerActor:
         interval_s = self._master_config.rollout_checkpointing.interval_s
         if interval_s is None:
             raise RuntimeError("rollout checkpoint pump started while disabled")
+        consecutive_failures = 0
         while True:
             await asyncio.sleep(interval_s)
             deadline_due = self._train_steps == 0 and self._timeout.would_save()
@@ -3451,12 +3504,16 @@ class SingleControllerActor:
                     raise RuntimeError(
                         "failed to save the required pre-step rollout checkpoint"
                     ) from error
-                warnings.warn(
+                consecutive_failures += 1
+                print(
                     "Periodic rollout checkpoint failed; retaining the previous "
-                    f"committed snapshot: {type(error).__name__}: {error}",
-                    stacklevel=2,
+                    "committed snapshot: "
+                    f"consecutive_failures={consecutive_failures}, "
+                    f"{type(error).__name__}: {error}",
+                    flush=True,
                 )
                 continue
+            consecutive_failures = 0
             if deadline_due and saved and self._timeout.check_save():
                 print(
                     "Checkpoint deadline reached before the first train step; "
@@ -3473,14 +3530,7 @@ class SingleControllerActor:
         is_policy_training_step: bool,
     ) -> None:
         """Serialize full and rollout-only checkpoint publication."""
-        lock = getattr(self, "_checkpoint_save_lock", None)
-        if lock is None:
-            await self._save_checkpoint_impl(
-                step_metrics,
-                is_policy_training_step=is_policy_training_step,
-            )
-            return
-        async with lock:
+        async with self._checkpoint_save_lock:
             await self._save_checkpoint_impl(
                 step_metrics,
                 is_policy_training_step=is_policy_training_step,
@@ -4085,12 +4135,13 @@ class SingleControllerActor:
             fields_to_put[adv_cfg.returns_field] = returns
             new_fields.append(adv_cfg.returns_field)
 
-        await self._call_dp(
-            "put_samples",
-            sample_ids=meta.sample_ids,
-            partition_id=meta.partition_id,
-            fields=fields_for_put(meta, fields_to_put),
-        )
+        async with self._data_plane_checkpoint_barrier.mutation():
+            await self._call_dp(
+                "put_samples",
+                sample_ids=meta.sample_ids,
+                partition_id=meta.partition_id,
+                fields=fields_for_put(meta, fields_to_put),
+            )
         return (
             meta.with_fields(new_fields),
             has_valid_training_tokens,
