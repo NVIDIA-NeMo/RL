@@ -2012,6 +2012,7 @@ class RolloutManager:
                 ) = self._recovery_ledger.finalization_inputs(group_id)
             request = ReassemblyRequest(
                 group_id=group_id,
+                prompt_idx=int(recovery_group.prompt_id),
                 rollout_ids=tuple(physical_rollout_ids),
                 canonical_sample_ids=tuple(canonical_sample_ids),
                 receipts=tuple(receipts),

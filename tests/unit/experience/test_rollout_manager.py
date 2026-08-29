@@ -1616,6 +1616,7 @@ class TestGenerateForFinalizationFlow:
         )
         assert mgr._impl.seen_rollout_ids == attempt_ids
         assert request.group_id == group_id
+        assert request.prompt_idx == 0
         assert request.rollout_ids == tuple(attempt_ids)
         assert request.canonical_sample_ids == tuple(canonical_ids)
         assert [r["rollout_id"] for r in request.receipts] == attempt_ids
@@ -1656,6 +1657,7 @@ class TestGenerateForFinalizationFlow:
         request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 4}))
 
         assert request is not None
+        assert request.prompt_idx == 4
         assert attempts == 2
         assert len(buf.reserve_rollout_ids) == 2
         assert buf.reserve_rollout_ids[0] != buf.reserve_rollout_ids[1]
@@ -1721,6 +1723,7 @@ class TestGenerateForFinalizationFlow:
         request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 9}))
 
         assert request is not None
+        assert request.prompt_idx == 9
         assert impl.generation_indices == [[0, 1], [1]]
         first_ids, second_ids = buf.reserve_rollout_ids
         assert first_ids is not None and second_ids is not None
@@ -1788,4 +1791,5 @@ class TestGenerateForFinalizationFlow:
         )
 
         assert request is not None
+        assert request.prompt_idx == 9
         assert restored._impl.seen_generation_indices == [0, 1]
