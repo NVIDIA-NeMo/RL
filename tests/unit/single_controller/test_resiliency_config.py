@@ -300,6 +300,39 @@ class TestFleetHealthValidation:
             FleetHealthConfig(on_dead_shard="degrade_and_restore")
 
 
+class TestTheRefitDeadlineIsArmedByDefault:
+    """The deadline is a precondition for recovery, so it may not default to None.
+
+    A shard dying mid-collective leaves every trainer blocked inside NCCL. A Ray actor
+    runs one task at a time, so the rebuild's own ``init_collective`` queues behind that
+    blocked task and never runs -- the recovery wedges and the run ends on the stall
+    watchdog instead. Only the abort releases those ranks.
+
+    With ``None`` as the default, turning fleet health on bought detection and quarantine
+    but no refit recovery, and nothing said so. These tests exist so that reverting the
+    default to None fails loudly rather than silently removing recovery.
+    """
+
+    def test_the_documented_default_is_armed(self):
+        assert AsyncRLConfig().generation_fleet_health.refit_timeout_s == 300.0
+
+    def test_turning_fleet_health_on_does_not_have_to_ask_for_it(self):
+        """The combination that used to be silently non-recovering."""
+        cfg = FleetHealthConfig(enabled=True)
+        assert cfg.refit_timeout_s is not None, (
+            "enabled=True with no deadline is the configuration that advertises recovery "
+            "and cannot perform it"
+        )
+
+    def test_it_clears_a_healthy_refit_by_a_wide_margin(self):
+        """~1.9s measured for a 1.5B model on GB200, so it cannot fire on a slow one."""
+        assert AsyncRLConfig().generation_fleet_health.refit_timeout_s >= 100 * 1.9
+
+    def test_none_still_disarms_it_when_asked_explicitly(self):
+        """The escape hatch stays: an explicit None starts no watchdog thread."""
+        assert FleetHealthConfig(refit_timeout_s=None).refit_timeout_s is None
+
+
 class TestWatchdogVersusRolloutTimeout:
     """The watchdog must outlast EVERY deadline, not just the NeMo-Gym one.
 
