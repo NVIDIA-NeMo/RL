@@ -217,7 +217,9 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         setup_timing_metrics=SetupTimingMetrics(),
     )
 
-    logger.log_hyperparams.assert_called_once_with(master_config.model_dump())
+    expected_hparams = master_config.model_dump()
+    expected_hparams["token_capture"]["control_auth_token"] = "<redacted>"
+    logger.log_hyperparams.assert_called_once_with(expected_hparams)
     output = capsys.readouterr().out
     assert "weight_sync=FakeWeightSynchronizer" in output
     assert "transport=stub" not in output
