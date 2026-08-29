@@ -1,0 +1,19 @@
+defaults: ./qwen30-fp8param-false.yaml
+
+checkpointing:
+  checkpoint_dir: results/native_mxfp8_source_refit/qwen30-bf16
+policy:
+  megatron_cfg:
+    te_precision_config_file: null
+    fp8_cfg:
+      enabled: false
+  generation:
+    refit_transport: nccl_reshard
+    vllm_cfg:
+      precision: bfloat16
+      is_mx: false
+      quantization_ignore_patterns: []
+logger:
+  log_dir: logs/native_mxfp8_source_refit/qwen30-bf16
+  wandb:
+    name: native-mxfp8-qwen30-bf16

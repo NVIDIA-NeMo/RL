@@ -5,11 +5,12 @@ with native MXFP8 parameter storage (`fp8_param=true`) on the same
 non-colocated NCCL Reshard topology. The launcher does not submit work unless
 `ACTION=submit` is selected.
 
-The four configurations are resolved from the repository's baseline GRPO
+The configurations are resolved from the repository's baseline GRPO
 configuration and retain their task-owned model geometry:
 
 | Model | Configuration | Nodes x GPUs | Segment |
 | --- | --- | ---: | ---: |
+| Qwen3-30B-A3B | `qwen30-bf16.yaml` | 4 x 4 | 2 |
 | Qwen3-30B-A3B | `qwen30-fp8param-false.yaml` | 4 x 4 | 2 |
 | Qwen3-30B-A3B | `qwen30-fp8param-true.yaml` | 4 x 4 | 2 |
 | Nemotron-3 Nano | `nano-fp8param-false.yaml` | 8 x 4 | 4 |
@@ -43,7 +44,7 @@ vLLM, Triton, Inductor, Ray temporary files, and staged model caches only
 under `/raid/scratch/${USER}`. Build caches are keyed by source SHA and model
 cache staging is keyed by model, never job ID or run label. The worker
 environment is keyed only by source SHA; compiled vLLM, Triton, and Inductor
-caches are additionally scoped by the `fp8_param` arm.
+caches are additionally scoped by precision mode and the `fp8_param` arm.
 
 The known model cache directories are staged once on each allocated node with
 `rsync --ignore-existing`; the launcher does not scan or copy the entire
@@ -62,28 +63,43 @@ MODEL=qwen30 FP8_PARAM=true MAX_STEPS=2 ACTION=render \
 Run `sbatch --test-only` before each smoke or submission:
 
 ```bash
-MODEL=qwen30 FP8_PARAM=true MAX_STEPS=2 ACTION=test-only \
+PRECISION_MODE=mxfp8 MODEL=qwen30 FP8_PARAM=true MAX_STEPS=2 ACTION=test-only \
   ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
-MODEL=nano FP8_PARAM=true MAX_STEPS=2 ACTION=test-only \
+PRECISION_MODE=mxfp8 MODEL=nano FP8_PARAM=true MAX_STEPS=2 ACTION=test-only \
   ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
 ```
 
 The native two-step smoke commands are:
 
 ```bash
-MODEL=qwen30 FP8_PARAM=true MAX_STEPS=2 ACTION=submit \
+PRECISION_MODE=mxfp8 MODEL=qwen30 FP8_PARAM=true MAX_STEPS=2 ACTION=submit \
   ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
-MODEL=nano FP8_PARAM=true MAX_STEPS=2 ACTION=submit \
+PRECISION_MODE=mxfp8 MODEL=nano FP8_PARAM=true MAX_STEPS=2 ACTION=submit \
   ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
 ```
 
-Run matched 20-step A/B measurements from one clean source SHA:
+Run the Qwen3-30B-A3B BF16-versus-native-MXFP8 20-step comparison from one
+clean source SHA. Both arms use 4 nodes, asynchronous GRPO, policy and
+reference logprob, CUDA Graph rollout, and NCCL Reshard refit:
 
 ```bash
-MODEL=qwen30 FP8_PARAM=false MAX_STEPS=20 ACTION=submit ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
-MODEL=qwen30 FP8_PARAM=true  MAX_STEPS=20 ACTION=submit ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
-MODEL=nano   FP8_PARAM=false MAX_STEPS=20 ACTION=submit ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
-MODEL=nano   FP8_PARAM=true  MAX_STEPS=20 ACTION=submit ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
+PRECISION_MODE=bf16 MODEL=qwen30 FP8_PARAM=false MAX_STEPS=20 ACTION=submit \
+  ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
+PRECISION_MODE=mxfp8 MODEL=qwen30 FP8_PARAM=true MAX_STEPS=20 ACTION=submit \
+  ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
+```
+
+Report the closed step window 2 through 19. Use logged throughput metrics and
+report policy training, policy/reference logprob, generation, refit, and E2E
+step time; report `tokens/s/GPU` wherever the run records it.
+
+The original parameter-storage A/B measurements remain available with:
+
+```bash
+PRECISION_MODE=mxfp8 MODEL=qwen30 FP8_PARAM=false MAX_STEPS=20 ACTION=submit ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
+PRECISION_MODE=mxfp8 MODEL=qwen30 FP8_PARAM=true  MAX_STEPS=20 ACTION=submit ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
+PRECISION_MODE=mxfp8 MODEL=nano   FP8_PARAM=false MAX_STEPS=20 ACTION=submit ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
+PRECISION_MODE=mxfp8 MODEL=nano   FP8_PARAM=true  MAX_STEPS=20 ACTION=submit ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
 ```
 
 After a submission, use one filtered `squeue -j <job-id>` or `squeue --me`

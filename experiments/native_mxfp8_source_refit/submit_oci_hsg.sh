@@ -4,6 +4,7 @@ set -euo pipefail
 
 ACTION=${ACTION:-render}
 MODEL=${MODEL:-qwen30}
+PRECISION_MODE=${PRECISION_MODE:-mxfp8}
 FP8_PARAM=${FP8_PARAM:-true}
 MAX_STEPS=${MAX_STEPS:-2}
 RUN_GROUP=${RUN_GROUP:-$(date +%Y%m%d-%H%M%S)}
@@ -29,6 +30,14 @@ case "${MODEL}" in
     ;;
 esac
 
+case "${PRECISION_MODE}" in
+  bf16|mxfp8) ;;
+  *)
+    echo "PRECISION_MODE must be bf16 or mxfp8" >&2
+    exit 2
+    ;;
+esac
+
 case "${FP8_PARAM}" in
   true|false) ;;
   *)
@@ -42,30 +51,40 @@ if ! [[ "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
-case "${MODEL}:${FP8_PARAM}" in
-  qwen30:false)
+case "${MODEL}:${PRECISION_MODE}:${FP8_PARAM}" in
+  qwen30:bf16:false)
+    CONFIG=experiments/native_mxfp8_source_refit/qwen30-bf16.yaml
+    NUM_NODES=4
+    SEGMENT_SIZE=2
+    MODEL_CACHE_PATHS='hub/models--Qwen--Qwen3-30B-A3B'
+    ;;
+  qwen30:mxfp8:false)
     CONFIG=experiments/native_mxfp8_source_refit/qwen30-fp8param-false.yaml
     NUM_NODES=4
     SEGMENT_SIZE=2
     MODEL_CACHE_PATHS='hub/models--Qwen--Qwen3-30B-A3B'
     ;;
-  qwen30:true)
+  qwen30:mxfp8:true)
     CONFIG=experiments/native_mxfp8_source_refit/qwen30-fp8param-true.yaml
     NUM_NODES=4
     SEGMENT_SIZE=2
     MODEL_CACHE_PATHS='hub/models--Qwen--Qwen3-30B-A3B'
     ;;
-  nano:false)
+  nano:mxfp8:false)
     CONFIG=experiments/native_mxfp8_source_refit/nano-fp8param-false.yaml
     NUM_NODES=8
     SEGMENT_SIZE=4
     MODEL_CACHE_PATHS='hub/models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16 hub/models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16'
     ;;
-  nano:true)
+  nano:mxfp8:true)
     CONFIG=experiments/native_mxfp8_source_refit/nano-fp8param-true.yaml
     NUM_NODES=8
     SEGMENT_SIZE=4
     MODEL_CACHE_PATHS='hub/models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16 hub/models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16'
+    ;;
+  *)
+    echo "Unsupported MODEL/PRECISION_MODE/FP8_PARAM combination: ${MODEL}/${PRECISION_MODE}/${FP8_PARAM}" >&2
+    exit 2
     ;;
 esac
 
@@ -75,8 +94,8 @@ if [[ -n "${REPO:-}" ]] && git -C "${REPO}" rev-parse --is-inside-work-tree >/de
 fi
 
 if [[ "${ACTION}" == render ]]; then
-  printf 'model=%s\nfp8_param=%s\nconfig=%s\nnodes=%s\nsegment_size=%s\nsteps=%s\nsource_sha=%s\n' \
-    "${MODEL}" "${FP8_PARAM}" "${CONFIG}" "${NUM_NODES}" "${SEGMENT_SIZE}" "${MAX_STEPS}" "${SOURCE_SHA}"
+  printf 'model=%s\nprecision_mode=%s\nfp8_param=%s\nconfig=%s\nnodes=%s\nsegment_size=%s\nsteps=%s\nsource_sha=%s\n' \
+    "${MODEL}" "${PRECISION_MODE}" "${FP8_PARAM}" "${CONFIG}" "${NUM_NODES}" "${SEGMENT_SIZE}" "${MAX_STEPS}" "${SOURCE_SHA}"
   exit 0
 fi
 
@@ -200,7 +219,8 @@ DATASET_ROOT=${DATASET_ROOT:-${RESULT_ROOT}/datasets/${SOURCE_SHA}}
 require_prefix "${MEGATRON_CHECKPOINT_ROOT}" /lustre MEGATRON_CHECKPOINT_ROOT
 require_prefix "${DATASET_ROOT}" /lustre DATASET_ROOT
 
-RUN_NAME="native-mxfp8-${MODEL}-fp8param-${FP8_PARAM}-${RUN_GROUP}"
+CACHE_ARM="${PRECISION_MODE}-fp8param-${FP8_PARAM}"
+RUN_NAME="native-mxfp8-${MODEL}-${CACHE_ARM}-${RUN_GROUP}"
 RUN_ROOT="${RESULT_ROOT}/${RUN_NAME}"
 if [[ "${ACTION}" == submit ]]; then
   mkdir -p "${RUN_ROOT}/logs"
@@ -209,7 +229,7 @@ if [[ "${ACTION}" == submit ]]; then
 fi
 
 NATIVE_OVERRIDES=()
-if [[ "${FP8_PARAM}" == true ]]; then
+if [[ "${PRECISION_MODE}" == mxfp8 && "${FP8_PARAM}" == true ]]; then
   NATIVE_OVERRIDES=(
     policy.megatron_cfg.fp8_cfg.enabled=true
     policy.megatron_cfg.fp8_cfg.fp8=e4m3
@@ -234,9 +254,9 @@ export HF_DATASETS_CACHE=${DATASET_ROOT}
 export HUGGINGFACE_HUB_CACHE=\${HF_HOME}/hub
 export NRL_MEGATRON_CHECKPOINT_DIR=${MEGATRON_CHECKPOINT_ROOT}/${MODEL}
 export NEMO_RL_VENV_DIR=${LOCAL_SCRATCH}/nemo-rl-worker-cache/${SOURCE_SHA}
-export VLLM_CACHE_ROOT=${LOCAL_SCRATCH}/vllm-cache/${SOURCE_SHA}/fp8param-${FP8_PARAM}
-export TORCHINDUCTOR_CACHE_DIR=${LOCAL_SCRATCH}/inductor-cache/${SOURCE_SHA}/fp8param-${FP8_PARAM}
-export TRITON_CACHE_DIR=${LOCAL_SCRATCH}/triton-cache/${SOURCE_SHA}/fp8param-${FP8_PARAM}
+export VLLM_CACHE_ROOT=${LOCAL_SCRATCH}/vllm-cache/${SOURCE_SHA}/${CACHE_ARM}
+export TORCHINDUCTOR_CACHE_DIR=${LOCAL_SCRATCH}/inductor-cache/${SOURCE_SHA}/${CACHE_ARM}
+export TRITON_CACHE_DIR=${LOCAL_SCRATCH}/triton-cache/${SOURCE_SHA}/${CACHE_ARM}
 export UV_CACHE_DIR=${LOCAL_SCRATCH}/uv-cache
 export UV_PYTHON_INSTALL_DIR=${LOCAL_SCRATCH}/uv-python
 export UV_LOCK_TIMEOUT=7200
@@ -264,9 +284,9 @@ SETUP_COMMAND=$(cat <<EOF
 set -euo pipefail
 LOCAL_HF_HOME=${LOCAL_SCRATCH}/hf-cache/${MODEL}
 mkdir -p "${LOCAL_SCRATCH}/nemo-rl-worker-cache/${SOURCE_SHA}" \\
-  "${LOCAL_SCRATCH}/vllm-cache/${SOURCE_SHA}/fp8param-${FP8_PARAM}" \\
-  "${LOCAL_SCRATCH}/inductor-cache/${SOURCE_SHA}/fp8param-${FP8_PARAM}" \\
-  "${LOCAL_SCRATCH}/triton-cache/${SOURCE_SHA}/fp8param-${FP8_PARAM}" \\
+  "${LOCAL_SCRATCH}/vllm-cache/${SOURCE_SHA}/${CACHE_ARM}" \\
+  "${LOCAL_SCRATCH}/inductor-cache/${SOURCE_SHA}/${CACHE_ARM}" \\
+  "${LOCAL_SCRATCH}/triton-cache/${SOURCE_SHA}/${CACHE_ARM}" \\
   "${LOCAL_SCRATCH}/uv-cache" \\
   "${LOCAL_SCRATCH}/uv-python" \\
   "${LOCAL_SCRATCH}/ray" \\

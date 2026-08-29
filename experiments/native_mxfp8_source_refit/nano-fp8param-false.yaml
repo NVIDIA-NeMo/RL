@@ -55,6 +55,7 @@ policy:
       gpu_memory_utilization: 0.5
       precision: fp8
       is_mx: true
+      num_last_layers_in_bf16: 8
       quantization_ignore_patterns:
       - model.layers.*.mixer.qkv_proj
       - model.layers.*.mixer.o_proj

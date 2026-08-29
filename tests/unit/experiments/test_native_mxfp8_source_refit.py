@@ -32,6 +32,12 @@ def test_native_smoke_overlays_enable_runtime_inventory_assertion() -> None:
     assert "first_last_layers_bf16: true" in nano_config
     assert "num_layers_at_end_in_bf16: 8" in nano_config
 
+    generation_config = nano_config.split("  generation:\n", maxsplit=1)[1]
+    vllm_config = generation_config.split("    vllm_cfg:\n", maxsplit=1)[1].split(
+        "    vllm_kwargs:", maxsplit=1
+    )[0]
+    assert "num_last_layers_in_bf16: 8" in vllm_config
+
 
 def test_nano_native_storage_recipe_enables_fp8_params_for_routed_experts() -> None:
     config = (EXPERIMENT_DIR / "nano-fp8param-true.yaml").read_text()
@@ -44,6 +50,25 @@ def test_nano_native_storage_recipe_enables_fp8_params_for_routed_experts() -> N
     assert 'pattern: "*mlp.experts.linear_fc2"' in recipe
     assert 'pattern: "*mlp.experts.local_experts.*.linear_fc1"' in recipe
     assert 'pattern: "*mlp.experts.local_experts.*.linear_fc2"' in recipe
+
+
+def test_qwen30_bf16_baseline_disables_training_and_rollout_quantization() -> None:
+    config = (EXPERIMENT_DIR / "qwen30-bf16.yaml").read_text()
+
+    assert "fp8_cfg:\n      enabled: false" in config
+    assert "te_precision_config_file: null" in config
+    assert "precision: bfloat16" in config
+    assert "is_mx: false" in config
+    assert "refit_transport: nccl_reshard" in config
+
+
+def test_launcher_selects_a_distinct_bf16_qwen30_arm() -> None:
+    launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
+
+    assert "PRECISION_MODE=${PRECISION_MODE:-mxfp8}" in launcher
+    assert "qwen30:bf16" in launcher
+    assert "CONFIG=experiments/native_mxfp8_source_refit/qwen30-bf16.yaml" in launcher
+    assert 'CACHE_ARM="${PRECISION_MODE}-fp8param-${FP8_PARAM}"' in launcher
 
 
 def test_ray_tmpdir_is_resolved_before_ray_head_and_workers_start() -> None:
