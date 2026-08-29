@@ -44,6 +44,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     create_sampler,
     required_buffer_capacity_for_config,
     sampler_supports_buffer_checkpoint,
+    sampler_supports_training_claims,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
@@ -274,6 +275,20 @@ class TestFactory:
             )
         )
         assert not CheckpointingEchoSampler.constructed
+
+    @pytest.mark.parametrize(
+        ("config", "expected"),
+        [
+            (InOrderSamplerConfig(), True),
+            (CustomSamplerConfig(target=f"{__name__}:EchoSampler"), False),
+            (
+                CustomSamplerConfig(target=f"{__name__}:CheckpointingEchoSampler"),
+                True,
+            ),
+        ],
+    )
+    def test_training_claim_capability_requires_custom_opt_in(self, config, expected):
+        assert sampler_supports_training_claims(config) is expected
 
     def test_ready_first_config_builds_ready_first_sampler(self):
         s = create_sampler(
@@ -696,6 +711,7 @@ class CheckpointingEchoSampler(EchoSampler):
     """Custom sampler with a static replay-checkpoint capability."""
 
     supports_buffer_checkpoint = True
+    supports_training_claims = True
     constructed = False
 
     def __init__(self, *args, **kwargs) -> None:

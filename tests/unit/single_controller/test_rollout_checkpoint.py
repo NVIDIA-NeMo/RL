@@ -20,8 +20,15 @@ from unittest.mock import Mock, call
 import pytest
 
 from nemo_rl.algorithms.single_controller_utils import rollout_checkpoint
+from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
+from nemo_rl.data import DataConfig
+from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.vllm.config import VllmSpecificArgs
+from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
+    ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
     RolloutSnapshotManifest,
     bootstrap_fingerprint,
     commit_snapshot,
@@ -43,6 +50,26 @@ class _DumpedConfig:
         return self._dumped
 
 
+@pytest.mark.parametrize(
+    ("declared", "schema"),
+    [
+        (rollout_checkpoint._BOOTSTRAP_POLICY_FIELDS, PolicyConfig),
+        (rollout_checkpoint._BOOTSTRAP_GENERATION_FIELDS, GenerationConfig),
+        (rollout_checkpoint._BOOTSTRAP_VLLM_FIELDS, VllmSpecificArgs),
+        (rollout_checkpoint._BOOTSTRAP_GRPO_FIELDS, GRPOConfig),
+        (rollout_checkpoint._BOOTSTRAP_DATA_FIELDS, DataConfig),
+        (rollout_checkpoint._BOOTSTRAP_TOKEN_CAPTURE_FIELDS, TokenCaptureConfig),
+    ],
+)
+def test_bootstrap_projection_fields_exist_in_config_schema(declared, schema):
+    fields = (
+        set(schema.model_fields)
+        if hasattr(schema, "model_fields")
+        else set(schema.__annotations__)
+    )
+    assert declared <= fields
+
+
 def _commit_snapshot(
     anchor,
     *,
@@ -52,10 +79,11 @@ def _commit_snapshot(
 ):
     tmp_path, final_path, _ = prepare_snapshot_paths(anchor)
     manifest = RolloutSnapshotManifest(
-        schema_version=1,
+        schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
         base_train_step=trainer_version,
         trainer_version=trainer_version,
         current_epoch=2,
+        sampler_dispatch_index=trainer_version + 1,
         mutation_version=mutation_version,
         rolled_back_train_group_count=0,
         bootstrap_fingerprint=fingerprint,
@@ -353,6 +381,24 @@ def test_resolver_falls_back_from_corrupt_newest_snapshot(tmp_path):
     assert resolved.path == first
 
 
+def test_resolver_ignores_snapshot_without_commit_marker(tmp_path):
+    anchor = ensure_bootstrap_anchor(tmp_path, fingerprint="fingerprint-v1")
+    committed = _commit_snapshot(anchor, mutation_version=1)
+    incomplete = anchor / "rollout_snapshots" / "snapshot_000002"
+    incomplete.mkdir()
+    (incomplete / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text("{}")
+
+    resolved = resolve_latest_snapshot(
+        anchor,
+        expected_train_step=0,
+        expected_trainer_version=0,
+        expected_bootstrap_fingerprint="fingerprint-v1",
+    )
+
+    assert resolved is not None
+    assert resolved.path == committed
+
+
 def test_resolver_fails_when_no_committed_snapshot_matches_anchor(tmp_path):
     anchor = ensure_bootstrap_anchor(tmp_path, fingerprint="fingerprint-v1")
     _commit_snapshot(anchor, mutation_version=1, fingerprint="different")
@@ -383,13 +429,68 @@ def test_commit_snapshot_flushes_payload_before_publication(tmp_path, monkeypatc
     fsync_tree.assert_called_once_with(tmp_snapshot)
     assert fsync_file.call_args_list == [
         call(tmp_snapshot / "COMMITTED"),
-        call(anchor / "rollout_snapshots" / "LATEST.tmp"),
     ]
     assert fsync_directory.call_args_list[:2] == [
         call(tmp_snapshot),
         call(anchor / "rollout_snapshots"),
     ]
     assert (final_snapshot / "COMMITTED").is_file()
-    assert (
-        anchor / "rollout_snapshots" / "LATEST"
-    ).read_text().strip() == final_snapshot.name
+
+
+def test_commit_snapshot_prunes_oldest_committed_snapshot(tmp_path):
+    anchor = ensure_bootstrap_anchor(tmp_path, fingerprint="fingerprint-v1")
+    first = _commit_snapshot(anchor, mutation_version=1)
+    second = _commit_snapshot(anchor, mutation_version=2)
+    third_tmp, third, _ = prepare_snapshot_paths(anchor)
+    manifest = RolloutSnapshotManifest(
+        schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+        base_train_step=0,
+        trainer_version=0,
+        current_epoch=2,
+        sampler_dispatch_index=2,
+        mutation_version=3,
+        rolled_back_train_group_count=0,
+        bootstrap_fingerprint="fingerprint-v1",
+    )
+    (third_tmp / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text(
+        json.dumps(manifest.to_dict())
+    )
+
+    commit_snapshot(third_tmp, third, keep_latest_k=2)
+
+    assert not first.exists()
+    assert second.is_dir()
+    assert third.is_dir()
+
+
+def test_manifest_rejects_bool_for_integer_field():
+    raw = {
+        "schema_version": ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+        "base_train_step": 0,
+        "trainer_version": 0,
+        "current_epoch": 0,
+        "sampler_dispatch_index": -1,
+        "mutation_version": 0,
+        "rolled_back_train_group_count": 0,
+        "bootstrap_fingerprint": "fingerprint-v1",
+    }
+    raw["mutation_version"] = True
+
+    with pytest.raises(ValueError, match="mutation_version.*integer"):
+        RolloutSnapshotManifest.from_mapping(raw)
+
+
+def test_manifest_rejects_dispatch_index_below_initial_state():
+    raw = {
+        "schema_version": ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+        "base_train_step": 0,
+        "trainer_version": 0,
+        "current_epoch": 0,
+        "sampler_dispatch_index": -2,
+        "mutation_version": 0,
+        "rolled_back_train_group_count": 0,
+        "bootstrap_fingerprint": "fingerprint-v1",
+    }
+
+    with pytest.raises(ValueError, match="sampler_dispatch_index.*at least -1"):
+        RolloutSnapshotManifest.from_mapping(raw)
