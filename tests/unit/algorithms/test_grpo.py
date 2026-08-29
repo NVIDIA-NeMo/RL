@@ -353,7 +353,6 @@ def test_nemo_gym_generation_replicas_receive_unique_stable_indices():
         {
             "extra_env_info": [
                 {
-                    "context_compaction_contract_version": 2,
                     "context_compaction_rollout_index": base_index,
                 }
                 for base_index in (4, 4, 7, 7)

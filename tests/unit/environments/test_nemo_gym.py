@@ -43,6 +43,7 @@ from nemo_rl.environments.nemo_gym import (
     NemoGymConfig,
     _actor_peak_rss_gib,
     _attach_multimodal_data_to_user_message,
+    _canonical_digest,
     _compact_json_size,
     _index_per_turn_images,
     _resolve_images_by_media_id,
@@ -1766,23 +1767,17 @@ def test_nemo_gym_postprocess_rejects_undeclared_rewrite():
         postprocess(_MockSelf(), row, make_result(), _Tokenizer())
 
 
-def test_nemo_gym_postprocess_accepts_completion_evidence_without_contract():
+def test_nemo_gym_postprocess_rejects_model_call_metadata_without_contract():
     class _Tokenizer:
         def batch_decode(self, batch):
             return [" ".join(map(str, token_ids)) for token_ids in batch]
 
     nemo_gym_result = {
         "response": {
-            "completion_evidence": [
+            "model_call_metadata": [
                 {
                     "turn_id": 1,
                     "completion_id": "completion-1",
-                    "prompt_token_ids": [1, 2],
-                    "sampled_token_ids": [3],
-                    "sampled_logprobs": [-0.1],
-                    "media_ids": [],
-                    "finish_reason": "max_output_tokens",
-                    "eligible": True,
                 }
             ],
             "output": [
@@ -1799,7 +1794,9 @@ def test_nemo_gym_postprocess_accepts_completion_evidence_without_contract():
     class _MockSelf:
         cfg = {}
 
-    result = (
+    with pytest.raises(
+        ValueError, match="model_call_metadata requires a rollout_trace_contract"
+    ):
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
             _MockSelf(),
             {
@@ -1809,13 +1806,6 @@ def test_nemo_gym_postprocess_accepts_completion_evidence_without_contract():
             nemo_gym_result,
             _Tokenizer(),
         )
-    )
-
-    assert [message["token_ids"].tolist() for message in result["message_log"]] == [
-        [1, 2],
-        [3],
-    ]
-    assert result["truncated"] is True
 
 
 def test_nemo_gym_postprocess_builds_exact_compacted_physical_logs():
@@ -1834,9 +1824,7 @@ def test_nemo_gym_postprocess_builds_exact_compacted_physical_logs():
     rollout_id = "group-cc:batch-000000:row-000003"
     result_payload = {
         "response": {
-            "context_compaction_contract": {
-                "schema_version": 2,
-                "mode": "exact_trace_authority",
+            "rollout_trace_contract": {
                 "rollout_id": rollout_id,
                 "group_id": "group-cc",
                 "task_id": "task-cc",
@@ -1856,15 +1844,19 @@ def test_nemo_gym_postprocess_builds_exact_compacted_physical_logs():
             "final_policy_decision": _TEST_FINAL_POLICY_DECISION,
             "lineage_deltas": _test_lineage_deltas(2),
             "boundary_events": [boundary],
-            "completion_evidence": [
+            "model_call_metadata": [
                 {
                     "rollout_id": rollout_id,
                     "turn_id": 1,
                     "completion_id": "completion-1",
                     "action_id": "action-1",
-                    "prompt_token_ids": [1],
-                    "sampled_token_ids": [2],
-                    "sampled_logprobs": [-0.1],
+                    "generation_evidence_digest": _canonical_digest(
+                        {
+                            "prompt_token_ids": [1],
+                            "sampled_token_ids": [2],
+                            "sampled_logprobs": [-0.1],
+                        }
+                    ),
                     "media_ids": ["screen-a"],
                     "policy_decision": {
                         "policy_name": "recency",
@@ -1886,9 +1878,13 @@ def test_nemo_gym_postprocess_builds_exact_compacted_physical_logs():
                     "turn_id": 2,
                     "completion_id": "completion-2",
                     "action_id": "action-2",
-                    "prompt_token_ids": [8],
-                    "sampled_token_ids": [9],
-                    "sampled_logprobs": [-0.2],
+                    "generation_evidence_digest": _canonical_digest(
+                        {
+                            "prompt_token_ids": [8],
+                            "sampled_token_ids": [9],
+                            "sampled_logprobs": [-0.2],
+                        }
+                    ),
                     "media_ids": ["screen-a", "screen-b"],
                     "policy_decision": {
                         "policy_name": "recency",
@@ -2005,14 +2001,24 @@ def test_nemo_gym_postprocess_builds_exact_compacted_physical_logs():
             "agent_input",
             "seed_obs",
             "media_assets",
-            "completion_evidence",
+            "model_call_metadata",
             "final_policy_decision",
             "lineage_deltas",
         }
     )
 
 
-def test_nemo_gym_postprocess_exact_authority_rejects_missing_evidence():
+@pytest.mark.parametrize(
+    ("model_call_metadata", "error_match"),
+    [
+        ([], "missing model_call_metadata"),
+        ([{}, {}], "metadata count does not match trainable model calls"),
+    ],
+)
+def test_nemo_gym_postprocess_rejects_invalid_rollout_trace_contract(
+    model_call_metadata: list[dict],
+    error_match: str,
+):
     class _Tokenizer:
         def batch_decode(self, batch):
             return [" ".join(map(str, token_ids)) for token_ids in batch]
@@ -2020,9 +2026,7 @@ def test_nemo_gym_postprocess_exact_authority_rejects_missing_evidence():
     rollout_id = "group-cc:batch-000000:row-000000"
     payload = {
         "response": {
-            "context_compaction_contract": {
-                "schema_version": 2,
-                "mode": "exact_trace_authority",
+            "rollout_trace_contract": {
                 "rollout_id": rollout_id,
                 "group_id": "group-cc",
                 "task_id": "task-cc",
@@ -2030,7 +2034,7 @@ def test_nemo_gym_postprocess_exact_authority_rejects_missing_evidence():
                 "attempt_index": 0,
             },
             "media_assets": {},
-            "completion_evidence": [],
+            "model_call_metadata": model_call_metadata,
             "output": [
                 {
                     "prompt_token_ids": [1],
@@ -2055,7 +2059,7 @@ def test_nemo_gym_postprocess_exact_authority_rejects_missing_evidence():
     postprocess = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
     )
-    with pytest.raises(ValueError, match="missing completion_evidence"):
+    with pytest.raises(ValueError, match=error_match):
         postprocess(
             type("_MockSelf", (), {"cfg": {}})(),
             row,
@@ -2073,9 +2077,7 @@ def test_nemo_gym_postprocess_rejects_mismatched_generation_evidence():
     rollout_id = "group-cc:batch-000000:row-000000"
     payload = {
         "response": {
-            "context_compaction_contract": {
-                "schema_version": 2,
-                "mode": "exact_trace_authority",
+            "rollout_trace_contract": {
                 "rollout_id": rollout_id,
                 "group_id": "group-cc",
                 "task_id": "task-cc",
@@ -2083,15 +2085,19 @@ def test_nemo_gym_postprocess_rejects_mismatched_generation_evidence():
                 "attempt_index": 0,
             },
             "media_assets": {},
-            "completion_evidence": [
+            "model_call_metadata": [
                 {
                     "rollout_id": rollout_id,
                     "turn_id": 1,
                     "completion_id": "completion-1",
                     "action_id": "action-1",
-                    "prompt_token_ids": [99],
-                    "sampled_token_ids": [2],
-                    "sampled_logprobs": [-0.1],
+                    "generation_evidence_digest": _canonical_digest(
+                        {
+                            "prompt_token_ids": [99],
+                            "sampled_token_ids": [2],
+                            "sampled_logprobs": [-0.1],
+                        }
+                    ),
                     "media_ids": [],
                     **_exact_evidence_contract_fields(
                         turn_id=1,
@@ -2125,7 +2131,7 @@ def test_nemo_gym_postprocess_rejects_mismatched_generation_evidence():
     postprocess = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
     )
-    with pytest.raises(ValueError, match="does not exactly match"):
+    with pytest.raises(ValueError, match="digest does not match"):
         postprocess(
             type("_MockSelf", (), {"cfg": {}})(),
             row,
@@ -2135,34 +2141,16 @@ def test_nemo_gym_postprocess_rejects_mismatched_generation_evidence():
         )
 
 
-def test_context_compaction_rollout_ids_are_unique_within_and_across_batches():
-    rows = [
-        {
-            "_rowidx": row_index,
-            "context_compaction_contract_version": 1,
-            "context_compaction_group_id": "group-cc",
-        }
-        for row_index in range(2)
-    ]
-    _stamp_nemo_gym_rollout_ids(
-        rows, rollout_batch_index=4, num_generations_per_prompt=2
-    )
+def test_context_compaction_rollout_identity_rejects_partial_coordinates():
+    rows = [{"_rowidx": 0, "context_compaction_group_id": "group-cc"}]
 
-    assert [row["context_compaction_rollout_id"] for row in rows] == [
-        "group-cc:batch-000004:row-000000",
-        "group-cc:batch-000004:row-000001",
-    ]
-
-    next_batch = [dict(rows[0])]
-    _stamp_nemo_gym_rollout_ids(
-        next_batch, rollout_batch_index=5, num_generations_per_prompt=1
-    )
-    assert next_batch[0]["context_compaction_rollout_id"] == (
-        "group-cc:batch-000005:row-000000"
-    )
+    with pytest.raises(ValueError, match="require non-empty task and group IDs"):
+        _stamp_nemo_gym_rollout_ids(
+            rows, rollout_batch_index=4, num_generations_per_prompt=1
+        )
 
 
-def test_policy_version_supports_rows_without_context_compaction_contract():
+def test_policy_version_supports_rows_without_context_compaction_identity():
     rows = [{"_rowidx": 0}]
 
     _stamp_nemo_gym_rollout_ids(
@@ -2177,11 +2165,10 @@ def test_policy_version_supports_rows_without_context_compaction_contract():
     assert rows[0]["_nemo_rl_generation_policy_version"] == "sync-policy-step-00000000"
 
 
-def test_v2_context_compaction_rollout_ids_are_retry_and_order_stable():
+def test_context_compaction_rollout_ids_are_retry_and_order_stable():
     rows = [
         {
             "_rowidx": 19,
-            "context_compaction_contract_version": 2,
             "context_compaction_group_id": "group-cc",
             "context_compaction_task_id": task_id,
             "context_compaction_rollout_index": rollout_index,

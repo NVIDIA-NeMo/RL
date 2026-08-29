@@ -3534,7 +3534,6 @@ class TestAsyncTrajectoryCollector:
                 "message_log": [[{"role": "user", "content": "test"}]],
                 "extra_env_info": [
                     {
-                        "context_compaction_contract_version": 2,
                         "context_compaction_rollout_index": 7,
                     }
                 ],

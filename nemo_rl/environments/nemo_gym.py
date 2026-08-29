@@ -73,19 +73,25 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
-_EXACT_TRACE_RESPONSE_PROJECTION_FIELDS = (
+_ROLLOUT_TRACE_RESPONSE_PROJECTION_FIELDS = (
     "id",
     "status",
     "error",
     "incomplete_details",
     "usage",
     "output",
-    "context_compaction_contract",
+    "rollout_trace_contract",
     "chunk_records",
     "boundary_events",
     "guard_records",
 )
 _MEDIA_PART_TYPES = frozenset({"input_image", "image", "image_url"})
+_CONTEXT_COMPACTION_IDENTITY_FIELDS = (
+    "context_compaction_task_id",
+    "context_compaction_group_id",
+    "context_compaction_rollout_index",
+    "context_compaction_attempt_index",
+)
 
 
 class NemoGymCompatibleConfig(Protocol):
@@ -293,10 +299,10 @@ def _project_semantic_value(value: Any) -> Any:
     return value
 
 
-def _build_exact_trace_full_result_projection(
+def _build_rollout_trace_full_result_projection(
     nemo_gym_result: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build the bounded Ray/logging projection after exact trace factoring.
+    """Build the bounded Ray/logging projection after rollout trace factoring.
 
     The complete Gym HTTP result is required until tokens and media have been
     independently validated and materialized. After that point, training
@@ -312,7 +318,7 @@ def _build_exact_trace_full_result_projection(
             if key == "output"
             else deepcopy(response[key])
         )
-        for key in _EXACT_TRACE_RESPONSE_PROJECTION_FIELDS
+        for key in _ROLLOUT_TRACE_RESPONSE_PROJECTION_FIELDS
         if key in response and response[key] is not None
     }
     projection = {
@@ -656,7 +662,7 @@ def assign_nemo_gym_generation_replica_indices(
     for row_index, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
-        if row.get("context_compaction_contract_version") != 2:
+        if "context_compaction_rollout_index" not in row:
             continue
         if row.get("_nemo_rl_replica_index_assigned") is True:
             continue
@@ -667,7 +673,7 @@ def assign_nemo_gym_generation_replica_indices(
             or base_rollout_index < 0
         ):
             raise ValueError(
-                "Version 2 NeMo-Gym rows require a non-negative integer "
+                "Context-compaction NeMo-Gym rows require a non-negative integer "
                 "context_compaction_rollout_index before generation replication"
             )
         replica_index = row_index % num_generations_per_prompt
@@ -691,51 +697,32 @@ def _stamp_nemo_gym_rollout_ids(
         raise ValueError("generation_policy_version must be non-empty")
     stamped_ids: set[str] = set()
     for row in rows:
-        contract_version = row.get("context_compaction_contract_version")
-        if contract_version is not None and contract_version not in {1, 2}:
-            raise ValueError(
-                "Unsupported context compaction row contract version: "
-                f"{contract_version!r}"
-            )
         row_index = row.get("_rowidx")
         if not isinstance(row_index, int):
             raise ValueError("NeMo-Gym rows require an integer _rowidx")
-        group_id = row.get("context_compaction_group_id")
-        if not isinstance(group_id, str) or not group_id:
-            task_index = row.get("_ng_task_index")
-            group_id = (
-                f"nemo-gym-task-{task_index}"
-                if isinstance(task_index, int)
-                else (
-                    f"nemo-gym-batch-{rollout_batch_index:06d}:group-"
-                    f"{row_index // num_generations_per_prompt:06d}"
-                )
-            )
-        if (
-            contract_version is not None
-            and row.get("context_compaction_group_id") != group_id
-        ):
-            raise ValueError(
-                "Context-compaction rows require a non-empty "
-                "context_compaction_group_id"
-            )
-        if contract_version == 2:
+        has_context_compaction_identity = any(
+            field in row for field in _CONTEXT_COMPACTION_IDENTITY_FIELDS
+        )
+        if has_context_compaction_identity:
             task_id = row.get("context_compaction_task_id")
+            group_id = row.get("context_compaction_group_id")
             rollout_index = row.get("context_compaction_rollout_index")
             attempt_index = row.get("context_compaction_attempt_index")
             if (
                 not isinstance(task_id, str)
                 or not task_id
+                or not isinstance(group_id, str)
+                or not group_id
+                or isinstance(rollout_index, bool)
                 or not isinstance(rollout_index, int)
                 or rollout_index < 0
+                or isinstance(attempt_index, bool)
                 or not isinstance(attempt_index, int)
                 or attempt_index < 0
             ):
                 raise ValueError(
-                    "Version 2 context compaction rows require a non-empty "
-                    "context_compaction_task_id and non-negative integer "
-                    "context_compaction_rollout_index and "
-                    "context_compaction_attempt_index"
+                    "Context-compaction rows require non-empty task and group IDs "
+                    "and non-negative integer rollout and attempt indices"
                 )
             identity = json.dumps(
                 {
@@ -749,11 +736,16 @@ def _stamp_nemo_gym_rollout_ids(
             )
             digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
             rollout_id = f"rollout-{digest[:24]}"
-        elif contract_version == 1:
-            rollout_id = (
-                f"{group_id}:batch-{rollout_batch_index:06d}:row-{row_index:06d}"
-            )
         else:
+            task_index = row.get("_ng_task_index")
+            group_id = (
+                f"nemo-gym-task-{task_index}"
+                if isinstance(task_index, int)
+                else (
+                    f"nemo-gym-batch-{rollout_batch_index:06d}:group-"
+                    f"{row_index // num_generations_per_prompt:06d}"
+                )
+            )
             rollout_id = (
                 f"{group_id}:rollout-{row_index % num_generations_per_prompt:06d}"
             )
@@ -762,7 +754,7 @@ def _stamp_nemo_gym_rollout_ids(
         stamped_ids.add(rollout_id)
         row["_nemo_rl_group_id"] = group_id
         row["_nemo_rl_rollout_id"] = rollout_id
-        if contract_version is not None:
+        if has_context_compaction_identity:
             row["context_compaction_rollout_id"] = rollout_id
         if generation_policy_version is not None:
             row["_nemo_rl_generation_policy_version"] = generation_policy_version
@@ -1129,8 +1121,8 @@ Depending on your data shape, you may want to change these values."""
                 media_messages, raw_initial_sources
             )
 
-        contract = response.get("context_compaction_contract")
-        exact_trace_authority = contract is not None
+        contract = response.get("rollout_trace_contract")
+        has_rollout_trace_contract = contract is not None
         rollout_id = nemo_gym_row.get("_nemo_rl_rollout_id")
         group_id = nemo_gym_row.get("_nemo_rl_group_id")
         if not isinstance(rollout_id, str) or not rollout_id:
@@ -1149,17 +1141,9 @@ Depending on your data shape, you may want to change these values."""
             raise ValueError(
                 "_nemo_rl_generation_policy_version must be a non-empty string"
             )
-        if exact_trace_authority:
+        if has_rollout_trace_contract:
             if not isinstance(contract, dict):
-                raise TypeError("context_compaction_contract must be a mapping")
-            contract_version = contract.get("schema_version")
-            if (
-                contract_version not in {2, 3}
-                or contract.get("mode") != "exact_trace_authority"
-            ):
-                raise ValueError(
-                    f"Unsupported context compaction response contract: {contract!r}"
-                )
+                raise TypeError("rollout_trace_contract must be a mapping")
             if nemo_gym_row.get("context_compaction_rollout_id") != rollout_id:
                 raise ValueError(
                     "Context-compaction and generic rollout identities disagree"
@@ -1205,47 +1189,34 @@ Depending on your data shape, you may want to change these values."""
             for item in response["output"]
             if "generation_token_ids" in item and item["generation_token_ids"]
         ]
-        evidence_field = (
-            "model_call_metadata"
-            if exact_trace_authority and contract["schema_version"] == 3
-            else "completion_evidence"
-        )
-        completion_evidence = response.get(evidence_field) or []
-        if exact_trace_authority and not completion_evidence:
+        model_call_metadata = response.get("model_call_metadata")
+        if model_call_metadata is None:
+            model_call_metadata = []
+        elif not isinstance(model_call_metadata, list):
+            raise TypeError("model_call_metadata must be a list")
+        if has_rollout_trace_contract and not model_call_metadata:
+            raise ValueError("Rollout trace response is missing model_call_metadata")
+        if model_call_metadata and not has_rollout_trace_contract:
+            raise ValueError("model_call_metadata requires a rollout_trace_contract")
+        if has_rollout_trace_contract and len(model_call_metadata) != len(
+            trainable_output_items
+        ):
             raise ValueError(
-                f"Exact-trace authority response is missing {evidence_field}"
-            )
-        if (exact_trace_authority or completion_evidence) and len(
-            completion_evidence
-        ) != len(trainable_output_items):
-            raise ValueError(
-                "Completion evidence count does not match trainable model calls: "
-                f"evidence={len(completion_evidence)} "
+                "Model-call metadata count does not match trainable model calls: "
+                f"metadata={len(model_call_metadata)} "
                 f"calls={len(trainable_output_items)}"
             )
 
         trace_calls = []
         for call_index, output_item in enumerate(trainable_output_items):
-            evidence = completion_evidence[call_index] if completion_evidence else None
+            evidence = model_call_metadata[call_index] if model_call_metadata else None
             if evidence is not None:
                 canonical_arrays = {
                     "prompt_token_ids": output_item["prompt_token_ids"],
                     "sampled_token_ids": output_item["generation_token_ids"],
                     "sampled_logprobs": output_item["generation_log_probs"],
                 }
-                if contract is None or contract["schema_version"] == 2:
-                    evidence_arrays = {
-                        "prompt_token_ids": evidence["prompt_token_ids"],
-                        "sampled_token_ids": evidence["sampled_token_ids"],
-                        "sampled_logprobs": evidence["sampled_logprobs"],
-                    }
-                    if evidence_arrays != canonical_arrays:
-                        raise ValueError(
-                            "Gym completion evidence does not exactly match the "
-                            f"generation response at call {call_index}: "
-                            f"expected={canonical_arrays}, actual={evidence_arrays}"
-                        )
-                elif evidence.get("generation_evidence_digest") != _canonical_digest(
+                if evidence.get("generation_evidence_digest") != _canonical_digest(
                     canonical_arrays
                 ):
                     raise ValueError(
@@ -1335,19 +1306,19 @@ Depending on your data shape, you may want to change these values."""
             )
 
         media_assets = response.get("media_assets")
-        if exact_trace_authority and media_assets is None:
-            raise ValueError(
-                "Exact-trace authority response is missing its media asset arena"
-            )
+        if has_rollout_trace_contract and media_assets is None:
+            raise ValueError("Rollout trace response is missing its media asset arena")
         media_assets = media_assets or {}
         trace_plan = build_rollout_trace_plan(
             rollout_id=rollout_id,
             calls=trace_calls,
             boundary_events=(
-                response.get("boundary_events") or [] if exact_trace_authority else []
+                response.get("boundary_events") or []
+                if has_rollout_trace_contract
+                else []
             ),
             media_assets=media_assets,
-            strict=exact_trace_authority,
+            strict=has_rollout_trace_contract,
         )
         inferred_boundary_count = int(trace_plan["checks"]["inferred_boundary_count"])
         if inferred_boundary_count:
@@ -1355,7 +1326,7 @@ Depending on your data shape, you may want to change these values."""
                 "NeMo-Gym rollout "
                 f"{rollout_id!r} contains {inferred_boundary_count} undeclared "
                 "prompt/media discontinuity boundary or boundaries. Only an exact "
-                "context-compaction contract may authorize a physical trace split."
+                "rollout trace contract may authorize a physical trace split."
             )
         if (
             not generation_only
@@ -1456,7 +1427,7 @@ Depending on your data shape, you may want to change these values."""
             if routed_experts is not None:
                 user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
             if processor is not None:
-                if completion_evidence:
+                if model_call_metadata:
                     images_this_turn = _resolve_images_by_media_id(
                         media_assets,
                         trace_call["new_media_ids"],
@@ -1590,8 +1561,8 @@ Depending on your data shape, you may want to change these values."""
             else None
         )
 
-        if exact_trace_authority:
-            full_result = _build_exact_trace_full_result_projection(nemo_gym_result)
+        if has_rollout_trace_contract:
+            full_result = _build_rollout_trace_full_result_projection(nemo_gym_result)
         else:
             full_result = nemo_gym_result
         result = {
