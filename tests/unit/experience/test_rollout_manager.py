@@ -33,6 +33,7 @@ from copy import deepcopy
 import pytest
 import torch
 
+from nemo_rl.algorithms.async_utils.replay_buffer import PostWriteEnrichmentError
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
@@ -153,6 +154,96 @@ def _make_manager(
 
 
 class TestGenerateAndPushFlow:
+    def test_post_write_failure_does_not_regenerate_the_rollout(self):
+        class _EnrichmentFailBuffer(_FakeBuffer):
+            async def commit(
+                self,
+                group_id: str,
+                record,
+                start_weight_version: int,
+                end_weight_version: int,
+            ):
+                await super().commit(
+                    group_id,
+                    record,
+                    start_weight_version,
+                    end_weight_version,
+                )
+                raise PostWriteEnrichmentError("teacher stage failed")
+
+        rollout_calls = 0
+
+        async def _count_rollout(_sample):
+            nonlocal rollout_calls
+            rollout_calls += 1
+
+        buf = _EnrichmentFailBuffer()
+        mgr = _make_manager(
+            buf,
+            _FakeImpl(on_run=_count_rollout),
+            retry_policy=RolloutRetryPolicy(
+                max_infra_attempts=3,
+                max_data_attempts=3,
+                max_gym_row_attempts=1,
+            ),
+        )
+
+        with pytest.raises(PostWriteEnrichmentError, match="teacher stage failed"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert rollout_calls == 1
+        assert len(buf.reserve_calls) == 1
+        assert len(buf.remove_calls) == 1
+
+    def test_grouped_post_write_failure_does_not_regenerate_the_rollout(self):
+        """Rollback failures do not hide the post-write failure classification."""
+
+        class _GroupedEnrichmentFailBuffer(_FakeBuffer):
+            async def commit(
+                self,
+                group_id: str,
+                record,
+                start_weight_version: int,
+                end_weight_version: int,
+            ):
+                await super().commit(
+                    group_id,
+                    record,
+                    start_weight_version,
+                    end_weight_version,
+                )
+                raise ExceptionGroup(
+                    "commit and rollback both failed",
+                    [
+                        PostWriteEnrichmentError("teacher stage failed"),
+                        RuntimeError("rollback failed"),
+                    ],
+                )
+
+        rollout_calls = 0
+
+        async def _count_rollout(_sample):
+            nonlocal rollout_calls
+            rollout_calls += 1
+
+        buf = _GroupedEnrichmentFailBuffer()
+        mgr = _make_manager(
+            buf,
+            _FakeImpl(on_run=_count_rollout),
+            retry_policy=RolloutRetryPolicy(
+                max_infra_attempts=3,
+                max_data_attempts=3,
+                max_gym_row_attempts=1,
+            ),
+        )
+
+        with pytest.raises(ExceptionGroup, match="commit and rollback"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert rollout_calls == 1
+        assert len(buf.reserve_calls) == 1
+        assert len(buf.remove_calls) == 1
+
     def test_explicit_registry_tracks_only_inflight_generation(self):
         registry: dict[str, tuple[asyncio.Task[None], int]] = {}
         buf = _FakeBuffer()
