@@ -24,6 +24,7 @@ import torch
 from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -46,6 +47,18 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 class FakeWeightSynchronizer:
     pass
+
+
+class _InitBuffer:
+    """Minimal non-optional TQ buffer contract for actor-init tests."""
+
+    def __init__(self) -> None:
+        self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
+
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        self.checkpoint_barrier = barrier
 
 
 def _checkpointing_config(tmp_path) -> dict:
@@ -86,6 +99,7 @@ def _grpo_master_config(tmp_path) -> MasterConfig:
 
 def _actor_args_for_init(**overrides) -> SimpleNamespace:
     """Minimal actor args for a controller built through the real __init__."""
+    tq_buffer = _InitBuffer()
     args = dict(
         partition_id="rollout_data",
         dp_client=None,
@@ -95,8 +109,8 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         weight_synchronizer=FakeWeightSynchronizer(),
         advantage_estimator=None,
         loss_fn=None,
-        tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        tq_buffer=tq_buffer,
+        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -104,6 +118,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         inference_cluster=None,
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
+        data_plane_checkpoint_metadata=None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -133,6 +148,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         logger={},
         env={},
     )
+    tq_buffer = _InitBuffer()
     actor_args = SimpleNamespace(
         partition_id="rollout_data",
         dp_client=None,
@@ -142,8 +158,8 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         weight_synchronizer=None,
         advantage_estimator=None,
         loss_fn=None,
-        tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        tq_buffer=tq_buffer,
+        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -192,25 +208,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         # __init__ builds a CheckpointManager + TimeoutChecker from this block.
         checkpointing=_checkpointing_config(tmp_path),
     )
-    actor_args = SimpleNamespace(
-        partition_id="rollout_data",
-        dp_client=None,
-        gen_handle=None,
-        trainer_handle=None,
-        dataloader=None,
-        weight_synchronizer=FakeWeightSynchronizer(),
-        advantage_estimator=None,
-        loss_fn=None,
-        tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
-        env_handles={},
-        fleet_monitor=None,
-        generation_router=None,
-        train_cluster=None,
-        inference_cluster=None,
-        save_state=_initial_grpo_save_state(),
-        last_checkpoint_path=None,
-    )
+    actor_args = _actor_args_for_init()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
     controller_cls(
@@ -321,26 +319,7 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
     setup_metrics = SetupTimingMetrics(
         generation_init_time_s=1.5, policy_init_time_s=2.5
     )
-    actor_args = SimpleNamespace(
-        partition_id="rollout_data",
-        dp_client=None,
-        gen_handle=None,
-        trainer_handle=None,
-        dataloader=None,
-        weight_synchronizer=FakeWeightSynchronizer(),
-        advantage_estimator=None,
-        loss_fn=None,
-        tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
-        train_cluster=None,
-        inference_cluster=None,
-        # A real field of SingleControllerActorArgs. Read directly rather than via a
-        # getattr default, so omitting it breaks here instead of silently degrading
-        # watchdog.gym_subprocess_check into a no-op at runtime.
-        env_handles={},
-        save_state=_initial_grpo_save_state(),
-        last_checkpoint_path=None,
-    )
+    actor_args = _actor_args_for_init()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
     controller_cls(
@@ -468,12 +447,16 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     )
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
+    # No fleet health: _sync_weights reconciles refit membership first, and with no
+    # monitor there is nothing to reconcile.
+    ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=False,
     )
     ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
     ctrl._master_config = SimpleNamespace(env={})
@@ -491,6 +474,9 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._async_cfg = AsyncRLConfig()
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
+    # No fleet health: _sync_weights reconciles refit membership first, and with no
+    # monitor there is nothing to reconcile.
+    ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
@@ -500,6 +486,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
         calibrate_qkv_fp8_scales=MagicMock(return_value={"layers": {"layer.0": 0.5}})
     )
     ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
     ctrl._master_config = SimpleNamespace(env={})
@@ -1142,6 +1129,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
     ctrl._train_steps = 0
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}

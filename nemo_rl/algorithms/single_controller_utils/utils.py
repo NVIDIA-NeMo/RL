@@ -94,7 +94,11 @@ def reduce_advantage_pump_metrics(
     rewards: list[torch.Tensor],
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
+    *,
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
+    num_invalid_tool_calls: list[int] | None = None,
+    num_malformed_thinking: list[int] | None = None,
+    num_assistant_messages: list[int] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -104,10 +108,14 @@ def reduce_advantage_pump_metrics(
         sequence_lengths: All input_lengths trained on this step.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
+        num_invalid_tool_calls: Per-sample invalid tool-call counts.
+        num_malformed_thinking: Per-sample malformed-thinking counts.
+        num_assistant_messages: Per-sample assistant message counts (rate denominator).
 
     Returns:
-        Step-level reward, advantage, token-count, and optional sequence
-        log-probability error metrics.
+        Step-level reward, advantage, token-count, optional sequence
+        log-probability error metrics, and per-sample violation counts.
+
     """
     out: dict[str, float] = {}
     if rewards:
@@ -126,6 +134,15 @@ def reduce_advantage_pump_metrics(
         out["total_num_tokens"] = float(sum(sequence_lengths))
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
+    n_asst = sum(num_assistant_messages or [])
+    if n_asst:
+        n_invalid = sum(num_invalid_tool_calls or [])
+        n_malformed = sum(num_malformed_thinking or [])
+        out["invalid_tool_call_rate"] = n_invalid / n_asst
+        out["malformed_thinking_rate"] = n_malformed / n_asst
+        out["num_invalid_tool_calls"] = float(n_invalid)
+        out["num_malformed_thinking"] = float(n_malformed)
+        out["num_assistant_messages"] = float(n_asst)
     return out
 
 
