@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import inspect
 import sys
-from copy import deepcopy
 from contextlib import AbstractContextManager, contextmanager
+from copy import deepcopy
 from pathlib import Path
 from types import ModuleType, SimpleNamespace, TracebackType
 from typing import Any

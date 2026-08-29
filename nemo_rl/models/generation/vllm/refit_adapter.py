@@ -31,7 +31,6 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     _extract_layer_prefix,
 )
 
-
 _NATIVE_VALUE_DTYPE = torch.float8_e4m3fn
 _NATIVE_SCALE_DTYPE = torch.uint8
 

@@ -33,10 +33,10 @@ import torch
 
 pytest.importorskip("vllm")  # module-top `import vllm` in vllm_backend
 
+import nemo_rl.models.generation.vllm.vllm_backend as vllm_backend_module  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_backend import (  # noqa: E402
     VllmInternalWorkerExtension,
 )
-import nemo_rl.models.generation.vllm.vllm_backend as vllm_backend_module  # noqa: E402
 from nemo_rl.weight_sync.nccl_reshard_utils import (  # noqa: E402
     HFToLocalParamMap,
     LocalParamSpec,
