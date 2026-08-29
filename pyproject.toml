@@ -360,11 +360,6 @@ name = "flashinfer-cu130"
 url = "https://flashinfer.ai/whl/cu130"
 explicit = true
 
-[[tool.uv.index]]
-name = "flashinfer"
-url = "https://flashinfer.ai/whl"
-explicit = true
-
 [tool.uv]
 managed = true
 environments = [
