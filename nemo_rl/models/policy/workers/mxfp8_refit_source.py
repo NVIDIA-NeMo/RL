@@ -61,9 +61,13 @@ def extract_native_mxfp8_components(tensor: Any) -> NativeMXFP8Components:
     assert isinstance(data, torch.Tensor)
     assert isinstance(scale, torch.Tensor)
 
+    scale_view = scale[:rows, :scale_columns].view((*shape[:-1], scale_columns))
+    if not scale_view.is_contiguous():
+        scale_view = scale_view.contiguous()
+
     return NativeMXFP8Components(
         weight=data.view(torch.float8_e4m3fn).view(shape),
-        weight_scale=scale[:rows, :scale_columns].view((*shape[:-1], scale_columns)),
+        weight_scale=scale_view,
     )
 
 

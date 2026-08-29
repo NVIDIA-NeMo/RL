@@ -30,6 +30,8 @@ def first_last_bf16_local_layers(
         raise ValueError("Invalid leading BF16 layer count")
     if not 0 <= num_layers_at_end_in_bf16 <= total_layers:
         raise ValueError("Invalid trailing BF16 layer count")
+    if num_layers_at_start_in_bf16 + num_layers_at_end_in_bf16 > total_layers:
+        raise ValueError("Leading and trailing BF16 layer ranges overlap")
 
     trailing_start = total_layers - num_layers_at_end_in_bf16
     return tuple(
@@ -42,13 +44,23 @@ def first_last_bf16_local_layers(
 
 
 def _find_bf16_config_key(recipe: Any) -> str:
+    candidates = []
     for config_key, config in recipe.configs.items():
         training_recipe = config.get("training_recipe", {})
         if (
             training_recipe.get("fp8_quantization_recipe") is None
             and training_recipe.get("fp4_quantization_recipe") is None
         ):
-            return str(config_key)
+            candidates.append(str(config_key))
+    if "bf16" in candidates:
+        return "bf16"
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise ValueError(
+            "A first/last BF16 override found multiple non-quantized training "
+            f"configs without a 'bf16' key: {candidates!r}"
+        )
     raise ValueError(
         "A first/last BF16 override requires a non-quantized training config "
         "in the TE precision recipe"

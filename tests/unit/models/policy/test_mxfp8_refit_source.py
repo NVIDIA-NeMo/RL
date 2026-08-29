@@ -123,7 +123,7 @@ def _source(
     )
 
 
-def test_extract_native_mxfp8_components_crops_scale_padding_without_copy() -> None:
+def test_extract_native_mxfp8_components_packs_padded_scale_rows() -> None:
     data = _bytes(3 * 64).reshape(3, 64)
     scale = _bytes(5 * 4).reshape(5, 4)
     source = _source(rowwise_data=data, rowwise_scale_inv=scale)
@@ -136,6 +136,19 @@ def test_extract_native_mxfp8_components_crops_scale_padding_without_copy() -> N
     assert result.weight.view(torch.uint8).data_ptr() == data.data_ptr()
     assert result.weight_scale.shape == (3, 2)
     assert torch.equal(result.weight_scale, scale[:3, :2])
+    assert result.weight_scale.is_contiguous()
+    assert result.weight_scale.data_ptr() != scale.data_ptr()
+
+
+def test_extract_native_mxfp8_components_keeps_exact_scale_storage_zero_copy() -> None:
+    data = _bytes(3 * 64).reshape(3, 64)
+    scale = _bytes(3 * 2).reshape(3, 2)
+
+    result = extract_native_mxfp8_components(
+        _source(rowwise_data=data, rowwise_scale_inv=scale)
+    )
+
+    assert result.weight_scale.is_contiguous()
     assert result.weight_scale.data_ptr() == scale.data_ptr()
 
 
@@ -150,7 +163,7 @@ def test_extract_native_mxfp8_components_restores_grouped_leading_dimensions() -
     assert torch.equal(result.weight.view(torch.uint8), data)
     assert result.weight_scale.shape == (2, 3, 2)
     assert torch.equal(result.weight_scale, scale[:6, :2].view(2, 3, 2))
-    assert result.weight_scale.data_ptr() == scale.data_ptr()
+    assert result.weight_scale.is_contiguous()
 
 
 def test_extract_native_mxfp8_components_does_not_fall_back_to_columnwise_storage() -> (

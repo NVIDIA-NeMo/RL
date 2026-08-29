@@ -2360,14 +2360,11 @@ class MegatronPolicyWorkerImpl(
             ".mlp.experts.linear_fc2.weight",
         )
         local_tasks: dict[str, tuple[str, torch.Tensor, Any]] = {}
+        local_storage: dict[str, bool] = {}
         for local_name, param in self.model.named_parameters():
             local_name = bridge._unwrap_name(local_name)
             if not local_name.endswith(grouped_suffixes):
                 continue
-            if not is_grouped_mxfp8tensor(param):
-                raise ValueError(
-                    f"Expected grouped MXFP8 storage for {local_name!r} role 'weight'"
-                )
             global_name = _megatron_local_name_to_global(
                 models, self.model.config, local_name, 0
             )
@@ -2377,6 +2374,13 @@ class MegatronPolicyWorkerImpl(
                     "Missing Megatron-Bridge mapping for grouped MXFP8 source "
                     f"{global_name!r} role 'weight'"
                 )
+            uses_native_storage = bool(is_grouped_mxfp8tensor(param))
+            local_storage[global_name] = uses_native_storage
+            # A per-module TE recipe can keep first/last or other selected
+            # grouped experts in BF16. Those tasks remain in the ordinary
+            # Bridge stream and are sent through the misc path.
+            if not uses_native_storage:
+                continue
             local_tasks[global_name] = (local_name, param, mapping)
 
         tasks: list[Any] = []
@@ -2395,6 +2399,20 @@ class MegatronPolicyWorkerImpl(
                     "Missing Megatron-Bridge mapping for grouped MXFP8 source "
                     f"{global_name!r} role 'weight'"
                 )
+            local_uses_native = local_storage.get(global_name)
+            broadcaster = getattr(mapping, "broadcast_obj_from_pp_rank", None)
+            uses_native = (
+                bool(
+                    broadcaster(
+                        local_uses_native,
+                        cache_key=f"native-grouped-storage:{global_name}",
+                    )
+                )
+                if callable(broadcaster)
+                else bool(local_uses_native)
+            )
+            if not uses_native:
+                continue
             tasks.append(
                 WeightConversionTask(
                     param_name=param_name,
@@ -2858,9 +2876,12 @@ class MegatronPolicyWorkerImpl(
             if grouped:
                 from megatron.core.fp8_utils import get_grouped_quantized_members
 
-                members = get_grouped_quantized_members(
-                    task.param_weight, create_if_missing=False
-                )
+                try:
+                    members = get_grouped_quantized_members(
+                        task.param_weight, create_if_missing=False
+                    )
+                except (RuntimeError, ValueError):
+                    return False
                 if not members:
                     logical_name = self._native_task_projections(task, grouped=True)[0][
                         0

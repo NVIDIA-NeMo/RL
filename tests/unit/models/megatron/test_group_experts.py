@@ -86,7 +86,7 @@ def _native_worker(
     grouped_tasks: list[SimpleNamespace] | None = None,
 ) -> MegatronPolicyWorkerImpl:
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.fp8_cfg = {"fp8_param": True, "fp8_recipe": "mxfp8"}
+    worker.fp8_cfg = {"enabled": True, "fp8_param": True, "fp8_recipe": "mxfp8"}
     worker.cfg = cast(
         Any,
         {
@@ -983,6 +983,38 @@ def test_native_mxfp8_metadata_keeps_bf16_ignored_experts_in_misc() -> None:
         f"{ignored_prefix}.down_proj.weight",
     ]
     assert worker._misc_conversion_tasks == [ignored_fc1, ignored_fc2]
+
+
+def test_native_grouped_task_builder_leaves_bf16_experts_for_misc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from megatron.bridge.models.conversion import model_bridge
+    from megatron.core import fp8_utils
+
+    global_name = "decoder.layers.0.mlp.experts.linear_fc1.weight"
+    parameter = torch.nn.Parameter(torch.zeros((8, 64), dtype=torch.bfloat16))
+    worker = _native_worker([])
+    worker.model = SimpleNamespace(
+        config=SimpleNamespace(moe_single_grouped_weight=True),
+        named_parameters=lambda: [(global_name, parameter)],
+    )
+    bridge = SimpleNamespace(_unwrap_name=lambda name: name)
+    registry = SimpleNamespace(megatron_to_hf_lookup=lambda _name: object())
+    monkeypatch.setattr(fp8_utils, "is_grouped_mxfp8tensor", lambda _param: False)
+    monkeypatch.setattr(
+        model_bridge,
+        "_megatron_local_name_to_global",
+        lambda _models, _config, name, _vp_stage: name,
+    )
+
+    tasks = worker._build_native_grouped_mxfp8_tasks(
+        bridge=bridge,
+        registry=registry,
+        global_names=[global_name],
+        pp_rank=0,
+    )
+
+    assert tasks == []
 
 
 def test_native_mxfp8_per_expert_metadata_expands_global_expert_axis() -> None:
