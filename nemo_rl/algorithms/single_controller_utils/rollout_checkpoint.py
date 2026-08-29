@@ -27,14 +27,13 @@ from typing import Any, Mapping, Optional
 
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
-ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 1
+ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 2
 BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 2
 BOOTSTRAP_DIRNAME = "bootstrap"
 BOOTSTRAP_MANIFEST_FILENAME = "manifest.json"
 ROLLOUT_SNAPSHOTS_DIRNAME = "rollout_snapshots"
 ROLLOUT_SNAPSHOT_MANIFEST_FILENAME = "manifest.json"
 ROLLOUT_SNAPSHOT_COMMITTED_FILENAME = "COMMITTED"
-ROLLOUT_SNAPSHOT_LATEST_FILENAME = "LATEST"
 
 _SNAPSHOT_RE = re.compile(r"snapshot_(\d+)")
 
@@ -172,6 +171,7 @@ class RolloutSnapshotManifest:
     base_train_step: int
     trainer_version: int
     current_epoch: int
+    sampler_dispatch_index: int
     mutation_version: int
     rolled_back_train_group_count: int
     bootstrap_fingerprint: Optional[str]
@@ -184,6 +184,7 @@ class RolloutSnapshotManifest:
             "base_train_step",
             "trainer_version",
             "current_epoch",
+            "sampler_dispatch_index",
             "mutation_version",
             "rolled_back_train_group_count",
         )
@@ -203,6 +204,7 @@ class RolloutSnapshotManifest:
             base_train_step=raw["base_train_step"],
             trainer_version=raw["trainer_version"],
             current_epoch=raw["current_epoch"],
+            sampler_dispatch_index=raw["sampler_dispatch_index"],
             mutation_version=raw["mutation_version"],
             rolled_back_train_group_count=raw["rolled_back_train_group_count"],
             bootstrap_fingerprint=fingerprint,
@@ -223,6 +225,10 @@ class RolloutSnapshotManifest:
             < 0
         ):
             raise ValueError("rollout snapshot counters must be non-negative")
+        if manifest.sampler_dispatch_index < -1:
+            raise ValueError(
+                "rollout snapshot sampler_dispatch_index must be at least -1"
+            )
         return manifest
 
     def to_dict(self) -> dict[str, Any]:
@@ -438,12 +444,6 @@ def commit_snapshot(
     os.rename(tmp_path, final_path)
 
     root = final_path.parent
-    _fsync_directory(root)
-    latest_path = root / ROLLOUT_SNAPSHOT_LATEST_FILENAME
-    latest_tmp = latest_path.with_suffix(".tmp")
-    latest_tmp.write_text(final_path.name + "\n")
-    _fsync_file(latest_tmp)
-    os.replace(latest_tmp, latest_path)
     _fsync_directory(root)
 
     committed = sorted(

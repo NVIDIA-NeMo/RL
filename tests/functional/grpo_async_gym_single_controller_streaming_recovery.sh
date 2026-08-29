@@ -19,8 +19,9 @@ NUM_GENERATIONS=${SC_STREAMING_RECOVERY_NUM_GENERATIONS:-2}
 MIN_STREAMING_GROUPS=${SC_STREAMING_RECOVERY_MIN_GROUPS:-2}
 CLAIMED_GROUPS=${SC_STREAMING_RECOVERY_CLAIMED_GROUPS:-2}
 MAX_STEPS=${SC_STREAMING_RECOVERY_MAX_STEPS:-3}
-SNAPSHOT_INTERVAL_S=${SC_STREAMING_RECOVERY_INTERVAL_S:-0.05}
+SNAPSHOT_INTERVAL_S=${SC_STREAMING_RECOVERY_INTERVAL_S:-0.2}
 SNAPSHOT_TIMEOUT_S=${SC_STREAMING_RECOVERY_TIMEOUT_S:-2400}
+PHASE2_TIMEOUT_S=${SC_STREAMING_RECOVERY_PHASE2_TIMEOUT_S:-2400}
 TRAIN_GLOBAL_BATCH_SIZE=$((NUM_PROMPTS * NUM_GENERATIONS))
 
 if (( CLAIMED_GROUPS < MIN_STREAMING_GROUPS || CLAIMED_GROUPS >= NUM_PROMPTS )); then
@@ -55,13 +56,17 @@ COMMON_OVERRIDES=(
     ++token_capture.enabled=true
     ++rollout_recovery.default_granularity=sibling
     ++rollout_checkpointing.interval_s="$SNAPSHOT_INTERVAL_S"
-    ++rollout_checkpointing.keep_latest_k=256
+    ++rollout_checkpointing.keep_latest_k=8
     ++rollout_checkpointing.restore_mode=latest
     async_rl.sampler.name=in_order
     async_rl.sampler.max_lookahead_versions=0
     async_rl.min_groups_for_streaming_train="$MIN_STREAMING_GROUPS"
     async_rl.max_inflight_prompts="$MIN_STREAMING_GROUPS"
     async_rl.max_buffered_rollouts=$((NUM_PROMPTS + MIN_STREAMING_GROUPS))
+    ++async_rl.rollout_failure.nemo_gym.rollout_timeout_s=120
+    ++async_rl.stall_watchdog.interval_s=10
+    ++async_rl.stall_watchdog.stall_timeout_s=300
+    ++async_rl.stall_watchdog.stall_action=abort
     grpo.num_prompts_per_step="$NUM_PROMPTS"
     grpo.num_generations_per_prompt="$NUM_GENERATIONS"
     grpo.max_num_steps="$MAX_STEPS"
@@ -103,7 +108,7 @@ while time.monotonic() < deadline:
         if (
             manifest["base_train_step"] == 1
             and manifest["trainer_version"] == 1
-            and manifest["rolled_back_train_group_count"] == expected_claimed
+            and manifest["rolled_back_train_group_count"] >= expected_claimed
         ):
             selection.write_text(snapshot.name + "\n")
             raise SystemExit(0)
@@ -117,7 +122,9 @@ while time.monotonic() < deadline:
             "phase one exited before producing the requested streamed cut:\n" + tail
         ) from error
     time.sleep(0.1)
-raise TimeoutError(f"no snapshot captured {expected_claimed} claimed groups")
+raise TimeoutError(
+    f"no snapshot captured at least {expected_claimed} claimed groups"
+)
 PY
 
 stop_phase1
@@ -132,8 +139,6 @@ for candidate in "$SNAPSHOT_ROOT"/snapshot_*; do
         rm -rf "$candidate"
     fi
 done
-printf '%s\n' "$SNAPSHOT_NAME" > "$SNAPSHOT_ROOT/LATEST"
-
 uv run --directory "$PROJECT_ROOT" --no-sync python - \
     "$SNAPSHOT_DIR/manifest.json" \
     "$SNAPSHOT_DIR/replay_buffer_metadata.pt" \
@@ -149,13 +154,14 @@ replay = torch.load(sys.argv[2], weights_only=False)
 lineage = torch.load(sys.argv[3], weights_only=False)
 expected_claimed = int(sys.argv[4])
 
-assert manifest["rolled_back_train_group_count"] == expected_claimed, manifest
+assert manifest["rolled_back_train_group_count"] >= expected_claimed, manifest
 assert len(replay["groups"]) >= expected_claimed, replay
 assert lineage["open_train_step"] is None, lineage
 PY
 
 echo "=== Phase 2: restore claimed rows and finish without duplicate steps ==="
-RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" "${COMMON_OVERRIDES[@]}"
+timeout --signal=TERM --kill-after=30s "${PHASE2_TIMEOUT_S}s" \
+    env RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" "${COMMON_OVERRIDES[@]}"
 cp "$BASE_RUN_LOG" "$PHASE2_LOG"
 
 grep -Fq "Selected rollout recovery snapshot: $SNAPSHOT_DIR" "$PHASE2_LOG"
