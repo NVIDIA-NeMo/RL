@@ -1551,7 +1551,7 @@ def setup(
         else:
             if real_quant:
                 policy_generation, vllm_time = init_vllm()
-                setup_timing_metrics.vllm_init_time_s = vllm_time
+                setup_timing_metrics.generation_init_time_s = vllm_time
             else:
                 policy_generation, policy = initialize_generation_with_policy(
                     init_generation_fn=init_vllm,
