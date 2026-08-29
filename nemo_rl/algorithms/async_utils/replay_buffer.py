@@ -1477,6 +1477,10 @@ class TQReplayBuffer:
         """Return metadata for canonical rows owned by the open train step."""
         return copy.deepcopy(list(self._training_claims.values()))
 
+    def training_owned_group_ids(self) -> set[str]:
+        """Return stable IDs currently owned by the open train step."""
+        return set(self._training_claims)
+
     def release_training_claims(self, group_ids: list[str]) -> None:
         """Release checkpoint ownership after consumed TQ rows are cleared."""
         if len(group_ids) != len(set(group_ids)):
@@ -1614,6 +1618,8 @@ class TQReplayBuffer:
         complete publish/index or clear/remove transition. No writer is exempt,
         including post-train cleanup in ``_train_pump``; canonical writes are
         not required to originate specifically from :meth:`commit`.
+        The advantage stage also takes a mutation slot because the periodic
+        checkpoint pump runs concurrently with ``_train_pump``.
         In-flight reservations are intentionally omitted. ``additional_groups``
         is used by periodic snapshots to re-index rows claimed by an unfinished
         streamed optimizer step.

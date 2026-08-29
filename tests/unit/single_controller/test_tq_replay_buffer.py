@@ -1189,6 +1189,52 @@ class TestTQReplayBufferStateDict:
         assert buf.training_owned_replay_groups() == []
         assert dp.depth() == _N_GENS
 
+    def test_training_claim_rejects_negative_index(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+        _add_group(buf, weight=3)
+
+        with pytest.raises(IndexError, match="must be non-negative"):
+            _run(buf.claim_for_training([-1]))
+
+        assert buf.size() == 1
+        assert buf.training_owned_group_ids() == set()
+
+    def test_training_claim_rejects_out_of_range_index(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+        _add_group(buf, weight=3)
+
+        with pytest.raises(IndexError, match=r"out of range: 2; size=1"):
+            _run(buf.claim_for_training([2]))
+
+        assert buf.size() == 1
+        assert buf.training_owned_group_ids() == set()
+
+    def test_training_claim_requires_bound_checkpoint_barrier(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+        _add_group(buf, weight=3)
+        buf._data_plane_checkpoint_barrier = None
+
+        with pytest.raises(RuntimeError, match="must be bound"):
+            _run(buf.claim_for_training([0]))
+
+    def test_training_claim_rejects_non_ready_group(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+        buf.reserve(weight_version=3)
+
+        with pytest.raises(RuntimeError, match="only ready replay groups"):
+            _run(buf.claim_for_training([0]))
+
+        assert buf.size() == 1
+        assert buf.training_owned_group_ids() == set()
+
+    def test_training_claim_release_rejects_unknown_and_duplicate_ids(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+
+        with pytest.raises(ValueError, match=r"unknown=\['unknown'\]"):
+            buf.release_training_claims(["unknown"])
+        with pytest.raises(ValueError, match="duplicate group IDs"):
+            buf.release_training_claims(["unknown", "unknown"])
+
     def test_metadata_state_dict_omits_tensors_and_data_plane_reads(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)

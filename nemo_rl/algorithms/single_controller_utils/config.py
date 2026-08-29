@@ -705,11 +705,13 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
 
     SingleController has no validation loop, so checkpoint selection must use
     ``checkpointing.metric_name=None`` or a ``train:<name>`` metric. Inherited
-    ``val:<name>`` settings are rejected during setup.
+    ``val:<name>`` settings are rejected during setup. Unknown keys are
+    forbidden because a misspelled interval, retention, or restore option can
+    silently disable the durability behavior the operator intended.
     """
 
-    interval_s: Optional[float] = Field(default=None, gt=0)
-    keep_latest_k: int = Field(default=2, ge=1)
+    interval_s: Annotated[Optional[float], Field(gt=0)] = None
+    keep_latest_k: Annotated[int, Field(ge=1)] = 2
     restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
 
 
