@@ -2183,6 +2183,92 @@ class TestCreateMegatronConfigGlooProcessGroups:
 
 
 @pytest.mark.mcore
+class TestCreateMegatronConfigOptimizerFp8Recipe:
+    """Tests for optimizer FP8 recipe plumbing in _create_megatron_config."""
+
+    @staticmethod
+    def _config(fp8_cfg: dict[str, Any] | None) -> dict[str, Any]:
+        megatron_cfg = {
+            "optimizer": {"use_distributed_optimizer": True},
+            "scheduler": {},
+            "distributed_data_parallel_config": {
+                "overlap_param_gather": False,
+                "grad_reduce_in_fp32": False,
+                "overlap_grad_reduce": False,
+                "data_parallel_sharding_strategy": "optim_grads_params",
+            },
+            "train_iters": 10,
+        }
+        if fp8_cfg is not None:
+            megatron_cfg["fp8_cfg"] = fp8_cfg
+        return {"megatron_cfg": megatron_cfg, "train_global_batch_size": 8}
+
+    @staticmethod
+    def _optimizer_passed_to_container(
+        config: dict[str, Any], *, fp8_param_enabled: bool
+    ) -> Any:
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_container,
+            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+            patch("nemo_rl.models.megatron.setup.DistributedDataParallelConfig"),
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+                fp8_param_enabled=fp8_param_enabled,
+            )
+
+        return mock_container.call_args.kwargs["optimizer"]
+
+    def test_enabled_mxfp8_fp8_param_forwards_recipe(self) -> None:
+        optimizer = self._optimizer_passed_to_container(
+            self._config(
+                {
+                    "enabled": True,
+                    "fp8": "hybrid",
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": True,
+                }
+            ),
+            fp8_param_enabled=True,
+        )
+
+        assert optimizer.fp8_recipe == "mxfp8"
+
+    @pytest.mark.parametrize(
+        "fp8_cfg",
+        [
+            pytest.param(None, id="absent"),
+            pytest.param(
+                {
+                    "enabled": False,
+                    "fp8": "hybrid",
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": False,
+                },
+                id="disabled",
+            ),
+        ],
+    )
+    def test_disabled_or_absent_fp8_preserves_optimizer_default(
+        self, fp8_cfg: dict[str, Any] | None
+    ) -> None:
+        optimizer = self._optimizer_passed_to_container(
+            self._config(fp8_cfg), fp8_param_enabled=False
+        )
+
+        assert optimizer.fp8_recipe is None
+
+
+@pytest.mark.mcore
 class TestCreateMegatronConfigOptimizerOffload:
     """Tests for optimizer CPU-offload plumbing into Megatron Core."""
 
