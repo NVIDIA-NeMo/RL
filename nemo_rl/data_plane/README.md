@@ -437,6 +437,9 @@ data_plane:
     local_buffer_size:    4294967296   # 4 GiB/process
     reuse_registered_buffers: true     # reuse RDMA-registered buffers
     staging_buffer_size:   268435456   # 256 MiB/pool slot; bigger transfers bypass the pool
+    hard_pin: null                       # null = TQ auto policy; checkpoint jobs set true
+    offload:
+      enabled: false                     # owner-distributed checkpoints require false
     checkpoint:
       enabled: false                    # explicit save/load support; normal PUTs stay memory-only
   # observability:                     # NotRequired
@@ -463,22 +466,28 @@ ordinary PUTs remain in Mooncake memory and perform no checkpoint-related
 Lustre I/O.
 
 On `tq.save_checkpoint(...)`, the plugin enumerates every raw Mooncake object
-key referenced by the TQ controller snapshot. One TQ storage-manager process
-then fetches each object's exact bytes through its Mooncake client and writes
-them into one packed payload file, together with an offset/size/digest manifest,
-beneath the requested TQ checkpoint directory on the shared filesystem. On
-`tq.load_checkpoint(...)`, the plugin validates the manifest and each payload
-slice as it is read, then upserts the raw
-objects into a clean Mooncake store before TQ restores the controller metadata.
-No separate Mooncake `storage_root` is configured; the explicit TQ checkpoint
-destination is the persistent location.
+key referenced by the TQ controller snapshot and maps it to a live client with
+a complete memory replica. The coordinator then fans out metadata-only save
+requests. Each selected client reads only the objects it owns and writes one
+unique packed shard beneath the requested TQ checkpoint directory on the
+shared filesystem. The coordinator commits the offset/size/digest manifest
+only after every owner has flushed, fsynced, and acknowledged its exact shard.
+Payload bytes never pass through the coordinator.
 
-This initial plugin-only implementation centralizes checkpoint-time transfer
-through one manager process. It avoids any steady-state PUT overhead, but its
-Mooncake GETs and filesystem writes can become a checkpoint-latency and network
-bottleneck as the live TQ payload grows. A future distributed implementation
-could parallelize persistence across Mooncake clients without changing the
-explicit-checkpoint semantics.
+The plugin discovers clients through a small named Ray registry, but the Ray
+actor stores endpoint metadata only. The shard writer is a ZMQ endpoint hosted
+inside each existing TQ Mooncake-manager process, where it can access that
+process's Mooncake memory directly. This gives checkpointing the same scaling
+shape as SimpleStorage's manager fanout without changing TQ itself.
+
+On `tq.load_checkpoint(...)`, the plugin validates the manifest and controller
+key set, balances the durable objects over the currently connected clients,
+and asks those clients to read and verify their assigned Lustre slices. Each
+client upserts into its current preferred Mooncake segment; saved process and
+segment identities are provenance only and are not reused after restart. TQ
+restores controller metadata only after every object has a complete live
+memory replica. No separate Mooncake `storage_root` is configured; the
+explicit TQ checkpoint destination is the persistent location.
 
 This module supplies storage capability only. A caller such as Single
 Controller remains responsible for choosing the checkpoint boundary and must
@@ -492,6 +501,10 @@ contributes Mooncake memory capacity first, keep the saved GDR mode and staging
 size unchanged, call `tq.load_checkpoint` before starting producers, and restart
 from an empty master before retrying a failed load. Release validation must
 exercise this order across a 2-node/16-GPU save, process restart, load, and read.
+The first version requires hard-pinned memory replicas with Mooncake offload
+disabled. It supports NeMo-RL's HTTP metadata mode and rejects `P2PHANDSHAKE`,
+whose public Mooncake API does not expose the local transfer endpoint needed for
+exact owner matching.
 
 Capacity rule of thumb (any backend):
 

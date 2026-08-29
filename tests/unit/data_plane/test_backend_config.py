@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import pydantic
 import pytest
+from omegaconf import OmegaConf
 from pydantic import TypeAdapter
 
 from nemo_rl.data_plane.interfaces import (
@@ -114,6 +115,61 @@ def test_mooncake_checkpoint_is_an_explicit_opt_in() -> None:
         )
     )
     assert resolved.checkpoint.enabled is True
+
+
+def test_mooncake_checkpoint_placement_settings_are_resolved() -> None:
+    defaults = backend_config(_cfg("mooncake_cpu"))
+    assert defaults.hard_pin is None
+    assert defaults.offload.enabled is False
+
+    resolved = backend_config(
+        _cfg(
+            "mooncake_cpu",
+            mooncake_cpu={
+                "hard_pin": True,
+                "offload": {"enabled": False},
+                "checkpoint": {"enabled": True},
+            },
+        )
+    )
+    assert resolved.hard_pin is True
+    assert resolved.offload.enabled is False
+    assert resolved.checkpoint.enabled is True
+
+
+def test_mooncake_checkpoint_placement_settings_reach_tq(monkeypatch) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    captured = {}
+    monkeypatch.setattr(adapter, "_get_local_node_ip", lambda: "10.0.0.7")
+    monkeypatch.setattr(
+        adapter,
+        "_mooncake_transport_config",
+        lambda: {"protocol": "rdma", "device_name": "mlx5_test"},
+    )
+    monkeypatch.setattr(adapter.os, "chmod", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        adapter.tq,
+        "init",
+        lambda *, conf: captured.setdefault("conf", conf),
+    )
+
+    adapter._init_tq(
+        _cfg(
+            "mooncake_cpu",
+            mooncake_cpu={
+                "hard_pin": True,
+                "offload": {"enabled": False},
+                "checkpoint": {"enabled": True},
+            },
+        )
+    )
+
+    conf = OmegaConf.to_container(captured["conf"], resolve=True)
+    mooncake = conf["backend"]["MooncakeStore"]
+    assert mooncake["hard_pin"] is True
+    assert mooncake["offload"] == {"enabled": False}
+    assert mooncake["checkpoint"] == {"enabled": True}
 
 
 def test_simple_backend_nested_block_is_used() -> None:

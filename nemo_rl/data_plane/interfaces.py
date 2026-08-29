@@ -71,6 +71,18 @@ class MooncakeCheckpointConfig(BaseModel, extra="allow"):
     enabled: bool = False
 
 
+class MooncakeOffloadConfig(BaseModel, extra="allow"):
+    """TQ Mooncake eviction/offload settings.
+
+    Owner-distributed checkpoints require the referenced objects to remain in
+    client memory until an explicit save completes, so that mode is compatible
+    only with ``enabled=False``.  The nested model still mirrors TQ's config
+    shape instead of hiding the setting from NeMo-RL.
+    """
+
+    enabled: bool = False
+
+
 class MooncakeCpuConfig(BaseModel, extra="allow"):
     """Sizing and RDMA knobs for ``backend="mooncake_cpu"``. Ignored otherwise.
 
@@ -101,6 +113,10 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     local_buffer_size: int = 4294967296  # 4 GiB per client process
     reuse_registered_buffers: bool = True
     staging_buffer_size: int = 268435456  # 256 MiB per pool slot
+    # ``None`` preserves TQ's auto policy: hard-pin unless offload is enabled.
+    # Checkpoint participants verify the resolved live client setting is True.
+    hard_pin: bool | None = None
+    offload: MooncakeOffloadConfig = Field(default_factory=MooncakeOffloadConfig)
     checkpoint: MooncakeCheckpointConfig = Field(
         default_factory=MooncakeCheckpointConfig
     )

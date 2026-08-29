@@ -683,6 +683,8 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     # mooncake_master + the metadata server bind to.
                     "metadata_server": f"{local_ip}:50050",
                     "master_server_address": f"{local_ip}:50051",
+                    "hard_pin": mooncake_cfg.hard_pin,
+                    "offload": mooncake_cfg.offload.model_dump(),
                     "checkpoint": mooncake_cfg.checkpoint.model_dump(),
                     **_mooncake_transport_config(),
                 },
