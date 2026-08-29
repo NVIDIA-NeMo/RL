@@ -31,6 +31,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     is_distillation_run,
     is_ppo_run,
+    validate_single_controller_config,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
@@ -136,6 +137,27 @@ class TestAlgorithmBlockValidation:
         assert is_distillation_run(cfg)
         assert not is_ppo_run(cfg)
         assert algo_config(cfg) is cfg.distillation
+
+    def test_the_algorithm_agnostic_guards_still_fire_on_distillation(self):
+        """A distillation run must not buy an exemption from checks that are
+        not about GRPO at all.
+
+        ``_validate_algo_settings`` mixes one GRPO/PPO-shaped check -- the
+        reward shaping and filtering knobs, which ``DistillationConfig`` does
+        not declare -- with checks whose own comments say they hold whatever
+        the algorithm. Routing distillation around the whole function to dodge
+        the first would silently accept configs GRPO rejects, which is the
+        exact failure mode the shaping check exists to prevent.
+        """
+        zero_epochs = self._as_distillation()
+        zero_epochs["distillation"]["max_num_epochs"] = 0
+        with pytest.raises(ValueError, match="trains zero steps"):
+            validate_single_controller_config(MasterConfig(**zero_epochs))
+
+        warmup = self._as_distillation()
+        warmup["async_rl"]["sampler"]["warmup_lookahead_versions"] = 3
+        with pytest.raises(ValueError, match="warmup_lookahead_versions"):
+            validate_single_controller_config(MasterConfig(**warmup))
 
     def test_distillation_without_a_teacher_is_rejected(self):
         resolved = self._as_distillation()

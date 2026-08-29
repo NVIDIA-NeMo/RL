@@ -836,13 +836,27 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
     # SC reads none of these on either path, so an enabled one describes shaping
     # this run does not do. Async GRPO rejects three of them the same way.
+    #
+    # ``getattr``: DistillationConfig declares none of them -- there is no
+    # reward to shape or filter on -- and a knob that cannot be set cannot be
+    # set wrong. Reading them defensively keeps distillation on this same
+    # function rather than around it, so the checks below that ARE
+    # algorithm-agnostic keep firing on a distillation run.
+    def _knob(path: str) -> bool:
+        obj: Any = algo_cfg
+        for part in path.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                return False
+        return bool(obj)
+
     unsupported = [
         name
         for name, enabled in (
-            ("overlong_filtering", algo_cfg.overlong_filtering),
-            ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
-            ("reward_scaling", algo_cfg.reward_scaling.enabled),
-            ("reward_shaping", algo_cfg.reward_shaping.enabled),
+            ("overlong_filtering", _knob("overlong_filtering")),
+            ("use_dynamic_sampling", _knob("use_dynamic_sampling")),
+            ("reward_scaling", _knob("reward_scaling.enabled")),
+            ("reward_shaping", _knob("reward_shaping.enabled")),
         )
         if enabled
     ]
@@ -981,15 +995,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
-    if is_distillation_run(master_config):
-        # ``_validate_algo_settings`` is GRPO/PPO-shaped throughout:
-        # DistillationConfig defines none of the shaping knobs it rejects --
-        # there is no reward to shape or filter on -- and the rest of it is
-        # PPO-specific. The colocated requirement is the one part that applies,
-        # so it is called directly.
-        _reject_colocated_generation(master_config)
-    else:
-        _validate_algo_settings(master_config)
+    _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
