@@ -54,6 +54,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
 )
+from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1601,6 +1602,34 @@ class VllmAsyncGenerationWorkerImpl(
         gc.collect()
         torch.cuda.empty_cache()
 
+    async def pause_generation_async(self, *, clear_cache: bool) -> bool:
+        """Pause vLLM generation for an in-flight weight update."""
+        assert self.llm is not None, (
+            "Attempting to pause generation with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "pause_generation_async can only be used with async_engine=True"
+            )
+
+        await self.llm.pause_generation(mode="keep", clear_cache=clear_cache)
+        return True
+
+    async def resume_generation_async(self) -> bool:
+        """Resume vLLM generation after an in-flight weight update."""
+        assert self.llm is not None, (
+            "Attempting to resume generation with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "resume_generation_async can only be used with async_engine=True"
+            )
+
+        await self.llm.resume_generation()
+        return True
+
     async def sleep_async(self):
         """Async version of sleep."""
         assert self.llm is not None, (
@@ -1683,6 +1712,13 @@ class VllmAsyncGenerationWorkerImpl(
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+        finally:
+            # Flush buffered spans/metrics before the actor goes away. Off the
+            # event loop: the flush blocks on a network export with a 5s
+            # timeout, and this is an async actor whose other coroutines --
+            # including in-flight generate requests -- share this loop. Same
+            # reason the sparse-refit shutdown above is offloaded.
+            await asyncio.to_thread(shutdown_telemetry)
 
 
 @ray.remote(

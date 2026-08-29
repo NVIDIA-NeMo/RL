@@ -37,6 +37,7 @@ run_test() {
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_gym_single_controller.sh
 # Full mode only (~10 min): SIGKILLs a generation worker and asserts the job fails fast
 # and attributably instead of wedging. This is the ONLY end-to-end check of the
 # containment behaviour -- without it, a regression that restores the silent wedge is
@@ -176,6 +177,11 @@ run_test      env VICTIM_STATE=serving uv run --no-sync bash ./tests/functional/
 
 # Checkpoint save/restore (upstream #3429).
 run_test      uv run --no-sync bash ./tests/functional/grpo_checkpoint_single_controller.sh
+# Native TQ + metadata-only completed replay recovery (#3480).
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh
+# Deterministic process restart with an admitted group held before canonical TQ
+# commit, followed by exact-once redispatch at its stable group ID.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_unfinished_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

@@ -117,6 +117,7 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.telemetry.setup import init_telemetry_worker
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -460,6 +461,10 @@ class MegatronPolicyWorkerImpl(
         # set by configure_worker), so it can't identify this worker's GPU.
         bind_to_gpu_numa(local_rank)
 
+        # OTel providers are process-global, so the driver's setup does not
+        # reach this actor. No-op unless telemetry is enabled.
+        init_telemetry_worker()
+
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
@@ -497,16 +502,19 @@ class MegatronPolicyWorkerImpl(
         # worker) may set ``_model_import_post_wrap_hook`` and
         # layer-spec hooks on ``self`` before calling
         # super().__init__() to inject quantization hooks into HF->Megatron
-        # import.
-        handle_model_import(
-            config,
-            hf_model_name,
-            pretrained_path,
-            pt_checkpoint_exists,
-            model_post_wrap_hook=getattr(self, "_model_import_post_wrap_hook", None),
-            transformer_layer_spec=getattr(self, "_transformer_layer_spec", None),
-            mamba_stack_spec=getattr(self, "_mamba_stack_spec", None),
-        )
+        # import. Refit-fed inference-only policies (skip_weight_load) skip the import entirely.
+        if not skip_weight_load:
+            handle_model_import(
+                config,
+                hf_model_name,
+                pretrained_path,
+                pt_checkpoint_exists,
+                model_post_wrap_hook=getattr(
+                    self, "_model_import_post_wrap_hook", None
+                ),
+                transformer_layer_spec=getattr(self, "_transformer_layer_spec", None),
+                mamba_stack_spec=getattr(self, "_mamba_stack_spec", None),
+            )
         log_gpu_memory_diagnostics(
             label="after_hf_import", worker_type="MegatronPolicyWorker"
         )
@@ -524,6 +532,7 @@ class MegatronPolicyWorkerImpl(
             pretrained_path,
             weights_path,
             optimizer_path,
+            skip_weight_load=skip_weight_load,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg

@@ -770,6 +770,16 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     """
     algo_cfg = algo_config(master_config)
 
+    # None means no epoch bound. SC has no -1 convention though: the rollout pump
+    # gates on _current_epoch < max_num_epochs, so <= 0 trains nothing and exits 0.
+    if algo_cfg.max_num_epochs is not None and algo_cfg.max_num_epochs <= 0:
+        raise ValueError(
+            f"max_num_epochs={algo_cfg.max_num_epochs} trains zero steps on the "
+            "SingleController path, which does not use the -1 convention that v1 "
+            "async PPO requires. Set a positive max_num_epochs and bound the run "
+            "with max_num_steps."
+        )
+
     # SC reads none of these on either path, so an enabled one describes shaping
     # this run does not do. Async GRPO rejects three of them the same way.
     unsupported = [

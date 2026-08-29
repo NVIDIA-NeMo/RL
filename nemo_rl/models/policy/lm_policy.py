@@ -53,7 +53,7 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
-    get_default_hf_config,
+    get_hf_config,
     get_theoretical_tflops,
 )
 from nemo_rl.utils.multimodal_payload_metrics import (
@@ -345,7 +345,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # initialize FLOPs tracker
         try:
             self.flops_tracker = FLOPTracker.from_config(
-                config["model_name"], get_default_hf_config(config["model_name"])
+                config["model_name"],
+                get_hf_config(
+                    config["model_name"],
+                    **(config.get("hf_config_overrides") or {}),
+                ),
             )
         except ValueError as e:
             self.flops_tracker = None
