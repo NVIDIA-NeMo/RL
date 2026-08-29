@@ -4378,6 +4378,52 @@ def _startup_pipeline_ready(
     )
 
 
+def _raise_if_collector_stopped(
+    collector_status: dict[str, Any],
+    *,
+    awaited_target: str,
+    awaited_work: str,
+    action: str,
+) -> None:
+    """Raise if the collector stopped terminally while training waits on it.
+
+    Both ``data_exhausted`` and ``errored`` are terminal — neither is reset once
+    set — so a stopped collector with no in-flight workers can never supply the
+    awaited target. Waiting longer would hang silently instead of failing.
+
+    Args:
+        collector_status: Snapshot from ``AsyncTrajectoryCollector.get_status``.
+        awaited_target: Rendered target being awaited, e.g. ``"target=5"`` or
+            ``"training_step=5"``.
+        awaited_work: What is being awaited, e.g. ``"lookahead claim"``.
+        action: Verb for the message — ``"start"`` or ``"continue"``.
+    """
+    if not (
+        (collector_status["data_exhausted"] or collector_status.get("errored", False))
+        and not collector_status["running"]
+        and collector_status["inflight_workers"] == 0
+    ):
+        return
+
+    stop_reason = (
+        "dataloader exhausted"
+        if collector_status["data_exhausted"]
+        else "collector errored"
+    )
+    recovery_advice = (
+        "Increase data.train.max_num_epochs or use a larger dataset."
+        if collector_status["data_exhausted"]
+        else "Inspect the preceding trajectory collector error."
+    )
+    raise RuntimeError(
+        f"Trajectory collector stopped ({stop_reason}) while waiting for "
+        f"{awaited_work} at {awaited_target}. "
+        f"Training cannot {action} without the required trajectories. "
+        f"Collector status: {collector_status}. "
+        f"{recovery_advice}"
+    )
+
+
 @trace_fn(RLSpanGroup.JOB, "rl.grpo.job")
 def async_grpo_train(
     policy: ColocatablePolicyInterface,
@@ -4873,33 +4919,13 @@ def async_grpo_train(
                 f"trajectories for step {step}"
             )
 
-        if (
-            (
-                collector_status["data_exhausted"]
-                or collector_status.get("errored", False)
-            )
-            and not collector_status["running"]
-            and collector_status["inflight_workers"] == 0
-        ):
-            awaited_target = step + 1 if current_step_ready else step
-            awaited_work = "lookahead claim" if current_step_ready else "buffer fill"
-            stop_reason = (
-                "dataloader exhausted"
-                if collector_status["data_exhausted"]
-                else "collector errored"
-            )
-            recovery_advice = (
-                "Increase data.train.max_num_epochs or use a larger dataset."
-                if collector_status["data_exhausted"]
-                else "Inspect the preceding trajectory collector error."
-            )
-            raise RuntimeError(
-                f"Trajectory collector stopped ({stop_reason}) while waiting for "
-                f"{awaited_work} at target={awaited_target}. "
-                f"Training cannot start without the required target. "
-                f"Collector status: {collector_status}. "
-                f"{recovery_advice}"
-            )
+        awaited_target = step + 1 if current_step_ready else step
+        _raise_if_collector_stopped(
+            collector_status,
+            awaited_target=f"target={awaited_target}",
+            awaited_work="lookahead claim" if current_step_ready else "buffer fill",
+            action="start",
+        )
 
         wait_iterations += 1
         time.sleep(1.0)
@@ -5017,31 +5043,12 @@ def async_grpo_train(
                             f"   Awaiting target {awaited_target}; claimed by collector: "
                             f"{awaited_target in collector_status.get('generating_targets', ())}"
                         )
-                        if (
-                            (
-                                collector_status["data_exhausted"]
-                                or collector_status.get("errored", False)
-                            )
-                            and not collector_status["running"]
-                            and collector_status["inflight_workers"] == 0
-                        ):
-                            stop_reason = (
-                                "dataloader exhausted"
-                                if collector_status["data_exhausted"]
-                                else "collector errored"
-                            )
-                            recovery_advice = (
-                                "Increase data.train.max_num_epochs or use a larger dataset."
-                                if collector_status["data_exhausted"]
-                                else "Inspect the preceding trajectory collector error."
-                            )
-                            raise RuntimeError(
-                                f"Trajectory collector stopped ({stop_reason}) while waiting "
-                                f"for a full batch at training_step={step}. "
-                                f"Training cannot continue without the required trajectories. "
-                                f"Collector status: {collector_status}. "
-                                f"{recovery_advice}"
-                            )
+                        _raise_if_collector_stopped(
+                            collector_status,
+                            awaited_target=f"training_step={step}",
+                            awaited_work="a full batch",
+                            action="continue",
+                        )
 
                         with (
                             timer.time("idle/buffer_starvation"),
