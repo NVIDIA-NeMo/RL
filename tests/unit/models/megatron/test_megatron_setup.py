@@ -1006,36 +1006,14 @@ class TestApplyPrecisionConfig:
             _apply_precision_config(model_cfg, config, torch.float32)
             assert model_cfg.pipeline_dtype == expected_dtype
 
-    def test_loads_te_recipe_and_first_last_bf16_counts(self, tmp_path):
-        """TE recipe and first/last exclusions reach the Megatron provider."""
-        from megatron.core.quantization.quant_config import MatchContext
-
+    def test_applies_first_last_bf16_counts(self):
+        """First/last exclusions reach the Megatron provider."""
         from nemo_rl.models.megatron.setup import _apply_precision_config
 
-        recipe_path = tmp_path / "routed-experts.yaml"
-        recipe_path.write_text(
-            """\
-configs:
-  bf16: {transformer_engine_config_type: TEQuantizationParams}
-  mxfp8: {transformer_engine_config_type: TEQuantizationParams}
-matchers:
-  routed_fc1:
-    config: mxfp8
-    type: glob
-    pattern: "*mlp.experts.linear_fc1"
-    enabled: true
-  all_other_modules:
-    config: bf16
-    type: glob
-    pattern: "*"
-    enabled: true
-"""
-        )
         model_cfg = SimpleNamespace()
         config = {
             "megatron_cfg": {
                 "pipeline_dtype": "bfloat16",
-                "te_precision_config_file": str(recipe_path),
                 "first_last_layers_bf16": True,
                 "num_layers_at_start_in_bf16": 0,
                 "num_layers_at_end_in_bf16": 8,
@@ -1044,18 +1022,6 @@ matchers:
 
         _apply_precision_config(model_cfg, config, torch.bfloat16)
 
-        assert (
-            model_cfg.quant_recipe.match_to_config_key(
-                MatchContext("decoder.layers.3.mlp.experts.linear_fc1", 3)
-            )
-            == "mxfp8"
-        )
-        assert (
-            model_cfg.quant_recipe.match_to_config_key(
-                MatchContext("decoder.layers.3.self_attention.linear_qkv", 3)
-            )
-            == "bf16"
-        )
         assert model_cfg.first_last_layers_bf16 is True
         assert model_cfg.num_layers_at_start_in_bf16 == 0
         assert model_cfg.num_layers_at_end_in_bf16 == 8
@@ -1139,41 +1105,6 @@ matchers:
                 )
                 == "bf16"
             )
-
-    def test_resolves_te_recipe_relative_to_repo_root(self, tmp_path, monkeypatch):
-        """Ray workers can load repo-relative recipes from another cwd."""
-        from nemo_rl.models.megatron import setup
-
-        recipe_path = tmp_path / "configs" / "routed-experts.yaml"
-        recipe_path.parent.mkdir()
-        recipe_path.write_text(
-            """\
-configs:
-  bf16: {transformer_engine_config_type: TEQuantizationParams}
-matchers:
-  all_modules:
-    config: bf16
-    type: glob
-    pattern: "*"
-    enabled: true
-"""
-        )
-        worker_cwd = tmp_path / "worker"
-        worker_cwd.mkdir()
-        monkeypatch.chdir(worker_cwd)
-        monkeypatch.setattr(setup, "_NEMO_RL_ROOT", tmp_path)
-
-        model_cfg = SimpleNamespace()
-        config = {
-            "megatron_cfg": {
-                "pipeline_dtype": "bfloat16",
-                "te_precision_config_file": "configs/routed-experts.yaml",
-            }
-        }
-
-        setup._apply_precision_config(model_cfg, config, torch.bfloat16)
-
-        assert model_cfg.quant_recipe is not None
 
 
 @pytest.mark.mcore

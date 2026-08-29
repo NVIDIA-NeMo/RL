@@ -327,8 +327,6 @@ class MegatronCheckpointConfig(TypedDict, total=False):
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
-    # Optional Transformer Engine per-module precision recipe.
-    te_precision_config_file: NotRequired[str]
     # Keep global leading/trailing transformer layers in BF16 when a per-module
     # precision recipe is active.
     first_last_layers_bf16: NotRequired[bool]

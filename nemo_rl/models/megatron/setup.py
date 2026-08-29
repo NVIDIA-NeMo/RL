@@ -21,7 +21,6 @@ import time
 import warnings
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, replace
-from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
@@ -77,8 +76,6 @@ from nemo_rl.models.megatron.quantization_recipe import (
 )
 
 _HF_CONFIG_PATCHED = False
-
-_NEMO_RL_ROOT = Path(__file__).resolve().parents[3]
 
 _NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT = "expanded_sequence_v1"
 
@@ -1097,17 +1094,6 @@ def _apply_precision_config(
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
 
     megatron_cfg = config["megatron_cfg"]
-    recipe_path = megatron_cfg.get("te_precision_config_file")
-    if recipe_path is not None:
-        from megatron.core.quantization.utils import load_quantization_recipe
-
-        resolved_recipe_path = Path(recipe_path).expanduser()
-        if not resolved_recipe_path.is_absolute() and not resolved_recipe_path.exists():
-            repo_recipe_path = _NEMO_RL_ROOT / resolved_recipe_path
-            if repo_recipe_path.exists():
-                resolved_recipe_path = repo_recipe_path
-        model_cfg.quant_recipe = load_quantization_recipe(resolved_recipe_path)
-
     for field in (
         "first_last_layers_bf16",
         "num_layers_at_start_in_bf16",
