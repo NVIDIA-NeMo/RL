@@ -449,6 +449,7 @@ class _FakeTQBuffer:
         self.metadata_state_dict_calls: list[int] = []
         self.load_calls: list[dict[str, Any]] = []
         self.checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
+        self.training_claims: list[dict[str, Any]] = []
 
     @property
     def group_ids(self) -> tuple[str, ...]:
@@ -459,9 +460,28 @@ class _FakeTQBuffer:
     ) -> None:
         self.checkpoint_barrier = barrier
 
-    def metadata_state_dict(self, *, saved_capacity: int) -> dict[str, Any]:
+    def metadata_state_dict(
+        self,
+        *,
+        saved_capacity: int,
+        additional_groups: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
         self.metadata_state_dict_calls.append(saved_capacity)
-        return dict(self._metadata_state)
+        state = dict(self._metadata_state)
+        state["groups"] = [
+            *self._metadata_state["groups"],
+            *(additional_groups or []),
+        ]
+        return state
+
+    def training_owned_replay_groups(self) -> list[dict[str, Any]]:
+        return list(self.training_claims)
+
+    def release_training_claims(self, group_ids: list[str]) -> None:
+        claimed = {group["group_id"] for group in self.training_claims}
+        if claimed:
+            assert set(group_ids) == claimed
+            self.training_claims = []
 
     def count_for_target_step(self, target_step: int) -> int:
         """Return the number of ready fake groups owned by one gated step."""
@@ -1094,24 +1114,58 @@ class TestPeriodicRolloutCheckpoint:
         assert (snapshot / ROLLOUT_RECOVERY_STATE_FILENAME).is_file()
         assert not (snapshot / "policy").exists()
 
-    def test_snapshot_waits_until_no_training_rows_are_owned(self, tmp_path: Path):
+    def test_snapshot_reindexes_rows_owned_by_active_streamed_step(
+        self, tmp_path: Path
+    ):
         actor = self._actor(tmp_path)
-
-        async def exercise() -> None:
-            actor._train_step_idle.clear()
-            save_task = asyncio.create_task(
-                actor._save_rollout_checkpoint(force=True)
-            )
-            await asyncio.sleep(0)
-            assert not save_task.done()
-            assert actor._dp_client.save_calls == []
-
-            async with actor._data_plane_checkpoint_barrier.mutation():
-                actor._train_step_idle.set()
-            assert await asyncio.wait_for(save_task, timeout=5.0)
+        claimed_meta = KVBatchMeta(
+            partition_id=_PARTITION_ID,
+            task_name=None,
+            sample_ids=["claimed-group_g0"],
+            sequence_lengths=[16],
+            tags=[{"weight_version": 0}],
+        )
+        actor._buffer.training_claims = [
+            {
+                "meta": claimed_meta,
+                "start_weight": 0,
+                "end_weight": 0,
+                "target_step": 0,
+                "group_id": "claimed-group",
+            }
+        ]
+        actor._dp_client.sample_ids = list(claimed_meta.sample_ids)
 
         try:
-            asyncio.run(exercise())
+            assert asyncio.run(actor._save_rollout_checkpoint(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+
+        snapshot = (
+            tmp_path
+            / "checkpoints"
+            / BOOTSTRAP_DIRNAME
+            / "rollout_snapshots"
+            / "snapshot_000001"
+        )
+        manifest = json.loads(
+            (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).read_text()
+        )
+        replay_state = torch.load(
+            snapshot / REPLAY_BUFFER_METADATA_FILENAME,
+            weights_only=False,
+        )
+        assert manifest["rolled_back_train_group_count"] == 1
+        assert [group["group_id"] for group in replay_state["groups"]] == [
+            "claimed-group"
+        ]
+
+    def test_snapshot_skips_optimizer_commit_window(self, tmp_path: Path):
+        actor = self._actor(tmp_path)
+        actor._optimizer_commit_in_progress = True
+        try:
+            assert not asyncio.run(actor._save_rollout_checkpoint(force=True))
+            assert actor._dp_client.save_calls == []
         finally:
             actor._checkpointer.shutdown()
 
