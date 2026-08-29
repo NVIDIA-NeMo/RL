@@ -103,3 +103,18 @@ def tq_client_backends(request):
     (see module docstring).
     """
     return request.getfixturevalue(f"_session_tq_client_{request.param}")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_codec_timer():
+    """Drain the module-level codec timer around every test in this package.
+
+    ``pack_jagged_fields`` records into a process-global timer, so a test that
+    packs (the codec and column_io suites) leaves residue that the next
+    ``get_step_metrics`` would report as its own ``step/codec/pack_ms``.
+    """
+    from nemo_rl.data_plane.codec import drain_codec_ms
+
+    drain_codec_ms()
+    yield
+    drain_codec_ms()

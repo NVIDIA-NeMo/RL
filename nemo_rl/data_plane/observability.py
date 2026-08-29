@@ -60,6 +60,7 @@ class DataPlaneEvent(TypedDict):
 import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict, TensorDictBase
 
+from nemo_rl.data_plane.codec import drain_codec_ms
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 
 logger = logging.getLogger(__name__)
@@ -402,6 +403,8 @@ def _step_deltas(snap: dict[str, Any], prev: dict[str, Any]) -> dict[str, float]
         )
         / 1e6,
         "now/bytes_outstanding_mb": snap["bytes_outstanding"] / 1e6,
+        "step/codec/pack_ms": snap["pack_ms"] - prev.get("pack_ms", 0.0),
+        "step/codec/unpack_ms": snap["unpack_ms"] - prev.get("unpack_ms", 0.0),
     }
 
 
@@ -662,6 +665,8 @@ _SNAPSHOT_SUM = (
     "peak_bytes_outstanding",
     "n_keys_outstanding",
     "self_ms",
+    "pack_ms",
+    "unpack_ms",
 )
 _SNAPSHOT_MAX = ("max_bytes_per_key_seen", "last_put_bytes_per_key")
 _OP_SUM = (
@@ -815,6 +820,7 @@ _HEADLINE_PREFIXES = (
     "step/volume_mb/",
     "step/hash/",
     "step/self/",
+    "step/codec/",
 )
 
 
@@ -986,6 +992,20 @@ class DataPlaneStats:
     # observability bill next to the thing it is observing rather than
     # taking a benchmark's word for it.
     self_ms: float = 0.0
+    # Jagged pad/unpad CPU cost, drained from the codec timer. Packing runs
+    # in the caller before ``put_samples`` and so is invisible to ``by_op``;
+    # unpacking runs inside the adapter's ``get_samples`` and is otherwise
+    # billed as transport. Kept out of ``total_wall_ms`` so ``frac_of_step``
+    # and ``percent_of_dataplane`` keep meaning time spent in the data plane.
+    #
+    # Same coverage gap as ``comm_volume`` and for the same reason: only a
+    # process that drains the codec timer reports its own pad cost, and the
+    # rollout actor is not on the policy worker group the fan-out reaches. So
+    # ``pack_ms`` omits ``kv_first_write``, the largest single pack in the job.
+    # The single-controller path has no fan-out at all, so there it is
+    # driver-only on both counters.
+    pack_ms: float = 0.0
+    unpack_ms: float = 0.0
     hash_verify: HashStats = field(default_factory=HashStats)
 
 
@@ -1058,6 +1078,14 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 that has to. Left off by default so an inspection snapshot
                 never disturbs the step series.
         """
+        # Gated on reset_step_window for the same reason step_max_ms is: the
+        # codec timer is drained destructively, so an inspection snapshot that
+        # took it would delete that time from the series the step reader
+        # reports. Both callers that consume a step pass True.
+        if reset_step_window:
+            codec = drain_codec_ms()
+            self._stats.pack_ms += codec.get("pack", 0.0)
+            self._stats.unpack_ms += codec.get("unpack", 0.0)
         out = asdict(self._stats)
         out["n_keys_outstanding"] = sum(
             len(k) for k in self._keys_by_partition.values()
