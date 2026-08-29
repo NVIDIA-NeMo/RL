@@ -38,6 +38,10 @@ class MCoreGenerationSpecificArgs(TypedDict):
     num_cuda_graphs: int | None
     use_cuda_graphs_for_non_decode_steps: bool
     cuda_graph_impl: str
+    cuda_graph_sizing_distribution: NotRequired[
+        Literal["exponential", "linear", "hybrid"]
+    ]
+    cuda_graph_max_tokens: NotRequired[int]
     # Inference CUDA-graph scope. Options:
     # - 'none': inference runs in eager mode (no CUDA graphs).
     # - 'layer': graphs are owned at the per-layer boundary (TransformerLayer / MambaLayer).
@@ -54,6 +58,16 @@ class MCoreGenerationSpecificArgs(TypedDict):
 
     mamba_inference_ssm_states_dtype: NotRequired[str]
     mamba_inference_conv_states_dtype: NotRequired[str]
+    prefix_caching_mamba_gb: NotRequired[int]
+
+    prefix_caching_coordinator_policy: NotRequired[
+        Literal["load_balanced", "longest_prefix", "first_prefix_block"]
+    ]
+    prefix_cache_ttl_seconds: NotRequired[float]
+    prefix_caching_cost_policy: NotRequired[
+        Literal["simple_multiplicative", "load_aware"]
+    ]
+    prefix_caching_load_beta: NotRequired[float]
 
     # KV cache lifecycle across suspend/resume:
     # - "persist": cache stays allocated; CUDA graphs remain valid (default)
