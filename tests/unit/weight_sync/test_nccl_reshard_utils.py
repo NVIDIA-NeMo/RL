@@ -519,7 +519,7 @@ def _dense_metadata(hidden=32, inter=64):
 
 
 def _native_mxfp8_metadata(
-    hidden: int = 32, inter: int = 64
+    hidden: int = 32, inter: int = 128
 ) -> dict[str, dict[str, Any]]:
     return {
         "model.layers.0.mlp.down_proj.weight": {
@@ -615,8 +615,8 @@ def test_build_refit_info_preserves_native_mxfp8_components() -> None:
         "weight",
         "weight_scale",
     ]
-    assert param["components"][0]["global_shape"] == (32, 64)
-    assert param["components"][1]["global_shape"] == (32, 2)
+    assert param["components"][0]["global_shape"] == (32, 128)
+    assert param["components"][1]["global_shape"] == (32, 4)
     for component in param["components"]:
         assert any(
             isinstance(placement, Shard) and placement.dim == 1
@@ -625,6 +625,23 @@ def test_build_refit_info_preserves_native_mxfp8_components() -> None:
         assert any(
             isinstance(placement, Shard) and placement.dim == 1
             for placement in component["dst_placements"]
+        )
+
+
+def test_build_refit_info_rejects_incomplete_local_mxfp8_blocks() -> None:
+    metadata = _native_mxfp8_metadata()
+    param = metadata["model.layers.0.mlp.down_proj.weight"]
+    param["shape"] = [32, 64]
+    param["components"][0]["shape"] = [32, 64]
+    param["components"][1]["shape"] = [32, 2]
+
+    with pytest.raises(ValueError, match="local K.*divisible by 32"):
+        build_nccl_reshard_refit_info(
+            metadata,
+            train_parallelism={"tp_size": 4, "ep_size": 1, "pp_size": 1},
+            gen_parallelism={"tp_size": 4, "ep_size": 1, "pp_size": 1},
+            train_world_size=4,
+            gen_world_size=4,
         )
 
 

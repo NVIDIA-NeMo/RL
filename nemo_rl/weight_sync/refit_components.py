@@ -66,11 +66,17 @@ def normalize_refit_components(
     Raises:
         ValueError: If component roles, shapes, or MXFP8 scale metadata are invalid.
     """
-    logical_shape = _positive_shape(metadata["shape"], logical_name)
+    logical_shape = _positive_shape(
+        _required(metadata, "shape", logical_name), logical_name
+    )
     serialized = metadata.get("components")
     if serialized is None:
         serialized = [
-            {"role": "weight", "shape": logical_shape, "dtype": metadata["dtype"]}
+            {
+                "role": "weight",
+                "shape": logical_shape,
+                "dtype": _required(metadata, "dtype", logical_name),
+            }
         ]
     if (
         not isinstance(serialized, Sequence)
@@ -84,14 +90,17 @@ def normalize_refit_components(
     for item in serialized:
         if not isinstance(item, Mapping):
             raise ValueError(f"{logical_name} component metadata must be mappings")
-        role = item["role"]
+        role = _required(item, "role", f"{logical_name} component")
         if role not in ("weight", "weight_scale"):
             raise ValueError(f"{logical_name} has unsupported component role {role!r}")
         if role in roles:
             raise ValueError(f"{logical_name} has duplicate component role {role!r}")
         roles.add(role)
-        shape = _positive_shape(item["shape"], f"{logical_name} {role}")
-        dtype = str(item["dtype"])
+        shape = _positive_shape(
+            _required(item, "shape", f"{logical_name} {role}"),
+            f"{logical_name} {role}",
+        )
+        dtype = str(_required(item, "dtype", f"{logical_name} {role}"))
         result.append(
             RefitComponentMeta(
                 logical_name=logical_name,
@@ -138,6 +147,7 @@ def component_plan_digest(refit_info: Mapping[str, Any]) -> str:
                     "components": [
                         {
                             "role": component["role"],
+                            "checkpoint_name": component.get("checkpoint_name"),
                             "dtype": str(component["dtype"]),
                             "global_shape": list(component["global_shape"]),
                             "src_placements": _canonical_placements(
@@ -157,10 +167,51 @@ def component_plan_digest(refit_info: Mapping[str, Any]) -> str:
                     ],
                     "pp_stage": param_info.get("pp_stage"),
                     "grouped_expert_proj": param_info.get("grouped_expert_proj"),
+                    "src_mesh": _canonical_mesh(param_info.get("src_mesh_info")),
+                    "dst_mesh": _canonical_mesh(param_info.get("dst_mesh_info")),
                 }
             )
-    payload = json.dumps(canonical_plan, sort_keys=True, separators=(",", ":"))
+    misc_plan = [
+        {
+            "name": name,
+            "shape": list(metadata["shape"]),
+            "dtype": str(metadata["dtype"]),
+        }
+        for name, metadata in refit_info.get("misc_meta", {}).items()
+    ]
+    payload = json.dumps(
+        {"bulk": canonical_plan, "misc": misc_plan},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def native_mxfp8_param_names(refit_info: Mapping[str, Any]) -> set[str]:
+    """Return parameters represented by a canonical MXFP8 value/scale pair."""
+    result: set[str] = set()
+    per_layer_params = refit_info.get("per_layer_params", {})
+    for layer_name in refit_info.get("layer_names", []):
+        for param_info in per_layer_params.get(layer_name, []):
+            components = param_info.get("components", [])
+            if [component.get("role") for component in components] != [
+                "weight",
+                "weight_scale",
+            ]:
+                continue
+            if (
+                str(components[0].get("dtype")) == "torch.float8_e4m3fn"
+                and str(components[1].get("dtype")) == "torch.uint8"
+            ):
+                result.add(param_info["name"])
+    return result
+
+
+def _required(metadata: Mapping[str, Any], key: str, context: str) -> Any:
+    """Read one required metadata field with a public validation error."""
+    if key not in metadata:
+        raise ValueError(f"{context} metadata must include {key!r}")
+    return metadata[key]
 
 
 def _positive_shape(value: Any, context: str) -> tuple[int, ...]:
@@ -218,3 +269,18 @@ def _canonical_placements(placements: Sequence[Any]) -> list[dict[str, int | str
         else:
             raise ValueError(f"unsupported refit placement {placement!r}")
     return result
+
+
+def _canonical_mesh(mesh_info: Any) -> Any:
+    """Return nested mesh ranks without tensor or wrapper identity."""
+    if mesh_info is None:
+        return None
+    mesh = (
+        mesh_info.get("mesh")
+        if isinstance(mesh_info, Mapping)
+        else getattr(mesh_info, "mesh", None)
+    )
+    if mesh is None:
+        raise ValueError(f"unsupported refit mesh {mesh_info!r}")
+    tolist = getattr(mesh, "tolist", None)
+    return tolist() if callable(tolist) else mesh

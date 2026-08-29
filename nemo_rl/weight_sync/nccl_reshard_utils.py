@@ -1018,8 +1018,9 @@ def build_nccl_reshard_refit_info(
                 "dst_mesh_info": dst_mesh,
             }
 
+        normalized_components = normalize_refit_components(name, meta)
         component_infos = []
-        for component in normalize_refit_components(name, meta):
+        for component in normalized_components:
             src_placements = get_placements(
                 name, src_dim_map, len(component.global_shape)
             )
@@ -1037,6 +1038,15 @@ def build_nccl_reshard_refit_info(
             component_info["src_placements"] = src_placements
             component_info["dst_placements"] = dst_placements
             component_infos.append(component_info)
+
+        if len(normalized_components) == 2:
+            weight_shape = normalized_components[0].global_shape
+            _validate_native_local_block_width(
+                name, weight_shape, src_mesh, component_infos[0]["src_placements"]
+            )
+            _validate_native_local_block_width(
+                name, weight_shape, dst_mesh, component_infos[0]["dst_placements"]
+            )
 
         weight_component = next(
             component for component in component_infos if component["role"] == "weight"
@@ -1077,3 +1087,26 @@ def _validate_component_placement_dims(
                 f"{logical_name} {role} placement shards dimension {placement.dim} "
                 f"outside component rank {len(shape)}"
             )
+
+
+def _validate_native_local_block_width(
+    logical_name: str,
+    shape: tuple[int, ...],
+    mesh: MeshInfo,
+    placements: list[Any],
+) -> None:
+    """Require each local K shard to contain complete 32-value MXFP8 blocks."""
+    shard_count = 1
+    for mesh_dim, placement in enumerate(placements):
+        if isinstance(placement, Shard) and placement.dim == len(shape) - 1:
+            shard_count *= int(mesh.mesh.shape[mesh_dim])
+    if shape[-1] % shard_count:
+        raise ValueError(
+            f"{logical_name} native MXFP8 K={shape[-1]} is not divisible by "
+            f"the K shard count {shard_count}"
+        )
+    local_k = shape[-1] // shard_count
+    if local_k % 32:
+        raise ValueError(
+            f"{logical_name} native MXFP8 local K={local_k} must be divisible by 32"
+        )
