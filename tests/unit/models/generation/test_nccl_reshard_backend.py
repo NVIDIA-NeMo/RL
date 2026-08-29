@@ -27,6 +27,7 @@ from contextlib import nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -168,6 +169,87 @@ class _RecordingNativeAdapter:
     def abort_update(self, error: BaseException) -> None:
         self.events.append("abort")
         self.aborted_with = error
+
+
+def _make_native_speculative_extension(
+    *,
+    method: str,
+    draft_quantization: str | None,
+    from_disk: bool = False,
+) -> tuple[VllmInternalWorkerExtension, MagicMock]:
+    extension = _make_ext({})
+    extension._mtp_drafter_from_disk = from_disk
+    extension.model_runner.drafter = SimpleNamespace(
+        model=SimpleNamespace(load_weights=MagicMock())
+    )
+    extension.model_runner.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method=method,
+            draft_model_config=SimpleNamespace(quantization=draft_quantization),
+        )
+    )
+    adapter = MagicMock()
+    extension._nccl_reshard_refit_adapter = adapter
+    return extension, adapter
+
+
+@pytest.mark.parametrize(
+    ("method", "draft_quantization", "match"),
+    [
+        ("mtp", "fp8", "co-trained MTP"),
+        ("deepseek_mtp", "fp8", "co-trained MTP"),
+        ("eagle3", "fp8", "quantized external drafter"),
+    ],
+)
+def test_native_mxfp8_prepare_rejects_unsafe_speculative_drafters_before_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    draft_quantization: str,
+    match: str,
+) -> None:
+    extension, adapter = _make_native_speculative_extension(
+        method=method,
+        draft_quantization=draft_quantization,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.weight_sync.nccl_reshard_utils.restore_refit_info_placements",
+        lambda refit_info: refit_info,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        extension.prepare_nccl_reshard_refit_info(_native_down_refit_info())
+
+    adapter.validate_plan.assert_not_called()
+    adapter.prepare.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("method", "draft_quantization", "from_disk"),
+    [
+        ("eagle3", None, False),
+        ("mtp", "fp8", True),
+    ],
+)
+def test_native_mxfp8_prepare_allows_safe_speculative_drafters(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    draft_quantization: str | None,
+    from_disk: bool,
+) -> None:
+    extension, adapter = _make_native_speculative_extension(
+        method=method,
+        draft_quantization=draft_quantization,
+        from_disk=from_disk,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.weight_sync.nccl_reshard_utils.restore_refit_info_placements",
+        lambda refit_info: refit_info,
+    )
+
+    extension.prepare_nccl_reshard_refit_info(_native_down_refit_info())
+
+    adapter.validate_plan.assert_called_once()
+    adapter.prepare.assert_called_once()
 
 
 def _patch_cpu_nccl_refit(

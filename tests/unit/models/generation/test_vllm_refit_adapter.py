@@ -595,6 +595,11 @@ def _make_adapter(
         device=torch.device("cpu"),
     )
     monkeypatch.setattr(adapter, "_prepare_native_bindings", lambda *_args: {})
+    monkeypatch.setattr(
+        refit_adapter,
+        "_validate_destination_owner_isolation",
+        lambda *_args: None,
+    )
     return (
         adapter,
         parameter,
@@ -1116,6 +1121,31 @@ def test_0251_adapter_rejects_consistent_dense_metadata_that_misses_fused_target
         )
 
     assert retained_loads == []
+
+
+def test_0251_adapter_rejects_native_and_legacy_bulk_under_one_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _model, _retained_loads = _make_binding_adapter(monkeypatch, [])
+    refit_info = _native_binding_refit_info()
+    grouped_down = refit_info["per_layer_params"]["model.layers.0"][-1]
+    grouped_down["dtype"] = "torch.bfloat16"
+    grouped_down["components"] = [
+        {
+            "role": "weight",
+            "dtype": "torch.bfloat16",
+            "global_shape": grouped_down["global_shape"],
+            "dst_placements": grouped_down["dst_placements"],
+        }
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match="routed_experts.*native=.*gate_proj.*legacy=.*down_proj",
+    ):
+        adapter.prepare(refit_info)
+
+    assert adapter._state == "new"
 
 
 @pytest.mark.parametrize(

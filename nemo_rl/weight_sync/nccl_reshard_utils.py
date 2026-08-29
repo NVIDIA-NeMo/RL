@@ -750,7 +750,9 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
         #   BF16 storage → MXFP8 gen  (receiver quantizes the resharded BF16 shard)
         # FP8→BF16 has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
-        fp8_param = fp8_cfg.get("fp8_param", False)
+        fp8_param = bool(
+            fp8_cfg.get("enabled", False) and fp8_cfg.get("fp8_param", False)
+        )
         fp8_recipe = fp8_cfg.get("fp8_recipe", None)
         trainer_precision = policy.get("precision")
         gen_precision = vllm_cfg.get("precision", None)
@@ -760,6 +762,13 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             and gen_precision == "fp8"
             and vllm_cfg.get("is_mx") is True
         )
+
+        if native_mxfp8 and (megatron_cfg.get("mtp_num_layers", 0) or 0) > 0:
+            violations.append(
+                "native MXFP8 refit does not yet support co-trained MTP layers; "
+                "set policy.megatron_cfg.mtp_num_layers=0 and load static MTP "
+                "weights from the generation checkpoint"
+            )
 
         # The refit byte-copies weights train -> gen, so gen dtype must match
         # train: BF16 (unset / "auto" / "bf16" / "bfloat16") or FP8 ("fp8").  A
@@ -970,6 +979,8 @@ def build_nccl_reshard_refit_info(
 
     per_layer_params: dict[str, list] = OrderedDict()
     for name, meta in state_dict_metadata.items():
+        normalized_components = normalize_refit_components(name, meta)
+        logical_weight = normalized_components[0]
         layer = _extract_layer_name(name)
         expert = is_expert_param(name)
         # Pick the gen (dst) mesh: experts go to the EP/TP-expert mesh, all other
@@ -996,8 +1007,8 @@ def build_nccl_reshard_refit_info(
             src_dim_map = stage_src_dim_map
             info = {
                 "name": name,
-                "global_shape": tuple(meta["shape"]),
-                "dtype": meta["dtype"],
+                "global_shape": logical_weight.global_shape,
+                "dtype": logical_weight.dtype,
                 "pp_stage": stage,
                 "src_mesh_info": src_mesh,
                 "dst_mesh_info": dst_mesh,
@@ -1012,13 +1023,12 @@ def build_nccl_reshard_refit_info(
             src_dim_map = this_src_dim_map
             info = {
                 "name": name,
-                "global_shape": tuple(meta["shape"]),
-                "dtype": meta["dtype"],
+                "global_shape": logical_weight.global_shape,
+                "dtype": logical_weight.dtype,
                 "src_mesh_info": src_mesh,
                 "dst_mesh_info": dst_mesh,
             }
 
-        normalized_components = normalize_refit_components(name, meta)
         component_infos = []
         for component in normalized_components:
             src_placements = get_placements(

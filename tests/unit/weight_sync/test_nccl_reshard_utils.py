@@ -105,6 +105,7 @@ def test_check_nccl_reshard_refit_support_keeps_matching_blockwise_fp8() -> None
     config = _valid_nccl_reshard_config()
     config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
     config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
         "fp8_param": True,
         "fp8_recipe": "blockwise",
     }
@@ -131,6 +132,7 @@ def test_check_nccl_reshard_refit_support_rejects_non_blockwise_fp8_storage(
     config = _valid_nccl_reshard_config()
     config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
     config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
         "fp8_param": True,
         "fp8_recipe": fp8_recipe,
     }
@@ -187,6 +189,7 @@ def test_check_nccl_reshard_refit_support_rejects_blockwise_fp8_to_mxfp8() -> No
     config = _valid_nccl_reshard_config()
     config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
     config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
         "fp8_param": True,
         "fp8_recipe": "blockwise",
     }
@@ -212,6 +215,35 @@ def test_check_nccl_reshard_refit_support_rejects_native_mxfp8_with_etp() -> Non
     with pytest.raises(
         ValueError, match="expert_tensor_parallel_size is not supported"
     ):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_ignores_disabled_fp8_storage() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": False,
+        "fp8_param": True,
+        "fp8_recipe": "mxfp8",
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_native_mxfp8_with_mtp() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+    config.policy["megatron_cfg"].update(
+        {
+            "mtp_num_layers": 1,
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8_param": True,
+                "fp8_recipe": "mxfp8",
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="co-trained MTP"):
         check_nccl_reshard_refit_support(config)
 
 

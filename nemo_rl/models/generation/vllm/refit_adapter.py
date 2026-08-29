@@ -30,6 +30,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     RefitCtx,
     _extract_layer_prefix,
 )
+from nemo_rl.weight_sync.refit_components import native_mxfp8_param_names
 
 _NATIVE_VALUE_DTYPE = torch.float8_e4m3fn
 _NATIVE_SCALE_DTYPE = torch.uint8
@@ -171,6 +172,11 @@ class Vllm0251RefitAdapter:
                 raise ValueError(
                     "vLLM native refit plan has no canonical MXFP8 value/scale pair"
                 )
+            _validate_destination_owner_isolation(
+                self._model_runner.model,
+                refit_info,
+                native_names,
+            )
             self._native_bindings = self._prepare_native_bindings(
                 refit_info, native_names
             )
@@ -279,7 +285,7 @@ class Vllm0251RefitAdapter:
             if expected_shape is None:
                 raise ValueError(
                     f"vLLM refit component {component!r} has no destination "
-                    "shape derived from Task 2 metadata"
+                    "shape derived from the refit plan"
                 )
             self._validate_local_component_shape(binding, role, region, expected_shape)
             self._install_local_loader_bridge(target_name, target)
@@ -490,7 +496,7 @@ class Vllm0251RefitAdapter:
             raise ValueError(
                 f"vLLM checkpoint destination for {(binding.logical_name, role)!r} "
                 f"has local shape {tuple(region.shape)}, expected {expected_shape} "
-                "from Task 2 destination geometry"
+                "from the refit plan destination geometry"
             )
 
     def _install_local_loader_bridge(
@@ -792,45 +798,8 @@ def _component_keys(refit_info: Mapping[str, Any]) -> set[tuple[str, str]]:
 
 def _native_component_names(refit_info: Mapping[str, Any]) -> set[str]:
     """Validate complete native pairs and return their logical names."""
-    metadata = _component_metadata(refit_info)
-    param_info_by_name = _parameter_info_by_name(refit_info)
-    native_names: set[str] = set()
-    for logical_name, param_info in param_info_by_name.items():
-        weight = metadata[(logical_name, "weight")]
-        scale = metadata.get((logical_name, "weight_scale"))
-        if scale is None:
-            continue
-        if not any(
-            field in weight or field in scale for field in ("dtype", "global_shape")
-        ):
-            continue
-        if str(weight.get("dtype")) != "torch.float8_e4m3fn":
-            raise ValueError(
-                f"{logical_name!r} native weight dtype must be torch.float8_e4m3fn"
-            )
-        if str(scale.get("dtype")) != "torch.uint8":
-            raise ValueError(f"{logical_name!r} weight_scale dtype must be torch.uint8")
-        weight_shape = _shape_tuple(weight.get("global_shape"), logical_name, "weight")
-        scale_shape = _shape_tuple(
-            scale.get("global_shape"), logical_name, "weight_scale"
-        )
-        if weight_shape[-1] % 32:
-            raise ValueError(
-                f"{logical_name!r} native weight K must be divisible by 32"
-            )
-        expected_scale_shape = (*weight_shape[:-1], weight_shape[-1] // 32)
-        if scale_shape != expected_scale_shape:
-            raise ValueError(
-                f"{logical_name!r} weight_scale shape {scale_shape} must equal "
-                f"the scale shape {expected_scale_shape}"
-            )
-        logical_shape = param_info.get("global_shape")
-        if logical_shape is not None and tuple(logical_shape) != weight_shape:
-            raise ValueError(
-                f"{logical_name!r} native weight shape must equal its logical shape"
-            )
-        native_names.add(logical_name)
-    return native_names
+    _component_metadata(refit_info)
+    return native_mxfp8_param_names(refit_info, strict=True)
 
 
 def _shape_tuple(value: Any, logical_name: str, role: str) -> tuple[int, ...]:
@@ -853,7 +822,7 @@ def _expected_local_component_shapes(
     refit_info: Mapping[str, Any],
     native_names: set[str],
 ) -> dict[tuple[str, str], tuple[int, ...]]:
-    """Derive local receive shapes only from Task 2 mesh metadata."""
+    """Derive local receive shapes only from refit-plan mesh metadata."""
     components = _component_metadata(refit_info)
     parameters = _parameter_info_by_name(refit_info)
     result: dict[tuple[str, str], tuple[int, ...]] = {}
@@ -864,7 +833,7 @@ def _expected_local_component_shapes(
         if mesh_tensor is None:
             mesh_tensor = getattr(mesh, "_mesh", None)
         if not isinstance(mesh_tensor, torch.Tensor) or mesh_tensor.numel() == 0:
-            raise ValueError(f"{logical_name!r} has no valid Task 2 destination mesh")
+            raise ValueError(f"{logical_name!r} has no valid refit destination mesh")
         mesh_shape = tuple(int(size) for size in mesh_tensor.shape)
         for role in ("weight", "weight_scale"):
             component = components[(logical_name, role)]
@@ -878,7 +847,7 @@ def _expected_local_component_shapes(
                 placements, (str, bytes)
             ):
                 raise ValueError(
-                    f"{logical_name!r} {role} has no Task 2 destination placements"
+                    f"{logical_name!r} {role} has no refit destination placements"
                 )
             if len(placements) != len(mesh_shape):
                 raise ValueError(
@@ -1063,6 +1032,46 @@ def _resolve_vllm_value_destinations(
                 continue
         raise ValueError(f"no vLLM FFN destination for {logical_name!r}")
     return result
+
+
+def _validate_destination_owner_isolation(
+    model: torch.nn.Module,
+    refit_info: Mapping[str, Any],
+    native_names: set[str],
+) -> None:
+    """Reject native and legacy bulk writes that share one vLLM module owner."""
+    destinations = _resolve_vllm_value_destinations(model, refit_info)
+    parameter_names = {
+        id(parameter): name for name, parameter in model.named_parameters()
+    }
+    owner_members: dict[str, dict[str, list[str]]] = {}
+    for logical_name, (parameter, _merged_slice) in destinations.items():
+        parameter_name = parameter_names.get(id(parameter))
+        if parameter_name is None:
+            raise ValueError(
+                f"vLLM destination for {logical_name!r} is not a registered parameter"
+            )
+        owner_name = parameter_name.rsplit(".", 1)[0]
+        kind = "native" if logical_name in native_names else "legacy"
+        owner_members.setdefault(owner_name, {"native": [], "legacy": []})[kind].append(
+            logical_name
+        )
+
+    conflicts = {
+        owner_name: members
+        for owner_name, members in owner_members.items()
+        if members["native"] and members["legacy"]
+    }
+    if conflicts:
+        details = "; ".join(
+            f"{owner}: native={sorted(members['native'])!r}, "
+            f"legacy={sorted(members['legacy'])!r}"
+            for owner, members in sorted(conflicts.items())
+        )
+        raise ValueError(
+            "vLLM native refit cannot mix native and legacy bulk destinations "
+            f"under one module owner: {details}"
+        )
 
 
 def _has_weight_transfer_engine_registry() -> bool:

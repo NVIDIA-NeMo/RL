@@ -1109,7 +1109,8 @@ class VllmInternalWorkerExtension:
         )
 
         self.nccl_reshard_refit_info = restore_refit_info_placements(refit_info)
-        if native_mxfp8_param_names(self.nccl_reshard_refit_info):
+        if native_mxfp8_param_names(self.nccl_reshard_refit_info, strict=True):
+            self._validate_native_speculative_refit()
             adapter = self._get_nccl_reshard_refit_adapter()
             adapter.validate_plan(self.nccl_reshard_refit_info)
             adapter.prepare(self.nccl_reshard_refit_info)
@@ -1121,7 +1122,27 @@ class VllmInternalWorkerExtension:
                 self.nccl_reshard_refit_info
             )
 
-    def _get_nccl_reshard_refit_adapter(self):
+    def _validate_native_speculative_refit(self) -> None:
+        """Reject drafter updates that lack a native layerwise reload lifecycle."""
+        if self._mtp_drafter_refit_enabled():
+            raise ValueError(
+                "native MXFP8 refit does not yet support a co-trained MTP drafter; "
+                "load static MTP weights from the generation checkpoint instead"
+            )
+
+        if self._mtp_drafter_from_disk:
+            return
+        spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
+        draft_model_config = getattr(spec_config, "draft_model_config", None)
+        draft_quantization = getattr(draft_model_config, "quantization", None)
+        if self._get_drafter_model() is not None and draft_quantization is not None:
+            raise ValueError(
+                "native MXFP8 refit does not yet support a quantized external "
+                f"drafter (quantization={draft_quantization!r})"
+            )
+
+    def _get_nccl_reshard_refit_adapter(self) -> Any:
+        """Return the cached native refit adapter for this vLLM worker."""
         adapter = self._nccl_reshard_refit_adapter
         if adapter is None:
             # Keep vLLM reload capability probing off legacy NCCL Reshard setup.
@@ -1142,7 +1163,7 @@ class VllmInternalWorkerExtension:
         refit_info: dict[str, Any],
     ) -> dict[tuple[str, str], LocalParamSpec]:
         """Resolve native destinations while vLLM checkpoint storage is active."""
-        native_names = native_mxfp8_param_names(refit_info)
+        native_names = native_mxfp8_param_names(refit_info, strict=True)
         if not native_names:
             return {}
         param_info_by_name = {
@@ -1224,7 +1245,7 @@ class VllmInternalWorkerExtension:
             for param_info in refit_info["per_layer_params"][layer_name]
         }
         specs: dict[str | tuple[str, str], LocalParamSpec] = {}
-        native_names = native_mxfp8_param_names(refit_info)
+        native_names = native_mxfp8_param_names(refit_info, strict=True)
         if include_native:
             for key, spec in self._build_native_destination_specs(refit_info).items():
                 specs[key] = spec
@@ -1608,7 +1629,9 @@ class VllmInternalWorkerExtension:
                 )
             torch.cuda.empty_cache()
 
-        native_names = native_mxfp8_param_names(self.nccl_reshard_refit_info)
+        native_names = native_mxfp8_param_names(
+            self.nccl_reshard_refit_info, strict=True
+        )
         if native_names:
             adapter = self._get_nccl_reshard_refit_adapter()
             # vLLM's layerwise initializer replaces checkpoint parameters with
