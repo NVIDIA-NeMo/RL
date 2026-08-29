@@ -39,6 +39,9 @@ from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.models.megatron.router_replay import (
+    validate_router_replay_transport_path,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
@@ -677,6 +680,13 @@ def _validate_failure_settings(
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    validate_router_replay_transport_path(
+        master_config.policy,
+        data_plane_enabled=bool((master_config.data_plane or {}).get("enabled", False)),
+        async_grpo_enabled=True,
+        nemo_gym_enabled=bool(master_config.env.get("should_use_nemo_gym", False)),
+    )
+
     async_config = master_config.async_rl
     num_prompts_per_step = master_config.grpo.num_prompts_per_step
     if num_prompts_per_step < async_config.min_groups_for_streaming_train:

@@ -38,7 +38,13 @@ from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+    Completion,
+    PromptGroupRecord,
+)
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutManager,
@@ -120,8 +126,10 @@ class _FakeImpl:
     def __init__(self, record="sentinel-record", on_run=None) -> None:
         self._record = record
         self._on_run = on_run
+        self.target_weight_versions = []
 
-    async def run_rollout(self, input_sample):
+    async def run_rollout(self, input_sample, target_weight_version=None):
+        self.target_weight_versions.append(target_weight_version)
         if self._on_run is not None:
             await self._on_run(input_sample)
         return self._record
@@ -153,6 +161,15 @@ def _make_manager(
 
 
 class TestGenerateAndPushFlow:
+    def test_forwards_target_step_to_rollout(self):
+        buf = _FakeBuffer()
+        impl = _FakeImpl()
+        mgr = _make_manager(buf, impl)
+
+        _run(mgr.generate_and_push({"prompt": "p"}, target_step=9))
+
+        assert impl.target_weight_versions == [9]
+
     def test_explicit_registry_tracks_only_inflight_generation(self):
         registry: dict[str, tuple[asyncio.Task[None], int]] = {}
         buf = _FakeBuffer()
@@ -393,6 +410,36 @@ def _nemo_gym_impl(mask_env_flagged_samples):
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
     )
+
+
+def test_nemo_gym_build_inputs_assigns_rollout_transport_fields():
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 3
+    impl._generation_config.update(
+        temperature=0.7,
+        top_p=0.9,
+        max_new_tokens=32,
+    )
+    sample = {
+        "extra_env_info": {
+            NEMO_GYM_TASK_INDEX_KEY: 17,
+            "responses_create_params": {},
+        }
+    }
+
+    rows = impl._build_inputs(sample, target_weight_version=23)
+
+    assert [row["_rowidx"] for row in rows] == [0, 1, 2]
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2]
+    assert [row[NEMO_GYM_TARGET_WEIGHT_VERSION_KEY] for row in rows] == [23, 23, 23]
+    assert [row[NEMO_GYM_TASK_INDEX_KEY] for row in rows] == [17, 17, 17]
+
+    # Runtime coordination indices are owned by RL, not the dataset.
+    sample["extra_env_info"][NEMO_GYM_ROLLOUT_INDEX_KEY] = 41
+    sample["extra_env_info"][NEMO_GYM_TARGET_WEIGHT_VERSION_KEY] = 42
+    rows = impl._build_inputs(sample)
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2]
+    assert all(NEMO_GYM_TARGET_WEIGHT_VERSION_KEY not in row for row in rows)
 
 
 def _mask_gate_result():

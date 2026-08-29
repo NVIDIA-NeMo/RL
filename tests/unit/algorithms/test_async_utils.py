@@ -2946,6 +2946,9 @@ class TestAsyncTrajectoryCollector:
                 "low_string": "{reasoning effort: efficient}",
             }
         }
+        collector.master_config.env.setdefault("nemo_gym", {})[
+            "log_training_samples"
+        ] = True
         target_weight = 15
         collector._generating_targets.add(target_weight)
         repeated_batch = BatchedDataDict(
@@ -2986,6 +2989,8 @@ class TestAsyncTrajectoryCollector:
                     for row in kwargs["input_batch"]["extra_env_info"]
                 ]
             )
+            assert kwargs["target_weight_version"] == target_weight
+            assert kwargs["log_training_samples"] is True
             rollout_calls += 1
             yield _rollout_result(7)
             if rollout_calls == 1:

@@ -56,6 +56,86 @@ def test_validate_router_replay_config_allows_prefix_cache_default():
 
 
 @pytest.mark.mcore
+def test_configure_vllm_for_ray_router_replay_sets_stable_internal_store_id():
+    from nemo_rl.models.megatron.router_replay import (
+        configure_vllm_for_router_replay,
+        validate_router_replay_config,
+    )
+
+    config = {
+        "router_replay": {"enabled": True, "transport": "ray"},
+        "generation": {
+            "backend": "vllm",
+            "vllm_cfg": {"async_engine": True},
+            "vllm_kwargs": {},
+        },
+        "megatron_cfg": {"enabled": True},
+    }
+
+    configure_vllm_for_router_replay(config)
+    first_id = config["router_replay"]["_store_run_instance_id"]
+    configure_vllm_for_router_replay(config)
+
+    assert config["router_replay"]["_store_run_instance_id"] == first_id
+    assert config["generation"]["vllm_cfg"]["_routed_experts_transport"] == "ray"
+    assert (
+        config["generation"]["vllm_cfg"]["_routed_experts_store_run_instance_id"]
+        == first_id
+    )
+    validate_router_replay_config(config)
+
+
+@pytest.mark.mcore
+def test_ray_router_replay_rejects_transfer_queue_path():
+    from nemo_rl.models.megatron.router_replay import (
+        validate_router_replay_transport_path,
+    )
+
+    config = {"router_replay": {"enabled": True, "transport": "ray"}}
+
+    with pytest.raises(NotImplementedError, match="data_plane.enabled=true"):
+        validate_router_replay_transport_path(
+            config,
+            data_plane_enabled=True,
+            async_grpo_enabled=True,
+            nemo_gym_enabled=True,
+        )
+
+    validate_router_replay_transport_path(
+        config,
+        data_plane_enabled=False,
+        async_grpo_enabled=True,
+        nemo_gym_enabled=True,
+    )
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("async_grpo_enabled", "nemo_gym_enabled", "message"),
+    [
+        (False, True, "requires async GRPO"),
+        (True, False, "env.should_use_nemo_gym=true"),
+    ],
+)
+def test_ray_router_replay_rejects_non_gym_or_sync_paths(
+    async_grpo_enabled, nemo_gym_enabled, message
+):
+    from nemo_rl.models.megatron.router_replay import (
+        validate_router_replay_transport_path,
+    )
+
+    config = {"router_replay": {"enabled": True, "transport": "ray"}}
+
+    with pytest.raises(NotImplementedError, match=message):
+        validate_router_replay_transport_path(
+            config,
+            data_plane_enabled=False,
+            async_grpo_enabled=async_grpo_enabled,
+            nemo_gym_enabled=nemo_gym_enabled,
+        )
+
+
+@pytest.mark.mcore
 def test_normalize_routed_experts_dense_batch_uses_seq_major_order():
     from nemo_rl.models.megatron.router_replay import (
         _normalize_routed_experts_for_mcore,
