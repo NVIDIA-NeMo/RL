@@ -48,6 +48,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import torch
 import yaml
+from pydantic import ValidationError
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
@@ -1050,6 +1051,10 @@ class TestSaveTrigger:
 
 
 class TestPeriodicRolloutCheckpoint:
+    def test_restore_mode_rejects_inconsistent_trainer_only_resume(self):
+        with pytest.raises(ValidationError, match="restore_mode"):
+            RolloutCheckpointConfig.model_validate({"restore_mode": "none"})
+
     def _actor(self, tmp_path: Path):
         config = _actor_master_config(
             tmp_path,

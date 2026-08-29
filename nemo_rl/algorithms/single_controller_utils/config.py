@@ -693,9 +693,8 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     interval attempts are skipped until that exact anchor exists.
 
     ``restore_mode="latest"`` selects the newest compatible periodic snapshot.
-    ``trainer_checkpoint`` ignores newer periodic snapshots, while ``none``
-    resumes trainer state without restoring rollout, replay, lineage, or the
-    dataloader cursor.
+    ``trainer_checkpoint`` ignores newer periodic snapshots and restores the
+    rollout state bundled with the durable trainer checkpoint.
 
     SingleController has no validation loop, so checkpoint selection must use
     ``checkpointing.metric_name=None`` or a ``train:<name>`` metric. Inherited
@@ -704,7 +703,7 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
 
     interval_s: Optional[float] = Field(default=None, gt=0)
     keep_latest_k: int = Field(default=2, ge=1)
-    restore_mode: Literal["latest", "trainer_checkpoint", "none"] = "latest"
+    restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
 
 
 class MasterConfig(BaseModel, extra="allow"):

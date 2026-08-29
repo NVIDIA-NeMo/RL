@@ -919,10 +919,8 @@ def setup_single_controller(
         sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
             master_config.async_rl.sampler
         )
-        if (
-            sampler_supports_replay_recovery
-            and rollout_checkpoint_cfg.restore_mode != "none"
-            and not master_config.checkpointing.get("save_data_plane")
+        if sampler_supports_replay_recovery and not master_config.checkpointing.get(
+            "save_data_plane"
         ):
             error_message = (
                 "SingleController checkpointing with a replay-checkpoint-capable "
@@ -937,10 +935,7 @@ def setup_single_controller(
                     "checkpointing.enabled=false."
                 )
             raise ValueError(error_message)
-        if (
-            rollout_checkpoint_cfg.restore_mode != "none"
-            and not sampler_supports_replay_recovery
-        ):
+        if not sampler_supports_replay_recovery:
             warnings.warn(
                 f"Sampler {master_config.async_rl.sampler.name!r} cannot recover "
                 "completed buffered rollouts. On resume, the dataloader cursor "
@@ -1062,9 +1057,7 @@ def setup_single_controller(
         )
 
     restore_mode = rollout_checkpoint_cfg.restore_mode
-    recovery_checkpoint_path = (
-        trainer_checkpoint_path if restore_mode != "none" else None
-    )
+    recovery_checkpoint_path = trainer_checkpoint_path
     bootstrap_anchor = checkpointer.checkpoint_dir / BOOTSTRAP_DIRNAME
     needs_bootstrap_identity = trainer_checkpoint_path is None and (
         rollout_checkpoint_cfg.interval_s is not None
@@ -1135,12 +1128,6 @@ def setup_single_controller(
             f"without considering newer periodic snapshots: {trainer_checkpoint_path}",
             flush=True,
         )
-    elif restore_mode == "none" and trainer_checkpoint_path:
-        print(
-            "📦 Resuming trainer state without rollout, replay, lineage, or "
-            "dataloader recovery.",
-            flush=True,
-        )
 
     # ==========================
     # Setup Dataset & Environments
@@ -1175,8 +1162,7 @@ def setup_single_controller(
     )
     if recovery_checkpoint_path is not None:
         print(
-            "📦 Restoring dataloader state from checkpoint: "
-            f"{recovery_checkpoint_path}"
+            f"📦 Restoring dataloader state from checkpoint: {recovery_checkpoint_path}"
         )
         load_dataloader_state(dataloader, recovery_checkpoint_path, data_config)
 
