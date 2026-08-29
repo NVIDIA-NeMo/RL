@@ -1226,7 +1226,8 @@ class VllmInternalWorkerExtension:
         specs: dict[str | tuple[str, str], LocalParamSpec] = {}
         native_names = native_mxfp8_param_names(refit_info)
         if include_native:
-            specs.update(self._build_native_destination_specs(refit_info))
+            for key, spec in self._build_native_destination_specs(refit_info).items():
+                specs[key] = spec
         if native_names == set(param_info_by_name):
             return HFToLocalParamMap(specs=specs)
 
@@ -1631,7 +1632,8 @@ class VllmInternalWorkerExtension:
                         "vLLM refit destination plan has duplicate components: "
                         f"{sorted(duplicate_keys)!r}"
                     )
-                destination_map.specs.update(native_specs)
+                for key, spec in native_specs.items():
+                    destination_map.specs[key] = spec
                 self.hf_to_local_param_map = destination_map
                 _receive_bulk_components()
                 _receive_misc()
