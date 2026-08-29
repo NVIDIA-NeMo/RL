@@ -110,8 +110,7 @@ def normalize_refit_components(
     role_sequence = tuple(component.role for component in result)
     if role_sequence not in (("weight",), ("weight", "weight_scale")):
         raise ValueError(
-            f"{logical_name} components must be ordered as "
-            "('weight', 'weight_scale')"
+            f"{logical_name} components must be ordered as ('weight', 'weight_scale')"
         )
     return tuple(result)
 
