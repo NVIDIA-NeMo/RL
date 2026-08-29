@@ -680,7 +680,7 @@ class TestNcclReshardWeightSynchronizer:
         policy.init_nccl_reshard_comm_group.side_effect = record(
             "policy.init_reshard", [MagicMock()]
         )
-        generation.init_nccl_reshard_comm_group.side_effect = record(
+        generation.rebuild_nccl_reshard_comm_group.side_effect = record(
             "generation.init_reshard", [MagicMock()]
         )
         train_cluster = _mock_cluster(world_size=2)

@@ -1042,10 +1042,18 @@ def build_nccl_reshard_refit_info(
         if len(normalized_components) == 2:
             weight_shape = normalized_components[0].global_shape
             _validate_native_local_block_width(
-                name, weight_shape, src_mesh, component_infos[0]["src_placements"]
+                name,
+                "source",
+                weight_shape,
+                src_mesh,
+                component_infos[0]["src_placements"],
             )
             _validate_native_local_block_width(
-                name, weight_shape, dst_mesh, component_infos[0]["dst_placements"]
+                name,
+                "destination",
+                weight_shape,
+                dst_mesh,
+                component_infos[0]["dst_placements"],
             )
 
         weight_component = next(
@@ -1091,6 +1099,7 @@ def _validate_component_placement_dims(
 
 def _validate_native_local_block_width(
     logical_name: str,
+    endpoint: str,
     shape: tuple[int, ...],
     mesh: MeshInfo,
     placements: list[Any],
@@ -1102,11 +1111,12 @@ def _validate_native_local_block_width(
             shard_count *= int(mesh.mesh.shape[mesh_dim])
     if shape[-1] % shard_count:
         raise ValueError(
-            f"{logical_name} native MXFP8 K={shape[-1]} is not divisible by "
-            f"the K shard count {shard_count}"
+            f"{logical_name} native MXFP8 {endpoint} K={shape[-1]} is not "
+            f"divisible by the K shard count {shard_count}"
         )
     local_k = shape[-1] // shard_count
     if local_k % 32:
         raise ValueError(
-            f"{logical_name} native MXFP8 local K={local_k} must be divisible by 32"
+            f"{logical_name} native MXFP8 {endpoint} local K={local_k} must be "
+            "divisible by 32"
         )
