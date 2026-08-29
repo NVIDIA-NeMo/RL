@@ -72,6 +72,9 @@ from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
+from nemo_rl.models.megatron.quantization_recipe import (
+    specialize_first_last_bf16_quant_recipe_for_current_pipeline_rank,
+)
 
 _HF_CONFIG_PATCHED = False
 
@@ -1699,6 +1702,9 @@ def setup_model_and_optimizer(
         cfg=megatron_cfg,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
+    )
+    specialize_first_last_bf16_quant_recipe_for_current_pipeline_rank(
+        megatron_cfg.model
     )
 
     if megatron_cfg.ft and megatron_cfg.ft.enable_ft_package:

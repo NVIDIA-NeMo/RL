@@ -15,11 +15,17 @@ configuration and retain their task-owned model geometry:
 | Nemotron-3 Nano | `nano-fp8param-false.yaml` | 8 x 4 | 4 |
 | Nemotron-3 Nano | `nano-fp8param-true.yaml` | 8 x 4 | 4 |
 
-`te_nano_routed.yaml` orders routed `linear_fc1` and `linear_fc2` MXFP8
-matchers before a BF16 catch-all. Nano additionally holds zero leading layers
-and the final eight layers in BF16. Its native smoke must verify that only the
-routed-expert FC1/FC2 tensors carry E4M3 values plus E8M0 scales; attention,
-shared experts, router, QKVO, and `lm_head` remain BF16 misc entries.
+`te_nano_routed_fp8param.yaml` orders routed `linear_fc1` and `linear_fc2`
+MXFP8 parameter-storage matchers before a BF16 catch-all. It covers both
+grouped expert names and Nano's `local_experts` names. Nano additionally holds
+zero leading layers and the final eight global layers in BF16. Its hybrid
+layer pattern has 23 routed-expert layers; four of them are in the final-eight
+BF16 range. After pipeline initialization, NeMo RL maps those global BF16
+layers to each rank's local module names and puts their BF16 matchers before
+the routed-expert matchers. The native smoke must therefore cover 19 native
+and four BF16 routed layers. Only the native routed-expert FC1/FC2 tensors
+carry E4M3 values plus E8M0 scales; attention, shared experts, router, QKVO,
+and `lm_head` remain BF16 misc entries.
 
 The native overlays enable a bounded worker-side assertion over the actual
 refit metadata. Before the NCCL refit plan is built, it emits one
@@ -97,6 +103,8 @@ quantization for native components, and a Qwen value-changing second refit.
 The worker validates native source tensor dtype, compact scale layout, and
 swizzled-scale rejection before the collective. For the true-arm smoke it also
 emits `[native-mxfp8-inventory]` with the complete task-owned routed FC1/FC2
-and BF16 ignored-scope inventory, and exits nonzero on any mismatch. Preserve
-that JSON record in the Task 10 results artifact; no manual reconstruction of
-the module storage scope is required.
+and BF16 ignored-scope inventory. Hybrid models derive the expected routed
+layers from `hybrid_layer_pattern`; models without that field retain the
+all-layer MoE check. The worker exits nonzero on any mismatch. Preserve that
+JSON record in the Task 10 results artifact; no manual reconstruction of the
+module storage scope is required.
