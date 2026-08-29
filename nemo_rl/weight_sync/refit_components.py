@@ -253,8 +253,10 @@ def _validate_weight_scale_pair(
         )
 
 
-def _canonical_placements(placements: Sequence[Any]) -> list[dict[str, int | str]]:
+def _canonical_placements(placements: object) -> list[dict[str, int | str]]:
     """Represent Shard and Replicate placements without runtime object identity."""
+    if not isinstance(placements, Sequence) or isinstance(placements, (str, bytes)):
+        raise ValueError("refit placements must be a sequence")
     result: list[dict[str, int | str]] = []
     for placement in placements:
         if isinstance(placement, Shard):
