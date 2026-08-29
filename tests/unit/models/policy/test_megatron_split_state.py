@@ -1124,6 +1124,7 @@ class TestPrepareForLpInference:
         w.move_optimizer = MagicMock()
         w.optimizer_cpu_offload = False
         w.offload_optimizer_for_logprob = True
+        w._uses_mxfp8_overlap_shared_param_buffer = MagicMock(return_value=False)
         return w
 
     @staticmethod
@@ -1173,6 +1174,23 @@ class TestPrepareForLpInference:
         assert first.args[1] == "cuda"
         assert first.kwargs == {"move_grads": False}
         w.model.eval.assert_called_once()
+
+    def test_restores_and_stages_mxfp8_shared_buffer_before_logprobs(
+        self, mock_module_symbols
+    ):
+        """MXFP8 param all-gather reuses grad storage, so params cannot be
+        reloaded without restoring that shared storage first."""
+        w = self._worker()
+        w._uses_mxfp8_overlap_shared_param_buffer.return_value = True
+
+        with patch("torch.randn"):
+            w.prepare_for_lp_inference(keep_train_buffers=False)
+
+        first = w.move_model.call_args_list[0]
+        assert first.args[1] == "cuda"
+        assert first.kwargs == {"move_grads": True}
+        assert self._grad_offload_calls(w) == []
+        w.optimizer.prepare_model_params_for_param_sync.assert_called_once_with()
 
     def test_keeps_buffers_across_an_open_step(self, mock_module_symbols):
         """The sequence the streaming pump actually produces: open a step, run a
