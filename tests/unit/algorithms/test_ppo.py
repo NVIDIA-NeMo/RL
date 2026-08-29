@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import nullcontext
 import pathlib
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -2628,8 +2628,8 @@ class TestDynamicSamplingIsRejected:
     """``ppo.use_dynamic_sampling`` has no implementation on the PPO path.
 
     ``nemo_rl.algorithms.ppo.dynamic_sampling`` was copied from ``grpo.py`` but
-    has never been called from any commit since it was added -- ``grpo.py:3226``
-    is the tree's only call site and it reaches ``grpo.py``'s own copy. Setup
+    has never been called from any commit since it was added -- ``grpo.py``
+    holds the only production call site, reaching its own copy. Setup
     nonetheless accepted the flag and scaled the rollout batch by
     ``batch_multiplier``, so the batch grew and nothing filtered it.
 

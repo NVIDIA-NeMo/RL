@@ -420,8 +420,8 @@ def setup(
     if ppo_config.use_dynamic_sampling:
         # PPO implements no filtering for this knob. ``dynamic_sampling`` was
         # copied into this module but has never been called from any commit
-        # since it was added -- ``grpo.py:3226`` is the only call site in the
-        # tree, and it reaches ``grpo.py``'s copy. Accepting the flag scaled
+        # since it was added -- ``grpo.py`` holds the only production call
+        # site, and it reaches ``grpo.py``'s own copy. Accepting the flag scaled
         # the rollout batch by ``batch_multiplier`` and then trained on all of
         # it, so ``num_prompts_per_step`` silently stopped meaning what it
         # says and the LR schedule, ``consumed_samples``, and every per-step
