@@ -52,9 +52,23 @@ from tests.unit.conftest import TEST_ASSETS_DIR
 
 def _ray_sub_default(name: str) -> int:
     ray_sub = (Path(__file__).resolve().parents[3] / "ray.sub").read_text()
-    match = re.search(rf"^{name}=\$\{{{name}:-(\d+)\}}", ray_sub, re.MULTILINE)
+    match = re.search(
+        rf'^{re.escape(name)}="?\$\{{[A-Z0-9_]+:-(\d+)\}}"?',
+        ray_sub,
+        re.MULTILINE,
+    )
     assert match is not None, f"{name} default not found in ray.sub"
     return int(match.group(1))
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    (("SANDBOX_PORT", 6000), ("SANDBOX_BASE_PORT", 6001)),
+)
+def test_ray_sub_default_handles_quoted_and_aliased_variables(
+    name: str, expected: int
+) -> None:
+    assert _ray_sub_default(name) == expected
 
 
 def test_get_node_ip_and_free_port_does_not_start_with_zero():

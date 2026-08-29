@@ -2,7 +2,10 @@
 # Excluded unit tests for FAST CI mode (Lfast).
 # Source this file and append "${EXCLUDED_UNIT_TESTS[@]}" to pytest args.
 # Supports: --ignore=<path>, --ignore-glob=<pattern>, --deselect=<node_id>
-# All paths are relative to tests/ (run_unit.sh cwd).
+# --ignore/--ignore-glob paths are relative to tests/ (run_unit.sh cwd).
+# --deselect node IDs are relative to the pytest rootdir (the repo root), so
+# they start with "tests/". A node ID without that prefix matches nothing and
+# is ignored silently.
 #
 # Principles:
 #   - Run ALL cheap tests (<1s, pure math/mocks/tensor ops)

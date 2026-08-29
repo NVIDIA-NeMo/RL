@@ -32,18 +32,15 @@ ULTRA_CONFIG_PATHS = [
 NEMO_GYM_CONFIG_PATHS = ULTRA_CONFIG_PATHS + [
     "examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml",
 ]
+# Select by content: every example that pins a service port range must stay
+# inside the layout in virtual_cluster.py. Configs without a port key inherit
+# the defaults and cannot violate the invariant themselves.
 PORT_ISOLATION_CONFIG_PATHS = sorted(
-    {
-        str(path.relative_to(REPO_ROOT))
-        for pattern in ("*single-controller*.yaml", "*single_controller*.yaml")
-        for path in (REPO_ROOT / "examples/configs").rglob(pattern)
-    }
-    | {
-        str(path.relative_to(REPO_ROOT))
-        for family in (REPO_ROOT / "examples/nemo_gym").glob("nemotron-*")
-        for path in family.rglob("*.yaml")
-    }
+    str(path.relative_to(REPO_ROOT))
+    for path in (REPO_ROOT / "examples").rglob("*.yaml")
+    if "port_range" in path.read_text()
 )
+assert PORT_ISOLATION_CONFIG_PATHS, "port-isolation config selection matched nothing"
 
 
 @pytest.fixture
@@ -286,8 +283,8 @@ def test_nemo_gym_configs_satisfy_current_grpo_contract(config_path):
 
 
 @pytest.mark.parametrize("config_path", PORT_ISOLATION_CONFIG_PATHS)
-def test_single_controller_and_nemotron_service_ports_are_isolated(config_path):
-    """Resolved production configs must not bypass the below-9000 port layout."""
+def test_example_service_port_ranges_are_isolated(config_path):
+    """Resolved example configs must not bypass the below-9000 port layout."""
     from nemo_rl.distributed.virtual_cluster import (
         DEFAULT_GENERATION_PORT_RANGE_HIGH,
         DEFAULT_GENERATION_PORT_RANGE_LOW,
