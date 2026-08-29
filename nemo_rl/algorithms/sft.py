@@ -41,6 +41,10 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
+from nemo_rl.telemetry.setup import get_telemetry_handle
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
@@ -99,6 +103,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    telemetry: Optional[TelemetryConfig] = None
 
 
 # =======================================================
@@ -277,8 +282,18 @@ def validate(
         return {}, {}
 
     timer = Timer()
+    _telemetry = get_telemetry_handle()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
 
-    with timer.time("total_validation_time"):
+    with (
+        timer.time("total_validation_time"),
+        managed_span(
+            RLSpanGroup.EVALUATE,
+            "rl.sft.evaluate",
+            tracer=_tracer,
+            **{"rl.step": step},
+        ),
+    ):
         print(f"▶ Starting validation at step {step}...")
 
         # Show a progress indicator for validation
@@ -376,6 +391,7 @@ def validate(
     return val_metrics, timing_metrics
 
 
+@trace_fn(RLSpanGroup.JOB, "rl.sft.job")
 def sft_train(
     policy,
     train_dataloader,
@@ -389,6 +405,8 @@ def sft_train(
 ) -> None:
     # Run basic sft training
     timer = Timer()
+    _telemetry = get_telemetry_handle()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -441,10 +459,25 @@ def sft_train(
             maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics, validation_timings = None, None
 
-            with timer.time("total_step_time"):
+            with (
+                timer.time("total_step_time"),
+                managed_span(
+                    RLSpanGroup.STEP,
+                    "rl.sft.step",
+                    tracer=_tracer,
+                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                ),
+            ):
                 # Prepare batch and generate responses
                 print("▶ Preparing batch...")
-                with timer.time("data_processing"):
+                with (
+                    timer.time("data_processing"),
+                    managed_span(
+                        RLSpanGroup.DATA_PROCESSING,
+                        "rl.sft.data_processing",
+                        tracer=_tracer,
+                    ),
+                ):
                     ## add loss mask based on role to every message
                     add_loss_mask_to_message_log(
                         batch["message_log"],
@@ -473,7 +506,15 @@ def sft_train(
                     )
 
                 print("▶ Taking a training step...")
-                with timer.time("policy_training"):
+                with (
+                    timer.time("policy_training"),
+                    managed_span(
+                        RLSpanGroup.POLICY_UPDATE,
+                        "rl.sft.policy_training",
+                        tracer=_tracer,
+                        **{"rl.iteration": total_steps + 1},
+                    ),
+                ):
                     train_results = policy.train(
                         train_data,
                         loss_fn,
@@ -579,7 +620,14 @@ def sft_train(
                                 metrics_source[metric_name],
                             )
 
-                    with timer.time("checkpointing"):
+                    with (
+                        timer.time("checkpointing"),
+                        managed_span(
+                            RLSpanGroup.CHECKPOINT,
+                            "rl.sft.checkpointing",
+                            tracer=_tracer,
+                        ),
+                    ):
                         print(f"Saving checkpoint for step {total_steps + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
                             total_steps + 1, vars(sft_save_state), master_config

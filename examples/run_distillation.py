@@ -22,6 +22,7 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -67,57 +68,68 @@ def main() -> None:
     # Get the next experiment directory with incremented ID
     config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
 
-    init_ray()
+    # Initialise telemetry on the driver BEFORE init_ray() so the resolved
+    # NEMO_RL_OTEL_* env is snapshotted into the Ray runtime_env and inherited
+    # by every worker. No-op unless nemo-lens is installed and telemetry is on.
+    init_telemetry_driver(config, algorithm="distillation")
 
-    tokenizer = get_tokenizer(config.policy["tokenizer"])
+    try:
+        init_ray()
 
-    if config.policy["generation"] is not None:
-        config.policy["generation"] = configure_generation_config(
-            config.policy["generation"], tokenizer
-        )
-    else:
-        print("  ⚠️ No generation config found, this may cause issues")
+        tokenizer = get_tokenizer(config.policy["tokenizer"])
 
-    # setup data
-    (
-        dataset,
-        val_dataset,
-        task_to_env,
-        val_task_to_env,
-    ) = setup_response_data(tokenizer, config.data, config.env)
+        if config.policy["generation"] is not None:
+            config.policy["generation"] = configure_generation_config(
+                config.policy["generation"], tokenizer
+            )
+        else:
+            print("  ⚠️ No generation config found, this may cause issues")
 
-    (
-        student_policy,
-        teacher_policy,
-        student_generation,
-        _nemo_gym,
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        distillation_state,
-        master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
+        # setup data
+        (
+            dataset,
+            val_dataset,
+            task_to_env,
+            val_task_to_env,
+        ) = setup_response_data(tokenizer, config.data, config.env)
 
-    # The checkpointer owns background async-checkpoint finalization threads;
-    # the context manager guarantees they are flushed (rename + delete) on exit.
-    with checkpointer:
-        distillation_train(
+        (
             student_policy,
             teacher_policy,
             student_generation,
+            _nemo_gym,
             dataloader,
             val_dataloader,
-            tokenizer,  # pass tokenizer parameter
             loss_fn,
-            task_to_env,
-            val_task_to_env,
             logger,
             checkpointer,
             distillation_state,
             master_config,
-        )
+        ) = setup(config, tokenizer, dataset, val_dataset)
+
+        # The checkpointer owns background async-checkpoint finalization threads;
+        # the context manager guarantees they are flushed (rename + delete) on exit.
+        with checkpointer:
+            distillation_train(
+                student_policy,
+                teacher_policy,
+                student_generation,
+                dataloader,
+                val_dataloader,
+                tokenizer,  # pass tokenizer parameter
+                loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                distillation_state,
+                master_config,
+            )
+    finally:
+        # Flush on the failure paths too, and before cluster teardown: the OTel
+        # SDK's own atexit hook is registered ahead of Ray's and so runs after
+        # it. No-op when telemetry is inactive.
+        shutdown_telemetry()
 
 
 if __name__ == "__main__":
