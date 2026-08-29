@@ -1176,3 +1176,49 @@ def test_implausible_mismatch_rates_are_called_out(caplog, mismatches, warns):
 
 
 # ── call-site ordering ─────────────────────────────────────────────────
+
+
+def test_codec_pack_unpack_time_is_reported_separately():
+    """Jagged pad/unpad is real CPU cost the per-op metrics cannot see.
+
+    ``pack_jagged_fields`` runs in the caller before ``put_samples`` is
+    entered, so it never reaches ``by_op``; ``_from_wire`` runs inside the
+    adapter's ``get_samples``, where it would otherwise be billed as
+    transport. Both are drained from the codec timer into their own series,
+    deliberately outside ``total_wall_ms`` so ``frac_of_step`` keeps meaning
+    time spent in the data plane rather than time spent on CPU around it.
+    """
+    from nemo_rl.data_plane import codec
+
+    client = _client(register=False)
+    codec.record_codec_s("pack", 0.010)  # 10 ms
+    codec.record_codec_s("unpack", 0.004)  # 4 ms
+
+    metrics = client.get_step_metrics(1.0)
+    assert metrics["step/codec/pack_ms"] == pytest.approx(10.0, rel=1e-3)
+    assert metrics["step/codec/unpack_ms"] == pytest.approx(4.0, rel=1e-3)
+    # not folded into the transport totals
+    assert metrics["step/wall_ms"] == 0.0
+    # and charted, not just tabulated
+    assert "step/codec/pack_ms" in headline_series(metrics)
+
+    # drained exactly once: a second step reports zero, not the same 10 ms
+    assert client.get_step_metrics(1.0)["step/codec/pack_ms"] == 0.0
+    client.close()
+
+
+def test_inspection_snapshot_does_not_steal_codec_time():
+    """The drain is destructive, so only the reader that closes the step window
+    may take it. ``snapshot()`` is also how a human inspects a live client, and
+    an unguarded drain there would delete the time the step reader is about to
+    report -- the same hazard ``step_max_ms`` is gated for."""
+    from nemo_rl.data_plane import codec
+
+    client = _client(register=False)
+    codec.record_codec_s("pack", 0.010)
+
+    client.snapshot()  # inspection: must not consume it
+    assert client.get_step_metrics(1.0)["step/codec/pack_ms"] == pytest.approx(
+        10.0, rel=1e-3
+    )
+    client.close()
