@@ -275,3 +275,45 @@ def test_init_workers_ray_reports_success_and_is_idempotent(monkeypatch, tmp_pat
 
     assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
     assert ray_executor.read_text() == once
+
+
+def test_locked_file_patch_writes_under_lock_on_writable_install(tmp_path):
+    """The normal path still locks, yields content, and lands the write."""
+    target = tmp_path / "target.py"
+    target.write_text("ORIGINAL")
+
+    with patches._locked_file_patch(str(target)) as (content, write_back):
+        assert content == "ORIGINAL"
+        write_back("PATCHED")
+
+    assert target.read_text() == "PATCHED"
+
+
+def test_locked_file_patch_degrades_to_lockless_read_on_read_only_install(
+    tmp_path, caplog
+):
+    """EACCES/EROFS on the lock file yields the content and a warn-only writer."""
+    ro_dir = tmp_path / "site-packages"
+    ro_dir.mkdir()
+    target = ro_dir / "target.py"
+    target.write_text("ORIGINAL")
+    ro_dir.chmod(0o555)
+    if os.access(ro_dir, os.W_OK):  # root ignores mode bits (e.g. CI containers)
+        pytest.skip("cannot simulate a read-only install as root")
+    try:
+        with caplog.at_level(logging.WARNING):
+            with patches._locked_file_patch(str(target)) as (content, write_back):
+                assert content == "ORIGINAL"
+                write_back("MUST_NOT_LAND")
+        assert target.read_text() == "ORIGINAL"
+        assert not (ro_dir / "target.py.patch_lock").exists()
+        assert "Read-only install" in caplog.text
+    finally:
+        ro_dir.chmod(0o755)
+
+
+def test_locked_file_patch_still_raises_on_unrelated_oserror(tmp_path):
+    """Only EROFS/EACCES trigger the fallback; anything else propagates."""
+    with pytest.raises(FileNotFoundError):
+        with patches._locked_file_patch(str(tmp_path / "missing" / "target.py")):
+            pass

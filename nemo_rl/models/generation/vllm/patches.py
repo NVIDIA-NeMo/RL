@@ -48,11 +48,36 @@ def _get_vllm_file(relative_path: str) -> str:
 
 @contextmanager
 def _locked_file_patch(file_path: str):
-    """Yield (content, writer) under an exclusive file lock."""
+    """Yield (content, writer) under an exclusive file lock.
+
+    On read-only installs (baked container venvs) the lock cannot be created --
+    but neither can any concurrent writer, so proceed lockless. The writer then
+    degrades to a warning: a patch whose effect is required at runtime has to
+    be baked into the image instead.
+    """
+    import errno
     import fcntl
 
     lock_path = file_path + ".patch_lock"
-    lock_fd = open(lock_path, "w")
+    try:
+        lock_fd = open(lock_path, "w")
+    except OSError as e:
+        if e.errno not in (errno.EROFS, errno.EACCES):
+            raise
+        with open(file_path, "r") as f:
+            content = f.read()
+
+        def warn_only(new_content: str) -> None:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Read-only install: cannot patch %s at runtime; bake the "
+                "patch into the image if its effect is required.",
+                file_path,
+            )
+
+        yield content, warn_only
+        return
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
