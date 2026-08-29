@@ -367,7 +367,7 @@ def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
     ext.pp_comm_groups = {0: SimpleNamespace(rank=9)}
     ext._uses_unquantized_flashinfer_trtllm = lambda: True
     ext._load_full_hf_weights = MagicMock(
-        side_effect=lambda weights: [name for name, _ in weights]
+        return_value={"model.layers.0.mlp.experts.w13_weight"}
     )
 
     spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
@@ -392,6 +392,51 @@ def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
         loaded_weights[1][1], torch.full((P, H), 3.0, dtype=torch.bfloat16)
     )
     torch.testing.assert_close(packed_w13, torch.full_like(packed_w13, 7.0))
+
+
+def test_build_hf_to_local_param_map_rejects_missing_trtllm_destination():
+    """The staged load must report the fused destination parameter."""
+    hidden_size, num_experts, intermediate_size = 16, 4, 32
+    expert_name = "model.layers.0.mlp.experts.down_proj.weight"
+    refit_info = {
+        "gen_tp_size": 2,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": expert_name,
+                    "global_shape": [
+                        num_experts,
+                        hidden_size,
+                        intermediate_size,
+                    ],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "down_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
+                    "dst_placements": [Shard(0)],
+                }
+            ]
+        },
+    }
+    ext = _make_ext(
+        {
+            "model.layers.0.mlp.experts.routed_experts.w2_weight": torch.empty(
+                128, 16, 24, 64
+            ),
+        }
+    )
+    ext.device = torch.device("cpu")
+    ext.pp_comm_groups = {0: SimpleNamespace(rank=9)}
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    ext._load_full_hf_weights = MagicMock(
+        return_value={"model.layers.0.mlp.experts.w13_weight"}
+    )
+
+    spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
+    assert spec is not None and spec.pre is not None and spec.post is not None
+
+    with pytest.raises(RuntimeError, match="w2_weight"):
+        spec.post(spec.pre(spec.base))
 
 
 def test_build_hf_to_local_param_map_rejects_trtllm_tensor_sharding():
@@ -449,6 +494,54 @@ def test_prepare_nccl_reshard_refit_info_validates_before_building_map(monkeypat
     restore_refit_info_placements.assert_not_called()
     ext.build_hf_to_local_param_map.assert_not_called()
     assert not hasattr(ext, "nccl_reshard_refit_info")
+
+
+def test_legacy_refit_map_is_built_after_comm_groups_exist(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.device = torch.device("cpu")
+    ext._validate_native_layerwise_refit = MagicMock()
+    expected_map = HFToLocalParamMap()
+    ext.build_hf_to_local_param_map = MagicMock(return_value=expected_map)
+    refit_info = {"layer_names": [], "per_layer_params": {}}
+    monkeypatch.setattr(
+        "nemo_rl.weight_sync.nccl_reshard_utils.restore_refit_info_placements",
+        lambda value: value,
+    )
+
+    class _FakeGroup:
+        def __init__(self, *, rank, **_kwargs):
+            self.rank = rank
+
+        def init_nccl_communicator(self, *, device):
+            assert device == torch.device("cpu")
+
+    monkeypatch.setattr(
+        "nemo_rl.distributed.stateless_process_group.StatelessProcessGroup",
+        _FakeGroup,
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    ext.init_nccl_reshard_comm_group(
+        rank_prefix=0,
+        pp_ips=["127.0.0.1"],
+        pp_ports=[29500],
+        pp_size=1,
+        train_ranks_per_stage=8,
+        sub_world_size=10,
+    )
+
+    assert ext.pp_comm_groups[0].rank == 8
+    assert ext.build_hf_to_local_param_map.call_count == 0
+
+    ext.prepare_nccl_reshard_refit_info(refit_info)
+
+    ext.build_hf_to_local_param_map.assert_called_once_with(refit_info)
+    assert ext.hf_to_local_param_map is expected_map
 
 
 def test_nccl_reshard_lifecycle_repeats_for_trtllm_moe_modules(monkeypatch):

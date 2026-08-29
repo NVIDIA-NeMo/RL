@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import inspect
 import logging
 import os
 import sys
@@ -24,6 +25,7 @@ import torch
 from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_VLLM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORTS_PER_ENGINE,
@@ -59,6 +61,14 @@ from nemo_rl.models.generation.vllm.worker_utils import (
 )
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.telemetry.instrumentation import trace_fn
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    shutdown_telemetry,
+    telemetry_enabled_in_env,
+    vllm_native_tracing_requested,
+)
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -79,6 +89,59 @@ def _context_capped_max_new_tokens(
             f"model context: input_length={input_length}, max_model_len={max_model_len}."
         )
     return min(configured_max_new_tokens, remaining_context)
+
+
+def _maybe_enable_vllm_native_tracing(llm_kwargs: dict[str, Any]) -> None:
+    """Optionally enable vLLM's native OpenTelemetry tracing on the engine.
+
+    Requires both ``telemetry.enabled`` and ``telemetry.vllm_native_tracing``
+    (plus an OTLP endpoint). vLLM's OTLP span exporter is gRPC-only, so the
+    endpoint must speak OTLP/gRPC (e.g. a collector on ``:4317`` or a
+    gRPC-capable backend) — it will not reach an ``http/protobuf`` OTLP
+    endpoint. Degrades to a no-op if the installed vLLM lacks these engine args.
+    """
+    # The master switch is re-checked here because _config_to_env() exports
+    # every field before init_telemetry_driver's `enabled` check, so
+    # vllm_native_tracing would otherwise survive enabled=false and turn on
+    # per-request tracing on exactly the runs that disabled telemetry.
+    if not (telemetry_enabled_in_env() and vllm_native_tracing_requested()):
+        return
+    endpoint = (
+        os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+        or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    )
+    if not endpoint:
+        logger.warning(
+            "nemo-lens: NEMO_RL_OTEL_VLLM_NATIVE_TRACING is set but no OTLP "
+            "endpoint is configured; skipping native vLLM tracing."
+        )
+        return
+    # Narrow: this introspects a third-party surface that moves across vLLM
+    # versions, which justifies tolerating a missing attribute or a moved
+    # module -- but not swallowing every failure inside a vLLM worker.
+    try:
+        from vllm.engine.arg_utils import EngineArgs
+
+        supported = set(getattr(EngineArgs, "__dataclass_fields__", {})) | set(
+            inspect.signature(EngineArgs.__init__).parameters
+        )
+    except (ImportError, AttributeError, ValueError, TypeError):
+        logger.warning(
+            "nemo-lens: could not introspect vLLM EngineArgs; skipping native "
+            "vLLM tracing.",
+            exc_info=True,
+        )
+        return
+    if "otlp_traces_endpoint" not in supported:
+        logger.warning(
+            "nemo-lens: installed vLLM does not support 'otlp_traces_endpoint'; "
+            "skipping native vLLM tracing."
+        )
+        return
+    llm_kwargs.setdefault("otlp_traces_endpoint", endpoint)
+    if "collect_detailed_traces" in supported:
+        llm_kwargs.setdefault("collect_detailed_traces", ["all"])
+    logger.info("nemo-lens: enabled vLLM native OTLP tracing -> %s", endpoint)
 
 
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
@@ -323,6 +386,10 @@ class BaseVllmGenerationWorker:
         if bundle_indices is not None and len(bundle_indices) == 1:
             bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
 
+        # OTel providers are process-global, so the driver's setup does not
+        # reach this actor. No-op unless telemetry is enabled.
+        init_telemetry_worker()
+
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
@@ -388,6 +455,7 @@ class BaseVllmGenerationWorker:
         self.rank = 0
         self.world_size = 1
 
+    @trace_fn(RLSpanGroup.MODEL_INIT, "rl.vllm.load_model")
     def _load_model(self, bundle_indices, seed):
         """Perform the heavy model loading and engine creation.
 
@@ -649,6 +717,9 @@ class BaseVllmGenerationWorker:
                 sampling_style=video_config.sampling_style,
                 temporal_patch_size=video_config.temporal_patch_size,
             )
+
+        _maybe_enable_vllm_native_tracing(llm_kwargs)
+
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
@@ -1232,7 +1303,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             return False
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -1245,7 +1318,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_from_collective", args=(refit_timeout_s,)
             )
             worker_results = cast(list[bool], result_or_coro)
 
@@ -1256,6 +1329,19 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 return False
             return True
         except Exception as e:
+            # Propagate a deliberate abort instead of folding it into `return False`. It
+            # is the controller's signal to rebuild over the survivors and retry; reported
+            # as a generic failure it just ends the run, which is the wedge this exists to
+            # replace.
+            #
+            # Matched by message, not by type, and that is not belt-and-braces. vLLM's
+            # EngineCore RPC stringifies the worker exception and re-raises it client-side
+            # as a bare Exception, so the RefitAborted raised inside the engine arrives
+            # here as Exception(str) and a plain `except RefitAborted` never fires. Job
+            # 6484412 is the proof: the deadline fired, the abort was named in the log, and
+            # the run still wedged at step 4 because this handler did not match.
+            if is_refit_abort(e):
+                raise RefitAborted(str(e)) from e
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
 
@@ -1288,14 +1374,16 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         """Forward refit info to vLLM backend workers."""
         self.llm.collective_rpc("prepare_nccl_reshard_refit_info", args=(refit_info,))
 
-    def nccl_reshard_refit(self) -> bool:
+    def nccl_reshard_refit(self, refit_timeout_s: Optional[float] = None) -> bool:
         """Receive weights from training workers via nccl_reshard (xferdtensor)."""
         try:
             assert self.llm is not None, (
                 "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
             )
 
-            result_or_coro = self.llm.collective_rpc("nccl_reshard_refit", args=tuple())
+            result_or_coro = self.llm.collective_rpc(
+                "nccl_reshard_refit", args=(refit_timeout_s,)
+            )
             worker_result = result_or_coro[0]
 
             if not worker_result:
@@ -1305,6 +1393,19 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 return False
             return True
         except Exception as e:
+            # Propagate a deliberate abort instead of folding it into `return False`. It
+            # is the controller's signal to rebuild over the survivors and retry; reported
+            # as a generic failure it just ends the run, which is the wedge this exists to
+            # replace.
+            #
+            # Matched by message, not by type, and that is not belt-and-braces. vLLM's
+            # EngineCore RPC stringifies the worker exception and re-raises it client-side
+            # as a bare Exception, so the RefitAborted raised inside the engine arrives
+            # here as Exception(str) and a plain `except RefitAborted` never fires. Job
+            # 6484412 is the proof: the deadline fired, the abort was named in the log, and
+            # the run still wedged at step 4 because this handler did not match.
+            if is_refit_abort(e):
+                raise RefitAborted(str(e)) from e
             print(f"Exception during nccl_reshard_refit: {e}")
             import traceback
 
@@ -1397,6 +1498,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+        finally:
+            # Flush buffered spans/metrics before the actor goes away.
+            shutdown_telemetry()
 
 
 @ray.remote(

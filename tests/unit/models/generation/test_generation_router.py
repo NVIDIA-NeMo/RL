@@ -434,9 +434,9 @@ class TestBackendErrorHandling:
             async with _Harness([wedged, healthy], backend_timeout_s=0.5) as harness:
                 harness.router.set_serving_backends([wedged.url])
                 await harness.call("/v1/chat/completions")
-                drained = harness.router.drain_backend_failures()
-                assert drained == {wedged.url: 1}
-                assert harness.router.drain_backend_failures() == {}, "drain resets"
+                drained = harness.router.drain_backend_outcomes()
+                assert drained == {wedged.url: (0, 1)}, "(successes, failures)"
+                assert harness.router.drain_backend_outcomes() == {}, "drain resets"
 
         asyncio.run(_main())
 
