@@ -28,6 +28,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     PromptGroupPhase,
@@ -269,6 +270,30 @@ def test_recovery_config_resolves_agent_then_task_then_default() -> None:
     assert agent_policy.granularity is RecoveryGranularity.PROMPT_GROUP
     assert task_policy.granularity is RecoveryGranularity.PROMPT_GROUP
     assert default_policy.granularity is RecoveryGranularity.SIBLING
+
+
+@pytest.mark.parametrize(
+    ("prompt", "error_fragment"),
+    [
+        (
+            {"extra_env_info": {"agent_ref": "genrm_agent"}},
+            "agent_ref must be a mapping or None",
+        ),
+        (
+            {"extra_env_info": {"agent_ref": {"name": 7}}},
+            "agent_ref.name must be a string or None",
+        ),
+        (
+            {"task_name": 7},
+            "task_name must be a string or None",
+        ),
+    ],
+)
+def test_recovery_config_rejects_malformed_prompt_identity(
+    prompt: dict[str, Any], error_fragment: str
+) -> None:
+    with pytest.raises(TypeError, match=error_fragment):
+        RolloutRecoveryConfig().resolve_for_prompt(prompt)
 
 
 def test_target_step_none_does_not_mean_unadmitted() -> None:
@@ -614,6 +639,135 @@ def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
         "g7/sibling-0/call-0",
         "g7/sibling-1/call-0",
     }
+
+
+@pytest.mark.parametrize("unknown_outcome", [False, True])
+def test_checkpoint_rejects_ambiguous_finalization_state(
+    unknown_outcome: bool,
+) -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        agent_name=None,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    gate_id = group.gate_rollout_id(0)
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=0,
+            gate_rollout_id=gate_id,
+            receipt={
+                "rollout_id": gate_id,
+                "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
+            },
+            reward=1.0,
+        )
+    )
+    _mutate(lambda cut: ledger.mark_finalization_started(cut, "g7"))
+    if unknown_outcome:
+        _mutate(lambda cut: ledger.mark_finalization_unknown(cut, "g7"))
+
+    with pytest.raises(RuntimeError, match="checkpoint-unsafe group states"):
+        ledger.state_dict()
+
+
+def test_checkpoint_rejects_an_open_optimizer_step() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        agent_name=None,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    gate_id = group.gate_rollout_id(0)
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=0,
+            gate_rollout_id=gate_id,
+            receipt={
+                "rollout_id": gate_id,
+                "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
+            },
+            reward=1.0,
+        )
+    )
+    _mutate(lambda cut: ledger.mark_finalization_started(cut, "g7"))
+    ledger.mark_group_finalized(
+        "g7",
+        meta=KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["g7_g0"],
+        ),
+        group_min_weight_version=6,
+        group_max_weight_version=6,
+    )
+    ledger.claim_groups_for_training(
+        ["g7"],
+        train_step=7,
+        trainer_version=7,
+        expected_group_count=1,
+    )
+
+    with pytest.raises(RuntimeError, match="open optimizer step"):
+        ledger.state_dict()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error_fragment"),
+    [
+        ("recovery_granularity", "banana", "invalid recovery_granularity"),
+        ("recovery_granularity", None, "recovery_granularity must be a string"),
+        ("agent_name", 123, "agent_name must be a string or None"),
+    ],
+)
+def test_restore_rejects_malformed_recovery_policy_fields(
+    field: str, value: Any, error_fragment: str
+) -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        agent_name=None,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        admitted=True,
+    )
+    state = ledger.state_dict()
+    group_state = state["groups"][0]
+    if value is None:
+        del group_state[field]
+    else:
+        group_state[field] = value
+
+    with pytest.raises(ValueError, match=error_fragment):
+        _load(RolloutRecoveryLedger(), state)
 
 
 @pytest.mark.parametrize(
