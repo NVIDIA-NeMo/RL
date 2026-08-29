@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import gc
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -21,12 +20,6 @@ from typing import Any, Generator, Iterable, Optional
 import ray
 import torch
 from nemo_automodel.components._peft.lora import LinearLoRA
-from nemo_automodel.components.distributed.cp_utils import (
-    create_context_parallel_ctx,
-)
-from nemo_automodel.components.distributed.cp_utils import (
-    get_train_context as get_train_context_automodel,
-)
 from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
@@ -60,6 +53,7 @@ from nemo_rl.models.automodel.train import (
     aggregate_training_statistics,
     automodel_forward_backward,
     forward_with_post_processing_fn,
+    prepare_model_forward,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -185,35 +179,6 @@ def _maybe_adapt_tensor_to_hf(
     return [(fqn, tensor)]
 
 
-@contextlib.contextmanager
-def get_train_context(
-    cp_size: int,
-    cp_mesh: Any,
-    cp_buffers: list,
-    sequence_dim: int,
-    dtype: torch.dtype,
-    autocast_enabled: bool = True,
-) -> Generator[None, None, None]:
-    """Create combined context manager for training with context parallel and autocast."""
-    with contextlib.ExitStack() as stack:
-        context_parallel_ctx = None
-        if cp_size > 1:
-            # Create context parallel context
-            context_parallel_ctx = create_context_parallel_ctx(
-                cp_mesh=cp_mesh,
-                cp_buffers=cp_buffers,
-                cp_seq_dims=[sequence_dim] * len(cp_buffers),
-                cp_no_restore_buffers=set(cp_buffers),
-            )
-
-        stack.enter_context(
-            get_train_context_automodel(False, False, context_parallel_ctx)()
-        )
-        if autocast_enabled:
-            stack.enter_context(torch.autocast(device_type="cuda", dtype=dtype))
-        yield
-
-
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class DTensorPolicyWorkerV2Impl(
@@ -319,7 +284,6 @@ class DTensorPolicyWorkerV2Impl(
         self.rank = torch.distributed.get_rank()
         self.timer = Timer(context={"worker": "dtensor_policy_v2", "rank": self.rank})
         self.device_mesh = distributed_context.device_mesh
-        self.dp_cp_mesh = self.device_mesh["dp_cp"]
         self.dp_mesh = self.device_mesh["dp"]
         self.tp_mesh = self.device_mesh["tp"]
         self.cp_mesh = self.device_mesh["cp"]
@@ -415,6 +379,16 @@ class DTensorPolicyWorkerV2Impl(
         if update_moe_gate_bias is not None:
             update_moe_gate_bias()
 
+    def _autocast_context(self) -> AbstractContextManager[Any]:
+        """Return the worker-owned precision context for one microbatch."""
+        if not self.autocast_enabled:
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=self.dtype)
+
+    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
+        """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
+        self._rollout_num_gpus_per_engine = num_gpus_per_engine
+
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
         self,
@@ -455,25 +429,12 @@ class DTensorPolicyWorkerV2Impl(
         loss_post_processor = LossPostProcessor(
             loss_fn=loss_fn,
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
             cp_mesh=self.cp_mesh,
-            tp_mesh=self.tp_mesh,
             cp_size=self.cp_size,
             dp_size=self.dp_size,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
         )
-
-        # Create train context factory
-        def train_context_fn(processed_inputs):
-            return get_train_context(
-                cp_size=self.cp_size,
-                cp_mesh=self.cp_mesh,
-                cp_buffers=processed_inputs.cp_buffers,
-                sequence_dim=sequence_dim,
-                dtype=self.dtype,
-                autocast_enabled=self.autocast_enabled,
-            )
 
         # Setup cache clearing callback if configured
         empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
@@ -516,7 +477,6 @@ class DTensorPolicyWorkerV2Impl(
                     mbs,
                     self.dp_mesh,
                     tokenizer=self.tokenizer,
-                    cp_size=self.cp_size,
                 )
 
                 # Use automodel_forward_backward for the training loop
@@ -524,6 +484,9 @@ class DTensorPolicyWorkerV2Impl(
                     model=self.model,
                     data_iterator=processed_iterator,
                     post_processing_fn=loss_post_processor,
+                    device_mesh=self.device_mesh,
+                    padding_token_id=self.tokenizer.pad_token_id or 0,
+                    autocast_context_factory=self._autocast_context,
                     forward_only=eval_mode,
                     is_reward_model=self._is_reward_model,
                     allow_flash_attn_args=self.allow_flash_attn_args,
@@ -534,7 +497,6 @@ class DTensorPolicyWorkerV2Impl(
                     dp_size=self.dp_size,
                     cp_size=self.cp_size,
                     num_global_batches=num_global_batches,
-                    train_context_fn=train_context_fn,
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
                 )
@@ -635,10 +597,6 @@ class DTensorPolicyWorkerV2Impl(
         # Create logprobs post-processor
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
-            cp_mesh=self.cp_mesh,
-            tp_mesh=self.tp_mesh,
-            cp_size=self.cp_size,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
         )
@@ -652,27 +610,27 @@ class DTensorPolicyWorkerV2Impl(
                 logprob_batch_size,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
-                cp_size=self.cp_size,
             )
 
             for batch_idx, processed_mb in enumerate(processed_iterator):
                 processed_inputs = processed_mb.processed_inputs
-
-                with get_train_context(
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
-                    cp_mesh=self.cp_mesh,
-                    cp_buffers=processed_inputs.cp_buffers,
-                    sequence_dim=sequence_dim,
-                    dtype=self.dtype,
-                    autocast_enabled=self.autocast_enabled,
-                ):
+                    padding_token_id=self.tokenizer.pad_token_id or 0,
+                    is_reward_model=False,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                )
+
+                with prepared.model_context_factory(), self._autocast_context():
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     token_logprobs, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
+                        prepared=prepared,
                         post_processing_fn=logprobs_post_processor,
                         processed_mb=processed_mb,
-                        is_reward_model=False,
-                        allow_flash_attn_args=self.allow_flash_attn_args,
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
@@ -721,28 +679,28 @@ class DTensorPolicyWorkerV2Impl(
                 global_batch_size,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
-                cp_size=self.cp_size,
             )
 
             all_rm_scores = []
             for batch_idx, processed_mb in enumerate(processed_iterator):
                 processed_inputs = processed_mb.processed_inputs
-
-                with get_train_context(
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
-                    cp_mesh=self.cp_mesh,
-                    cp_buffers=processed_inputs.cp_buffers,
-                    sequence_dim=sequence_dim,
-                    dtype=self.dtype,
-                    autocast_enabled=self.autocast_enabled,
-                ):
+                    padding_token_id=self.tokenizer.pad_token_id or 0,
+                    is_reward_model=True,
+                    allow_flash_attn_args=False,
+                )
+
+                with prepared.model_context_factory(), self._autocast_context():
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     rm_scores, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
+                        prepared=prepared,
                         post_processing_fn=score_post_processor,
                         processed_mb=processed_mb,
-                        is_reward_model=True,
-                        allow_flash_attn_args=False,
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
@@ -795,10 +753,7 @@ class DTensorPolicyWorkerV2Impl(
         # Create top-k post-processor
         topk_post_processor = TopkLogitsPostProcessor(
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
-            cp_mesh=self.cp_mesh,
             tp_mesh=self.tp_mesh,
-            cp_size=self.cp_size,
             k=k,
             enable_seq_packing=self.enable_seq_packing,
         )
@@ -812,27 +767,27 @@ class DTensorPolicyWorkerV2Impl(
                 topk_batch_size,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
-                cp_size=self.cp_size,
             )
 
             for batch_idx, processed_mb in enumerate(processed_iterator):
                 processed_inputs = processed_mb.processed_inputs
-
-                with get_train_context(
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
-                    cp_mesh=self.cp_mesh,
-                    cp_buffers=processed_inputs.cp_buffers,
-                    sequence_dim=sequence_dim,
-                    dtype=self.dtype,
-                    autocast_enabled=self.autocast_enabled,
-                ):
+                    padding_token_id=self.tokenizer.pad_token_id or 0,
+                    is_reward_model=False,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                )
+
+                with prepared.model_context_factory(), self._autocast_context():
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     (vals, idx), _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
+                        prepared=prepared,
                         post_processing_fn=topk_post_processor,
                         processed_mb=processed_mb,
-                        is_reward_model=False,
-                        allow_flash_attn_args=self.allow_flash_attn_args,
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
@@ -906,9 +861,7 @@ class DTensorPolicyWorkerV2Impl(
 
         post_processor = FullLogitsPostProcessor(
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
             cp_mesh=self.cp_mesh,
-            tp_mesh=self.tp_mesh,
             cp_size=self.cp_size,
             enable_seq_packing=self.enable_seq_packing,
         )
@@ -931,24 +884,24 @@ class DTensorPolicyWorkerV2Impl(
                 forward_batch_size,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
-                cp_size=self.cp_size,
             )
             for buf_idx, processed_mb in enumerate(processed_iterator):
                 processed_inputs = processed_mb.processed_inputs
-                with get_train_context(
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
-                    cp_mesh=self.cp_mesh,
-                    cp_buffers=processed_inputs.cp_buffers,
-                    sequence_dim=sequence_dim,
-                    dtype=self.dtype,
-                    autocast_enabled=self.autocast_enabled,
-                ):
+                    padding_token_id=self.tokenizer.pad_token_id or 0,
+                    is_reward_model=False,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                )
+                with prepared.model_context_factory(), self._autocast_context():
                     vals, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
+                        prepared=prepared,
                         post_processing_fn=post_processor,
                         processed_mb=processed_mb,
-                        is_reward_model=False,
-                        allow_flash_attn_args=self.allow_flash_attn_args,
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
@@ -1409,6 +1362,17 @@ class DTensorPolicyWorkerV2Impl(
             lora_enabled=self.lora_enabled,
             peft_config=self.peft_config,
         )
+
+    def finalize_async_save(self) -> None:
+        """Block until this worker's in-flight async checkpoint writes complete.
+
+        Overrides the base no-op: this worker initializes the checkpoint manager
+        with ``is_async=True``, so the caller-side rename of ``tmp_step_N`` to
+        ``step_N`` must wait for the staged writes to land.
+        """
+        if self.checkpoint_manager is None:
+            return
+        self.checkpoint_manager.finalize_async_save()
 
     def load_checkpoint(
         self,
