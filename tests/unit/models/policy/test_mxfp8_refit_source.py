@@ -14,9 +14,9 @@
 
 """Tests for canonical Transformer Engine MXFP8 source storage extraction."""
 
+import sys
 from collections.abc import Mapping
 from types import ModuleType
-import sys
 
 import pytest
 import torch
@@ -24,7 +24,6 @@ import torch
 from nemo_rl.models.policy.workers.mxfp8_refit_source import (
     extract_native_mxfp8_components,
 )
-
 
 _DEFAULT_METADATA = object()
 
