@@ -230,6 +230,11 @@ class _FakeWeightSynchronizer:
         self.sync_count = 0
         self.shutdown_count = 0
 
+    @property
+    def is_stale(self) -> bool:
+        # WeightSynchronizer contract: stale until the first successful sync.
+        return self.sync_count == 0
+
     def sync_weights(self, *, kv_scales: Any = None) -> None:
         self.sync_count += 1
 

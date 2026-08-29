@@ -62,7 +62,7 @@ grpo:
     # when transient generation errors are expected and acceptable to drop.
     max_generation_failures: 0
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates
+    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates.
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:
@@ -410,7 +410,7 @@ policy:
       enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
       enable_prefix_caching: false  # Reuse KV blocks across requests sharing a prompt prefix.
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
-      kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload". To select "recompute", set grpo.async_grpo.recompute_kv_cache_after_weight_updates=true.
+      kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload", "recompute".
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
       logprobs_mode: processed_logprobs  # Return log-probs after sampling processors. Use raw_logprobs for parity with policy recomputation.
