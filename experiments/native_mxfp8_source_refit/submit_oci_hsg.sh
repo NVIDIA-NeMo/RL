@@ -7,6 +7,7 @@ MODEL=${MODEL:-qwen30}
 PRECISION_MODE=${PRECISION_MODE:-mxfp8}
 FP8_PARAM=${FP8_PARAM:-true}
 MAX_STEPS=${MAX_STEPS:-2}
+NATIVE_REFIT_AUDIT="${NATIVE_REFIT_AUDIT:-0}"
 RUN_GROUP=${RUN_GROUP:-$(date +%Y%m%d-%H%M%S)}
 WALLTIME=${WALLTIME:-04:00:00}
 PARTITION=${PARTITION:-batch}
@@ -45,6 +46,20 @@ case "${FP8_PARAM}" in
     exit 2
     ;;
 esac
+
+case "${NATIVE_REFIT_AUDIT}" in
+  0|1) ;;
+  *)
+    echo "NATIVE_REFIT_AUDIT must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+
+if [[ "${NATIVE_REFIT_AUDIT}" == 1 ]] \
+  && [[ "${MODEL}:${PRECISION_MODE}:${FP8_PARAM}" != qwen30:mxfp8:true ]]; then
+  echo "runtime audit requires MODEL=qwen30 PRECISION_MODE=mxfp8 FP8_PARAM=true" >&2
+  exit 2
+fi
 
 if ! [[ "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "MAX_STEPS must be a positive integer" >&2
@@ -94,8 +109,8 @@ if [[ -n "${REPO:-}" ]] && git -C "${REPO}" rev-parse --is-inside-work-tree >/de
 fi
 
 if [[ "${ACTION}" == render ]]; then
-  printf 'model=%s\nprecision_mode=%s\nfp8_param=%s\nconfig=%s\nnodes=%s\nsegment_size=%s\nsteps=%s\nsource_sha=%s\n' \
-    "${MODEL}" "${PRECISION_MODE}" "${FP8_PARAM}" "${CONFIG}" "${NUM_NODES}" "${SEGMENT_SIZE}" "${MAX_STEPS}" "${SOURCE_SHA}"
+  printf 'model=%s\nprecision_mode=%s\nfp8_param=%s\nnative_refit_audit=%s\nconfig=%s\nnodes=%s\nsegment_size=%s\nsteps=%s\nsource_sha=%s\n' \
+    "${MODEL}" "${PRECISION_MODE}" "${FP8_PARAM}" "${NATIVE_REFIT_AUDIT}" "${CONFIG}" "${NUM_NODES}" "${SEGMENT_SIZE}" "${MAX_STEPS}" "${SOURCE_SHA}"
   exit 0
 fi
 
@@ -244,9 +259,15 @@ if [[ "${PRECISION_MODE}" == mxfp8 && "${FP8_PARAM}" == true ]]; then
   )
 fi
 
+NATIVE_AUDIT_COMMAND="unset NRL_NATIVE_MXFP8_REFIT_AUDIT"
+if [[ "${NATIVE_REFIT_AUDIT}" == 1 ]]; then
+  NATIVE_AUDIT_COMMAND="export NRL_NATIVE_MXFP8_REFIT_AUDIT=require-second-change"
+fi
+
 COMMAND=$(cat <<EOF
 set -euo pipefail
 cd ${REPO}
+${NATIVE_AUDIT_COMMAND}
 export HOME=/root
 export HF_HOME_SOURCE=${HF_HOME}
 export HF_HOME=${LOCAL_SCRATCH}/hf-cache/${MODEL}

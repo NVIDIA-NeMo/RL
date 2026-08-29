@@ -817,6 +817,69 @@ def test_0251_adapter_allows_a_second_complete_update(
     assert torch.equal(parameter, torch.full((2, 2), 2.0))
 
 
+def _load_complete_native_binding_update(
+    adapter: refit_adapter.Vllm0251RefitAdapter,
+    refit_info: dict[str, Any],
+    *,
+    value: int,
+) -> None:
+    adapter.begin_update()
+    for layer_name in refit_info["layer_names"]:
+        for param_info in refit_info["per_layer_params"][layer_name]:
+            for component in param_info["components"]:
+                spec = adapter.resolve_destination(
+                    logical_name=param_info["name"],
+                    role=component["role"],
+                )
+                assert spec.pre is not None and spec.post is not None
+                ctx = spec.pre(spec.base)
+                ctx.buf.fill_(value)
+                spec.post(ctx)
+    adapter.finish_update()
+
+
+def test_0251_adapter_audit_proves_second_runtime_update_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv(
+        "NRL_NATIVE_MXFP8_REFIT_AUDIT",
+        "require-second-change",
+    )
+    adapter, _model, _retained_loads = _make_binding_adapter(monkeypatch, [])
+    refit_info = _native_binding_refit_info()
+    adapter.prepare(refit_info)
+
+    _load_complete_native_binding_update(adapter, refit_info, value=2)
+    _load_complete_native_binding_update(adapter, refit_info, value=18)
+
+    audit_lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[native-mxfp8-refit-audit]")
+    ]
+    assert len(audit_lines) == 2
+    assert '"changed_from_previous": null' in audit_lines[0]
+    assert '"changed_from_previous": true' in audit_lines[1]
+    assert '"update": 2' in audit_lines[1]
+
+
+def test_0251_adapter_audit_rejects_unchanged_second_runtime_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "NRL_NATIVE_MXFP8_REFIT_AUDIT",
+        "require-second-change",
+    )
+    adapter, _model, _retained_loads = _make_binding_adapter(monkeypatch, [])
+    refit_info = _native_binding_refit_info()
+    adapter.prepare(refit_info)
+
+    _load_complete_native_binding_update(adapter, refit_info, value=7)
+    with pytest.raises(RuntimeError, match="second vLLM native MXFP8 refit"):
+        _load_complete_native_binding_update(adapter, refit_info, value=7)
+
+
 def test_0251_adapter_passes_finalizer_failure_to_context_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

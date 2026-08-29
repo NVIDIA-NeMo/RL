@@ -71,6 +71,14 @@ def test_launcher_selects_a_distinct_bf16_qwen30_arm() -> None:
     assert 'CACHE_ARM="${PRECISION_MODE}-fp8param-${FP8_PARAM}"' in launcher
 
 
+def test_launcher_can_enable_second_refit_runtime_audit() -> None:
+    launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
+
+    assert 'NATIVE_REFIT_AUDIT="${NATIVE_REFIT_AUDIT:-0}"' in launcher
+    assert "NRL_NATIVE_MXFP8_REFIT_AUDIT=require-second-change" in launcher
+    assert "runtime audit requires MODEL=qwen30" in launcher
+
+
 def test_ray_tmpdir_is_resolved_before_ray_head_and_workers_start() -> None:
     launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
     ray_sub = (REPO_ROOT / "ray.sub").read_text()

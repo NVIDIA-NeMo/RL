@@ -14,8 +14,11 @@
 
 """vLLM-specific implementation of the version-neutral refit lifecycle."""
 
+import hashlib
 import importlib
 import inspect
+import json
+import os
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -34,6 +37,10 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 
 _NATIVE_VALUE_DTYPE = torch.float8_e4m3fn
 _NATIVE_SCALE_DTYPE = torch.uint8
+_NATIVE_AUDIT_ENV = "NRL_NATIVE_MXFP8_REFIT_AUDIT"
+_NATIVE_AUDIT_MODE = "require-second-change"
+_NATIVE_AUDIT_MAX_TENSORS = 32
+_NATIVE_AUDIT_BYTES_PER_TENSOR = 65536
 
 
 @dataclass(frozen=True)
@@ -129,6 +136,9 @@ class Vllm0251RefitAdapter:
     _finalize_layerwise_reload: Callable[..., Any] | None
     _state: str
     _failure: BaseException | None
+    _audit_mode: str | None
+    _audit_previous_digest: str | None
+    _audit_update_index: int
 
     def __init__(
         self,
@@ -149,6 +159,14 @@ class Vllm0251RefitAdapter:
         self._finalize_layerwise_reload: Callable[..., Any] | None = None
         self._state = "new"
         self._failure: BaseException | None = None
+        audit_mode = os.environ.get(_NATIVE_AUDIT_ENV, "").strip() or None
+        if audit_mode not in (None, _NATIVE_AUDIT_MODE):
+            raise ValueError(
+                f"{_NATIVE_AUDIT_ENV} must be unset or {_NATIVE_AUDIT_MODE!r}"
+            )
+        self._audit_mode = audit_mode
+        self._audit_previous_digest: str | None = None
+        self._audit_update_index = 0
 
     def validate_plan(self, refit_info: Mapping[str, Any]) -> None:
         """Validate that the plan has one ordered identity for every component."""
@@ -347,6 +365,7 @@ class Vllm0251RefitAdapter:
             with torch.device(self._refit_device):
                 finalize_layerwise_reload(self._model_runner.model, self._model_config)
             self._verify_runtime_bindings()
+            self._audit_native_runtime_update()
         except BaseException as error:
             self.abort_update(error)
             raise
@@ -357,6 +376,75 @@ class Vllm0251RefitAdapter:
             raise
         self._loaded_components.clear()
         self._state = "prepared"
+
+    def _audit_native_runtime_update(self) -> None:
+        if self._audit_mode is None:
+            return
+        runtime_parameters = dict(self._model_runner.model.named_parameters())
+        runtime_names: list[str] = []
+        seen_names: set[str] = set()
+        for binding in sorted(
+            self._native_bindings.values(), key=lambda item: item.logical_name
+        ):
+            for runtime_name in (binding.value_name, binding.runtime_scale_name):
+                if runtime_name in seen_names:
+                    continue
+                runtime_names.append(runtime_name)
+                seen_names.add(runtime_name)
+                if len(runtime_names) == _NATIVE_AUDIT_MAX_TENSORS:
+                    break
+            if len(runtime_names) == _NATIVE_AUDIT_MAX_TENSORS:
+                break
+        if not runtime_names:
+            raise RuntimeError("native MXFP8 refit audit found no runtime tensors")
+
+        digest = hashlib.sha256()
+        sampled_bytes = 0
+        for runtime_name in runtime_names:
+            tensor = runtime_parameters.get(runtime_name)
+            if tensor is None:
+                raise RuntimeError(
+                    f"native MXFP8 refit audit cannot find {runtime_name!r}"
+                )
+            if not tensor.is_contiguous():
+                raise RuntimeError(
+                    f"native MXFP8 refit audit requires contiguous tensor {runtime_name!r}"
+                )
+            flat_bytes = tensor.detach().view(torch.uint8).flatten()
+            stride = max(
+                1,
+                flat_bytes.numel() // _NATIVE_AUDIT_BYTES_PER_TENSOR,
+            )
+            sample = flat_bytes[::stride][:_NATIVE_AUDIT_BYTES_PER_TENSOR]
+            sample_bytes = sample.cpu().numpy().tobytes()
+            digest.update(runtime_name.encode())
+            digest.update(str(tuple(tensor.shape)).encode())
+            digest.update(sample_bytes)
+            sampled_bytes += len(sample_bytes)
+
+        current_digest = digest.hexdigest()
+        self._audit_update_index += 1
+        changed = (
+            None
+            if self._audit_previous_digest is None
+            else current_digest != self._audit_previous_digest
+        )
+        record = {
+            "changed_from_previous": changed,
+            "digest": current_digest,
+            "sampled_bytes": sampled_bytes,
+            "tensors": len(runtime_names),
+            "update": self._audit_update_index,
+        }
+        print(
+            f"[native-mxfp8-refit-audit] {json.dumps(record, sort_keys=True)}",
+            flush=True,
+        )
+        self._audit_previous_digest = current_digest
+        if self._audit_update_index == 2 and not changed:
+            raise RuntimeError(
+                "second vLLM native MXFP8 refit did not change audited runtime values"
+            )
 
     def abort_update(self, error: BaseException) -> None:
         """Close an active context without finalizing incomplete vLLM storage."""

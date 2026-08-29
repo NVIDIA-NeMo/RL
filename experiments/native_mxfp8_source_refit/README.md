@@ -116,6 +116,18 @@ with E4M3 values and `torch.uint8` E8M0 scales. It must also prove one vLLM
 reload initialization and finalization per refit, no BF16 receiver
 quantization for native components, and a Qwen value-changing second refit.
 
+Run the bounded vLLM runtime audit for the two-step Qwen gate with:
+
+```bash
+NATIVE_REFIT_AUDIT=1 MODEL=qwen30 PRECISION_MODE=mxfp8 FP8_PARAM=true \
+  MAX_STEPS=2 ACTION=submit ./experiments/native_mxfp8_source_refit/submit_oci_hsg.sh
+```
+
+The audit samples at most 32 graph-visible runtime tensors after each native
+refit and emits `[native-mxfp8-refit-audit]`. Update 2 must report
+`"changed_from_previous": true`; otherwise the worker exits nonzero. The audit
+is disabled by default and adds no work to normal runs.
+
 The worker validates native source tensor dtype, compact scale layout, and
 swizzled-scale rejection before the collective. For the true-arm smoke it also
 emits `[native-mxfp8-inventory]` with the complete task-owned routed FC1/FC2
