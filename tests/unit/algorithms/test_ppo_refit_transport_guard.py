@@ -32,7 +32,13 @@ import pytest
 from nemo_rl.algorithms.ppo import setup
 
 # Anything that is not the default collective path.
-_TRANSPORTS = ["nixl", "nccl_reshard"]
+# The three transports that main drops in silence: each returns None from
+# ``checkpoint_engine_refit_config``, so ``create_weight_synchronizer`` falls
+# through to the SGLang branch with the setting discarded. ``nixl`` and custom
+# ``module:ClassName`` engines are deliberately NOT here -- they build a
+# checkpoint-engine config that weight_sync/factory.py already rejects loudly,
+# so the guard is redundant for them and listing them would overstate it.
+_TRANSPORTS = ["nccl_reshard", "vllm_s3_sparse", "vllm_zmq_sparse"]
 
 
 def _master_config(backend: str, transport):
@@ -69,8 +75,13 @@ def test_sglang_with_a_transport_is_rejected(transport):
 
 @pytest.mark.parametrize("transport", _TRANSPORTS)
 def test_vllm_with_a_transport_is_still_rejected(transport):
-    """The pre-existing rejection must survive the restructuring."""
-    with pytest.raises(ValueError, match="refit_transport"):
+    """The pre-existing rejection must survive the restructuring.
+
+    The two sparse transports get their own, older message on vLLM -- they are
+    a GRPO-only feature rather than an unwired one -- so match on the shared
+    tracking issue instead of on either wording.
+    """
+    with pytest.raises(ValueError, match="3275"):
         _run("vllm", transport)
 
 
@@ -78,7 +89,7 @@ def test_the_error_names_the_backend_that_was_configured():
     """A message that only says 'not supported by PPO' sends the reader to the
     vLLM branch, which is not where their config went wrong."""
     with pytest.raises(ValueError, match="sglang"):
-        _run("sglang", "nixl")
+        _run("sglang", "nccl_reshard")
 
 
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])
