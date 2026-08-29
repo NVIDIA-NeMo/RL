@@ -74,6 +74,12 @@ def _mock_generation(**overrides):
     gen.update_weights_via_ipc_zmq.return_value = [MagicMock()]
     gen.update_weights_from_collective.return_value = [MagicMock()]
     gen.init_collective.return_value = [MagicMock()]
+    # A real worker group, because the reshard transport now derives its refit
+    # membership from dp_size and the worker count. Left as bare MagicMocks these
+    # reach the rank arithmetic and fail there, on a comparison, several frames from
+    # the cause.
+    gen.worker_group.dp_size = 1
+    gen.worker_group.workers = [MagicMock()]
     gen.get_collective_sender_spec.return_value = CollectiveSenderSpec()
     gen.get_inference_world_size.return_value = None
     for k, v in overrides.items():
@@ -524,6 +530,7 @@ class TestCollectiveWeightSynchronizer:
 
         policy.broadcast_weights_for_collective.assert_called_once_with(
             kv_scales=None,
+            refit_timeout_s=None,
             buffer_size_bytes=None,
             num_buffers=None,
         )
@@ -609,6 +616,7 @@ class TestCollectiveWeightSynchronizer:
         )
         policy.broadcast_weights_for_collective.assert_called_once_with(
             kv_scales=None,
+            refit_timeout_s=None,
             buffer_size_bytes=1024**3,
             num_buffers=2,
         )
@@ -652,6 +660,9 @@ class TestNcclReshardWeightSynchronizer:
         policy.prepare_nccl_reshard_refit_info.return_value = refit_info
         gen = _mock_generation()
         gen.init_nccl_reshard_comm_group.return_value = [MagicMock()]
+        # tp_size=4 over a 4-GPU generation world -> one DP shard.
+        gen.worker_group.dp_size = 1
+        gen.worker_group.workers = [MagicMock() for _ in range(4)]
         train_cluster = _mock_cluster(world_size=2)
         train_cluster.num_gpus_per_node = 8
         train_cluster.get_available_address_and_port.return_value = (

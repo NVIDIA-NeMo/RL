@@ -1970,6 +1970,15 @@ def test_megatron_train_iters_matches_ppo_training_limit(
     assert config.value["megatron_cfg"]["train_iters"] == expected_train_iters
 
 
+def test_ppo_setup_rejects_a_warm_start_that_does_not_resolve(monkeypatch, tmp_path):
+    """A fresh run's warm-start checkpoint must resolve, or the critic would silently start cold."""
+    config = _make_noncolocated_setup_config()
+    config.ppo.warm_start_value_checkpoint = str(tmp_path / "typo")
+
+    with pytest.raises(ValueError, match="would silently start cold"):
+        _run_noncolocated_setup(monkeypatch, config)
+
+
 def test_colocated_setup_keeps_single_cluster_and_skips_collective(monkeypatch):
     """The default colocated setup remains unchanged by the cluster split."""
     config = _make_noncolocated_setup_config()

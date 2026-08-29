@@ -64,6 +64,13 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     should_use_async_rollouts,
 )
+from nemo_rl.telemetry.instrumentation import (
+    efficiency_span,
+    managed_span,
+    remote_trace_context,
+)
+from nemo_rl.telemetry.setup import init_telemetry_worker, shutdown_telemetry
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
@@ -76,6 +83,10 @@ TokenizerType = PreTrainedTokenizerBase
 _MAX_NEMO_GYM_STREAM_RETRIES = 3
 _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
 _REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
+# How often telemetry teardown re-releases the collection loop's pause events
+# while waiting for it to exit. Short enough that the loop is not held for a
+# meaningful slice of the quiesce budget, long enough not to spin.
+_WAKE_RETRY_INTERVAL_S = 0.1
 
 
 def _stamped_task_indices(batch: BatchedDataDict[DatumSpec]) -> list[int]:
@@ -132,7 +143,23 @@ class AsyncTrajectoryCollector:
         ordinals_frontier_aligned: bool = True,
         resume_frontier_ordinal: Optional[int] = None,
         resume_covered_task_indices: Optional[list[int]] = None,
+        trace_carrier: Optional[dict[str, str]] = None,
     ) -> None:
+        # Every rollout in an async run is generated from this process, so
+        # without this the spans below are no-ops and an async trace has no
+        # rollout phase at all. rank/world_size are passed explicitly: this
+        # actor is a singleton rather than a member of a ranked group, and its
+        # runtime_env is a copy of the driver's environment, so a stray RANK
+        # there must not decide whether it exports. always_export goes with
+        # that synthetic rank -- an export_strategy picking among a group's
+        # ranks would otherwise mute this actor entirely (export_rank: 3 never
+        # matches rank 0), taking every rollout span with it.
+        _telemetry = init_telemetry_worker(rank=0, world_size=1, always_export=True)
+        self._tracer = _telemetry.tracer if _telemetry is not None else None
+        # The driver's rl.grpo.job span, so this actor's spans land in the run's
+        # trace rather than as loose roots. Reattached per thread below.
+        self._trace_carrier = trace_carrier or {}
+
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
         self.task_to_env = task_to_env
@@ -214,6 +241,12 @@ class AsyncTrajectoryCollector:
 
         # Track threads
         self._inflight_threads: set[_threading.Thread] = set()
+        # Same threads, different question, so a separate set. A batch worker
+        # drops out of _inflight_threads as soon as its batch is done -- from
+        # inside its own finally, which still runs inside the batch's span --
+        # whereas telemetry teardown needs to know which threads could still be
+        # writing spans. Entries here survive until the thread itself is dead.
+        self._live_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
 
         # Simple lock to prevent race conditions when checking/spawning workers
@@ -409,7 +442,9 @@ class AsyncTrajectoryCollector:
 
         print("Started continuous trajectory collection")
 
-        self.collection_thread = _threading.Thread(target=self._collection_loop)
+        self.collection_thread = _threading.Thread(
+            target=self._collection_loop, name="collection-loop"
+        )
         self.collection_thread.daemon = True
         self.collection_thread.start()
 
@@ -449,12 +484,22 @@ class AsyncTrajectoryCollector:
         never discarded. The dataloader counts as exhausted only when the
         iterator drains with no pending prompts remaining.
         """
-        dataloader_exhausted = False
         if self.dataloader is None:
             raise RuntimeError(
                 "start_collection must set a dataloader before collection"
             )
-        dataloader_iter = iter(self.dataloader)
+        # Attached for the life of the loop so the waits below hang off the
+        # driver's job span. This thread is not the one that captured the
+        # carrier, so it starts with an empty OTel context.
+        with remote_trace_context(self._trace_carrier):
+            self._run_collection_loop(self.dataloader)
+
+    def _run_collection_loop(
+        self, dataloader: StatefulDataLoader | CyclingDataLoader
+    ) -> None:
+        """Body of :meth:`_collection_loop`, inside the driver's trace context."""
+        dataloader_exhausted = False
+        dataloader_iter = iter(dataloader)
         try:
             while self.running:
                 # Check if manually paused and wait
@@ -464,7 +509,10 @@ class AsyncTrajectoryCollector:
                 # Check if refit is in progress and wait
                 if not self._refit_pause_cleared.is_set() and self.running:
                     print("⏸️ Pausing collection for refit...")
-                    with self._efficiency_timer.time("idle/refit_event_wait"):
+                    with (
+                        efficiency_span("idle/refit_event_wait", tracer=self._tracer),
+                        self._efficiency_timer.time("idle/refit_event_wait"),
+                    ):
                         self._refit_pause_cleared.wait()
                     print("▶️ Refit completed, resuming collection")
 
@@ -484,7 +532,12 @@ class AsyncTrajectoryCollector:
                         self._last_limit_warning_version = self.current_weight_version
 
                     # Efficiently wait for generation limits to be cleared (no polling!)
-                    with self._efficiency_timer.time("idle/generation_limit_pause"):
+                    with (
+                        efficiency_span(
+                            "idle/generation_limit_pause", tracer=self._tracer
+                        ),
+                        self._efficiency_timer.time("idle/generation_limit_pause"),
+                    ):
                         self._generation_limit_cleared.wait()
 
                     # Double-check we're still running after being woken up
@@ -828,9 +881,19 @@ class AsyncTrajectoryCollector:
                     "⏸️ Waiting for refit to complete before starting new "
                     f"generation ({active_threads} threads still active)"
                 )
-                with self._efficiency_timer.time("idle/refit_event_wait"):
+                with (
+                    efficiency_span("idle/refit_event_wait", tracer=self._tracer),
+                    self._efficiency_timer.time("idle/refit_event_wait"),
+                ):
                     self._refit_pause_cleared.wait()
                 generation_weight_version = self.current_weight_version
+                # Teardown clears `running` and then sets this event to wake the
+                # loop. Without the re-check we would spawn one more batch
+                # worker, whose spans open against a provider that is on its way
+                # out.
+                if not self.running:
+                    self._release_target(reserved_target)
+                    return
 
             # Task indices are stamped at yield time in _collection_loop, so
             # slices and carried-over remainders keep their original ordinals.
@@ -857,21 +920,55 @@ class AsyncTrajectoryCollector:
             )
 
             def _run_rollout_batch() -> None:
-                asyncio.run(
-                    self._run_rollout_batch_worker(
-                        repeated_batch=repeated_batch,
-                        generation_weight_version=generation_weight_version,
-                        target_weight_version=reserved_target,
-                        num_generations=num_generations,
-                        use_nemo_gym=use_nemo_gym,
-                        dispatched_task_indices=dispatched_task_indices,
-                    )
-                )
+                # Reattached here too: this is a fresh thread, which inherits no
+                # contextvars from the loop thread that spawned it.
+                with remote_trace_context(self._trace_carrier):
+                    _collect()
 
-            worker = _threading.Thread(target=_run_rollout_batch, daemon=True)
+            def _collect() -> None:
+                # The async counterpart of the driver's rl.grpo.generation.
+                # ROLLOUT is an umbrella group, so this carries no rl.bucket --
+                # several batch workers run concurrently, so their durations sum
+                # past wall time and cannot go into a bucket rollup. It is here
+                # for the trace: how long a batch took, and at which weight
+                # version. Deliberately one span per batch, not per sample:
+                # generate_async is dispatched one coroutine per sample, which
+                # would be thousands of overlapping spans per step.
+                with managed_span(
+                    RLSpanGroup.ROLLOUT,
+                    "rl.grpo.generation",
+                    tracer=self._tracer,
+                    **{
+                        "rl.weight_version": generation_weight_version,
+                        "rl.target_weight_version": reserved_target,
+                        "rl.num_generations_per_prompt": num_generations,
+                        # Batch width, so the duration can be read per rollout.
+                        # A gap-filling batch is a fraction of a full one, and
+                        # without this its span looks like an unexplained
+                        # speed-up.
+                        "rl.num_prompt_groups": num_prompts_to_generate,
+                    },
+                ):
+                    asyncio.run(
+                        self._run_rollout_batch_worker(
+                            repeated_batch=repeated_batch,
+                            generation_weight_version=generation_weight_version,
+                            target_weight_version=reserved_target,
+                            num_generations=num_generations,
+                            use_nemo_gym=use_nemo_gym,
+                            dispatched_task_indices=dispatched_task_indices,
+                        )
+                    )
+
+            worker = _threading.Thread(
+                target=_run_rollout_batch,
+                daemon=True,
+                name=f"rollout-batch-target-{reserved_target}",
+            )
             try:
                 with self._threads_lock:
                     self._inflight_threads.add(worker)
+                    self._live_threads.add(worker)
                 if dispatched_task_indices:
                     with self._outstanding_lock:
                         self._outstanding_task_indices.update(dispatched_task_indices)
@@ -880,6 +977,7 @@ class AsyncTrajectoryCollector:
             except Exception:
                 with self._threads_lock:
                     self._inflight_threads.discard(worker)
+                    self._live_threads.discard(worker)
                 if dispatched_task_indices:
                     with self._outstanding_lock:
                         self._outstanding_task_indices.difference_update(
@@ -1086,6 +1184,130 @@ class AsyncTrajectoryCollector:
             self._efficiency_timer.get_timing_metrics(reduction_op="sum"),
         )
 
+    def flush_telemetry(self, quiesce_timeout_s: float = 5.0) -> None:
+        """Stop collecting, then export whatever spans are still buffered here.
+
+        The driver reaps this actor with ``ray.kill``, which runs no atexit
+        handler, so the span processor's pending batch would otherwise be
+        dropped -- including the last rollout batches of the run. Call this
+        before the kill.
+
+        Quiesces first because the shutdown is terminal, not a checkpoint: once
+        the provider is gone, a still-running loop thread or batch worker keeps
+        opening spans against a dead processor, which drops them and logs a line
+        per span. Clearing ``running`` and waiting for the in-flight batches is
+        what makes the flush cover the batches it exists to save.
+
+        Joins ``_live_threads`` rather than ``_inflight_threads``, and joins
+        rather than polling ``is_alive``: a batch worker leaves the latter from
+        inside its own ``finally``, which still sits inside the
+        ``rl.grpo.generation`` span, so neither an empty set nor a set snapshot
+        means the spans are closed. Thread death does.
+
+        The loop is woken before it is joined, since the refit and
+        generation-limit waits each hold an open span and each is followed by a
+        ``running`` re-check, so releasing them makes the loop exit rather than
+        pick up another batch. It is joined before the batch workers because
+        while it is alive it can still spawn one.
+
+        The loop gets at most half the budget. The two joins are sequential, so
+        a loop wedged in a slow batch dispatch would otherwise spend all of it
+        and leave the batch workers -- whose spans are the ones this exists to
+        save -- with nothing.
+
+        Bounded rather than reusing :meth:`wait_for_pending_generations`, which
+        waits indefinitely: that is right mid-run before a refit, but here the
+        caller is on its way to ``ray.kill``, so a wedged rollout must not be
+        able to hold the run's teardown open. The caller's RPC timeout has to
+        leave room for this budget *plus* the export that follows it.
+
+        Args:
+            quiesce_timeout_s: Total time to wait for the collection loop and
+                the in-flight batch workers before flushing anyway.
+        """
+        self.running = False
+
+        deadline = time.monotonic() + quiesce_timeout_s
+        loop = self.collection_thread
+        if loop is not None:
+            self._drain_thread(
+                loop, min(deadline, time.monotonic() + quiesce_timeout_s / 2)
+            )
+        else:
+            self._wake_waits()
+
+        # Re-read the set each pass rather than snapshotting once: a worker
+        # spawned just before the loop exited would not be in a snapshot taken
+        # here.
+        while time.monotonic() < deadline:
+            with self._threads_lock:
+                alive = [t for t in self._live_threads if self._may_still_run(t)]
+            if not alive:
+                break
+            for thread in alive:
+                self._join_until(thread, deadline)
+
+        with self._threads_lock:
+            still_running = [
+                t.name for t in self._live_threads if self._may_still_run(t)
+            ]
+        if loop is not None and self._may_still_run(loop):
+            still_running.append(loop.name)
+        if still_running:
+            print(
+                f"⚠️ Flushing telemetry with {len(still_running)} thread(s) still "
+                f"running after {quiesce_timeout_s}s ({', '.join(still_running)}); "
+                "their spans may be dropped.",
+                flush=True,
+            )
+        shutdown_telemetry()
+
+    def _wake_waits(self) -> None:
+        """Release every event the collection loop can be parked on."""
+        self._manual_pause_cleared.set()
+        self._refit_pause_cleared.set()
+        self._generation_limit_cleared.set()
+
+    def _drain_thread(self, thread: _threading.Thread, deadline: float) -> None:
+        """Join *thread*, re-arming the pause events until it exits or time is up.
+
+        Re-armed every pass rather than set once, because the loop checks
+        ``running`` and *then* clears an event: a single set landing in that
+        window is swallowed by the clear, and the wait that follows it has
+        nothing left to release it -- the driver is on its way to ``ray.kill``,
+        so no refit or weight update is coming.
+        """
+        while self._may_still_run(thread):
+            if time.monotonic() >= deadline:
+                return
+            self._wake_waits()
+            self._join_until(
+                thread, min(deadline, time.monotonic() + _WAKE_RETRY_INTERVAL_S)
+            )
+
+    @staticmethod
+    def _may_still_run(thread: _threading.Thread) -> bool:
+        """Whether *thread* could still be opening spans.
+
+        ``is_alive()`` alone is false for a worker that has been registered but
+        has not reached ``start()`` yet, which would drop it from both the join
+        set and the warning.
+        """
+        return thread.is_alive() or thread.ident is None
+
+    @staticmethod
+    def _join_until(thread: _threading.Thread, deadline: float) -> None:
+        """Join *thread* with whatever is left of the budget, if anything."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            thread.join(timeout=remaining)
+        except RuntimeError:
+            # Registered before start(), so not joinable yet. Yield rather than
+            # spin; the caller's drain loop comes back to it.
+            time.sleep(0.01)
+
     async def drain_payload_metrics(self) -> dict[str, int | float]:
         """Close one drain-to-drain collector/Gym telemetry interval.
 
@@ -1128,6 +1350,9 @@ class AsyncTrajectoryCollector:
             finished = {t for t in self._inflight_threads if not t.is_alive()}
             for t in finished:
                 self._inflight_threads.remove(t)
+            # Pruned here (and discarded directly if a thread never started), so
+            # the set does not grow for the life of the run.
+            self._live_threads = {t for t in self._live_threads if t.is_alive()}
 
     def _release_target(self, target_weight_version: int) -> None:
         """Release the reservation owned by a completed batch worker."""
