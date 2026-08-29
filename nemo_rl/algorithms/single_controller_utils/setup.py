@@ -47,6 +47,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_buffer_checkpoint,
+    sampler_supports_training_claims,
 )
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
@@ -985,6 +986,11 @@ def setup_single_controller(
                 "rollout checkpointing requires a sampler that supports "
                 "replay-buffer recovery"
             )
+        if not sampler_supports_training_claims(master_config.async_rl.sampler):
+            raise ValueError(
+                "rollout checkpointing requires a sampler that explicitly "
+                "supports training-claim ownership"
+            )
     if token_capture_cfg.enabled:
         if not should_use_nemo_gym(master_config):
             raise ValueError(
@@ -1118,6 +1124,9 @@ def setup_single_controller(
     if resolved_snapshot is not None:
         recovery_checkpoint_path = str(resolved_snapshot.path)
         save_state.current_epoch = resolved_snapshot.manifest.current_epoch
+        save_state.sampler_dispatch_index = (
+            resolved_snapshot.manifest.sampler_dispatch_index
+        )
         print(
             f"📦 Selected rollout recovery snapshot: {recovery_checkpoint_path}",
             flush=True,

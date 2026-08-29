@@ -1462,6 +1462,10 @@ class TQReplayBuffer:
         """Return metadata for canonical rows owned by the open train step."""
         return copy.deepcopy(list(self._training_claims.values()))
 
+    def training_owned_group_ids(self) -> set[str]:
+        """Return stable IDs currently owned by the open train step."""
+        return set(self._training_claims)
+
     def release_training_claims(self, group_ids: list[str]) -> None:
         """Release checkpoint ownership after consumed TQ rows are cleared."""
         if len(group_ids) != len(set(group_ids)):
@@ -1597,11 +1601,9 @@ class TQReplayBuffer:
         controller-local replay membership must either participate in that
         barrier across the complete publish/index or clear/remove transition,
         or run in the same asyncio task as the checkpoint save. The advantage
-        stage relies on the latter: it and ``_save_checkpoint`` both live in
-        ``_train_pump``, so they cannot interleave. Any new writer outside
-        ``_train_pump`` -- including future finalizer paths -- must take a
-        mutation slot; canonical writes are not required to originate
-        specifically from :meth:`commit`.
+        stage takes a mutation slot because the periodic checkpoint pump runs
+        concurrently with ``_train_pump``. Canonical writes are not required to
+        originate specifically from :meth:`commit`.
         In-flight reservations are intentionally omitted. ``additional_groups``
         is used by periodic snapshots to re-index rows claimed by an unfinished
         streamed optimizer step.

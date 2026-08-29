@@ -92,7 +92,12 @@ class PromptGroupSampler(Protocol):
         min_prompt_groups: int,
         max_prompt_groups: int,
     ) -> tuple[Optional[KVBatchMeta], int]:
-        """Pick up to ``max_prompt_groups`` eligible groups; drop them locally."""
+        """Pick up to ``max_prompt_groups`` eligible groups for training.
+
+        Claim-aware samplers transfer the groups from ordinary replay-buffer
+        selection into training ownership until the controller releases them.
+        Legacy custom samplers may still remove selected groups immediately.
+        """
         ...
 
     async def evict(self, *, current_train_weight: int) -> int:
@@ -158,6 +163,7 @@ class BaseSampler(abc.ABC):
     """
 
     supports_buffer_checkpoint: ClassVar[bool] = False
+    supports_training_claims: ClassVar[bool] = True
 
     def __init__(self, buffer: TQReplayBuffer) -> None:
         self._buffer = buffer
@@ -737,6 +743,27 @@ def sampler_supports_buffer_checkpoint(cfg: SamplerConfig) -> bool:
     if not isinstance(capability, bool):
         raise TypeError(
             f"{sampler_cls.__name__}.supports_buffer_checkpoint must be a "
+            f"boolean class attribute, got {capability!r}"
+        )
+    return capability
+
+
+def sampler_supports_training_claims(cfg: SamplerConfig) -> bool:
+    """Return whether selection transfers rows into training ownership.
+
+    Built-in samplers use :meth:`TQReplayBuffer.claim_for_training`. Custom
+    samplers retain the legacy local-removal contract unless they explicitly
+    opt in, so enabling periodic snapshots cannot silently assume ownership
+    metadata that the sampler never created.
+    """
+    sampler_cls = _sampler_class_for_config(cfg)
+    if isinstance(cfg, CustomSamplerConfig):
+        capability = sampler_cls.__dict__.get("supports_training_claims", False)
+    else:
+        capability = getattr(sampler_cls, "supports_training_claims", None)
+    if not isinstance(capability, bool):
+        raise TypeError(
+            f"{sampler_cls.__name__}.supports_training_claims must be a "
             f"boolean class attribute, got {capability!r}"
         )
     return capability
