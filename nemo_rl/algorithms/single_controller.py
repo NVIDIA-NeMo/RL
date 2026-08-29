@@ -171,6 +171,7 @@ class _RolloutCheckpointCut:
     replay_metadata: Optional[TQReplayMetadataState]
     rollout_recovery_payload: Optional[bytes]
     rollout_recovery_group_count: Optional[int]
+    rolled_back_train_group_count: int
     mutation_version: int
 
 
@@ -436,10 +437,11 @@ class SingleControllerActor:
         self._last_missing_rollout_snapshot_anchor: Optional[tuple[int, int]] = None
         self._bootstrap_fingerprint = getattr(actor_args, "bootstrap_fingerprint", None)
         self._rollout_checkpoint_stop_requested = asyncio.Event()
-        # Periodic snapshots intentionally skip an optimizer step in progress.
-        # The transition to/from idle joins the data-plane barrier below.
-        self._train_step_idle = asyncio.Event()
-        self._train_step_idle.set()
+        # Narrow unsafe window after an optimizer mutates model state and before
+        # SC publishes the matching TQ cleanup and trainer counters. Gradient
+        # accumulation remains snapshot-safe because selected rows stay owned by
+        # the replay buffer and are re-indexed in periodic snapshots.
+        self._optimizer_commit_in_progress = False
 
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
@@ -568,10 +570,7 @@ class SingleControllerActor:
                 set(tasks), return_when=asyncio.FIRST_COMPLETED
             )
             stop_after_rollout_checkpoint = False
-            if (
-                rollout_checkpoint_task is not None
-                and rollout_checkpoint_task in done
-            ):
+            if rollout_checkpoint_task is not None and rollout_checkpoint_task in done:
                 await rollout_checkpoint_task
                 if not self._rollout_checkpoint_stop_requested.is_set():
                     raise RuntimeError(
@@ -1520,6 +1519,22 @@ class SingleControllerActor:
         async with self._data_plane_checkpoint_barrier.mutation() as cut:
             await self._cleanup_consumed_metas_unlocked(cut, metas)
 
+    @staticmethod
+    def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
+        """Return stable prompt-group IDs in canonical sample order."""
+        group_ids: list[str] = []
+        seen_group_ids: set[str] = set()
+        for sample_id in meta.sample_ids:
+            group_id = sample_id
+            if "_g" in sample_id:
+                candidate, generation_index = sample_id.rsplit("_g", 1)
+                if candidate and generation_index.isdigit():
+                    group_id = candidate
+            if group_id not in seen_group_ids:
+                group_ids.append(group_id)
+                seen_group_ids.add(group_id)
+        return group_ids
+
     # ── the three pumps + the inline advantage stage ───────────────────────
 
     async def _rollout_pump(self) -> None:
@@ -2262,6 +2277,8 @@ class SingleControllerActor:
             # Always True off the PPO path: the start step is pinned to 0 there.
             is_policy_training_step = self._train_steps >= policy_training_start_step
             consumed_metas: list[KVBatchMeta] = []
+            consumed_group_ids: list[str] = []
+            consumed_group_count = 0
             step_finalizer_metrics: dict[str, list[float]] = {}
 
             with self._timer.time("total_step_time"):
@@ -2305,6 +2322,7 @@ class SingleControllerActor:
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
+                        selected_group_ids: list[str] = []
                         async with self._data_plane_checkpoint_barrier.mutation():
                             train_meta, num_groups = await self._sampler.select(
                                 current_train_weight=self._trainer_version,
@@ -2312,11 +2330,9 @@ class SingleControllerActor:
                                 max_prompt_groups=max_prompt_groups,
                             )
                             if train_meta is not None:
-                                train_step_idle = getattr(
-                                    self, "_train_step_idle", None
+                                selected_group_ids = self._group_ids_from_meta(
+                                    train_meta
                                 )
-                                if train_step_idle is not None:
-                                    train_step_idle.clear()
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:
@@ -2344,16 +2360,8 @@ class SingleControllerActor:
                             continue
 
                         consumed_metas.append(train_meta)
-
-                        # Release buffer capacity. The rows stay in TQ until the
-                        # post-step clear, but every reservation uses a fresh
-                        # uuid group id, so nothing can collide with them.
-                        for _ in range(num_groups):
-                            self._buffer_capacity.release()
-                        selected_group_ids = {
-                            sample_id.rsplit("_g", 1)[0]
-                            for sample_id in train_meta.sample_ids
-                        }
+                        consumed_group_ids.extend(selected_group_ids)
+                        consumed_group_count += num_groups
                         for group_id in selected_group_ids:
                             for name, value in self._finalizer_metrics_by_group.pop(
                                 group_id, {}
@@ -2442,6 +2450,10 @@ class SingleControllerActor:
                     # TODO(#2625): value_result, policy_result only record the last epoch's metrics.
                     # That matches ppo.py for the losses; total_flops is additive and undercounted.
                     if self._is_ppo:
+                        # A critic optimizer update is already irreversible. Keep
+                        # periodic snapshots out until this whole training step is
+                        # published as consumed below.
+                        self._optimizer_commit_in_progress = True
                         with self._timer.time("value_training"):
                             value_result = await self._value_train_epochs(
                                 train_meta,
@@ -2569,10 +2581,7 @@ class SingleControllerActor:
                         policy_result = await asyncio.to_thread(
                             self._trainer.finish_train_step
                         )
-
-                # Clear consumed canonical rows (and their staged capture deltas)
-                # now that the step's training dispatches are complete.
-                await self._cleanup_consumed_metas(consumed_metas)
+                    self._optimizer_commit_in_progress = True
 
                 # Aggregate step metrics
                 step_metrics = {}
@@ -2580,6 +2589,11 @@ class SingleControllerActor:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
+                async with self._data_plane_checkpoint_barrier.mutation() as cut:
+                    await self._cleanup_consumed_metas_unlocked(cut, consumed_metas)
+                    self._buffer.release_training_claims(consumed_group_ids)
+                for _ in range(consumed_group_count):
+                    self._buffer_capacity.release()
                 step_metrics.update(
                     {
                         name: statistics.fmean(values)
@@ -2622,6 +2636,7 @@ class SingleControllerActor:
 
                 self._trainer_version += 1
                 self._train_steps += 1
+                self._optimizer_commit_in_progress = False
                 dropped_prompt_groups = self._batch_shortfall.get(
                     version_during_step, 0
                 )
@@ -2779,11 +2794,6 @@ class SingleControllerActor:
                 f"lag={lag}  ",
                 flush=True,
             )
-
-            train_step_idle = getattr(self, "_train_step_idle", None)
-            if train_step_idle is not None:
-                async with self._data_plane_checkpoint_barrier.mutation():
-                    train_step_idle.set()
 
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
@@ -3348,12 +3358,12 @@ class SingleControllerActor:
         self,
         checkpoint_path: PathLike,
     ) -> _RolloutCheckpointCut:
-        """Save TQ and capture matching rollout sidecars under the barrier."""
-        if not self._train_step_idle.is_set():
-            raise RuntimeError(
-                "periodic rollout snapshot attempted after training consumed rows"
-            )
+        """Save TQ and capture matching restart state under the barrier.
 
+        Groups selected by an unfinished streamed step are absent from the live
+        replay index but remain in TQ. Re-index them only in this persisted cut;
+        the live trainer keeps accumulating gradients without modification.
+        """
         save_state = self._save_state
         save_state.current_step = self._train_steps
         save_state.total_steps = self._train_steps
@@ -3366,8 +3376,10 @@ class SingleControllerActor:
 
         dataloader_state = self._dataloader.state_dict()
         replacement_reserve = list(self._replacement_reserve)
+        training_owned_groups = self._buffer.training_owned_replay_groups()
         replay_metadata = self._buffer.metadata_state_dict(
-            saved_capacity=self._async_cfg.max_buffered_rollouts
+            saved_capacity=self._async_cfg.max_buffered_rollouts,
+            additional_groups=training_owned_groups,
         )
         await self._validate_replay_inventory(replay_metadata)
 
@@ -3376,9 +3388,7 @@ class SingleControllerActor:
         recovery_state["sampler_stamps_target_steps"] = (
             self._sampler_stamps_target_steps
         )
-        canonical_group_ids = {
-            group["group_id"] for group in replay_metadata["groups"]
-        }
+        canonical_group_ids = {group["group_id"] for group in replay_metadata["groups"]}
         recovery_state["groups"] = [
             group
             for group in recovery_state["groups"]
@@ -3406,6 +3416,7 @@ class SingleControllerActor:
             replay_metadata=replay_metadata,
             rollout_recovery_payload=recovery_payload,
             rollout_recovery_group_count=len(recovery_state["groups"]),
+            rolled_back_train_group_count=len(training_owned_groups),
             mutation_version=self._data_plane_checkpoint_barrier.mutation_version,
         )
 
@@ -3449,11 +3460,9 @@ class SingleControllerActor:
 
     async def _save_rollout_checkpoint(self, *, force: bool = False) -> bool:
         """Publish one rollout-only snapshot anchored to durable trainer state."""
-        # Never hold the filesystem publication lock while waiting for the train
-        # step. A full checkpoint runs before the step becomes idle and needs the
-        # same lock, so reversing these waits would deadlock both save paths.
-        await self._train_step_idle.wait()
         async with self._checkpoint_save_lock:
+            if self._optimizer_commit_in_progress:
+                return False
             if (
                 not force
                 and self._last_rollout_snapshot_mutation_version
@@ -3517,7 +3526,7 @@ class SingleControllerActor:
             try:
                 async with self._data_plane_checkpoint_barrier.checkpoint():
                     if (
-                        not self._train_step_idle.is_set()
+                        self._optimizer_commit_in_progress
                         or self._train_steps != expected_train_step
                         or self._trainer_version != expected_trainer_version
                     ):
@@ -3533,7 +3542,7 @@ class SingleControllerActor:
                     trainer_version=expected_trainer_version,
                     current_epoch=snapshot_epoch,
                     mutation_version=cut.mutation_version,
-                    rolled_back_train_group_count=0,
+                    rolled_back_train_group_count=(cut.rolled_back_train_group_count),
                     bootstrap_fingerprint=snapshot_fingerprint,
                 )
                 await asyncio.to_thread(
@@ -3565,7 +3574,7 @@ class SingleControllerActor:
             return True
 
     async def _rollout_checkpoint_pump(self) -> None:
-        """Persist rollout state periodically at trainer-safe boundaries."""
+        """Persist rollout state periodically, including during streamed train."""
         interval_s = self._master_config.rollout_checkpointing.interval_s
         if interval_s is None:
             raise RuntimeError("rollout checkpoint pump started while disabled")
@@ -3689,6 +3698,12 @@ class SingleControllerActor:
             )
 
             if self._master_config.checkpointing.get("save_data_plane"):
+                training_owned_groups = self._buffer.training_owned_replay_groups()
+                if training_owned_groups:
+                    raise RuntimeError(
+                        "full trainer checkpoint still owns streamed training rows: "
+                        f"groups={[group['group_id'] for group in training_owned_groups]!r}"
+                    )
                 if self._sampler.supports_buffer_checkpoint:
                     replay_metadata = self._buffer.metadata_state_dict(
                         saved_capacity=self._async_cfg.max_buffered_rollouts

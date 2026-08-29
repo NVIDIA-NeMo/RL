@@ -270,6 +270,21 @@ def _add_group(
 
 
 class TestDataPlaneCheckpointBarrier:
+    def test_mutation_version_counts_completed_outer_sections(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            assert barrier.mutation_version == 0
+            async with barrier.mutation():
+                async with barrier.mutation():
+                    assert barrier.mutation_version == 0
+            assert barrier.mutation_version == 1
+            with pytest.raises(RuntimeError, match="injected"):
+                async with barrier.mutation():
+                    raise RuntimeError("injected")
+            assert barrier.mutation_version == 2
+
+        asyncio.run(exercise())
+
     def test_mutation_and_checkpoint_cuts_expire_on_context_exit(self):
         async def exercise() -> None:
             barrier = DataPlaneCheckpointBarrier()
@@ -1121,6 +1136,59 @@ class TestReplayManifestDigest:
 
 
 class TestTQReplayBufferStateDict:
+    def test_training_claim_is_reindexed_only_for_periodic_snapshot(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(
+            weight_version=3,
+            target_step=4,
+            group_id="claimed-group",
+        )
+        claimed_meta = _run(
+            buf.commit(
+                group_id,
+                _make_record(),
+                start_weight_version=3,
+                end_weight_version=3,
+            )
+        )
+
+        assert _run(buf.claim_for_training([0])) == 1
+        assert buf.size() == 0
+        claims = buf.training_owned_replay_groups()
+        assert [group["group_id"] for group in claims] == ["claimed-group"]
+        assert buf.metadata_state_dict(saved_capacity=8)["groups"] == []
+
+        periodic_state = buf.metadata_state_dict(
+            saved_capacity=8,
+            additional_groups=claims,
+        )
+        assert [group["meta"].sample_ids for group in periodic_state["groups"]] == [
+            list(claimed_meta.sample_ids)
+        ]
+        assert dp.depth() == _N_GENS
+
+        with pytest.raises(ValueError, match="unreleased=\\['claimed-group'\\]"):
+            buf.release_training_claims([])
+        assert [group["group_id"] for group in buf.training_owned_replay_groups()] == [
+            "claimed-group"
+        ]
+
+        buf.release_training_claims([claims[0]["group_id"]])
+        assert buf.training_owned_replay_groups() == []
+
+    def test_duplicate_training_claim_indices_do_not_change_ownership(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=3)
+
+        with pytest.raises(ValueError, match="duplicate replay indices"):
+            _run(buf.claim_for_training([0, 0]))
+
+        assert buf.size() == 1
+        assert buf.training_owned_replay_groups() == []
+        assert dp.depth() == _N_GENS
+
     def test_metadata_state_dict_omits_tensors_and_data_plane_reads(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
