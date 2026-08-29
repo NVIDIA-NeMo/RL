@@ -116,6 +116,7 @@ from nemo_rl.experience.rollout_recovery import (
     parse_rollout_recovery_state,
 )
 from nemo_rl.models.generation.fleet_health import ShardState
+from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -124,7 +125,7 @@ from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
 from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
-Generation = Union[VllmGeneration, SGLangGeneration]
+Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
 
 # Named `log` rather than `logger` to keep it distinct from the experiment
 # Logger this module also uses as `self._logger`.
@@ -428,8 +429,9 @@ class SingleControllerActor:
 
     async def run(self) -> dict[str, Any]:
         """Main entry point. Runs until max_train_steps is reached."""
-        # Synchronize weights before starting the pumps
-        await self._sync_weights()
+        # Synchronize weights before starting the pumps, unless setup already delivered them.
+        if self._weight_synchronizer.is_stale:
+            await self._sync_weights()
         self._rollout_manager.set_weight_version(self._trainer_version)
 
         restored_replay_groups = await self._maybe_restore_replay_buffer()

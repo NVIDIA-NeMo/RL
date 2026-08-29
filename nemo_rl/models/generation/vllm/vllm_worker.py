@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import inspect
 import logging
 import os
 import sys
@@ -60,6 +61,14 @@ from nemo_rl.models.generation.vllm.worker_utils import (
 )
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.telemetry.instrumentation import trace_fn
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    shutdown_telemetry,
+    telemetry_enabled_in_env,
+    vllm_native_tracing_requested,
+)
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -80,6 +89,59 @@ def _context_capped_max_new_tokens(
             f"model context: input_length={input_length}, max_model_len={max_model_len}."
         )
     return min(configured_max_new_tokens, remaining_context)
+
+
+def _maybe_enable_vllm_native_tracing(llm_kwargs: dict[str, Any]) -> None:
+    """Optionally enable vLLM's native OpenTelemetry tracing on the engine.
+
+    Requires both ``telemetry.enabled`` and ``telemetry.vllm_native_tracing``
+    (plus an OTLP endpoint). vLLM's OTLP span exporter is gRPC-only, so the
+    endpoint must speak OTLP/gRPC (e.g. a collector on ``:4317`` or a
+    gRPC-capable backend) — it will not reach an ``http/protobuf`` OTLP
+    endpoint. Degrades to a no-op if the installed vLLM lacks these engine args.
+    """
+    # The master switch is re-checked here because _config_to_env() exports
+    # every field before init_telemetry_driver's `enabled` check, so
+    # vllm_native_tracing would otherwise survive enabled=false and turn on
+    # per-request tracing on exactly the runs that disabled telemetry.
+    if not (telemetry_enabled_in_env() and vllm_native_tracing_requested()):
+        return
+    endpoint = (
+        os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+        or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    )
+    if not endpoint:
+        logger.warning(
+            "nemo-lens: NEMO_RL_OTEL_VLLM_NATIVE_TRACING is set but no OTLP "
+            "endpoint is configured; skipping native vLLM tracing."
+        )
+        return
+    # Narrow: this introspects a third-party surface that moves across vLLM
+    # versions, which justifies tolerating a missing attribute or a moved
+    # module -- but not swallowing every failure inside a vLLM worker.
+    try:
+        from vllm.engine.arg_utils import EngineArgs
+
+        supported = set(getattr(EngineArgs, "__dataclass_fields__", {})) | set(
+            inspect.signature(EngineArgs.__init__).parameters
+        )
+    except (ImportError, AttributeError, ValueError, TypeError):
+        logger.warning(
+            "nemo-lens: could not introspect vLLM EngineArgs; skipping native "
+            "vLLM tracing.",
+            exc_info=True,
+        )
+        return
+    if "otlp_traces_endpoint" not in supported:
+        logger.warning(
+            "nemo-lens: installed vLLM does not support 'otlp_traces_endpoint'; "
+            "skipping native vLLM tracing."
+        )
+        return
+    llm_kwargs.setdefault("otlp_traces_endpoint", endpoint)
+    if "collect_detailed_traces" in supported:
+        llm_kwargs.setdefault("collect_detailed_traces", ["all"])
+    logger.info("nemo-lens: enabled vLLM native OTLP tracing -> %s", endpoint)
 
 
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
@@ -324,6 +386,10 @@ class BaseVllmGenerationWorker:
         if bundle_indices is not None and len(bundle_indices) == 1:
             bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
 
+        # OTel providers are process-global, so the driver's setup does not
+        # reach this actor. No-op unless telemetry is enabled.
+        init_telemetry_worker()
+
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
@@ -389,6 +455,7 @@ class BaseVllmGenerationWorker:
         self.rank = 0
         self.world_size = 1
 
+    @trace_fn(RLSpanGroup.MODEL_INIT, "rl.vllm.load_model")
     def _load_model(self, bundle_indices, seed):
         """Perform the heavy model loading and engine creation.
 
@@ -650,6 +717,9 @@ class BaseVllmGenerationWorker:
                 sampling_style=video_config.sampling_style,
                 temporal_patch_size=video_config.temporal_patch_size,
             )
+
+        _maybe_enable_vllm_native_tracing(llm_kwargs)
+
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
@@ -1428,6 +1498,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+        finally:
+            # Flush buffered spans/metrics before the actor goes away.
+            shutdown_telemetry()
 
 
 @ray.remote(

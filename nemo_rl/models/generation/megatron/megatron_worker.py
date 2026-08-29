@@ -928,6 +928,10 @@ class MegatronGenerationRefitMixin:
                 nccl_store, global_rank, world_size, nccl_options
             )
             nccl_backend._set_sequence_number_for_group()
+            # Create the group-wide NCCL communicator now, on every rank.
+            nccl_backend.eager_connect_single_device(
+                torch.device("cuda", torch.cuda.current_device())
+            )
             pg._register_backend(
                 torch.device("cuda"),
                 ProcessGroup.BackendType.NCCL,

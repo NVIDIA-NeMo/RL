@@ -94,6 +94,7 @@ from nemo_rl.experience.rollout_manager import (
     RolloutTimeouts,
 )
 from nemo_rl.experience.rollouts import should_mask_flagged_samples
+from nemo_rl.models.generation import resolve_generation_class
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetHealth,
@@ -106,6 +107,7 @@ from nemo_rl.models.generation.generation_router import (
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
 )
+from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -346,10 +348,6 @@ def _build_clusters(
         return cluster, cluster, teacher_topology
 
     # Non-colocated: split node into train + inference clusters.
-    assert backend != "megatron", (
-        "The Megatron generation backend does not support non-colocated inference "
-        "in SingleController."
-    )
     inference_resources = generation_config["colocated"]["resources"]
     inference_gpus_per_node = inference_resources["gpus_per_node"]
     if inference_gpus_per_node is None:
@@ -409,10 +407,14 @@ def _build_clusters(
                 gpus_per_instance = generation_config_dict["sglang_cfg"].get(
                     "gpus_per_server", 1
                 )
+            elif backend == "megatron":
+                gpus_per_instance = MegatronGeneration.nvlink_domain_span(
+                    master_config.policy
+                )
             else:
                 raise ValueError(
-                    "single_controller_utils.setup only supports vllm or sglang "
-                    f"generation; got {backend!r}"
+                    "single_controller_utils.setup only supports vllm, sglang, "
+                    f"or megatron generation; got {backend!r}"
                 )
             nodes_per_instance = (
                 gpus_per_instance + inference_gpus_per_node - 1
@@ -471,17 +473,23 @@ def _build_generation(
     master_config: MasterConfig,
     *,
     defer_model_load: bool = False,
+    reserved_http_server_port: Optional[int] = None,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
+    processor: Optional[AutoProcessor] = None,
 ) -> tuple[Any, float]:
-    """Spin up the generation backend (vLLM or SGLang).
+    """Spin up the generation backend (vLLM, SGLang, or Megatron).
 
     Args:
         inference_cluster: Ray virtual cluster the generation workers run on.
         master_config: SC MasterConfig.
-        defer_model_load: If True (for the NeMo-Gym flow), reserve OpenAI server URLs without loading weights; caller runs gen.load_and_start() later.
+        defer_model_load: If True (for the NeMo-Gym flow), reserve OpenAI server URLs without loading weights; caller runs gen.load_and_start() later (vLLM only).
+        reserved_http_server_port: OpenAI server port pre-published to NeMo-Gym (Megatron only).
+        tokenizer: Tokenizer for the dedicated Megatron inference policy (Megatron only).
+        processor: Optional AutoProcessor for VLM paths (Megatron only).
 
     Returns:
         A tuple of (generation object, wall time spent in this call). The
-        generation object is a VllmGeneration or SGLangGeneration.
+        generation object is a VllmGeneration, SGLangGeneration, or MegatronGeneration.
     """
     t0 = time.perf_counter()
     generation_config = master_config.policy["generation"]
@@ -513,9 +521,27 @@ def _build_generation(
             sglang_cfg=sglang_config,
         )
 
+    elif backend == "megatron":
+        assert not defer_model_load, (
+            "defer_model_load is only supported for the vllm backend"
+        )
+        assert tokenizer is not None, "Megatron generation requires a tokenizer"
+        # Non-colocated only (colocated is rejected at config validation).
+        # The inference and trainer policies build in parallel;
+        # the inference engine only becomes live at the initial refit, which delivers weights.
+        gen = MegatronGeneration(
+            config=master_config.policy,
+            tokenizer=tokenizer,
+            cluster=inference_cluster,
+            reserved_http_server_port=reserved_http_server_port,
+            processor=processor,
+            skip_weight_load=True,
+        )
+
     else:
         raise ValueError(
-            f"single_controller_utils.setup only supports vllm or sglang generation; got {backend!r}"
+            "single_controller_utils.setup only supports vllm, sglang, or megatron "
+            f"generation; got {backend!r}"
         )
 
     if not defer_model_load:
@@ -653,8 +679,7 @@ def _generation_max_seq_len(generation_config) -> int:
     """Return the per-backend max sequence length.
 
     vllm uses vllm_cfg.max_model_len; sglang uses sglang_cfg.context_length;
-    megatron generation has no dedicated field and routes max_new_tokens
-    through as max_sequence_length on the inference worker.
+    megatron uses mcore_generation_config.max_model_len.
     """
     backend = generation_config["backend"]
     if backend == "vllm":
@@ -662,7 +687,7 @@ def _generation_max_seq_len(generation_config) -> int:
     if backend == "sglang":
         return generation_config["sglang_cfg"]["context_length"]
     if backend == "megatron":
-        return generation_config["max_new_tokens"]
+        return generation_config["mcore_generation_config"]["max_model_len"]
     raise ValueError(f"Unknown generation backend: {backend!r}")
 
 
@@ -743,8 +768,14 @@ def _shard_base_urls(generation: Any) -> Optional[list[Optional[str]]]:
     return urls
 
 
-def _maybe_start_generation_router(generation: Any, master_config: MasterConfig) -> Any:
+def _maybe_start_generation_router(
+    base_urls: list[Optional[str]], master_config: MasterConfig
+) -> Any:
     """Start the NeMo-Gym-facing router, if enabled.
+
+    Args:
+        base_urls: OpenAI server URLs for the router.
+        master_config: SingleController MasterConfig.
 
     Returns:
         The router actor handle, or None when the router is disabled.
@@ -765,7 +796,7 @@ def _maybe_start_generation_router(generation: Any, master_config: MasterConfig)
             flush=True,
         )
 
-    backend_urls = [url for url in (generation.dp_openai_server_base_urls or []) if url]
+    backend_urls = [url for url in (base_urls or []) if url]
     if not backend_urls:
         raise ValueError(
             "async_rl.generation_router.enabled=true requires generation backends that "
@@ -973,11 +1004,13 @@ def setup_single_controller(
     # ==========================
     # TODO: add validate dataset wiring.
     use_nemo_gym = should_use_nemo_gym(master_config)
-    if use_nemo_gym and generation_config["backend"] != "vllm":
+    if use_nemo_gym and generation_config["backend"] not in ("vllm", "megatron"):
         raise NotImplementedError(
-            "SC NeMo-Gym integration currently supports the vllm backend "
-            f"only; got {generation_config['backend']!r}"
+            "SC NeMo-Gym integration currently supports the vllm and megatron backends only; got "
+            f"{generation_config['backend']!r}"
         )
+    # Backend settings checks are pure config: run them before anything builds.
+    resolve_generation_class(generation_config).validate_settings(master_config)
     if use_nemo_gym:
         # NeMo-Gym creates the env actor outside setup_response_data; we wire
         # it in after generation is up (it needs the OpenAI server URLs).
@@ -1047,6 +1080,12 @@ def setup_single_controller(
     # live generation to front. None is also the correct value whenever the router
     # is disabled or NeMo-Gym is not in play -- it is Gym that needs one stable URL.
     generation_router = None
+    megatron_backend = generation_config["backend"] == "megatron"
+    megatron_reserved_url = None
+    megatron_port_holder = None
+    reserved_http_server_port = None
+    if megatron_backend:
+        generation_config["model_name"] = master_config.policy["model_name"]
 
     def _build_trainer_and_value() -> tuple[Any, Optional[TQValue], dict[str, float]]:
         """Build the trainer, then the critic when this is a PPO run.
@@ -1129,26 +1168,52 @@ def setup_single_controller(
         )
 
     if use_nemo_gym:
-        # defer generation, only get base_urls for nemo_gym spinup
-        generation, gen_reserve_time = _build_generation(
-            inference_cluster,
-            master_config=master_config,
-            defer_model_load=True,
-        )
-        defer_generation_model_load = True
+        if megatron_backend:
+            # Megatron serves from rank 0 of the generation workers; pre-publish that address.
+            t0 = time.perf_counter()
+            (
+                megatron_reserved_url,
+                reserved_http_server_port,
+                megatron_port_holder,
+            ) = MegatronGeneration.reserve_http_server_address(
+                inference_cluster,
+                master_config.policy,
+            )
+            gen_reserve_time = time.perf_counter() - t0
+            print(
+                f"  ✓ Reserved Megatron server URL: {megatron_reserved_url}",
+                flush=True,
+            )
+            gym_base_urls: list[Optional[str]] = [megatron_reserved_url]
+        else:
+            # defer generation, only get base_urls for nemo_gym spinup
+            generation, gen_reserve_time = _build_generation(
+                inference_cluster,
+                master_config=master_config,
+                defer_model_load=True,
+            )
+            defer_generation_model_load = True
+            gym_base_urls = generation.dp_openai_server_base_urls
         # Before the Gym task is built, so Gym can be handed the router's single URL.
-        generation_router = _maybe_start_generation_router(generation, master_config)
+        # These two statements are the only failable ones related to the port holder's creation.
+        try:
+            generation_router = _maybe_start_generation_router(
+                gym_base_urls, master_config
+            )
+            gym_spinup_base_urls = (
+                [ray.get(generation_router.base_url.remote())]
+                if generation_router is not None
+                else gym_base_urls
+            )
+        except BaseException:
+            if megatron_port_holder is not None:
+                ray.kill(megatron_port_holder)
+            raise
         # add nemo_gym spinup task
         build_tasks["nemo_gym"] = partial(
             _spinup_gym,
             master_config=master_config,
-            # The whole point of the router: Gym holds one NeMo-RL-owned URL and
-            # never has to fail over, which is the thing it cannot do.
-            base_urls=(
-                [ray.get(generation_router.base_url.remote())]
-                if generation_router is not None
-                else generation.dp_openai_server_base_urls
-            ),
+            base_urls=gym_spinup_base_urls,
             tokenizer=tokenizer,
         )
 
@@ -1171,20 +1236,54 @@ def setup_single_controller(
                 _build_generation,
                 inference_cluster=inference_cluster,
                 master_config=master_config,
+                reserved_http_server_port=reserved_http_server_port,
+                tokenizer=tokenizer,
+                processor=processor,
             )
         build_tasks["trainer"] = _build_trainer_and_value
 
     # Submit build tasks and get results
-    with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
-        submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
-        results = {k: f.result() for k, f in submitted.items()}
+    weight_synchronizer: Optional[WeightSynchronizer] = None
+    try:
+        with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
+            submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
+            if "generation_trainer" in submitted:
+                generation, trainer, value, time_metrics = submitted[
+                    "generation_trainer"
+                ].result()
+                gen_load_time = time_metrics["gen_time"]
+            else:
+                generation, gen_load_time = submitted["generation"].result()
+                trainer, value, time_metrics = submitted["trainer"].result()
+            if megatron_reserved_url is not None:
+                # Gym initialization needs a live URL that will respond to health checks.
+                # Megatron generation can only respond to health checks once initialized.
+                # The Megatron engine cannot be initialized with dummy weights.
+                # Thus, we must do an initial refit during initialization,
+                # before Gym can spin up.
+                t0 = time.perf_counter()
+                weight_synchronizer = create_weight_synchronizer(
+                    policy=trainer,
+                    generation=generation,
+                    generation_backend=generation_config["backend"],
+                    colocated=colocated,
+                    train_cluster=train_cluster,
+                    inference_cluster=inference_cluster,
+                    refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+                )
+                weight_synchronizer.init_communicator()
+                setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                weight_synchronizer.sync_weights()
+                setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
+            if use_nemo_gym:
+                env_handles["nemo_gym"], gym_time = submitted["nemo_gym"].result()
+                setup_timing_metrics.nemo_gym_init_time_s = gym_time
+    finally:
+        if megatron_port_holder is not None:
+            # Rank 0 adopted (or will never adopt) the held socket; drop the holder.
+            ray.kill(megatron_port_holder)
 
-    if colocated:
-        generation, trainer, value, time_metrics = results["generation_trainer"]
-        gen_load_time = time_metrics["gen_time"]
-    else:
-        generation, gen_load_time = results["generation"]
-        trainer, value, time_metrics = results["trainer"]
     setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
 
     setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
@@ -1203,11 +1302,14 @@ def setup_single_controller(
     )
 
     if use_nemo_gym:
-        env_handles["nemo_gym"], gym_time = results["nemo_gym"]
-        setup_timing_metrics.nemo_gym_init_time_s = gym_time
         # the two fields are only meaningful when use_nemo_gym enabled
         setup_timing_metrics.generation_init_reserve_time_s = gen_reserve_time
         setup_timing_metrics.generation_init_load_time_s = gen_load_time
+
+    if megatron_reserved_url is not None:
+        MegatronGeneration.verify_served_address(
+            generation.dp_openai_server_base_urls, megatron_reserved_url
+        )
 
     # Loading a teacher with the same checkpoint as the student must happen only
     # after student initialization finishes: both use the same HF-to-Megatron
@@ -1260,20 +1362,20 @@ def setup_single_controller(
         grpo_group_size=algo_cfg.num_generations_per_prompt,
     )
 
-    t0 = time.perf_counter()
-    weight_synchronizer = create_weight_synchronizer(
-        policy=trainer,
-        generation=generation,
-        generation_backend=generation_config["backend"],
-        colocated=colocated,
-        train_cluster=train_cluster,
-        inference_cluster=inference_cluster,
-        refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
-        # Only armed when configured; None leaves the refit path unchanged.
-        refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
-    )
-    weight_synchronizer.init_communicator()
-    setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
+    if weight_synchronizer is None:
+        t0 = time.perf_counter()
+        weight_synchronizer = create_weight_synchronizer(
+            policy=trainer,
+            generation=generation,
+            generation_backend=generation_config["backend"],
+            colocated=colocated,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+            refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+            refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
+        )
+        weight_synchronizer.init_communicator()
+        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
 
     # ==========================
     # Setup Algorithm + Rollout Wiring

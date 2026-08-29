@@ -37,6 +37,7 @@ run_test() {
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_gym_single_controller.sh
 # Full mode only (~10 min): SIGKILLs a generation worker and asserts the job fails fast
 # and attributably instead of wedging. This is the ONLY end-to-end check of the
 # containment behaviour -- without it, a regression that restores the silent wedge is
