@@ -1017,6 +1017,42 @@ def test_native_grouped_task_builder_leaves_bf16_experts_for_misc(
     assert tasks == []
 
 
+def test_native_grouped_task_builder_skips_mtp_experts_before_mapping_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from megatron.bridge.models.conversion import model_bridge
+    from megatron.core import fp8_utils
+
+    global_name = "mtp.layers.0.transformer_layer.mlp.experts.linear_fc1.weight"
+    parameter = torch.nn.Parameter(torch.zeros((8, 64), dtype=torch.uint8))
+    worker = _native_worker([])
+    worker.model = SimpleNamespace(
+        config=SimpleNamespace(moe_single_grouped_weight=True),
+        named_parameters=lambda: [(global_name, parameter)],
+    )
+    bridge = SimpleNamespace(_unwrap_name=lambda name: name)
+
+    def unexpected_mapping_lookup(_name: str) -> object:
+        raise AssertionError("MTP grouped experts must not enter the policy refit plan")
+
+    registry = SimpleNamespace(megatron_to_hf_lookup=unexpected_mapping_lookup)
+    monkeypatch.setattr(fp8_utils, "is_grouped_mxfp8tensor", lambda _param: True)
+    monkeypatch.setattr(
+        model_bridge,
+        "_megatron_local_name_to_global",
+        lambda _models, _config, name, _vp_stage: name,
+    )
+
+    tasks = worker._build_native_grouped_mxfp8_tasks(
+        bridge=bridge,
+        registry=registry,
+        global_names=[global_name],
+        pp_rank=0,
+    )
+
+    assert tasks == []
+
+
 def test_native_mxfp8_per_expert_metadata_expands_global_expert_axis() -> None:
     from megatron.bridge.models.conversion.param_mapping import (
         AutoMapping,
