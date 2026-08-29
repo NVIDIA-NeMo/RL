@@ -70,8 +70,26 @@ fi
 # ---- Derived paths ----
 CODE_DIR=$(realpath "$PWD")
 WANDB_NAME="${EXP_NAME}"
-CHECKPOINT_DIR="results/${EXP_NAME}"
-LOG_DIR="logs/${EXP_NAME}"
+# Optional stable results layout: set RESULTS_DIR to get
+#   $RESULTS_DIR/checkpoints             (stable -> singleton auto-resume)
+#   $RESULTS_DIR/runs/<ts>/{logs,slurm}  (per-submission; runs/latest symlink)
+#   $RESULTS_DIR/ray_logs/<jobid>-logs   (ray.sub infra logs via BASE_LOG_DIR)
+# Unset: legacy snapshot-relative results/ and logs/ dirs.
+RESULTS_DIR="${RESULTS_DIR:-}"
+if [[ -n "${RESULTS_DIR}" ]]; then
+    CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RESULTS_DIR}/checkpoints}"
+    RUN_DIR="${RESULTS_DIR}/runs/$(date +%Y%m%d-%H%M)"
+    LOG_DIR="${RUN_DIR}/logs"
+    SLURM_LOG_DIR="${RUN_DIR}/slurm"
+    mkdir -p "${CHECKPOINT_DIR}" "${LOG_DIR}" "${SLURM_LOG_DIR}"
+    ln -sfn "$(realpath "${RUN_DIR}")" "${RESULTS_DIR}/runs/latest"
+    export BASE_LOG_DIR="${BASE_LOG_DIR:-${RESULTS_DIR}/ray_logs}"
+    mkdir -p "${BASE_LOG_DIR}"
+else
+    CHECKPOINT_DIR="results/${EXP_NAME}"
+    LOG_DIR="logs/${EXP_NAME}"
+    SLURM_LOG_DIR=""
+fi
 
 VLLM_CACHE_DIR="${PERSISTENT_CACHE}/vllm_compile_cache"
 FLASHINFER_CUBIN_CACHE="${PERSISTENT_CACHE}/flashinfer_cubins"
@@ -134,7 +152,7 @@ export LISTEN_PORT=6000
 export NGINX_PORT=6000
 export NEMO_SKILLS_SANDBOX_PORT=6000
 export SANDBOX_CONTAINER
-export SANDBOX_COMMAND="/start-with-nginx.sh"
+export SANDBOX_COMMAND="${SANDBOX_COMMAND:-/start-with-nginx.sh}"
 export SANDBOX_ENV_VARS="NEMO_SKILLS_SANDBOX_PORT=${NEMO_SKILLS_SANDBOX_PORT}"
 
 # ---- Build the run command ----
@@ -160,8 +178,8 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
     PYTHONPATH=${SNAPSHOT_DIR}:\${PYTHONPATH:-} \
     python ./examples/nemo_gym/run_grpo_nemo_gym.py \
     --config ${CONFIG_PATH} \
-    env.nemo_gym.uv_venv_dir=${GYM_VENV_DIR} \
-    env.nemo_gym.skip_venv_if_present=true \
+    ++env.nemo_gym.uv_venv_dir=${GYM_VENV_DIR} \
+    ++env.nemo_gym.skip_venv_if_present=true \
     policy.model_name=${MODEL_PATH} \
     checkpointing.checkpoint_dir=${CHECKPOINT_DIR} \
     logger.log_dir=${LOG_DIR} \
@@ -216,11 +234,27 @@ SBATCH_CMD=(
     --job-name="${WANDB_NAME}"
     --partition="${SLURM_PARTITION}"
     --time="${SLURM_TIME_LIMIT}"
-    --gres=gpu:8
+    --gres=gpu:"${GPUS_PER_NODE:-8}"
     --exclusive
-    --dependency=singleton
+    --dependency=singleton${SLURM_EXTRA_DEPENDENCY:+,${SLURM_EXTRA_DEPENDENCY}}
     ray.sub
 )
+if [[ -n "${SLURM_QOS:-}" ]]; then
+    SBATCH_CMD=("${SBATCH_CMD[@]:0:1}" --qos="${SLURM_QOS}" "${SBATCH_CMD[@]:1}")
+fi
+if [[ -n "${SLURM_COMMENT:-}" ]]; then
+    SBATCH_CMD=("${SBATCH_CMD[@]:0:1}" --comment="${SLURM_COMMENT}" "${SBATCH_CMD[@]:1}")
+fi
+if [[ -n "${SLURM_LOG_DIR}" ]]; then
+    SBATCH_CMD=("${SBATCH_CMD[@]:0:1}" --output="${SLURM_LOG_DIR}/%j.out" --error="${SLURM_LOG_DIR}/%j.err" "${SBATCH_CMD[@]:1}")
+fi
+if [[ -n "${SLURM_SEGMENT:-}" ]]; then
+    if (( SBATCH_NUM_NODES % SLURM_SEGMENT != 0 )); then
+        echo "Error: SBATCH_NUM_NODES=${SBATCH_NUM_NODES} not divisible by SLURM_SEGMENT=${SLURM_SEGMENT}" >&2
+        exit 1
+    fi
+    SBATCH_CMD=("${SBATCH_CMD[@]:0:1}" --segment="${SLURM_SEGMENT}" "${SBATCH_CMD[@]:1}")
+fi
 
 if [[ "$DRY_RUN" == true ]]; then
     echo ""

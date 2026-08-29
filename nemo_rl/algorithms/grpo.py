@@ -3018,6 +3018,7 @@ def grpo_train(
                             greedy=False,
                             effort_config=_get_effort_config(master_config),
                             reward_penalty_config=master_config.reward_penalties,
+                            length_penalty_config=master_config.grpo.model_dump(),
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                             mask_env_flagged_samples=should_mask_flagged_samples(
                                 master_config.env
@@ -3941,6 +3942,11 @@ def validate(
                     greedy=False,
                     effort_config=_get_effort_config(master_config),
                     reward_penalty_config=master_config.reward_penalties,
+                    # No length_penalty_config here: validation metrics
+                    # (accuracy/pass_k) must reflect the raw env reward, and the
+                    # adjustment code groups by the TRAINING stride
+                    # (num_generations_per_prompt), which does not match
+                    # val_num_generations_per_prompt.
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                     mask_env_flagged_samples=should_mask_flagged_samples(
                         master_config.env

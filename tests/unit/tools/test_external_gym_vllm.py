@@ -20,6 +20,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -38,6 +39,39 @@ from tools.external_gym_vllm.vllm_pool_lb import (
 REPO_ROOT = Path(__file__).parents[3]
 
 
+def test_serve_wrapper_applies_only_external_vllm_patches(monkeypatch):
+    from tools.external_gym_vllm import serve_vllm_on_ray
+
+    calls = []
+    monkeypatch.setattr(
+        serve_vllm_on_ray,
+        "_load_apply_external_vllm_patches",
+        lambda: lambda: calls.append("patches"),
+    )
+    monkeypatch.setattr(
+        serve_vllm_on_ray.ray,
+        "init",
+        lambda **_kwargs: calls.append("ray"),
+    )
+
+    vllm_module = types.ModuleType("vllm")
+    vllm_module.__path__ = []
+    entrypoints_module = types.ModuleType("vllm.entrypoints")
+    entrypoints_module.__path__ = []
+    cli_module = types.ModuleType("vllm.entrypoints.cli")
+    cli_module.__path__ = []
+    cli_main_module = types.ModuleType("vllm.entrypoints.cli.main")
+    cli_main_module.main = lambda: calls.append("vllm")
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints", entrypoints_module)
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints.cli", cli_module)
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints.cli.main", cli_main_module)
+
+    serve_vllm_on_ray.main()
+
+    assert calls == ["patches", "ray", "vllm"]
+
+
 def test_serve_wrapper_loads_patches_without_importing_nemo_rl_package():
     script = REPO_ROOT / "tools/external_gym_vllm/serve_vllm_on_ray.py"
     program = textwrap.dedent(
@@ -48,7 +82,8 @@ def test_serve_wrapper_loads_patches_without_importing_nemo_rl_package():
 
         sys.modules["ray"] = types.ModuleType("ray")
         namespace = runpy.run_path({str(script)!r})
-        namespace["_load_apply_vllm_patches"]()
+        apply_external_vllm_patches = namespace["_load_apply_external_vllm_patches"]()
+        assert callable(apply_external_vllm_patches)
         assert "nemo_rl.models.generation" not in sys.modules
         assert "nemo_rl.models.policy" not in sys.modules
         """
