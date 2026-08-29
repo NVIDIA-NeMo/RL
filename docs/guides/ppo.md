@@ -187,12 +187,13 @@ Unlike GRPO, which performs one training update per rollout, PPO can perform mul
 ```yaml
 ppo:
   ppo_epochs: 4          # actor passes over each rollout batch
-  critic_ppo_epochs: 6  # critic passes; null uses ppo_epochs
+  critic_ppo_epochs: ${ppo.ppo_epochs}  # critic passes; follows actor by default
 ```
 
 Each pass uses the same returns and advantage estimates computed from the initial
-rollout. `critic_ppo_epochs` must be greater than or equal to `ppo_epochs`, so the
-critic can be fit harder without adding actor updates.
+rollout. Both epoch counts must be at least 1 and can be configured independently;
+the exemplar uses interpolation so the critic follows the actor unless explicitly
+overridden.
 
 ### Critic Warmup
 
@@ -273,7 +274,7 @@ ppo:
   max_num_epochs: 100000
   max_num_steps: 100000
   ppo_epochs: 4
-  critic_ppo_epochs: null
+  critic_ppo_epochs: ${ppo.ppo_epochs}
   policy_training_start_step: 0
   warm_start_value_checkpoint: null
   val_period: 20
@@ -331,7 +332,7 @@ value_loss_fn:
 
 **PPO-specific parameters:**
 - **`ppo.ppo_epochs`**: Number of actor training updates per rollout batch
-- **`ppo.critic_ppo_epochs`**: Number of critic training updates per rollout batch. `null` uses `ppo_epochs`; an explicit value must be greater than or equal to it.
+- **`ppo.critic_ppo_epochs`**: Number of critic training updates per rollout batch. It can differ from `ppo_epochs`; the exemplar defaults it to `${ppo.ppo_epochs}`.
 - **`ppo.policy_training_start_step`**: Number of critic-only warmup steps before policy training begins
 - **`ppo.warm_start_value_checkpoint`**: Checkpoint step directory whose `value/` seeds the critic on a fresh run. See [Warm-Starting the Critic](#warm-starting-the-critic)
 - **`ppo.seq_logprob_error_threshold`**: Nullable sequence-level multiplicative probability-error threshold. PPO always logs sequence-level train/generation mismatch metrics; when this is set, sequences above the threshold are excluded from advantage and loss computation.

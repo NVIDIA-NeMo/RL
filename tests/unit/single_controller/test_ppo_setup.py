@@ -292,17 +292,17 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="ppo_epochs must be at least 1"):
             validate_single_controller_config(mc)
 
-    def test_rejects_fewer_critic_epochs_than_actor_epochs(self):
+    def test_rejects_a_critic_epoch_count_below_one(self):
         mc = _ppo_master_config(
             ppo=PPOConfig.model_construct(
                 max_num_steps=100,
                 ppo_epochs=2,
-                critic_ppo_epochs=1,
+                critic_ppo_epochs=0,
                 **_STEP_CONFIG,
             )
         )
 
-        with pytest.raises(ValueError, match="critic_ppo_epochs"):
+        with pytest.raises(ValueError, match="critic_ppo_epochs must be at least 1"):
             validate_single_controller_config(mc)
 
     @pytest.mark.parametrize(
@@ -510,6 +510,7 @@ class TestMegatronTrainIters:
             ppo=PPOConfig.model_construct(
                 max_num_steps=7,
                 ppo_epochs=ppo_epochs,
+                critic_ppo_epochs=ppo_epochs,
                 policy_training_start_step=policy_training_start_step,
                 **_STEP_CONFIG,
             ),

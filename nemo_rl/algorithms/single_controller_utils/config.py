@@ -865,10 +865,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
-    # model_construct-based callers bypass PPOConfig's model validator, so
-    # resolve again at setup to keep invalid epoch relationships fail-fast.
+    # model_construct-based callers bypass PPOConfig's model validator, so run
+    # the same epoch validation at setup to keep invalid counts fail-fast.
     assert master_config.ppo is not None
-    _ = master_config.ppo.resolved_critic_ppo_epochs
+    master_config.ppo.validate_epoch_settings()
 
     # Each PPO epoch must consume the complete RL batch. Without this guard, every
     # chunk would independently run the configured actor and critic optimizer steps.

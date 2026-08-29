@@ -201,16 +201,11 @@ class SingleControllerActor:
         self._algo_cfg = algo_config(master_config)
         self._async_cfg = master_config.async_rl
         self._is_ppo: bool = is_ppo_run(master_config)
-        self._ppo_epochs: int
-        self._critic_ppo_epochs: int
-        if self._is_ppo:
-            assert master_config.ppo is not None
-            self._ppo_epochs = master_config.ppo.ppo_epochs
-            self._critic_ppo_epochs = master_config.ppo.resolved_critic_ppo_epochs
-        else:
-            # GRPO has no epoch knob: it makes one optimizer step per RL step.
-            self._ppo_epochs = 1
-            self._critic_ppo_epochs = 1
+        # GRPO has no epoch knob: it makes one optimizer step per RL step.
+        self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
+        self._critic_ppo_epochs: int = (
+            self._algo_cfg.critic_ppo_epochs if self._is_ppo else 1
+        )
         self._message_level_advantage_penalties_enabled = (
             self._algo_cfg.invalid_tool_call_advantage is not None
             or self._algo_cfg.malformed_thinking_advantage is not None
@@ -3138,9 +3133,6 @@ class SingleControllerActor:
             The final epoch's ``train_from_meta`` output; earlier epochs'
             results are discarded.
         """
-        if num_epochs < 1:
-            raise ValueError("num_epochs must be at least 1")
-
         await asyncio.to_thread(self._value.prepare_for_training)
         result: dict[str, Any] | None = None
         for _ in range(num_epochs):

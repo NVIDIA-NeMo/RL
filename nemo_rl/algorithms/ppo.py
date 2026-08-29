@@ -192,11 +192,8 @@ class PPOConfig(BaseModel, extra="allow"):
     batch_multiplier: float = 1.0
     # Number of actor (policy) passes over each rollout batch.
     ppo_epochs: int = 4
-    # Number of critic (value) passes over each rollout batch. None preserves
-    # the historical behavior by coupling it to ppo_epochs. An explicit value
-    # may only increase the number of critic passes, never reduce it below the
-    # actor's count.
-    critic_ppo_epochs: int | None = None
+    # Number of critic (value) passes over each rollout batch.
+    critic_ppo_epochs: int = 4
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     adv_estimator: GAEConfig = Field(default_factory=GAEConfig)
@@ -220,9 +217,16 @@ class PPOConfig(BaseModel, extra="allow"):
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
     async_ppo: AsyncPPOConfig | None = Field(default_factory=AsyncPPOConfig)
 
+    def validate_epoch_settings(self) -> None:
+        """Validate the actor and critic update counts."""
+        if self.ppo_epochs < 1:
+            raise ValueError("ppo.ppo_epochs must be at least 1")
+        if self.critic_ppo_epochs < 1:
+            raise ValueError("ppo.critic_ppo_epochs must be at least 1")
+
     @model_validator(mode="after")
     def validate_settings(self) -> "PPOConfig":
-        _ = self.resolved_critic_ppo_epochs
+        self.validate_epoch_settings()
         if (
             self.async_ppo is not None
             and self.async_ppo.enabled
@@ -233,21 +237,6 @@ class PPOConfig(BaseModel, extra="allow"):
                 "warmup_generation_lead_steps requires policy_training_start_step > 0"
             )
         return self
-
-    @property
-    def resolved_critic_ppo_epochs(self) -> int:
-        """Resolve and validate the number of critic passes per rollout batch."""
-        if self.ppo_epochs < 1:
-            raise ValueError("ppo.ppo_epochs must be at least 1")
-        if self.critic_ppo_epochs is None:
-            return self.ppo_epochs
-        if self.critic_ppo_epochs < self.ppo_epochs:
-            raise ValueError(
-                "ppo.critic_ppo_epochs "
-                f"({self.critic_ppo_epochs}) must be greater than or equal to "
-                f"ppo.ppo_epochs ({self.ppo_epochs})"
-            )
-        return self.critic_ppo_epochs
 
 
 class PPOSaveState(TypedDict):
@@ -765,7 +754,7 @@ def setup(
     # ticks once per train() call, so policy and value need separate budgets
     # when their epoch counts or training start steps differ.
     ppo_epochs = ppo_config.ppo_epochs
-    critic_ppo_epochs = ppo_config.resolved_critic_ppo_epochs
+    critic_ppo_epochs = ppo_config.critic_ppo_epochs
     async_config = ppo_config.async_ppo
     if async_config.enabled:
         outer_training_steps = ppo_config.max_num_steps
@@ -1302,7 +1291,7 @@ def ppo_train(
     current_epoch = ppo_save_state["current_epoch"]
     max_num_epochs = master_config.ppo.max_num_epochs
     ppo_epochs = master_config.ppo.ppo_epochs
-    critic_ppo_epochs = master_config.ppo.resolved_critic_ppo_epochs
+    critic_ppo_epochs = master_config.ppo.critic_ppo_epochs
     # Number of PPO steps to train only the critic before starting policy
     # training.  Despite the legacy name, this is compared against total_steps
     # (not current_epoch) to match veRL's critic_warmup semantics.
@@ -2200,7 +2189,7 @@ def async_ppo_train(
     max_trajectory_age_steps = async_config.max_trajectory_age_steps
     warmup_generation_lead_steps = async_config.resolved_warmup_generation_lead_steps
     policy_training_start_step = master_config.ppo.policy_training_start_step
-    critic_ppo_epochs = master_config.ppo.resolved_critic_ppo_epochs
+    critic_ppo_epochs = master_config.ppo.critic_ppo_epochs
     if max_trajectory_age_steps > 1:
         print(
             "⚠️ WARNING: max_trajectory_age_steps > 1 increases off-policy "

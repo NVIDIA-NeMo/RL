@@ -645,24 +645,24 @@ def test_ppo_schema_rejects_unsupported_estimator_name():
         PPOConfig(adv_estimator={"name": "grpo"})
 
 
-def test_ppo_config_defaults_critic_epochs_to_actor_epochs():
-    config = PPOConfig(ppo_epochs=3)
+def test_ppo_config_defaults_both_epoch_counts_to_four():
+    config = PPOConfig()
 
-    assert config.critic_ppo_epochs is None
-    assert config.resolved_critic_ppo_epochs == 3
+    assert config.ppo_epochs == 4
+    assert config.critic_ppo_epochs == 4
 
 
 def test_ppo_config_accepts_more_critic_epochs():
     config = PPOConfig(ppo_epochs=1, critic_ppo_epochs=3)
 
-    assert config.resolved_critic_ppo_epochs == 3
+    assert config.critic_ppo_epochs == 3
 
 
-def test_ppo_config_rejects_fewer_critic_epochs_than_actor_epochs():
-    from pydantic import ValidationError
+def test_ppo_config_accepts_independent_actor_and_critic_epoch_counts():
+    config = PPOConfig(ppo_epochs=3, critic_ppo_epochs=1)
 
-    with pytest.raises(ValidationError, match="critic_ppo_epochs"):
-        PPOConfig(ppo_epochs=2, critic_ppo_epochs=1)
+    assert config.ppo_epochs == 3
+    assert config.critic_ppo_epochs == 1
 
 
 def test_ppo_config_rejects_zero_ppo_epochs():
@@ -670,6 +670,13 @@ def test_ppo_config_rejects_zero_ppo_epochs():
 
     with pytest.raises(ValidationError, match="ppo_epochs must be at least 1"):
         PPOConfig(ppo_epochs=0)
+
+
+def test_ppo_config_rejects_zero_critic_ppo_epochs():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="critic_ppo_epochs must be at least 1"):
+        PPOConfig(critic_ppo_epochs=0)
 
 
 def test_create_advantage_estimator_rejects_unsupported_name():
@@ -939,7 +946,9 @@ def _run_mock_ppo_train(
             overlong_filtering=overlong_filtering,
             policy_training_start_step=policy_training_start_step,
             ppo_epochs=ppo_epochs,
-            critic_ppo_epochs=critic_ppo_epochs,
+            critic_ppo_epochs=(
+                ppo_epochs if critic_ppo_epochs is None else critic_ppo_epochs
+            ),
             reward_scaling={"enabled": False},
             reward_shaping=RewardShapingConfig(enabled=False),
             seq_logprob_error_threshold=seq_logprob_error_threshold,
@@ -2053,9 +2062,9 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
         "expected_value_train_iters",
     ),
     [
-        (False, None, 0, 3, 3),
+        (False, 3, 0, 3, 3),
         (False, 5, 0, 3, 5),
-        (True, None, 0, 30, 30),
+        (True, 3, 0, 30, 30),
         (True, 5, 2, 24, 50),
         (True, 5, 10, 1, 50),
     ],
@@ -2313,23 +2322,11 @@ def test_async_ppo_launcher_entry_guards(mutate, message):
         _validate_async_ppo_entry_config(config)
 
 
-@pytest.mark.parametrize(
-    ("mutate", "message"),
-    [
-        (lambda cfg: setattr(cfg.ppo, "ppo_epochs", 0), "ppo_epochs"),
-        (
-            lambda cfg: (
-                setattr(cfg.ppo, "skip_reference_policy_logprobs_calculation", True),
-                setattr(cfg.loss_fn, "reference_policy_kl_penalty", 0.1),
-            ),
-            "Skipping reference logprobs",
-        ),
-    ],
-)
-def test_async_ppo_training_loop_guards(mutate, message):
+def test_async_ppo_training_loop_rejects_skipped_reference_logprobs_with_kl_penalty():
     config = _make_async_ppo_config()
-    mutate(config)
-    with pytest.raises(ValueError, match=message):
+    config.ppo.skip_reference_policy_logprobs_calculation = True
+    config.loss_fn.reference_policy_kl_penalty = 0.1
+    with pytest.raises(ValueError, match="Skipping reference logprobs"):
         _call_async_ppo_until_guard(config)
 
 

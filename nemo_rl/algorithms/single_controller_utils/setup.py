@@ -737,7 +737,7 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     value_config = master_config.value
     if value_config.get("megatron_cfg", {}).get("enabled", False):
         value_config["megatron_cfg"]["train_iters"] = (  # type: ignore[index]
-            algo_cfg.max_num_steps * ppo_config.resolved_critic_ppo_epochs
+            algo_cfg.max_num_steps * ppo_config.critic_ppo_epochs
         )
 
 
