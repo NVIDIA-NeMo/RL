@@ -117,6 +117,19 @@ class Vllm0251RefitAdapter:
     not selected as a runtime implementation here.
     """
 
+    _model_runner: _VllmModelRunner
+    _model_config: object
+    _refit_device: Any
+    _expected_components: frozenset[tuple[str, str]]
+    _expected_local_shapes: dict[tuple[str, str], tuple[int, ...]]
+    _loaded_components: set[tuple[str, str]]
+    _native_bindings: dict[str, _NativeDestinationBinding]
+    _bridged_target_ids: set[int]
+    _config_context: AbstractContextManager[Any] | None
+    _finalize_layerwise_reload: Callable[..., Any] | None
+    _state: str
+    _failure: BaseException | None
+
     def __init__(
         self,
         *,
@@ -126,7 +139,7 @@ class Vllm0251RefitAdapter:
     ) -> None:
         self._model_runner = model_runner
         self._model_config = model_config
-        self._device = device
+        self._refit_device = device
         self._expected_components: frozenset[tuple[str, str]] = frozenset()
         self._expected_local_shapes: dict[tuple[str, str], tuple[int, ...]] = {}
         self._loaded_components: set[tuple[str, str]] = set()
@@ -211,7 +224,7 @@ class Vllm0251RefitAdapter:
             self._config_context = config_context
             self._state = "active"
             config_context.__enter__()
-            with torch.device(self._device):
+            with torch.device(self._refit_device):
                 initialize_layerwise_reload(self._model_runner.model)
             self._finalize_layerwise_reload = finalize_layerwise_reload
             self._bridged_target_ids.clear()
@@ -271,18 +284,21 @@ class Vllm0251RefitAdapter:
             raise
 
         def pre(_base: torch.Tensor) -> RefitCtx:
-            return RefitCtx(buf=torch.empty_like(region, device=self._device))
+            return RefitCtx(buf=torch.empty_like(region, device=self._refit_device))
+
+        resolved_binding = binding
+        resolved_target = target
 
         def post(ctx: RefitCtx) -> None:
             self._load_local_component(
-                binding=binding,
+                binding=resolved_binding,
                 role=role,
                 target_name=target_name,
-                target=target,
+                target=resolved_target,
                 loaded_weight=ctx.buf,
             )
 
-        return LocalParamSpec(base=target, pre=pre, post=post)
+        return LocalParamSpec(base=resolved_target, pre=pre, post=post)
 
     def load_component(
         self,
@@ -328,7 +344,7 @@ class Vllm0251RefitAdapter:
             finalize_layerwise_reload = self._finalize_layerwise_reload
             if finalize_layerwise_reload is None:
                 raise RuntimeError("vLLM refit adapter has no active finalizer")
-            with torch.device(self._device):
+            with torch.device(self._refit_device):
                 finalize_layerwise_reload(self._model_runner.model, self._model_config)
             self._verify_runtime_bindings()
         except BaseException as error:

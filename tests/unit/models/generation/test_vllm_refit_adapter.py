@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch.distributed._tensor import Shard
 from torch.distributed.tensor.placement_types import Replicate
 
@@ -1209,7 +1210,9 @@ def test_0251_adapter_repeated_refits_change_bytes_and_preserve_runtime_pointers
 
 
 @pytest.mark.vllm
-def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers() -> None:
+def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers(
+    tmp_path: Path,
+) -> None:
     vllm = pytest.importorskip("vllm")
     if vllm.__version__ != "0.25.1":
         pytest.skip("native refit integration is pinned to vLLM 0.25.1")
@@ -1220,7 +1223,7 @@ def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers() ->
 
     from unittest.mock import patch
 
-    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config import VllmConfig
     from vllm.model_executor.layers.fused_moe import FusedMoE
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
     from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
@@ -1353,7 +1356,7 @@ def test_0251_native_cuda_dense_and_routed_refit_preserves_runtime_pointers() ->
             "process_weights_after_loading",
             process_weights_after_loading_mxfp8_moe,
         ),
-        set_current_vllm_config(vllm_config),
+        _single_rank_vllm_model_parallel(tmp_path=tmp_path, vllm_config=vllm_config),
         torch.device("cuda"),
     ):
         model = NativeModel(vllm_config=vllm_config, quant_config=quant_config)
