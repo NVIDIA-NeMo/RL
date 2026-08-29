@@ -243,6 +243,11 @@ def _estimate_refit_tensor_size_in_bytes(
     return param.numel() * tp_size * ep_size * element_size
 
 
+def _is_mtp_megatron_param(param_name: str) -> bool:
+    """Return whether a Megatron parameter belongs to a co-trained MTP module."""
+    return param_name.startswith("mtp.") or ".mtp." in param_name
+
+
 def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
     """Return HF layer names whose weights originate from Megatron's MTP module.
 
@@ -261,9 +266,7 @@ def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
     for task in conversion_tasks or []:
         if task is None:
             continue
-        if ".mtp." in task.global_param_name or task.global_param_name.startswith(
-            "mtp."
-        ):
+        if _is_mtp_megatron_param(task.global_param_name):
             hf = task.mapping.hf_param
             for hf_name in hf.values() if isinstance(hf, dict) else [str(hf)]:
                 mtp_layers.add(_extract_layer_name(hf_name))
@@ -2368,6 +2371,8 @@ class MegatronPolicyWorkerImpl(
             global_name = _megatron_local_name_to_global(
                 models, self.model.config, local_name, 0
             )
+            if _is_mtp_megatron_param(global_name):
+                continue
             mapping = registry.megatron_to_hf_lookup(f"{global_name}0")
             if mapping is None:
                 raise ValueError(
@@ -2386,6 +2391,8 @@ class MegatronPolicyWorkerImpl(
         tasks: list[Any] = []
         for global_name in global_names:
             if not global_name.endswith(grouped_suffixes):
+                continue
+            if _is_mtp_megatron_param(global_name):
                 continue
             local = local_tasks.get(global_name)
             if local is None:
@@ -2780,7 +2787,7 @@ class MegatronPolicyWorkerImpl(
         from nemo_rl.weight_sync.nccl_reshard_utils import is_nccl_reshard_param
 
         global_name = task.global_param_name
-        if global_name.startswith("mtp.") or ".mtp." in global_name:
+        if _is_mtp_megatron_param(global_name):
             return ()
 
         mapping = task.mapping
