@@ -187,23 +187,83 @@ def component_plan_digest(refit_info: Mapping[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def native_mxfp8_param_names(refit_info: Mapping[str, Any]) -> set[str]:
-    """Return parameters represented by a canonical MXFP8 value/scale pair."""
+def native_mxfp8_param_names(
+    refit_info: Mapping[str, Any],
+    *,
+    strict: bool = False,
+) -> set[str]:
+    """Return parameters represented by a canonical MXFP8 value/scale pair.
+
+    ``strict=False`` is suitable for feature detection: malformed entries are
+    ignored conservatively. ``strict=True`` validates every serialized
+    value/scale pair and reports malformed native metadata to the caller.
+    """
     result: set[str] = set()
     per_layer_params = refit_info.get("per_layer_params", {})
     for layer_name in refit_info.get("layer_names", []):
         for param_info in per_layer_params.get(layer_name, []):
-            components = param_info.get("components", [])
-            if [component.get("role") for component in components] != [
-                "weight",
-                "weight_scale",
-            ]:
+            if not isinstance(param_info, Mapping):
+                if strict:
+                    raise ValueError("refit parameter metadata must be a mapping")
                 continue
-            if (
-                str(components[0].get("dtype")) == "torch.float8_e4m3fn"
-                and str(components[1].get("dtype")) == "torch.uint8"
-            ):
-                result.add(param_info["name"])
+            logical_name = param_info.get("name")
+            if not isinstance(logical_name, str):
+                if strict:
+                    raise ValueError("refit parameter metadata must contain a name")
+                continue
+            try:
+                serialized = param_info.get("components")
+                metadata: dict[str, Any] = {
+                    "shape": param_info.get("global_shape"),
+                    "dtype": param_info.get("dtype"),
+                }
+                if serialized is not None:
+                    if not isinstance(serialized, Sequence) or isinstance(
+                        serialized, (str, bytes)
+                    ):
+                        raise ValueError(
+                            f"{logical_name} components must be a sequence"
+                        )
+                    normalized_components: list[dict[str, Any]] = []
+                    for component in serialized:
+                        if not isinstance(component, Mapping):
+                            raise ValueError(
+                                f"{logical_name} component metadata must be mappings"
+                            )
+                        normalized_components.append(
+                            {
+                                "role": component.get("role"),
+                                "shape": component.get("global_shape"),
+                                "dtype": component.get("dtype"),
+                            }
+                        )
+                    metadata["components"] = normalized_components
+                normalized = normalize_refit_components(
+                    logical_name,
+                    metadata,
+                )
+            except ValueError:
+                if strict:
+                    raise
+                continue
+            if len(normalized) == 1:
+                continue
+            weight, scale = normalized
+            if weight.dtype != "torch.float8_e4m3fn":
+                if strict:
+                    raise ValueError(
+                        f"{logical_name!r} native weight dtype must be "
+                        "torch.float8_e4m3fn"
+                    )
+                continue
+            if scale.dtype != "torch.uint8":
+                if strict:
+                    raise ValueError(
+                        f"{logical_name!r} weight_scale dtype must be torch.uint8"
+                    )
+                continue
+            if weight.role == "weight" and scale.role == "weight_scale":
+                result.add(logical_name)
     return result
 
 

@@ -954,6 +954,8 @@ def build_nccl_reshard_refit_info(
 
     per_layer_params: dict[str, list] = OrderedDict()
     for name, meta in state_dict_metadata.items():
+        normalized_components = normalize_refit_components(name, meta)
+        logical_weight = normalized_components[0]
         layer = _extract_layer_name(name)
         expert = is_expert_param(name)
         # Pick the gen (dst) mesh: experts go to the EP/TP-expert mesh, all other
@@ -980,8 +982,8 @@ def build_nccl_reshard_refit_info(
             src_dim_map = stage_src_dim_map
             info = {
                 "name": name,
-                "global_shape": tuple(meta["shape"]),
-                "dtype": meta["dtype"],
+                "global_shape": logical_weight.global_shape,
+                "dtype": logical_weight.dtype,
                 "pp_stage": stage,
                 "src_mesh_info": src_mesh,
                 "dst_mesh_info": dst_mesh,
@@ -996,13 +998,12 @@ def build_nccl_reshard_refit_info(
             src_dim_map = this_src_dim_map
             info = {
                 "name": name,
-                "global_shape": tuple(meta["shape"]),
-                "dtype": meta["dtype"],
+                "global_shape": logical_weight.global_shape,
+                "dtype": logical_weight.dtype,
                 "src_mesh_info": src_mesh,
                 "dst_mesh_info": dst_mesh,
             }
 
-        normalized_components = normalize_refit_components(name, meta)
         component_infos = []
         for component in normalized_components:
             src_placements = get_placements(
