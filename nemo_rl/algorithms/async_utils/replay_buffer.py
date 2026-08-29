@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import copy
 import gc
 import hashlib
 import json
@@ -216,6 +217,7 @@ class DataPlaneCheckpointBarrier:
         self._checkpoint_active = False
         self._active_mutations = 0
         self._section_holders: set[asyncio.Task[Any]] = set()
+        self._mutation_version = 0
 
     def _current_task(self) -> asyncio.Task[Any]:
         """Return the task entering a barrier section and reject reentrancy."""
@@ -228,6 +230,11 @@ class DataPlaneCheckpointBarrier:
                 "DataPlaneMutationCut you already have instead of opening another"
             )
         return task
+
+    @property
+    def mutation_version(self) -> int:
+        """Return a monotonic marker for completed outer mutation sections."""
+        return self._mutation_version
 
     @asynccontextmanager
     async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
@@ -245,6 +252,9 @@ class DataPlaneCheckpointBarrier:
             async with self._condition:
                 self._section_holders.discard(task)
                 self._active_mutations -= 1
+                # Count the section even when its body raised. A redundant
+                # snapshot is safe; skipping a partially applied mutation is not.
+                self._mutation_version += 1
                 if self._active_mutations == 0:
                     self._condition.notify_all()
 
@@ -1026,6 +1036,11 @@ class TQReplayBuffer:
         # Parallel to the lists above; populated only in token-capture mode.
         self._rollout_ids_list: list[Optional[list[str]]] = []
         self._staging_keys_list: list[Optional[list[str]]] = []
+        # Sampler selection removes ready slots from the live replay index but
+        # deliberately leaves their rows in TQ until optimizer completion.
+        # Retain their metadata here so a periodic checkpoint can make an open
+        # streamed step replayable without depending on the sibling lineage.
+        self._training_claims: dict[str, TQReplayGroupMetadata] = {}
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier
@@ -1410,15 +1425,71 @@ class TQReplayBuffer:
                 cut, drop_group_ids, clear_data_plane=remove_in_dp
             )
 
+    async def claim_for_training(self, idxs: list[int]) -> int:
+        """Transfer ready groups from sampler ownership to an open train step.
+
+        The canonical rows remain in TQ. Their metadata stays checkpoint-visible
+        until :meth:`release_training_claims` runs after optimizer success and
+        data-plane cleanup.
+        """
+        if len(idxs) == 0:
+            return 0
+        if len(idxs) != len(set(idxs)):
+            raise ValueError("training claim contains duplicate replay indices")
+        if min(idxs) < 0:
+            raise IndexError("training claim indices must be non-negative")
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the controller data-plane "
+                "checkpoint barrier before claiming groups for training"
+            )
+        claim_idxs = sorted(idxs, reverse=True)
+        if claim_idxs[0] >= len(self.meta_list):
+            raise IndexError(
+                "TQReplayBuffer.claim_for_training: indices out of range: "
+                f"{claim_idxs[0]}; size={len(self.meta_list)}"
+            )
+        claim_group_ids = [self._group_ids[i] for i in claim_idxs]
+        async with self._data_plane_checkpoint_barrier.mutation() as cut:
+            return await self._remove_groups_unlocked(
+                cut,
+                claim_group_ids,
+                clear_data_plane=False,
+                retain_training_claims=True,
+            )
+
+    def training_owned_replay_groups(self) -> list[TQReplayGroupMetadata]:
+        """Return metadata for canonical rows owned by the open train step."""
+        return copy.deepcopy(list(self._training_claims.values()))
+
+    def release_training_claims(self, group_ids: list[str]) -> None:
+        """Release checkpoint ownership after consumed TQ rows are cleared."""
+        if len(group_ids) != len(set(group_ids)):
+            raise ValueError("training claim release contains duplicate group IDs")
+        claimed_group_ids = set(self._training_claims)
+        released_group_ids = set(group_ids)
+        unknown = sorted(released_group_ids - claimed_group_ids)
+        unreleased = sorted(claimed_group_ids - released_group_ids)
+        if unknown or unreleased:
+            raise ValueError(
+                "training claim release does not match current ownership: "
+                f"unknown={unknown!r}, unreleased={unreleased!r}"
+            )
+        for group_id in group_ids:
+            del self._training_claims[group_id]
+
     async def _remove_groups_unlocked(
         self,
         cut: DataPlaneMutationCut,
         group_ids: list[str],
         *,
         clear_data_plane: bool,
+        retain_training_claims: bool = False,
     ) -> int:
         """Remove stable groups while the caller owns a live mutation cut."""
         cut.require_live()
+        if clear_data_plane and retain_training_claims:
+            raise ValueError("cleared rows cannot be retained as training claims")
         if len(group_ids) != len(set(group_ids)):
             raise ValueError("replay removal contains duplicate group IDs")
         index_by_group_id = {group_id: i for i, group_id in enumerate(self._group_ids)}
@@ -1468,6 +1539,25 @@ class TQReplayBuffer:
                         "may already be cleared"
                     ) from error
 
+        new_training_claims: dict[str, TQReplayGroupMetadata] = {}
+        if retain_training_claims:
+            for group_id in group_ids:
+                i = index_by_group_id[group_id]
+                meta = self.meta_list[i]
+                if meta is None or not self.ready_list[i]:
+                    raise RuntimeError(
+                        "only ready replay groups may be claimed for training"
+                    )
+                if group_id in self._training_claims:
+                    raise ValueError(f"duplicate training-owned group_id={group_id!r}")
+                new_training_claims[group_id] = {
+                    "meta": copy.deepcopy(meta),
+                    "start_weight": self.start_weight_list[i],
+                    "end_weight": self.end_weight_list[i],
+                    "target_step": self.target_step_list[i],
+                    "group_id": group_id,
+                }
+
         # A different mutation may have removed a lower list slot while the
         # DataPlane calls were awaiting. Resolve the original stable IDs again;
         # never apply pre-await indices to the now-shifted parallel lists. A group
@@ -1483,12 +1573,20 @@ class TQReplayBuffer:
             ),
             reverse=True,
         )
+        if retain_training_claims and len(current_drop_idxs) != len(group_ids):
+            raise RuntimeError("training claim ownership changed during mutation")
+        self._training_claims.update(new_training_claims)
         for i in current_drop_idxs:
             self._delete_slot(i)
 
         return len(current_drop_idxs)
 
-    def metadata_state_dict(self, *, saved_capacity: int) -> TQReplayMetadataState:
+    def metadata_state_dict(
+        self,
+        *,
+        saved_capacity: int,
+        additional_groups: Optional[list[TQReplayGroupMetadata]] = None,
+    ) -> TQReplayMetadataState:
         """Capture the controller index for ready groups without tensor payloads.
 
         The caller must hold the exclusive side of the shared data-plane
@@ -1504,7 +1602,9 @@ class TQReplayBuffer:
         ``_train_pump`` -- including future finalizer paths -- must take a
         mutation slot; canonical writes are not required to originate
         specifically from :meth:`commit`.
-        In-flight reservations are intentionally omitted.
+        In-flight reservations are intentionally omitted. ``additional_groups``
+        is used by periodic snapshots to re-index rows claimed by an unfinished
+        streamed optimizer step.
         """
         groups: list[TQReplayGroupMetadata] = []
         for i, ready in enumerate(self.ready_list):
@@ -1521,6 +1621,27 @@ class TQReplayBuffer:
                     "group_id": self._group_ids[i],
                 }
             )
+        existing_group_ids = {group["group_id"] for group in groups}
+        existing_sample_ids = {
+            sample_id for group in groups for sample_id in group["meta"].sample_ids
+        }
+        for group in additional_groups or []:
+            group_id = group["group_id"]
+            if group_id in existing_group_ids:
+                raise ValueError(
+                    f"additional replay metadata duplicates group_id={group_id!r}"
+                )
+            duplicate_sample_ids = existing_sample_ids.intersection(
+                group["meta"].sample_ids
+            )
+            if duplicate_sample_ids:
+                raise ValueError(
+                    "additional replay metadata duplicates sample IDs: "
+                    f"{sorted(duplicate_sample_ids)!r}"
+                )
+            groups.append(copy.deepcopy(group))
+            existing_group_ids.add(group_id)
+            existing_sample_ids.update(group["meta"].sample_ids)
         return {
             "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
             "storage": REPLAY_BUFFER_METADATA_STORAGE,
@@ -1572,7 +1693,7 @@ class TQReplayBuffer:
                 sample_ids), disagrees with the native TQ snapshot, or exceeds
                 ``max_groups``.
         """
-        if self.meta_list or self._group_ids:
+        if self.meta_list or self._group_ids or self._training_claims:
             raise RuntimeError(
                 "Replay-buffer checkpoint loading requires an empty local buffer"
             )

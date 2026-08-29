@@ -90,6 +90,9 @@ class FakeBuffer:
             del self.ready_list[i]
         return len(idxs)
 
+    async def claim_for_training(self, idxs: list[int]) -> int:
+        return await self.remove(idxs, remove_in_dp=False)
+
 
 def _run(coro):
     return asyncio.run(coro)
