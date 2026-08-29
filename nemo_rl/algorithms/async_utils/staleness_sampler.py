@@ -287,7 +287,7 @@ class BaseSampler(abc.ABC):
         ]
         selected_meta = selected_metas[0].concat(*selected_metas[1:])  # type: ignore[union-attr]
         selected_meta.extra_info[ROLLOUT_METRICS] = selected_rollout_metrics
-        await self._buffer.remove(selected_idxs, remove_in_dp=False)
+        await self._buffer.claim_for_training(selected_idxs)
         return selected_meta, len(selected_idxs)
 
 
