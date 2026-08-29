@@ -1,0 +1,12 @@
+defaults: ./dapo-gemma4-26ba4b-it-4n8g-fsdp2-automodel.yaml
+policy:
+  dtensor_cfg:
+    context_parallel_size: 2
+checkpointing:
+  checkpoint_dir: results/dapo-gemma4-26ba4b-it-8n8g-fsdp2ep32cp2-automodel
+logger:
+  log_dir: logs/dapo-gemma4-26ba4b-it-8n8g-fsdp2ep32cp2-automodel
+  wandb:
+    name: dapo-gemma4-26ba4b-it-8n8g-fsdp2ep32cp2-automodel
+cluster:
+  num_nodes: 8
