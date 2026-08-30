@@ -1518,12 +1518,17 @@ def spinup_nemo_gym_actor(
             node_id=ray.get_runtime_context().get_node_id(),
             soft=True,
         )
+    # VIRTUAL_ENV must be the venv root, not the interpreter: gym server
+    # subprocesses run `uv venv`, and uv's interpreter discovery hard-errors
+    # inspecting an active venv whose path is a python binary (it probes
+    # `$VIRTUAL_ENV/bin/python3`). Mirrors environments/utils.py:create_env.
+    nemo_gym_py_venv = os.path.dirname(os.path.dirname(nemo_gym_py_exec))
     nemo_gym_opts["runtime_env"] = {
         "py_executable": nemo_gym_py_exec,
         "env_vars": {
             **os.environ,
-            "VIRTUAL_ENV": nemo_gym_py_exec,
-            "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
+            "VIRTUAL_ENV": nemo_gym_py_venv,
+            "UV_PROJECT_ENVIRONMENT": nemo_gym_py_venv,
         },
     }
 
