@@ -80,6 +80,32 @@ from nemo_rl.package_info import (
 os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
 
+# Let the RAYLET reap a dead worker's grandchildren, because nothing else will.
+#
+# A vLLM generation worker spawns its EngineCore as a plain multiprocessing child --
+# context.Process(target=EngineCoreProc.run_engine_core), no setsid, not a daemon -- and
+# that child owns the CUDA context and the KV cache. Every cleanup path that exists runs
+# INSIDE the dying process, so SIGKILL defeats all of them: vLLM's weakref.finalize never
+# fires, a non-daemon multiprocessing child is designed to outlive its parent, and Ray's
+# default RAY_kill_child_processes_on_worker_exit is the worker's own exit handler.
+#
+# The orphan then holds its GPU allocation for the life of the job. Job 6720618 measured it
+# on 4xGB200: after one generation shard was SIGKILLed, cuda:0 reported 69.36/184.31 GiB
+# free -- 114.95 GiB still held, which is one engine at gpu_memory_utilization=0.6 plus
+# overhead -- and that number did not move across five restart attempts over 370s. The
+# replacement could not fit, so re-admission failed while the survivors carried on.
+#
+# This is NOT specific to restart. Any shard loss leaks that GPU for the rest of the run;
+# the plain recovery variants only pass because nobody ever asks for the memory back.
+#
+# Set here rather than at ray.init: these are read by the raylet when the driver spawns it,
+# and the raylet outlives the worker, which is the whole point -- it can kill what the
+# worker no longer can. The EngineCore never calls setsid, so it stays in the worker's
+# process group and per-worker process-group cleanup reaches it.
+#
+# setdefault, not assignment: an operator debugging a wedged engine may want the corpse.
+os.environ.setdefault("RAY_process_group_cleanup_enabled", "1")
+
 
 def _is_build_isolation():
     """Detect if we're running in a uv build isolation environment.
