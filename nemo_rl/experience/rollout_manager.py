@@ -764,6 +764,7 @@ class AsyncNemoGymRolloutImpl:
         max_rollout_turns: int,
         generation_config: GenerationConfig,
         mask_env_flagged_samples: bool = True,
+        log_full_result_tables: bool = False,
         # Optional so direct construction does not have to carry the resiliency wiring;
         # RolloutManager always passes both explicitly.
         timeouts: Optional[RolloutTimeouts] = None,
@@ -782,6 +783,7 @@ class AsyncNemoGymRolloutImpl:
         self._max_rollout_turns = max_rollout_turns
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
+        self._log_full_result_tables = log_full_result_tables
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._max_gym_row_attempts = (
             retry_policy
@@ -1067,10 +1069,6 @@ class AsyncNemoGymRolloutImpl:
         agent_name: str,
     ) -> dict[str, Any]:
         """Aggregate per-sample and per-agent metrics."""
-        # Deferred: wandb is optional, and importing it at module scope would
-        # pull it in for every importer of nemo_rl.algorithms.grpo.
-        from wandb import Table
-
         # Prepare lists of values for each metric.
         total_reward = [c.reward for c in completions]
         turn_count = [
@@ -1131,10 +1129,15 @@ class AsyncNemoGymRolloutImpl:
                 rollout_metrics.update(
                     calculate_single_metric(values, n, f"{agent_name}/{key}")
                 )
-        rollout_metrics[f"{agent_name}/full_result"] = Table(
-            data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
-            columns=["Full result"],
-        )
+        if self._log_full_result_tables:
+            # W&B is optional. Keep the import behind the same runtime gate as
+            # table construction so a disabled backend has no import side effect.
+            from wandb import Table
+
+            rollout_metrics[f"{agent_name}/full_result"] = Table(
+                data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
+                columns=["Full result"],
+            )
 
         # Necessary for downstream nemo rl logging/printing.
         rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
@@ -1157,6 +1160,7 @@ class RolloutManager:
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
         mask_env_flagged_samples: bool = True,
+        log_full_result_tables: bool = False,
         tq_buffer: Optional[TQReplayBuffer] = None,
         timeouts: Optional[RolloutTimeouts] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
@@ -1196,6 +1200,7 @@ class RolloutManager:
             generation_config=generation_config,
             # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores it.
             mask_env_flagged_samples=mask_env_flagged_samples,
+            log_full_result_tables=log_full_result_tables,
             # None means "no deadlines", which is what async_rl's own defaults resolve
             # to; callers that have a config pass the resolved values in.
             timeouts=timeouts if timeouts is not None else RolloutTimeouts(),

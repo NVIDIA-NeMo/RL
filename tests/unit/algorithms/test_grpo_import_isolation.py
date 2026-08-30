@@ -35,6 +35,7 @@ DEFERRED_MODULES = [
     "matplotlib.pyplot",
     "fastapi",
     "uvicorn",
+    "ray.scripts.scripts",
 ]
 
 

@@ -157,6 +157,10 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
+        logger={
+            "wandb_enabled": False,
+            "wandb": {"log_nemo_gym_full_result_tables": False},
+        },
         cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
         env=env if env is not None else {},
@@ -847,6 +851,34 @@ class TestSetup:
 
         _, call_kwargs = mock_rollout_manager.call_args
         assert call_kwargs["effort_config"] is None
+
+    @pytest.mark.parametrize(
+        ("wandb_enabled", "table_flag", "expected"),
+        [
+            (False, False, False),
+            (False, True, False),
+            (True, False, False),
+            (True, True, True),
+        ],
+    )
+    def test_wandb_table_gate_reaches_rollout_manager(
+        self,
+        wandb_enabled: bool,
+        table_flag: bool,
+        expected: bool,
+        patched_factories,
+    ):
+        """SC uses the shared W&B/config gate instead of always building tables."""
+        mc = _make_master_config()
+        mc.logger["wandb_enabled"] = wandb_enabled
+        mc.logger["wandb"]["log_nemo_gym_full_result_tables"] = table_flag
+
+        with patch.object(sc_setup_mod, "RolloutManager") as mock_rollout_manager:
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert (
+            mock_rollout_manager.call_args.kwargs["log_full_result_tables"] is expected
+        )
 
     def test_router_replay_requires_routes_in_tq_buffer(self, patched_factories):
         mc = _make_master_config()

@@ -1563,6 +1563,10 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             min_groups_for_streaming_train=4,
             max_buffered_rollouts=8,
         ),
+        logger={
+            "wandb_enabled": False,
+            "wandb": {"log_nemo_gym_full_result_tables": False},
+        },
         checkpointing={
             "enabled": True,
             "checkpoint_dir": checkpoint_dir,

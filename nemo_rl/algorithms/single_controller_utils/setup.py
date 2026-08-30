@@ -122,6 +122,7 @@ from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     validate_warm_start_checkpoint,
 )
+from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
@@ -1405,6 +1406,10 @@ def setup_single_controller(
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
+        log_full_result_tables=should_log_nemo_gym_full_result_tables(
+            wandb_enabled=master_config.logger["wandb_enabled"],
+            wandb_config=master_config.logger["wandb"],
+        ),
         tq_buffer=tq_buffer,
         timeouts=RolloutTimeouts(
             rollout_s=master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s,
