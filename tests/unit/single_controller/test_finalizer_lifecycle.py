@@ -29,10 +29,6 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.experience.blackbox_finalizer import FinalizedGroup
 from nemo_rl.experience.finalizer_actor import FinalizationRequest
-from nemo_rl.experience.rollout_recovery import (
-    PromptGroupStatus,
-    RolloutRecoveryLedger,
-)
 from nemo_rl.experience.route_plan import (
     ROUTE_PLAN_SCHEMA_VERSION,
     RouteAssemblyPlan,
@@ -263,30 +259,3 @@ def test_post_train_cleanup_clears_canonical_rows_and_route_plan_staging_keys() 
             "partition_id": "staging",
         },
     ]
-
-
-def test_train_selection_transfers_finalized_group_to_open_step() -> None:
-    meta = KVBatchMeta(
-        partition_id="canonical",
-        task_name="train",
-        sample_ids=["group_g0"],
-        fields=["input_ids"],
-        sequence_lengths=[3],
-        tags=[{"weight_version": 3}],
-    )
-    ctrl = _controller(SimpleNamespace())
-    ledger = RolloutRecoveryLedger()
-    ledger.adopt_finalized_group(
-        group_id="group",
-        meta=meta,
-        start_weight_version=3,
-        end_weight_version=3,
-    )
-    ctrl._rollout_recovery_ledger = ledger
-
-    selected = ctrl._claim_train_meta(meta, num_groups=1)
-
-    assert selected == ["group"]
-    assert ledger.get_group("group").status == PromptGroupStatus.CLAIMED_FOR_TRAINING
-    assert ledger.open_train_step is not None
-    assert ledger.open_train_step.group_ids == ["group"]

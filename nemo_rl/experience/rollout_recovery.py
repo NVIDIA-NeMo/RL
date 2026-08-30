@@ -28,8 +28,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
 
-from nemo_rl.data_plane import KVBatchMeta
-
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
@@ -74,16 +72,6 @@ class PromptGroupStatus(StrEnum):
     READY_TO_FINALIZE = "ready_to_finalize"
     FINALIZING = "finalizing"
     FINALIZATION_UNKNOWN = "finalization_unknown"
-    FINALIZED = "finalized"
-    CLAIMED_FOR_TRAINING = "claimed_for_training"
-    APPLIED_UNCHECKPOINTED = "applied_uncheckpointed"
-
-
-class TrainStepStatus(StrEnum):
-    """State of the one optimizer step the SingleController may have open."""
-
-    OPEN = "open"
-    APPLIED_UNCHECKPOINTED = "applied_uncheckpointed"
 
 
 @dataclass(frozen=True)
@@ -179,10 +167,6 @@ class PromptGroupRecoveryRecord:
     siblings: list[RolloutSiblingRecord]
     phase: PromptGroupPhase
     status: PromptGroupStatus = PromptGroupStatus.GENERATING
-    canonical_meta: Optional[KVBatchMeta] = None
-    group_min_weight_version: Optional[int] = None
-    group_max_weight_version: Optional[int] = None
-    claimed_train_step: Optional[int] = None
 
     @property
     def prompt_payload(self) -> DatumSpec:
@@ -226,17 +210,6 @@ class PromptGroupRecoveryRecord:
             for sibling in self.siblings
             if sibling.current_attempt.status == RolloutAttemptStatus.SEALED
         ]
-
-
-@dataclass
-class OpenTrainStepRecord:
-    """Groups contributing to the current, not-yet-durable optimizer step."""
-
-    train_step: int
-    trainer_version: int
-    expected_group_count: int
-    group_ids: list[str] = field(default_factory=list)
-    status: TrainStepStatus = TrainStepStatus.OPEN
 
 
 @dataclass(frozen=True)
@@ -293,11 +266,6 @@ class RolloutRecoveryLedger:
 
     def __init__(self) -> None:
         self._groups: dict[str, PromptGroupRecoveryRecord] = {}
-        self._open_train_step: Optional[OpenTrainStepRecord] = None
-
-    @property
-    def open_train_step(self) -> Optional[OpenTrainStepRecord]:
-        return copy.deepcopy(self._open_train_step)
 
     def groups(self) -> list[PromptGroupRecoveryRecord]:
         return [self._copy_group(group) for group in self._groups.values()]
@@ -433,12 +401,7 @@ class RolloutRecoveryLedger:
         record.status = PromptGroupStatus.GENERATING
 
     def assert_checkpoint_safe(self) -> None:
-        """Reject states whose publication or optimizer outcome is ambiguous."""
-        if self._open_train_step is not None:
-            raise RuntimeError(
-                "rollout recovery contains an open optimizer step; restoring "
-                "mid-step training ownership is not supported"
-            )
+        """Reject states whose canonical publication outcome is ambiguous."""
         unsafe = [
             record.group_id
             for record in self._groups.values()
@@ -446,8 +409,6 @@ class RolloutRecoveryLedger:
             in {
                 PromptGroupStatus.FINALIZING,
                 PromptGroupStatus.FINALIZATION_UNKNOWN,
-                PromptGroupStatus.CLAIMED_FOR_TRAINING,
-                PromptGroupStatus.APPLIED_UNCHECKPOINTED,
             }
         ]
         if unsafe:
@@ -773,137 +734,10 @@ class RolloutRecoveryLedger:
         )
         record.status = PromptGroupStatus.FINALIZATION_UNKNOWN
 
-    def mark_group_finalized(
-        self,
-        group_id: str,
-        *,
-        meta: KVBatchMeta,
-        group_min_weight_version: int,
-        group_max_weight_version: int,
-    ) -> None:
-        """Transfer recovery ownership from staged receipts to canonical TQ rows."""
-        record = self._require_group(group_id)
-        self._require_group_status(
-            record,
-            allowed={PromptGroupStatus.FINALIZING},
-            transition="finalize",
-        )
-        if list(meta.sample_ids) != record.logical_rollout_ids:
-            raise ValueError(
-                "finalized sample IDs do not match stable logical rollout IDs: "
-                f"{meta.sample_ids!r} != {record.logical_rollout_ids!r}"
-            )
-        record.canonical_meta = copy.deepcopy(meta)
-        record.group_min_weight_version = int(group_min_weight_version)
-        record.group_max_weight_version = int(group_max_weight_version)
-        record.runtime_prompt_payload = None
-        record.status = PromptGroupStatus.FINALIZED
-
-    def claim_groups_for_training(
-        self,
-        group_ids: list[str],
-        *,
-        train_step: int,
-        trainer_version: int,
-        expected_group_count: int,
-    ) -> None:
-        """Move finalized groups into the controller's one open optimizer step."""
-        if not group_ids:
-            raise ValueError("training claim must contain at least one group")
-        if len(group_ids) != len(set(group_ids)):
-            raise ValueError("training claim contains duplicate group IDs")
-        if self._open_train_step is None:
-            self._open_train_step = OpenTrainStepRecord(
-                train_step=train_step,
-                trainer_version=trainer_version,
-                expected_group_count=expected_group_count,
-            )
-        open_step = self._open_train_step
-        if (
-            open_step.train_step != train_step
-            or open_step.trainer_version != trainer_version
-            or open_step.expected_group_count != expected_group_count
-            or open_step.status != TrainStepStatus.OPEN
-        ):
-            raise ValueError(
-                "training claim does not match the existing open train step"
-            )
-        records = [self._require_group(group_id) for group_id in group_ids]
-        for record in records:
-            if record.status != PromptGroupStatus.FINALIZED:
-                raise ValueError(
-                    f"cannot claim group {record.group_id!r} from "
-                    f"{record.status.value!r}"
-                )
-        if len(open_step.group_ids) + len(group_ids) > expected_group_count:
-            raise ValueError("training claim exceeds the step's expected group count")
-        for record in records:
-            record.status = PromptGroupStatus.CLAIMED_FOR_TRAINING
-            record.claimed_train_step = train_step
-            open_step.group_ids.append(record.group_id)
-
-    def mark_train_step_applied(self, train_step: int) -> None:
-        """Record optimizer success while rows are still not checkpoint-covered."""
-        open_step = self._require_open_train_step(train_step)
-        if open_step.status != TrainStepStatus.OPEN:
-            raise ValueError(
-                f"train step {train_step} is already {open_step.status.value!r}"
-            )
-        if len(open_step.group_ids) != open_step.expected_group_count:
-            raise ValueError(
-                f"train step {train_step} has {len(open_step.group_ids)} claimed "
-                f"groups; expected {open_step.expected_group_count}"
-            )
-        for group_id in open_step.group_ids:
-            record = self._require_group(group_id)
-            if record.status != PromptGroupStatus.CLAIMED_FOR_TRAINING:
-                raise ValueError(
-                    f"train step {train_step} owns group {group_id!r} in state "
-                    f"{record.status.value!r}"
-                )
-        for group_id in open_step.group_ids:
-            self._groups[group_id].status = PromptGroupStatus.APPLIED_UNCHECKPOINTED
-        open_step.status = TrainStepStatus.APPLIED_UNCHECKPOINTED
-
-    def release_applied_train_step(self, train_step: int) -> None:
-        """Drop group metadata after the caller has cleared all owned TQ rows.
-
-        The current controller clears immediately after optimizer success. A later
-        persistence change will delay this call until a trainer checkpoint covers
-        the applied update.
-        """
-        open_step = self._require_open_train_step(train_step)
-        if open_step.status != TrainStepStatus.APPLIED_UNCHECKPOINTED:
-            raise ValueError(
-                f"cannot release train step {train_step} from "
-                f"{open_step.status.value!r}"
-            )
-        for group_id in open_step.group_ids:
-            del self._groups[group_id]
-        self._open_train_step = None
-
-    def rollback_open_train_step(self, train_step: int) -> None:
-        """Return an uncheckpointed step's groups to finalized ownership."""
-        open_step = self._require_open_train_step(train_step)
-        for group_id in open_step.group_ids:
-            record = self._require_group(group_id)
-            if record.status not in {
-                PromptGroupStatus.CLAIMED_FOR_TRAINING,
-                PromptGroupStatus.APPLIED_UNCHECKPOINTED,
-            }:
-                raise ValueError(
-                    f"cannot roll back group {group_id!r} from {record.status.value!r}"
-                )
-            record.status = PromptGroupStatus.FINALIZED
-            record.claimed_train_step = None
-        self._open_train_step = None
-
     def discard_group(self, cut: DataPlaneMutationCut, group_id: str) -> None:
         """Drop a group only after its external TQ/Gate ownership is cleaned."""
         cut.require_live()
-        record = self._require_group(group_id)
-        if record.claimed_train_step is not None:
-            raise ValueError(f"cannot discard training-owned group {group_id!r}")
+        self._require_group(group_id)
         del self._groups[group_id]
 
     def discard_canonical_groups(
@@ -961,10 +795,6 @@ class RolloutRecoveryLedger:
                     "start_weight_version": record.start_weight_version,
                     "status": record.status.value,
                     "phase": record.phase.value,
-                    "canonical_meta": copy.deepcopy(record.canonical_meta),
-                    "group_min_weight_version": record.group_min_weight_version,
-                    "group_max_weight_version": record.group_max_weight_version,
-                    "claimed_train_step": record.claimed_train_step,
                     "siblings": [
                         {
                             "generation_index": sibling.generation_index,
@@ -983,21 +813,9 @@ class RolloutRecoveryLedger:
                     ],
                 }
             )
-        open_step = self._open_train_step
         return {
             "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
             "groups": groups,
-            "open_train_step": (
-                None
-                if open_step is None
-                else {
-                    "train_step": open_step.train_step,
-                    "trainer_version": open_step.trainer_version,
-                    "expected_group_count": open_step.expected_group_count,
-                    "group_ids": list(open_step.group_ids),
-                    "status": open_step.status.value,
-                }
-            ),
         }
 
     @classmethod
@@ -1034,54 +852,6 @@ class RolloutRecoveryLedger:
                 raise ValueError(f"duplicate recovery group_id={record.group_id!r}")
             ledger._groups[record.group_id] = record
 
-        raw_open_step = state.get("open_train_step")
-        if raw_open_step is not None:
-            if not isinstance(raw_open_step, dict):
-                raise ValueError("open_train_step must be a mapping or None")
-            try:
-                open_step = OpenTrainStepRecord(
-                    train_step=int(raw_open_step["train_step"]),
-                    trainer_version=int(raw_open_step["trainer_version"]),
-                    expected_group_count=int(raw_open_step["expected_group_count"]),
-                    group_ids=list(raw_open_step["group_ids"]),
-                    status=TrainStepStatus(raw_open_step["status"]),
-                )
-            except (KeyError, TypeError, ValueError) as error:
-                raise ValueError("invalid open_train_step state") from error
-            if not all(isinstance(group_id, str) for group_id in open_step.group_ids):
-                raise ValueError("open_train_step group_ids must be strings")
-            if len(open_step.group_ids) != len(set(open_step.group_ids)):
-                raise ValueError("open_train_step contains duplicate group IDs")
-            if len(open_step.group_ids) > open_step.expected_group_count:
-                raise ValueError("open_train_step exceeds expected_group_count")
-            expected_group_status = (
-                PromptGroupStatus.CLAIMED_FOR_TRAINING
-                if open_step.status == TrainStepStatus.OPEN
-                else PromptGroupStatus.APPLIED_UNCHECKPOINTED
-            )
-            for group_id in open_step.group_ids:
-                record = ledger._require_group(group_id)
-                if (
-                    record.claimed_train_step != open_step.train_step
-                    or record.status != expected_group_status
-                ):
-                    raise ValueError(
-                        f"open_train_step ownership mismatch for group {group_id!r}"
-                    )
-            claimed_group_ids = {
-                record.group_id
-                for record in ledger._groups.values()
-                if record.claimed_train_step is not None
-            }
-            if claimed_group_ids != set(open_step.group_ids):
-                raise ValueError(
-                    "open_train_step does not list every training-owned group"
-                )
-            ledger._open_train_step = open_step
-        elif any(
-            record.claimed_train_step is not None for record in ledger._groups.values()
-        ):
-            raise ValueError("claimed groups require an open_train_step record")
         admission_states: dict[str, tuple[PromptGroupPhase, Optional[int]]] = {}
         for record in ledger._groups.values():
             signature = (record.phase, record.target_step)
@@ -1100,13 +870,12 @@ class RolloutRecoveryLedger:
     ) -> None:
         """Replace this empty ledger from a validated checkpoint envelope."""
         cut.require_live()
-        if self._groups or self._open_train_step is not None:
+        if self._groups:
             raise RuntimeError(
                 "cannot restore into a non-empty rollout recovery ledger"
             )
         restored = self.from_state_dict(state)
         self._groups = restored._groups
-        self._open_train_step = restored._open_train_step
 
     @classmethod
     def _group_from_state(
@@ -1261,30 +1030,12 @@ class RolloutRecoveryLedger:
             raise ValueError("prompt_ref task_name must be a string or None")
         if sample_id != prompt_id:
             raise ValueError("prompt_ref sample_id must match prompt_id")
-        canonical_meta = raw_group.get("canonical_meta")
-        if canonical_meta is not None and not isinstance(canonical_meta, KVBatchMeta):
-            raise ValueError("canonical_meta must be KVBatchMeta or None")
         target_step = raw_group.get("target_step")
-        claimed_train_step = raw_group.get("claimed_train_step")
         if target_step is not None and not isinstance(target_step, int):
             raise ValueError("target_step must be an integer or None")
-        if claimed_train_step is not None and not isinstance(claimed_train_step, int):
-            raise ValueError("claimed_train_step must be an integer or None")
         start_weight = raw_group.get("start_weight_version")
         if not isinstance(start_weight, int):
             raise ValueError("start_weight_version must be an integer")
-        min_weight = raw_group.get("group_min_weight_version")
-        max_weight = raw_group.get("group_max_weight_version")
-        if min_weight is not None and not isinstance(min_weight, int):
-            raise ValueError("group_min_weight_version must be an integer or None")
-        if max_weight is not None and not isinstance(max_weight, int):
-            raise ValueError("group_max_weight_version must be an integer or None")
-
-        finalized_states = {
-            PromptGroupStatus.FINALIZED,
-            PromptGroupStatus.CLAIMED_FOR_TRAINING,
-            PromptGroupStatus.APPLIED_UNCHECKPOINTED,
-        }
         prefinalization_sealed_states = {
             PromptGroupStatus.READY_TO_FINALIZE,
             PromptGroupStatus.FINALIZING,
@@ -1299,23 +1050,6 @@ class RolloutRecoveryLedger:
         if status in prefinalization_sealed_states and not all_current_attempts_sealed:
             raise ValueError(
                 f"group state {status.value!r} requires every sibling to be sealed"
-            )
-        if status in finalized_states:
-            if canonical_meta is None or min_weight is None or max_weight is None:
-                raise ValueError("finalized group state requires canonical metadata")
-            if list(canonical_meta.sample_ids) != [
-                f"{group_id}_g{s.generation_index}" for s in siblings
-            ]:
-                raise ValueError("canonical sample IDs do not match logical lineage")
-        elif canonical_meta is not None:
-            raise ValueError("unfinished group cannot contain canonical metadata")
-        claimed_states = {
-            PromptGroupStatus.CLAIMED_FOR_TRAINING,
-            PromptGroupStatus.APPLIED_UNCHECKPOINTED,
-        }
-        if (status in claimed_states) != (claimed_train_step is not None):
-            raise ValueError(
-                "claimed_train_step must be present exactly for training-owned groups"
             )
 
         return PromptGroupRecoveryRecord(
@@ -1332,10 +1066,6 @@ class RolloutRecoveryLedger:
             siblings=siblings,
             phase=phase,
             status=status,
-            canonical_meta=copy.deepcopy(canonical_meta),
-            group_min_weight_version=min_weight,
-            group_max_weight_version=max_weight,
-            claimed_train_step=claimed_train_step,
         )
 
     def _require_group(self, group_id: str) -> PromptGroupRecoveryRecord:
@@ -1361,10 +1091,6 @@ class RolloutRecoveryLedger:
             siblings=copy.deepcopy(record.siblings),
             phase=record.phase,
             status=record.status,
-            canonical_meta=copy.deepcopy(record.canonical_meta),
-            group_min_weight_version=record.group_min_weight_version,
-            group_max_weight_version=record.group_max_weight_version,
-            claimed_train_step=record.claimed_train_step,
         )
 
     @staticmethod
@@ -1390,13 +1116,6 @@ class RolloutRecoveryLedger:
                 f"cannot {transition} group {record.group_id!r} from "
                 f"{record.status.value!r}"
             )
-
-    def _require_open_train_step(self, train_step: int) -> OpenTrainStepRecord:
-        open_step = self._open_train_step
-        if open_step is None or open_step.train_step != train_step:
-            raise ValueError(f"train step {train_step} is not open")
-        return open_step
-
 
 def _validate_batch_shortfall(value: object) -> dict[int, int]:
     """Return a defensive copy of per-step permanent rollout losses."""
@@ -1468,7 +1187,6 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
     ledger_state: RolloutRecoveryState = {
         "schema_version": schema_version,
         "groups": groups,
-        "open_train_step": state.get("open_train_step"),
     }
     return ParsedRolloutRecoveryState(
         ledger_state=ledger_state,

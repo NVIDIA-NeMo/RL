@@ -28,7 +28,6 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     PromptGroupPhase,
@@ -133,6 +132,13 @@ def test_ledger_round_trip_preserves_group_ownership() -> None:
     )
 
     state = ledger.state_dict()
+    assert "open_train_step" not in state
+    assert {
+        "canonical_meta",
+        "group_min_weight_version",
+        "group_max_weight_version",
+        "claimed_train_step",
+    }.isdisjoint(state["groups"][0])
     restored = RolloutRecoveryLedger()
     _load(restored, state)
 
@@ -773,58 +779,6 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
         _mutate(lambda cut: ledger.mark_finalization_unknown(cut, "g7"))
 
     with pytest.raises(RuntimeError, match="checkpoint-unsafe group states"):
-        ledger.state_dict()
-
-
-def test_checkpoint_rejects_an_open_optimizer_step() -> None:
-    ledger = RolloutRecoveryLedger()
-    group = _reserve(
-        ledger,
-        group_id="g7",
-        admission_id="batch-7",
-        prompt_id="7",
-        prompt_payload=_prompt(),
-        expected_generations=1,
-        target_step=7,
-        start_weight_version=6,
-        agent_name=None,
-        recovery_granularity=RecoveryGranularity.SIBLING,
-        admitted=True,
-    )
-    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
-    gate_id = group.gate_rollout_id(0)
-    _mutate(
-        lambda cut: ledger.mark_sibling_sealed(
-            cut,
-            "g7",
-            generation_index=0,
-            gate_rollout_id=gate_id,
-            receipt={
-                "rollout_id": gate_id,
-                "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
-            },
-            reward=1.0,
-        )
-    )
-    _mutate(lambda cut: ledger.mark_finalization_started(cut, "g7"))
-    ledger.mark_group_finalized(
-        "g7",
-        meta=KVBatchMeta(
-            partition_id="rollout_data",
-            task_name="train",
-            sample_ids=["g7_g0"],
-        ),
-        group_min_weight_version=6,
-        group_max_weight_version=6,
-    )
-    ledger.claim_groups_for_training(
-        ["g7"],
-        train_step=7,
-        trainer_version=7,
-        expected_group_count=1,
-    )
-
-    with pytest.raises(RuntimeError, match="open optimizer step"):
         ledger.state_dict()
 
 
