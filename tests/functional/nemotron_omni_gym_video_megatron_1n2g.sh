@@ -12,8 +12,8 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
 fi
 
 GPU_COUNT=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
-if (( GPU_COUNT < 4 )); then
-    echo "SKIP: Omni Gym-video Megatron smoke requires at least four GPUs"
+if (( GPU_COUNT < 2 )); then
+    echo "SKIP: Omni Gym-video Megatron smoke requires at least two GPUs"
     exit 0
 fi
 DETECTED_CUDA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0)
@@ -69,7 +69,7 @@ uv run --no-sync examples/nemo_gym/prepare_video_dataset.py convert \
 uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml \
     cluster.num_nodes=1 \
-    cluster.gpus_per_node=4 \
+    cluster.gpus_per_node=2 \
     policy.megatron_cfg.env_vars.TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
     policy.megatron_cfg.tensor_model_parallel_size=2 \
     policy.megatron_cfg.pipeline_model_parallel_size=1 \
@@ -85,7 +85,7 @@ uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     ++policy.megatron_cfg.optimizer.store_param_remainders=true \
     policy.generation.backend=megatron \
     ++policy.generation.bad_words=null \
-    policy.generation.colocated.enabled=false \
+    policy.generation.colocated.enabled=true \
     policy.generation.colocated.resources.num_nodes=1 \
     policy.generation.colocated.resources.gpus_per_node=2 \
     policy.generation.max_new_tokens=128 \

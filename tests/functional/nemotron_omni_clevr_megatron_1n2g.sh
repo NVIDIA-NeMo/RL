@@ -12,8 +12,8 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
 fi
 
 GPU_COUNT=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
-if (( GPU_COUNT < 4 )); then
-    echo "SKIP: Omni CLEVR Megatron smoke requires at least four visible GPUs"
+if (( GPU_COUNT < 2 )); then
+    echo "SKIP: Omni CLEVR Megatron smoke requires at least two visible GPUs"
     exit 0
 fi
 DETECTED_CUDA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0)
@@ -81,10 +81,10 @@ PY
 uv run --no-sync python examples/run_vlm_grpo.py \
     --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n4g-megatron_generation.v1.yaml \
     cluster.num_nodes=1 \
-    cluster.gpus_per_node=4 \
+    cluster.gpus_per_node=2 \
     policy.megatron_cfg.env_vars.TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
-    policy.megatron_cfg.tensor_model_parallel_size=4 \
-    policy.megatron_cfg.expert_model_parallel_size=4 \
+    policy.megatron_cfg.tensor_model_parallel_size=2 \
+    policy.megatron_cfg.expert_model_parallel_size=2 \
     policy.megatron_cfg.expert_tensor_parallel_size=1 \
     policy.megatron_cfg.context_parallel_size=1 \
     policy.megatron_cfg.sequence_parallel=true \
@@ -97,16 +97,17 @@ uv run --no-sync python examples/run_vlm_grpo.py \
     policy.generation.backend=megatron \
     policy.generation.colocated.enabled=true \
     policy.generation.colocated.resources.num_nodes=1 \
-    policy.generation.colocated.resources.gpus_per_node=4 \
+    policy.generation.colocated.resources.gpus_per_node=2 \
     policy.generation.max_new_tokens=128 \
-    policy.generation.mcore_generation_config.tensor_model_parallel_size=4 \
-    policy.generation.mcore_generation_config.expert_model_parallel_size=4 \
+    policy.generation.mcore_generation_config.tensor_model_parallel_size=2 \
+    policy.generation.mcore_generation_config.expert_model_parallel_size=2 \
     policy.generation.mcore_generation_config.expert_tensor_parallel_size=1 \
     ++policy.generation.mcore_generation_config.context_parallel_size=1 \
     ++policy.generation.mcore_generation_config.moe_router_dtype=fp32 \
     policy.generation.mcore_generation_config.transformer_impl="${MEGATRON_TRANSFORMER_IMPL}" \
     policy.generation.mcore_generation_config.sequence_parallel=true \
     policy.generation.mcore_generation_config.refit_backend=nccl \
+    policy.generation.mcore_generation_config.buffer_size_gb=8 \
     policy.generation.mcore_generation_config.cuda_graph_impl="${MEGATRON_CUDA_GRAPH_IMPL}" \
     policy.generation.mcore_generation_config.inference_cuda_graph_scope=block \
     policy.generation.mcore_generation_config.num_cuda_graphs=-1 \
@@ -114,6 +115,8 @@ uv run --no-sync python examples/run_vlm_grpo.py \
     policy.generation.mcore_generation_config.moe_pad_experts_for_cuda_graph_inference="${MOE_PAD_EXPERTS_FOR_CG}" \
     policy.generation.mcore_generation_config.enable_chunked_prefill=true \
     ++policy.generation.mcore_generation_config.async_sched_mode=async \
+    policy.generation.mcore_generation_config.max_model_len=4096 \
+    policy.generation.mcore_generation_config.max_tokens=4096 \
     data.train.dataset_name=ResponseDataset \
     ++data.train.data_path="${TRAIN_PATH}" \
     data.train.split=train \

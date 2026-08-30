@@ -30,6 +30,9 @@ from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
 )
 from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
+from nemo_rl.models.generation.megatron.utils import (
+    build_prompt_and_multimodal_data,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.weight_sync.megatron_weight_synchronizer import (
@@ -41,28 +44,33 @@ model_name = "Qwen/Qwen3-0.6B"
 
 
 @pytest.mark.mcore
-def test_direct_megatron_media_request_preserves_preexpanded_prompt():
-    worker = object.__new__(MegatronGenerationMixin)
-    worker.cfg = {"generation": {"mcore_generation_config": {}}}
+def test_multimodal_preprocessing_requires_policy_processor():
+    class _ImageWrapper:
+        supports_image = True
 
-    def sample_vision_tensors(data, index):
+    worker = object.__new__(MegatronGenerationMixin)
+    worker._get_megatron_inference_wrapper_cls = lambda: _ImageWrapper
+
+    with pytest.raises(ValueError, match="requires the policy processor"):
+        worker._build_image_preprocessing_config({})
+
+
+@pytest.mark.mcore
+def test_direct_megatron_media_request_preserves_preexpanded_prompt():
+    def fake_sample_vision_tensors(data, index):
         return torch.ones(1, 2, 4), torch.tensor([[2, 2]]), None
 
-    def get_wrapper_cls():
-        return object
-
-    def wrapper_supports_modality(wrapper_cls, modality):
-        return modality == "image"
-
-    worker._sample_vision_tensors = sample_vision_tensors
-    worker._get_megatron_inference_wrapper_cls = get_wrapper_cls
-    worker._wrapper_supports_modality = wrapper_supports_modality
     data = {
         "input_ids": torch.tensor([[10, 99, 99, 20, 0]]),
         "input_lengths": torch.tensor([4]),
     }
 
-    prompt, multi_modal_data = worker._build_prompt_and_multimodal_data(data, 0)
+    prompt, multi_modal_data = build_prompt_and_multimodal_data(
+        data,
+        0,
+        sample_tensors=fake_sample_vision_tensors,
+        supports_modality=lambda modality: modality == "image",
+    )
 
     assert prompt == [10, 99, 99, 20]
     assert multi_modal_data["media_tokens_preexpanded"] is True
@@ -70,32 +78,44 @@ def test_direct_megatron_media_request_preserves_preexpanded_prompt():
 
 
 @pytest.mark.mcore
-def test_direct_megatron_video_request_marks_preexpanded_prompt():
-    worker = object.__new__(MegatronGenerationMixin)
-    worker.cfg = {"generation": {"mcore_generation_config": {}}}
+def test_text_only_request_does_not_resolve_multimodal_capabilities():
+    data = {
+        "input_ids": torch.tensor([[10, 20, 0]]),
+        "input_lengths": torch.tensor([2]),
+    }
 
-    def sample_vision_tensors(data, index):
+    prompt, multi_modal_data = build_prompt_and_multimodal_data(
+        data,
+        0,
+        supports_modality=lambda modality: pytest.fail(
+            f"unexpected capability lookup for {modality}"
+        ),
+    )
+
+    assert prompt == [10, 20]
+    assert multi_modal_data is None
+
+
+@pytest.mark.mcore
+def test_direct_megatron_video_request_marks_preexpanded_prompt():
+    def fake_sample_vision_tensors(data, index):
         return (
             torch.ones(1, 4, 4),
             torch.tensor([[2, 2], [2, 2], [2, 2], [2, 2]]),
             torch.tensor([4]),
         )
 
-    def get_wrapper_cls():
-        return object
-
-    def wrapper_supports_modality(wrapper_cls, modality):
-        return modality == "video"
-
-    worker._sample_vision_tensors = sample_vision_tensors
-    worker._get_megatron_inference_wrapper_cls = get_wrapper_cls
-    worker._wrapper_supports_modality = wrapper_supports_modality
     data = {
         "input_ids": torch.tensor([[10, 99, 99, 20]]),
         "input_lengths": torch.tensor([4]),
     }
 
-    prompt, multi_modal_data = worker._build_prompt_and_multimodal_data(data, 0)
+    prompt, multi_modal_data = build_prompt_and_multimodal_data(
+        data,
+        0,
+        sample_tensors=fake_sample_vision_tensors,
+        supports_modality=lambda modality: modality == "video",
+    )
 
     assert prompt == [10, 99, 99, 20]
     assert multi_modal_data["media_tokens_preexpanded"] is True
@@ -784,6 +804,12 @@ def test_megatron_generation_non_colocated_refit(
             tokenizer=tokenizer,
             cluster=generation_cluster,
             skip_weight_load=skip_weight_load,
+        )
+        assert mg._policy_config is not config
+        assert mg._policy_config["generation"] is not config["generation"]
+        assert (
+            mg._policy_config["generation"]["mcore_generation_config"]
+            is not config["generation"]["mcore_generation_config"]
         )
 
         # Wire the refit collective the way grpo.setup does: through the

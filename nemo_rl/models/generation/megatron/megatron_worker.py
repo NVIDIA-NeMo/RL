@@ -64,9 +64,11 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.megatron.utils import (
     build_image_preprocessing_config,
+    build_prompt_and_multimodal_data,
     build_video_preprocessing_config,
     log_gpu_memory,
     resolve_torch_dtype,
+    sample_vision_tensors,
 )
 from nemo_rl.models.megatron.memory_saver import (
     HAVE_TORCH_MEMORY_SAVER,
@@ -86,12 +88,14 @@ class MegatronGenerationMixin:
      - rank: global rank (used for logging).
      - tokenizer: HF tokenizer.
      - megatron_tokenizer: tokenizer for inference.
+     - processor: optional multimodal processor.
      - is_generation_colocated: Whether colocated or distributed.
      - _reserved_http_server_socket: driver-reserved server socket, or None.
     """
 
     # Colocated-reshard hosts assign the dedicated inference-layout model here
     # (see MegatronPolicyWorkerImpl._build_colocated_inference_model).
+    processor: Optional[Any] = None
     inference_model = None
     _colocated_reshard_plan = None
 
@@ -179,7 +183,7 @@ class MegatronGenerationMixin:
         inference_wrapper_cls = self._get_megatron_inference_wrapper_cls()
         if not self._wrapper_supports_modality(inference_wrapper_cls, "image"):
             return None
-        processor = getattr(self, "processor", None)
+        processor = self.processor
         if processor is None:
             raise ValueError(
                 "Megatron multimodal generation requires the policy processor."
@@ -786,108 +790,19 @@ class MegatronGenerationMixin:
 
     def _sample_vision_tensors(self, data, index: int):
         """Return one sample's vision tensors from RL PackedTensors."""
-        from nemo_rl.data.multimodal_utils import PackedTensor
-
-        pixel_values = data.get("pixel_values")
-        imgs_sizes = data.get("imgs_sizes")
-        packed_num_frames = data.get("num_frames")
-        if pixel_values is None and imgs_sizes is None:
-            if packed_num_frames is not None:
-                raise ValueError("num_frames was provided without vision tensors.")
-            return None, None, None
-        if pixel_values is None or imgs_sizes is None:
-            raise ValueError(
-                "Megatron image generation requires both pixel_values and imgs_sizes."
-            )
-        if not isinstance(pixel_values, PackedTensor) or not isinstance(
-            imgs_sizes, PackedTensor
-        ):
-            raise TypeError(
-                "Megatron image generation expects pixel_values and imgs_sizes "
-                "as per-sample PackedTensor values."
-            )
-        if packed_num_frames is not None and not isinstance(
-            packed_num_frames, PackedTensor
-        ):
-            raise TypeError(
-                "Megatron video generation expects num_frames as a "
-                "per-sample PackedTensor value."
-            )
-
-        # `.tensors` is the *physical* segment list. It only lines up with the
-        # logical row index while media are un-deduplicated (`_row_offsets is
-        # None`); once `repeat_interleave(..., share_immutable_media=True)` packs
-        # N rows onto fewer segments, row `index` would silently read another
-        # row's image. `_validate_multimodal_dedup_capability` rejects
-        # `deduplicate_multimodal_data` for non-vLLM backends, so this is
-        # currently unreachable — assert it here, where the assumption is used.
-        for name, packed in (
-            ("pixel_values", pixel_values),
-            ("imgs_sizes", imgs_sizes),
-            ("num_frames", packed_num_frames),
-        ):
-            if packed is not None and packed._row_offsets is not None:
-                raise ValueError(
-                    f"Megatron generation cannot index deduplicated {name}; "
-                    "set deduplicate_multimodal_data=false (it is only supported "
-                    "for the vLLM backend)."
-                )
-
-        imgs = pixel_values.tensors[index]
-        sizes = imgs_sizes.tensors[index]
-        num_frames = (
-            packed_num_frames.tensors[index] if packed_num_frames is not None else None
-        )
-        if imgs is None and sizes is None:
-            return None, None, None
-        if imgs is None or sizes is None:
-            raise ValueError(
-                "Megatron image generation requires matching per-sample "
-                "pixel_values and imgs_sizes."
-            )
-        if imgs.ndim == 3:
-            imgs = imgs.unsqueeze(0)
-        if sizes.ndim == 1:
-            sizes = sizes.unsqueeze(0)
-        if num_frames is not None:
-            num_frames = num_frames.to(dtype=torch.int32).reshape(-1)
-        return imgs, sizes, num_frames
+        return sample_vision_tensors(data, index)
 
     def _build_prompt_and_multimodal_data(self, data, index: int):
         """Build one pre-expanded token prompt and optional MCore media payload."""
-        length = int(data["input_lengths"][index].item())
-        prompt = data["input_ids"][index, :length].tolist()
-        imgs, imgs_sizes, num_frames = self._sample_vision_tensors(data, index)
-        if imgs is None:
-            return prompt, None
-
-        assert imgs_sizes is not None
-        is_video = num_frames is not None and bool(torch.any(num_frames > 1).item())
-        modality = "video" if is_video else "image"
-        inference_wrapper_cls = self._get_megatron_inference_wrapper_cls()
-        if not self._wrapper_supports_modality(inference_wrapper_cls, modality):
-            raise ValueError(
-                f"The configured megatron_inference_wrapper does not support "
-                f"{modality} inputs."
-            )
-        if is_video:
-            if int(num_frames.sum().item()) != int(imgs_sizes.shape[0]):
-                raise ValueError(
-                    "Video num_frames must partition imgs_sizes exactly: "
-                    f"sum(num_frames)={int(num_frames.sum().item())}, "
-                    f"imgs_sizes={imgs_sizes.shape[0]}."
-                )
-            modality_data = {
-                "imgs": imgs,
-                "imgs_sizes": imgs_sizes,
-                "num_frames": num_frames,
-            }
-        else:
-            modality_data = {"imgs": imgs, "imgs_sizes": imgs_sizes}
-        return prompt, {
-            modality: modality_data,
-            "media_tokens_preexpanded": True,
-        }
+        return build_prompt_and_multimodal_data(
+            data,
+            index,
+            sample_tensors=self._sample_vision_tensors,
+            supports_modality=lambda modality: self._wrapper_supports_modality(
+                self._get_megatron_inference_wrapper_cls(),
+                modality,
+            ),
+        )
 
     def _prepare_data_for_generation(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

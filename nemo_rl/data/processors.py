@@ -680,7 +680,9 @@ def vlm_hf_data_processor(
         # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images/audios) for the entire conversation
         # Placeholder-style processors set vllm_content to None so vLLM uses expanded input_ids.
         vllm_kwargs = {
-            "vllm_content": None if uses_placeholder else string_formatted_dialog,
+            "vllm_content": (
+                None if uses_placeholder and images else string_formatted_dialog
+            ),
             "vllm_images": images,
             "vllm_audios": audios,
             "vllm_videos": videos,
