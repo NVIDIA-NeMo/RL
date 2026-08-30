@@ -480,8 +480,10 @@ def test_get_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
         "total_steps": 13,
         "total_valid_tokens": 0,
         "val_reward": -99999999.0,
-        # SingleController-only field; None for every other algorithm.
+        # SingleController-only fields; None for every other algorithm.
         "sampler_name": None,
+        "trainer_version": None,
+        "sampler_dispatch_index": None,
     }
     assert "total_valid_tokens" not in loaded_state
     assert not hasattr(save_state, "val:accuracy")
@@ -3599,8 +3601,8 @@ def test_async_grpo_colocated_save_defers_wake_until_after_checkpoint(
     policy_generation.finish_generation.side_effect = lambda *a, **k: events.append(
         ("finish_generation", k.get("release_gpu", True))
     )
-    policy_generation.prepare_for_generation.side_effect = (
-        lambda *a, **k: events.append("wake_engine")
+    policy_generation.prepare_for_generation.side_effect = lambda *a, **k: (
+        events.append("wake_engine")
     )
     policy.offload_before_refit.side_effect = lambda *a, **k: events.append(
         "offload_before_refit"
