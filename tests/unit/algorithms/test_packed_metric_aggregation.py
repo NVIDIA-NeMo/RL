@@ -83,6 +83,44 @@ def _packed_and_unpacked(value_rows, sample_mask):
     return unpacked, packed
 
 
+class _AdditiveControlLossFn:
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        del logits, global_valid_seqs, global_valid_toks
+        value = data["values"].sum()
+        return value.new_zeros(()), {
+            "latency_minibatch": value,
+            "latency_maximum": value,
+        }
+
+
+def test_embedded_extrema_substrings_do_not_make_metrics_extrema() -> None:
+    """Only suffixes classify extrema; ordinary metric names remain additive."""
+    data, values = _batch([[1.0, 2.0], [3.0, 4.0]], [1, 1])
+    cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
+    wrapper = SequencePackingLossWrapper(
+        loss_fn=_AdditiveControlLossFn(),
+        prepare_fn=_value_prepare_fn,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens,
+    )
+
+    _, metrics = wrapper(
+        values.reshape(1, -1, 1),
+        data,
+        data["sample_mask"].sum(),
+        data["token_mask"].sum(),
+    )
+
+    assert metrics["latency_minibatch"] == pytest.approx(10.0)
+    assert metrics["latency_maximum"] == pytest.approx(10.0)
+
+
 def test_packing_reports_the_true_value_range():
     """Summed extrema are not extrema -- and the reported minimum flips sign.
 
