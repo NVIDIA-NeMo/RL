@@ -836,8 +836,21 @@ def test_multimodal_dedup_rejects_unqualified_transfer_paths(
         _validate_multimodal_dedup_capability(master_config)
 
     master_config.policy["generation"]["backend"] = "vllm"
+
+    # Data plane + NeMo-Gym stays rejected: ``grpo_train_sync`` never calls
+    # ``attach_initial_nemo_gym_image_payloads``, so the run would silently
+    # train on the media a Gym dataset omits from ``extra_env_info``.
     master_config.data_plane = {"enabled": True}
-    with pytest.raises(NotImplementedError, match="data_plane.enabled=false"):
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
+        with pytest.raises(NotImplementedError, match="NeMo-Gym"):
+            _validate_multimodal_dedup_capability(master_config)
+
+    # Data plane without Gym is supported: the wire format carries dedup
+    # (``PackedTensor.to_wire`` emits one row per *logical* row), and the Gym
+    # attach helper is itself gated on ``should_use_nemo_gym``. Rejecting this
+    # blocked every Nemotron-Omni recipe, since all of them set
+    # ``deduplicate_multimodal_data: true``.
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=False):
         _validate_multimodal_dedup_capability(master_config)
 
     master_config.data_plane = {"enabled": False}

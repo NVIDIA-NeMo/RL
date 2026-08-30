@@ -36,6 +36,7 @@ import torch
 
 from nemo_rl.data.multimodal_utils import (
     PACKED_MULTIMODAL_FIELDS,
+    multimodal_row_tags,
     PER_TOKEN_MULTIMODAL_FIELDS,
     PackedTensor,
     encode_multimodal_for_wire,
@@ -119,7 +120,8 @@ def _sync_rollout_write_loop(fb: BatchedDataDict, bulk_batch: BatchedDataDict) -
             continue  # multimodal PackedTensor; also handled below
         bulk_batch[k] = v
 
-    for k, v in fb.get_multimodal_dict(as_tensors=False).items():
+    multimodal = fb.get_multimodal_dict(as_tensors=False)
+    for k, v in multimodal.items():
         for wk, wv in encode_multimodal_for_wire(k, v):
             bulk_batch[wk] = wv
 
@@ -154,6 +156,7 @@ def test_vlm_wire_roundtrip_through_noop_data_plane():
         sample_ids=keys_from_uids(["a", "b", "c", "d"]),
         dp_client=client,
         partition_id="train",
+        tags=multimodal_row_tags(fb.get_multimodal_dict(as_tensors=False), n),
     )
     # kv_first_write ships one wire field per logical field — the nested
     # parent carries its own row boundaries, so there is no companion.
@@ -171,14 +174,20 @@ def test_vlm_wire_roundtrip_through_noop_data_plane():
     )
 
     # ── Contract checks on the materialized batch ───────────────────
-    # Packed multimodal fields stay NESTED through materialize — no
-    # rectangularization to ``[B, max_per_sample, ...]``, so no zero
-    # padding on the wire or in worker memory, and the row boundaries
-    # never have to be recovered from a companion column.
-    assert fetched["pixel_values"].is_nested
-    assert fetched["image_grid_thw"].is_nested
-    assert [t.shape[0] for t in fetched["pixel_values"].unbind()] == [
-        t.shape[0] for t in packed_truth["pixel_values"].to_wire().unbind()
+    # Packed multimodal fields are never rectangularized to
+    # ``[B, max_per_sample, ...]`` — no zero padding on the wire or in
+    # worker memory, and the row boundaries never have to be recovered
+    # from a companion column.
+    #
+    # ``materialize`` hands them back as ``PackedTensor``, not as the raw
+    # nested wire value: generic ``BatchedDataDict`` consumers dispatch on
+    # ``PackedTensor`` and otherwise fall through to ``tensor[start:end]``
+    # (``slice``) or ``tuple(v.shape)`` (``_broadcast_batched_data_dict``),
+    # neither of which torch.nested supports on the ragged dim 0.
+    assert isinstance(fetched["pixel_values"], PackedTensor)
+    assert isinstance(fetched["image_grid_thw"], PackedTensor)
+    assert [t.numel() for t in fetched["pixel_values"].to_wire()[0].unbind()] == [
+        t.numel() for t in packed_truth["pixel_values"].to_wire()[0].unbind()
     ]
     assert "pixel_values__lengths" not in fetched
     assert "image_grid_thw__lengths" not in fetched
@@ -234,6 +243,7 @@ def test_materialize_forward_pad_skips_packed_multimodal_fields():
         sample_ids=keys_from_uids(["a", "b", "c", "d"]),
         dp_client=client,
         partition_id="train",
+        tags=multimodal_row_tags(fb.get_multimodal_dict(as_tensors=False), n),
     )
     meta = replace(
         meta, extra_info={**(meta.extra_info or {}), GLOBAL_FORWARD_PAD_SEQLEN: pad_to}
@@ -244,12 +254,17 @@ def test_materialize_forward_pad_skips_packed_multimodal_fields():
     # Token-aligned fields DO get padded up to the forward target.
     assert fetched["input_ids"].shape == (n, pad_to)
     assert fetched["mm_token_type_ids"].shape == (n, pad_to)
-    # Packed multimodal fields stay nested — no rectangularization, so the
-    # forward pad target cannot reach them.
-    assert fetched["pixel_values"].is_nested
-    assert fetched["image_grid_thw"].is_nested
-    assert max(t.shape[0] for t in fetched["pixel_values"].unbind()) == 5
-    assert max(t.shape[0] for t in fetched["image_grid_thw"].unbind()) == 2
+    # Packed multimodal fields are never rectangularized, so the forward pad
+    # target cannot reach them. ``materialize`` returns them as PackedTensor;
+    # ``to_wire()`` recovers the per-row view to check the row counts.
+    assert isinstance(fetched["pixel_values"], PackedTensor)
+    assert isinstance(fetched["image_grid_thw"], PackedTensor)
+    assert (
+        max(t.shape[0] for t in fetched["pixel_values"].tensors if t is not None) == 5
+    )
+    assert (
+        max(t.shape[0] for t in fetched["image_grid_thw"].tensors if t is not None) == 2
+    )
 
     # Reassembly still reproduces the pre-wire values under forward padding.
     mm = fetched.get_multimodal_dict(as_tensors=True)
@@ -424,3 +439,99 @@ def test_sc_microbatch_dispatch_ships_multimodal_fields(monkeypatch):
     # Both train entrypoints must request the identical multimodal set.
     all_mm = PACKED_MULTIMODAL_FIELDS | PER_TOKEN_MULTIMODAL_FIELDS
     assert sc_fields & all_mm == sync_fields & all_mm
+
+
+def test_materialized_multimodal_batch_survives_microbatch_slicing():
+    """A materialized batch must be sliceable before any multimodal reassembly.
+
+    The training path slices the fetched batch long before anything calls
+    ``get_multimodal_dict``::
+
+        get_logprobs -> make_processed_microbatch_iterator
+                     -> make_microbatch_iterator_with_dynamic_shapes
+                     -> BatchedDataDict.slice -> self.data[k][start:end]
+
+    ``slice`` dispatches on ``PackedTensor`` and otherwise falls through to
+    plain indexing. A raw nested value satisfies ``isinstance(v, Tensor)`` and
+    has a valid ``shape[0]``, so it clears both guards and only fails at the
+    indexing itself with ``slice(): not supported for NestedTensor on dim=0``.
+    That took down a Qwen3.5 VLM GRPO run at the first logprob step.
+    """
+    n = 4
+    fb, packed_truth, _ = _make_vlm_rollout_output(n=n, seqlen=32)
+
+    client = NoOpDataPlaneClient()
+    register_train_partition(client, num_samples=n, fields=list(fb.keys()))
+    bulk_batch: BatchedDataDict = BatchedDataDict()
+    _sync_rollout_write_loop(fb, bulk_batch)
+    meta = kv_first_write(
+        bulk_batch,
+        sample_ids=keys_from_uids(["a", "b", "c", "d"]),
+        dp_client=client,
+        partition_id="train",
+        tags=multimodal_row_tags(fb.get_multimodal_dict(as_tensors=False), n),
+    )
+    fetched = read_columns(client, meta, select_fields=meta.fields, layout="padded")
+
+    # The regression: this raised RuntimeError when the packed fields were
+    # left as raw nested tensors.
+    sliced = fetched.slice(1, 3)
+
+    for key in ("pixel_values", "image_grid_thw"):
+        assert isinstance(sliced[key], PackedTensor)
+        expected = packed_truth[key].slice([1, 2]).as_tensor()
+        assert torch.equal(sliced.get_multimodal_dict(as_tensors=True)[key], expected)
+
+
+def test_from_wire_keeps_packed_multimodal_fields_nested():
+    """``_from_wire`` must not densify packed multimodal fields.
+
+    It stacks any nested field whose rows all share a shape, to restore the
+    dense representation of ordinary batched inputs. For a packed multimodal
+    field, uniform rows are a *data-dependent accident* -- every sample simply
+    happened to carry one image -- and stacking discards the row boundaries.
+
+    The dense value then fails the ``is_nested`` check in
+    ``codec.materialize``, so it is never reassembled, and reaches
+    ``get_multimodal_dict`` as a dense tensor::
+
+        TypeError: from_wire expects the nested value produced by to_wire,
+        got a dense tensor of shape (3, 1, 3)
+
+    That killed a Qwen3.5 VLM GRPO run on a batch where every sample had
+    exactly one image.
+    """
+    from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.transfer_queue import _from_wire
+
+    # Rows that flatten to equal lengths -- one image per sample.
+    uniform_grid = PackedTensor(
+        [
+            torch.tensor([[1, 2, 2]], dtype=torch.int64),
+            torch.tensor([[1, 3, 3]], dtype=torch.int64),
+            torch.tensor([[1, 2, 1]], dtype=torch.int64),
+        ],
+        dim_to_pack=0,
+    )
+    # A non-multimodal field with equally uniform rows, to pin that the
+    # densification still happens for everything else.
+    ordinary = torch.nested.as_nested_tensor(
+        [torch.ones(4), torch.ones(4), torch.ones(4)], layout=torch.jagged
+    )
+
+    td = TensorDict(
+        {"image_grid_thw": uniform_grid.to_wire()[0], "input_ids": ordinary},
+        batch_size=(3,),
+    )
+    out = _from_wire(td)
+
+    assert out["image_grid_thw"].is_nested, (
+        "packed multimodal field was densified; row boundaries are lost"
+    )
+    assert not out["input_ids"].is_nested, (
+        "ordinary uniform field should still be densified"
+    )
+    # Still reassembles into the original per-row values.
+    rebuilt = PackedTensor.from_wire(out["image_grid_thw"], uniform_grid.to_wire()[1])
+    assert torch.equal(rebuilt.as_tensor(), uniform_grid.as_tensor())

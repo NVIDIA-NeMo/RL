@@ -24,6 +24,7 @@ MICRO_BATCH_LENGTHS = "micro_batch_lengths"
 ELEM_COUNTS_PER_GB = "elem_counts_per_gb"
 GLOBAL_FORWARD_PAD_SEQLEN = "global_forward_pad_seqlen"
 
+
 # Skeleton field names from `shard_meta_for_dp`.
 INPUT_IDS = "input_ids"
 INPUT_LENGTHS = "input_lengths"
