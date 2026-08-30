@@ -53,6 +53,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     validate_single_controller_config,
 )
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 
 _NUM_PROMPTS_PER_STEP = 4
 _NUM_GENERATIONS_PER_PROMPT = 2
@@ -138,7 +139,9 @@ def _make_master_config(
         },
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
-        cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
+        cluster=ClusterConfig.model_validate(
+            {"num_nodes": 2, "gpus_per_node": 8, "segment_size": None}
+        ),
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=min_groups_for_streaming_train,
             max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,

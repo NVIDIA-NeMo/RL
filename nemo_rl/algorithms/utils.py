@@ -748,8 +748,8 @@ def print_performance_metrics(
             + policy_training_time
         )
 
-    num_nodes = master_config.cluster["num_nodes"]
-    gpus_per_node = master_config.cluster["gpus_per_node"]
+    num_nodes = master_config.cluster.num_nodes
+    gpus_per_node = master_config.cluster.gpus_per_node
     total_num_gpus = num_nodes * gpus_per_node
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 

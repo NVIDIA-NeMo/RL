@@ -16,9 +16,10 @@ import os
 import socket
 import sys
 import time
-from typing import NamedTuple, NotRequired, Optional, TypedDict
+from typing import NamedTuple, Optional
 
 import ray
+from pydantic import BaseModel
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
@@ -31,7 +32,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class ClusterConfig(TypedDict):
+class ClusterConfig(BaseModel, extra="allow"):
     gpus_per_node: int
     num_nodes: int
     # Port range for the distributed master address (TCPStore / NCCL rendezvous)
@@ -40,11 +41,10 @@ class ClusterConfig(TypedDict):
     # TOCTOU collisions with kernel-assigned source ports.  When absent,
     # RayVirtualCluster falls back to DEFAULT_MASTER_PORT_RANGE_LOW/HIGH
     # (1400-1999).  See ray.sub for the full port layout.
-    master_port_range_low: NotRequired[int]
-    master_port_range_high: NotRequired[int]
-    segment_size: NotRequired[
-        int | None
-    ]  # Nodes per NVLink domain segment for topology-aware alignment; None to disable
+    master_port_range_low: Optional[int] = None
+    master_port_range_high: Optional[int] = None
+    # Nodes per NVLink domain segment for topology-aware alignment; None to disable
+    segment_size: Optional[int] = None
 
 
 # Get the directory path of the current module and the root of the package

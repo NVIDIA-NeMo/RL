@@ -27,6 +27,7 @@ from nemo_rl.algorithms.rm import (
     rm_train,
     setup,
 )
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 
 
 def test_get_rm_save_state_handles_legacy_checkpoint_and_filters_metrics():
@@ -136,10 +137,12 @@ def mock_components():
                 "checkpoint_must_save_by": None,
                 "save_period": 10,
             },
-            "cluster": {
-                "num_nodes": 1,
-                "gpus_per_node": 2,
-            },
+            "cluster": ClusterConfig.model_validate(
+                {
+                    "num_nodes": 1,
+                    "gpus_per_node": 2,
+                }
+            ),
         }
     )
 

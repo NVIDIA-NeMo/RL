@@ -94,6 +94,7 @@ from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.timer import Timer
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from tests.unit.algorithms.utils import (
     create_mock_batch,
 )
@@ -433,10 +434,12 @@ def mock_grpo_components():
                 "checkpoint_must_save_by": None,
                 "save_period": 10,
             },
-            "cluster": {
-                "num_nodes": 1,
-                "gpus_per_node": 2,
-            },
+            "cluster": ClusterConfig.model_validate(
+                {
+                    "num_nodes": 1,
+                    "gpus_per_node": 2,
+                }
+            ),
             "logger": {
                 "num_val_samples_to_print": 5,
             },

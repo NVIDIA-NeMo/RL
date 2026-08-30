@@ -273,7 +273,7 @@ def _non_colocated_teacher_node_count(master_config: MasterConfig) -> int:
     teacher_configs = create_teacher_configs_from_opd_config(
         opd_module._opd_cfg(master_config)
     )
-    cluster_gpus_per_node = master_config.cluster["gpus_per_node"]
+    cluster_gpus_per_node = master_config.cluster.gpus_per_node
     for teacher_config in teacher_configs:
         if teacher_config.gpus_per_node > cluster_gpus_per_node:
             raise ValueError(
@@ -300,11 +300,11 @@ def _build_clusters(
     generation_config = master_config.policy["generation"]
     colocated = generation_config["colocated"]["enabled"]
     backend = generation_config["backend"]
-    num_nodes = cluster_config["num_nodes"]
-    gpus_per_node = cluster_config["gpus_per_node"]
-    segment_size = cluster_config.get("segment_size")
-    port_range_low = cluster_config.get("master_port_range_low")
-    port_range_high = cluster_config.get("master_port_range_high")
+    num_nodes = cluster_config.num_nodes
+    gpus_per_node = cluster_config.gpus_per_node
+    segment_size = cluster_config.segment_size
+    port_range_low = cluster_config.master_port_range_low
+    port_range_high = cluster_config.master_port_range_high
     teacher_nodes = _non_colocated_teacher_node_count(master_config)
     policy_nodes = num_nodes - teacher_nodes
     if policy_nodes <= 0:

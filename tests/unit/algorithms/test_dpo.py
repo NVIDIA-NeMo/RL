@@ -30,6 +30,7 @@ from nemo_rl.algorithms.dpo import (
 from nemo_rl.algorithms.loss import PreferenceLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 
 
 def test_get_dpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
@@ -228,10 +229,12 @@ def mock_dpo_components():
                 "checkpoint_must_save_by": None,
                 "save_period": 10,
             },
-            "cluster": {
-                "num_nodes": 1,
-                "gpus_per_node": 1,
-            },
+            "cluster": ClusterConfig.model_validate(
+                {
+                    "num_nodes": 1,
+                    "gpus_per_node": 1,
+                }
+            ),
         }
     )
 
