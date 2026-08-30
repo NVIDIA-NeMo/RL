@@ -35,9 +35,13 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     SamplerConfig,
     required_buffer_capacity_for_config,
 )
+from nemo_rl.algorithms.distillation import DistillationConfig
 from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
-from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
+from nemo_rl.algorithms.loss.loss_functions import (
+    DistillationLossConfig,
+    MseValueLossConfig,
+)
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.data import DataConfig
@@ -576,9 +580,11 @@ class MasterConfig(BaseModel, extra="allow"):
     # algo configs
     grpo: Optional[GRPOConfig] = None
     ppo: Optional[PPOConfig] = None
+    distillation: Optional[DistillationConfig] = None
     policy: PolicyConfig
     value: Optional[ValueConfig] = None  # PPO extras
-    loss_fn: ClippedPGLossConfig
+    teacher: Optional[PolicyConfig] = None  # distillation extras
+    loss_fn: ClippedPGLossConfig | DistillationLossConfig
     value_loss_fn: Optional[MseValueLossConfig] = None  # PPO extras
     # common configs
     env: dict[str, Any]
@@ -592,15 +598,41 @@ class MasterConfig(BaseModel, extra="allow"):
 
     @model_validator(mode="after")
     def validate_algorithm_block(self) -> "MasterConfig":
-        # Both are Optional so a PPO run can omit `grpo`; without this the
-        # entrypoint dereferences the absent block before validation runs.
-        if self.grpo is not None and self.ppo is not None:
+        # All three are Optional so a run can omit the blocks it does not use;
+        # without this the entrypoint dereferences an absent block before
+        # validation runs.
+        blocks = [
+            name
+            for name in ("grpo", "ppo", "distillation")
+            if getattr(self, name, None) is not None
+        ]
+        if len(blocks) > 1:
             raise ValueError(
-                "Only one algorithm block can be set, either `grpo` or `ppo`."
+                "Only one algorithm block can be set, one of `grpo`, `ppo` or "
+                f"`distillation`; got {', '.join(blocks)}."
             )
-        if self.grpo is None and self.ppo is None:
+        if not blocks:
             raise ValueError(
-                "At least one algorithm block must be set, either `grpo` or `ppo`."
+                "At least one algorithm block must be set, one of `grpo`, "
+                "`ppo` or `distillation`."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_distillation_pairs_with_a_teacher(self) -> "MasterConfig":
+        """A distillation run needs a `teacher` block, and only it may set one.
+
+        Without the second half, a `teacher` block on a GRPO run would be
+        silently ignored -- the same class of quiet drop this path already
+        rejects for unsupported algorithm knobs.
+        """
+        is_distillation = getattr(self, "distillation", None) is not None
+        has_teacher = getattr(self, "teacher", None) is not None
+        if is_distillation and not has_teacher:
+            raise ValueError("A `distillation` run requires a `teacher` policy block.")
+        if has_teacher and not is_distillation:
+            raise ValueError(
+                "A `teacher` policy block is only used by a `distillation` run."
             )
         return self
 
@@ -616,14 +648,30 @@ def is_ppo_run(master_config: MasterConfig) -> bool:
     return getattr(master_config, "ppo", None) is not None
 
 
-def algo_config(master_config: MasterConfig) -> GRPOConfig | PPOConfig:
-    """The active algorithm block: ``ppo`` on a PPO run, else ``grpo``.
+def is_distillation_run(master_config: MasterConfig) -> bool:
+    """Whether this SingleController run distills from a teacher policy.
 
-    Exactly one of the two is set; MasterConfig.validate_algorithm_block checks
-    that at construction.
+    Single source of truth for the flag, mirroring ``is_ppo_run``: setup reads
+    it to decide whether to build the teacher, and the controller reads it to
+    decide whether the train pump runs the teacher stage. ``model_construct``
+    skips defaults, so the attribute can genuinely be missing on a hand-built
+    config.
+    """
+    return getattr(master_config, "distillation", None) is not None
+
+
+def algo_config(
+    master_config: MasterConfig,
+) -> GRPOConfig | PPOConfig | DistillationConfig:
+    """The active algorithm block: ``ppo``, ``distillation``, else ``grpo``.
+
+    Exactly one of the three is set; MasterConfig.validate_algorithm_block
+    checks that at construction.
     """
     if is_ppo_run(master_config):
         return master_config.ppo  # type: ignore
+    if is_distillation_run(master_config):
+        return master_config.distillation  # type: ignore
     return master_config.grpo  # type: ignore
 
 
@@ -756,6 +804,17 @@ def _validate_failure_settings(
         )
 
 
+def _reject_colocated_generation(master_config: MasterConfig) -> None:
+    """SC drives rollout through the disaggregated async engine only."""
+    if master_config.policy["generation"]["colocated"]["enabled"]:
+        raise ValueError(
+            "The SingleController path requires "
+            "policy.generation.colocated.enabled=false: SC drives rollout via "
+            "RolloutManager.generate_and_push, which is only supported on the "
+            "disaggregated async engine."
+        )
+
+
 def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
@@ -777,13 +836,27 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
     # SC reads none of these on either path, so an enabled one describes shaping
     # this run does not do. Async GRPO rejects three of them the same way.
+    #
+    # ``getattr``: DistillationConfig declares none of them -- there is no
+    # reward to shape or filter on -- and a knob that cannot be set cannot be
+    # set wrong. Reading them defensively keeps distillation on this same
+    # function rather than around it, so the checks below that ARE
+    # algorithm-agnostic keep firing on a distillation run.
+    def _knob(path: str) -> bool:
+        obj: Any = algo_cfg
+        for part in path.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                return False
+        return bool(obj)
+
     unsupported = [
         name
         for name, enabled in (
-            ("overlong_filtering", algo_cfg.overlong_filtering),
-            ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
-            ("reward_scaling", algo_cfg.reward_scaling.enabled),
-            ("reward_shaping", algo_cfg.reward_shaping.enabled),
+            ("overlong_filtering", _knob("overlong_filtering")),
+            ("use_dynamic_sampling", _knob("use_dynamic_sampling")),
+            ("reward_scaling", _knob("reward_scaling.enabled")),
+            ("reward_shaping", _knob("reward_shaping.enabled")),
         )
         if enabled
     ]
@@ -795,13 +868,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "shaping. Disable them."
         )
 
-    if master_config.policy["generation"]["colocated"]["enabled"]:
-        raise ValueError(
-            "The SingleController path requires "
-            "policy.generation.colocated.enabled=false: SC drives rollout via "
-            "RolloutManager.generate_and_push, which is only supported on the "
-            "disaggregated async engine."
-        )
+    _reject_colocated_generation(master_config)
 
     async_config = master_config.async_rl
     # Capacity is sized from the peak window whatever the algorithm, so an inert
@@ -1025,11 +1092,16 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     env_config = getattr(master_config, "env", None)
 
     opd_enabled = opd_module.is_opd_enabled(master_config)
-    if opd_enabled and is_ppo_run(master_config):
+    if opd_enabled and (
+        is_ppo_run(master_config) or is_distillation_run(master_config)
+    ):
         raise ValueError(
             "on_policy_distillation is only supported with the `grpo` algorithm block."
         )
-    if algo_cfg.adv_estimator.name == "opd" and not opd_enabled:
+    # DistillationConfig has no adv_estimator: its teacher signal is the loss,
+    # not an advantage, so there is no estimator to name.
+    adv_estimator = getattr(algo_cfg, "adv_estimator", None)
+    if adv_estimator is not None and adv_estimator.name == "opd" and not opd_enabled:
         raise ValueError(
             "grpo.adv_estimator.name='opd' requires "
             "on_policy_distillation.enabled=true."
@@ -1060,9 +1132,10 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             )
         opd_module.assert_prev_logprobs_available(master_config)
 
-    if (
-        reference_policy_kl_penalty == 0
-        and not algo_cfg.skip_reference_policy_logprobs_calculation
+    # ``getattr`` above: DistillationConfig has no reference KL and no skip
+    # knob -- the teacher is the only other distribution in that loss.
+    if reference_policy_kl_penalty == 0 and not getattr(
+        algo_cfg, "skip_reference_policy_logprobs_calculation", True
     ):
         print(
             "Reference policy logprob calculation will be skipped since "

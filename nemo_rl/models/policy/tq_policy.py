@@ -291,6 +291,38 @@ class TQPolicy(TQDriverMixin, Policy):
             common_kwargs={"micro_batch_size": micro_batch_size},
         )
 
+    def get_topk_logits_from_meta(
+        self,
+        meta: KVBatchMeta,
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> None:
+        """1-hop counterpart to get_topk_logits, for a distillation teacher.
+
+        Returns nothing: the two tensors land in TQ under
+        ``teacher_topk_logits`` / ``teacher_topk_indices`` via the worker-side
+        write-back, so the loss reads them from there rather than through Ray.
+
+        Reuses ``LP_SEED_FIELDS`` because a teacher forward needs exactly what a
+        logprob forward needs -- the student's tokens and their masks. The
+        teacher contributes only its own scoring of them.
+
+        Args:
+            meta: Full-step batch metadata consumed by all DP ranks.
+            k: Number of top logits to keep per position.
+            micro_batch_size: Inference micro batch size; None uses the config default.
+            timer: Optional timer for nested measurements.
+        """
+        self._logprob_dispatch(
+            meta,
+            task_name="teacher_topk",
+            worker_method="get_topk_logits_presharded",
+            timer_prefix="get_topk_logits",
+            timer=timer,
+            common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+        )
+
     def train_from_meta(
         self,
         meta: KVBatchMeta,
@@ -438,6 +470,7 @@ class TQPolicy(TQDriverMixin, Policy):
         self,
         meta: KVBatchMeta,
         timer: Optional[Timer] = None,
+        train_fields: tuple[str, ...] = DP_TRAIN_FIELDS,
     ) -> None:
         """Dispatch one meta slice (DP-sharded) into an open train step.
 
@@ -452,12 +485,22 @@ class TQPolicy(TQDriverMixin, Policy):
         ``.grad``. Returns nothing — per-microbatch metrics accumulate in
         the workers' open-step state and surface once via
         :meth:`finish_train_step`.
+
+        Args:
+            meta: One chunk's ``KVBatchMeta``.
+            timer: Optional timer for nested ``policy_training/*`` measurements.
+            train_fields: TQ columns workers fetch for this chunk; defaults to
+                the full ``DP_TRAIN_FIELDS`` schema. Same escape hatch as
+                :meth:`train_from_meta`'s -- a caller whose loss reads a
+                different set (distillation) or which skipped writing a column
+                this step must narrow it, since fetching a column nobody wrote
+                errors out.
         """
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._isolated_meta(
             meta,
             fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                train_fields, enabled=self._router_replay_enabled
             ),
             task_name="train",
         )

@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Async GRPO / PPO launcher driven by the SingleController actor.
+"""Async GRPO / PPO / distillation launcher driven by the SingleController actor.
 
 Builds the full SC actor args driver-side via setup_single_controller and hands them
 to SingleControllerActor. Mirrors run_grpo.py for config loading so the same YAML
 files apply. data_plane.enabled=true is mandatory. A config carrying a `ppo:` block
-additionally brings up the PPO critic and trains it alongside the policy.
+additionally brings up the PPO critic and trains it alongside the policy; one
+carrying `distillation:` brings up the frozen teacher instead.
 """
 
 import argparse
@@ -30,10 +31,12 @@ from typing import Any
 import ray
 from omegaconf import OmegaConf
 
+from nemo_rl.algorithms.distillation import check_vocab_equality
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
     MasterConfig,
     WatchdogConfig,
+    is_distillation_run,
     is_ppo_run,
     setup_single_controller,
 )
@@ -97,6 +100,12 @@ def main() -> None:
 
     if is_ppo_run(config):
         legacy_async_block, legacy_async = "ppo.async_ppo", config.ppo.async_ppo
+    elif is_distillation_run(config):
+        # DistillationConfig carries no legacy async block: distillation never
+        # had a v1 async path, so there is nothing here to reject. Without this
+        # branch the `else` below dereferences `config.grpo`, which is None on a
+        # distillation run.
+        legacy_async_block, legacy_async = "", None
     else:
         legacy_async_block, legacy_async = "grpo.async_grpo", config.grpo.async_grpo
     if legacy_async is not None:
@@ -127,6 +136,18 @@ def main() -> None:
     init_ray()
 
     tokenizer = get_tokenizer(config.policy["tokenizer"])
+    if is_distillation_run(config) and not os.environ.get(
+        "NRL_SKIP_DISTILLATION_TOKENIZER_CHECK"
+    ):
+        # The teacher writes top-k *indices*, which the loss reads as student
+        # vocabulary ids. A teacher on a different vocabulary produces indices
+        # that are silently wrong rather than an error, so check before any
+        # model loads. Same check and same opt-out as distillation.py.
+        check_vocab_equality(
+            tokenizer,
+            config.policy["model_name"],
+            config.teacher["model_name"],  # type: ignore[index]
+        )
     assert config.policy["generation"] is not None, (
         "A generation config is required for SC-driven async GRPO"
     )
@@ -178,6 +199,7 @@ def main() -> None:
             ("Generation", actor_args.gen_handle),
             ("Trainer", actor_args.trainer_handle),
             ("Value", actor_args.value_handle),
+            ("Teacher", getattr(actor_args, "teacher_handle", None)),
         ):
             if resource is None:
                 continue

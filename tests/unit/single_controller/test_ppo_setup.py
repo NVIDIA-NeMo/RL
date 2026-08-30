@@ -433,6 +433,31 @@ class TestPPOValidation:
 
 
 class TestAdvantageEstimatorSelection:
+    def test_distillation_skips_the_grpo_and_ppo_factories(self):
+        from nemo_rl.algorithms.distillation import DistillationConfig
+        from nemo_rl.algorithms.loss.loss_functions import DistillationLossConfig
+
+        mc = _make_master_config()
+        mc.grpo = None
+        mc.distillation = DistillationConfig(
+            num_prompts_per_step=_NUM_PROMPTS_PER_STEP,
+            num_generations_per_prompt=_NUM_GENERATIONS_PER_PROMPT,
+            val_period=0,
+            val_at_start=False,
+            val_at_end=False,
+        )
+        mc.teacher = mc.policy
+        mc.loss_fn = DistillationLossConfig()
+
+        with (
+            patch("nemo_rl.algorithms.grpo._create_advantage_estimator") as grpo,
+            patch("nemo_rl.algorithms.ppo._create_advantage_estimator") as ppo,
+        ):
+            assert sc_setup_mod._build_advantage_estimator(mc) is None
+
+        grpo.assert_not_called()
+        ppo.assert_not_called()
+
     def test_ppo_gets_gae_with_the_configured_lambdas(self):
         mc = _ppo_master_config(
             ppo=PPOConfig.model_construct(
@@ -475,6 +500,22 @@ class TestMegatronTrainIters:
 
         assert mc.policy["megatron_cfg"]["train_iters"] == expected
         assert mc.value["megatron_cfg"]["train_iters"] == expected
+
+    def test_injects_into_policy_and_frozen_teacher_for_distillation(self):
+        """Megatron validates train_iters even when the teacher has no optimizer."""
+        from nemo_rl.algorithms.distillation import DistillationConfig
+
+        mc = _make_master_config(megatron_enabled=True, max_num_steps=7)
+        mc.grpo = None
+        mc.distillation = DistillationConfig.model_construct(
+            max_num_steps=7, **_STEP_CONFIG
+        )
+        mc.teacher = {"megatron_cfg": {"enabled": True}}
+
+        sc_setup_mod._maybe_inject_megatron_train_iters(mc)
+
+        assert mc.policy["megatron_cfg"]["train_iters"] == 7
+        assert mc.teacher["megatron_cfg"]["train_iters"] == 7
 
     def test_skips_a_critic_on_a_non_megatron_backend(self):
         mc = _ppo_master_config(megatron_enabled=False, max_num_steps=7)
