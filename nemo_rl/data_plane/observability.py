@@ -396,15 +396,26 @@ def _step_deltas(snap: dict[str, Any], prev: dict[str, Any]) -> dict[str, float]
     volume and get's is the read volume, split finer than a global pair
     would be.
     """
+
+    def _delta_s(field: str) -> float:
+        """A millisecond accumulator differenced into the charted seconds.
+
+        Every ``_s`` series goes through here so a new one cannot forget the
+        conversion and chart milliseconds under a seconds name. Seconds
+        because these sit beside ``timing/train/total_step_time``: a real
+        step logged 78800.9 ms, which reads as noise against a 674 s clock.
+        """
+        return (snap[field] - prev.get(field, 0.0)) / 1e3
+
     return {
-        "step/wall_ms": snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0),
+        "step/wall_s": _delta_s("total_wall_ms"),
         "step/comm_volume_mb": (
             snap["comm_volume_bytes"] - prev.get("comm_volume_bytes", 0)
         )
         / 1e6,
         "now/bytes_outstanding_mb": snap["bytes_outstanding"] / 1e6,
-        "step/codec/pack_ms": snap["pack_ms"] - prev.get("pack_ms", 0.0),
-        "step/codec/unpack_ms": snap["unpack_ms"] - prev.get("unpack_ms", 0.0),
+        "step/codec/pack_s": _delta_s("pack_ms"),
+        "step/codec/unpack_s": _delta_s("unpack_ms"),
     }
 
 
@@ -809,7 +820,7 @@ def cluster_step_metrics(
 # The full dict is still returned, so the table and the series are derived
 # from one computation and cannot disagree.
 _HEADLINE = (
-    "step/wall_ms",
+    "step/wall_s",
     "step/frac_of_step",
     "step/comm_volume_mb",
     "now/bytes_outstanding_mb",
@@ -1121,11 +1132,10 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._prev_snapshot = snap
 
         wall_ms = snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
-        # Every duration is ms and every volume is MB, with no exceptions:
-        # a chart that mixes wall_s against p90_ms puts a 0.008 next to a
-        # 24.85 and reads as a bug in the data plane rather than in the
-        # axis. GB was the same problem one dimension over -- a realistic
-        # step moved 0.00017 GB.
+        # Units are not mixed within one chart: durations charted beside the
+        # step clock are seconds, the per-op table is ms throughout, volumes
+        # are always MB. GB was the same problem one dimension over -- a
+        # realistic step moved 0.00017 GB.
         metrics = _step_deltas(snap, prev)
         metrics["step/frac_of_step"] = (
             (wall_ms / 1e3 / step_time_s) if step_time_s > 0 else 0.0

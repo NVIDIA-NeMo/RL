@@ -465,14 +465,15 @@ totals and `percent_of_dataplane`, with the per-op detail in a table beside them
 |---|---|
 | `step/frac_of_step` | is the data plane worth optimising at all? |
 | `step/percent_of_dataplane/by_op/{put,get,clear,register}` | which call is expensive? |
-| `step/wall_ms`, `step/comm_volume_mb` | how much time and traffic |
+| `step/wall_s`, `step/comm_volume_mb` | how much time and traffic |
 | `step/volume_mb/by_op/{get,put}` | which direction that traffic went |
-
-Per-op detail is published under `step/by_op/<op>/<field>` and feeds the
-breakdown table rather than a chart.
+| `step/codec/{pack_s,unpack_s}` | jagged pad/unpad cost, which `by_op` cannot see |
 | `now/bytes_outstanding_mb`, `now/n_processes` | occupancy, fan-out width |
 | `step/self/{overhead_ms,frac}` | what measuring cost |
 | `step/hash/*` | only with `verify_tensor_hash` on |
+
+Per-op detail is published under `step/by_op/<op>/<field>` and feeds the
+breakdown table rather than a chart.
 
 **`percent_of_dataplane` is a percentage of data-plane time, not of the step.** The
 denominator is `sum(wall_ms)` over the ops that ran, so
@@ -593,9 +594,16 @@ It is deliberately not clamped to 100%. Against a fast backend the ratio
 can exceed 1, meaning measuring cost more than the operation measured — a
 signal worth seeing rather than hiding.
 
-**Units:** every duration is `_ms`, every volume is `_mb`, no exceptions —
-a chart mixing `wall_s` against `p90_ms` puts a 0.008 beside a 24.85 and
-reads as a data-plane bug rather than an axis one.
+**Units:** charted *durations* are seconds — `step/wall_s`,
+`step/codec/{pack_s,unpack_s}` — so they sit beside
+`timing/train/total_step_time`. The one charted duration that is not is
+`step/self/overhead_ms`: it is a cost-of-measurement figure, read against the
+breakdown table rather than against the step clock. The table itself is ms
+throughout (`wall_ms`, `mean_ms`, `max_ms`, `p50_ms`, `p90_ms`), where
+sub-second per-call figures stay legible. Volumes are always `_mb`. What is not
+allowed is mixing units *within one chart*: `step/wall_s` on the same axis as
+`p90_ms` puts a 0.008 next to a 24.85 and reads as a data-plane bug rather than
+an axis one.
 
 **Per step you get, per op tag:** `calls`, `wall_ms`, `max_ms`. Percentiles come off the *step's* histogram delta, not the
 cumulative one -- a per-step p50 off a histogram that is never reset goes
