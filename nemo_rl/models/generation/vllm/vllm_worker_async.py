@@ -54,6 +54,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
 )
+from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1711,6 +1712,13 @@ class VllmAsyncGenerationWorkerImpl(
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+        finally:
+            # Flush buffered spans/metrics before the actor goes away. Off the
+            # event loop: the flush blocks on a network export with a 5s
+            # timeout, and this is an async actor whose other coroutines --
+            # including in-flight generate requests -- share this loop. Same
+            # reason the sparse-refit shutdown above is offloaded.
+            await asyncio.to_thread(shutdown_telemetry)
 
 
 @ray.remote(

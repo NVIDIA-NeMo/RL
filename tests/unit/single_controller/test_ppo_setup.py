@@ -103,7 +103,11 @@ def _make_master_config(
     block is active and the other one stays None.
     """
     return MasterConfig.model_construct(
-        data_plane={"enabled": True, "impl": "transfer_queue"},
+        data_plane={
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "simple",
+        },
         data={
             "use_multiple_dataloader": False,
             "shuffle": False,

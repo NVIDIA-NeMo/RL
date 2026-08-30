@@ -19,6 +19,7 @@ import zmq
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
+from nemo_rl.telemetry.setup import shutdown_telemetry
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -292,6 +293,12 @@ class AbstractPolicyWorker:
             return True
         except Exception:
             return False
+        finally:
+            # Flush buffered spans/metrics before the actor goes away. Only the
+            # async GRPO trainer calls shutdown() today; elsewhere Ray reaps the
+            # actor and this never runs, so worker telemetry relies on the batch
+            # processor's periodic export.
+            shutdown_telemetry()
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

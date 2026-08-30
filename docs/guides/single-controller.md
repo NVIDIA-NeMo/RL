@@ -25,7 +25,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       enabled: true
     ```
 
-2. **Enable vLLM async engine** and **disable colocated inference** (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine; setup rejects `colocated.enabled: true`):
+2. **Pick a generation backend** and **disable colocated inference** (setup rejects `colocated.enabled: true`). With vLLM, enable the async engine (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine):
 
     ```yaml
     policy:
@@ -38,6 +38,23 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
           resources:
             num_nodes: 1
             gpus_per_node: 4  # inference GPUs; remainder go to training
+    ```
+
+    Megatron generation is also supported, non-colocated only. It requires the Megatron trainer (`policy.megatron_cfg.enabled: true`) and NeMo-Gym rollouts additionally require `policy.generation.mcore_generation_config.expose_http_server: true`. The exemplar — a NeMo-Gym run with the OpenAI server exposed — lives at [examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml](../../examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml):
+
+    ```yaml
+    policy:
+      megatron_cfg:
+        enabled: true
+      generation:
+        backend: "megatron"
+        mcore_generation_config:
+          expose_http_server: true  # required for NeMo-Gym rollouts
+        colocated:
+          enabled: false
+          resources:
+            num_nodes: 1
+            gpus_per_node: 1  # inference GPUs; remainder go to training
     ```
 
 3. **One RL step = one training batch.** The batch a step trains on is the whole step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)). A GRPO step is also one optimizer step; a PPO step is `ppo.ppo_epochs` of them over that same batch.
@@ -54,7 +71,45 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       use_importance_sampling_correction: true
     ```
 
-5. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step. `ppo.warm_start_value_checkpoint` seeds that critic from another run's checkpoint instead, so a fresh run can skip the online warmup entirely — see [Warm-Starting the Critic](./ppo.md#warm-starting-the-critic).
+5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. Native TQ checkpointing currently supports only the `simple` storage backend. For multi-node runs, `checkpoint_dir` must be on a durable filesystem visible at the same path from every node.
+
+    ```yaml
+    checkpointing:
+      enabled: true
+      checkpoint_dir: /shared/checkpoints/my-run
+      save_data_plane: true
+
+    data_plane:
+      enabled: true
+      backend: "simple"
+    ```
+
+6. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step. `ppo.warm_start_value_checkpoint` seeds that critic from another run's checkpoint instead, so a fresh run can skip the online warmup entirely — see [Warm-Starting the Critic](./ppo.md#warm-starting-the-critic).
+
+## Checkpointing and Replay Recovery
+
+With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:
+
+- The normal model, dataloader, and controller state, plus optimizer state when configured.
+- A native TQ snapshot containing rollout tensor payloads and TQ state.
+- A metadata-only replay index describing the completed rollout groups stored in TQ.
+- A `rollout_recovery.pt` ownership ledger describing unfinished prompt groups that must be redispatched after a restart.
+- A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, when applicable.
+- The sampler dispatch position needed to continue scheduling from the correct point.
+
+The TQ snapshot and replay index are captured under the same checkpoint barrier. Generation may continue while the snapshot is written, but completed-group commits and destructive TQ clears wait at the barrier. This ensures that the TQ snapshot and replay index describe the same set of groups.
+
+On resume, Single-Controller validates the TQ snapshot against the trainer checkpoint, restores the replay index, and makes completed, committed, unconsumed groups available to the sampler before training resumes.
+
+Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
+
+:::{note}
+Completed groups are restored directly from the TQ snapshot. Prompt groups whose generations were still in flight at the checkpoint boundary are recovered by ownership: `rollout_recovery.pt` records them, and on resume they are redispatched and regenerated from the same dataset rows. Only rows already committed to TQ preserve their exact generated tokens; redispatched groups produce new samples from the same prompts.
+:::
+
+When a sampler does not support replay recovery, a requested data-plane checkpoint is written in `shadow` mode. The TQ snapshot is retained, but no authoritative replay index is written and its rows are not restored into the training replay buffer.
+
+Native TQ save/load currently requires `data_plane.backend: "simple"`. Mooncake-backed storage is not recoverable through this mechanism. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
 
 ## Async-RL Knobs and Sampler Modes
 
@@ -62,7 +117,7 @@ All SC async-RL runtime knobs live under `async_rl:` in the master config. The m
 
 ### Sampler modes
 
-Pick one of four modes with `sampler.name`. Each mode takes its own knobs, listed below — a knob from one mode has no effect under another:
+Pick one of five modes with `sampler.name`. Each mode takes its own knobs, listed below — a knob from one mode has no effect under another:
 
 ![Sampler modes: same buffer, four different training batches](../assets/sc-sampler-modes.png)
 
@@ -73,13 +128,14 @@ Pick one of four modes with `sampler.name`. Each mode takes its own knobs, liste
 | -------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `in_order`     | Dispatch may lead the trainer by up to `max_lookahead_versions` batches. Each dispatch is stamped with a `target_step`. | Consume the group whose `target_step == current_train_weight`.                                                    | Sync mode (`max_lookahead_versions=0`) and legacy-async exact-batch semantics (`max_lookahead_versions>=1`). The only mode supported on a PPO run. |
 | `weight_fifo`  | Same gate as `in_order` (`max_staleness_versions` of lookahead).                                                        | Drain the oldest in-window `start_weight` first, waiting for that weight's batch to fill.                         | Strict weight-version FIFO under a bounded lookahead.                                                        |
+| `ready_first`  | Same gate as `weight_fifo` (`max_staleness_versions` of lookahead).                                                     | Take any ready group generated by a policy version no newer than the trainer, including late stragglers.         | Completion-order streaming without stale-group eviction.                                                    |
 | `windowed`     | Ungated — rollout keeps producing until the buffer fills.                                                               | Take any ready group with `start_weight` in `[train - max_staleness_versions, train]`, optionally freshest-first. | Over-sampled streaming; aged groups outside the window are evicted (wasted compute).                         |
 | `custom`       | Determined by the imported class.                                                                                       | Determined by the imported class.                                                                                 | `target: "module:ClassName"` — bring your own `PromptGroupSampler`.                                          |
 
 
 ### Config → behavior map
 
-The shipped exemplars cover three of the four modes:
+The shipped exemplars cover three of the five modes:
 
 
 | Mode                             | `sampler.name` | Sampler knob                   | `min_groups_for_streaming_train` | `max_buffered_rollouts`                               | Exemplar |
@@ -87,6 +143,7 @@ The shipped exemplars cover three of the four modes:
 | Sync / on-policy                 | `in_order`     | `max_lookahead_versions: 0`    | `${grpo.num_prompts_per_step}`   | `num_prompts_per_step × 1`                            | [`grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.yaml`](../../examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.yaml) |
 | Async, exact batch→step matching | `in_order`     | `max_lookahead_versions: >= 1` | `x <= num_prompts_per_step`   | `num_prompts_per_step × (max_lookahead_versions + 1)` | [`grpo_math_1B_megatron_single_controller.yaml`](../../examples/configs/grpo_math_1B_megatron_single_controller.yaml) |
 | Streaming, gated dispatch        | `weight_fifo`  | `max_staleness_versions: >= 1` | `x <= num_prompts_per_step`      | `num_prompts_per_step × (max_staleness_versions + 1)` | — (none shipped) |
+| Streaming, ready-first           | `ready_first`  | `max_staleness_versions: >= 1` | `x <= num_prompts_per_step`      | `num_prompts_per_step × (max_staleness_versions + 1)` | — (none shipped) |
 | Streaming, over-sampled          | `windowed`     | `max_staleness_versions: >= 1` | `x <= num_prompts_per_step`      | Larger than the gated capacity (dispatch is ungated)  | [`grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2.yaml`](../../examples/configs/recipes/llm/grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2.yaml) |
 
 
@@ -127,7 +184,7 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 #### 4. Samplers (`nemo_rl/algorithms/async_utils/staleness_sampler.py`)
 
 - Filter-only prompt-group selector over `TQReplayBuffer`. The base `PromptGroupSampler` protocol defines `admit`, `select`, and `evict`.
-- `WindowedSampler`, `WeightFifoSampler`, `InOrderSampler` are the built-in policies (one per row in the [Sampler modes](#sampler-modes) table). The `custom` mode (`CustomSamplerConfig.target`) makes `create_sampler` import a user-supplied class by FQN and type-check it against `PromptGroupSampler`.
+- `WindowedSampler`, `ReadyFirstSampler`, `WeightFifoSampler`, and `InOrderSampler` are the built-in policies (one per row in the [Sampler modes](#sampler-modes) table). The `custom` mode (`CustomSamplerConfig.target`) makes `create_sampler` import a user-supplied class by FQN and type-check it against `PromptGroupSampler`.
 
 #### 5. `_rollout_pump` and `_train_pump`
 
@@ -152,7 +209,7 @@ The [legacy async GRPO](./async-grpo.md) (`grpo.async_grpo.enabled: true` under 
 | Entrypoint       | `run_grpo.py`                            | `run_grpo_single_controller.py`                                                      |
 | Data-plane       | Direct actor RPC                         | TransferQueue (`data_plane.enabled: true` required)                                  |
 | Rollout batching | Full-batch `AsyncTrajectoryCollector`    | Per-prompt `RolloutManager.generate_and_push` into a group-granular `TQReplayBuffer` |
-| Staleness policy | Single knob (`max_trajectory_age_steps`) | Pluggable `StalenessSampler` (`in_order` / `weight_fifo` / `windowed` / `custom`)    |
+| Staleness policy | Single knob (`max_trajectory_age_steps`) | Pluggable `StalenessSampler` (`in_order` / `weight_fifo` / `ready_first` / `windowed` / `custom`) |
 | Batch boundary   | Sampled by target weight                 | Sampler-defined; can decouple rollout dispatch from train batch (streaming)          |
 
 
@@ -181,8 +238,8 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
-- Generation backend: only vLLM is supported and validated; Megatron generation, SGLang, and TRT-LLM have not been tested on SC.
-- Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`).
+- Generation backend: vLLM and Megatron generation are supported; SGLang and TRT-LLM have not been tested on SC.
+- Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, and the critic shards it against the configured `value.train_global_batch_size` rather than its actual size, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
 - Reward shaping and sample filtering — `overlong_filtering`, `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
