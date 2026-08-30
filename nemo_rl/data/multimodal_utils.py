@@ -989,10 +989,10 @@ class PackedTensor:
         reconstructs as legacy does: ``as_tensor`` returns ``None`` and
         ``logical_segment_counts_by_row`` reports 0 rather than 1.
 
-        ``pad_to_max_shape`` is restored onto the rebuilt value rather than
-        materialized on the wire. A multi-segment row whose segments differ in
-        trailing dims is padded here, in worker memory, exactly as
-        :meth:`as_tensor` would -- the concat cannot happen otherwise.
+        ``pad_to_max_shape`` is restored onto the rebuilt value as a flag, not
+        materialized. Segments come back at their true shapes and stay separate
+        via the CSR row map, so nothing is padded or concatenated here;
+        :meth:`as_tensor` pads at use time.
 
         Mirrors :meth:`to_wire`; both assume ``dim_to_pack=0``.
         """
