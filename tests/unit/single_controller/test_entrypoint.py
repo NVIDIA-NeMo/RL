@@ -51,6 +51,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         gen_handle=SimpleNamespace(shutdown=MagicMock()),
         trainer_handle=SimpleNamespace(shutdown=MagicMock()),
         value_handle=None,
+        teacher_handle=None,
     )
     ray_get = MagicMock(return_value={})
     # The driver now polls ping() around the run. Report the run as ready on the first
@@ -188,6 +189,18 @@ def _distillation_context(main_context, monkeypatch, *, teacher_model="teacher/m
 
 
 class TestDistillationEntrypoint:
+    def test_the_distillation_teacher_is_shut_down(self, main_context, monkeypatch):
+        _distillation_context(main_context, monkeypatch)
+        monkeypatch.setattr(
+            run_grpo_single_controller, "check_vocab_equality", lambda *a: None
+        )
+        teacher = SimpleNamespace(shutdown=MagicMock())
+        main_context.actor_args.teacher_handle = teacher
+
+        run_grpo_single_controller.main()
+
+        teacher.shutdown.assert_called_once_with()
+
     def test_a_distillation_config_reaches_setup(self, main_context, monkeypatch):
         """The legacy-async check reads ``config.grpo.async_grpo`` on anything
         that is not PPO. ``grpo`` is None on a distillation run, so without its

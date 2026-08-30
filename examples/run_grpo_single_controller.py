@@ -199,6 +199,7 @@ def main() -> None:
             ("Generation", actor_args.gen_handle),
             ("Trainer", actor_args.trainer_handle),
             ("Value", actor_args.value_handle),
+            ("Teacher", getattr(actor_args, "teacher_handle", None)),
         ):
             if resource is None:
                 continue

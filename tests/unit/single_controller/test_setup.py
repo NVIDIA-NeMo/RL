@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -47,7 +48,9 @@ from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _initial_grpo_save_state,
 )
+from nemo_rl.algorithms.distillation import DistillationConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss.loss_functions import DistillationLossConfig
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
@@ -56,7 +59,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     setup_single_controller,
 )
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
-from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
+from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS, TEACHER_TOPK_FIELDS
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
@@ -168,6 +171,26 @@ def _make_master_config(
     )
 
 
+def _make_distillation_master_config() -> MasterConfig:
+    """Build the smallest distillation config that reaches the real setup caller."""
+    master_config = _make_master_config(megatron_enabled=True)
+    master_config.grpo = None
+    master_config.distillation = DistillationConfig(
+        num_prompts_per_step=4,
+        num_generations_per_prompt=2,
+        max_num_steps=100,
+        max_num_epochs=1,
+        val_period=0,
+        val_at_start=False,
+        val_at_end=False,
+    )
+    # A real teacher has its own nested config. Keep it independent here so
+    # mutating the policy cannot accidentally make the teacher assertion pass.
+    master_config.teacher = copy.deepcopy(master_config.policy)
+    master_config.loss_fn = DistillationLossConfig()
+    return master_config
+
+
 def _native_tq_metadata(
     *, step: int = 3, trainer_version: Optional[int] = None, epoch: int = 1
 ) -> DataPlaneCheckpointMetadata:
@@ -212,6 +235,7 @@ def patched_factories():
     # Real return objects; _build_generation and _build_trainer return (obj, elapsed_s) tuples.
     fake_gen = MagicMock(name="gen")
     fake_policy = MagicMock(name="policy")
+    fake_teacher = MagicMock(name="teacher")
 
     with (
         patch.object(
@@ -239,6 +263,9 @@ def patched_factories():
         patch.object(
             sc_setup_mod, "_build_trainer", return_value=(fake_policy, 0.0)
         ) as mock_trainer,
+        patch.object(
+            sc_setup_mod, "_build_teacher", return_value=(fake_teacher, 0.0)
+        ) as mock_teacher,
         patch.object(
             sc_setup_mod,
             "build_data_plane_client",
@@ -268,6 +295,7 @@ def patched_factories():
             "_build_clusters": mock_clusters,
             "_build_generation": mock_gen,
             "_build_trainer": mock_trainer,
+            "_build_teacher": mock_teacher,
             "build_data_plane_client": mock_dp_client,
             "create_weight_synchronizer": mock_weight_sync,
             "_create_advantage_estimator": mock_adv,
@@ -276,6 +304,7 @@ def patched_factories():
             "env_handles": fake_env_handles,
             "fake_gen": fake_gen,
             "fake_policy": fake_policy,
+            "fake_teacher": fake_teacher,
         }
 
 
@@ -773,6 +802,24 @@ class TestSetup:
         assert "teacher_reference_logprobs" in warmup["fields"]
         assert warmup["num_samples"] == 16
         assert warmup["grpo_group_size"] == 2
+
+    def test_distillation_reaches_setup_without_a_grpo_estimator(
+        self, patched_factories
+    ):
+        """Exercise the caller that previously sent distillation to GRPO's factory."""
+        mc = _make_distillation_master_config()
+
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.advantage_estimator is None
+        assert actor_args.teacher_handle is patched_factories["fake_teacher"]
+        patched_factories["_build_teacher"].assert_called_once()
+        build_config = patched_factories["_build_teacher"].call_args.args[1]
+        assert build_config.policy["megatron_cfg"]["train_iters"] == 4
+        assert build_config.teacher["megatron_cfg"]["train_iters"] == 4
+        patched_factories["_create_advantage_estimator"].assert_not_called()
+        warmup = actor_args.dp_client.register_partition.call_args.kwargs
+        assert set(TEACHER_TOPK_FIELDS) <= set(warmup["fields"])
 
     def test_reserves_topology_constrained_training_before_builds(
         self, patched_factories
