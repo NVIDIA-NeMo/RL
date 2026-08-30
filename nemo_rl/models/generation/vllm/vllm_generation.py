@@ -716,7 +716,29 @@ class VllmGeneration(GenerationInterface):
             self.worker_group.recreate_worker(worker_idx)
 
         leader = self.worker_group.workers[leader_idx]
-        ray.get(leader.load_model.remote())
+        # load_model ONLY on the deferred path, because only there is the model still
+        # unloaded after __init__.
+        #
+        # The two startup paths are not the same sequence. With defer_model_load=True the
+        # worker reserves a port and stashes its bundle_indices and seed for later, and
+        # load_and_start() does the heavy lifting. With the default False -- which is what
+        # every SingleController config uses -- __init__ loads the model itself, and
+        # _deferred_seed is left at the None it was initialised to, because the branch that
+        # assigns it returns early:
+        #
+        #     if not self.is_model_owner or not defer_model_load:
+        #         return
+        #     self._deferred_seed = seed
+        #
+        # Calling load_model there re-enters _create_engine with seed=None, and vLLM's
+        # ModelConfig requires an int: job 6722014 failed five restarts with
+        # "ValidationError: seed - Input should be a valid integer". The recreated worker
+        # already had a working engine; this call broke it.
+        #
+        # post_init and the URL report stay unconditional -- eager startup runs both too,
+        # from VllmGeneration.__init__ rather than from load_and_start.
+        if self._defer_model_load:
+            ray.get(leader.load_model.remote())
         method_name = (
             "post_init_async" if self.cfg["vllm_cfg"]["async_engine"] else "post_init"
         )
