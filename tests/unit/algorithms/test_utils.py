@@ -24,6 +24,7 @@ from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.utils import (
     EFFICIENCY_CATEGORIES,
+    STEP_WINDOW_WALL_CLOCK_CATEGORIES,
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
     get_tokenizer,
@@ -798,9 +799,11 @@ class TestPrintEfficiencySummary:
 
         result = print_efficiency_summary(metrics, total_wall, step=1)
 
-        assert result["efficiency/total_waste_s"] == 20.0
-        assert result["efficiency/productive_time_s"] == 80.0
-        assert result["efficiency/efficiency_pct"] == pytest.approx(80.0)
+        # init/total is not waste for this step: it is a run-long constant, so
+        # only the three per-step idle categories count (5 + 3 + 2).
+        assert result["efficiency/total_waste_s"] == 10.0
+        assert result["efficiency/productive_time_s"] == 90.0
+        assert result["efficiency/efficiency_pct"] == pytest.approx(90.0)
         assert result["efficiency/total_wall_time_s"] == 100.0
 
         assert result["efficiency/init/total_s"] == 10.0
@@ -812,7 +815,51 @@ class TestPrintEfficiencySummary:
 
         captured = capsys.readouterr()
         assert "Efficiency Summary (Step 1)" in captured.out
-        assert "80.00%" in captured.out
+        assert "90.00%" in captured.out
+
+    def test_startup_cost_is_not_charged_to_every_step(self):
+        """init/total is republished every step, so counting it would recur.
+
+        The driver measures it once before the loop and re-supplies the same
+        value on every step so the series does not zero out. Folding it into the
+        waste aggregate would subtract the whole startup cost from every step.
+        """
+        idle_only = {"idle/refit_bubble": 4.0}
+        with_startup = {**idle_only, "init/total": 300.0}
+
+        assert print_efficiency_summary(
+            with_startup, total_wall_time_s=1000.0, step=9, step_wall_time_s=20.0
+        )["efficiency/efficiency_pct"] == pytest.approx(
+            print_efficiency_summary(
+                idle_only, total_wall_time_s=1000.0, step=9, step_wall_time_s=20.0
+            )["efficiency/efficiency_pct"]
+        )
+
+    def test_efficiency_is_a_per_step_ratio(self):
+        """The numerator is per-step, so the denominator has to be too.
+
+        Against the run's elapsed time, a fixed per-step idle cost would look
+        like it was shrinking: the same 5s of idle in a 20s step is 25% waste at
+        step 2 and 25% at step 500, but 5/1000 at step 500 if divided by the run.
+        """
+        metrics = {"idle/buffer_starvation": 5.0}
+
+        result = print_efficiency_summary(
+            metrics, total_wall_time_s=1000.0, step=50, step_wall_time_s=20.0
+        )
+
+        assert result["efficiency/efficiency_pct"] == pytest.approx(75.0)
+        # The per-category column stays a share of the run, which is what makes
+        # a cumulative denominator the right one there.
+        assert result["efficiency/idle/buffer_starvation_pct"] == pytest.approx(0.5)
+
+    def test_step_wall_time_defaults_to_the_run(self):
+        """Callers with no per-step measurement keep the old denominator."""
+        metrics = {"idle/refit_bubble": 25.0}
+
+        result = print_efficiency_summary(metrics, total_wall_time_s=100.0, step=1)
+
+        assert result["efficiency/efficiency_pct"] == pytest.approx(75.0)
 
     def test_zero_wall_time(self):
         """Test that zero wall time produces 100% efficiency."""
@@ -831,10 +878,11 @@ class TestPrintEfficiencySummary:
             if cat in WALL_CLOCK_EFFICIENCY_CATEGORIES:
                 assert f"efficiency/{cat}_pct" in result
 
-        # total_waste_s reflects wall-clock categories only (4 x 1.0); collector
-        # thread-seconds are reported separately, not folded into wall waste.
-        assert result["efficiency/total_waste_s"] == 4.0
-        assert result["efficiency/efficiency_pct"] == pytest.approx(96.0)
+        # total_waste_s reflects the per-step wall-clock categories only
+        # (3 x 1.0): collector thread-seconds are reported separately rather
+        # than folded into wall waste, and init/total is a run constant.
+        assert result["efficiency/total_waste_s"] == 3.0
+        assert result["efficiency/efficiency_pct"] == pytest.approx(97.0)
 
     def test_efficiency_with_collector_metrics_merge(self):
         """Test merging driver and collector metrics before computing efficiency."""
@@ -847,13 +895,16 @@ class TestPrintEfficiencySummary:
 
         result = print_efficiency_summary(merged, total_wall_time_s=50.0, step=3)
 
-        assert result["efficiency/total_waste_s"] == 8.0
+        # Only the driver's per-step idle counts: refit_bubble (3.0). The
+        # collector's two categories are thread-seconds, init/total is a run
+        # constant.
+        assert result["efficiency/total_waste_s"] == 3.0
         assert result["efficiency/thread_seconds_total_s"] == 3.0
-        assert result["efficiency/efficiency_pct"] == pytest.approx(84.0)
+        assert result["efficiency/efficiency_pct"] == pytest.approx(94.0)
 
     def test_wall_waste_clamped_to_wall_time(self):
         """Wall-clock waste is capped so efficiency stays in [0, 100]."""
-        metrics = {cat: 30.0 for cat in WALL_CLOCK_EFFICIENCY_CATEGORIES}
+        metrics = {cat: 30.0 for cat in STEP_WINDOW_WALL_CLOCK_CATEGORIES}
         result = print_efficiency_summary(metrics, total_wall_time_s=60.0, step=2)
 
         assert result["efficiency/total_waste_s"] == 60.0

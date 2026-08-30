@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -26,6 +26,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    reject_unenforceable_refit_deadline,
 )
 from nemo_rl.models.generation.megatron.config import (
     MCoreGenerationConfig,
@@ -36,6 +37,8 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.distributed.worker_groups import RayWorkerGroup
     from nemo_rl.models.policy.lm_policy import Policy
 
 
@@ -139,6 +142,56 @@ class MegatronGeneration(GenerationInterface):
         node_ip, port = ray.get(holder.address.remote())
         return f"http://{node_ip}:{port}/v1", port, holder
 
+    @classmethod
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Reject config the Megatron generation backend cannot honor."""
+        policy_config: PolicyConfig = master_config.policy
+        recompute_kv_cache_after_weight_updates: bool = (
+            master_config.async_rl.recompute_kv_cache_after_weight_updates
+        )
+        if not (
+            "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
+        ):
+            raise ValueError(
+                "policy.generation.backend='megatron' requires the Megatron trainer "
+                "(policy.megatron_cfg.enabled=true): refit transfers weights via Megatron reshard "
+                "collective from the Megatron trainer."
+            )
+
+        mcore_cfg = cast(MCoreGenerationConfig, policy_config["generation"])[
+            "mcore_generation_config"
+        ]
+        # Recompute-after-refit is implemented engine-side (kv_cache_management_mode="recompute");
+        # the loop-level flag must agree with that mode, and setup errors on a mismatch.
+        kv_cache_mode = mcore_cfg["kv_cache_management_mode"]
+        if recompute_kv_cache_after_weight_updates != (kv_cache_mode == "recompute"):
+            raise ValueError(
+                "async_rl.recompute_kv_cache_after_weight_updates="
+                f"{recompute_kv_cache_after_weight_updates} conflicts with "
+                "policy.generation.mcore_generation_config."
+                f"kv_cache_management_mode={kv_cache_mode!r}: with "
+                "policy.generation.backend='megatron' the two must agree. Either "
+                "set the flag to true with kv_cache_management_mode='recompute', "
+                "or leave the flag false with 'persist'/'offload'."
+            )
+
+        if master_config.async_rl.generation_fleet_health.enabled:
+            raise NotImplementedError(
+                "async_rl.generation_fleet_health.enabled=true is not supported "
+                f"for the {cls.__name__} generation backend"
+            )
+
+    @classmethod
+    def verify_served_address(
+        cls, served_urls: list[Optional[str]], reserved_url: str
+    ) -> None:
+        """Fail loud if the engine serves anywhere but the pre-published address."""
+        if served_urls != [reserved_url]:
+            raise RuntimeError(
+                "Megatron server came up at a different address than the one "
+                f"pre-published to NeMo Gym: reserved {reserved_url}, serving {served_urls}."
+            )
+
     def __init__(
         self,
         config: PolicyConfig,
@@ -147,7 +200,6 @@ class MegatronGeneration(GenerationInterface):
         policy: Optional["Policy"] = None,
         name_prefix: str = "megatron_generation",
         processor: Optional[AutoProcessor] = None,
-        weights_path: Optional[str] = None,
         skip_weight_load: bool = False,
         reserved_http_server_port: Optional[int] = None,
     ):
@@ -162,7 +214,6 @@ class MegatronGeneration(GenerationInterface):
             policy: Existing training Policy to reuse for generation.
             name_prefix: Prefix for naming the worker group (non-colocated only).
             processor: Optional processor for VLMs (non-colocated only).
-            weights_path: Optional path to model weights (non-colocated only).
             skip_weight_load: Do not load the weights from the checkpoint; refit will do it.
             reserved_http_server_port: Driver-reserved OpenAI server port for non-colocated.
         """
@@ -214,15 +265,20 @@ class MegatronGeneration(GenerationInterface):
             processor=processor,
             init_optimizer=False,
             init_reference_model=False,
-            weights_path=weights_path,
             skip_weight_load=skip_weight_load,
             reserved_http_server_port=reserved_http_server_port,
         )
 
-        # Skip-load models do not have their final refit weight buffers yet. Defer
-        # engine initialization so CUDA graphs capture the persistent buffers.
+        # Skip-load models do not have their final refit weight buffers yet.
+        # Defer engine initialization so CUDA graphs capture the persistent buffers.
+        # The engine + HTTP server then first come up at the initial refit.
         if not skip_weight_load:
             self.prepare_for_generation()
+
+    @property
+    def worker_group(self) -> "RayWorkerGroup":
+        """The underlying policy's worker group (fleet-health probes read dp_size)."""
+        return self._policy.worker_group
 
     def init_collective(
         self,
@@ -254,8 +310,11 @@ class MegatronGeneration(GenerationInterface):
             refit_backend=refit_backend,
         )
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
         """Receive updated weights from the training cluster via collective communication."""
+        reject_unenforceable_refit_deadline("Megatron", refit_timeout_s)
         return self._policy.swap_weights_via_reshard(is_source=False)
 
     def generate(
