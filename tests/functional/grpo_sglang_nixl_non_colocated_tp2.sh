@@ -17,7 +17,9 @@ set -eou pipefail
 # succeeding; only tp_size>1 can catch that, and the token_mult_prob_error gate
 # below is what would catch it.
 #
-# 3 GPUs: 2 for the SGLang engine, 1 for the trainer.
+# 4 GPUs: 2 for the SGLang engine and 2 for the trainer. NIXL maps one
+# policy sender to every rollout rank and rejects train_world_size smaller
+# than rollout_world_size, so a one-GPU trainer cannot exercise TP2.
 
 EXP_NAME=$(basename "$0" .sh)
 EXP_DIR="$SCRIPT_DIR/$EXP_NAME"
@@ -38,7 +40,7 @@ uv run --group test coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" 
     grpo.num_generations_per_prompt=4 \
     policy.train_global_batch_size=4 \
     policy.train_micro_batch_size=1 \
-    cluster.gpus_per_node=3 \
+    cluster.gpus_per_node=4 \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.gpus_per_node=2 \
     policy.generation.refit_transport=nixl \
