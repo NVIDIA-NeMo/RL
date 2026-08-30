@@ -40,6 +40,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
@@ -977,7 +978,9 @@ class _NoOpTrainer:
     def begin_train_step(self, loss_fn) -> None:
         del loss_fn
 
-    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, train_fields: tuple[str, ...] = ()
+    ) -> None:
         del meta
 
     def finish_train_step(self) -> dict:
@@ -1031,7 +1034,9 @@ class _EpochRecordingTrainer(_OrderRecordingTrainer):
         del loss_fn
         self.calls.append("policy.begin_train_step")
 
-    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, train_fields: tuple[str, ...] = ()
+    ) -> None:
         del meta
         self.calls.append("policy.train_microbatches_from_meta")
 
@@ -1327,7 +1332,9 @@ def test_train_pump_skips_empty_chunk_and_trains_later_valid_chunk(
 
     assert trainer.prepare_for_training.call_count == 2
     trainer.begin_train_step.assert_called_once_with(None)
-    trainer.train_microbatches_from_meta.assert_called_once_with(valid_meta)
+    trainer.train_microbatches_from_meta.assert_called_once_with(
+        valid_meta, train_fields=DP_TRAIN_FIELDS
+    )
     trainer.finish_train_step.assert_called_once_with()
     assert ctrl._train_steps == 1
 

@@ -55,7 +55,10 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import MseValueLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    DistillationLossFn,
+    MseValueLossFn,
+)
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
     print_setup_timing_summary,
@@ -64,6 +67,7 @@ from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
+    is_distillation_run,
     is_ppo_run,
     validate_single_controller_config,
 )
@@ -161,6 +165,10 @@ class SingleControllerActorArgs:
     # the MSE loss it trains under.
     value_handle: Optional[TQValue] = None
     value_loss_fn: Optional[LossFunction] = None
+    # None unless this is a distillation run, where it is the frozen teacher the
+    # train pump scores each chunk with. Its loss is the run's ``loss_fn``, not a
+    # second one -- unlike the critic, the teacher never trains.
+    teacher_handle: Optional[TQPolicy] = None
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -316,7 +324,10 @@ def _build_clusters(
 
     # Worker groups sharing the training GPUs: the policy, plus the critic on
     # the PPO path.
-    train_worker_groups = 2 if is_ppo_run(master_config) else 1
+    # The critic on PPO, the frozen teacher on distillation; never both.
+    train_worker_groups = (
+        2 if is_ppo_run(master_config) or is_distillation_run(master_config) else 1
+    )
 
     if colocated:
         # Policy (+ critic) + generation share GPUs — one cluster.
@@ -589,7 +600,10 @@ def _build_trainer(
     """
     t0 = time.perf_counter()
     loss_config = master_config.loss_fn
-    init_reference_model = loss_config.reference_policy_kl_penalty > 0
+    # DistillationLossConfig carries no reference KL: the teacher is the only
+    # other distribution in that loss, so the student needs no frozen copy of
+    # itself.
+    init_reference_model = getattr(loss_config, "reference_policy_kl_penalty", 0.0) > 0
     trainer = TQPolicy(
         cluster=train_cluster,
         config=master_config.policy,
@@ -636,6 +650,44 @@ def _build_value(
         dp_cfg=master_config.data_plane,
     )
     return value, time.perf_counter() - t0
+
+
+def _build_teacher(
+    train_cluster: RayVirtualCluster,
+    master_config: MasterConfig,
+    tokenizer: PreTrainedTokenizerBase,
+) -> tuple[TQPolicy, float]:
+    """Build the TQ-mediated distillation teacher (driver-side TQPolicy).
+
+    A ``TQPolicy`` rather than a class of its own: the teacher is a policy that
+    happens never to train, which is why ``init_optimizer`` and
+    ``init_reference_model`` are both off. ``distillation.py`` builds it the
+    same way.
+
+    No checkpoint paths: the teacher is frozen, so there is nothing of its own
+    to resume, and resuming *into* it would overwrite the teacher with student
+    weights.
+
+    Args:
+        train_cluster: Ray virtual cluster the teacher shares with the trainer.
+        master_config: SC MasterConfig.
+        tokenizer: Tokenizer used by the teacher; distillation requires the
+            student and teacher share a vocabulary.
+
+    Returns:
+        A tuple of (TQPolicy teacher, wall time spent in this call).
+    """
+    t0 = time.perf_counter()
+    teacher = TQPolicy(
+        cluster=train_cluster,
+        config=master_config.teacher,
+        tokenizer=tokenizer,
+        name_prefix="teacher",
+        init_optimizer=False,
+        init_reference_model=False,
+        dp_cfg=master_config.data_plane,
+    )
+    return teacher, time.perf_counter() - t0
 
 
 def _spinup_gym(
@@ -718,6 +770,13 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     policy_config = master_config.policy
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         policy_config["megatron_cfg"]["train_iters"] = train_iters
+
+    # frozen distillation teacher
+    if is_distillation_run(master_config):
+        teacher_config = master_config.teacher
+        if teacher_config.get("megatron_cfg", {}).get("enabled", False):
+            teacher_config["megatron_cfg"]["train_iters"] = train_iters
+        return
 
     # value
     if not is_ppo:
@@ -835,16 +894,20 @@ def _maybe_start_generation_router(
 
 def _build_advantage_estimator(master_config: MasterConfig) -> Any:
     """Build the advantage estimator from whichever algorithm's factory applies."""
+    if is_distillation_run(master_config):
+        # Distillation trains directly from the teacher distribution. Its train
+        # pump deliberately skips the advantage stage, and DistillationConfig
+        # has no GRPO ``adv_estimator`` block for the GRPO factory to read.
+        return None
     if is_ppo_run(master_config):
         # TODO(#2625): raw_reward passes this factory but yields no returns, so
         # the critic train would then fetch a column nobody wrote.
         from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
         return _create_advantage_estimator(cast(PPOMasterConfig, master_config))
-    else:
-        from nemo_rl.algorithms.grpo import _create_advantage_estimator
+    from nemo_rl.algorithms.grpo import _create_advantage_estimator
 
-        return _create_advantage_estimator(cast(GRPOMasterConfig, master_config))
+    return _create_advantage_estimator(cast(GRPOMasterConfig, master_config))
 
 
 def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
@@ -1087,8 +1150,10 @@ def setup_single_controller(
     if megatron_backend:
         generation_config["model_name"] = master_config.policy["model_name"]
 
-    def _build_trainer_and_value() -> tuple[Any, Optional[TQValue], dict[str, float]]:
-        """Build the trainer, then the critic when this is a PPO run.
+    def _build_trainer_and_value() -> tuple[
+        Any, Optional[TQValue], Optional[TQPolicy], dict[str, float]
+    ]:
+        """Build the trainer, then the critic or the teacher when there is one.
 
         Serial, and with the trainer offloaded in between, because both worker
         groups live on the same training GPUs: leaving the policy resident
@@ -1096,8 +1161,10 @@ def setup_single_controller(
         to GPU before returning so callers see the same state GRPO leaves them.
 
         Returns:
-            A tuple of (TQPolicy trainer, TQValue critic or None, per-phase wall
-            times keyed as "trainer_time" and "value_time").
+            A tuple of (TQPolicy trainer, TQValue critic or None, TQPolicy
+            teacher or None, per-phase wall times keyed as "trainer_time" and
+            "value_time"/"teacher_time"). At most one of the critic and the
+            teacher is ever set -- MasterConfig admits one algorithm block.
         """
         time_metrics: dict[str, float] = {}
         trainer, time_metrics["trainer_time"] = _build_trainer(
@@ -1108,8 +1175,22 @@ def setup_single_controller(
             weights_path=weights_path,
             optimizer_path=optimizer_path,
         )
+        if is_distillation_run(master_config):
+            # Same serial shape as the critic below, and for the same reason:
+            # both worker groups sit on the training GPUs, so the trainer is
+            # parked while the teacher loads.
+            trainer.offload_to_cpu()
+            teacher, time_metrics["teacher_time"] = _build_teacher(
+                train_cluster,
+                master_config,
+                tokenizer,
+            )
+            teacher.offload_after_refit()
+            trainer.prepare_for_training()
+            return trainer, None, teacher, time_metrics
+
         if not is_ppo_run(master_config):
-            return trainer, None, time_metrics
+            return trainer, None, None, time_metrics
 
         trainer.offload_to_cpu()
         value, time_metrics["value_time"] = _build_value(
@@ -1122,12 +1203,12 @@ def setup_single_controller(
         # Blocks on the critic's async Ray __init__, then parks it on CPU.
         value.finish_training()
         trainer.prepare_for_training()
-        return trainer, value, time_metrics
+        return trainer, value, None, time_metrics
 
     def _build_generation_then_trainer(
         defer_generation_model_load: bool, generation=None
-    ) -> tuple[Any, Any, Optional[TQValue], dict[str, float]]:
-        """Build generation then trainer (and critic) serially.
+    ) -> tuple[Any, Any, Optional[TQValue], Optional[TQPolicy], dict[str, float]]:
+        """Build generation then trainer (and critic or teacher) serially.
 
         Args:
             defer_generation_model_load: If True, generation is a pre-reserved handle and this call
@@ -1136,8 +1217,8 @@ def setup_single_controller(
 
         Returns:
             A tuple of (finalized generation object, TQPolicy trainer, TQValue
-            critic or None, per-phase wall times keyed as "gen_time",
-            "trainer_time" and "value_time").
+            critic or None, TQPolicy teacher or None, per-phase wall times keyed
+            as "gen_time", "trainer_time" and "value_time"/"teacher_time").
         """
         time_metrics = {}
 
@@ -1151,11 +1232,11 @@ def setup_single_controller(
                 inference_cluster, master_config
             )
 
-        # trainer (+ critic when PPO)
-        trainer, value, train_side_metrics = _build_trainer_and_value()
+        # trainer (+ critic when PPO, teacher when distillation)
+        trainer, value, teacher, train_side_metrics = _build_trainer_and_value()
         time_metrics.update(train_side_metrics)
 
-        return generation, trainer, value, time_metrics
+        return generation, trainer, value, teacher, time_metrics
 
     if not use_nemo_gym and master_config.async_rl.generation_router.enabled:
         # The router exists to hand NeMo-Gym one URL; the native path calls generation
@@ -1248,13 +1329,13 @@ def setup_single_controller(
         with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
             submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
             if "generation_trainer" in submitted:
-                generation, trainer, value, time_metrics = submitted[
+                generation, trainer, value, teacher, time_metrics = submitted[
                     "generation_trainer"
                 ].result()
                 gen_load_time = time_metrics["gen_time"]
             else:
                 generation, gen_load_time = submitted["generation"].result()
-                trainer, value, time_metrics = submitted["trainer"].result()
+                trainer, value, teacher, time_metrics = submitted["trainer"].result()
             if megatron_reserved_url is not None:
                 # Gym initialization needs a live URL that will respond to health checks.
                 # Megatron generation can only respond to health checks once initialized.
@@ -1289,6 +1370,8 @@ def setup_single_controller(
     setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
     if "value_time" in time_metrics:
         setup_timing_metrics.value_init_time_s = time_metrics["value_time"]
+    if "teacher_time" in time_metrics:
+        setup_timing_metrics.teacher_init_time_s = time_metrics["teacher_time"]
 
     # Native TQ restore must run through the trainer's bootstrap client before
     # the normal SC data-plane client is created or any rollout/train data-plane
@@ -1381,7 +1464,11 @@ def setup_single_controller(
     # Setup Algorithm + Rollout Wiring
     # ==========================
     advantage_estimator = _build_advantage_estimator(master_config)
-    loss_fn: LossFunction = ClippedPGLossFn(master_config.loss_fn)
+    loss_fn: LossFunction = (
+        DistillationLossFn(master_config.loss_fn)  # type: ignore[arg-type]
+        if is_distillation_run(master_config)
+        else ClippedPGLossFn(master_config.loss_fn)  # type: ignore[arg-type]
+    )
     value_loss_fn: Optional[LossFunction] = (
         MseValueLossFn(master_config.value_loss_fn)  # type: ignore
         if is_ppo_run(master_config)
@@ -1446,5 +1533,6 @@ def setup_single_controller(
         # PPO extras
         value_handle=value,
         value_loss_fn=value_loss_fn,
+        teacher_handle=teacher,
     )
     return actor_args, setup_timing_metrics

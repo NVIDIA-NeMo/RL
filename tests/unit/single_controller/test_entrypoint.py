@@ -51,6 +51,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         gen_handle=SimpleNamespace(shutdown=MagicMock()),
         trainer_handle=SimpleNamespace(shutdown=MagicMock()),
         value_handle=None,
+        teacher_handle=None,
     )
     ray_get = MagicMock(return_value={})
     # The driver now polls ping() around the run. Report the run as ready on the first
@@ -170,3 +171,90 @@ def test_main_configures_generation_for_trained_mtp(
     assert (
         main_context.config.policy["generation"] is main_context.configured_generation
     )
+
+
+def _distillation_context(main_context, monkeypatch, *, teacher_model="teacher/model"):
+    """Point the shared fixture's config at a distillation run.
+
+    ``model_construct`` skips validation, which is what lets these tests carry
+    only the fields the entrypoint reads.
+    """
+    cfg = main_context.config
+    cfg.grpo = None
+    cfg.ppo = None
+    cfg.distillation = SimpleNamespace(topk_logits_k=8)
+    cfg.teacher = {"model_name": teacher_model}
+    cfg.policy["model_name"] = "student/model"
+    return cfg
+
+
+class TestDistillationEntrypoint:
+    def test_the_distillation_teacher_is_shut_down(self, main_context, monkeypatch):
+        _distillation_context(main_context, monkeypatch)
+        monkeypatch.setattr(
+            run_grpo_single_controller, "check_vocab_equality", lambda *a: None
+        )
+        teacher = SimpleNamespace(shutdown=MagicMock())
+        main_context.actor_args.teacher_handle = teacher
+
+        run_grpo_single_controller.main()
+
+        teacher.shutdown.assert_called_once_with()
+
+    def test_a_distillation_config_reaches_setup(self, main_context, monkeypatch):
+        """The legacy-async check reads ``config.grpo.async_grpo`` on anything
+        that is not PPO. ``grpo`` is None on a distillation run, so without its
+        own branch the launcher dies on an AttributeError before setup."""
+        _distillation_context(main_context, monkeypatch)
+        monkeypatch.setattr(
+            run_grpo_single_controller, "check_vocab_equality", lambda *a: None
+        )
+
+        run_grpo_single_controller.main()
+
+        main_context.ray_get.assert_called()
+
+    def test_the_teacher_vocabulary_is_checked_before_anything_loads(
+        self, main_context, monkeypatch
+    ):
+        """The teacher writes top-k *indices*, read back as student vocabulary
+        ids. A teacher on another vocabulary is silently wrong, not an error."""
+        seen = []
+        _distillation_context(main_context, monkeypatch, teacher_model="other/model")
+        monkeypatch.setattr(
+            run_grpo_single_controller,
+            "check_vocab_equality",
+            lambda tok, student, teacher: seen.append((tok, student, teacher)),
+        )
+
+        run_grpo_single_controller.main()
+
+        assert seen == [("tokenizer", "student/model", "other/model")]
+
+    def test_the_vocabulary_check_has_the_same_opt_out_as_distillation_py(
+        self, main_context, monkeypatch
+    ):
+        called = []
+        _distillation_context(main_context, monkeypatch)
+        monkeypatch.setenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", "true")
+        monkeypatch.setattr(
+            run_grpo_single_controller,
+            "check_vocab_equality",
+            lambda *a: called.append(a),
+        )
+
+        run_grpo_single_controller.main()
+
+        assert called == []
+
+    def test_a_grpo_run_is_not_vocabulary_checked(self, main_context, monkeypatch):
+        called = []
+        monkeypatch.setattr(
+            run_grpo_single_controller,
+            "check_vocab_equality",
+            lambda *a: called.append(a),
+        )
+
+        run_grpo_single_controller.main()
+
+        assert called == []

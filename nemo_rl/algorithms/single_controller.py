@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import io
 import logging
@@ -86,6 +87,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
     algo_config,
+    is_distillation_run,
     is_ppo_run,
     validate_sampler_buffer_capacity,
     validate_single_controller_config,
@@ -101,7 +103,12 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
-from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
+from nemo_rl.data_plane.schema import (
+    DP_CALIB_INPUT_FIELDS,
+    DP_DISTILLATION_TRAIN_FIELDS,
+    DP_TRAIN_FIELDS,
+    TEACHER_TOPK_FIELDS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
@@ -177,6 +184,14 @@ class SingleControllerActor:
     # tick, and it must exist on any instance the watchdog can reach.
     _recovering_from_refit: bool = False
 
+    # Class-level for the same reason -- an instance built with
+    # ``object.__new__``, which is how the unit tests reach a single pump
+    # without standing up a cluster, reads the GRPO/PPO shape by default rather
+    # than raising AttributeError.
+    _is_distillation: bool = False
+    _teacher: Optional["TQPolicy"] = None
+    _train_fields: tuple[str, ...] = DP_TRAIN_FIELDS
+
     def __init__(
         self,
         master_config: MasterConfig,
@@ -199,14 +214,19 @@ class SingleControllerActor:
         self._algo_cfg = algo_config(master_config)
         self._async_cfg = master_config.async_rl
         self._is_ppo: bool = is_ppo_run(master_config)
+        self._is_distillation: bool = is_distillation_run(master_config)
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
 
-        self._policy_logprobs_required = not (
+        # DistillationLossFn takes only the sequence columns and the teacher's
+        # top-k. It forms no importance ratio and no reference KL, so neither
+        # logprob forward has a consumer -- and the two knobs that gate them do
+        # not exist on DistillationConfig.
+        self._policy_logprobs_required = not self._is_distillation and not (
             master_config.loss_fn.force_on_policy_ratio
             and self._algo_cfg.seq_logprob_error_threshold is None
         )
-        self._reference_logprobs_required = bool(
+        self._reference_logprobs_required = not self._is_distillation and bool(
             master_config.loss_fn.reference_policy_kl_penalty > 0
             and not self._algo_cfg.skip_reference_policy_logprobs_calculation
         )
@@ -215,6 +235,12 @@ class SingleControllerActor:
         self._gen: Generation = actor_args.gen_handle
         self._trainer: TQPolicy = actor_args.trainer_handle
         self._value: Optional[TQValue] = getattr(actor_args, "value_handle", None)
+        self._teacher: Optional[TQPolicy] = getattr(actor_args, "teacher_handle", None)
+        # Distillation's loss reads a different set of columns, and the ones it
+        # skips are never written -- fetching those would error, not read zeros.
+        self._train_fields: tuple[str, ...] = (
+            DP_DISTILLATION_TRAIN_FIELDS if self._is_distillation else DP_TRAIN_FIELDS
+        )
         self._dataloader = actor_args.dataloader
         self._weight_synchronizer = actor_args.weight_synchronizer
         self._advantage_estimator = actor_args.advantage_estimator
@@ -1801,9 +1827,10 @@ class SingleControllerActor:
                                     self._trainer.get_reference_policy_logprobs_from_meta,
                                     train_meta,
                                 )
-                    elif self._is_ppo:
+                    elif self._is_ppo or self._is_distillation:
                         # prepare_for_lp_inference is skipped here, and it is the only
-                        # other call that parks the policy optimizer before the critic.
+                        # other call that parks the policy optimizer before the critic
+                        # or the teacher.
                         with self._timer.time("value_inference_prep"):
                             await asyncio.to_thread(self._trainer.offload_to_cpu)
 
@@ -1813,12 +1840,22 @@ class SingleControllerActor:
                             await asyncio.to_thread(self._trainer.finish_inference)
                             train_meta = await self._value_stage(train_meta)
 
-                    # Compute advantages
-                    with self._timer.time("advantage_calculation"):
-                        (
-                            train_meta,
-                            has_valid_training_tokens,
-                        ) = await self._advantage_stage(train_meta)
+                    # Teacher forward
+                    if self._is_distillation:
+                        with self._timer.time("teacher_logprob_inference"):
+                            await asyncio.to_thread(self._trainer.finish_inference)
+                            train_meta = await self._teacher_stage(train_meta)
+
+                    # Compute advantages. Distillation has none: its loss reads the
+                    # teacher's top-k directly and never forms a return, so there is
+                    # no reward to turn into one.
+                    has_valid_training_tokens = True
+                    if not self._is_distillation:
+                        with self._timer.time("advantage_calculation"):
+                            (
+                                train_meta,
+                                has_valid_training_tokens,
+                            ) = await self._advantage_stage(train_meta)
 
                     # A PPO step is this one chunk, so a chunk with nothing left
                     # after filtering is a step that trains neither model.
@@ -1872,8 +1909,11 @@ class SingleControllerActor:
                                         )
                                         step_open = True
                                     await asyncio.to_thread(
-                                        self._trainer.train_microbatches_from_meta,
-                                        train_meta,
+                                        functools.partial(
+                                            self._trainer.train_microbatches_from_meta,
+                                            train_meta,
+                                            train_fields=self._train_fields,
+                                        )
                                     )
                                     # A PPO step is one chunk: nothing to
                                     # accumulate, so close every epoch here.
@@ -3116,6 +3156,35 @@ class SingleControllerActor:
         await asyncio.to_thread(self._value.get_values_from_meta, meta)
         await asyncio.to_thread(self._value.finish_inference)
         return meta.with_fields([self._advantage_cfg.values_field])
+
+    async def _teacher_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
+        """Run the distillation teacher's top-k forward over the selected chunk.
+
+        Same shape as ``_value_stage``: tensors never touch SC, the workers
+        fetch the sequence columns from DataPlane and commit the teacher's
+        scoring back under ``teacher_topk_logits`` / ``teacher_topk_indices``,
+        which the distillation loss then reads alongside the student's own.
+
+        The teacher is loaded and offloaded around the call so it holds the
+        training GPUs only for the duration of the forward -- ``distillation.py``
+        does the same, and with ``init_optimizer=False`` there is no optimizer
+        state to park.
+
+        Returns:
+            The batch metadata with the two teacher columns recorded on it.
+        """
+        assert self._teacher is not None, (
+            "_teacher_stage requires a teacher; setup builds one only on a "
+            "distillation run."
+        )
+        await asyncio.to_thread(self._teacher.prepare_for_lp_inference)
+        await asyncio.to_thread(
+            self._teacher.get_topk_logits_from_meta,
+            meta,
+            self._algo_cfg.topk_logits_k,
+        )
+        await asyncio.to_thread(self._teacher.offload_after_refit)
+        return meta.with_fields(TEACHER_TOPK_FIELDS)
 
     async def _value_train(self, meta: KVBatchMeta) -> dict[str, Any]:
         """Run one value model optimizer step against this chunk's GAE returns.
