@@ -56,8 +56,12 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
 )
+from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
+
+
+from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -1465,7 +1469,9 @@ class VllmAsyncGenerationWorkerImpl(
             traceback.print_exc()
             return False
 
-    async def update_weights_from_collective_async(self) -> bool:
+    async def update_weights_from_collective_async(
+        self, refit_timeout_s: float | None = None
+    ) -> bool:
         """Async version of update_weights_from_collective."""
         try:
             assert self.llm is not None, (
@@ -1478,7 +1484,7 @@ class VllmAsyncGenerationWorkerImpl(
                 )
 
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_from_collective", args=(refit_timeout_s,)
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1496,6 +1502,19 @@ class VllmAsyncGenerationWorkerImpl(
             await self._reset_encoder_cache_after_weight_update()
             return True
         except Exception as e:
+            # Propagate a deliberate abort instead of folding it into `return False`. It
+            # is the controller's signal to rebuild over the survivors and retry; reported
+            # as a generic failure it just ends the run, which is the wedge this exists to
+            # replace.
+            #
+            # Matched by message, not by type, and that is not belt-and-braces. vLLM's
+            # EngineCore RPC stringifies the worker exception and re-raises it client-side
+            # as a bare Exception, so the RefitAborted raised inside the engine arrives
+            # here as Exception(str) and a plain `except RefitAborted` never fires. Job
+            # 6484412 is the proof: the deadline fired, the abort was named in the log, and
+            # the run still wedged at step 4 because this handler did not match.
+            if is_refit_abort(e):
+                raise RefitAborted(str(e)) from e
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
 
@@ -1530,7 +1549,9 @@ class VllmAsyncGenerationWorkerImpl(
             "prepare_nccl_reshard_refit_info", args=(refit_info,)
         )
 
-    async def nccl_reshard_refit_async(self) -> bool:
+    async def nccl_reshard_refit_async(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> bool:
         """Async version of nccl_reshard_refit."""
         try:
             assert self.llm is not None, (
@@ -1538,7 +1559,7 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
             result_or_coro = await self.llm.collective_rpc(
-                "nccl_reshard_refit", args=tuple()
+                "nccl_reshard_refit", args=(refit_timeout_s,)
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1556,6 +1577,19 @@ class VllmAsyncGenerationWorkerImpl(
             await self._reset_encoder_cache_after_weight_update()
             return True
         except Exception as e:
+            # Propagate a deliberate abort instead of folding it into `return False`. It
+            # is the controller's signal to rebuild over the survivors and retry; reported
+            # as a generic failure it just ends the run, which is the wedge this exists to
+            # replace.
+            #
+            # Matched by message, not by type, and that is not belt-and-braces. vLLM's
+            # EngineCore RPC stringifies the worker exception and re-raises it client-side
+            # as a bare Exception, so the RefitAborted raised inside the engine arrives
+            # here as Exception(str) and a plain `except RefitAborted` never fires. Job
+            # 6484412 is the proof: the deadline fired, the abort was named in the log, and
+            # the run still wedged at step 4 because this handler did not match.
+            if is_refit_abort(e):
+                raise RefitAborted(str(e)) from e
             print(f"Exception during nccl_reshard_refit: {e}", flush=True)
             import traceback
 
@@ -1576,6 +1610,34 @@ class VllmAsyncGenerationWorkerImpl(
         await self.llm.reset_prefix_cache()
         gc.collect()
         torch.cuda.empty_cache()
+
+    async def pause_generation_async(self, *, clear_cache: bool) -> bool:
+        """Pause vLLM generation for an in-flight weight update."""
+        assert self.llm is not None, (
+            "Attempting to pause generation with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "pause_generation_async can only be used with async_engine=True"
+            )
+
+        await self.llm.pause_generation(mode="keep", clear_cache=clear_cache)
+        return True
+
+    async def resume_generation_async(self) -> bool:
+        """Resume vLLM generation after an in-flight weight update."""
+        assert self.llm is not None, (
+            "Attempting to resume generation with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "resume_generation_async can only be used with async_engine=True"
+            )
+
+        await self.llm.resume_generation()
+        return True
 
     async def sleep_async(self):
         """Async version of sleep."""
@@ -1659,6 +1721,13 @@ class VllmAsyncGenerationWorkerImpl(
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+        finally:
+            # Flush buffered spans/metrics before the actor goes away. Off the
+            # event loop: the flush blocks on a network export with a 5s
+            # timeout, and this is an async actor whose other coroutines --
+            # including in-flight generate requests -- share this loop. Same
+            # reason the sparse-refit shutdown above is offloaded.
+            await asyncio.to_thread(shutdown_telemetry)
 
 
 @ray.remote(

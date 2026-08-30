@@ -50,6 +50,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         env_handles={},
         gen_handle=SimpleNamespace(shutdown=MagicMock()),
         trainer_handle=SimpleNamespace(shutdown=MagicMock()),
+        value_handle=None,
     )
     ray_get = MagicMock(return_value={})
     # The driver now polls ping() around the run. Report the run as ready on the first

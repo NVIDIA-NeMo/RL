@@ -47,6 +47,7 @@ from torch.utils.tensorboard import SummaryWriter
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.metric_utils import is_histogram_metric
+from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
 
 if TYPE_CHECKING:
     import mlflow
@@ -1121,6 +1122,8 @@ class Logger(LoggerInterface):
 
         for logger in self.loggers:
             logger.log_metrics(metrics_to_log, step, prefix, step_metric, step_finished)
+
+        tee_rl_metrics_to_otel(metrics, prefix)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to all enabled backends.
