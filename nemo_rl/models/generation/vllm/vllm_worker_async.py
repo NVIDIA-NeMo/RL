@@ -440,9 +440,13 @@ class VllmAsyncGenerationWorkerImpl(
                 """Clamp the request's max output tokens so that input + output <= max_model_len."""
                 remaining = self.model_config.max_model_len - len(prompt_token_ids)
                 if remaining <= 0:
+                    # Phrasing matters: the Gym vllm_model proxy classifies an
+                    # overflow by looking for "context length" in the response
+                    # body, so keep that wording here.
                     raise ValueError(
                         f"Prompt length ({len(prompt_token_ids)}) fills or exceeds "
-                        f"max_model_len ({self.model_config.max_model_len}). "
+                        f"the model's maximum context length "
+                        f"({self.model_config.max_model_len}). "
                         f"No room for output tokens."
                     )
                 max_tokens = min(request_max_tokens, remaining)
@@ -777,11 +781,24 @@ class VllmAsyncGenerationWorkerImpl(
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
                 )
-            except VLLMValidationError as e:
+            except (VLLMValidationError, ValueError) as e:
                 # vLLM raises VLLMValidationError for prompts exceeding
                 # max_model_len during tokenization, instead of returning an
                 # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
                 # detect context-length overflow and handle it gracefully.
+                #
+                # The renderer and _clamp_max_tokens raise a plain ValueError
+                # for the same condition. Without this, it escapes as a 500 and
+                # the Gym vllm_model proxy's handler never fires: it keys on
+                # `e.status == 400 and "context length" in body`, turning the
+                # overflow into an empty completion with finish_reason="length"
+                # (responses_api_models/vllm_model/app.py). A 500 instead burns
+                # the retry budget and then fails the rollout.
+                # Any other ValueError is a real error: let it 500.
+                if not isinstance(e, VLLMValidationError) and (
+                    "context length" not in str(e)
+                ):
+                    raise
                 return JSONResponse(
                     content={
                         "error": {
