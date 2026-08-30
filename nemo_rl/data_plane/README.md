@@ -643,75 +643,86 @@ MLflow). Roughly 5-8 series per distinct op tag. Set
 `observability.callback` if you additionally want a hook on every transfer;
 `log_event` is exported for that.
 
-`verify_tensor_hash: true` additionally records a `torch.hash_tensor`
-fingerprint on every put and re-checks it on every get, so a tensor that
-changes between wire-in and wire-out is reported (`hash/mismatches`)
-instead of being trained on silently.
+`verify_tensor_hash: true` additionally records a fingerprint of every row
+on every put and re-checks it on every get, so a tensor that changes between
+wire-in and wire-out is reported (`hash/mismatches`) instead of being trained
+on silently.
 
-Two granularities, because torch has no ragged hash kernel:
+One granularity: every row carries its own digest, formed from two parts.
 
-| leaf | digest | scope |
+```
+  the row's values ──► torch.hash_tensor  (XOR fold, on device) ──► fold
+                                                                      ⊕ ──► digest
+  "<dtype>|<row shape>" ──► crc32  (host, one short string)    ──► seed
+```
+
+| what it covers | so a divergence in | is caught |
 |---|---|---|
-| rectangular rows — dense, or jagged with uniform lengths | one per row, `hash_tensor(..., dim=1)` | per sample id; survives shard reads |
-| genuinely ragged rows | one over the values buffer, XORed per row with that row's length | per batch; a shard read reports unverified |
+| the values fold | any element's value | yes |
+| the seed's dtype | precision (bf16 vs fp32 at equal width) | yes |
+| the seed's shape | length (a zero pad or a truncation) and trailing-dim layout | yes |
+| — | a permutation *within* one row | **no** — see below |
 
-The split is on the *rows*, not the layout. A jagged leaf whose rows happen
-to be uniform is already a rectangle — its values buffer reshapes to one as
-a view — so it takes the per-row path for free. Only a leaf with rows of
-differing lengths falls back, and giving *those* per-row digests would mean
-padding each out to a rectangle first: on a realistically ragged batch that
-rectangle is 3.5× the real payload and costs 13× more, to answer a question
-the buffer digest already answers.
+The shape never travels and is never compared: only one integer per row is
+stored. A shape change makes the seed differ, which makes the digest differ,
+which surfaces as an ordinary mismatch.
 
-Whichever scheme a put used is recorded per field and replayed on the read,
-so the two sides always compute the same thing. A field written with
-uniform rows that comes back ragged is a divergence in the row lengths
-themselves, and is reported as a mismatch.
+The seed's shape is the *row's*, not the leaf's, and both layouts must agree
+on it — a dense `(N, L, D)` and the jagged form whose values are `(total, D)`
+both report a row of `(L, D)`. That is what lets a field packed jagged and
+read back densified (`_from_wire` stacks uniform nested rows) reconcile
+instead of reporting a mismatch on every round trip. Deriving the dense row's
+length from its offsets instead would say `(1, L, D)` and break exactly that.
 
-**Detection is not attribution, and the difference is the whole point of
-the split.** The same corruption, injected into an 8-row batch:
+Because the digest covers one row and nothing else, it reconciles against any
+later grouping of the same rows: a shard read is *checked*, not abstained on,
+and a delta write that touches one field leaves the others' fingerprints
+alone. This is also why there is no longer a second, coarser granularity for
+ragged leaves. `hash_tensor` has no ragged kernel, so a ragged leaf folds one
+row at a time — but the fold is an XOR, which is associative and elementwise,
+so `hash_tensor(row)` equals `hash_tensor(rect, dim=1)[i]`. The vectorized and
+per-row paths produce identical values, and the `_WriteScheme` bookkeeping
+that used to record which granularity a put had used, so a get could replay
+it, is gone with them.
 
-| corruption | ragged leaf | rectangular leaf |
-|---|---|---|
-| 1 element changed in `u3` | caught, flags **all 8 rows** | caught, names **`u3`** |
-| `u5` zeroed | caught, flags all 8 rows | caught, names `u5` |
-| `u3`↔`u4` swapped | caught only if their lengths differ | caught, names `u3`,`u4` |
-| nothing | clean | clean |
+**The accepted limit: a within-row permutation is not detected.** XOR cannot
+see its own operands reordered, and no seed fixes it — the seed covers dtype
+and shape, which a reordering leaves alone. This was taken deliberately, for
+cost. Measured on a 107 MB batch of 1536 rows × 4 fields:
 
-A ragged digest covers the whole values buffer, so any change moves every
-row's value: it says *this batch is wrong*, never *this sample is wrong*.
-On rollout data straight out of generation that is the normal resolution
-for the token-aligned fields — you learn a step's transfer diverged and
-have to bisect for the row yourself. Anything uniform-width (a densified
-read, `advantages` written at full width, a shard whose rows agree) names
-the sample.
+| digest | cost | pad / reshape / dtype | permutation |
+|---|---|---|---|
+| **`hash_tensor` + shape seed** | **8 ms** | caught | **blind** |
+| `crc32` over the row's bytes | 64 ms | caught | caught |
+| `blake2b` over the row's bytes | 146 ms | caught | caught |
+| bare `hash_tensor` (what this replaced) | 94 ms | blind | blind |
+
+The two sequential hashes cost ~7-18x because they read every byte on the
+host, one row at a time; the fold reduces a whole rectangular leaf in one
+on-device call. If a reordering bug is ever suspected — the jagged
+pack/unpack offsets are where one would live — swapping `_leaf_digests` for
+the `crc32` form is a one-function change.
 
 Verified by injecting corruption into the round trip. Caught: a
 single-element change in every dtype, a truncated row, a zeroed row, a
-bf16→fp32 precision change, and a row served from the wrong sample — with
-**zero false alarms** over a 500-row randomized soak, every shard grouping
-from 1 to 256, reversed id order, field subsets and delta writes. Known
-limits, measured rather than assumed:
+bf16→fp32 precision change, a zero pad, a trailing-dim reshape, and a row
+served from the wrong sample — with **zero false alarms** over a 500-row
+randomized soak, every shard grouping from 1 to 256, reversed id order,
+field subsets and delta writes. Not caught, by the deliberate choice above:
+a reordering of elements *within* one row. Note the row-swap and the
+within-row cases differ — two rows exchanged between wire-in and wire-out
+land against the wrong sample ids and are caught, because each row carries
+its own digest. Known limits, measured rather than assumed:
 
-- A batch-scoped digest is an XOR reduction over one shared buffer, and XOR
-  cannot see a permutation of what it reduces. On a ragged field a
-  **mis-shard** (two rows swapped) is therefore caught only when the two
-  rows differ in length — 60/60 on ragged rollout data, where lengths rarely
-  collide. Rows of uniform width catch it unconditionally, per row. The same
-  blind spot hides a reordering *within* a row: 0/200 for a two-token swap
-  in `input_ids`, and 18/200 for moving two set bits in a bool mask.
-- It reads every tensor byte again on both sides. Measured against a live
-  TransferQueue moving 23.6 MB per step: **10.2 ms, or +11% of data-plane
-  time** — which on a real GRPO step, where the data plane is a few percent
-  of the step, is under 0.1% end to end. The cost lands in
-  `step/self/overhead_ms` like the rest of the measurement, so it is visible
-  rather than quoted from a benchmark.
+- It compares digests, so it detects divergence, not its cause. A mismatch
+  names the sample, the field, the row index and the row length; what
+  changed between the two reads is still yours to find.
 - **A mismatch count at or above `rows_checked` is reported as suspect.**
   Every row of every field wrong, identically, every step is not what a
   broken wire looks like; it is what a broken guard looks like. Both false
   alarms this check has produced had exactly that shape, and both were its
-  own bookkeeping. Per-sample lines carry the scheme, the row index and the
-  row length so the next one is adjudicable from a single log line.
+  own bookkeeping. Per-sample lines carry the row index and the row length
+  so the next one is adjudicable from a single log line.
 - Only rows this process wrote can be checked. A consumer-side client
   reports them under `hash/rows_unverified` rather than counting them
   clean, and `hash/fields_skipped` reports any leaf it could not compare

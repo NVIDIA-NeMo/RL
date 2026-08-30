@@ -179,12 +179,13 @@ class ObservabilityConfig(TypedDict):
     ``get_step_metrics``, so a per-op sink is opt-in.
 
     ``verify_tensor_hash`` is a correctness check, not a metric: each put
-    records a per-row ``torch.hash_tensor`` fingerprint and each get
-    re-checks it, so a value that changes between wire-in and wire-out is
-    reported (``hash/mismatches``) instead of silently training on it. It
-    reads every tensor byte a second time on both sides — budget roughly
-    2.4 ms for a 12 MB jagged batch, on each side — so leave it off
-    outside of debugging.
+    records a per-row ``torch.hash_tensor`` fold of the row's values, mixed
+    with the row's dtype and shape, and each get re-checks it, so a value
+    that changes between wire-in and wire-out is reported
+    (``hash/mismatches``) instead of silently training on it. It reads every
+    tensor element a second time on both sides — roughly 8 ms for a 107 MB
+    batch — so leave it off outside of debugging. It does not detect a
+    permutation *within* a row; see ``data_plane/README.md``.
     """
 
     enabled: bool
