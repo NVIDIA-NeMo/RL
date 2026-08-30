@@ -2435,6 +2435,104 @@ class TestCreateMegatronConfigGlooProcessGroups:
 
 
 @pytest.mark.mcore
+class TestCreateMegatronConfigInfraKnobs:
+    """Tests for logging_level / check_for_nan_in_grad plumbing in _create_megatron_config."""
+
+    @staticmethod
+    def _config(**megatron_overrides):
+        megatron_cfg = {
+            "optimizer": {"use_distributed_optimizer": False},
+            "scheduler": {},
+            "distributed_data_parallel_config": {
+                "overlap_param_gather": False,
+                "grad_reduce_in_fp32": False,
+                "overlap_grad_reduce": False,
+                "data_parallel_sharding_strategy": "no_shard",
+            },
+            "train_iters": 10,
+        }
+        megatron_cfg.update(megatron_overrides)
+        return {"megatron_cfg": megatron_cfg, "train_global_batch_size": 8}
+
+    def _container_call_kwargs(self, config):
+        """Run _create_megatron_config with mocked sub-configs and return the
+        kwargs handed to the LoggerConfig and DistributedDataParallelConfig mocks."""
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer"),
+            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+            patch("nemo_rl.models.megatron.setup.OptimizerConfig"),
+            patch(
+                "nemo_rl.models.megatron.setup.DistributedDataParallelConfig"
+            ) as mock_ddp,
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig") as mock_logger,
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+            )
+
+        return mock_logger.call_args.kwargs, mock_ddp.call_args.kwargs
+
+    def test_logging_level_forwarded(self):
+        logger_kwargs, _ = self._container_call_kwargs(self._config(logging_level=2))
+        assert logger_kwargs["logging_level"] == 2
+
+    def test_logging_level_absent_keeps_historical_default(self):
+        logger_kwargs, _ = self._container_call_kwargs(self._config())
+        assert logger_kwargs["logging_level"] == 0
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_check_for_nan_in_grad_forwarded(self, value):
+        _, ddp_kwargs = self._container_call_kwargs(
+            self._config(check_for_nan_in_grad=value)
+        )
+        assert ddp_kwargs["check_for_nan_in_grad"] is value
+
+    def test_check_for_nan_in_grad_absent_keeps_historical_default(self):
+        _, ddp_kwargs = self._container_call_kwargs(self._config())
+        assert ddp_kwargs["check_for_nan_in_grad"] is True
+
+
+@pytest.mark.mcore
+class TestSetupDistributedTimeout:
+    """Tests for distributed_timeout_minutes plumbing in setup_distributed."""
+
+    def _init_process_group_kwargs(self, megatron_cfg):
+        from nemo_rl.models.megatron.setup import setup_distributed
+
+        config = {
+            "megatron_cfg": megatron_cfg,
+            "generation": None,
+        }
+        with (
+            patch("nemo_rl.models.megatron.setup.configure_refit_environment"),
+            patch("nemo_rl.models.megatron.setup.configure_dynamo_cache"),
+            patch("nemo_rl.models.megatron.setup.destroy_parallel_state"),
+            patch("torch.distributed.init_process_group") as mock_init,
+        ):
+            setup_distributed(config)
+
+        return mock_init.call_args.kwargs
+
+    def test_timeout_forwarded_when_set(self):
+        from datetime import timedelta
+
+        kwargs = self._init_process_group_kwargs({"distributed_timeout_minutes": 120})
+        assert kwargs["timeout"] == timedelta(minutes=120)
+
+    def test_timeout_absent_uses_torch_default(self):
+        kwargs = self._init_process_group_kwargs({})
+        assert "timeout" not in kwargs
+
+
+@pytest.mark.mcore
 class TestCreateMegatronConfigOptimizerFp8Recipe:
     """Tests for optimizer FP8 recipe plumbing in _create_megatron_config."""
 

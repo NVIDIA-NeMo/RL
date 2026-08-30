@@ -19,6 +19,7 @@ import os
 import threading
 import time
 import warnings
+from datetime import timedelta
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, replace
 from typing import Any, Callable, Optional, TypeVar
@@ -334,7 +335,12 @@ def setup_distributed(config) -> None:
     # Ensure clean slate before import
     destroy_parallel_state()
     # Initialize process group
-    torch.distributed.init_process_group("nccl")
+    init_kwargs: dict[str, Any] = {}
+    if "distributed_timeout_minutes" in config["megatron_cfg"]:
+        init_kwargs["timeout"] = timedelta(
+            minutes=config["megatron_cfg"]["distributed_timeout_minutes"]
+        )
+    torch.distributed.init_process_group("nccl", **init_kwargs)
 
 
 def validate_and_set_config(
@@ -1536,10 +1542,18 @@ def _create_megatron_config(
             "use_gloo_process_groups"
         ]
 
+    logging_level = 0
+    if "logging_level" in config["megatron_cfg"]:
+        logging_level = config["megatron_cfg"]["logging_level"]
+
+    check_for_nan_in_grad = True
+    if "check_for_nan_in_grad" in config["megatron_cfg"]:
+        check_for_nan_in_grad = config["megatron_cfg"]["check_for_nan_in_grad"]
+
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
-        logger=LoggerConfig(logging_level=0),
+        logger=LoggerConfig(logging_level=logging_level),
         dist=dist_cfg,
         train=TrainingConfig(
             micro_batch_size=1,  # ignored
@@ -1548,7 +1562,7 @@ def _create_megatron_config(
         ),
         optimizer=OptimizerConfig(**optimizer_kwargs),
         ddp=DistributedDataParallelConfig(
-            check_for_nan_in_grad=True,
+            check_for_nan_in_grad=check_for_nan_in_grad,
             grad_reduce_in_fp32=config["megatron_cfg"][
                 "distributed_data_parallel_config"
             ]["grad_reduce_in_fp32"],
