@@ -771,6 +771,13 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         policy_config["megatron_cfg"]["train_iters"] = train_iters
 
+    # frozen distillation teacher
+    if is_distillation_run(master_config):
+        teacher_config = master_config.teacher
+        if teacher_config.get("megatron_cfg", {}).get("enabled", False):
+            teacher_config["megatron_cfg"]["train_iters"] = train_iters
+        return
+
     # value
     if not is_ppo:
         return
@@ -887,16 +894,20 @@ def _maybe_start_generation_router(
 
 def _build_advantage_estimator(master_config: MasterConfig) -> Any:
     """Build the advantage estimator from whichever algorithm's factory applies."""
+    if is_distillation_run(master_config):
+        # Distillation trains directly from the teacher distribution. Its train
+        # pump deliberately skips the advantage stage, and DistillationConfig
+        # has no GRPO ``adv_estimator`` block for the GRPO factory to read.
+        return None
     if is_ppo_run(master_config):
         # TODO(#2625): raw_reward passes this factory but yields no returns, so
         # the critic train would then fetch a column nobody wrote.
         from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
         return _create_advantage_estimator(cast(PPOMasterConfig, master_config))
-    else:
-        from nemo_rl.algorithms.grpo import _create_advantage_estimator
+    from nemo_rl.algorithms.grpo import _create_advantage_estimator
 
-        return _create_advantage_estimator(cast(GRPOMasterConfig, master_config))
+    return _create_advantage_estimator(cast(GRPOMasterConfig, master_config))
 
 
 def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
@@ -1359,6 +1370,8 @@ def setup_single_controller(
     setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
     if "value_time" in time_metrics:
         setup_timing_metrics.value_init_time_s = time_metrics["value_time"]
+    if "teacher_time" in time_metrics:
+        setup_timing_metrics.teacher_init_time_s = time_metrics["teacher_time"]
 
     # Native TQ restore must run through the trainer's bootstrap client before
     # the normal SC data-plane client is created or any rollout/train data-plane

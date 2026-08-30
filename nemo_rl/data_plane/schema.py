@@ -44,6 +44,15 @@ DP_TRAIN_FIELDS = (
     "sample_mask",
 )
 
+# Distillation teachers add two rank-3 tensors to the same long-lived rollout
+# partition. Keep the names available to the pre-registration schema below so
+# TransferQueue never has to lazily register them after concurrent producers
+# have started.
+TEACHER_TOPK_FIELDS = (
+    "teacher_topk_logits",
+    "teacher_topk_indices",
+)
+
 # Full known tensor schema for SingleController's long-lived rollout partition.
 # The initial rollout put writes the first seven payload fields; later stages add
 # student/reference logprobs, advantages, PPO critic columns, and the MOPD teacher
@@ -56,6 +65,7 @@ SC_ROLLOUT_SCHEMA_FIELDS = (
     "values",
     "returns",
     "teacher_reference_logprobs",
+    *TEACHER_TOPK_FIELDS,
 )
 
 # Subset fetched by logprob / ref-logprob workers.
@@ -79,11 +89,6 @@ PPO_VALUE_FIELDS = (
 # Kept out of DP_TRAIN_FIELDS for the same reason as PPO_VALUE_FIELDS: only a
 # distillation run writes them, and a worker fetching a column nobody wrote
 # errors out rather than reading zeros.
-TEACHER_TOPK_FIELDS = (
-    "teacher_topk_logits",
-    "teacher_topk_indices",
-)
-
 # What DistillationLossFn reads. Narrower than DP_TRAIN_FIELDS in both
 # directions: distillation writes no advantages and forms no importance ratio,
 # so none of the logprob columns exist on that run.

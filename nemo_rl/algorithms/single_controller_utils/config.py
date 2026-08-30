@@ -1092,11 +1092,16 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     env_config = getattr(master_config, "env", None)
 
     opd_enabled = opd_module.is_opd_enabled(master_config)
-    if opd_enabled and is_ppo_run(master_config):
+    if opd_enabled and (
+        is_ppo_run(master_config) or is_distillation_run(master_config)
+    ):
         raise ValueError(
             "on_policy_distillation is only supported with the `grpo` algorithm block."
         )
-    if algo_cfg.adv_estimator.name == "opd" and not opd_enabled:
+    # DistillationConfig has no adv_estimator: its teacher signal is the loss,
+    # not an advantage, so there is no estimator to name.
+    adv_estimator = getattr(algo_cfg, "adv_estimator", None)
+    if adv_estimator is not None and adv_estimator.name == "opd" and not opd_enabled:
         raise ValueError(
             "grpo.adv_estimator.name='opd' requires "
             "on_policy_distillation.enabled=true."

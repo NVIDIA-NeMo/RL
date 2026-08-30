@@ -37,6 +37,7 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     DP_DISTILLATION_TRAIN_FIELDS,
     DP_TRAIN_FIELDS,
+    SC_ROLLOUT_SCHEMA_FIELDS,
     TEACHER_TOPK_FIELDS,
 )
 
@@ -182,6 +183,13 @@ class TestAlgorithmBlockValidation:
         with pytest.raises(ValidationError, match="Only one algorithm block"):
             MasterConfig(**resolved)
 
+    def test_on_policy_distillation_is_rejected_on_a_distillation_run(self):
+        resolved = self._as_distillation()
+        resolved["on_policy_distillation"] = {"enabled": True}
+
+        with pytest.raises(ValueError, match="only supported with the `grpo`"):
+            validate_single_controller_config(MasterConfig(**resolved))
+
 
 class TestTrainFieldSelection:
     def test_distillation_narrows_the_fetched_columns(self):
@@ -198,6 +206,11 @@ class TestTrainFieldSelection:
         for field in TEACHER_TOPK_FIELDS:
             assert field not in DP_TRAIN_FIELDS
             assert field in DP_DISTILLATION_TRAIN_FIELDS
+
+    def test_the_teacher_columns_are_pre_registered_for_the_rollout_partition(self):
+        """Teacher writes race the trainer on the long-lived TQ partition."""
+        for field in TEACHER_TOPK_FIELDS:
+            assert field in SC_ROLLOUT_SCHEMA_FIELDS
 
     def test_the_loss_inputs_are_all_present(self):
         """DistillationLossDataDict names exactly what the loss reads."""
