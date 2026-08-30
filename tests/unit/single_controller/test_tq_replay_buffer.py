@@ -1071,6 +1071,36 @@ class TestTQReplayBufferStateDict:
         assert buf.training_owned_replay_groups() == []
         assert dp.depth() == _N_GENS
 
+    def test_training_claim_keeps_stable_selection_while_barrier_waits(self):
+        async def exercise() -> None:
+            checkpoint_barrier = DataPlaneCheckpointBarrier()
+            buf = _make_buffer(
+                FakeDataPlaneClient(), checkpoint_barrier=checkpoint_barrier
+            )
+            unready_group_id = buf.reserve(weight_version=0, group_id="unready")
+            ready_group_ids = [
+                buf.reserve(weight_version=i, group_id=f"ready-{i}")
+                for i in (1, 2)
+            ]
+            for i, group_id in enumerate(ready_group_ids, start=1):
+                await buf.commit(
+                    group_id,
+                    _make_record(),
+                    start_weight_version=i,
+                    end_weight_version=i,
+                )
+
+            async with checkpoint_barrier.checkpoint():
+                claim_task = asyncio.create_task(buf.claim_for_training([2]))
+                await asyncio.sleep(0)
+                assert buf.abort(unready_group_id) is True
+
+            assert await claim_task == 1
+            assert buf.group_ids == (ready_group_ids[0],)
+            assert buf.training_owned_group_ids() == {ready_group_ids[1]}
+
+        asyncio.run(exercise())
+
     def test_training_claim_rejects_negative_index(self):
         buf = _make_buffer(FakeDataPlaneClient())
         _add_group(buf, weight=3)
