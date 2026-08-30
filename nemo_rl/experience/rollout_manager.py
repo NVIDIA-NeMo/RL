@@ -60,8 +60,10 @@ from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     PromptGroupStatus,
+    RecoveryGranularity,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
+    SiblingSealResult,
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
@@ -426,6 +428,7 @@ class AsyncRolloutImpl:
         rollout_ids: Optional[list[str]] = None,
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
+        recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
@@ -444,6 +447,9 @@ class AsyncRolloutImpl:
         )
         assert on_completion is None, (
             "streamed completion callbacks are only supported on the NeMo-Gym path"
+        )
+        assert recovery_granularity is RecoveryGranularity.SIBLING, (
+            "recovery granularity is only supported on the NeMo-Gym path"
         )
         timer = Timer()
         timer_prefix = "timing/rollout"
@@ -844,6 +850,7 @@ class AsyncNemoGymRolloutImpl:
         rollout_ids: Optional[list[str]] = None,
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
+        recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
@@ -871,6 +878,7 @@ class AsyncNemoGymRolloutImpl:
             timer,
             timer_prefix,
             on_completion=on_completion,
+            recovery_granularity=recovery_granularity,
         )
         # Token-capture receipt rows carry empty message logs by design — the
         # canonical row (and any media it needs) is rebuilt by the finalizer
@@ -1039,14 +1047,13 @@ class AsyncNemoGymRolloutImpl:
         timer_prefix: str,
         *,
         on_completion: Optional[RolloutCompletionCallback] = None,
+        recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
     ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
         """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics.
 
-        Rows that never arrive are re-dispatched on their own rather than by redoing the
-        whole group. NeMo-Gym's stream dies on the first failing row, so one bad row
-        takes every later row with it; at num_generations_per_prompt=16 a naive whole
-        group retry pays 16 generations to recover one. Completed rows are kept across
-        attempts, which is the same shape as the legacy collector's pending-group retry.
+        Sibling recovery re-dispatches only rows that never arrive. Prompt-group
+        recovery performs one physical Gym dispatch here and delegates a complete
+        cohort replacement to the outer recovery loop.
         """
         nemo_gym_env = self._task_to_env["nemo_gym"]
         if not inputs:
@@ -1084,15 +1091,20 @@ class AsyncNemoGymRolloutImpl:
             # below, and a wider annotation makes the `raise ... from last_error` at the
             # end unverifiable.
             last_error: Optional[Exception] = None
+            max_row_attempts = (
+                1
+                if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+                else self._max_gym_row_attempts
+            )
             async with _Deadline(self._timeouts.rollout_s, "NeMo-Gym prompt group"):
-                for attempt in range(1, self._max_gym_row_attempts + 1):
+                for attempt in range(1, max_row_attempts + 1):
                     pending = [row for row in inputs if results[row["_rowidx"]] is None]
                     if not pending:
                         break
                     if attempt > 1:
                         print(
                             f"NeMo-Gym: re-dispatching {len(pending)}/{total_rows} "
-                            f"row(s) (attempt {attempt}/{self._max_gym_row_attempts})",
+                            f"row(s) (attempt {attempt}/{max_row_attempts})",
                             flush=True,
                         )
                         # Row re-dispatches are invisible in redispatch_total -- they
@@ -1115,7 +1127,7 @@ class AsyncNemoGymRolloutImpl:
                         # prompt NeMo-Gym cannot serve fails the same way every time.
                         if (
                             classify_rollout_failure(error) is not FailureClass.INFRA
-                            or attempt == self._max_gym_row_attempts
+                            or attempt == max_row_attempts
                         ):
                             raise
                     else:
@@ -1127,7 +1139,7 @@ class AsyncNemoGymRolloutImpl:
                 failure = GymTransportError(
                     "NeMo-Gym rollout stream ended before all rows arrived; missing "
                     f"rows {missing} of {total_rows} after "
-                    f"{self._max_gym_row_attempts} attempt(s)"
+                    f"{max_row_attempts} attempt(s)"
                 )
                 # Narrowed before the raise: pyrefly rejects an Optional in a `from`
                 # clause, even though `raise ... from None` is legal at runtime.
@@ -1555,10 +1567,12 @@ class RolloutManager:
         rollout_ids: Optional[list[str]] = None,
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
+        recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
     ) -> PromptGroupRecord:
         if rollout_ids is None:
             assert generation_indices is None
             assert on_completion is None
+            assert recovery_granularity is RecoveryGranularity.SIBLING
             # Legacy path: keep the impl call signature byte-identical.
             return await self._impl.run_rollout(input_sample)
         return await self._impl.run_rollout(
@@ -1566,6 +1580,7 @@ class RolloutManager:
             rollout_ids=rollout_ids,
             generation_indices=generation_indices,
             on_completion=on_completion,
+            recovery_granularity=recovery_granularity,
         )
 
     async def generate_and_push(
@@ -1840,7 +1855,7 @@ class RolloutManager:
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
         lineage_group_id: Optional[str] = None,
     ) -> Optional["ReassemblyRequest"]:
-        """Capture siblings with stable lineage and retry only unfinished work."""
+        """Capture siblings with stable lineage and configured retry granularity."""
         assert self._tq_buffer is not None, (
             "generate_for_finalization requires tq_buffer to be set at __init__"
         )
@@ -1919,7 +1934,7 @@ class RolloutManager:
         recovery_group_id: str,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]],
     ) -> "ReassemblyRequest":
-        """Dispatch only unfinished siblings and leave one reserved slot unready."""
+        """Dispatch the current sibling cohort and leave one slot unready."""
         from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
         assert self._tq_buffer is not None
@@ -1950,6 +1965,7 @@ class RolloutManager:
             group_id=group_id,
             rollout_ids=list(rollout_ids),
         )
+        pending_group_results: dict[int, SiblingSealResult] = {}
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
@@ -1969,6 +1985,53 @@ class RolloutManager:
                 raise ValueError(
                     "token-capture completion must contain its Gate rollout ID"
                 )
+            if not 0 <= generation_index < len(rollout_ids):
+                raise ValueError(
+                    f"streamed generation index {generation_index} is outside "
+                    f"prompt group {group_id!r}"
+                )
+            expected_gate_rollout_id = rollout_ids[generation_index]
+            if gate_rollout_id != expected_gate_rollout_id:
+                raise ValueError(
+                    "streamed rollout identity mismatch: "
+                    f"result={gate_rollout_id!r}, "
+                    f"expected={expected_gate_rollout_id!r}"
+                )
+            if receipt.get("rollout_id") != gate_rollout_id:
+                raise ValueError(
+                    "receipt rollout identity mismatch: "
+                    f"receipt={receipt.get('rollout_id')!r}, "
+                    f"expected={gate_rollout_id!r}"
+                )
+
+            if (
+                recovery_group.recovery_granularity
+                is RecoveryGranularity.PROMPT_GROUP
+            ):
+                result = SiblingSealResult(
+                    gate_rollout_id=gate_rollout_id,
+                    receipt=receipt,
+                    reward=completion.reward,
+                )
+                previous = pending_group_results.get(generation_index)
+                if previous is not None:
+                    if previous != result:
+                        raise ValueError(
+                            "conflicting duplicate prompt-group completion for "
+                            f"generation_index={generation_index}"
+                        )
+                    return
+                pending_group_results[generation_index] = result
+                if len(pending_group_results) < recovery_group.expected_generations:
+                    return
+                async with self._recovery_mutation() as cut:
+                    self._recovery_ledger.mark_group_sealed(
+                        cut,
+                        group_id,
+                        pending_group_results,
+                    )
+                return
+
             async with self._recovery_mutation() as cut:
                 self._recovery_ledger.mark_sibling_sealed(
                     cut,
@@ -2009,6 +2072,7 @@ class RolloutManager:
                         rollout_ids=list(rollout_ids),
                         generation_indices=pending_indices,
                         on_completion=_record_completion,
+                        recovery_granularity=recovery_group.recovery_granularity,
                     )
             finally:
                 if inflight_registry is not None:

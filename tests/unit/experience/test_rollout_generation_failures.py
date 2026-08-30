@@ -54,6 +54,7 @@ from nemo_rl.experience.rollout_manager import (
     _Deadline,
     _gather_cancelling_siblings,
 )
+from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.utils.timer import Timer
 
 
@@ -624,6 +625,23 @@ class TestPartialGymRedispatch:
         assert method.dispatched == [[0, 1, 2, 3, 4], [3, 4]]
         assert len(completions) == 5
         assert sum(len(d) for d in method.dispatched) == 7
+
+    def test_prompt_group_defers_complete_retry_to_the_outer_manager(self):
+        method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
+        impl = _make_gym_impl(method, num_generations=4, row_attempts=3)
+
+        with pytest.raises(ConnectionResetError, match="gym stream died"):
+            asyncio.run(
+                impl._run_rollouts(
+                    _gym_rows(4),
+                    Timer(),
+                    "timing/rollout",
+                    recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
+                )
+            )
+
+        assert method.dispatched == [[0, 1, 2, 3]]
+        assert impl._stats.gym_row_redispatches == 0
 
     def test_a_stale_echo_of_a_landed_row_is_rejected(self):
         """Re-dispatch narrows the stream; an echo of an already-landed row must not win.
