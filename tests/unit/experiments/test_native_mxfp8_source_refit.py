@@ -20,7 +20,7 @@ EXPERIMENT_DIR = REPO_ROOT / "experiments" / "native_mxfp8_source_refit"
 
 
 def test_native_smoke_overlays_enable_runtime_inventory_assertion() -> None:
-    for model_scope in ("qwen30", "nano"):
+    for model_scope in ("qwen30", "qwen235", "nano"):
         config = (EXPERIMENT_DIR / f"{model_scope}-fp8param-true.yaml").read_text()
         assert f"native_mxfp8_storage_assertion: {model_scope}" in config
 
@@ -69,6 +69,23 @@ def test_launcher_selects_a_distinct_bf16_qwen30_arm() -> None:
     assert "qwen30:bf16" in launcher
     assert "CONFIG=experiments/native_mxfp8_source_refit/qwen30-bf16.yaml" in launcher
     assert 'CACHE_ARM="${PRECISION_MODE}-fp8param-${FP8_PARAM}"' in launcher
+
+
+def test_launcher_selects_qwen235_native_mxfp8_arm() -> None:
+    launcher = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
+
+    assert "qwen235:mxfp8:true" in launcher
+    assert (
+        "CONFIG=experiments/native_mxfp8_source_refit/qwen235-fp8param-true.yaml"
+        in launcher
+    )
+    assert "MODEL_CACHE_PATHS='hub/models--Qwen--Qwen3-235B-A22B'" in launcher
+
+    config = (EXPERIMENT_DIR / "qwen235-fp8param-true.yaml").read_text()
+    assert "defaults: ../../examples/configs/recipes/llm/performance/" in config
+    assert "grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout.yaml" in config
+    assert "native_mxfp8_storage_assertion: qwen235" in config
+    assert "fp8_param: true" in config
 
 
 def test_launcher_can_enable_second_refit_runtime_audit() -> None:

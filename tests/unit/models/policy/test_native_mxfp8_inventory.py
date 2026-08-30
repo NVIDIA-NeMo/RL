@@ -237,6 +237,26 @@ def test_qwen_inventory_allows_absent_shared_expert_when_no_native_entry() -> No
     )
 
 
+def test_qwen235_inventory_requires_all_94_routed_expert_layers() -> None:
+    native = OrderedDict(
+        (
+            (_routed_name(layer, projection), _native_entry())
+            for layer in range(94)
+            for projection in ("gate", "up", "down")
+        )
+    )
+
+    inventory = assert_native_mxfp8_storage_inventory(
+        native_metadata=native,
+        misc_metadata=_bf16_non_routed_entries(include_shared_experts=False),
+        model_scope="qwen235",
+        num_layers_at_end_in_bf16=0,
+    )
+
+    assert inventory["routed_experts"]["native"] == 282
+    assert inventory["routed_experts"]["bf16"] == 0
+
+
 def test_nano_inventory_rejects_early_bf16_routed_expert() -> None:
     native, misc = _nano_inventory_inputs()
     early_fc1 = _routed_name(3, "up")

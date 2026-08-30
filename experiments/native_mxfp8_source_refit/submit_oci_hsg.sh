@@ -24,9 +24,9 @@ case "${ACTION}" in
 esac
 
 case "${MODEL}" in
-  qwen30|nano) ;;
+  qwen30|qwen235|nano) ;;
   *)
-    echo "MODEL must be qwen30 or nano" >&2
+    echo "MODEL must be qwen30, qwen235, or nano" >&2
     exit 2
     ;;
 esac
@@ -84,6 +84,12 @@ case "${MODEL}:${PRECISION_MODE}:${FP8_PARAM}" in
     NUM_NODES=4
     SEGMENT_SIZE=2
     MODEL_CACHE_PATHS='hub/models--Qwen--Qwen3-30B-A3B'
+    ;;
+  qwen235:mxfp8:true)
+    CONFIG=experiments/native_mxfp8_source_refit/qwen235-fp8param-true.yaml
+    NUM_NODES=32
+    SEGMENT_SIZE=16
+    MODEL_CACHE_PATHS='hub/models--Qwen--Qwen3-235B-A22B'
     ;;
   nano:mxfp8:false)
     CONFIG=experiments/native_mxfp8_source_refit/nano-fp8param-false.yaml

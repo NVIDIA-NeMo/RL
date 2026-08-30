@@ -3628,7 +3628,7 @@ class MegatronPolicyWorkerImpl(
         )
 
         assertion_scope = cast(
-            Literal["qwen30", "nano"] | None,
+            Literal["qwen30", "qwen235", "nano"] | None,
             self.cfg["megatron_cfg"].get("native_mxfp8_storage_assertion"),
         )
         if assertion_scope is not None:
