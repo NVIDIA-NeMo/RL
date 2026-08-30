@@ -525,6 +525,7 @@ def _make_adapter(
     _ConfigContext,
 ]:
     parameter = torch.nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+    pending_loads: list[torch.Tensor] = []
 
     def checkpoint_loader(
         target: torch.Tensor,
@@ -535,18 +536,32 @@ def _make_adapter(
 
     parameter.weight_loader = checkpoint_loader
 
-    def initialize(model: SimpleNamespace) -> None:
+    def initialize(model: torch.nn.Module) -> None:
         events.append("initialize")
-        model.parameter.weight_loader = checkpoint_loader
 
-    def finalize(_model: SimpleNamespace, _model_config: object) -> None:
+        def online_process_loader(
+            target: torch.Tensor,
+            loaded_weight: torch.Tensor,
+        ) -> None:
+            pending_loads.append(loaded_weight)
+            checkpoint_loader(target, loaded_weight)
+
+        online_process_loader.__name__ = "online_process_loader"
+        model.parameter.weight_loader = online_process_loader
+
+    def finalize(_model: torch.nn.Module, _model_config: object) -> None:
         events.append("finalize")
         if finalizer_error is not None:
             raise finalizer_error
+        pending_loads.clear()
 
     reload_module = ModuleType("vllm.model_executor.model_loader.reload")
     reload_module.initialize_layerwise_reload = initialize
     reload_module.finalize_layerwise_reload = finalize
+    layerwise_module = ModuleType("vllm.model_executor.model_loader.reload.layerwise")
+    layerwise_module.make_online_process_loader = lambda owner, parameter_name: getattr(
+        owner, parameter_name
+    ).weight_loader
     config_module = ModuleType("vllm.config")
     config_context = _ConfigContext(events, exit_error=exit_error)
     config_module.set_current_vllm_config = lambda _config: config_context
@@ -555,9 +570,11 @@ def _make_adapter(
         {
             "vllm.config": config_module,
             "vllm.model_executor.model_loader.reload": reload_module,
+            "vllm.model_executor.model_loader.reload.layerwise": layerwise_module,
         },
     )
-    model = SimpleNamespace(parameter=parameter)
+    model = torch.nn.Module()
+    model.register_parameter("parameter", parameter)
     runner = SimpleNamespace(model=model, vllm_config=object())
     return (
         refit_adapter.Vllm0251RefitAdapter(
@@ -624,10 +641,7 @@ def test_single_rank_vllm_model_parallel_cleans_partial_setup_failures(
             pytest.fail("setup failure should prevent entering the context body")
 
     assert state["cleanup_calls"] == expected_cleanup_calls
-    assert (
-        state["destroy_process_group_calls"]
-        == expected_destroy_process_group_calls
-    )
+    assert state["destroy_process_group_calls"] == expected_destroy_process_group_calls
     assert state["config_entries"] == 1
     assert state["config_exits"] == 1
     assert not state["pg_initialized"]
@@ -972,6 +986,8 @@ def test_capability_probe_records_later_engine_api_without_selecting_it(
     reload_module = ModuleType("vllm.model_executor.model_loader.reload")
     reload_module.initialize_layerwise_reload = lambda _model: None
     reload_module.finalize_layerwise_reload = lambda _model, _config: None
+    layerwise_module = ModuleType("vllm.model_executor.model_loader.reload.layerwise")
+    layerwise_module.make_online_process_loader = lambda _layer, _param_name: None
     config_module = ModuleType("vllm.config")
     config_module.set_current_vllm_config = lambda _config: _ConfigContext([])
     factory_module = ModuleType("vllm.distributed.weight_transfer.factory")
@@ -1010,6 +1026,7 @@ def test_capability_probe_records_later_engine_api_without_selecting_it(
         {
             "vllm.config": config_module,
             "vllm.model_executor.model_loader.reload": reload_module,
+            "vllm.model_executor.model_loader.reload.layerwise": layerwise_module,
             "vllm.distributed.weight_transfer.factory": factory_module,
             "vllm.distributed.weight_transfer.base": base_module,
         },
@@ -1091,8 +1108,7 @@ def test_0251_adapter_binds_dense_and_routed_checkpoint_components(
     spec.post(ctx)
 
     routed = ".experts." in logical_name
-    expected_calls = expected_shape[0] if routed else 1
-    assert len(retained_loads) == expected_calls
+    assert len(retained_loads) == 1
     assert (
         sum(
             bound.arguments["loaded_weight"].numel()
@@ -1104,11 +1120,7 @@ def test_0251_adapter_binds_dense_and_routed_checkpoint_components(
         assert bound.arguments["logical_name"] == logical_name
         assert bound.arguments["role"] == role
         if routed:
-            assert bound.arguments["weight_name"].endswith(
-                "weight" if role == "weight" else "weight_scale"
-            )
-            assert bound.arguments["shard_id"] in {"w1", "w2", "w3"}
-            assert isinstance(bound.arguments["expert_id"], int)
+            assert bound.arguments["expert_id"] is None
         elif logical_name.endswith(("gate_proj.weight", "up_proj.weight")):
             assert bound.arguments["loaded_shard_id"] in {0, 1}
 
@@ -1214,7 +1226,7 @@ def test_0251_adapter_rejects_missing_checkpoint_alias_and_loader_before_receive
             )
 
 
-def test_0251_adapter_wrapped_loader_owns_received_payload(
+def test_0251_adapter_passes_received_storage_to_wrapped_loader_without_copy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter, _model, retained_loads = _make_binding_adapter(monkeypatch, [])
@@ -1227,12 +1239,12 @@ def test_0251_adapter_wrapped_loader_owns_received_payload(
     assert spec.pre is not None and spec.post is not None
     ctx = spec.pre(spec.base)
     ctx.buf.fill_(3)
+    received_pointer = ctx.buf.untyped_storage().data_ptr()
     spec.post(ctx)
     retained = retained_loads[0][1].arguments["loaded_weight"]
-    ctx.buf.fill_(5)
 
     assert torch.all(retained.float() == 3)
-    assert retained.untyped_storage().data_ptr() != ctx.buf.untyped_storage().data_ptr()
+    assert retained.untyped_storage().data_ptr() == received_pointer
 
 
 def test_0251_adapter_repeated_refits_change_bytes_and_preserve_runtime_pointers(

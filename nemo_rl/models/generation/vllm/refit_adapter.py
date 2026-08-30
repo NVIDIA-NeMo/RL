@@ -132,8 +132,13 @@ class Vllm0251RefitAdapter:
     _loaded_components: set[tuple[str, str]]
     _native_bindings: dict[str, _NativeDestinationBinding]
     _bridged_target_ids: set[int]
+    _model_modules: dict[str, torch.nn.Module]
+    _active_parameters: dict[str, torch.Tensor]
     _config_context: AbstractContextManager[Any] | None
+    _set_current_vllm_config: Callable[..., Any] | None
+    _initialize_layerwise_reload: Callable[..., Any] | None
     _finalize_layerwise_reload: Callable[..., Any] | None
+    _make_online_process_loader: Callable[..., Any] | None
     _state: str
     _failure: BaseException | None
     _audit_mode: str | None
@@ -155,8 +160,13 @@ class Vllm0251RefitAdapter:
         self._loaded_components: set[tuple[str, str]] = set()
         self._native_bindings: dict[str, _NativeDestinationBinding] = {}
         self._bridged_target_ids: set[int] = set()
+        self._model_modules: dict[str, torch.nn.Module] = {}
+        self._active_parameters: dict[str, torch.Tensor] = {}
         self._config_context: AbstractContextManager[Any] | None = None
+        self._set_current_vllm_config: Callable[..., Any] | None = None
+        self._initialize_layerwise_reload: Callable[..., Any] | None = None
         self._finalize_layerwise_reload: Callable[..., Any] | None = None
+        self._make_online_process_loader: Callable[..., Any] | None = None
         self._state = "new"
         self._failure: BaseException | None = None
         audit_mode = os.environ.get(_NATIVE_AUDIT_ENV, "").strip() or None
@@ -167,6 +177,7 @@ class Vllm0251RefitAdapter:
         self._audit_mode = audit_mode
         self._audit_previous_digest: str | None = None
         self._audit_update_index = 0
+        self._resolve_vllm_lifecycle()
 
     def validate_plan(self, refit_info: Mapping[str, Any]) -> None:
         """Validate that the plan has one ordered identity for every component."""
@@ -196,6 +207,7 @@ class Vllm0251RefitAdapter:
             self._expected_local_shapes = _expected_local_component_shapes(
                 refit_info, native_names
             )
+            self._model_modules = dict(self._model_runner.model.named_modules())
         except BaseException as error:
             self.abort_update(error)
             raise
@@ -211,29 +223,10 @@ class Vllm0251RefitAdapter:
                 "vLLM refit adapter must be prepared before begin_update"
             )
         try:
-            config_module = importlib.import_module("vllm.config")
-            reload_module = importlib.import_module(
-                "vllm.model_executor.model_loader.reload"
-            )
-            set_current_vllm_config = getattr(config_module, "set_current_vllm_config")
-            initialize_layerwise_reload = getattr(
-                reload_module, "initialize_layerwise_reload"
-            )
-            finalize_layerwise_reload = getattr(
-                reload_module, "finalize_layerwise_reload"
-            )
-            if not callable(set_current_vllm_config):
-                raise VllmRefitCompatibilityError(
-                    "vLLM is missing set_current_vllm_config for layerwise refit"
-                )
-            if not _accepts_arguments(initialize_layerwise_reload, (object(),)):
-                raise VllmRefitCompatibilityError(
-                    "vLLM is missing initialize_layerwise_reload(model)"
-                )
-            if not _accepts_arguments(finalize_layerwise_reload, (object(), object())):
-                raise VllmRefitCompatibilityError(
-                    "vLLM is missing finalize_layerwise_reload(model, model_config)"
-                )
+            set_current_vllm_config = self._set_current_vllm_config
+            initialize_layerwise_reload = self._initialize_layerwise_reload
+            if set_current_vllm_config is None or initialize_layerwise_reload is None:
+                raise RuntimeError("vLLM refit lifecycle was not prepared")
             config_context = set_current_vllm_config(self._model_runner.vllm_config)
             if not isinstance(config_context, AbstractContextManager):
                 raise VllmRefitCompatibilityError(
@@ -244,7 +237,7 @@ class Vllm0251RefitAdapter:
             config_context.__enter__()
             with torch.device(self._refit_device):
                 initialize_layerwise_reload(self._model_runner.model)
-            self._finalize_layerwise_reload = finalize_layerwise_reload
+            self._active_parameters = dict(self._model_runner.model.named_parameters())
             self._bridged_target_ids.clear()
         except BaseException as error:
             self.abort_update(error)
@@ -267,7 +260,7 @@ class Vllm0251RefitAdapter:
                 f"vLLM refit component {component!r} has no native destination binding"
             )
         try:
-            parameters = dict(self._model_runner.model.named_parameters())
+            parameters = self._active_parameters
             if role == "weight":
                 target_name = binding.value_name
             elif role == "weight_scale":
@@ -340,7 +333,7 @@ class Vllm0251RefitAdapter:
                 raise RuntimeError(
                     f"vLLM checkpoint parameter for {component!r} has no weight_loader"
                 )
-            owned_weight = loaded_weight.detach().clone()
+            owned_weight = self._prepare_loaded_weight(loaded_weight)
             weight_loader(target, owned_weight, **dict(loader_kwargs or {}))
             self._loaded_components.add(component)
         except BaseException as error:
@@ -375,6 +368,7 @@ class Vllm0251RefitAdapter:
             self.abort_update(error)
             raise
         self._loaded_components.clear()
+        self._clear_active_update()
         self._state = "prepared"
 
     def _audit_native_runtime_update(self) -> None:
@@ -454,6 +448,7 @@ class Vllm0251RefitAdapter:
             self._exit_config_context(error)
         except BaseException:
             pass
+        self._clear_active_update()
 
     def _prepare_native_bindings(
         self,
@@ -536,6 +531,55 @@ class Vllm0251RefitAdapter:
             )
         return bindings
 
+    def _resolve_vllm_lifecycle(self) -> None:
+        if self._set_current_vllm_config is not None:
+            return
+        config_module = importlib.import_module("vllm.config")
+        reload_module = importlib.import_module(
+            "vllm.model_executor.model_loader.reload"
+        )
+        layerwise_module = importlib.import_module(
+            "vllm.model_executor.model_loader.reload.layerwise"
+        )
+        set_current_vllm_config = getattr(
+            config_module, "set_current_vllm_config", None
+        )
+        initialize_layerwise_reload = getattr(
+            reload_module, "initialize_layerwise_reload", None
+        )
+        finalize_layerwise_reload = getattr(
+            reload_module, "finalize_layerwise_reload", None
+        )
+        make_online_process_loader = getattr(
+            layerwise_module, "make_online_process_loader", None
+        )
+        if not callable(set_current_vllm_config):
+            raise VllmRefitCompatibilityError(
+                "vLLM is missing set_current_vllm_config for layerwise refit"
+            )
+        if not _accepts_arguments(initialize_layerwise_reload, (object(),)):
+            raise VllmRefitCompatibilityError(
+                "vLLM is missing initialize_layerwise_reload(model)"
+            )
+        if not _accepts_arguments(finalize_layerwise_reload, (object(), object())):
+            raise VllmRefitCompatibilityError(
+                "vLLM is missing finalize_layerwise_reload(model, model_config)"
+            )
+        if not _accepts_arguments(
+            make_online_process_loader, (torch.nn.Module(), "weight")
+        ):
+            raise VllmRefitCompatibilityError(
+                "vLLM 0.25.1 local-shard refit requires "
+                "make_online_process_loader(layer, param_name)"
+            )
+        assert callable(initialize_layerwise_reload)
+        assert callable(finalize_layerwise_reload)
+        assert callable(make_online_process_loader)
+        self._set_current_vllm_config = set_current_vllm_config
+        self._initialize_layerwise_reload = initialize_layerwise_reload
+        self._finalize_layerwise_reload = finalize_layerwise_reload
+        self._make_online_process_loader = make_online_process_loader
+
     def _active_checkpoint_scale_name(
         self,
         binding: _NativeDestinationBinding,
@@ -592,23 +636,14 @@ class Vllm0251RefitAdapter:
                 f"vLLM checkpoint parameter {target_name!r} has no wrapped weight_loader"
             )
         owner_name, parameter_name = target_name.rsplit(".", 1)
-        owner = dict(self._model_runner.model.named_modules()).get(owner_name)
+        owner = self._model_modules.get(owner_name)
         if owner is None or getattr(owner, parameter_name, None) is not target:
             raise ValueError(
                 f"vLLM checkpoint parameter {target_name!r} has no owning module"
             )
-        layerwise_module = importlib.import_module(
-            "vllm.model_executor.model_loader.reload.layerwise"
-        )
-        make_online_process_loader = getattr(
-            layerwise_module, "make_online_process_loader", None
-        )
-        if not _accepts_arguments(make_online_process_loader, (owner, parameter_name)):
-            raise VllmRefitCompatibilityError(
-                "vLLM 0.25.1 local-shard refit requires "
-                "make_online_process_loader(layer, param_name)"
-            )
-        assert callable(make_online_process_loader)
+        make_online_process_loader = self._make_online_process_loader
+        if make_online_process_loader is None:
+            raise RuntimeError("vLLM local loader bridge was not prepared")
 
         def local_shard_loader(
             param: torch.Tensor,
@@ -654,30 +689,16 @@ class Vllm0251RefitAdapter:
                 raise RuntimeError(
                     f"vLLM checkpoint parameter for {component!r} has no weight_loader"
                 )
-            owned_weight = loaded_weight.detach().clone()
+            owned_weight = self._prepare_loaded_weight(loaded_weight)
             if binding.grouped_expert_proj is not None:
-                shard_id = {
-                    "gate_proj": "w1",
-                    "up_proj": "w3",
-                    "down_proj": "w2",
-                }[binding.grouped_expert_proj]
-                base_region: list[Any] = list(
-                    binding.merged_slice
-                    or tuple(slice(None) for _ in range(target.ndim))
+                weight_loader(
+                    target,
+                    owned_weight,
+                    region=binding.merged_slice
+                    or tuple(slice(None) for _ in range(target.ndim)),
+                    logical_name=binding.logical_name,
+                    role=role,
                 )
-                for expert_id in range(owned_weight.shape[0]):
-                    expert_region = list(base_region)
-                    expert_region[0] = expert_id
-                    weight_loader(
-                        target,
-                        owned_weight[expert_id],
-                        region=tuple(expert_region),
-                        logical_name=binding.logical_name,
-                        role=role,
-                        weight_name=target_name.rsplit(".", 1)[-1],
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
             else:
                 loader_kwargs: dict[str, Any] = {
                     "region": binding.merged_slice
@@ -698,11 +719,10 @@ class Vllm0251RefitAdapter:
     def _verify_runtime_bindings(self) -> None:
         if not self._native_bindings:
             return
-        parameters = dict(self._model_runner.model.named_parameters())
         for binding in self._native_bindings.values():
-            value = parameters.get(binding.value_name)
-            runtime_scale = parameters.get(binding.runtime_scale_name)
-            checkpoint_alias = parameters.get(binding.checkpoint_alias_name)
+            value = self._registered_parameter(binding.value_name)
+            runtime_scale = self._registered_parameter(binding.runtime_scale_name)
+            checkpoint_alias = self._registered_parameter(binding.checkpoint_alias_name)
             if value is None or value.data_ptr() != binding.runtime_value_ptr:
                 raise RuntimeError(
                     f"vLLM refit changed CUDA Graph-visible value storage for "
@@ -730,6 +750,21 @@ class Vllm0251RefitAdapter:
                     checkpoint_alias, binding.merged_slice
                 ),
             )
+
+    def _registered_parameter(self, name: str) -> torch.Tensor | None:
+        owner_name, parameter_name = name.rsplit(".", 1)
+        owner = self._model_modules.get(owner_name)
+        if owner is None:
+            return None
+        parameter = owner._parameters.get(parameter_name)
+        return parameter if isinstance(parameter, torch.Tensor) else None
+
+    def _prepare_loaded_weight(self, loaded_weight: torch.Tensor) -> torch.Tensor:
+        return loaded_weight.detach() if loaded_weight.requires_grad else loaded_weight
+
+    def _clear_active_update(self) -> None:
+        self._active_parameters.clear()
+        self._bridged_target_ids.clear()
 
     def _require_not_poisoned(self) -> None:
         if self._failure is not None:
