@@ -109,6 +109,7 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
 )
 from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
@@ -725,7 +726,7 @@ def _actor_master_config(
             "mlflow_enabled": False,
             "monitor_gpus": False,
         },
-        cluster={"num_nodes": 1, "gpus_per_node": 1},
+        cluster=ClusterConfig.model_validate({"num_nodes": 1, "gpus_per_node": 1}),
         checkpointing={
             "enabled": enabled,
             "checkpoint_dir": str(tmp_path / "checkpoints"),

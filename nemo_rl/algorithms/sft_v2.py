@@ -439,17 +439,17 @@ def setup_sft_v2(
     checkpoint_probe.shutdown()
 
     cluster_config = master_config.cluster
-    num_nodes = cluster_config["num_nodes"]
-    segment_size = cluster_config.get("segment_size")
+    num_nodes = cluster_config.num_nodes
+    segment_size = cluster_config.segment_size
     node_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
         name="sft_v2_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
+        bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
         use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
+        num_gpus_per_node=cluster_config.gpus_per_node,
         max_colocated_worker_groups=1,
-        port_range_low=cluster_config.get("master_port_range_low"),
-        port_range_high=cluster_config.get("master_port_range_high"),
+        port_range_low=cluster_config.master_port_range_low,
+        port_range_high=cluster_config.master_port_range_high,
         segment_size=segment_size,
         node_resource_constraints=node_constraints,
     )
