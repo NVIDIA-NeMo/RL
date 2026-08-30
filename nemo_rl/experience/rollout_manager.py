@@ -1975,11 +1975,15 @@ class RolloutManager:
                 raise ValueError(
                     "token-capture completion must contain environment extras"
                 )
-            receipt = env_extras.get("ng_receipt")
-            gate_rollout_id = env_extras.get("ng_rollout_id")
-            if not isinstance(receipt, dict):
+            if "ng_receipt" not in env_extras:
                 raise ValueError(
-                    "token-capture completion must contain a receipt mapping"
+                    "token-capture completion must contain ng_receipt"
+                )
+            receipt = env_extras["ng_receipt"]
+            gate_rollout_id = env_extras.get("ng_rollout_id")
+            if receipt is not None and not isinstance(receipt, dict):
+                raise ValueError(
+                    "token-capture completion ng_receipt must be a mapping or None"
                 )
             if not isinstance(gate_rollout_id, str):
                 raise ValueError(
@@ -1997,7 +2001,7 @@ class RolloutManager:
                     f"result={gate_rollout_id!r}, "
                     f"expected={expected_gate_rollout_id!r}"
                 )
-            if receipt.get("rollout_id") != gate_rollout_id:
+            if receipt is not None and receipt.get("rollout_id") != gate_rollout_id:
                 raise ValueError(
                     "receipt rollout identity mismatch: "
                     f"receipt={receipt.get('rollout_id')!r}, "
