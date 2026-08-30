@@ -36,7 +36,7 @@ def _bare_actor():
     ctrl._gen_fleet = None  # no fleet -> run() creates no probe task
     ctrl._train_steps = 0
     ctrl._trainer_version = 0
-    ctrl._weight_synchronizer = SimpleNamespace(shutdown=lambda: None)
+    ctrl._weight_synchronizer = SimpleNamespace(is_stale=False, shutdown=lambda: None)
     ctrl._logger = SimpleNamespace(finish=lambda: None)
     ctrl._checkpointer = SimpleNamespace(shutdown=lambda: None)
     # run() stamps the rollout manager with the starting weight version before
@@ -48,6 +48,11 @@ def _bare_actor():
 
     ctrl._sync_weights = _noop
     ctrl._maybe_restore_replay_buffer = _noop
+
+    async def _noop_restore_recovery(*, restored_replay_groups):
+        return None
+
+    ctrl._maybe_restore_rollout_recovery = _noop_restore_recovery
     ctrl._maybe_restore_replacement_reserve = _noop
     return ctrl
 
