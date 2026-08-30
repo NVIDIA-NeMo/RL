@@ -22,12 +22,10 @@ supported Qwen3.5 dense models. Context parallelism requires sequence packing,
 which is enabled in the example recipe below.
 
 > [!NOTE]
-> AutoModel backend support is tracked in
-> [issue #3675](https://github.com/NVIDIA-NeMo/RL/issues/3675) and deferred until
-> [NeMo RL PR #3498](https://github.com/NVIDIA-NeMo/RL/pull/3498) upgrades the
-> pinned AutoModel revision to one that provides the Qwen3.5-family dense
-> state-dict adapter. A follow-up PR will add and validate the AutoModel example
-> recipe.
+> AutoModel dependencies now include the Qwen3.5-family dense adapter via
+> [NeMo RL PR #3498](https://github.com/NVIDIA-NeMo/RL/pull/3498).
+> Qwen3.8 AutoModel validation and an example recipe remain tracked in
+> [issue #3675](https://github.com/NVIDIA-NeMo/RL/issues/3675).
 
 ## Example Recipes
 
