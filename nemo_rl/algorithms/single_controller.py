@@ -686,8 +686,9 @@ class SingleControllerActor:
                 # Loops forever like the watchdog, so finishing at all means it raised.
                 await probe_task
             if rollout_telemetry_task is not None and rollout_telemetry_task in done:
+                # This pump has no normal return path. Awaiting it propagates the
+                # exception, including one concurrent with an orderly checkpoint stop.
                 await rollout_telemetry_task
-                raise RuntimeError("rollout telemetry pump exited unexpectedly")
             if not stop_after_rollout_checkpoint and watchdog_task in done:
                 # The watchdog loops forever, so finishing at all means it raised --
                 # a stall or an unhealthy environment. Surface that ahead of the
@@ -929,7 +930,9 @@ class SingleControllerActor:
             )
 
         recovery_ledger = self._rollout_manager.recovery_ledger
-        async with self._data_plane_checkpoint_barrier.mutation() as cut:
+        async with self._data_plane_checkpoint_barrier.mutation(
+            "recovery_restore"
+        ) as cut:
             recovery_ledger.load_state_dict(cut, parsed_state.ledger_state)
             recovery_ledger.prepare_for_restart(cut)
             self._batch_shortfall = parsed_state.batch_shortfall
@@ -1910,10 +1913,8 @@ class SingleControllerActor:
 
                         if self._rollout_recovery_enabled:
                             assert lineage_group_id is not None
-                            async with (
-                                self._data_plane_checkpoint_barrier.mutation(
-                                    "prompt_reservations"
-                                )
+                            async with self._data_plane_checkpoint_barrier.mutation(
+                                "prompt_reservations"
                             ) as cut:
                                 replacement = self._take_replacement(
                                     target_step, replacements
@@ -3824,9 +3825,7 @@ class SingleControllerActor:
                     if snapshot_cut.replay_metadata is not None
                     else 0
                 ),
-                "ledger_groups": float(
-                    snapshot_cut.rollout_recovery_group_count or 0
-                ),
+                "ledger_groups": float(snapshot_cut.rollout_recovery_group_count or 0),
             }
             self._log_telemetry_metrics(
                 checkpoint_metrics,
@@ -4761,7 +4760,7 @@ class SingleControllerActor:
             fields_to_put[adv_cfg.returns_field] = returns
             new_fields.append(adv_cfg.returns_field)
 
-        async with self._data_plane_checkpoint_barrier.mutation():
+        async with self._data_plane_checkpoint_barrier.mutation("advantage_writeback"):
             await self._call_dp(
                 "put_samples",
                 sample_ids=meta.sample_ids,

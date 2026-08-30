@@ -556,9 +556,6 @@ class _FakeTQBuffer:
         )
         return self.load_return
 
-    def __len__(self) -> int:
-        return self._num_groups
-
 
 # Default position sentinel the fake dataloader reports via state_dict().
 _SENTINEL_DL_STATE = {"fake_position": 42}

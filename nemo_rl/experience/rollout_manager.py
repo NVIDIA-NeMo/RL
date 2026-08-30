@@ -1898,10 +1898,8 @@ class RolloutManager:
             # succeeded on a retry also counts -- the fleet recovered either way.
             self._consecutive_infra_drops = 0
             if lineage_group_id is not None:
-                async with (
-                    self._tq_buffer.data_plane_checkpoint_barrier.mutation(
-                        "group_removals"
-                    )
+                async with self._tq_buffer.data_plane_checkpoint_barrier.mutation(
+                    "group_removals"
                 ) as cut:
                     self._recovery_ledger.discard_group(cut, lineage_group_id)
             return RolloutOutcome.COMMITTED

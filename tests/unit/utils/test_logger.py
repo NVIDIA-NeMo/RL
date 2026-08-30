@@ -578,6 +578,58 @@ class TestWandbLogger:
         )
 
     @patch("nemo_rl.utils.logger.wandb")
+    def test_define_metric_rejects_conflicting_registration(self, mock_wandb):
+        logger = WandbLogger({})
+        logger.define_metric("ray/*", step_metric="ray/ray_step")
+
+        with pytest.raises(ValueError, match="already registered"):
+            logger.define_metric("ray/*", step_metric="other/step")
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_define_metric_rejects_non_terminal_wildcard(self, mock_wandb):
+        logger = WandbLogger({})
+
+        with pytest.raises(ValueError, match="exactly one trailing"):
+            logger.define_metric("ray/*/util", step_metric="ray/ray_step")
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_log_metrics_requires_registered_step_metric(self, mock_wandb):
+        logger = WandbLogger({})
+        logger.define_metric(
+            "rollout/throughput/*",
+            step_metric="telemetry/wall_time_seconds",
+        )
+
+        with pytest.raises(ValueError, match="is missing from the logged event"):
+            logger.log_metrics(
+                {"rollout/throughput/tokens_per_second": 10.0},
+                step=0,
+            )
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_define_metric_uses_longest_matching_prefix(self, mock_wandb):
+        logger = WandbLogger({})
+        logger.define_metric("rollout/*", step_metric="rollout/step")
+        logger.define_metric(
+            "rollout/throughput/*",
+            step_metric="telemetry/wall_time_seconds",
+        )
+
+        logger.log_metrics(
+            {
+                "telemetry/wall_time_seconds": 30.0,
+                "rollout/throughput/tokens_per_second": 10.0,
+            },
+            step=0,
+        )
+
+        mock_run = mock_wandb.init.return_value
+        mock_run.define_metric.assert_any_call(
+            "rollout/throughput/tokens_per_second",
+            step_metric="telemetry/wall_time_seconds",
+        )
+
+    @patch("nemo_rl.utils.logger.wandb")
     def test_does_not_define_catch_all_metric(self, mock_wandb):
         """Overlapping W&B globs must not choose axes nondeterministically."""
         WandbLogger({})
