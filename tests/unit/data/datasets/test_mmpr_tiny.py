@@ -160,7 +160,10 @@ def _make_stub_nemotron_processor(*, include_imgs_sizes=True, num_tiles=1):
                     for item in content:
                         if isinstance(item, dict) and "text" in item:
                             parts.append(item["text"])
-            return " ".join(parts)
+            formatted_text = " ".join(parts)
+            if kwargs.get("tokenize"):
+                return {"input_ids": fake_input_ids}
+            return formatted_text
 
         def __call__(self, text=None, images=None, **kwargs):
             self.captured_call_text = text
@@ -240,6 +243,31 @@ class TestVLMProcessorMMPRTiny:
         assert torch.equal(user_message["num_frames"].as_tensor(), torch.tensor([1]))
         assert user_message["pixel_values"].pad_to_max_shape is True
         assert user_message["pixel_values"].as_tensor().dtype == torch.float32
+
+    def test_text_only_row_preserves_formatted_vllm_content(self):
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        processor = _make_stub_nemotron_processor()
+        task_data_spec = TaskDataSpec(task_name="text-only")
+        task_data_spec.prompt = "Answer: {}"
+
+        result = vlm_hf_data_processor(
+            datum_dict={
+                "messages": [
+                    {"role": "user", "content": "What is 2 + 2?"},
+                    {"role": "assistant", "content": "4"},
+                ],
+                "task_name": "text-only",
+            },
+            task_data_spec=task_data_spec,
+            processor=processor,
+            max_seq_length=8192,
+            idx=0,
+        )
+
+        assert result["vllm_content"] == "Answer: What is 2 + 2?"
+        assert result["vllm_images"] == []
 
     def test_conversation_preprocessor_is_preserved(self, tiny_image_path):
         processor = _make_stub_nemotron_processor()

@@ -58,12 +58,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     mamba_inference_ssm_states_dtype: NotRequired[str]
     mamba_inference_conv_states_dtype: NotRequired[str]
 
-    # Raw media preprocessing. Each key is read only on the path that needs it;
-    # when omitted, MCore's own dataclass default applies (see
-    # ImageProcessingConfig / VideoProcessingConfig).
-    # `image_dynamic_resolution` requires an inference wrapper that supports
-    # images. The `video_*` keys are read only when `video_temporal_patch_size`
-    # is set, and `video_num_frames` is then required.
+    # Raw media preprocessing corresponding with Megatron's
+    # ImageProcessingConfig / VideoProcessingConfig.
+    # `video_num_frames` is required for video.
     image_dynamic_resolution: NotRequired[bool]
     video_num_frames: NotRequired[int]  # Frames sampled per video.
     video_temporal_patch_size: NotRequired[int]  # Frames per temporal patch.

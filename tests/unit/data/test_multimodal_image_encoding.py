@@ -143,9 +143,93 @@ def test_encode_images_deduplicates_sources_and_uses_a_bounded_thread_pool(
     ]
     for example in examples:
         parts = example["responses_create_params"]["input"][0]["content"]
-        assert parts[0]["image_url"] == expected[first]
-        assert parts[1]["image_url"] == expected[first]
-        assert parts[2]["image_url"] == expected[second]
+        assert parts[0] == {
+            "type": "input_image",
+            "image_url": expected[first],
+        }
+        assert parts[1] == {
+            "type": "input_image",
+            "image_url": expected[first],
+        }
+        assert parts[2] == {
+            "type": "input_image",
+            "image_url": expected[second],
+        }
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        {"type": "image", "image": "a.png", "url": "b.png"},
+        {"type": "image"},
+    ],
+)
+def test_normalize_media_requires_exactly_one_source_key(part):
+    with pytest.raises(ValueError, match="requires exactly one"):
+        normalize_media_in_examples([_example(part)])
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["", {"url": ""}],
+)
+def test_normalize_media_rejects_empty_urls(source):
+    with pytest.raises(ValueError, match="requires a non-empty media URL"):
+        normalize_media_in_examples(
+            [_example({"type": "input_image", "image_url": source})]
+        )
+
+
+def test_normalize_media_preserves_input_image_file_id():
+    part = {"type": "input_image", "file_id": "file-123", "detail": "high"}
+    examples = [_example(part)]
+
+    normalize_media_in_examples(examples)
+
+    assert examples[0]["responses_create_params"]["input"][0]["content"][0] == {
+        "type": "input_image",
+        "file_id": "file-123",
+        "detail": "high",
+    }
+
+
+def test_normalize_media_promotes_nested_image_detail():
+    data_url = image_to_data_url(Image.new("RGB", (2, 2)))
+    examples = [
+        _example(
+            {
+                "type": "image",
+                "image": {"url": data_url, "detail": "high"},
+            }
+        )
+    ]
+
+    normalize_media_in_examples(examples)
+
+    assert examples[0]["responses_create_params"]["input"][0]["content"][0] == {
+        "type": "input_image",
+        "image_url": data_url,
+        "detail": "high",
+    }
+
+
+def test_normalize_media_canonicalizes_local_video(tmp_path, monkeypatch):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    encoded_url = "data:video/mp4;base64,dmlkZW8="
+    monkeypatch.setattr(
+        nemo_gym_multimodal,
+        "video_path_to_data_url",
+        lambda source: encoded_url,
+    )
+    examples = [_example({"type": "video", "url": str(video_path)})]
+
+    normalize_media_in_examples(examples)
+
+    assert examples[0]["responses_create_params"]["input"][0]["content"][0] == {
+        "type": "input_video",
+        "video_url": encoded_url,
+    }
 
 
 def test_encode_images_does_not_partially_mutate_on_error(tmp_path):
