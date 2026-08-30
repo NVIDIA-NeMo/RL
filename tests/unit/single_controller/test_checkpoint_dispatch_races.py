@@ -239,6 +239,9 @@ class _RecoveryRolloutManager:
     ) -> None:
         self.recovery_ledger.discard_group(cut, group_id)
 
+    def record_recovery_siblings(self, *, reused: int, redispatched: int) -> None:
+        del reused, redispatched
+
 
 class _BlockingRolloutManager:
     """Hold one admitted rollout unfinished while the checkpoint is written."""

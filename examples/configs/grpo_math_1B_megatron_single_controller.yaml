@@ -156,6 +156,7 @@ checkpointing:
 # checkpoint support. save_period=1 provides an anchor after every train step.
 rollout_checkpointing:
   snapshot_attempt_interval_s: null
+  telemetry_interval_s: null
   keep_latest_k: 2
   restore_mode: latest
   # Advanced escape hatch for runtime-only fields from external integrations.

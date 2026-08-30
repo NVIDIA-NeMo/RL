@@ -66,18 +66,22 @@ REPLAY_BUFFER_METADATA_SCHEMA_VERSION = 1
 REPLAY_BUFFER_METADATA_STORAGE: Literal["tq_checkpoint"] = "tq_checkpoint"
 
 CheckpointMutationKind = Literal[
+    "advantage_writeback",
     "group_commits",
     "group_removals",
     "other",
     "prompt_reservations",
+    "recovery_restore",
     "recovery_retries",
     "sample_clears",
     "sibling_seals",
 ]
 CHECKPOINT_MUTATION_KINDS: tuple[CheckpointMutationKind, ...] = (
+    "advantage_writeback",
     "group_commits",
     "group_removals",
     "prompt_reservations",
+    "recovery_restore",
     "recovery_retries",
     "sample_clears",
     "sibling_seals",
@@ -95,6 +99,7 @@ class DataPlaneCheckpointBarrierTelemetry:
     waiting_mutations: int
     max_waiting_mutations: int
     checkpoint_active: bool
+
 
 # These TypedDicts describe the versioned, plain-mapping checkpoint wire
 # format. They are intentionally not dataclass instances: persisting a
@@ -1255,9 +1260,7 @@ class TQReplayBuffer:
                 "the async message-log flattening path."
             )
         trace_rollout_payload(keys=sample_ids, data=train_batch)
-        async with self._data_plane_checkpoint_barrier.mutation(
-            "group_commits"
-        ) as cut:
+        async with self._data_plane_checkpoint_barrier.mutation("group_commits") as cut:
             try:
                 await call_data_plane(
                     self._dp_client,

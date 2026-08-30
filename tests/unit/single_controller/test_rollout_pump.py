@@ -105,6 +105,9 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._finalizer_actors = []
     ctrl._replacement_reserve = deque()
     ctrl._rollout_recovery_enabled = False
+    ctrl._rollout_slot_waiters = 0
+    ctrl._rollout_permitted_waiters = 0
+    ctrl._buffer_capacity_waiters = 0
 
 
 class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
