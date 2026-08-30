@@ -3341,10 +3341,14 @@ class MegatronPolicyWorkerImpl(
 
     def finish_inference(self) -> None:
         """Offload model params to CPU after inference. Only used in PPO."""
+        # MCore modules may refresh parameter-derived CUDA caches from ``eval()``
+        # (for example, MambaMixer refreshes its decode cache from ``A_log``).
+        # Finish that work before offload_to_cpu() releases the parameter storage.
+        self.model.eval()
+        torch.cuda.synchronize()
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
         )
-        self.model.eval()
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -3490,10 +3494,16 @@ class MegatronPolicyWorkerImpl(
             and self.inference_model is None
             and self._colocated_reshard_plan is None
         )
+        # eval() is no longer side-effect free for every MCore model. In
+        # particular, MambaMixer refreshes a CUDA decode cache by reading A_log.
+        # Run and fence those cache updates while the parameter buffers still
+        # have storage; doing this after move_model(..., "cpu") can launch a
+        # kernel against the zero-sized storage left by offload_to_cpu().
+        self.model.eval()
+        torch.cuda.synchronize()
         self.model = self.move_model(
             self.model, "cpu", move_params=not keep_params_for_generation
         )
-        self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
 

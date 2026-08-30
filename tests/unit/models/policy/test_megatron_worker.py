@@ -204,15 +204,20 @@ def test_qwen3vl_type_fallback_still_delegates_packing():
 
 
 class _FakeTrainableModel:
-    def __init__(self):
+    def __init__(self, events=None):
         self.train_called = False
         self.eval_called = False
+        self.events = events
 
     def train(self):
         self.train_called = True
+        if self.events is not None:
+            self.events.append("model_train")
 
     def eval(self):
         self.eval_called = True
+        if self.events is not None:
+            self.events.append("model_eval")
 
 
 class _ModelWithNonSerializableExtraState(torch.nn.Module):
@@ -318,8 +323,10 @@ def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
 def test_megatron_offload_after_refit_finalizes_before_model_move(
     monkeypatch, generation_backend, colocated, has_inference_model, expect_move_params
 ):
-    """Checkpoint CUDA IPC handles must be dropped before model storage is replaced,
-    and shared-model colocated generation must keep its params resident."""
+    """Finalize checkpoint/cache work before replacing model storage.
+
+    Shared-model colocated generation must also keep its params resident.
+    """
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
@@ -327,7 +334,7 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     events = []
     move_kwargs = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.model = _FakeTrainableModel()
+    worker.model = _FakeTrainableModel(events)
     worker.cfg = (
         {"generation": {"backend": generation_backend}} if generation_backend else {}
     )
@@ -354,13 +361,43 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
         "memory_reserved",
         lambda *args, **kwargs: events.append("memory_reserved") or 0,
     )
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda: events.append("cuda_synchronize")
+    )
     monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
 
     MegatronPolicyWorkerImpl.offload_after_refit(worker)
 
     assert events[0] == "finalize_async_save"
+    assert events.index("model_eval") < events.index("cuda_synchronize")
+    assert events.index("cuda_synchronize") < events.index("move_model")
     assert events.index("finalize_async_save") < events.index("move_model")
     assert move_kwargs[0]["move_params"] is expect_move_params
+
+
+def test_megatron_finish_inference_refreshes_caches_before_model_offload(monkeypatch):
+    """eval-time MCore cache refreshes must finish before parameter storage is freed."""
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    events = []
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.model = _FakeTrainableModel(events)
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append("move_model") or model
+    )
+
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda: events.append("cuda_synchronize")
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+    monkeypatch.setattr(
+        worker_module.gc, "collect", lambda: events.append("gc_collect")
+    )
+
+    worker_module.MegatronPolicyWorkerImpl.finish_inference(worker)
+
+    assert events.index("model_eval") < events.index("cuda_synchronize")
+    assert events.index("cuda_synchronize") < events.index("move_model")
 
 
 def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):

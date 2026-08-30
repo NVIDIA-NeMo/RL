@@ -1002,10 +1002,14 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
     def finish_training(self) -> None:
         """Offload model, gradients, and optimizer to CPU after training."""
+        # MCore modules may refresh parameter-derived CUDA caches from ``eval()``
+        # (for example, MambaMixer refreshes its decode cache from ``A_log``).
+        # Finish that work before offload_to_cpu() releases the parameter storage.
+        self.model.eval()
+        torch.cuda.synchronize()
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True
         )
-        self.model.eval()
 
         if (
             hasattr(self, "optimizer")
