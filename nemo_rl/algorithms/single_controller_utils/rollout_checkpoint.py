@@ -28,7 +28,7 @@ from typing import Any, Mapping, Optional
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 2
-BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 2
+BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 3
 BOOTSTRAP_DIRNAME = "bootstrap"
 BOOTSTRAP_MANIFEST_FILENAME = "manifest.json"
 ROLLOUT_SNAPSHOTS_DIRNAME = "rollout_snapshots"
@@ -91,17 +91,53 @@ _BOOTSTRAP_TOKEN_CAPTURE_FIELDS = frozenset(
         "staging_partition",
     }
 )
+# Deployment, placement, logging, and credential leaves do not change the
+# meaning of persisted rollout state. The recursive filter keeps semantic
+# neighbors such as model names, parser settings, timeouts, and reward config.
 _BOOTSTRAP_ENV_RUNTIME_FIELDS = frozenset(
     {
+        "api_key",
+        "api_server_count",
         "apptainer_memory_limit_mb",
         "concurrency",
+        "debug",
+        "default_host",
+        "global_aiohttp_connector_limit",
+        "global_aiohttp_connector_limit_per_host",
         "nemo_gym_log_dir",
         "num_gpu_nodes",
+        "num_processes",
+        "num_workers",
+        "policy_base_url",
         "port_range_high",
         "port_range_low",
+        "ray_head_node_address",
+        "ray_worker_py_executable",
         "should_log_nemo_gym_responses",
         "skip_venv_if_present",
         "use_absolute_ip",
+        "uv_cache_dir",
+        "uv_venv_dir",
+    }
+)
+# These remote services keep their model identity in the fingerprint, but the
+# endpoint may legitimately move when a Slurm job is restarted.
+_BOOTSTRAP_ENV_RUNTIME_PATHS = frozenset(
+    {
+        (
+            "nemo_gym",
+            "genrm_model",
+            "responses_api_models",
+            "genrm_model",
+            "base_url",
+        ),
+        (
+            "nemo_gym",
+            "nl2bash_judge_model",
+            "responses_api_models",
+            "local_vllm_model",
+            "base_url",
+        ),
     }
 )
 
@@ -116,16 +152,35 @@ def _select_fields(
     return {key: mapping[key] for key in sorted(fields) if key in mapping}
 
 
-def _drop_runtime_fields(value: Any, runtime_fields: frozenset[str]) -> Any:
-    """Recursively strip known operational leaves from an environment."""
+def _drop_runtime_fields(
+    value: Any,
+    runtime_fields: frozenset[str],
+    *,
+    runtime_paths: frozenset[tuple[str, ...]],
+    path: tuple[str, ...] = (),
+) -> Any:
+    """Recursively strip known operational leaves and paths from an environment."""
     if isinstance(value, Mapping):
         return {
-            key: _drop_runtime_fields(child, runtime_fields)
+            key: _drop_runtime_fields(
+                child,
+                runtime_fields,
+                runtime_paths=runtime_paths,
+                path=(*path, key),
+            )
             for key, child in value.items()
-            if key not in runtime_fields
+            if key not in runtime_fields and (*path, key) not in runtime_paths
         }
     if isinstance(value, list):
-        return [_drop_runtime_fields(child, runtime_fields) for child in value]
+        return [
+            _drop_runtime_fields(
+                child,
+                runtime_fields,
+                runtime_paths=runtime_paths,
+                path=path,
+            )
+            for child in value
+        ]
     return value
 
 
@@ -299,6 +354,7 @@ def bootstrap_compatibility_identity(
         environment=_drop_runtime_fields(
             dumped.get("env", {}),
             _BOOTSTRAP_ENV_RUNTIME_FIELDS,
+            runtime_paths=_BOOTSTRAP_ENV_RUNTIME_PATHS,
         ),
         sampler=dict(sampler),
         token_capture=_select_fields(
