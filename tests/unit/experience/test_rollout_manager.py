@@ -1294,6 +1294,28 @@ class TestGenerateForFinalizationFlow:
         # actor-pool path; the manager leaves the reservation unready.
         assert buf.commit_calls == []
 
+    def test_explicit_missing_receipt_reaches_finalizer_as_placeholder(self):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf)
+
+        class _MissingReceiptImpl:
+            async def run_rollout(self, _sample, *, rollout_ids=None):
+                receipts = [
+                    None,
+                    {
+                        "rollout_id": rollout_ids[1],
+                        "manifest": [{"staging_key": f"{rollout_ids[1]}/call"}],
+                    },
+                ]
+                return _receipt_record(rollout_ids, receipts)
+
+        mgr._impl = _MissingReceiptImpl()
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p"}))
+
+        assert request.receipts[0] is None
+        assert request.receipts[1] is not None
+
     def test_failed_dispatch_aborts_the_reservation(self):
         buf = _FakeCaptureBuffer()
 
