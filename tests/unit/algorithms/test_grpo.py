@@ -5897,7 +5897,7 @@ def test_grpo_train_sync_logs_data_plane_metrics_before_committing_the_step(
 
     payload = calls[dp[0]].args[0]
     assert payload["step/comm_volume_mb"] > 0, "the put moved bytes; the series says 0"
-    for key in ("step/wall_ms", "step/frac_of_step", "step/self/overhead_ms"):
+    for key in ("step/wall_s", "step/frac_of_step", "step/self/overhead_ms"):
         assert key in payload, f"{key} missing from {sorted(payload)}"
 
     assert [

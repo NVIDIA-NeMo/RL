@@ -464,7 +464,7 @@ def _log_data_plane_metrics_impl(
         logger.log_metrics(headline_series(metrics), step, prefix="data_plane/driver")
         _log_breakdown(logger, metrics, step, "data_plane/driver/breakdown")
     print(
-        f"  • data plane: {metrics['step/wall_ms']:.0f}ms, "
+        f"  • data plane: {metrics['step/wall_s']:.2f}s, "
         f"{metrics['step/comm_volume_mb']:.1f} MB moved"
     )
 

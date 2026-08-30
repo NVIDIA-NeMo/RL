@@ -1145,7 +1145,7 @@ class SingleControllerActor:
         if rows:
             self._logger.log_table(columns, rows, step, "data_plane/driver/breakdown")
         print(
-            f"  • data plane: {metrics['step/wall_ms']:.0f}ms, "
+            f"  • data plane: {metrics['step/wall_s']:.2f}s, "
             f"{metrics['step/comm_volume_mb']:.1f} MB moved",
             flush=True,
         )
