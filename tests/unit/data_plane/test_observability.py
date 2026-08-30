@@ -127,10 +127,9 @@ def _hash_fields(n=4):
 def _jagged_ids(lengths, seed=0, with_dense=False):
     """Rows of pseudorandom token ids, optionally beside a uniform ``lp`` field.
 
-    Deliberately not ``arange``: ``hash_tensor`` is an XOR reduction, and
-    aligned runs of consecutive integers collide under it — ``XOR(6..11)``
-    and ``XOR(12..17)`` are both 1 — which would make two visibly different
-    rows fingerprint the same.
+    Pseudorandom rather than ``arange`` so distinct rows stay visibly
+    distinct in a mismatch log line; the digest itself separates consecutive
+    runs fine.
     """
     g = torch.Generator().manual_seed(seed)
     fields = {
@@ -844,7 +843,7 @@ def test_guard_failure_is_absorbed_counted_and_charted(caplog, monkeypatch):
     ids = _ids(4)
 
     def boom(*_args, **_kwargs):
-        raise NotImplementedError("no hash_tensor kernel for this dtype")
+        raise NotImplementedError("no digest kernel for this dtype")
 
     monkeypatch.setattr(client, "_row_fingerprints", boom)
     with caplog.at_level(logging.WARNING):
@@ -939,8 +938,8 @@ def test_hash_fingerprint_covers_jagged_fields():
     digest = client._row_fingerprints(_jagged(rows), ["a", "b", "c"])["x"]
 
     assert client.snapshot()["hash_verify"]["fields_skipped"] == 0
-    assert digest.batch_scoped, "jagged digests only reconcile per batch"
-    assert len(digest.per_row) == 3
+    assert len(digest) == 3
+    assert len(set(digest)) == 3, "each ragged row gets its own digest"
     changed = list(rows)
     changed[1] = changed[1] + 1
     assert client._row_fingerprints(_jagged(changed), ["a", "b", "c"])["x"] != digest
@@ -949,33 +948,71 @@ def test_hash_fingerprint_covers_jagged_fields():
 
 def test_hash_fingerprint_matches_across_jagged_and_dense():
     """``_from_wire`` densifies a jagged field whose rows are uniform, so a
-    jagged put has to reconcile against a dense get. Picking the scheme from the
-    layout in hand rather than from what was recorded made every row of a
-    uniform batch report a mismatch — 940 false alarms over the soak."""
+    jagged put has to reconcile against a dense get. The digest binds in the
+    row *slice*'s shape for exactly this reason: ``v[i]`` of the dense form and
+    ``values[o : o + L]`` of the jagged one are both ``(L,)``, so the two sides
+    agree without either needing to know which layout the other held."""
     client = _client(verify_tensor_hash=True)
     ids = ["a", "b"]
     dense = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64)
 
-    # uniform rows: both sides reduce per row, and a densified read agrees
-    put_side = client._row_fingerprints(_jagged(list(dense.unbind())), ids)["x"]
-    assert not put_side.batch_scoped
-    assert put_side == client._row_fingerprints(
-        TensorDict({"x": dense}, batch_size=[2]), ids
+    assert (
+        client._row_fingerprints(_jagged(list(dense.unbind())), ids)["x"]
+        == client._row_fingerprints(TensorDict({"x": dense}, batch_size=[2]), ids)["x"]
+    )
+    client.close()
+
+
+def test_mixing_the_shape_in_closes_three_of_the_folds_blind_spots():
+    """A bare ``hash_tensor`` fold is blind to a zero pad (``x ^ 0 == x``), to
+    a trailing-dim reshape, and to a dtype change, because none of the three
+    alter the multiset of element words it reduces. Mixing the row's dtype and
+    shape into the fold makes each one a divergence. The values fold is
+    untouched — only the seed it is combined with changes.
+    """
+    client = _client(verify_tensor_hash=True)
+    row = torch.arange(1, 9, dtype=torch.int64)
+    fp = lambda t: client._row_fingerprints(  # noqa: E731
+        TensorDict({"x": t}, batch_size=[1]), ["a"]
     )["x"]
 
-    # ragged rows: batch-scoped, and the read replays that scheme rather than
-    # choosing one from the dense tensor in hand
-    ragged = _jagged([torch.tensor([1, 2, 3]), torch.tensor([4, 5])])
-    assert client._row_fingerprints(ragged, ids)["x"].batch_scoped
-    assert client._row_fingerprints(
-        TensorDict({"x": dense}, batch_size=[2]), ids, batch_scoped_fields={"x"}
-    )["x"].batch_scoped
+    base = fp(row.reshape(1, 8))
+    assert fp(torch.cat([row, torch.zeros(4, dtype=torch.int64)]).reshape(1, 12)) != (
+        base
+    ), "a zero-padded row: same elements, longer row"
+    assert fp(row.reshape(1, 2, 4)) != base, (
+        "the same elements under a different trailing shape"
+    )
+    assert fp(row.reshape(1, 8).to(torch.float64)) != base, (
+        "the same words under a different dtype"
+    )
+    client.close()
+
+
+def test_a_within_row_permutation_is_the_accepted_blind_spot():
+    """``hash_tensor``'s fold is an XOR, so it cannot see its own operands
+    reordered, and no seed fixes that — the seed covers dtype and shape, which
+    a permutation leaves alone. This is the price of reducing on device in one
+    call per leaf, taken deliberately: a sequential hash over the row's bytes
+    catches it but costs ~7x. Pinned so the limit stays a decision rather than
+    a surprise; ``README.md`` records it in the operator-facing table.
+    """
+    client = _client(verify_tensor_hash=True)
+    row = torch.arange(1, 9, dtype=torch.int64)
+    fp = lambda t: client._row_fingerprints(  # noqa: E731
+        TensorDict({"x": t}, batch_size=[1]), ["a"]
+    )["x"]
+
+    assert fp(row.flip(0).reshape(1, 8)) == fp(row.reshape(1, 8)), (
+        "a reordered row is NOT detected -- see the docstring before changing this"
+    )
     client.close()
 
 
 def test_hash_fingerprint_separates_dtype():
-    """The values reduce identically once bitcast, so only the dtype salt makes
-    a precision change visible."""
+    """The two hold different bytes, but a guard that hashed only bytes could
+    still collide across dtypes; binding the dtype into the preimage makes a
+    precision change visible on its own."""
     client = _client(verify_tensor_hash=True)
     ids = ["a", "b"]
     values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
@@ -984,14 +1021,15 @@ def test_hash_fingerprint_separates_dtype():
     as_bf16 = client._row_fingerprints(
         TensorDict({"x": values.to(torch.bfloat16)}, batch_size=[2]), ids
     )
-    assert as_fp32["x"].per_row != as_bf16["x"].per_row
+    assert as_fp32["x"] != as_bf16["x"]
     client.close()
 
 
 def test_hash_fingerprint_handles_float8():
-    """``hash_tensor`` has no float8 kernel. Without the integer bitcast the
-    ``NotImplementedError`` propagates out of ``put_samples`` and takes the
-    transfer down with it."""
+    """float8 has no dedicated hash kernel, and ``.numpy()`` rejects it
+    outright. Viewing the row as raw bytes spans every dtype, so a float8
+    payload is fingerprinted rather than raising out of ``put_samples`` and
+    taking the transfer down with it."""
     client = _client(verify_tensor_hash=True)
     fp8 = TensorDict(
         {"x": torch.tensor([[1.0, 2.0], [3.0, 4.0]]).to(torch.float8_e4m3fn)},
@@ -1019,18 +1057,18 @@ def test_hash_fingerprint_handles_device_tensors():
     on_device = client._row_fingerprints(
         TensorDict({"x": values.cuda()}, batch_size=[2]), ids
     )
-    assert on_device["x"].per_row == on_host["x"].per_row
+    assert on_device["x"] == on_host["x"]
     client.close()
 
 
 # ── hash verification: what counts as a mismatch vs an abstention ──────
 
 
-def test_hash_shard_of_a_ragged_field_is_skipped_not_a_mismatch():
-    """The abstention that *is* legitimate: a batch-scoped digest covers the
-    whole buffer it was reduced over, so a shard of it is genuinely
-    incomparable. That must land in ``fields_skipped`` — visible, but not
-    crying wolf on every sharded fetch."""
+def test_hash_shard_of_a_ragged_field_is_checked_not_abstained_on():
+    """A shard of a ragged put is fully comparable. The digest covers one row
+    and nothing else, so it reconciles against any later grouping of those
+    rows — where a fold over the whole batch's values buffer meant nothing
+    against a slice of it and had to be counted as an abstention."""
     client = _client(verify_tensor_hash=True)
     ids = _ids(4)
     rows = [torch.arange(3 + i, dtype=torch.int64) for i in range(4)]
@@ -1039,23 +1077,26 @@ def test_hash_shard_of_a_ragged_field_is_skipped_not_a_mismatch():
 
     hv = client.snapshot()["hash_verify"]
     assert hv["mismatches"] == 0
-    assert hv["fields_skipped"] == 1
-    assert client.get_step_metrics(1.0)["step/hash/fields_skipped"] == 1
+    assert hv["fields_skipped"] == 0, "a shard is comparable now"
+    assert hv["rows_checked"] == 2, "and both its rows were actually checked"
     client.close()
 
 
-def test_uniform_jagged_rows_are_fingerprinted_per_row():
-    """A jagged field whose rows happen to be uniform is a rectangle already —
-    its values buffer reshapes to one as a view — so it earns per-row
-    attribution for free. The batch-scoped fallback is an XOR over one shared
-    buffer, which cannot see a permutation: two equal-length rows swapped by a
-    mis-shard would round-trip clean."""
+@pytest.mark.parametrize(
+    "lengths", [[6, 6, 6, 6], [6, 6, 4, 9]], ids=["uniform", "ragged"]
+)
+def test_mis_sharded_rows_are_named_individually(lengths):
+    """Two rows swapped between wire-in and wire-out, named per sample.
+
+    A swap *between* rows is visible even though a permutation *within* one is
+    not: each row carries its own digest, so the two land against the wrong
+    sample ids. The old batch-scoped fallback folded every ragged row into one
+    buffer digest and lost that; per-row digests keep it for both layouts.
+    """
     inner = _JaggedEcho()
     client = _client(inner, verify_tensor_hash=True)
     ids = _ids(4)
-    client.put_samples(
-        sample_ids=ids, partition_id="p", fields=_jagged_ids([6, 6, 6, 6])
-    )
+    client.put_samples(sample_ids=ids, partition_id="p", fields=_jagged_ids(lengths))
     a, b = inner.rows[("p", "u1")]["ids"], inner.rows[("p", "u2")]["ids"]
     inner.rows[("p", "u1")]["ids"], inner.rows[("p", "u2")]["ids"] = b, a
     client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
@@ -1066,13 +1107,11 @@ def test_uniform_jagged_rows_are_fingerprinted_per_row():
     client.close()
 
 
-def test_uniform_put_read_back_ragged_checks_row_lengths():
-    """A row that changed length between wire-in and wire-out is a divergence.
-    The content is no longer comparable, so the field counts as an abstention,
-    but the lengths still are — and reporting the whole field as a skip would
-    leave mismatches reading zero, exactly the shape of a guard that covers
-    nothing. Failing the whole field instead reported 3584 mismatches per step
-    on a healthy 5-process run."""
+def test_a_truncated_row_is_a_mismatch():
+    """A row that changed length between wire-in and wire-out is a divergence,
+    and the shape is inside the digest, so it is caught as an ordinary content
+    mismatch. No side-channel length comparison and no abstention: the field
+    stays fully comparable."""
     inner = _JaggedEcho()
     client = _client(inner, verify_tensor_hash=True)
     ids = _ids(4)
@@ -1083,17 +1122,17 @@ def test_uniform_put_read_back_ragged_checks_row_lengths():
     client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
 
     hv = client.snapshot()["hash_verify"]
-    assert hv["mismatches"] > 0, "a truncated row must not read as clean"
-    assert hv["fields_skipped"] == 1, "and the content it could not compare"
+    assert hv["mismatches"] == 1, "the truncated row, named"
+    assert hv["fields_skipped"] == 0, "and the field stayed comparable"
     client.close()
 
 
 def test_uniform_write_read_back_inside_a_ragged_batch_is_clean():
-    """The false positive this cost: a shard written with uniform rows, read
-    back inside a batch whose *other* rows are ragged. Nothing diverged — every
-    recorded row still has the length it was written with — and the guard
-    reported 3584 mismatches per step on a healthy run until it compared lengths
-    instead of failing the field outright."""
+    """The false positive this once cost: a shard written with uniform rows,
+    read back inside a batch whose *other* rows are ragged. Nothing diverged,
+    and because a digest describes only its own row, the mixed batch needs no
+    special handling — the rows this process wrote are compared, the rows it
+    did not are counted unverified."""
     inner = _JaggedEcho()
     client = _client(inner, verify_tensor_hash=True)
     ids = _ids(4)
@@ -1107,19 +1146,21 @@ def test_uniform_write_read_back_inside_a_ragged_batch_is_clean():
     client.get_samples(sample_ids=ids + other, partition_id="p", select_fields=["ids"])
 
     hv = client.snapshot()["hash_verify"]
-    assert hv["mismatches"] == 0, "no row changed length; nothing diverged"
-    assert hv["fields_skipped"] == 1, "content uncomparable, and counted"
+    assert hv["mismatches"] == 0, "no row changed; nothing diverged"
+    assert hv["fields_skipped"] == 0, "and every field stayed comparable"
+    assert hv["rows_checked"] == 4, "the four this process wrote"
+    assert hv["rows_unverified"] == 2, "the two it did not"
     client.close()
 
 
-def test_delta_put_does_not_restate_the_scheme_of_untouched_fields():
-    """``write_columns`` puts one field into a partition written ragged earlier.
-    Holding the jagged/per-row choice per *partition* let that delta hand the
-    read side the wrong scheme for a field it never touched, and every row of
-    that field came back a false alarm.
+def test_delta_put_leaves_untouched_fields_fingerprinted():
+    """``write_columns`` puts one field into a partition written ragged
+    earlier. A delta must not disturb the fingerprints of a field it never
+    named — holding any of this state per *partition* rather than per field
+    turned every row of the untouched field into a false alarm.
 
-    The second field is the whole point: with only one, a per-partition and a
-    per-field scheme are indistinguishable, because the only put there is
+    The second field is the whole point: with only one, per-partition and
+    per-field bookkeeping are indistinguishable, because the only put there is
     restates its own field either way.
     """
     inner = _JaggedEcho()
@@ -1133,8 +1174,8 @@ def test_delta_put_does_not_restate_the_scheme_of_untouched_fields():
     client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
     assert client.snapshot()["hash_verify"]["mismatches"] == 0, "baseline"
 
-    # the delta names only ``lp``; ``ids`` must keep the ragged scheme it was
-    # written with, or its next read replays the uniform one and cries wolf
+    # the delta names only ``lp``; ``ids`` must keep the fingerprints it was
+    # written with, or its next read cries wolf on every row
     client.put_samples(
         sample_ids=ids,
         partition_id="p",
@@ -1143,7 +1184,7 @@ def test_delta_put_does_not_restate_the_scheme_of_untouched_fields():
     client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
 
     hv = client.snapshot()["hash_verify"]
-    assert hv["mismatches"] == 0, "a delta put must not restate ids's scheme"
+    assert hv["mismatches"] == 0, "a delta put must not disturb ids"
     assert hv["fields_skipped"] == 0, "and the read stays comparable"
     client.close()
 

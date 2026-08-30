@@ -27,12 +27,13 @@ bytes currently held in TQ, i.e. put minus cleared) and
 Every method here runs on the hot path of a transfer, so nothing traverses
 a structure twice and nothing is allocated for a payload no callback reads.
 
-``verify_tensor_hash=True`` adds an opt-in correctness check:
-``torch.hash_tensor`` fingerprints recorded at put and re-checked at get,
-so a tensor that changes between wire-in and wire-out is reported rather
-than trained on. It reads every tensor byte again on both sides, so it is a
-debugging tool, not a metric. See ``README.md`` for what it does and does
-not catch.
+``verify_tensor_hash=True`` adds an opt-in correctness check: a per-row
+``torch.hash_tensor`` fold over each row's values, mixed with its dtype
+and shape, recorded at
+put and re-checked at get, so a tensor that changes between wire-in and
+wire-out is reported rather than trained on. It reads every tensor byte
+again on both sides, so it is a debugging tool, not a metric. See
+``README.md`` for what it does and does not catch.
 """
 
 from __future__ import annotations
@@ -43,7 +44,8 @@ from bisect import bisect_left
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from time import monotonic
-from typing import Any, Callable, Collection, Literal, NamedTuple, TypedDict
+from collections.abc import Sequence
+from typing import Any, Callable, Literal, TypedDict
 
 EventStatus = Literal["ok", "error", "timeout"]
 
@@ -111,50 +113,76 @@ _MAX_HASH_MISMATCH_LOGS = 20
 _QUANTILES = ((0.50, "p50_ms", 20), (0.90, "p90_ms", 40))
 
 
-class _WriteScheme(NamedTuple):
-    """How a field was reduced when it was written, so a read can replay it.
-
-    A positional ``("scoped", n)`` / ``("rows", width)`` tuple carried two
-    different quantities in one slot, discriminated by a magic string, under
-    an annotation that said ``int``. Naming both makes each read site say
-    which one it means.
-    """
-
-    batch_scoped: bool
-    n_rows: int
-    row_width: int
-
-
-class _FieldDigest(NamedTuple):
-    """One fingerprint per row, plus how far it can be trusted.
-
-    ``batch_scoped`` means the values were derived from the whole batch's
-    buffer, so they only reconcile against a read of that same batch. A
-    shard of it computes a different buffer digest and must be reported
-    unverified rather than as a mismatch.
-
-    ``row_lens`` is how long each row was, which is the one thing still
-    comparable when the read cannot reproduce the write's scheme.
-    """
-
-    per_row: list[int]
-    batch_scoped: bool
-    row_lens: tuple[int, ...]
-
-
-# Same-width signed integer for each tensor element size, used to bitcast a
-# leaf before hashing.
+# Same-width integer for each element size, to bitcast a leaf before folding
+# it. ``weight_transfer_sparse_codec.integer_dtype_for_element_size`` is the
+# same map, but importing it drags in the vLLM generation stack
+# (weight_transfer_sparse_codec -> models.generation.vllm -> telemetry ->
+# nemo.lens), which the data plane must not depend on. Four entries is the
+# cheaper duplicate.
 _INT_VIEW_BY_WIDTH = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
 
 
-def _as_int_view(t: torch.Tensor) -> torch.Tensor:
-    """Bitcast to a same-width integer type, or pass through.
+def _leaf_digests(
+    leaf: torch.Tensor,
+    bounds: Sequence[int],
+    row_shape: Callable[[int], tuple[int, ...]],
+    dtype: torch.dtype,
+) -> list[int]:
+    """One digest per row: ``hash_tensor``'s fold, with the row shape mixed in.
 
-    ``hash_tensor`` has no float8 kernel and raises there; viewing the bytes
-    as integers sidesteps every dtype-specific kernel for free.
+    ``torch.hash_tensor`` only implements an XOR fold (``mode=0``), which is
+    blind to a zero pad, a trailing-dim reshape and a dtype change, because
+    none of those alter the multiset of element words. Mixing the row's shape
+    and dtype into the fold closes all three. It remains blind to a
+    permutation *within* a row, which is the price of the fold being
+    vectorized; ``README.md`` records that.
+
+    The fold being an XOR is also what lets one algorithm serve both layouts.
+    XOR is associative and elementwise, so ``hash_tensor(row)`` equals
+    ``hash_tensor(rect, dim=1)[i]`` -- a rectangle reduces in one on-device
+    call, a ragged leaf falls back to one call per row, and the two agree
+    value-for-value. A field packed jagged and read back densified therefore
+    reconciles without either side recording how the other reduced it.
+
+    ``bounds`` are leading-dim offsets, ``n_rows + 1`` of them: row *i* spans
+    ``leaf[bounds[i] : bounds[i + 1]]``. ``row_shape`` maps a row's length to
+    the shape recorded for it, which is what keeps the jagged and dense views
+    of one field agreeing: both must call a row ``(L, D)``.
+
+    Args:
+        leaf: The whole leaf -- a dense tensor, or a jagged one's values.
+        bounds: Leading-dim offsets delimiting each row.
+        row_shape: Row length -> the shape to record for that row.
+        dtype: Mixed in so a precision change diverges at equal byte width.
+
+    Returns:
+        One digest per row.
     """
-    int_dtype = _INT_VIEW_BY_WIDTH.get(t.element_size())
-    return t.view(int_dtype) if int_dtype is not None else t
+    # Bitcast so every dtype reduces: hash_tensor ships no float8 kernel.
+    # detach() because a grad-carrying leaf must not be viewed under autograd.
+    view = leaf.detach()
+    view = view.view(_INT_VIEW_BY_WIDTH[view.element_size()])
+    lengths = [hi - lo for lo, hi in zip(bounds, bounds[1:])]
+    if lengths and lengths.count(lengths[0]) == len(lengths):
+        folds = torch.hash_tensor(view.reshape(len(lengths), -1), dim=1).tolist()
+    else:
+        # Ragged rows have no rectangle to reduce over, so each row folds on
+        # its own. Same values as the vectorized path, just one call apiece.
+        folds = [
+            torch.hash_tensor(view[lo:hi].reshape(1, -1), dim=1)[0].item()
+            for lo, hi in zip(bounds, bounds[1:])
+        ]
+    # Salted on the host: torch has no UInt64 bitwise_xor CUDA kernel, so
+    # XOR-ing the digest tensor raises for any backend whose get returns
+    # device tensors. The digests come to the host for comparison regardless.
+    seeds: dict[int, int] = {}
+    digests = []
+    for fold, length in zip(folds, lengths):
+        seed = seeds.get(length)
+        if seed is None:
+            seed = seeds[length] = zlib.crc32(f"{dtype}|{row_shape(length)}".encode())
+        digests.append(fold ^ seed)
+    return digests
 
 
 def _as_list(sample_ids: Any) -> Any:
@@ -211,16 +239,6 @@ def _tensor_bytes(v: torch.Tensor) -> int:
     if offsets is not None and buf.shape[0] != int(offsets[-1]):
         return v.nbytes
     return buf.nbytes
-
-
-def _dtype_salt(dtype: torch.dtype) -> int:
-    """Salt distinguishing dtypes whose values reduce to the same words.
-
-    ``crc32``, not the builtin ``hash()``: ``hash()`` of a ``str`` is salted
-    per process, so the fingerprint would not survive being compared across
-    ranks.
-    """
-    return zlib.crc32(str(dtype).encode())
 
 
 def percentile_from_hist(hist: list[int], q: float) -> float:
@@ -417,17 +435,6 @@ def _step_deltas(snap: dict[str, Any], prev: dict[str, Any]) -> dict[str, float]
         "step/codec/pack_s": _delta_s("pack_ms"),
         "step/codec/unpack_s": _delta_s("unpack_ms"),
     }
-
-
-def _row_len(digest: _FieldDigest, row: int) -> int:
-    """How long ``row`` was, whichever scheme the digest used.
-
-    A per-row digest stores the one width its uniform rows shared; a
-    batch-scoped one stores every row's length.
-    """
-    if not digest.row_lens:
-        return -1
-    return digest.row_lens[row] if digest.batch_scoped else digest.row_lens[0]
 
 
 def _op_step_stats(
@@ -1036,10 +1043,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
             on_event: Per-op callback. ``None`` (the default) skips
                 building the event dict entirely — with metrics enabled but
                 no sink, nothing is paid for a payload nobody reads.
-            verify_tensor_hash: Record a per-row ``torch.hash_tensor``
-                fingerprint on put and re-check it on get. Debug aid, not a
-                metric: it reads every tensor byte again (~2.4 ms for a
-                12 MB jagged batch), so it is off unless the config asks.
+            verify_tensor_hash: Record a per-row fingerprint
+                on put and re-check it on get. Debug aid, not a metric: it
+                reads every tensor element again on both sides (~8 ms
+                for a 107 MB batch of 1536 rows), so it is off unless the
+                config asks.
         """
         self._inner = inner
         self._on_event = on_event
@@ -1054,12 +1062,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # lifetime as ``_bytes_by_partition``: cleared by ``clear_samples``,
         # so it is bounded by the live key population.
         self._hash_by_partition: dict[str, dict[str, dict[str, int]]] = {}
-        # partition -> (batch-scoped field names, row count at put). Those
-        # digests cover a whole buffer, so they only reconcile against a read
-        # of that same batch; the row count is what detects a shard read.
-        # partition -> field -> rows the field's digest was reduced over,
-        # for batch-scoped fields only. An absent field was reduced per row.
-        self._batch_scope: dict[str, dict[str, _WriteScheme]] = {}
         self._hash_mismatches_logged = 0
         # Set by ``_emit`` to the inner client's wall time for the op just
         # run, so the wrapping methods can subtract it and bill the rest to
@@ -1198,8 +1200,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
         """
         if self._verify_tensor_hash:
             _pop_partition_keys(self._hash_by_partition, partition_id, keys)
-            if keys is None:
-                self._batch_scope.pop(partition_id, None)
         live = self._keys_by_partition.get(partition_id)
         if live is None:
             return
@@ -1240,95 +1240,66 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self,
         td: TensorDict | None,
         sample_ids: list[str],
-        batch_scoped_fields: Collection[str] = (),
-    ) -> dict[str, _FieldDigest]:
-        """``torch.hash_tensor`` fingerprints for each tensor leaf.
+    ) -> dict[str, list[int]]:
+        """A per-row digest of each tensor leaf, covering bytes, dtype and shape.
 
-        A rectangular leaf reduces per row (``dim=1``), which names the
-        sample that diverged. A jagged leaf whose rows happen to be uniform
-        is rectangular already — its values buffer reshapes to the rectangle
-        as a view — so it takes the same path for free. Only a genuinely
-        ragged leaf falls back to one digest over its whole values buffer,
-        XORed per row with that row's length, and marked ``batch_scoped``;
-        padding it out to a rectangle costs far more than the answer is
-        worth. That fallback inherits the blind spot of an XOR reduction: it
-        sees any change to the multiset of values, but not a permutation of
-        them. ``README.md`` has the detection/attribution table.
+        Every leaf is fingerprinted one row at a time, so every divergence
+        names the sample that diverged -- a genuinely ragged leaf included.
+        See ``README.md`` for why the digest this replaced could not.
+
+        Both layouts reduce to the same shape of work: hand
+        :func:`_leaf_digests` the leaf, the offsets delimiting its rows, and
+        how to describe a row's shape. It picks between one vectorized fold
+        and a fold per row.
 
         Args:
             td: Leaves to fingerprint; ``None`` yields an empty result.
             sample_ids: Row *i* is attributed to ``sample_ids[i]``, the
                 ordering :meth:`DataPlaneClient.get_samples` promises.
-            batch_scoped_fields: Fields the *put* side reduced batch-scoped.
-                The scheme must follow the field, not the layout in hand: a
-                field packed jagged comes back dense whenever its rows are
-                uniform (``_from_wire`` densifies those), and choosing per
-                layout makes the two sides compute different things. The
-                values buffer of a uniform jagged field and the flattened
-                dense tensor it densifies into hold the same elements in the
-                same order, so replaying the recorded scheme agrees by
-                construction.
 
         Returns:
-            Field name -> :class:`_FieldDigest`. Leaves that cannot be
-            attributed per row (a leading dim that isn't ``len(sample_ids)``,
-            or a non-``jagged`` nested layout) are counted in
-            ``fields_skipped`` rather than silently dropped.
+            Field name -> one digest per row. A leaf that cannot be attributed
+            per row is counted in ``fields_skipped`` rather than silently
+            dropped: a non-``jagged`` nested layout, a leading dim that is not
+            ``len(sample_ids)``, or a leaf with no leading dim at all.
         """
         if td is None:
             return {}
         n_rows = len(sample_ids)
         stats = self._stats.hash_verify
-        out: dict[str, _FieldDigest] = {}
+        out: dict[str, list[int]] = {}
         for key, v in td.items(include_nested=True, leaves_only=True):
             if not isinstance(v, torch.Tensor) or v.ndim < 1:
                 stats.fields_skipped += 1
                 continue
-            salt = _dtype_salt(v.dtype)
-            name = key if isinstance(key, str) else ".".join(key)
             if v.is_nested:
-                if v.layout != torch.jagged:
+                if v.layout != torch.jagged or v.offsets().numel() - 1 != n_rows:
                     stats.fields_skipped += 1
                     continue
-                offsets = v.offsets()
-                if offsets.numel() - 1 != n_rows:
-                    stats.fields_skipped += 1
-                    continue
-                lengths = (offsets[1:] - offsets[:-1]).tolist()
-                # Uniform rows: the values buffer already *is* the rectangle,
-                # so reshaping it is a view and the per-row reduction is free.
-                uniform = lengths.count(lengths[0]) == n_rows
-                rectangle = v.values() if uniform else None
+                bounds = v.offsets().tolist()
+                leaf = v.values()
+                # A jagged row is its own length followed by the values
+                # buffer's trailing dims.
+                tail = tuple(leaf.shape[1:])
+                row_shape = lambda length, tail=tail: (length, *tail)
             elif v.shape[0] != n_rows:
                 stats.fields_skipped += 1
                 continue
             else:
-                lengths = [v.shape[1] if v.ndim >= 2 else 1] * n_rows
-                rectangle = v
-            if rectangle is not None and name not in batch_scoped_fields:
-                flat = _as_int_view(rectangle.reshape(n_rows, -1))
-                out[name] = _FieldDigest(
-                    # Salt on the host, as the batch-scoped path below already
-                    # does. Torch has no ``bitwise_xor`` CUDA kernel for
-                    # UInt64, so XOR-ing the digest tensor in place raises
-                    # ``NotImplementedError`` for any backend whose get returns
-                    # device tensors. The digests come back to the host for
-                    # comparison either way, so this costs nothing.
-                    [d ^ salt for d in torch.hash_tensor(flat, dim=1).tolist()],
-                    batch_scoped=False,
-                    # One width, not n_rows copies of it: the rows are
-                    # uniform by construction on this path.
-                    row_lens=(flat.shape[1],),
-                )
-                continue
-            buffer = v.values() if v.is_nested else v
-            flat_buffer = _as_int_view(buffer.reshape(1, -1))
-            buffer_digest = torch.hash_tensor(flat_buffer, dim=1).tolist()[0] ^ salt
-            out[name] = _FieldDigest(
-                [buffer_digest ^ length for length in lengths],
-                batch_scoped=True,
-                row_lens=tuple(lengths),
-            )
+                # Dense rows are equal-length by construction, so the same
+                # bounds describe them: element i starts at i.
+                bounds = range(n_rows + 1)
+                leaf = v
+                # ...and every dense row has the leaf's trailing shape, which
+                # is the *same* tuple the jagged form reports for it. That
+                # equality is what lets a jagged put reconcile against a
+                # densified get; recording the bounds-derived length here
+                # instead would make ``(N, L, D)`` say ``(1, L, D)`` and every
+                # round trip a mismatch.
+                shape = tuple(v.shape[1:])
+                row_shape = lambda _length, shape=shape: shape
+            name = key if isinstance(key, str) else ".".join(key)
+            out[name] = _leaf_digests(leaf, bounds, row_shape, v.dtype)
         return out
 
     def _hash_guard_failed(self, op: str, exc: Exception) -> None:
@@ -1372,22 +1343,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
         partition_hashes = self._hash_by_partition.setdefault(partition_id, {})
         for row, sample_id in enumerate(sample_ids):
             per_field = partition_hashes.setdefault(sample_id, {})
-            for name, digest in digests.items():
-                per_field[name] = digest.per_row[row]
-        # Per field, not per partition: a delta put (write_columns) names only
-        # the fields it writes, and must not restate the scheme of the ones it
-        # left alone. Recording the batch it was reduced over lets the read
-        # side tell a shard of a batch-scoped field from a relayout.
-        scheme = self._batch_scope.setdefault(partition_id, {})
-        for name, digest in digests.items():
-            # Width matters only for the per-row scheme -- uniform rows mean
-            # one number describes them all, and lets a later ragged read
-            # still check whether any row changed length.
-            scheme[name] = _WriteScheme(
-                batch_scoped=digest.batch_scoped,
-                n_rows=len(sample_ids),
-                row_width=digest.row_lens[0] if digest.row_lens else 0,
-            )
+            for name, per_row in digests.items():
+                per_field[name] = per_row[row]
         self._stats.hash_verify.rows_recorded += len(sample_ids)
 
     def _check_hashes(self, partition_id: str, sample_ids: list[str], out: Any) -> None:
@@ -1400,50 +1357,22 @@ class MetricsDataPlaneClient(DataPlaneClient):
     def _check_hashes_impl(
         self, partition_id: str, sample_ids: list[str], out: Any
     ) -> None:
-        """Compare wire-out fingerprints against what was written."""
+        """Compare wire-out fingerprints against what was written.
+
+        Every field is comparable now. The old two-tier classification --
+        which fields could be compared, which were a shard of a batch-scoped
+        put, which had been written uniform and read back ragged -- existed
+        entirely to work around a digest that only meant something against
+        the exact batch it was folded over. A per-row hash reconciles against
+        any grouping, so a shard read is checked rather than abstained on.
+        """
         if not isinstance(out, TensorDict):
             return
-        scheme = self._batch_scope.get(partition_id, {})
-        # Only the batch-scoped names: the scheme also records per-row fields
-        # now, and handing the whole mapping over forced every field onto the
-        # scoped path.
-        scoped_names = {n for n, how in scheme.items() if how.batch_scoped}
-        digests = self._row_fingerprints(out, sample_ids, scoped_names)
+        digests = self._row_fingerprints(out, sample_ids)
         if not digests:
             return
         partition_hashes = self._hash_by_partition.get(partition_id, {})
         stats = self._stats.hash_verify
-        # A batch-scoped digest covers the whole buffer it was reduced from,
-        # so it only means anything against a read of that same batch. Drop
-        # those fields on a shard read rather than reporting every row of it
-        # as a mismatch — but *count* the drop. Dropping silently is the
-        # exact shape of the bug that made this check pass while covering
-        # nothing: a field stops being compared and the report still reads
-        # clean.
-        comparable: dict[str, _FieldDigest] = {}
-        length_only: dict[str, tuple[_FieldDigest, int]] = {}
-        for name, digest in digests.items():
-            recorded = scheme.get(name)
-            if not digest.batch_scoped:
-                comparable[name] = digest
-            elif recorded is None:
-                continue  # this process never wrote the field
-            elif recorded.batch_scoped:
-                if recorded.n_rows == len(sample_ids):
-                    comparable[name] = digest
-                else:
-                    stats.fields_skipped += 1  # a shard of a batch-scoped put
-            else:
-                # Written with uniform rows, read back ragged. Treating that
-                # as a divergence reported 3584 mismatches per step on a
-                # healthy run: it is the normal shape of a real pipeline,
-                # where a shard is written uniform and read back inside a
-                # batch whose other rows differ in length. The row lengths
-                # are still comparable, and a row that changed length *is* a
-                # divergence, so check that much and count the rest as the
-                # abstention it is.
-                length_only[name] = (digest, recorded.row_width)
-                stats.fields_skipped += 1
         for row, sample_id in enumerate(sample_ids):
             per_field = partition_hashes.get(sample_id)
             if not per_field:
@@ -1452,46 +1381,26 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 stats.rows_unverified += 1
                 continue
             stats.rows_checked += 1
-            for name, (digest, width) in length_only.items():
-                read_len = _row_len(digest, row)
-                if per_field.get(name) is None or read_len == width:
-                    continue
-                stats.mismatches += 1
-                if self._hash_mismatches_logged < _MAX_HASH_MISMATCH_LOGS:
-                    self._hash_mismatches_logged += 1
-                    logger.error(
-                        "data-plane hash mismatch: partition=%s sample=%s "
-                        "field=%s row was %d long on the wire in, %d out",
-                        partition_id,
-                        sample_id,
-                        name,
-                        width,
-                        read_len,
-                    )
-            for name, digest in comparable.items():
+            for name, per_row in digests.items():
                 expected = per_field.get(name)
-                if expected is None or expected == digest.per_row[row]:
+                if expected is None or expected == per_row[row]:
                     continue
                 stats.mismatches += 1
                 if self._hash_mismatches_logged < _MAX_HASH_MISMATCH_LOGS:
                     self._hash_mismatches_logged += 1
-                    # Scheme and shape on the line: the last two false alarms
-                    # were both bookkeeping (a scheme replayed wrong, a
-                    # grouping that could not be compared), and neither was
+                    # Row index on the line: both false alarms this check ever
+                    # produced were its own bookkeeping, and neither was
                     # diagnosable from the digests alone.
                     logger.error(
                         "data-plane hash mismatch: partition=%s sample=%s "
-                        "field=%s wire_in=%d wire_out=%d "
-                        "(%s scheme, row %d of %d, %d long)",
+                        "field=%s wire_in=%d wire_out=%d (row %d of %d)",
                         partition_id,
                         sample_id,
                         name,
                         expected,
-                        digest.per_row[row],
-                        "batch-scoped" if digest.batch_scoped else "per-row",
+                        per_row[row],
                         row,
                         len(sample_ids),
-                        _row_len(digest, row),
                     )
 
     def _run(
