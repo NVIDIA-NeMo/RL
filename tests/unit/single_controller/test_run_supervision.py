@@ -36,9 +36,14 @@ def _bare_actor():
     ctrl._gen_fleet = None  # no fleet -> run() creates no probe task
     ctrl._train_steps = 0
     ctrl._trainer_version = 0
-    ctrl._weight_synchronizer = SimpleNamespace(shutdown=lambda: None)
+    ctrl._master_config = SimpleNamespace(
+        rollout_checkpointing=SimpleNamespace(snapshot_attempt_interval_s=None)
+    )
+    ctrl._rollout_checkpoint_stop_requested = asyncio.Event()
+    ctrl._weight_synchronizer = SimpleNamespace(is_stale=False, shutdown=lambda: None)
     ctrl._logger = SimpleNamespace(finish=lambda: None)
     ctrl._checkpointer = SimpleNamespace(shutdown=lambda: None)
+    ctrl._finalizer_actors = []
     # run() stamps the rollout manager with the starting weight version before
     # it launches any pump.
     ctrl._rollout_manager = SimpleNamespace(set_weight_version=lambda _v: None)
@@ -48,6 +53,11 @@ def _bare_actor():
 
     ctrl._sync_weights = _noop
     ctrl._maybe_restore_replay_buffer = _noop
+
+    async def _noop_restore_recovery(*, restored_replay_groups):
+        return None
+
+    ctrl._maybe_restore_rollout_recovery = _noop_restore_recovery
     ctrl._maybe_restore_replacement_reserve = _noop
     return ctrl
 
@@ -150,4 +160,41 @@ def test_the_fleet_probe_still_aborts_after_the_rollout_pump_exhausts():
     ctrl._gen_fleet_probe_pump = _fails_after(0.02)
 
     with pytest.raises(_Boom):
+        asyncio.run(asyncio.wait_for(ctrl.run(), timeout=5.0))
+
+
+def test_rollout_checkpoint_stop_finishes_without_waiting_for_train_drain():
+    """The new supervision loop must preserve main's orderly pre-step stop."""
+    ctrl = _bare_actor()
+    ctrl._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 1.0
+    ctrl._rollout_pump = _wedged
+    ctrl._train_pump = _wedged
+    ctrl._stall_watchdog_pump = _wedged
+
+    async def _checkpoint_stop():
+        await asyncio.sleep(0)
+        ctrl._rollout_checkpoint_stop_requested.set()
+
+    ctrl._rollout_checkpoint_pump = _checkpoint_stop
+
+    result = asyncio.run(asyncio.wait_for(ctrl.run(), timeout=5.0))
+
+    assert result == {"train_steps": 0, "trainer_version": 0}
+
+
+def test_rollout_checkpoint_exit_without_stop_request_is_an_error():
+    ctrl = _bare_actor()
+    ctrl._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 1.0
+    ctrl._rollout_pump = _wedged
+    ctrl._train_pump = _wedged
+    ctrl._stall_watchdog_pump = _wedged
+
+    async def _unexpected_checkpoint_exit():
+        await asyncio.sleep(0)
+
+    ctrl._rollout_checkpoint_pump = _unexpected_checkpoint_exit
+
+    with pytest.raises(
+        RuntimeError, match="rollout checkpoint pump exited without requesting stop"
+    ):
         asyncio.run(asyncio.wait_for(ctrl.run(), timeout=5.0))
