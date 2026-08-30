@@ -247,6 +247,7 @@ class TQWorkerMixin:
                     layout=layout,
                     pad_value_dict=pad_value_dict,
                     pad_to_seqlen=pad_to_seqlen,
+                    tags=meta.tags,
                 )
             else:
                 data = None
@@ -278,6 +279,7 @@ class TQWorkerMixin:
             layout=layout,
             pad_value_dict=pad_value_dict,
             pad_to_seqlen=pad_to_seqlen,
+            tags=meta.tags,
         )
         attach_message_log_view(data)
         trace_tq_fetch_payload(

@@ -45,6 +45,7 @@ import torch
 
 from nemo_rl.data.multimodal_utils import (
     encode_multimodal_for_wire,
+    multimodal_row_tags,
 )
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
@@ -326,9 +327,10 @@ class SyncRolloutActor:
         # re-applies it, so without this the largest column crosses the wire in
         # fp32 where legacy shipped bf16. ``PackedTensor.to_dtype`` leaves
         # integer segments (grid_thw / imgs_sizes / num_frames) untouched.
-        for k, v in flat.get_multimodal_dict(
+        multimodal = flat.get_multimodal_dict(
             as_tensors=False, pixel_dtype=_policy_dtype(cfg.policy)
-        ).items():
+        )
+        for k, v in multimodal.items():
             for wk, wv in encode_multimodal_for_wire(k, v):
                 bulk_batch[wk] = wv
         # ``content`` (raw assistant text per sample) — rides TQ as a
@@ -417,6 +419,10 @@ class SyncRolloutActor:
             dp_client=self._dp_client,
             partition_id=partition_id,
             extra_info={"rollout_metrics": rollout_metrics},
+            # Per-row shapes the flattening removes from the payload. ``tags``
+            # is the transport's per-sample channel and is projected with the
+            # rows, so no consumer re-keys them.
+            tags=multimodal_row_tags(multimodal, len(sample_ids)),
             task_name=partition_id,
             pad_to_multiple=int(
                 cfg.policy.get("make_sequence_length_divisible_by") or 1

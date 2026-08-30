@@ -141,6 +141,97 @@ PACKED_MULTIMODAL_FIELDS = frozenset(
 )
 
 
+def _combine_global_pad_shapes(
+    values: "list[Optional[list[int]]]",
+) -> Optional[list[int]]:
+    """Elementwise max of several batch-wide pad shapes; ``None`` if any is unset.
+
+    Multi-input constructors (:meth:`PackedTensor.concat`,
+    :meth:`merge_segments`, :meth:`flattened_concat`) join values that may come
+    from different batches, so the combined value must cover all of them. A
+    ``None`` input means that side never carried a target, and silently
+    adopting the other side's would pad it to dims it never agreed to -- so the
+    result degrades to ``None`` and ``as_tensor`` recomputes locally.
+    """
+    if not values or any(v is None for v in values):
+        return None
+    ranks = {len(v) for v in values if v is not None}
+    if len(ranks) != 1:
+        return None
+    return [max(v[d] for v in values if v is not None) for d in range(ranks.pop())]
+
+
+# Companion column carrying what ``to_wire``'s flattening removes from the
+# payload. It rides as a plain per-row object array -- the same opaque column
+# mechanism ``content`` uses -- so the data plane transports and slices it
+# without knowing what a pad shape is. Reassembly lives here, in the layer that
+# owns ``PackedTensor``.
+ROW_SHAPES_SUFFIX = "__row_shapes"
+
+
+def row_shapes_key(field: str) -> str:
+    """Companion column name carrying per-row shapes for ``field``."""
+    return field + ROW_SHAPES_SUFFIX
+
+
+def multimodal_row_tags(multimodal: dict, sample_count: int) -> "list[dict[str, Any]]":
+    """Per-sample tag rows carrying what ``to_wire``'s flattening removes.
+
+    ``KVBatchMeta.tags`` is the transport's channel for per-sample primitives:
+    it is aligned 1:1 with ``sample_ids`` and projected automatically by
+    ``subset``/``slice``/``concat``, so a worker holding a shard gets its own
+    rows without anyone re-keying them. The data plane never interprets the
+    contents.
+
+    ``pad``/``max`` are batch-wide and repeated on every row -- a few ints
+    against the megabytes of pixels they keep unpadded.
+    """
+    tags: list[dict[str, Any]] = [{} for _ in range(sample_count)]
+    for key, value in multimodal.items():
+        if key not in PACKED_MULTIMODAL_FIELDS or not isinstance(value, PackedTensor):
+            continue
+        nested, shapes = value.to_wire()
+        if nested is None:
+            continue
+        pad, batch_max = value.pad_to_max_shape, value.global_pad_shape()
+        for row, row_shapes in enumerate(shapes):
+            tags[row][row_shapes_key(key)] = {
+                "shapes": row_shapes,
+                "pad": pad,
+                "max": batch_max,
+            }
+    return tags
+
+
+def reassemble_packed_multimodal(
+    fields: dict, tags: "Optional[list[dict[str, Any]]]" = None
+) -> None:
+    """In place: rebuild ``PackedTensor`` for packed fields, consuming companions.
+
+    Called by the read path once its columns are materialized. Leaves anything
+    that is not a wire-form packed field untouched, so it is safe to call on any
+    column dict.
+    """
+    for key in list(fields):
+        if key not in PACKED_MULTIMODAL_FIELDS:
+            continue
+        value = fields[key]
+        if not (isinstance(value, torch.Tensor) and value.is_nested):
+            continue
+        rows = [t.get(row_shapes_key(key)) for t in tags] if tags is not None else None
+        present = [r for r in rows if r] if rows else []
+        rebuilt = PackedTensor.from_wire(
+            value,
+            [(r or {}).get("shapes", []) for r in rows] if rows else None,
+            pad_to_max_shape=bool(present[0].get("pad", False)) if present else False,
+            max_shape=present[0].get("max") if present else None,
+        )
+        if rebuilt is None:
+            del fields[key]
+        else:
+            fields[key] = rebuilt
+
+
 class PackedTensor:
     """A logical batch of rows backed by packable tensor segments.
 
@@ -188,6 +279,7 @@ class PackedTensor:
         _row_offsets: Optional[list[int]] = None,
         _segment_indices: Optional[list[int]] = None,
         _segment_provenance: Optional[list[bytes]] = None,
+        _global_pad_shape: Optional[list[int]] = None,
     ) -> None:
         """Wrap per-item tensors for concatenation along ``dim_to_pack``.
 
@@ -246,6 +338,7 @@ class PackedTensor:
         self._row_offsets = _row_offsets
         self._segment_indices = _segment_indices
         self._segment_provenance = _segment_provenance
+        self._global_pad_shape = _global_pad_shape
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         """Restore both current and pre-deduplication pickled instances."""
@@ -290,6 +383,12 @@ class PackedTensor:
             ]
         return self
 
+    # Batch-wide trailing dims for ``pad_to_max_shape``, minted on the writer
+    # and carried across the wire. ``as_tensor`` pads to this instead of a max
+    # over the rows it happens to hold: a per-shard max would let DP ranks
+    # encode the same media at different widths.
+    _global_pad_shape: Optional[list[int]] = None
+
     def _row_segment_indices(self, row: int) -> list[int]:
         if self._row_offsets is None:
             return [row]
@@ -305,6 +404,7 @@ class PackedTensor:
                 [deepcopy(item, memo) for item in self.tensors],
                 self.dim_to_pack,
                 pad_to_max_shape=self.pad_to_max_shape,
+                _global_pad_shape=self._global_pad_shape,
             )
         else:
             copied = PackedTensor(
@@ -315,6 +415,7 @@ class PackedTensor:
                 ),
                 self.dim_to_pack,
                 pad_to_max_shape=self.pad_to_max_shape,
+                _global_pad_shape=self._global_pad_shape,
                 _row_offsets=(
                     list(self._row_offsets) if self._row_offsets is not None else None
                 ),
@@ -368,10 +469,14 @@ class PackedTensor:
                 raise IndexError(
                     f"dim_to_pack={self.dim_to_pack} is invalid for tensors with rank {rank}"
                 )
-            max_shape = [
-                max(tensor.shape[dim] for tensor in non_none_tensors)
-                for dim in range(rank)
-            ]
+            max_shape = (
+                self._global_pad_shape
+                or self.global_pad_shape()
+                or [
+                    max(tensor.shape[dim] for tensor in non_none_tensors)
+                    for dim in range(rank)
+                ]
+            )
 
             def pad_to_batch_shape(tensor: torch.Tensor) -> torch.Tensor:
                 padding = []
@@ -451,6 +556,7 @@ class PackedTensor:
             ),
             self.dim_to_pack,
             pad_to_max_shape=self.pad_to_max_shape,
+            _global_pad_shape=self._global_pad_shape,
             _row_offsets=(
                 list(self._row_offsets) if self._row_offsets is not None else None
             ),
@@ -478,6 +584,7 @@ class PackedTensor:
                 tensors,
                 self.dim_to_pack,
                 pad_to_max_shape=self.pad_to_max_shape,
+                _global_pad_shape=self._global_pad_shape,
             )
 
         physical_remap: dict[int, int] = {}
@@ -502,6 +609,7 @@ class PackedTensor:
             tensors,
             self.dim_to_pack,
             pad_to_max_shape=self.pad_to_max_shape,
+            _global_pad_shape=self._global_pad_shape,
             _row_offsets=row_offsets,
             _segment_indices=segment_indices,
             _segment_provenance=(
@@ -524,6 +632,7 @@ class PackedTensor:
                 [],
                 other.dim_to_pack,
                 pad_to_max_shape=other.pad_to_max_shape,
+                _global_pad_shape=other._global_pad_shape,
                 _row_offsets=[0] * (num_rows + 1),
                 _segment_indices=[],
                 _segment_provenance=[],
@@ -533,6 +642,7 @@ class PackedTensor:
                 [],
                 other.dim_to_pack,
                 pad_to_max_shape=other.pad_to_max_shape,
+                _global_pad_shape=other._global_pad_shape,
                 _row_offsets=[0],
                 _segment_indices=[],
                 _segment_provenance=None,
@@ -541,6 +651,7 @@ class PackedTensor:
             [None] * num_rows,
             other.dim_to_pack,
             pad_to_max_shape=other.pad_to_max_shape,
+            _global_pad_shape=other._global_pad_shape,
         )
 
     @classmethod
@@ -614,6 +725,9 @@ class PackedTensor:
                 tensors,
                 dim_to_packs[0],
                 pad_to_max_shape=pad_to_max_shapes[0],
+                _global_pad_shape=_combine_global_pad_shapes(
+                    [b._global_pad_shape for b in from_packed_tensors]
+                ),
                 _row_offsets=row_offsets,
                 _segment_indices=segment_indices,
                 _segment_provenance=provenances,
@@ -628,6 +742,9 @@ class PackedTensor:
             tensors,
             dim_to_pack,
             pad_to_max_shape=pad_to_max_shapes[0],
+            _global_pad_shape=_combine_global_pad_shapes(
+                [b._global_pad_shape for b in from_packed_tensors]
+            ),
         )
 
     @classmethod
@@ -652,6 +769,7 @@ class PackedTensor:
             concatenated.tensors,
             concatenated.dim_to_pack,
             pad_to_max_shape=concatenated.pad_to_max_shape,
+            _global_pad_shape=concatenated._global_pad_shape,
             _row_offsets=[0, len(concatenated._segment_indices)],
             _segment_indices=concatenated._segment_indices,
             _segment_provenance=concatenated._segment_provenance,
@@ -706,6 +824,9 @@ class PackedTensor:
             tensors,
             from_packed_tensors[0].dim_to_pack,
             pad_to_max_shape=pad_to_max_shapes[0],
+            _global_pad_shape=_combine_global_pad_shapes(
+                [b._global_pad_shape for b in from_packed_tensors]
+            ),
         )
 
     # ── Wire encoding (data-plane roundtrip) ─────────────────────────
@@ -723,20 +844,50 @@ class PackedTensor:
     # ``codec.materialize``'s ``to_padded_tensor``, which no longer runs
     # for these fields.
 
-    def to_wire(self) -> Optional[torch.Tensor]:
-        """Encode as a ``torch.nested`` jagged tensor for wire transport.
+    def global_pad_shape(self) -> Optional[list[int]]:
+        """Batch-wide max trailing dims, as :meth:`as_tensor` would compute them.
 
-        Returns ``None`` when every logical row is empty so the caller can
-        skip the field entirely. Otherwise one nested row per *logical*
-        row; empty rows become zero-length placeholders sharing the ref
-        row's trailing dims / device so ``as_nested_tensor`` doesn't
-        reject the list on device or shape mismatch.
+        Minted on the writer, where the whole batch is in hand, and shipped in
+        the row metadata so every DP rank pads to the same dims. Before
+        flattening this was implicit -- ``to_wire`` padded to the global max, so
+        rows arrived pre-padded and each rank's ``as_tensor`` was a no-op. With
+        the padding moved to the read side, a rank that computed its own max
+        would pad its shard to different trailing dims than its peers, and the
+        logprob and training passes would encode the same media at different
+        widths.
 
-        ``pad_to_max_shape`` values are padded to the batch max first —
-        that is what :meth:`as_tensor` returns for them, and a
-        deduplicated row spanning segments of differing trailing dims
-        cannot be concatenated otherwise. Every other field travels at its
-        natural per-row size.
+        ``None`` when the field is not ``pad_to_max_shape``, is empty, or has
+        mixed rank -- the last is left for ``as_tensor`` to reject.
+        """
+        if not self.pad_to_max_shape:
+            return None
+        present = [t for t in self.tensors if t is not None]
+        if not present:
+            return None
+        ranks = {t.ndim for t in present}
+        if len(ranks) != 1:
+            return None
+        rank = ranks.pop()
+        return [max(t.shape[d] for t in present) for d in range(rank)]
+
+    def to_wire(
+        self,
+    ) -> tuple[Optional[torch.Tensor], list[list[list[int]]]]:
+        """Encode as a flattened ``torch.jagged`` tensor plus its row shapes.
+
+        Returns ``(None, [])`` when every logical row is empty so the caller
+        can skip the field entirely. Otherwise:
+
+          * ``nested`` — one row per *logical* row, each row the 1-D concat of
+            that row's segments. Flattening is what makes ``torch.jagged``
+            total: rows vary only in dim 0, so ragged trailing dims and mixed
+            rank both encode, and nothing is padded to make a container accept
+            them. Empty rows become zero-length placeholders.
+          * ``shapes`` — ``shapes[row][segment]`` is that segment's true shape.
+            Required because TQ derives ``per_sample_shapes`` from the value it
+            is handed, so flat rows make it record flat lengths. The caller
+            ships this via ``BatchMeta.extra_info``; see
+            :func:`nemo_rl.data_plane.schema.MULTIMODAL_ROW_SHAPES`.
 
         Only ``dim_to_pack=0`` is supported today; other values would
         need ``ragged_idx`` on the nested tensor and a matching
@@ -767,88 +918,81 @@ class PackedTensor:
                     segments.append(segment)
             row_segments.append(segments)
 
-        # ``pad_to_max_shape`` values are padded here, and that is not a wire
-        # artifact: ``as_tensor`` pads to the same batch max, so the padded
-        # form *is* the value the consumer expects. It is also required
-        # structurally — a deduplicated logical row can span segments with
-        # differing trailing dims, and the ``torch.cat`` below raises on
-        # those unless each segment is padded first.
+        # Each segment is flattened to 1-D and the row is the 1-D concat of its
+        # segments. Two consequences, both deliberate:
         #
-        # Pad each *segment* before the per-row concat, exactly as
-        # :meth:`as_tensor` does. Concatenating first would raise on a
-        # multi-segment row whose segments differ in trailing dims, before
-        # the padding could fix them. Padding to the *global* batch max
-        # (not a per-shard max) is deliberate: every DP rank then sees
-        # identical trailing dims for the forward.
+        #   * Rows then differ only in dim 0, so ``torch.jagged`` accepts every
+        #     shape -- ragged trailing dims and mixed rank included. No padding
+        #     is materialized into the bytes that cross the wire or land in TQ
+        #     storage, and TQ never falls back to the deprecated strided layout.
+        #   * The per-row concat is 1-D, so it cannot raise on segments whose
+        #     trailing dims differ -- which is what previously forced
+        #     ``pad_to_max_shape`` to pad *before* the concat.
         #
-        # Fields without the flag — pixel_values with a fixed vision-tower
-        # width, image_grid_thw, … — are never padded here and travel
-        # jagged at their natural size.
-        if self.pad_to_max_shape:
-            present = [t for segs in row_segments for t in segs]
-            if present:
-                ranks = {t.ndim for t in present}
-                if len(ranks) != 1:
-                    raise ValueError(
-                        "pad_to_max_shape requires tensors with the same rank, "
-                        f"but received ranks {sorted(ranks)}"
-                    )
-                rank = ranks.pop()
-                max_shape = [max(t.shape[d] for t in present) for d in range(rank)]
-
-                def _pad_trailing_dims(tensor: torch.Tensor) -> torch.Tensor:
-                    padding: list[int] = []
-                    for dim in reversed(range(rank)):
-                        # dim 0 is the packing/ragged dim — left jagged.
-                        padding.extend(
-                            (0, 0 if dim == 0 else max_shape[dim] - tensor.shape[dim])
-                        )
-                    return F.pad(tensor, padding)
-
-                row_segments = [
-                    [_pad_trailing_dims(t) for t in segs] for segs in row_segments
-                ]
-
+        # The true shapes travel beside the payload (see the returned
+        # ``shapes``) because TQ derives ``per_sample_shapes`` from what it is
+        # handed: give it flat rows and it records flat lengths. Padding still
+        # happens for ``pad_to_max_shape`` values, but in worker memory at use
+        # time via :meth:`as_tensor`, not on the wire.
+        shapes: list[list[list[int]]] = [
+            [list(t.shape) for t in segs] for segs in row_segments
+        ]
+        # ``reshape(-1)`` on contiguous processor output is a view, so the
+        # single-segment row -- one image per sample, the overwhelmingly common
+        # case -- stays zero-copy as it was before flattening. Only deduplicated
+        # multi-segment rows pay a concat.
         rows: list[Optional[torch.Tensor]] = [
             None
             if not segs
-            else (segs[0] if len(segs) == 1 else torch.cat(segs, dim=0))
+            else (
+                segs[0].reshape(-1)
+                if len(segs) == 1
+                else torch.cat([t.reshape(-1) for t in segs])
+            )
             for segs in row_segments
         ]
 
         ref = next((t for t in rows if t is not None), None)
         if ref is None:
-            return None
+            return None, []
 
         if any(t is None for t in rows):
-            placeholder = torch.zeros(
-                0, *ref.shape[1:], dtype=ref.dtype, device=ref.device
-            )
+            placeholder = torch.zeros(0, dtype=ref.dtype, device=ref.device)
             rows = [placeholder if t is None else t for t in rows]
 
-        return torch.nested.as_nested_tensor(rows, layout=torch.jagged)  # type: ignore[arg-type]
+        nested = torch.nested.as_nested_tensor(rows, layout=torch.jagged)  # type: ignore[arg-type]
+        return nested, shapes
 
     @classmethod
-    def from_wire(cls, nested: torch.Tensor) -> Optional["PackedTensor"]:
-        """Reconstruct from the nested tensor produced by :meth:`to_wire`.
+    def from_wire(
+        cls,
+        nested: torch.Tensor,
+        shapes: Optional[list[list[list[int]]]] = None,
+        *,
+        pad_to_max_shape: bool = False,
+        max_shape: Optional[list[int]] = None,
+    ) -> Optional["PackedTensor"]:
+        """Reconstruct from the value produced by :meth:`to_wire`.
 
         Returns ``None`` for an empty batch (no rows); the caller should
         skip the field entirely rather than instantiate an empty
         ``PackedTensor``.
 
-        No companion length field is needed: ``unbind`` yields each row at
-        its stored size, because TransferQueue persisted one entry per row
-        and ``codec.materialize`` leaves multimodal fields nested rather
-        than padding them into a rectangle.
+        ``shapes`` is the companion returned by :meth:`to_wire`, carried on
+        ``BatchMeta.extra_info``. Each flat row is split by segment ``numel``
+        and reshaped back to its true shape. When ``shapes`` is ``None`` the
+        rows are taken as-is -- the pre-flattening encoding, still used by
+        callers that hold a wire value without the batch metadata.
 
         A zero-length row means the sample had no media -- it becomes
         ``None`` (not a ``(0, ...)`` tensor) so an image-free shard
         reconstructs as legacy does: ``as_tensor`` returns ``None`` and
         ``logical_segment_counts_by_row`` reports 0 rather than 1.
 
-        ``pad_to_max_shape`` is not restored; the wire never carried it.
-        Consumers that need a rectangle pad at use time via
-        :meth:`as_tensor` on a value that still has the flag set.
+        ``pad_to_max_shape`` is restored onto the rebuilt value rather than
+        materialized on the wire. A multi-segment row whose segments differ in
+        trailing dims is padded here, in worker memory, exactly as
+        :meth:`as_tensor` would -- the concat cannot happen otherwise.
 
         Mirrors :meth:`to_wire`; both assume ``dim_to_pack=0``.
         """
@@ -862,19 +1006,59 @@ class PackedTensor:
         unbound = list(nested.unbind())
         if not unbound:
             return None
-        rows = [None if t.shape[0] == 0 else t for t in unbound]
-        return cls(rows, dim_to_pack=0)  # type: ignore[arg-type]
+
+        if shapes is None:
+            rows = [None if t.shape[0] == 0 else t for t in unbound]
+            return cls(rows, dim_to_pack=0, pad_to_max_shape=pad_to_max_shape)  # type: ignore[arg-type]
+
+        if len(shapes) != len(unbound):
+            raise ValueError(
+                f"from_wire got {len(unbound)} wire rows but {len(shapes)} shape "
+                "entries; they are minted together by to_wire and must agree."
+            )
+
+        # Segments are rebuilt at their true shapes and kept separate via the
+        # CSR row map. No padding happens here: the data plane transports, and
+        # ``as_tensor`` pads at use time because a rectangle is a *model input*
+        # requirement (the vision encoder consumes one dense tensor), not a
+        # transport one. An empty row contributes no segments, so
+        # ``logical_segment_counts_by_row`` reports 0 as it did for ``None``.
+        segments_flat: list[torch.Tensor] = []
+        row_offsets: list[int] = [0]
+        for flat, row_shapes in zip(unbound, shapes):
+            offset = 0
+            for shape in row_shapes:
+                numel = torch.Size(shape).numel()
+                segments_flat.append(flat[offset : offset + numel].reshape(shape))
+                offset += numel
+            row_offsets.append(len(segments_flat))
+        return cls(
+            segments_flat,  # type: ignore[arg-type]
+            dim_to_pack=0,
+            pad_to_max_shape=pad_to_max_shape,
+            _row_offsets=row_offsets,
+            _segment_indices=list(range(len(segments_flat))),
+            _global_pad_shape=max_shape,
+        )
 
 
 def encode_multimodal_for_wire(
     k: str, v: Union["PackedTensor", torch.Tensor]
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield ``(wire_key, wire_value)`` pairs. Dispatched by registry membership."""
+) -> Iterator[tuple[str, Any]]:
+    """Yield ``(wire_key, wire_value)`` pairs. Dispatched by registry membership.
+
+    ``row_meta`` is ``None`` for per-token fields, which ride rectangular. For
+    packed fields it carries the per-row segment shapes and the
+    ``pad_to_max_shape`` flag, both of which :meth:`PackedTensor.from_wire`
+    needs to undo the flattening. The caller ships it on
+    ``BatchMeta.extra_info`` -- TQ cannot derive it, because it reads
+    ``per_sample_shapes`` off the flattened rows it is handed.
+    """
     if k in PACKED_MULTIMODAL_FIELDS:
         assert isinstance(v, PackedTensor), (
             f"{k!r}: expected PackedTensor, got {type(v).__name__}"
         )
-        nested = v.to_wire()
+        nested, shapes = v.to_wire()
         if nested is None:
             return  # all-None batch
         yield k, nested

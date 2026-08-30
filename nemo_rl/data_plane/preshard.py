@@ -165,6 +165,9 @@ def shard_meta_for_dp(
                 sample_ids=rank_sample_ids,
                 fields=meta.fields,
                 sequence_lengths=rank_seqlens,
+                # Per-sample sidecar must be sliced alongside ``sample_ids``;
+                # without this a per-rank meta silently loses it.
+                tags=[meta.tags[i] for i in idx_list] if meta.tags else None,
                 extra_info=rank_extra,
             )
         )

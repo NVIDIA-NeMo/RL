@@ -118,6 +118,7 @@ def read_columns(
         layout=layout,
         pad_value_dict=pad_value_dict,
         pad_to_seqlen=pad_to_seqlen,
+        tags=meta.tags,
     )
     attach_message_log_view(data)
     return data

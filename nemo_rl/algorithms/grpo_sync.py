@@ -397,8 +397,10 @@ def grpo_train_sync(
     # fixed kwarg set to whichever trainer ``_select_trainer`` returns.
     # ``grpo_train``'s sole use of it is
     # ``attach_initial_nemo_gym_image_payloads``, gated on
-    # ``grpo.deduplicate_multimodal_data`` — which ``setup()`` already rejects
-    # for ``data_plane.enabled=true`` via ``_validate_multimodal_dedup_capability``.
+    # ``grpo.deduplicate_multimodal_data`` *and* ``should_use_nemo_gym`` — the
+    # combination ``setup()`` rejects via
+    # ``_validate_multimodal_dedup_capability``. Non-Gym dedup runs never call
+    # that helper, so they need no processor here either.
     processor: Optional["AutoProcessor"] = None,
 ) -> None:
     """Run GRPO training algorithm — TransferQueue-mediated.

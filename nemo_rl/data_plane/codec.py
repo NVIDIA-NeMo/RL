@@ -41,8 +41,12 @@ import numpy as np
 import torch
 from tensordict import TensorDict, TensorDictBase
 
-from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
+from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    reassemble_packed_multimodal,
+)
 from nemo_rl.data_plane.schema import Layout
+
 
 if TYPE_CHECKING:
     # Type-only import. At runtime, BatchedDataDict is loaded lazily
@@ -256,6 +260,7 @@ def materialize(
     layout: Layout = "padded",
     pad_value_dict: dict[str, int | float] | None = None,
     pad_to_seqlen: int = 0,
+    tags: list[dict[str, Any]] | None = None,
 ) -> "BatchedDataDict[Any]":
     """Convert a wire TensorDict to a BatchedDataDict.
 
@@ -359,4 +364,8 @@ def materialize(
             ]
             padded = torch.nn.functional.pad(padded, pad_spec, value=pad)
         out[key] = padded
+    # Packed multimodal fields arrive flattened with a companion shape column.
+    # The multimodal layer owns that encoding; the codec only asks it to fix up
+    # its own fields so no raw nested value reaches a BatchedDataDict consumer.
+    reassemble_packed_multimodal(out, tags)
     return BatchedDataDict(out)

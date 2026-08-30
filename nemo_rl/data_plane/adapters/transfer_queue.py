@@ -46,6 +46,7 @@ import torch
 import transfer_queue as tq
 from tensordict import TensorDict
 
+from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
@@ -707,6 +708,14 @@ def _from_wire(td: TensorDict) -> TensorDict:
     :func:`_patch_scalar_field_schema` applied they are stored and reported
     as 0-d rows, which ``_merge_tensors_to_tensordict`` stacks into a dense
     ``(N,)`` column before it ever reaches this function.
+
+    Packed multimodal fields are excluded: their rows are per-sample media,
+    not a padded sequence, and "all rows share a shape" is a data-dependent
+    accident (every sample happening to carry one image). Stacking them
+    discards the row boundaries that ``PackedTensor.from_wire`` needs, and
+    the dense value then fails the ``is_nested`` check in
+    ``codec.materialize`` and reaches ``get_multimodal_dict`` unreassembled.
+    ``codec.materialize`` applies the same exclusion.
     """
     # NonTensorData / NonTensorStack leaves are only visible via td.keys(),
     # not keys(leaves_only=True) — iterating the latter would silently drop
@@ -716,7 +725,11 @@ def _from_wire(td: TensorDict) -> TensorDict:
     for k in td.keys():
         v = td.get(k)
         field_name = str(k)
-        if isinstance(v, torch.Tensor) and v.is_nested:
+        if (
+            isinstance(v, torch.Tensor)
+            and v.is_nested
+            and field_name not in PACKED_MULTIMODAL_FIELDS
+        ):
             rows = list(v.unbind())
             if rows and all(row.shape == rows[0].shape for row in rows[1:]):
                 v = torch.stack(rows)
