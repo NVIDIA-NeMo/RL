@@ -156,6 +156,7 @@ def _make_controller(
     # is about, but both have to exist for it to reach the refit.
     ctrl._master_config = SimpleNamespace(env={})
     ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
     return ctrl, monitor, sync
 
 

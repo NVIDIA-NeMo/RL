@@ -45,6 +45,7 @@ from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
     MasterConfig,
+    _startup_pipeline_ready,
     add_grpo_token_loss_masks_and_generation_logprobs,
     extract_initial_prompt_messages,
 )
@@ -1245,23 +1246,21 @@ class TestReplayBuffer:
 
         ray.kill(buffer2)
 
-    def test_resume_deadlock_precondition_detectable(self):
-        """Regression: restored buffer can expose an async resume deadlock.
+    def test_restore_preserves_complete_current_target_without_lookahead(self):
+        """A restored buffer preserves target N while target N+1 remains absent.
 
-        After PR #2651 introduced replay-buffer checkpointing, resuming from a
-        checkpoint where target N is complete but target N+1 is absent can
-        deadlock Async GRPO or Async PPO:
+        This is the precondition for the async resume deadlock that PR #2651's
+        replay-buffer checkpointing exposed in Async GRPO or Async PPO:
 
           1. Startup wait sees has_complete_batch(N) == True and breaks immediately.
           2. Training consumes all target-N trajectories and triggers a refit.
           3. Collector's post-refit target window becomes [N+2, ...] (skipping N+1).
           4. Training waits for target N+1, which nobody generates — stall forever.
 
-        The fix is a startup pipeline barrier: before breaking, also require
-        has_complete_batch(N+1) to be True (or N+1 >= max_steps).  This test
-        constructs the exact precondition state — current step complete, lookahead
-        absent — to ensure it remains detectable and to document the expected
-        buffer readiness values that the barrier logic branches on.
+        The startup pipeline barrier requires target N+1 to be complete *or*
+        actively claimed by the collector before training may begin.  This test
+        constructs the precondition state — current step complete, lookahead
+        absent — and documents the buffer readiness values the barrier branches on.
         """
         num_prompts = 8
         resume_step = 30
@@ -1301,12 +1300,11 @@ class TestReplayBuffer:
             buffer2.has_complete_batch.remote(resume_step, num_prompts, max_age)
         ), "target step must be complete after restore"
 
-        # Step 31 is absent — this is the deadlock precondition.
-        # The startup pipeline barrier must detect this and continue waiting
-        # instead of breaking, giving the collector time to generate step 31.
+        # Step 31 is absent — startup may proceed only after collector status
+        # reports that this target has been claimed.
         assert not ray.get(
             buffer2.has_complete_batch.remote(resume_step + 1, num_prompts, max_age)
-        ), "lookahead step must be absent; barrier should block here"
+        ), "lookahead step must be absent from the restored buffer"
 
         ray.kill(buffer2)
 
@@ -2180,6 +2178,240 @@ class TestAsyncTrajectoryCollector:
         assert status["data_exhausted"] is False
         assert status["errored"] is False
 
+    def test_flush_telemetry_waits_for_inflight_batches(self, monkeypatch):
+        """The flush must cover the batches it exists to save.
+
+        Shutting the provider down is terminal, so a batch worker still running
+        when it happens loses its span -- exactly the last rollouts of the run
+        this call is meant to rescue.
+        """
+        collector = self.create_local_collector()
+        collector.running = True
+        alive_at_shutdown = []
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector.shutdown_telemetry",
+            lambda: alive_at_shutdown.append(worker.is_alive()),
+        )
+
+        release = threading.Event()
+        worker = threading.Thread(target=lambda: release.wait(timeout=10), daemon=True)
+        collector._inflight_threads.add(worker)
+        collector._live_threads.add(worker)
+        worker.start()
+        threading.Timer(0.2, release.set).start()
+
+        collector.flush_telemetry(quiesce_timeout_s=10.0)
+
+        assert collector.running is False
+        assert alive_at_shutdown == [False]
+
+    def test_flush_telemetry_gives_up_on_a_wedged_batch(self, monkeypatch):
+        # The caller is on its way to ray.kill, so the wait is bounded: losing a
+        # wedged worker's span beats hanging the run's teardown.
+        collector = self.create_local_collector()
+        collector.running = True
+        shutdown_calls = []
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector.shutdown_telemetry",
+            lambda: shutdown_calls.append(True),
+        )
+
+        release = threading.Event()
+        worker = threading.Thread(target=lambda: release.wait(timeout=30), daemon=True)
+        collector._inflight_threads.add(worker)
+        collector._live_threads.add(worker)
+        worker.start()
+        try:
+            started = time.monotonic()
+            collector.flush_telemetry(quiesce_timeout_s=0.3)
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+
+        assert shutdown_calls == [True]
+        # Bounded by the budget, not by the wedged worker's 30s: it must have
+        # waited (so the budget is respected) and then given up (so teardown
+        # cannot be held open).
+        assert 0.3 <= elapsed < 3.0
+
+    def test_flush_telemetry_waits_past_the_inflight_bookkeeping(self, monkeypatch):
+        """Leaving ``_inflight_threads`` does not mean the span is closed.
+
+        A batch worker discards itself from the set inside its own ``finally``,
+        which still runs inside the ``rl.grpo.generation`` span. Watching the set
+        would let the flush start while that span is still open; joining the
+        thread waits for the span to end, because thread death follows it.
+        """
+        collector = self.create_local_collector()
+        collector.running = True
+        span_closed = threading.Event()
+        span_closed_at_shutdown = []
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector.shutdown_telemetry",
+            lambda: span_closed_at_shutdown.append(span_closed.is_set()),
+        )
+
+        def _batch_worker():
+            # Mirrors the real ordering: bookkeeping first, span close after.
+            with collector._threads_lock:
+                collector._inflight_threads.discard(threading.current_thread())
+            time.sleep(0.3)
+            span_closed.set()
+
+        worker = threading.Thread(target=_batch_worker, daemon=True)
+        collector._inflight_threads.add(worker)
+        collector._live_threads.add(worker)
+        worker.start()
+
+        collector.flush_telemetry(quiesce_timeout_s=10.0)
+
+        assert span_closed_at_shutdown == [True]
+
+    def test_flush_telemetry_wakes_a_parked_collection_loop(self, monkeypatch):
+        """The loop's own waits hold open spans, so it has to be woken.
+
+        Both collection-loop waits are ``Event.wait()`` calls inside an
+        ``efficiency_span``. Joining a loop parked in one of them would burn the
+        whole budget and then flush with that span still open.
+        """
+        collector = self.create_local_collector()
+        collector.running = True
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector.shutdown_telemetry",
+            lambda: None,
+        )
+
+        collector._refit_pause_cleared.clear()
+        loop = threading.Thread(
+            target=collector._refit_pause_cleared.wait, kwargs={"timeout": 30}
+        )
+        collector.collection_thread = loop
+        loop.start()
+
+        started = time.monotonic()
+        collector.flush_telemetry(quiesce_timeout_s=10.0)
+        elapsed = time.monotonic() - started
+
+        assert not loop.is_alive()
+        assert elapsed < 3.0
+
+    def test_flush_telemetry_keeps_budget_for_the_batch_workers(self, monkeypatch):
+        """A wedged loop must not spend the whole budget.
+
+        The loop and the batch workers are joined in sequence, and the workers
+        hold the rollout spans this flush exists to save -- so a loop that never
+        exits has to be capped rather than allowed to starve them.
+        """
+        collector = self.create_local_collector()
+        collector.running = True
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector.shutdown_telemetry",
+            lambda: None,
+        )
+
+        # Ignores every wake, so it holds the loop join for its whole cap.
+        wedged_loop = threading.Thread(target=lambda: time.sleep(30), daemon=True)
+        collector.collection_thread = wedged_loop
+        wedged_loop.start()
+
+        joined = threading.Event()
+        worker = threading.Thread(target=joined.set, daemon=True)
+        collector._live_threads.add(worker)
+        worker.start()
+
+        started = time.monotonic()
+        collector.flush_telemetry(quiesce_timeout_s=1.0)
+        elapsed = time.monotonic() - started
+
+        # The worker was reached, so the drain loop still had budget left.
+        assert joined.is_set()
+        assert not worker.is_alive()
+        # Capped at half the budget on the loop, and the whole call stays inside
+        # it despite the loop never exiting.
+        assert 0.5 <= elapsed < 2.0
+
+    def test_flush_telemetry_survives_a_clear_that_races_the_wake(self, monkeypatch):
+        """The loop clears a pause event just after testing ``running``.
+
+        A single wake landing in that window is swallowed by the clear, and
+        nothing else will ever set the event -- the driver is on its way to
+        ``ray.kill``, so no refit or weight update is coming. Re-arming on each
+        pass is what keeps that from wedging teardown for the full budget.
+        """
+        collector = self.create_local_collector()
+        collector.running = True
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector.shutdown_telemetry",
+            lambda: None,
+        )
+
+        entered = threading.Event()
+
+        def _loop_body():
+            # The real ordering: check running, then clear, then wait. The sleep
+            # widens the window so the flush's first wake lands inside it.
+            entered.set()
+            if collector.running:
+                time.sleep(0.2)
+                collector._generation_limit_cleared.clear()
+                collector._generation_limit_cleared.wait(timeout=30)
+
+        loop = threading.Thread(target=_loop_body, daemon=True)
+        collector.collection_thread = loop
+        loop.start()
+        entered.wait(timeout=5)
+
+        started = time.monotonic()
+        collector.flush_telemetry(quiesce_timeout_s=10.0)
+        elapsed = time.monotonic() - started
+
+        assert not loop.is_alive()
+        assert elapsed < 3.0
+
+    def test_flush_telemetry_waits_for_a_worker_that_has_not_started(self, monkeypatch):
+        """A registered thread with no ``ident`` yet is about to open a span.
+
+        Spawning registers the worker under the lock and starts it just after,
+        so ``is_alive()`` is briefly false for a thread that is about to run.
+        Filtering on it alone would neither wait for that worker nor warn about
+        it.
+        """
+        collector = self.create_local_collector()
+        collector.running = True
+        shutdown_calls = []
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector.shutdown_telemetry",
+            lambda: shutdown_calls.append(True),
+        )
+
+        unstarted = threading.Thread(target=lambda: None, daemon=True)
+        collector._live_threads.add(unstarted)
+        assert not unstarted.is_alive()
+
+        threading.Timer(0.2, unstarted.start).start()
+        collector.flush_telemetry(quiesce_timeout_s=10.0)
+
+        # Waited for the late start and then for the thread itself, rather than
+        # treating "not alive yet" as "already done".
+        assert unstarted.ident is not None
+        assert not unstarted.is_alive()
+        assert shutdown_calls == [True]
+
+    def test_cleanup_prunes_dead_live_threads(self):
+        # _live_threads outlives the batch accounting on purpose, so cleanup is
+        # the only thing keeping a long run from holding every Thread it spawned.
+        collector = self.create_local_collector()
+        dead = threading.Thread(target=lambda: None)
+        dead.start()
+        dead.join()
+        collector._live_threads.add(dead)
+        collector._inflight_threads.add(dead)
+
+        collector._cleanup_finished_threads()
+
+        assert collector._live_threads == set()
+        assert collector._inflight_threads == set()
+
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
         return MasterConfig.model_construct(
@@ -2610,6 +2842,70 @@ class TestAsyncTrajectoryCollector:
 
         assert target_weight not in collector._generating_targets
 
+    def test_startup_barrier_clears_when_collector_reserves_lookahead(self):
+        """A real lookahead reservation opens the resume startup barrier."""
+        num_prompts = 2
+        resume_step = 30
+        max_age = 2
+
+        buffer1 = ReplayBuffer.remote(
+            max_size=20, drop_incomplete_targets_on_restore=False
+        )
+        buffer2 = None
+        try:
+            for _ in range(num_prompts):
+                ray.get(
+                    buffer1.add.remote(
+                        {"batch": {"data": "x"}, "rollout_metrics": {}},
+                        weight_version=resume_step - 1,
+                        target_weight_version=resume_step,
+                    )
+                )
+            state = ray.get(buffer1.state_dict.remote())
+            ray.kill(buffer1)
+            buffer1 = None
+
+            buffer2 = ReplayBuffer.remote(
+                max_size=20, drop_incomplete_targets_on_restore=False
+            )
+            ray.get(
+                buffer2.load_state_dict.remote(
+                    state,
+                    num_prompts_per_step=num_prompts,
+                    current_training_step=resume_step,
+                    max_age_steps=max_age,
+                )
+            )
+
+            collector = self.create_local_collector(replay_buffer=buffer2)
+            collector.initial_weight_version = resume_step
+            collector.current_weight_version = resume_step
+
+            def barrier_open() -> bool:
+                return _startup_pipeline_ready(
+                    buffer2,
+                    collector.get_status(),
+                    current_step_ready=True,
+                    step=resume_step,
+                    num_prompts_per_step=num_prompts,
+                    max_trajectory_age_steps=max_age,
+                    max_num_steps=resume_step + 100,
+                )
+
+            assert not barrier_open()
+            reserved = collector._get_next_target_for_generation(resume_step)
+            assert reserved == resume_step + 1
+            assert collector.get_status()["generating_targets"] == [resume_step + 1]
+            assert barrier_open()
+
+            collector._release_target(reserved)
+            assert not barrier_open()
+        finally:
+            if buffer1 is not None:
+                ray.kill(buffer1)
+            if buffer2 is not None:
+                ray.kill(buffer2)
+
     def test_process_batch_releases_target_when_worker_start_fails(self, monkeypatch):
         """Test start failures do not leave a target reserved forever."""
 
@@ -2682,9 +2978,12 @@ class TestAsyncTrajectoryCollector:
         started = []
 
         class RecordingThread:
-            def __init__(self, *, target, daemon):
+            def __init__(self, *, target, daemon, name):
                 assert daemon
+                # Named so teardown can say which thread it is still waiting on.
+                assert name
                 self.target = target
+                self.name = name
 
             def start(self):
                 started.append(self)
@@ -2736,9 +3035,12 @@ class TestAsyncTrajectoryCollector:
         started_threads = []
 
         class RecordingThread:
-            def __init__(self, *, target, daemon):
+            def __init__(self, *, target, daemon, name):
                 assert daemon
+                # Named so teardown can say which thread it is still waiting on.
+                assert name
                 self.target = target
+                self.name = name
 
             def start(self):
                 started_threads.append(self)
@@ -2802,9 +3104,12 @@ class TestAsyncTrajectoryCollector:
         started_threads = []
 
         class RecordingThread:
-            def __init__(self, *, target, daemon):
+            def __init__(self, *, target, daemon, name):
                 assert daemon
+                # Named so teardown can say which thread it is still waiting on.
+                assert name
                 self.target = target
+                self.name = name
 
             def start(self):
                 started_threads.append(self)
