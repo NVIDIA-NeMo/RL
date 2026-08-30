@@ -624,10 +624,11 @@ class ResolvedRolloutRecovery:
 
 
 class RolloutRecoveryConfig(BaseModel, extra="allow"):
-    """Restore policy for unfinished token-capture prompt groups.
+    """Retry and restore policy for unfinished token-capture prompt groups.
 
     The resolved value is persisted on each ledger group, so restoring a saved
-    group does not reinterpret it using a newer configuration.
+    group does not reinterpret it using a newer configuration. The same
+    granularity governs failures handled in-process and after a process restart.
     """
 
     default_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING

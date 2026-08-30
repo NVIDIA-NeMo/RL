@@ -1320,6 +1320,7 @@ def _make_capture_manager(
         def __init__(self):
             self.seen_rollout_ids = None
             self.seen_generation_indices = None
+            self.seen_recovery_granularity = None
 
         async def run_rollout(
             self,
@@ -1328,9 +1329,11 @@ def _make_capture_manager(
             rollout_ids=None,
             generation_indices=None,
             on_completion=None,
+            recovery_granularity=RecoveryGranularity.SIBLING,
         ):
             self.seen_rollout_ids = rollout_ids
             self.seen_generation_indices = list(generation_indices or [])
+            self.seen_recovery_granularity = recovery_granularity
             if on_run is not None:
                 await on_run(_sample)
             indices = generation_indices or list(range(len(rollout_ids)))
@@ -1466,7 +1469,7 @@ class TestGenerateForFinalizationFlow:
         )
         assert mgr.stats.as_metrics()["rollout/redispatch_total"] == 1.0
 
-    def test_prompt_group_policy_does_not_change_live_infrastructure_retry(self):
+    def test_prompt_group_policy_retries_the_complete_live_cohort(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(
             buf,
@@ -1482,6 +1485,7 @@ class TestGenerateForFinalizationFlow:
         class _PartialCaptureImpl:
             def __init__(self):
                 self.generation_indices: list[list[int]] = []
+                self.recovery_granularities: list[RecoveryGranularity] = []
 
             async def run_rollout(
                 self,
@@ -1490,9 +1494,11 @@ class TestGenerateForFinalizationFlow:
                 rollout_ids=None,
                 generation_indices=None,
                 on_completion=None,
+                recovery_granularity=RecoveryGranularity.SIBLING,
             ):
                 indices = list(generation_indices)
                 self.generation_indices.append(indices)
+                self.recovery_granularities.append(recovery_granularity)
                 completions = []
                 for generation_index in indices:
                     rollout_id = rollout_ids[generation_index]
@@ -1521,10 +1527,14 @@ class TestGenerateForFinalizationFlow:
 
         assert request is not None
         assert request.prompt_idx == 9
-        assert impl.generation_indices == [[0, 1], [1]]
+        assert impl.generation_indices == [[0, 1], [0, 1]]
+        assert impl.recovery_granularities == [
+            RecoveryGranularity.PROMPT_GROUP,
+            RecoveryGranularity.PROMPT_GROUP,
+        ]
         first_ids, second_ids = buf.reserve_rollout_ids
         assert first_ids is not None and second_ids is not None
-        assert second_ids[0] == first_ids[0]
+        assert second_ids[0] != first_ids[0]
         assert second_ids[1] != first_ids[1]
         assert request.rollout_ids == (second_ids[0], second_ids[1])
 
@@ -1543,22 +1553,6 @@ class TestGenerateForFinalizationFlow:
         _with_cut(
             first._tq_buffer,
             lambda cut: first.recovery_ledger.mark_group_dispatched(cut, group_id),
-        )
-        group = first.recovery_ledger.get_group(group_id)
-        gate_id = group.gate_rollout_id(0)
-        _with_cut(
-            first._tq_buffer,
-            lambda cut: first.recovery_ledger.mark_sibling_sealed(
-                cut,
-                group_id,
-                generation_index=0,
-                gate_rollout_id=gate_id,
-                receipt={
-                    "rollout_id": gate_id,
-                    "manifest": [{"staging_key": f"{gate_id}/call"}],
-                },
-                reward=0.5,
-            ),
         )
 
         restored = _make_capture_manager(
