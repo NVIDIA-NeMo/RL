@@ -125,9 +125,26 @@ policy and generation nodes.
 
 ## Running MOPD
 
-MOPD collects rollouts through NeMo Gym, so use the NeMo Gym GRPO entrypoint
-with an MOPD recipe. The checked-in recipe uses placeholder dataset paths;
-override them for your local data:
+MOPD collects rollouts through NeMo Gym and supports both the legacy async GRPO
+runtime and the Single-Controller runtime. The checked-in recipes use
+placeholder dataset paths; override them for your local data.
+
+### Single-Controller text path
+
+The Single-Controller path moves rollout and teacher-logprob tensors through
+TransferQueue. It currently supports text-only MOPD rollouts:
+
+```sh
+uv run examples/run_grpo_single_controller.py \
+  --config examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller.yaml \
+  data.train.data_path=/path/to/train.jsonl \
+  data.validation.data_path=/path/to/val.jsonl
+```
+
+See [Train with Single-Controller](../../guides/single-controller.md) for the
+runtime's configuration and architecture.
+
+### Legacy async GRPO path
 
 ```sh
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
@@ -136,10 +153,10 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
   data.validation.data_path=/path/to/val.jsonl
 ```
 
-The reference recipe self-distills `Qwen/Qwen3-1.7B` (student == teacher) across
-3 nodes (1 policy + 1 vLLM + 1 teacher) with sequence packing enabled. Because
-student and teacher are identical, the OPD loss stays near zero — it is a
-correctness smoke test, not a demonstration of distillation gains.
+Both reference recipes self-distill `Qwen/Qwen3-1.7B` (student == teacher)
+across 3 nodes (1 policy + 1 vLLM + 1 teacher) with sequence packing enabled.
+Because student and teacher are identical, the OPD loss stays near zero — it is
+a correctness smoke test, not a demonstration of distillation gains.
 
 ## References
 
