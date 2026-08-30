@@ -479,6 +479,9 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # Path to a per-module Transformer Engine precision recipe loaded into
+    # Megatron quant_recipe.
+    te_precision_config_file: NotRequired[str]
     # Passed through to the Megatron model's freeze() method.
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.

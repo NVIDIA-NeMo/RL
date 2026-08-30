@@ -4340,6 +4340,90 @@ def aggregate_rollout_metrics(
     return aggregated
 
 
+def _startup_pipeline_ready(
+    replay_buffer: Any,
+    collector_status: dict[str, Any],
+    *,
+    current_step_ready: bool,
+    step: int,
+    num_prompts_per_step: int,
+    max_trajectory_age_steps: int,
+    max_num_steps: int,
+) -> bool:
+    """Return whether async training can overlap safely with lookahead generation.
+
+    A restored buffer may already contain ``step``, letting startup consume it
+    before the collector generates ``step + 1``. After the refit that follows
+    ``step``, the collector's target window advances to ``step + 2``, so an
+    unclaimed ``step + 1`` would then be permanently missing. Requiring the
+    next target to be complete *or* actively claimed keeps that gap closed
+    while preserving the training/generation overlap used by steady-state async
+    training, and without letting an unrelated reservation open the barrier.
+    """
+    if not current_step_ready:
+        return False
+
+    next_step = step + 1
+    need_lookahead = max_trajectory_age_steps > 0 and next_step < max_num_steps
+    if not need_lookahead:
+        return True
+
+    next_step_ready = ray.get(
+        replay_buffer.has_complete_batch.remote(
+            next_step, num_prompts_per_step, max_trajectory_age_steps
+        )
+    )
+    return next_step_ready or next_step in collector_status.get(
+        "generating_targets", ()
+    )
+
+
+def _raise_if_collector_stopped(
+    collector_status: dict[str, Any],
+    *,
+    awaited_target: str,
+    awaited_work: str,
+    action: str,
+) -> None:
+    """Raise if the collector stopped terminally while training waits on it.
+
+    Both ``data_exhausted`` and ``errored`` are terminal — neither is reset once
+    set — so a stopped collector with no in-flight workers can never supply the
+    awaited target. Waiting longer would hang silently instead of failing.
+
+    Args:
+        collector_status: Snapshot from ``AsyncTrajectoryCollector.get_status``.
+        awaited_target: Rendered target being awaited, e.g. ``"target=5"`` or
+            ``"training_step=5"``.
+        awaited_work: What is being awaited, e.g. ``"lookahead claim"``.
+        action: Verb for the message — ``"start"`` or ``"continue"``.
+    """
+    if not (
+        (collector_status["data_exhausted"] or collector_status.get("errored", False))
+        and not collector_status["running"]
+        and collector_status["inflight_workers"] == 0
+    ):
+        return
+
+    stop_reason = (
+        "dataloader exhausted"
+        if collector_status["data_exhausted"]
+        else "collector errored"
+    )
+    recovery_advice = (
+        "Increase data.train.max_num_epochs or use a larger dataset."
+        if collector_status["data_exhausted"]
+        else "Inspect the preceding trajectory collector error."
+    )
+    raise RuntimeError(
+        f"Trajectory collector stopped ({stop_reason}) while waiting for "
+        f"{awaited_work} at {awaited_target}. "
+        f"Training cannot {action} without the required trajectories. "
+        f"Collector status: {collector_status}. "
+        f"{recovery_advice}"
+    )
+
+
 @trace_fn(RLSpanGroup.JOB, "rl.grpo.job")
 def async_grpo_train(
     policy: ColocatablePolicyInterface,
@@ -4804,31 +4888,24 @@ def async_grpo_train(
             f"step {step} ready={current_step_ready}"
         )
 
-        if current_step_ready:
-            # Keep the async pipeline one step ahead before entering training.
+        collector_status = ray.get(trajectory_collector.get_status.remote())
+        pipeline_ready = _startup_pipeline_ready(
+            replay_buffer,
+            collector_status,
+            current_step_ready=current_step_ready,
+            step=step,
+            num_prompts_per_step=num_prompts_per_step,
+            max_trajectory_age_steps=max_trajectory_age_steps,
+            max_num_steps=master_config.grpo.max_num_steps,
+        )
+        if current_step_ready and not pipeline_ready:
+            print(
+                f"  Pipeline barrier: step {step} ready but "
+                f"step {step + 1} is not yet claimed — waiting for lookahead "
+                f"to prevent resume deadlock"
+            )
 
-            # A restored buffer may already contain `step`, allowing startup to
-            # consume it before the collector generates `step + 1`. After refit,
-            # the collector advances to targets starting at `step + 2`, leaving
-            # `step + 1` permanently missing. Wait for the initial collector,
-            # whose range includes both steps, to complete the lookahead first.
-            max_num_steps = master_config.grpo.max_num_steps
-            need_lookahead = max_trajectory_age_steps > 0 and step + 1 < max_num_steps
-            if need_lookahead:
-                next_step_ready = ray.get(
-                    replay_buffer.has_complete_batch.remote(
-                        step + 1, num_prompts_per_step, max_trajectory_age_steps
-                    )
-                )
-                if not next_step_ready:  # pragma: no cover
-                    print(
-                        f"  Pipeline barrier: step {step} ready but "
-                        f"step {step + 1} not yet — waiting for lookahead fill "
-                        f"to prevent resume deadlock"
-                    )
-                    wait_iterations += 1
-                    time.sleep(1.0)
-                    continue
+        if pipeline_ready:
             break
 
         trajectories_needed = ray.get(
@@ -4842,21 +4919,13 @@ def async_grpo_train(
                 f"trajectories for step {step}"
             )
 
-        collector_status = ray.get(trajectory_collector.get_status.remote())
-        if (
-            (
-                collector_status["data_exhausted"]
-                or collector_status.get("errored", False)
-            )
-            and not collector_status["running"]
-            and collector_status["inflight_workers"] == 0
-        ):
-            raise RuntimeError(
-                f"Trajectory collector stopped: dataloader exhausted while waiting for initial buffer fill at step={step}. "
-                f"The dataset ran out of data before training could start. "
-                f"Collector status: {collector_status}. "
-                f"Increase data.train.max_num_epochs or use a larger dataset."
-            )
+        awaited_target = step + 1 if current_step_ready else step
+        _raise_if_collector_stopped(
+            collector_status,
+            awaited_target=f"target={awaited_target}",
+            awaited_work="lookahead claim" if current_step_ready else "buffer fill",
+            action="start",
+        )
 
         wait_iterations += 1
         time.sleep(1.0)
@@ -4969,20 +5038,17 @@ def async_grpo_train(
                         collector_status = ray.get(
                             trajectory_collector.get_status.remote()
                         )
-                        if (
-                            (
-                                collector_status["data_exhausted"]
-                                or collector_status.get("errored", False)
-                            )
-                            and not collector_status["running"]
-                            and collector_status["inflight_workers"] == 0
-                        ):
-                            raise RuntimeError(
-                                f"Trajectory collector stopped: dataloader exhausted at training_step={step}. "
-                                f"The dataset ran out of data before training could complete. "
-                                f"Collector status: {collector_status}. "
-                                f"Increase data.train.max_num_epochs or use a larger dataset."
-                            )
+                        awaited_target = step
+                        print(
+                            f"   Awaiting target {awaited_target}; claimed by collector: "
+                            f"{awaited_target in collector_status.get('generating_targets', ())}"
+                        )
+                        _raise_if_collector_stopped(
+                            collector_status,
+                            awaited_target=f"training_step={step}",
+                            awaited_work="a full batch",
+                            action="continue",
+                        )
 
                         with (
                             timer.time("idle/buffer_starvation"),
