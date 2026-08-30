@@ -47,7 +47,7 @@ class PromptGroupPhase(StrEnum):
 
 
 class RecoveryGranularity(StrEnum):
-    """Unit of completed work reused after restoring an unfinished group."""
+    """Unit of completed work reused after a live failure or process restart."""
 
     SIBLING = "sibling"
     PROMPT_GROUP = "prompt_group"
@@ -242,6 +242,15 @@ class ParsedRolloutRecoveryState:
     ledger_state: RolloutRecoveryState
     batch_shortfall: dict[int, int]
     sampler_stamps_target_steps: Optional[bool]
+
+
+@dataclass(frozen=True)
+class SiblingSealResult:
+    """One terminal sibling result waiting for an atomic prompt-group seal."""
+
+    gate_rollout_id: str
+    receipt: dict[str, Any]
+    reward: float
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -455,16 +464,46 @@ class RolloutRecoveryLedger:
         cut: DataPlaneMutationCut,
         group_id: str,
     ) -> PromptGroupRecoveryRecord:
-        """Mint fresh physical attempts only for siblings that are not sealed."""
+        """Mint fresh physical attempts according to the persisted granularity."""
         cut.require_live()
         record = self._require_group(group_id)
         if record.status != PromptGroupStatus.GENERATING:
             raise ValueError(
                 f"cannot retry group {group_id!r} from status {record.status.value!r}"
             )
+        current_statuses = [
+            sibling.current_attempt.status for sibling in record.siblings
+        ]
+        retry_prompt_group = (
+            record.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+            and any(
+                status
+                in {
+                    RolloutAttemptStatus.ABANDONED,
+                    RolloutAttemptStatus.FAILED,
+                }
+                for status in current_statuses
+            )
+        )
+        if retry_prompt_group and any(
+            status
+            not in {
+                RolloutAttemptStatus.ABANDONED,
+                RolloutAttemptStatus.FAILED,
+            }
+            for status in current_statuses
+        ):
+            raise ValueError(
+                "prompt-group retry requires every sibling attempt to be abandoned "
+                "or failed together"
+            )
+
         for sibling in record.siblings:
             attempt = sibling.current_attempt
-            if attempt.status == RolloutAttemptStatus.SEALED:
+            if (
+                record.recovery_granularity is RecoveryGranularity.SIBLING
+                and attempt.status == RolloutAttemptStatus.SEALED
+            ):
                 continue
             if attempt.status == RolloutAttemptStatus.RESERVED:
                 continue
@@ -522,6 +561,10 @@ class RolloutRecoveryLedger:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
         record = self._require_group(group_id)
+        if record.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
+            raise ValueError(
+                "prompt-group recovery must seal every sibling atomically"
+            )
         sibling = self._require_sibling(record, generation_index)
         attempt = sibling.current_attempt
         expected_gate_rollout_id = record.gate_rollout_id(generation_index)
@@ -564,8 +607,71 @@ class RolloutRecoveryLedger:
         ):
             record.status = PromptGroupStatus.READY_TO_FINALIZE
 
+    def mark_group_sealed(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+        results: dict[int, SiblingSealResult],
+    ) -> None:
+        """Atomically seal one complete prompt-group-scoped physical cohort."""
+        cut.require_live()
+        record = self._require_group(group_id)
+        if record.recovery_granularity is not RecoveryGranularity.PROMPT_GROUP:
+            raise ValueError(
+                "atomic group sealing requires prompt-group recovery granularity"
+            )
+        if record.status is not PromptGroupStatus.GENERATING:
+            raise ValueError(
+                f"cannot seal group {group_id!r} from status {record.status.value!r}"
+            )
+        expected_indices = set(range(record.expected_generations))
+        if set(results) != expected_indices:
+            raise ValueError(
+                "prompt-group seal requires every logical sibling exactly once: "
+                f"expected={sorted(expected_indices)}, actual={sorted(results)}"
+            )
+
+        validated: list[
+            tuple[RolloutAttemptRecord, SiblingSealResult, list[str]]
+        ] = []
+        for generation_index in range(record.expected_generations):
+            result = results[generation_index]
+            sibling = self._require_sibling(record, generation_index)
+            attempt = sibling.current_attempt
+            expected_gate_rollout_id = record.gate_rollout_id(generation_index)
+            if attempt.status is not RolloutAttemptStatus.DISPATCHED:
+                raise ValueError(
+                    "cannot seal logical rollout "
+                    f"{record.logical_rollout_id(generation_index)!r} "
+                    f"from status {attempt.status.value!r}"
+                )
+            if result.gate_rollout_id != expected_gate_rollout_id:
+                raise ValueError(
+                    "streamed rollout identity mismatch: "
+                    f"result={result.gate_rollout_id!r}, "
+                    f"expected={expected_gate_rollout_id!r}"
+                )
+            if result.receipt.get("rollout_id") != expected_gate_rollout_id:
+                raise ValueError(
+                    "receipt rollout identity mismatch: "
+                    f"receipt={result.receipt.get('rollout_id')!r}, "
+                    f"expected={expected_gate_rollout_id!r}"
+                )
+            validated.append(
+                (attempt, result, _receipt_staging_keys(result.receipt))
+            )
+
+        # Validate the complete cohort before changing any sibling. A checkpoint
+        # therefore observes either no committed siblings or the complete group.
+        for attempt, result, staging_keys in validated:
+            attempt.receipt = copy.deepcopy(result.receipt)
+            attempt.reward = float(result.reward)
+            attempt.staging_keys = staging_keys
+            attempt.status = RolloutAttemptStatus.SEALED
+        record.status = PromptGroupStatus.READY_TO_FINALIZE
+
     def abandon_unsealed(self, cut: DataPlaneMutationCut, group_id: str) -> None:
-        """Abandon failed attempts without destroying reusable sealed receipts."""
+        """Abandon failed work at the group's persisted recovery granularity."""
         cut.require_live()
         record = self._require_group(group_id)
         if record.status not in {
@@ -575,6 +681,12 @@ class RolloutRecoveryLedger:
             raise ValueError(
                 f"cannot abandon group {group_id!r} from {record.status.value!r}"
             )
+        if (
+            record.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+            and record.status is PromptGroupStatus.GENERATING
+        ):
+            self._abandon_entire_group(record)
+            return
         for sibling in record.siblings:
             attempt = sibling.current_attempt
             if attempt.status == RolloutAttemptStatus.SEALED:
