@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import asyncio
+import builtins
 import gc
 import json
 import tempfile
 from copy import deepcopy
 from dataclasses import asdict
+from types import SimpleNamespace
 
 import pytest
 import ray
@@ -2058,7 +2060,23 @@ def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group():
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
-def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
+def test_postprocess_nemo_gym_group_returns_task_index(
+    monkeypatch, log_full_result_tables
+):
+    imports = []
+    real_import = builtins.__import__
+
+    class FakeTable:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    def recording_import(name, *args, **kwargs):
+        imports.append(name)
+        if name == "wandb":
+            return SimpleNamespace(Table=FakeTable)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", recording_import)
     rows = [
         {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
         {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
@@ -2106,6 +2124,7 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
+    assert ("wandb" in imports) is log_full_result_tables
 
 
 def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):

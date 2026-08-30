@@ -20,12 +20,14 @@ import threading
 import time
 import uuid
 import warnings
-from typing import Any, AsyncGenerator, Optional, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
-import uvicorn
-from fastapi import FastAPI
+
+if TYPE_CHECKING:
+    import uvicorn
+    from fastapi import FastAPI
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -350,12 +352,17 @@ class VllmAsyncGenerationWorkerImpl(
         return self.base_url
 
     # ruff: noqa
-    def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
+    def _setup_vllm_openai_api_server(self, app: "FastAPI") -> "FastAPI":
         from copy import deepcopy
         from logging import Filter as LoggingFilter
         from logging import LogRecord
         from typing import List, Optional, Union
 
+        # Deferred: fastapi is only needed when this worker serves HTTP.
+        # These must stay unquoted at runtime -- FastAPI resolves handler
+        # annotations against the endpoint's globals, and a TYPE_CHECKING-only
+        # name leaves an unresolved ForwardRef, which silently demotes the
+        # parameter to a query param and 422s every request.
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
         from vllm.entrypoints.chat_utils import load_chat_template
@@ -907,6 +914,8 @@ class VllmAsyncGenerationWorkerImpl(
         from logging import Filter as LoggingFilter
         from logging import LogRecord, getLogger
 
+        # Deferred: fastapi and uvicorn are only needed when this worker
+        # actually serves the async engine over HTTP.
         import uvicorn
         from fastapi import FastAPI
 

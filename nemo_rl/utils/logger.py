@@ -22,16 +22,20 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Mapping,
+    NotRequired,
+    Optional,
+    TypedDict,
+)
 
-import mlflow
 import numpy as np
 import ray
 import requests
-import swanlab
 import torch
-import wandb
-from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 from rich.box import ROUNDED
@@ -44,6 +48,41 @@ from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.metric_utils import is_histogram_metric
 from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+if TYPE_CHECKING:
+    import mlflow
+    import swanlab
+    import wandb
+    from matplotlib import pyplot as plt
+
+
+class _LazyModule:
+    """Import a module on first attribute access, not at import time.
+
+    Each tracking backend is only touched by the logger the user configured,
+    but importing them here made every importer of ``nemo_rl.algorithms.grpo``
+    pay for all of them. These stay real module-level names so neither the call
+    sites below nor the ``unittest.mock.patch`` targets in
+    ``tests/unit/utils/test_logger.py`` need to change.
+    """
+
+    def __init__(self, module_name: str) -> None:
+        self._module_name = module_name
+        self._module: Any = None
+
+    def __getattr__(self, attr: str) -> Any:
+        if self._module is None:
+            import importlib
+
+            self._module = importlib.import_module(self._module_name)
+        return getattr(self._module, attr)
+
+
+mlflow = _LazyModule("mlflow")  # type: ignore[assignment]
+swanlab = _LazyModule("swanlab")  # type: ignore[assignment]
+wandb = _LazyModule("wandb")  # type: ignore[assignment]
+plt = _LazyModule("matplotlib.pyplot")  # type: ignore[assignment]
+
 
 # Flag to track if rich logging has been configured
 _rich_logging_configured = False
@@ -128,7 +167,7 @@ class LoggerInterface(ABC):
         pass
 
     @abstractmethod
-    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+    def log_plot(self, figure: "plt.Figure", step: int, name: str) -> None:
         """Log a matplotlib figure."""
         pass
 
@@ -205,7 +244,7 @@ class TensorboardLogger(LoggerInterface):
         # Flatten the params because add_hparams does not support nested dicts
         self.writer.add_hparams(flatten_dict(params), {})
 
-    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+    def log_plot(self, figure: "plt.Figure", step: int, name: str) -> None:
         """Log a plot to Tensorboard.
 
         Args:
@@ -400,7 +439,7 @@ class WandbLogger(LoggerInterface):
         """
         self.run.config.update(params, allow_val_change=True)
 
-    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+    def log_plot(self, figure: "plt.Figure", step: int, name: str) -> None:
         """Log a plot to wandb.
 
         Args:
@@ -482,7 +521,7 @@ class SwanlabLogger(LoggerInterface):
         """
         self.run.config.update(params, allow_val_change=True)
 
-    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+    def log_plot(self, figure: "plt.Figure", step: int, name: str) -> None:
         """Log a plot to swanlab.
 
         Args:
@@ -938,7 +977,7 @@ class MLflowLogger(LoggerInterface):
         # MLflow does not support nested dicts
         mlflow.log_params(flatten_dict(params), run_id=self.run_id)
 
-    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+    def log_plot(self, figure: "plt.Figure", step: int, name: str) -> None:
         """Log a plot to MLflow.
 
         Args:
@@ -1239,7 +1278,7 @@ class Logger(LoggerInterface):
         for logger in self.loggers:
             logger.log_histogram(histogram, step, name)
 
-    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+    def log_plot(self, figure: "plt.Figure", step: int, name: str) -> None:
         """Log a matplotlib figure to all backends.
 
         Args:

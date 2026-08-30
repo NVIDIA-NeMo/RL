@@ -29,7 +29,6 @@ import ray
 import torch
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
-from wandb import Table
 
 from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
 from nemo_rl.data.interfaces import (
@@ -2768,6 +2767,10 @@ def _postprocess_single_nemo_gym_group(
                     )
 
             if log_full_result_tables:
+                # W&B is optional. Keep the import behind the same runtime gate as
+                # table construction so a disabled backend has no import side effect.
+                from wandb import Table
+
                 to_log = [
                     [json.dumps(r, separators=((",", ":")))] for r in agent_results
                 ]
