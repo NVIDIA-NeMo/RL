@@ -5,9 +5,10 @@ They let GRPO move policy weights directly from policy workers to generation
 workers without using the driver as a model-sized staging point.
 
 The first built-in backend is NIXL. The current implementation targets policy
-workers refitting non-colocated vLLM generation workers. Colocated generation
-still uses the existing IPC/HTTP refit paths, and non-colocated generation
-without checkpoint engines still uses the existing NCCL collective path.
+workers refitting non-colocated vLLM generation workers. Without checkpoint
+engines, vLLM uses ZMQ/CUDA IPC when colocated and NCCL when non-colocated.
+SGLang uses Ray CUDA IPC when colocated and its own NCCL weight-update group
+with a Megatron policy when non-colocated.
 
 The user-facing guide is [Checkpoint-Engine Refit](../guides/checkpoint-engine-refit.md).
 

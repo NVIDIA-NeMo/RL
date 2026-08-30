@@ -1,0 +1,24 @@
+defaults: ./grpo-deepseek-v3-64n4g.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-deepseek-v3-64n4g-mxfp8-rollout
+policy:
+  generation:
+    vllm_cfg:
+      precision: "fp8"
+      is_mx: true
+      quantization_ignore_patterns:
+        - model.layers.*.self_attn.*
+        - model.layers.*.mlp.gate
+        - model.layers.*.mlp.shared_experts.*
+        - model.layers.0.mlp.*
+        - model.layers.1.mlp.*
+        - model.layers.2.mlp.*
+        - model.layers.61.*
+        - mtp.*
+        - language_model.mtp.*
+    vllm_kwargs:
+      moe_backend: flashinfer_trtllm
+logger:
+  log_dir: logs/grpo-deepseek-v3-64n4g-mxfp8-rollout
+  wandb:
+    name: grpo-deepseek-v3-64n4g-mxfp8-rollout

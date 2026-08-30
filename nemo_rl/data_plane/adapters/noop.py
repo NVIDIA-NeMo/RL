@@ -25,7 +25,10 @@ fallback (see ``factory.py``).
 
 from __future__ import annotations
 
+import pickle
+import shutil
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -220,6 +223,11 @@ class NoOpDataPlaneClient(DataPlaneClient):
         stacked = {f: _stack_or_nest(out[f]) for f in select_fields}
         return TensorDict(stacked, batch_size=(len(sample_ids),))
 
+    def list_sample_ids(self, partition_id: str) -> list[str]:
+        """List stored sample IDs without reading their tensor payloads."""
+        rec = self._partitions.get(partition_id)
+        return sorted(rec.rows) if rec is not None else []
+
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         rec = self._partitions.get(partition_id)
         if rec is None:
@@ -236,6 +244,67 @@ class NoOpDataPlaneClient(DataPlaneClient):
             rec.tags.pop(sid, None)
             for s in rec.consumed.values():
                 s.discard(sid)
+
+    def save_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist the trusted in-memory fixture for adapter contract tests.
+
+        This test-only adapter uses pickle; callers must not load checkpoints
+        from untrusted paths.
+        """
+        checkpoint_dir = Path(checkpoint_dir)
+        tmp_dir = checkpoint_dir.with_name(f"{checkpoint_dir.name}.tmp")
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True)
+        try:
+            with (tmp_dir / "noop_state.pkl").open("wb") as checkpoint_file:
+                pickle.dump(
+                    {
+                        "partitions": self._partitions,
+                        "metadata": metadata or {},
+                    },
+                    checkpoint_file,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+            if checkpoint_dir.exists():
+                shutil.rmtree(checkpoint_dir)
+            tmp_dir.rename(checkpoint_dir)
+        except Exception:
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+            raise
+
+    def load_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
+        """Restore the in-memory fixture into a clean client."""
+        if self._partitions:
+            raise RuntimeError(
+                "load_checkpoint requires a clean data-plane client with no "
+                "registered partitions"
+            )
+        checkpoint_file = Path(checkpoint_dir) / "noop_state.pkl"
+        if not checkpoint_file.is_file():
+            raise FileNotFoundError(f"NoOp checkpoint not found: {checkpoint_file}")
+        with checkpoint_file.open("rb") as state_file:
+            state = pickle.load(state_file)
+        metadata = state.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValueError("NoOp checkpoint metadata must be a dictionary")
+        if "partitions" not in state:
+            raise ValueError(
+                f"NoOp checkpoint at {checkpoint_file} has no 'partitions' key. "
+                "It was written by an incompatible version of this adapter, or the "
+                "write was interrupted. Delete it and re-run the test that produced "
+                "it; there is nothing to recover because this adapter holds no "
+                "training state."
+            )
+        self._partitions = state["partitions"]
+        self._closed = False
+        return dict(metadata)
 
     def close(self) -> None:
         if self._closed:

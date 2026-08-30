@@ -34,6 +34,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.train import (
     LogprobsPostProcessor,
     forward_with_post_processing_fn,
+    prepare_model_forward,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -113,15 +114,28 @@ class DTensorGDPOPolicyWorker(DTensorPolicyWorkerV2Impl):
             processed_inputs.input_ids = masked_input_ids
             processed_inputs.target_ids = target_ids
             try:
-                logprobs, _metrics, _ = forward_with_post_processing_fn(
-                    model=self.model,
-                    post_processing_fn=post_processing_fn,
-                    processed_mb=processed_mb,
+                # Built inside score_fn, after the masked ids are swapped in:
+                # prepare_model_forward snapshots processed_inputs, so hoisting
+                # it would score every quadrature point against the clean
+                # sequence instead of its own masked view.
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
+                    cp_size=self.cp_size,
+                    padding_token_id=self.tokenizer.pad_token_id or 0,
                     is_reward_model=False,
                     allow_flash_attn_args=self.allow_flash_attn_args,
-                    sampling_params=self.sampling_params,
-                    sequence_dim=sequence_dim,
                 )
+                with prepared.model_context_factory(), self._autocast_context():
+                    logprobs, _metrics, _ = forward_with_post_processing_fn(
+                        model=self.model,
+                        prepared=prepared,
+                        post_processing_fn=post_processing_fn,
+                        processed_mb=processed_mb,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                    )
             finally:
                 processed_inputs.input_ids = clean_input_ids
                 processed_inputs.target_ids = None
