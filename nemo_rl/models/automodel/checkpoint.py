@@ -29,13 +29,10 @@ from nemo_automodel.components.checkpoint._backports.filesystem import (
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
 )
-from nemo_automodel.components.checkpoint.checkpointing import (
+from nemo_automodel.components.checkpoint.config import (
     CheckpointingConfig as AutomodelCheckpointingConfig,
 )
-from nemo_automodel.components.checkpoint.config import (
-    SaveConsolidatedMode,
-    _normalize_save_consolidated,
-)
+from nemo_automodel.components.checkpoint.config import SaveConsolidatedMode
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoTokenizer
@@ -44,30 +41,29 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.native_checkpoint import save_tokenizer_on_rank0
 
 
-_CHECKPOINTER_CONSTRUCTION_FIELDS = frozenset(
+_CHECKPOINTER_RESOURCE_FIELDS = frozenset(
     {
         "consolidation_timeout_minutes",
         "is_async",
         "is_peft",
         "model_save_format",
-        "save_consolidated",
         "single_rank_consolidation",
     }
 )
-
-
-def _normalize_supported_save_consolidated(
-    value: bool | str | SaveConsolidatedMode,
-) -> SaveConsolidatedMode:
-    """Normalize the consolidated-save mode supported by NeMo-RL."""
-    mode = _normalize_save_consolidated(value)
-    if mode == SaveConsolidatedMode.FINAL:
-        raise ValueError(
-            "save_consolidated: final is not supported because NeMo-RL does not "
-            "mark final checkpoint saves. Use save_consolidated: true to export "
-            "consolidated weights."
-        )
-    return mode
+_AUTOMODEL_CONFIG_FIELDS = frozenset(
+    {
+        "consolidation_timeout_minutes",
+        "dequantize_base_checkpoint",
+        "is_async",
+        "is_peft",
+        "model_cache_dir",
+        "model_repo_id",
+        "model_save_format",
+        "save_consolidated",
+        "single_rank_consolidation",
+        "skip_task_head_prefixes_for_base_model",
+    }
+)
 
 
 def _patch_qwen_vl_vision_key_mapping() -> None:
@@ -192,38 +188,25 @@ class AutomodelCheckpointManager:
         if config_updates is None:
             config_updates = {}
 
-        # Initialize a base config with sensible defaults
+        # Let Automodel own defaults and normalization for its checkpoint fields.
+        # In particular, its canonical default is save_consolidated="final" and
+        # legacy booleans are normalized to false/every in __post_init__.
+        automodel_config_updates = {
+            key: value
+            for key, value in config_updates.items()
+            if key in _AUTOMODEL_CONFIG_FIELDS
+        }
         base_cfg = AutomodelCheckpointingConfig(
             enabled=True,
             checkpoint_dir=checkpoint_root or "",
-            model_save_format=config_updates.get("model_save_format", "safetensors"),
-            model_cache_dir=config_updates.get("model_cache_dir", ""),
-            model_repo_id=config_updates.get("model_repo_id", ""),
-            save_consolidated=_normalize_supported_save_consolidated(
-                config_updates.get("save_consolidated", False)
-            ),
-            is_peft=config_updates.get("is_peft", False),
-            is_async=config_updates.get("is_async", False),
-            single_rank_consolidation=config_updates.get(
-                "single_rank_consolidation", False
-            ),
-            consolidation_timeout_minutes=config_updates.get(
-                "consolidation_timeout_minutes", 30
-            ),
-            dequantize_base_checkpoint=config_updates.get(
-                "dequantize_base_checkpoint", False
-            ),
-            skip_task_head_prefixes_for_base_model=config_updates.get(
-                "skip_task_head_prefixes_for_base_model", None
-            ),
+            **automodel_config_updates,
         )
         self.checkpoint_config = base_cfg
         self.checkpointer = self._build_checkpointer(base_cfg)
 
     def _build_checkpointer(self, config: AutomodelCheckpointingConfig) -> Checkpointer:
         """Build an Automodel Checkpointer for this worker's mesh ranks."""
-        return Checkpointer(
-            config=config,
+        return config.build(
             dp_rank=self._get_dp_rank(),
             tp_rank=self._get_tp_rank(),
             pp_rank=0,
@@ -246,14 +229,7 @@ class AutomodelCheckpointManager:
             model_save_format = model_save_format.value
         updates["model_save_format"] = model_save_format
 
-        if "save_consolidated" in updates:
-            updates["save_consolidated"] = _normalize_supported_save_consolidated(
-                updates["save_consolidated"]
-            )
-
-        updated_config = replace(config, **updates)
-        _normalize_supported_save_consolidated(updated_config.save_consolidated)
-        return updated_config
+        return replace(config, **updates)
 
     @staticmethod
     def _requires_checkpointer_rebuild(
@@ -261,10 +237,14 @@ class AutomodelCheckpointManager:
         updated_config: AutomodelCheckpointingConfig,
     ) -> bool:
         """Return whether an update changes Checkpointer-owned resources."""
-        return any(
+        resource_field_changed = any(
             getattr(current_config, field_name) != getattr(updated_config, field_name)
-            for field_name in _CHECKPOINTER_CONSTRUCTION_FIELDS
+            for field_name in _CHECKPOINTER_RESOURCE_FIELDS
         )
+        consolidation_group_requirement_changed = (
+            current_config.save_consolidated != SaveConsolidatedMode.FALSE
+        ) != (updated_config.save_consolidated != SaveConsolidatedMode.FALSE)
+        return resource_field_changed or consolidation_group_requirement_changed
 
     @staticmethod
     def _apply_config_in_place(
@@ -276,10 +256,29 @@ class AutomodelCheckpointManager:
             setattr(target, field.name, getattr(source, field.name))
 
     def _replace_checkpointer(self, config: AutomodelCheckpointingConfig) -> None:
-        """Close the current Checkpointer and rebuild its owned resources."""
+        """Replace constructor-owned resources without invalidating on build failure."""
         assert self.checkpointer is not None
-        self.checkpointer.close()
-        self.checkpointer = self._build_checkpointer(config)
+        old_checkpointer = self.checkpointer
+
+        # Do not overlap a previous save with construction of new stagers/groups.
+        # Keep the old groups alive until construction succeeds so a failed build
+        # leaves the manager usable.
+        old_checkpointer.maybe_wait_for_staging()
+        old_checkpointer.async_wait()
+        new_checkpointer = self._build_checkpointer(config)
+
+        try:
+            old_checkpointer.close()
+        except Exception as close_error:
+            try:
+                new_checkpointer.close()
+            except Exception as cleanup_error:
+                close_error.add_note(
+                    f"Replacement Checkpointer cleanup also failed: {cleanup_error!r}"
+                )
+            raise
+
+        self.checkpointer = new_checkpointer
         self.checkpoint_config = config
 
     def update_checkpointer_config(
@@ -317,34 +316,6 @@ class AutomodelCheckpointManager:
         self._apply_config_in_place(cfg, updated_cfg)
         self.checkpoint_config = cfg
 
-        # Rebuild _addons list based on updated config
-        # This is necessary because _addons is populated during __init__ based on config
-        self._rebuild_checkpointer_addons()
-
-    def _rebuild_checkpointer_addons(self) -> None:
-        """Rebuild the checkpointer's _addons list based on current config.
-
-        The Checkpointer's _addons list is populated during __init__ based on config.
-        When config changes (e.g., model_save_format or is_peft), we need to rebuild
-        the addons list to match the new config.
-        """
-        if self.checkpointer is None or self.checkpoint_config is None:
-            return
-
-        from nemo_automodel.components.checkpoint.addons import (
-            ConsolidatedHFAddon,
-            PeftAddon,
-        )
-        from nemo_automodel.components.checkpoint.checkpointing import (
-            _should_write_hf_metadata,
-        )
-
-        self.checkpointer._addons = []
-        if _should_write_hf_metadata(self.checkpoint_config):
-            self.checkpointer._addons.append(ConsolidatedHFAddon())
-        if self.checkpoint_config.is_peft:
-            self.checkpointer._addons.append(PeftAddon())
-
     def finalize_async_save(self) -> None:
         """Block until in-flight async checkpoint writes have landed on disk.
 
@@ -373,6 +344,8 @@ class AutomodelCheckpointManager:
         tokenizer: Optional[AutoTokenizer] = None,
         tokenizer_path: Optional[str] = None,
         checkpointing_cfg: Optional[CheckpointingConfig] = None,
+        *,
+        is_final_checkpoint: bool,
         lora_enabled: bool = False,
         peft_config: Optional[PeftConfig] = None,
     ) -> None:
@@ -389,6 +362,7 @@ class AutomodelCheckpointManager:
             tokenizer: Optional tokenizer to save with the checkpoint.
             tokenizer_path: Optional path to save tokenizer separately.
             checkpointing_cfg: Checkpointing configuration.
+            is_final_checkpoint: Whether this is the terminal training checkpoint.
             lora_enabled: Whether LoRA is enabled.
             peft_config: Optional PEFT configuration.
         """
@@ -406,18 +380,7 @@ class AutomodelCheckpointManager:
         checkpoint_kwargs = {
             key: value
             for key, value in checkpointing_cfg.items()
-            if key
-            in {
-                "model_save_format",
-                "save_consolidated",
-                "is_peft",
-                "model_cache_dir",
-                "model_repo_id",
-                "is_async",
-                "single_rank_consolidation",
-                "consolidation_timeout_minutes",
-                "dequantize_base_checkpoint",
-            }
+            if key in _AUTOMODEL_CONFIG_FIELDS
         }
         save_peft_config = checkpointing_cfg.get("peft_config")
         if lora_enabled:
@@ -436,6 +399,7 @@ class AutomodelCheckpointManager:
             weights_path=weights_path,
             peft_config=save_peft_config,
             tokenizer=tokenizer if tokenizer_path is None else None,
+            is_final_checkpoint=is_final_checkpoint,
         )
 
         if optimizer_path and optimizer is not None:

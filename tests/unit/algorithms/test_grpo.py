@@ -4478,6 +4478,12 @@ def test_early_stop_saves_final_checkpoint(mock_grpo_components, train_func, tmp
     assert checkpointer.init_tmp_checkpoint.call_args.args[0] == 2
     assert checkpointer.init_tmp_checkpoint.call_args.args[1]["val_reward"] == 0.75
     mock_grpo_components["policy"].save_checkpoint.assert_called_once()
+    assert (
+        mock_grpo_components["policy"].save_checkpoint.call_args.kwargs[
+            "is_final_checkpoint"
+        ]
+        is True
+    )
     assert checkpointer.shutdown.called
 
 

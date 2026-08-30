@@ -27,7 +27,10 @@ checkpointing:
     save_period: 10
     checkpoint_must_save_by: null
     model_save_format: "safetensors"
-    save_consolidated: false
+    # Canonical Automodel modes: "false", "final", or "every".
+    save_consolidated: "final"
+    single_rank_consolidation: false
+    consolidation_timeout_minutes: 30
     save_optimizer: true
 
 policy: &POLICY_BASE

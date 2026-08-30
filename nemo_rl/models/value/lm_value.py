@@ -428,6 +428,8 @@ class Value(ValueInterface):
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
         checkpointing_cfg: Optional[CheckpointingConfig] = None,
+        *,
+        is_final_checkpoint: bool,
     ) -> None:
         """Save a checkpoint of the value model."""
         megatron_enable = bool(self.cfg.get("megatron_cfg", {}).get("enabled", False))
@@ -449,6 +451,7 @@ class Value(ValueInterface):
                 optimizer_path=optimizer_path,
                 tokenizer_path=tokenizer_path,
                 checkpointing_cfg=checkpointing_cfg,
+                is_final_checkpoint=is_final_checkpoint,
             )
         ray.get(futures)
 

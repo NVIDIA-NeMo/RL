@@ -780,6 +780,9 @@ def xtoken_off_policy_distillation_train(
                                 ckpt_path, "policy", "tokenizer"
                             ),
                             checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=(
+                                is_last_step or should_save_by_timeout
+                            ),
                         )
                         torch.save(
                             dataloader.state_dict(),

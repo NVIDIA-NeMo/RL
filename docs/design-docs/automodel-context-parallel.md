@@ -91,11 +91,11 @@ model = model_class.from_pretrained(
   ([#1172](https://github.com/NVIDIA-NeMo/Automodel/pull/1172)).
 - `Checkpointer._should_write_hf_metadata()` became the module-level
   `_should_write_hf_metadata(config)`.
-- `save_consolidated` now uses `SaveConsolidatedMode`; NeMo RL normalizes values with
-  `_normalize_save_consolidated()` after configuration updates
-  ([#2289](https://github.com/NVIDIA-NeMo/Automodel/pull/2289)). NeMo RL currently rejects
-  `save_consolidated: final` because its checkpoint calls do not identify the final save;
-  use `true`/`every` when inline consolidated export is required.
+- `save_consolidated` now uses the canonical `"false"`, `"final"`, and `"every"`
+  modes ([#2289](https://github.com/NVIDIA-NeMo/Automodel/pull/2289)). NeMo RL
+  delegates normalization to Automodel, explicitly marks terminal checkpoint saves,
+  and supports all three modes. Legacy booleans remain accepted by Automodel, but new
+  NeMo RL configurations should use the canonical strings.
 
 The upgrade removes three compatibility workarounds:
 

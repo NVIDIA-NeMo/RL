@@ -1193,6 +1193,11 @@ def grpo_train_sync(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
                             checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=(
+                                is_last_step
+                                or early_stop_message is not None
+                                or should_save_by_timeout
+                            ),
                         )
                         if master_config.data["use_multiple_dataloader"]:
                             for (

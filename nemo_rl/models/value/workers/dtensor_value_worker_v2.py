@@ -576,6 +576,8 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
         checkpointing_cfg: Optional[CheckpointingConfig] = None,
+        *,
+        is_final_checkpoint: bool,
     ) -> None:
         """Save a checkpoint of the value model."""
         self.checkpoint_manager.save_checkpoint(
@@ -587,6 +589,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
             checkpointing_cfg=checkpointing_cfg,
+            is_final_checkpoint=is_final_checkpoint,
             lora_enabled=self.lora_enabled,
             peft_config=self.peft_config,
         )

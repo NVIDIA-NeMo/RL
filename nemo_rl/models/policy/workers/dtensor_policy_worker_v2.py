@@ -1345,6 +1345,8 @@ class DTensorPolicyWorkerV2Impl(
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
         checkpointing_cfg: Optional[CheckpointingConfig] = None,
+        *,
+        is_final_checkpoint: bool,
     ) -> None:
         """Save a checkpoint of the model.
 
@@ -1359,6 +1361,7 @@ class DTensorPolicyWorkerV2Impl(
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
             checkpointing_cfg=checkpointing_cfg,
+            is_final_checkpoint=is_final_checkpoint,
             lora_enabled=self.lora_enabled,
             peft_config=self.peft_config,
         )

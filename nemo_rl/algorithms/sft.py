@@ -645,6 +645,9 @@ def sft_train(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
                             checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=(
+                                is_last_step or should_save_by_timeout
+                            ),
                         )
                         torch.save(
                             train_dataloader.state_dict(),

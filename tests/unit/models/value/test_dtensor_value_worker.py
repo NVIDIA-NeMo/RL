@@ -494,6 +494,7 @@ def test_value_worker_parallelism_equivalence(
         ref.save_checkpoint(
             weights_path=weights_path,
             checkpointing_cfg=_make_checkpointing_cfg(tmp_path),
+            is_final_checkpoint=False,
         )
         ref.shutdown()
         ref = None
@@ -584,6 +585,7 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
         weights_path=weights_path,
         optimizer_path=optimizer_path,
         checkpointing_cfg=_make_checkpointing_cfg(tmp_path / "value_ckpt_root"),
+        is_final_checkpoint=False,
     )
 
     assert os.path.isdir(weights_path), (
@@ -650,6 +652,7 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
             weights_path=resaved_weights_path,
             optimizer_path=resaved_optimizer_path,
             checkpointing_cfg=_make_checkpointing_cfg(resaved_root),
+            is_final_checkpoint=False,
         )
 
         saved_state = _load_dcp_state(

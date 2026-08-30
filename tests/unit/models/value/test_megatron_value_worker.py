@@ -549,7 +549,7 @@ def test_value_worker_parallelism_equivalence(
         # Save weights, then reload into a feature-ON worker (same weights).
         weights_path = os.path.join(str(tmp_path), "value", "weights")
         ref.prepare_for_inference()
-        ref.save_checkpoint(weights_path=weights_path)
+        ref.save_checkpoint(weights_path=weights_path, is_final_checkpoint=False)
         ref.shutdown()
         ref = None
 
@@ -625,7 +625,7 @@ def test_value_worker_context_parallel_equivalence(tiny_qwen2_model_path, tmp_pa
         # Save weights, then reload into the CP=2 worker (same weights).
         weights_path = os.path.join(str(tmp_path), "value", "weights")
         ref.prepare_for_inference()
-        ref.save_checkpoint(weights_path=weights_path)
+        ref.save_checkpoint(weights_path=weights_path, is_final_checkpoint=False)
         ref.shutdown()
         ref = None
 
@@ -822,6 +822,7 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
     value.save_checkpoint(
         weights_path=weights_path,
         optimizer_path=optimizer_path,
+        is_final_checkpoint=False,
     )
 
     # Verify on-disk artifacts.
@@ -890,6 +891,7 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
         resumed.save_checkpoint(
             weights_path=resaved_weights_path,
             optimizer_path=resaved_optimizer_path,
+            is_final_checkpoint=False,
         )
         assert not Path(resaved_optimizer_path).exists()
 

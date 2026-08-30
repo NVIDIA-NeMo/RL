@@ -7,7 +7,7 @@ checkpointing:
   save_period: 10
   checkpoint_must_save_by: null
   model_save_format: "safetensors"
-  save_consolidated: false
+  save_consolidated: "false"
   save_optimizer: true
 
 grpo:

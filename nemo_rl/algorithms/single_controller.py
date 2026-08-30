@@ -2094,6 +2094,9 @@ class SingleControllerActor:
                         await self._save_checkpoint(
                             step_metrics,
                             is_policy_training_step=is_policy_training_step,
+                            is_final_checkpoint=(
+                                is_last_step or should_save_by_timeout
+                            ),
                         )
 
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
@@ -2711,6 +2714,7 @@ class SingleControllerActor:
         step_metrics: dict[str, Any],
         *,
         is_policy_training_step: bool,
+        is_final_checkpoint: bool,
     ) -> None:
         """Write a full checkpoint for the just-finished train step.
 
@@ -2843,6 +2847,7 @@ class SingleControllerActor:
                 else None,
                 tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
                 checkpointing_cfg=self._master_config.checkpointing,
+                is_final_checkpoint=is_final_checkpoint,
             )
             await asyncio.to_thread(self._value.finish_training)
             # Also covers a warmup step, which never ran prepare_for_training in
@@ -2864,6 +2869,7 @@ class SingleControllerActor:
             else None,
             tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
             checkpointing_cfg=self._master_config.checkpointing,
+            is_final_checkpoint=is_final_checkpoint,
         )
 
         await asyncio.to_thread(

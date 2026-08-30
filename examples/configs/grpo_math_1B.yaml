@@ -123,7 +123,10 @@ checkpointing:
   # toward short rollouts at a save boundary).
   load_replay_buffer: true
   model_save_format: "safetensors"
-  save_consolidated: false
+  # Canonical Automodel modes: "false", "final", or "every".
+  save_consolidated: "final"
+  single_rank_consolidation: false
+  consolidation_timeout_minutes: 30
   save_optimizer: true
   # SingleController only: include native TQ state and the metadata-only replay
   # index. Required for recovery-capable samplers to preserve completed,

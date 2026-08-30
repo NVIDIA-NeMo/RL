@@ -1260,6 +1260,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
         checkpointing_cfg: Optional[CheckpointingConfig] = None,
+        *,
+        is_final_checkpoint: bool,
     ) -> None:
         """Save a checkpoint of the model.
 
@@ -1276,6 +1278,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 optimizer_path=optimizer_path,
                 tokenizer_path=tokenizer_path,
                 checkpointing_cfg=checkpointing_cfg,
+                is_final_checkpoint=is_final_checkpoint,
             )
         else:
             if (

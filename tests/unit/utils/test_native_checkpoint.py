@@ -389,6 +389,7 @@ def test_convert_dcp_to_hf(policy, num_gpus, request):
                 "enabled": True,
                 "model_save_format": "torch_save" if policy_version_is_v2 else None,
             },
+            is_final_checkpoint=False,
         )
         policy.finalize_async_save()
 

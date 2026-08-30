@@ -466,6 +466,7 @@ def test_dtensor_v2_checkpoint_save_and_load(
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
                 checkpointing_cfg=checkpointing_config,
+                is_final_checkpoint=False,
             )
             policy.finalize_async_save()
 

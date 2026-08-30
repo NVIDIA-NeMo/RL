@@ -9,7 +9,7 @@ checkpointing:
   keep_top_k: 1
   checkpoint_must_save_by: 00:03:30:00
   model_save_format: safetensors
-  save_consolidated: false
+  save_consolidated: "false"
 grpo:
   num_prompts_per_step: 2
   num_generations_per_prompt: 2

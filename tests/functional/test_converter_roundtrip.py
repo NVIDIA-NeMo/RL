@@ -241,7 +241,9 @@ def create_dcp_checkpoint(
         temp_dir, "dcp_checkpoint" + ("_v2" if use_v2 else "_v1")
     )
     policy.save_checkpoint(
-        dcp_checkpoint_path, checkpointing_cfg=config["checkpointing"]
+        dcp_checkpoint_path,
+        checkpointing_cfg=config["checkpointing"],
+        is_final_checkpoint=False,
     )
     policy.finalize_async_save()
 
