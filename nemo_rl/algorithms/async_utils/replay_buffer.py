@@ -63,18 +63,22 @@ REPLAY_BUFFER_METADATA_SCHEMA_VERSION = 1
 REPLAY_BUFFER_METADATA_STORAGE: Literal["tq_checkpoint"] = "tq_checkpoint"
 
 CheckpointMutationKind = Literal[
+    "advantage_writeback",
     "group_commits",
     "group_removals",
     "other",
     "prompt_reservations",
+    "recovery_restore",
     "recovery_retries",
     "sample_clears",
     "sibling_seals",
 ]
 CHECKPOINT_MUTATION_KINDS: tuple[CheckpointMutationKind, ...] = (
+    "advantage_writeback",
     "group_commits",
     "group_removals",
     "prompt_reservations",
+    "recovery_restore",
     "recovery_retries",
     "sample_clears",
     "sibling_seals",
@@ -92,6 +96,7 @@ class DataPlaneCheckpointBarrierTelemetry:
     waiting_mutations: int
     max_waiting_mutations: int
     checkpoint_active: bool
+
 
 # These TypedDicts describe the versioned, plain-mapping checkpoint wire
 # format. They are intentionally not dataclass instances: persisting a
@@ -1559,9 +1564,7 @@ class TQReplayBuffer:
             raise ValueError("cleared rows cannot be retained as training claims")
         if len(group_ids) != len(set(group_ids)):
             raise ValueError("replay removal contains duplicate group IDs")
-        index_by_group_id = {
-            group_id: i for i, group_id in enumerate(self._group_ids)
-        }
+        index_by_group_id = {group_id: i for i, group_id in enumerate(self._group_ids)}
         if len(index_by_group_id) != len(self._group_ids):
             raise RuntimeError("replay buffer contains duplicate live group IDs")
         missing_group_ids = [

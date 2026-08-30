@@ -377,6 +377,10 @@ class WandbLogger(LoggerInterface):
             name: Name of the metric or pattern (e.g. 'ray/*')
             step_metric: Optional name of the step metric to use
         """
+        if "*" in name and (not name.endswith("*") or name.count("*") != 1):
+            raise ValueError(
+                f"W&B metric patterns support exactly one trailing '*': {name!r}"
+            )
         with self._log_lock:
             existing_step_metric = self._metric_step_patterns.get(name)
             if name in self._metric_step_patterns and (
