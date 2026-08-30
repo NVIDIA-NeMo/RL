@@ -694,7 +694,7 @@ def test_headline_drops_per_op_detail_but_keeps_the_percentages():
     assert len(head) < len(metrics), f"{len(head)} of {len(metrics)}"
     assert not [k for k in head if k.split("/")[1:2] in (["get"], ["put"], ["clear"])]
     assert "step/percent_of_dataplane/by_op/get" in head
-    assert "step/wall_ms" in head and "step/frac_of_step" in head
+    assert "step/wall_s" in head and "step/frac_of_step" in head
     assert breakdown_table(metrics)[1], "the table still has rows"
     client.close()
 
@@ -733,7 +733,7 @@ def test_breakdown_table_rows_by_op_worst_first():
     is the second column for the same reason."""
     columns, rows = breakdown_table(
         {
-            "step/wall_ms": 100.0,
+            "step/wall_s": 0.1,
             "step/percent_of_dataplane/by_op/get": 10.0,
             "step/percent_of_dataplane/by_op/put": 90.0,
             "step/by_op/get/calls": 8,
@@ -770,7 +770,7 @@ def test_breakdown_table_leaves_withheld_series_empty():
 
 
 def test_breakdown_table_is_empty_when_nothing_ran():
-    assert breakdown_table({"step/wall_ms": 0.0})[1] == []
+    assert breakdown_table({"step/wall_s": 0.0})[1] == []
 
 
 def test_breakdown_table_ignores_reserved_namespaces():
@@ -1195,15 +1195,15 @@ def test_codec_pack_unpack_time_is_reported_separately():
     codec.record_codec_s("unpack", 0.004)  # 4 ms
 
     metrics = client.get_step_metrics(1.0)
-    assert metrics["step/codec/pack_ms"] == pytest.approx(10.0, rel=1e-3)
-    assert metrics["step/codec/unpack_ms"] == pytest.approx(4.0, rel=1e-3)
+    assert metrics["step/codec/pack_s"] == pytest.approx(0.010, rel=1e-3)
+    assert metrics["step/codec/unpack_s"] == pytest.approx(0.004, rel=1e-3)
     # not folded into the transport totals
-    assert metrics["step/wall_ms"] == 0.0
+    assert metrics["step/wall_s"] == 0.0
     # and charted, not just tabulated
-    assert "step/codec/pack_ms" in headline_series(metrics)
+    assert "step/codec/pack_s" in headline_series(metrics)
 
     # drained exactly once: a second step reports zero, not the same 10 ms
-    assert client.get_step_metrics(1.0)["step/codec/pack_ms"] == 0.0
+    assert client.get_step_metrics(1.0)["step/codec/pack_s"] == 0.0
     client.close()
 
 
@@ -1218,7 +1218,7 @@ def test_inspection_snapshot_does_not_steal_codec_time():
     codec.record_codec_s("pack", 0.010)
 
     client.snapshot()  # inspection: must not consume it
-    assert client.get_step_metrics(1.0)["step/codec/pack_ms"] == pytest.approx(
-        10.0, rel=1e-3
+    assert client.get_step_metrics(1.0)["step/codec/pack_s"] == pytest.approx(
+        0.010, rel=1e-3
     )
     client.close()

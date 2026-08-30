@@ -111,7 +111,7 @@ def _isolate_codec_timer():
 
     ``pack_jagged_fields`` records into a process-global timer, so a test that
     packs (the codec and column_io suites) leaves residue that the next
-    ``get_step_metrics`` would report as its own ``step/codec/pack_ms``.
+    ``get_step_metrics`` would report as its own ``step/codec/pack_s``.
     """
     from nemo_rl.data_plane.codec import drain_codec_ms
 
