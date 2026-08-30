@@ -170,6 +170,24 @@ class FailAfterPutAndClearDataPlaneClient(FailAfterPutDataPlaneClient):
         raise OSError("injected rollback failure")
 
 
+class BlockFirstClearDataPlaneClient(FakeDataPlaneClient):
+    """Pause one clear so another structural mutation can shift list indices."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.clear_started = threading.Event()
+        self.release_clear = threading.Event()
+        self._blocked = False
+
+    def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
+        if not self._blocked:
+            self._blocked = True
+            self.clear_started.set()
+            if not self.release_clear.wait(timeout=5):
+                raise TimeoutError("timed out waiting to release the first clear")
+        super().clear_samples(sample_ids, partition_id)
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -363,6 +381,13 @@ class TestDataPlaneCheckpointBarrier:
 
 
 class TestTQReplayBufferReserveCommit:
+    def test_reserve_rejects_duplicate_live_group_id(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+        buf.reserve(weight_version=0, group_id="group-0")
+
+        with pytest.raises(ValueError, match="duplicate live group_id"):
+            buf.reserve(weight_version=1, group_id="group-0")
+
     def test_commit_waits_for_active_checkpoint(self):
         async def exercise() -> None:
             dp = FakeDataPlaneClient()
@@ -691,6 +716,38 @@ class TestTQReplayBufferRemove:
         assert dp.clear_thread_ids
         assert dp.clear_thread_ids[0] != event_loop_thread_id
 
+    def test_concurrent_removal_re_resolves_stable_group_ids_after_dp_await(self):
+        async def exercise() -> None:
+            dp = BlockFirstClearDataPlaneClient()
+            buf = _make_buffer(dp)
+            group_ids = [buf.reserve(weight_version=i) for i in range(3)]
+            for i, group_id in enumerate(group_ids):
+                await buf.commit(
+                    group_id,
+                    _make_record(),
+                    start_weight_version=i,
+                    end_weight_version=i,
+                )
+
+            # Removing the final slot pauses in DataPlane. Removing the first slot
+            # concurrently shifts the final slot from index 2 to index 1.
+            remove_last = asyncio.create_task(buf.remove([2], remove_in_dp=True))
+            try:
+                clear_started = await asyncio.to_thread(dp.clear_started.wait, 2)
+                assert clear_started
+                assert await buf.remove([0], remove_in_dp=True) == 1
+            finally:
+                dp.release_clear.set()
+            assert await remove_last == 1
+
+            assert buf.group_ids == (group_ids[1],)
+            assert buf.start_weight_list == [1]
+            assert buf.end_weight_list == [1]
+            assert buf.ready_list == [True]
+            assert set(dp._rows) == set(buf.meta_list[0].sample_ids)
+
+        asyncio.run(exercise())
+
     def test_remove_drops_indices_and_clears_dp_when_requested(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
@@ -735,6 +792,28 @@ class TestTQReplayBufferRemove:
             list(metas[1].sample_ids),
         ]
         assert dp.depth() == 2 * _N_GENS
+        assert dp.clear_calls == []
+
+    def test_remove_rejects_duplicate_indices_before_mutating(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=0)
+
+        with pytest.raises(ValueError, match="duplicate indices"):
+            _run(buf.remove([0, 0], remove_in_dp=True))
+
+        assert buf.size() == 1
+        assert dp.clear_calls == []
+
+    def test_remove_rejects_negative_indices_before_mutating(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=0)
+
+        with pytest.raises(IndexError, match="must be non-negative"):
+            _run(buf.remove([-1], remove_in_dp=True))
+
+        assert buf.size() == 1
         assert dp.clear_calls == []
 
     def test_remove_empty_is_noop(self):
