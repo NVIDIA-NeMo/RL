@@ -27,7 +27,6 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
-    AdvantageEstimator,
     GAEConfig,
     GeneralizedAdvantageEstimator,
     RawRewardAdvantageEstimator,
@@ -1134,7 +1133,7 @@ def dynamic_sampling(
     return batch_to_return, is_batch_complete, batch_cache, dynamic_sampling_metrics
 
 
-def _create_advantage_estimator(master_config: MasterConfig) -> AdvantageEstimator:
+def _create_advantage_estimator(master_config: MasterConfig):
     """Create and return an advantage estimator based on configuration.
 
     Both supported estimators return an ``AdvantageResult``. `gae` populates
@@ -1652,12 +1651,12 @@ def ppo_train(
                     )
                     if "values" in train_data:
                         adv_kwargs["values"] = train_data["values"]
-                    result = adv_estimator.compute_advantage(**adv_kwargs)
+                    adv_result = adv_estimator.compute_advantage(**adv_kwargs)
                     del prompt_ids_for_adv
 
-                    train_data["advantages"] = result.advantages
-                    if result.returns is not None:
-                        train_data["returns"] = result.returns
+                    train_data["advantages"] = adv_result.advantages
+                    if adv_result.returns is not None:
+                        train_data["returns"] = adv_result.returns
 
                 # PPO: Multiple training steps per rollout
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
@@ -2661,11 +2660,11 @@ def async_ppo_train(
                     )
                     if "values" in train_data:
                         adv_kwargs["values"] = train_data["values"]
-                    result = adv_estimator.compute_advantage(**adv_kwargs)
+                    adv_result = adv_estimator.compute_advantage(**adv_kwargs)
                     del prompt_ids_for_adv
-                    train_data["advantages"] = result.advantages
-                    if result.returns is not None:
-                        train_data["returns"] = result.returns
+                    train_data["advantages"] = adv_result.advantages
+                    if adv_result.returns is not None:
+                        train_data["returns"] = adv_result.returns
 
                 # ---- 7. ppo_epochs inner loop (critic, then actor) ----
                 # Each epoch: value on GPU -> train -> off. Then, once past critic

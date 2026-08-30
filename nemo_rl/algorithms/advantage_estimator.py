@@ -29,7 +29,7 @@ Reference papers:
 """
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Protocol, runtime_checkable
+from typing import Literal, Optional
 
 import torch
 from pydantic import BaseModel
@@ -57,31 +57,6 @@ class AdvantageResult:
     advantages: torch.Tensor
     returns: torch.Tensor | None = None
     metrics: dict[str, float] = field(default_factory=dict)
-
-
-@runtime_checkable
-class AdvantageEstimator(Protocol):
-    """The contract the algorithm loops rely on.
-
-    Declared as a ``Protocol`` rather than a base class so that estimators living
-    outside ``nemo_rl`` satisfy it structurally, without having to import from
-    here.
-
-    The parameters are keyword-only because that is how the loops call it: every
-    estimator receives the union of what all of them need, and absorbs the rest
-    through ``**kwargs``. An estimator may therefore accept extra arguments, but
-    it may not *require* any beyond the three below -- otherwise the loops cannot
-    treat the estimators interchangeably.
-    """
-
-    def compute_advantage(
-        self,
-        *,
-        prompt_ids: torch.Tensor,
-        rewards: torch.Tensor,
-        mask: torch.Tensor,
-        **kwargs: object,
-    ) -> AdvantageResult: ...
 
 
 class AdvEstimatorConfig(BaseModel, extra="allow"):
@@ -176,7 +151,7 @@ class GDPOAdvantageEstimator:
         prompt_ids,
         rewards,
         mask,
-        repeated_batch=None,
+        repeated_batch,
         **kwargs,
     ):
         """Compute GDPO advantages.
@@ -185,10 +160,6 @@ class GDPOAdvantageEstimator:
             prompt_ids: Tensor identifying which prompt each sample belongs to (for per-prompt baselines).
             rewards: Unused; for interface consistency.
             repeated_batch: Batch containing named reward component keys (e.g. reward/correctness, reward/format).
-                Required, and checked below. It carries a default only so this
-                signature does not demand more than the shared
-                ``AdvantageEstimator`` contract, which promises every estimator
-                no more than prompt_ids/rewards/mask.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
             **kwargs: Additional arguments (unused).
 
@@ -196,11 +167,6 @@ class GDPOAdvantageEstimator:
             AdvantageResult whose ``advantages`` has shape
             [batch_size, seq_len]; ``returns`` is None.
         """
-        if repeated_batch is None:
-            raise ValueError(
-                "GDPO needs repeated_batch to read its reward/<name> components; "
-                "pass it as a keyword argument to compute_advantage."
-            )
         reward_component_keys = get_gdpo_reward_component_keys(repeated_batch)
         if len(reward_component_keys) < 2:
             raise ValueError(
@@ -506,7 +472,7 @@ class GeneralizedAdvantageEstimator:
         prompt_ids,
         rewards,
         mask,
-        values=None,
+        values,
         *,
         logprobs_policy=None,
         logprobs_reference=None,
@@ -521,30 +487,10 @@ class GeneralizedAdvantageEstimator:
           (default: gae_lambda)
         When none of these are set, this is standard GAE.
 
-        Args:
-            prompt_ids: Tensor identifying which prompt each sample belongs to.
-            rewards: Sequence-level rewards, shape [batch_size].
-            mask: Response token mask, shape [batch_size, seq_len].
-            values: Value predictions, shape [batch_size, response_length].
-                Required, and checked below. It carries a default only so this
-                signature does not demand more than the shared
-                ``AdvantageEstimator`` contract, which promises every estimator
-                no more than prompt_ids/rewards/mask.
-            reference_logprobs: Reference-policy logprobs, for KL-in-reward.
-            logprobs: Current-policy logprobs, for KL-in-reward.
-            **kwargs: Additional arguments (unused).
-
         Returns:
             AdvantageResult with ``advantages`` and ``returns``, each of shape
             [batch_size, seq_len].
         """
-        if values is None:
-            raise ValueError(
-                "GAE needs per-token value estimates; enable the critic so that "
-                "'values' is present in the training batch, or switch "
-                "ppo.adv_estimator.name to an estimator that needs no value model."
-            )
-
         token_level_rewards = self._build_token_level_rewards(
             rewards,
             mask,
