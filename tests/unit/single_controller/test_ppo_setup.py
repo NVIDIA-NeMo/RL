@@ -103,7 +103,11 @@ def _make_master_config(
     block is active and the other one stays None.
     """
     return MasterConfig.model_construct(
-        data_plane={"enabled": True, "impl": "transfer_queue"},
+        data_plane={
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "simple",
+        },
         data={
             "use_multiple_dataloader": False,
             "shuffle": False,
@@ -134,6 +138,7 @@ def _make_master_config(
         },
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
+        cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=min_groups_for_streaming_train,
             max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
@@ -407,6 +412,19 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="colocated.enabled=false"):
             validate_single_controller_config(mc)
 
+    @pytest.mark.parametrize(
+        "make_config", [_ppo_master_config, _make_master_config], ids=["ppo", "grpo"]
+    )
+    @pytest.mark.parametrize("epochs", [-1, 0], ids=["negative", "zero"])
+    def test_rejects_a_non_positive_max_num_epochs(self, make_config, epochs):
+        """docs/guides/ppo.md tells async-PPO users to set -1; carried onto SC it
+        makes the rollout pump's epoch gate unsatisfiable and the run exits 0."""
+        mc = make_config()
+        algo_config(mc).max_num_epochs = epochs
+
+        with pytest.raises(ValueError, match="trains zero steps"):
+            validate_single_controller_config(mc)
+
     def test_grpo_is_free_to_use_any_sampler(self):
         mc = _make_master_config()
         mc.async_rl.sampler = WindowedSamplerConfig()
@@ -484,7 +502,11 @@ def patched_ppo_factories():
         patch.object(
             sc_setup_mod,
             "_build_clusters",
-            return_value=(MagicMock(name="train"), MagicMock(name="inference")),
+            return_value=(
+                MagicMock(name="train"),
+                MagicMock(name="inference"),
+                None,
+            ),
         ),
         patch.object(
             sc_setup_mod, "_build_generation", return_value=(MagicMock(), 0.0)
@@ -565,6 +587,97 @@ class TestSetupBuildsTheCritic:
         patched_ppo_factories["policy"].offload_to_cpu.assert_not_called()
 
 
+class TestValueWarmStart:
+    def test_fresh_run_builds_the_critic_from_the_warm_start(
+        self, patched_ppo_factories, tmp_path
+    ):
+        seed = tmp_path / "critic_pretrain" / "step_370"
+        (seed / "value" / "weights").mkdir(parents=True)
+        (seed / "value" / "optimizer").mkdir()
+        mc = _ppo_master_config(
+            ppo=PPOConfig.model_construct(
+                max_num_steps=100,
+                warm_start_value_checkpoint=str(seed),
+                **_STEP_CONFIG,
+            )
+        )
+        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+
+        setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
+        assert value_kwargs["weights_path"] == seed / "value" / "weights"
+        assert value_kwargs["optimizer_path"] == seed / "value" / "optimizer"
+        # The policy is untouched by a warm start: pi_0 comes from the base model.
+        trainer_kwargs = patched_ppo_factories["_build_trainer"].call_args.kwargs
+        assert trainer_kwargs["weights_path"] is None
+
+    def test_unset_leaves_the_critic_cold(self, patched_ppo_factories, tmp_path):
+        mc = _ppo_master_config()
+        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+
+        setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
+        assert value_kwargs["weights_path"] is None
+        assert value_kwargs["optimizer_path"] is None
+
+    @pytest.mark.parametrize(
+        ("warm_start", "message"),
+        [
+            ("", "warm_start_value_checkpoint is empty"),
+            ("{tmp}/typo", "would silently start cold"),
+        ],
+        ids=["empty_string", "typo"],
+    )
+    def test_rejects_a_warm_start_that_does_not_resolve(
+        self, patched_ppo_factories, tmp_path, warm_start, message
+    ):
+        """get_resume_paths never stats the path, so an unresolvable one would
+        train a cold critic behind the line claiming a warm start. A Hydra
+        override written as `key=` with an unset variable arrives as ""."""
+        mc = _ppo_master_config(
+            ppo=PPOConfig.model_construct(
+                max_num_steps=100,
+                warm_start_value_checkpoint=warm_start.format(tmp=tmp_path),
+                **_STEP_CONFIG,
+            )
+        )
+        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+
+        with pytest.raises(ValueError, match=message):
+            setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        patched_ppo_factories["_build_value"].assert_not_called()
+
+    def test_resume_ignores_the_warm_start(self, patched_ppo_factories, tmp_path):
+        """Re-seeding a resumed run would discard the critic's own progress, so
+        the run's checkpoint has to win over the key left in the config."""
+        seed = tmp_path / "critic_pretrain" / "step_370"
+        (seed / "value" / "weights").mkdir(parents=True)
+        (seed / "value" / "optimizer").mkdir()
+        step_5 = tmp_path / "run" / "step_5"
+        for component in ("policy", "value"):
+            (step_5 / component / "weights").mkdir(parents=True)
+            (step_5 / component / "optimizer").mkdir()
+        (step_5 / "training_info.json").write_text("{}")
+        mc = _ppo_master_config(
+            ppo=PPOConfig.model_construct(
+                max_num_steps=100,
+                warm_start_value_checkpoint=str(seed),
+                **_STEP_CONFIG,
+            )
+        )
+        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+
+        with patch.object(sc_setup_mod, "load_dataloader_state"):
+            setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
+        assert value_kwargs["weights_path"] == step_5 / "value" / "weights"
+        assert value_kwargs["optimizer_path"] == step_5 / "value" / "optimizer"
+
+
 def _cluster_config(mc: MasterConfig, *, colocated: bool, backend: str) -> MasterConfig:
     """Fill in the cluster / generation keys _build_clusters reads."""
     mc.cluster = {
@@ -619,7 +732,7 @@ class TestTrainClusterSizesForTheCritic:
     ):
         mc = _cluster_config(make_config(), colocated=colocated, backend=backend)
 
-        train, inference = sc_setup_mod._build_clusters(mc)
+        train, inference, _teacher_topology = sc_setup_mod._build_clusters(mc)
 
         assert train.kwargs["max_colocated_worker_groups"] == expected_train_groups
         if colocated:
