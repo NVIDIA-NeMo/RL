@@ -35,6 +35,7 @@ from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
+    SiblingSealResult,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
 )
@@ -545,7 +546,7 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
 
 def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> None:
     ledger = RolloutRecoveryLedger()
-    group = _reserve(
+    _reserve(
         ledger,
         group_id="g7",
         admission_id="batch-7",
@@ -559,20 +560,6 @@ def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> 
         admitted=True,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
-    sealed_id = group.gate_rollout_id(0)
-    _mutate(
-        lambda cut: ledger.mark_sibling_sealed(
-            cut,
-            "g7",
-            generation_index=0,
-            gate_rollout_id=sealed_id,
-            receipt={
-                "rollout_id": sealed_id,
-                "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
-            },
-            reward=1.0,
-        )
-    )
 
     state = ledger.state_dict()
     assert state["groups"][0]["agent_name"] == "genrm_agent"
@@ -611,25 +598,20 @@ def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
         admitted=True,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    results = {}
     for generation_index in range(2):
         gate_id = group.gate_rollout_id(generation_index)
-        _mutate(
-            lambda cut, generation_index=generation_index, gate_id=gate_id: (
-                ledger.mark_sibling_sealed(
-                    cut,
-                    "g7",
-                    generation_index=generation_index,
-                    gate_rollout_id=gate_id,
-                    receipt={
-                        "rollout_id": gate_id,
-                        "manifest": [
-                            {"staging_key": (f"g7/sibling-{generation_index}/call-0")}
-                        ],
-                    },
-                    reward=1.0,
-                )
-            )
+        results[generation_index] = SiblingSealResult(
+            gate_rollout_id=gate_id,
+            receipt={
+                "rollout_id": gate_id,
+                "manifest": [
+                    {"staging_key": f"g7/sibling-{generation_index}/call-0"}
+                ],
+            },
+            reward=1.0,
         )
+    _mutate(lambda cut: ledger.mark_group_sealed(cut, "g7", results))
 
     restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
     _mutate(lambda cut: restored.prepare_for_restart(cut))
@@ -639,6 +621,43 @@ def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
         "g7/sibling-0/call-0",
         "g7/sibling-1/call-0",
     }
+
+
+def test_prompt_group_seal_is_atomic() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        agent_name="genrm_agent",
+        recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    gate_id = group.gate_rollout_id(0)
+    partial = {
+        0: SiblingSealResult(
+            gate_rollout_id=gate_id,
+            receipt={
+                "rollout_id": gate_id,
+                "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
+            },
+            reward=1.0,
+        )
+    }
+
+    with pytest.raises(ValueError, match="requires every logical sibling"):
+        _mutate(lambda cut: ledger.mark_group_sealed(cut, "g7", partial))
+
+    assert [
+        sibling.current_attempt.status for sibling in ledger.get_group("g7").siblings
+    ] == [RolloutAttemptStatus.DISPATCHED, RolloutAttemptStatus.DISPATCHED]
+    assert ledger.expected_staging_keys() == set()
 
 
 @pytest.mark.parametrize("unknown_outcome", [False, True])
