@@ -52,6 +52,9 @@ async_rl:
 checkpointing:
   enabled: false
   checkpoint_dir: results/distillation-single-controller
+  # The in-order sampler resumes buffered groups from the native TQ snapshot;
+  # checkpointing without it is rejected before any model is loaded.
+  save_data_plane: true
   # SC collects no val: metrics, so only a train: metric is selectable here.
   metric_name: null
 

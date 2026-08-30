@@ -85,8 +85,14 @@ cd "${PROJECT_ROOT}"
 grep -q "Teacher init:" "${EXP_DIR}/run1.log"
 # No critic on this path: distillation and ppo blocks are mutually exclusive.
 test "$(grep -c "Value init:" "${EXP_DIR}/run1.log")" -eq 0
-test -f "${CKPT_DIR}/step_1/replay_buffer.pt"
-test -f "${CKPT_DIR}/step_2/replay_buffer.pt"
+# Native SingleController recovery stores a metadata-only replay index bound to
+# an authoritative TransferQueue snapshot. The legacy tensor-bearing
+# replay_buffer.pt format is rejected on resume.
+for step in 1 2; do
+    test -f "${CKPT_DIR}/step_${step}/replay_buffer_metadata.pt"
+    test -d "${CKPT_DIR}/step_${step}/data_plane"
+    test ! -e "${CKPT_DIR}/step_${step}/replay_buffer.pt"
+done
 
 "${TRAIN_CMD[@]}" \
     distillation.max_num_steps=4 \
@@ -94,7 +100,7 @@ test -f "${CKPT_DIR}/step_2/replay_buffer.pt"
     "$@" \
     2>&1 | tee "${EXP_DIR}/run2.log"
 
-grep -q "Restoring replay buffer from checkpoint" "${EXP_DIR}/run2.log"
+grep -q "Restoring replay buffer metadata" "${EXP_DIR}/run2.log"
 test -d "${CKPT_DIR}/step_4/policy/weights"
 
 # run2 resumes at step 2 and writes to its own log dir, so it logs the two
