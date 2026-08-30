@@ -19,7 +19,7 @@ reward shaping / baseline-std for a sync GRPO step. The driver dispatches
 a per-step prompt batch + uids; the actor runs ``run_multi_turn_rollout``
 (or async / nemo_gym variants), then writes the bulk schema to TQ via
 :func:`nemo_rl.data_plane.column_io.kv_first_write`. Only a ``KVBatchMeta``
-and a small per-sample ``driver_carry`` dict (rewards, masks, lengths,
+and a small per-sample ``driver_carry`` batch (rewards, masks, lengths,
 baseline/std, prompt_ids_for_adv) cross back to the driver via Ray.
 
 **Goal — rollout 1-hop put**: bulk tensors (input_ids, output_ids,
@@ -148,7 +148,7 @@ class SyncRolloutActor:
         carry_keys: Optional[list[str]] = None,
     ) -> tuple[
         KVBatchMeta,
-        dict[str, Any],
+        BatchedDataDict[Any],
         dict[str, Any],
         Optional[dict[str, Any]],
     ]:
@@ -207,7 +207,7 @@ class SyncRolloutActor:
 
         Returns:
             ``(meta, driver_carry, rollout_metrics, generation_logger_metrics)``
-            where ``driver_carry`` is a per-row dict of tensors the driver
+            where ``driver_carry`` is a per-row ``BatchedDataDict`` the driver
             uses for compute (rewards, masks, lengths, prompt_ids_for_adv,
             …) — stays on the driver, never crosses an actor boundary.
         """
