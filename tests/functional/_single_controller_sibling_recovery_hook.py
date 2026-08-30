@@ -30,6 +30,7 @@ from typing import Any
 
 from examples import run_grpo_single_controller
 from nemo_rl.experience.rollout_manager import RolloutCompletionCallback
+from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 
 
 class _InstrumentedNemoGymRolloutImpl:
@@ -92,10 +93,15 @@ class _InstrumentedNemoGymRolloutImpl:
         rollout_ids: list[str] | None = None,
         generation_indices: list[int] | None = None,
         on_completion: RolloutCompletionCallback | None = None,
+        recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
     ) -> Any:
         if rollout_ids is None or generation_indices is None or on_completion is None:
             raise RuntimeError(
                 "sibling recovery hook requires the token-capture rollout path"
+            )
+        if recovery_granularity is not RecoveryGranularity.SIBLING:
+            raise RuntimeError(
+                "sibling recovery hook requires sibling recovery granularity"
             )
 
         group = self._find_group(rollout_ids)
@@ -163,6 +169,7 @@ class _InstrumentedNemoGymRolloutImpl:
             rollout_ids=rollout_ids,
             generation_indices=indices,
             on_completion=_instrumented_completion,
+            recovery_granularity=recovery_granularity,
         )
         self._append_event("capture_complete", **fields)
         return result
