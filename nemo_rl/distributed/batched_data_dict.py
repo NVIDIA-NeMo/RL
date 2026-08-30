@@ -193,9 +193,14 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 # Plain per-token tensor: emit as-is.
                 result[k] = v
             elif k in PACKED_MULTIMODAL_FIELDS:
-                # Data-plane wire form: the nested value straight off TQ.
-                # ``codec.materialize`` leaves these nested, so every row
-                # is already at its stored size — no companion needed.
+                # Data-plane wire form: a nested value that reached here
+                # without ``codec.materialize`` reassembling it. Its live
+                # purpose is the fail-loud guard below -- a *dense* value
+                # means the field was padded and the row boundaries are
+                # gone, which ``from_wire`` rejects with a wire-contract
+                # TypeError. A nested value with no shapes companion
+                # reconstructs 1-D rows, because ``to_wire`` flattens: only
+                # the companion carries the true per-segment shapes.
                 packed = PackedTensor.from_wire(v)
                 if packed is None:
                     continue  # empty batch (0 rows); nothing to emit
