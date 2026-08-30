@@ -1,0 +1,22 @@
+defaults: ../../examples/configs/recipes/llm/performance/grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout.yaml
+
+checkpointing:
+  checkpoint_dir: results/native_mxfp8_source_refit/qwen235-fp8param-true
+policy:
+  megatron_cfg:
+    native_mxfp8_storage_assertion: qwen235
+    te_precision_config_file: experiments/native_mxfp8_source_refit/te_nano_routed.yaml
+    fp8_cfg:
+      enabled: true
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      fp8_param: true
+    distributed_data_parallel_config:
+      overlap_param_gather: true
+      overlap_grad_reduce: true
+  generation:
+    refit_transport: nccl_reshard
+logger:
+  log_dir: logs/native_mxfp8_source_refit/qwen235-fp8param-true
+  wandb:
+    name: native-mxfp8-qwen235-fp8param-true

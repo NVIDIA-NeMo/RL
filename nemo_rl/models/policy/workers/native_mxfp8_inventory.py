@@ -30,12 +30,19 @@ _QKVO_RE = re.compile(
 )
 
 _BF16_ONLY_SCOPES = ("shared_experts", "router", "qkvo", "lm_head")
-_OPTIONAL_BF16_SCOPES = {"qwen30": frozenset(("shared_experts",)), "nano": frozenset()}
-_MODEL_ROUTED_LAYER_COUNTS = {"qwen30": 48, "nano": 52}
+_OPTIONAL_BF16_SCOPES = {
+    "qwen30": frozenset(("shared_experts",)),
+    "qwen235": frozenset(("shared_experts",)),
+    "nano": frozenset(),
+}
+_MODEL_ROUTED_LAYER_COUNTS = {"qwen30": 48, "qwen235": 94, "nano": 52}
 _MODEL_ROUTED_PROJECTIONS = {
     "qwen30": frozenset(("gate_proj", "up_proj", "down_proj")),
+    "qwen235": frozenset(("gate_proj", "up_proj", "down_proj")),
     "nano": frozenset(("up_proj", "down_proj")),
 }
+
+
 def _scope_for_name(name: str) -> str:
     if name.startswith("lm_head.") or ".lm_head." in name:
         return "lm_head"
@@ -88,7 +95,7 @@ def assert_native_mxfp8_storage_inventory(
     *,
     native_metadata: Mapping[str, Mapping[str, Any]],
     misc_metadata: Mapping[str, Mapping[str, Any]],
-    model_scope: Literal["qwen30", "nano"],
+    model_scope: Literal["qwen30", "qwen235", "nano"],
     num_layers_at_end_in_bf16: int,
     routed_layer_indices: Collection[int] | None = None,
 ) -> dict[str, dict[str, int | list[int]]]:

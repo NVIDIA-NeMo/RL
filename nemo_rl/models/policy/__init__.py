@@ -491,7 +491,9 @@ class MegatronConfig(TypedDict):
     num_layers_at_end_in_bf16: NotRequired[int]
     # Task-owned native source smoke gate. When selected, the policy worker
     # validates its refit metadata inventory before building the NCCL plan.
-    native_mxfp8_storage_assertion: NotRequired[Literal["qwen30", "nano"] | None]
+    native_mxfp8_storage_assertion: NotRequired[
+        Literal["qwen30", "qwen235", "nano"] | None
+    ]
     # Passed through to the Megatron model's freeze() method.
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.
