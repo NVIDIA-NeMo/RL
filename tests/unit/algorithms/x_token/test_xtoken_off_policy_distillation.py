@@ -54,6 +54,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_off_policy_distillation_train,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 
 
 def has_gloo() -> bool:
@@ -207,7 +208,9 @@ def _make_master_config(
                 "num_workers": 0,
             },
             "logger": {"log_dir": "/tmp/logger"},
-            "cluster": {"num_nodes": 1, "gpus_per_node": 1},
+            "cluster": ClusterConfig.model_validate(
+                {"num_nodes": 1, "gpus_per_node": 1}
+            ),
             "checkpointing": {
                 "enabled": save_enabled,
                 "checkpoint_must_save_by": None,
