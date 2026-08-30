@@ -401,6 +401,10 @@ def grpo_train_sync(
     # combination ``setup()`` rejects via
     # ``_validate_multimodal_dedup_capability``. Non-Gym dedup runs never call
     # that helper, so they need no processor here either.
+    #
+    # TODO: replace this parity kwarg with a ``ProcessorInterface`` both
+    # trainers consume, rather than threading ``Optional[AutoProcessor]``
+    # through every signature — ``grpo.py`` repeats it at seven sites.
     processor: Optional["AutoProcessor"] = None,
 ) -> None:
     """Run GRPO training algorithm — TransferQueue-mediated.
