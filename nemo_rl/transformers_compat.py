@@ -1,4 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright 2021 The HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,18 +12,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Compatibility patches for supported Transformers releases."""
+"""Temporary compatibility patches for supported Transformers releases.
+
+Remove this module and its package bootstrap when NeMo RL requires Transformers
+5.13.0 or newer.
+"""
 
 import hashlib
+import importlib
+import inspect
 import logging
 import os
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as distribution_version
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_SYMLINK_CACHE_BUG_VERSION = "5.12.1"
-_SYMLINK_CACHE_PATCH_MARKER = "_nemo_rl_symlink_cache_patch"
+_MIN_AFFECTED_TRANSFORMERS_VERSION = "5.11.0"
+_FIXED_TRANSFORMERS_VERSION = "5.13.0"
+_EXPECTED_HASH_FUNCTION_PARAMETERS = (
+    "pretrained_model_name_or_path",
+    "resolved_module_file",
+)
 
 
 def _compute_local_source_files_hash_with_symlink_fix(
@@ -31,10 +44,11 @@ def _compute_local_source_files_hash_with_symlink_fix(
 ) -> str:
     """Hash dynamic-module sources without losing symlinked snapshot filenames.
 
-    This is the implementation shipped upstream in Transformers 5.13.0 by
-    huggingface/transformers#46618. Transformers 5.12.1 resolves snapshot file
-    symlinks into ``blobs/`` before locating relative imports, where blob names
-    no longer have the Python module filenames that those imports reference.
+    Adapted from the implementation shipped upstream in Transformers 5.13.0 by
+    https://github.com/huggingface/transformers/pull/46618. Earlier affected
+    releases resolve snapshot file symlinks into ``blobs/`` before locating
+    relative imports, where blob names no longer have the Python module
+    filenames that those imports reference.
     """
     # Keep Transformers optional for lightweight NeMo RL import paths.
     from transformers.dynamic_module_utils import get_relative_import_files
@@ -67,54 +81,68 @@ def _compute_local_source_files_hash_with_symlink_fix(
             )
         )
 
-    sha256 = hashlib.sha256()
-    for relative_path, file_path in sorted(files_to_hash):
-        sha256.update(relative_path.encode("utf-8"))
-        sha256.update(file_path.read_bytes())
-    return sha256.hexdigest()[:16]
+    source_files_hash = hashlib.sha256()
+    for relative_path, file_path in sorted(files_to_hash, key=lambda entry: entry[0]):
+        source_files_hash.update(relative_path.encode("utf-8"))
+        source_files_hash.update(file_path.read_bytes())
+
+    return source_files_hash.hexdigest()[:16]
 
 
-setattr(
-    _compute_local_source_files_hash_with_symlink_fix,
-    _SYMLINK_CACHE_PATCH_MARKER,
-    True,
-)
-
-
-def patch_transformers_dynamic_module_symlink_cache() -> bool:
-    """Backport the Transformers 5.13 dynamic-module symlink fix to 5.12.1.
+def _patch_transformers_dynamic_module_symlink_cache() -> bool:
+    """Backport the Transformers 5.13 dynamic-module symlink fix.
 
     Returns ``True`` only when this call installs the patch. Missing
-    Transformers and unaffected versions are intentional no-ops.
+    Transformers and unaffected versions are intentional no-ops. Remove this
+    patch after upgrading the minimum supported Transformers version to 5.13.0.
     """
     # Keep Transformers optional for lightweight NeMo RL import paths.
     try:
-        import transformers
-        import transformers.dynamic_module_utils as dynamic_module_utils
-    except ImportError:
+        installed_version = distribution_version("transformers")
+    except PackageNotFoundError:
         return False
 
-    if transformers.__version__ != _SYMLINK_CACHE_BUG_VERSION:
+    # packaging is a Transformers dependency, but importing it only after the
+    # distribution check keeps Transformers optional for lightweight imports.
+    from packaging.version import Version
+
+    if not (
+        Version(_MIN_AFFECTED_TRANSFORMERS_VERSION)
+        <= Version(installed_version)
+        < Version(_FIXED_TRANSFORMERS_VERSION)
+    ):
         return False
 
+    # Do not mask an ImportError from a present but broken Transformers install.
+    dynamic_module_utils = importlib.import_module("transformers.dynamic_module_utils")
     current_function: Any = getattr(
         dynamic_module_utils, "_compute_local_source_files_hash", None
     )
     if current_function is None:
         raise RuntimeError(
-            "Transformers 5.12.1 does not expose "
+            f"Transformers {installed_version} does not expose "
             "dynamic_module_utils._compute_local_source_files_hash; cannot apply "
             "the NeMo RL symlink-cache compatibility patch."
         )
 
-    if getattr(current_function, _SYMLINK_CACHE_PATCH_MARKER, False):
+    if current_function is _compute_local_source_files_hash_with_symlink_fix:
         return False
+
+    actual_parameters = tuple(inspect.signature(current_function).parameters)
+    if actual_parameters != _EXPECTED_HASH_FUNCTION_PARAMETERS:
+        raise RuntimeError(
+            f"Transformers {installed_version} exposes an unexpected "
+            "dynamic_module_utils._compute_local_source_files_hash signature "
+            f"{actual_parameters}; cannot apply the NeMo RL symlink-cache "
+            "compatibility patch."
+        )
 
     dynamic_module_utils._compute_local_source_files_hash = (  # type: ignore[attr-defined]
         _compute_local_source_files_hash_with_symlink_fix
     )
     logger.info(
-        "Applied the Transformers 5.12.1 dynamic-module symlink-cache patch "
-        "(huggingface/transformers#46618)"
+        "Applied the Transformers %s dynamic-module symlink-cache patch "
+        "(https://github.com/huggingface/transformers/pull/46618)",
+        installed_version,
     )
     return True
