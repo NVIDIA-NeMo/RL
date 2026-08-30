@@ -30,6 +30,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
     RolloutSnapshotManifest,
+    bootstrap_compatibility_identity,
     bootstrap_fingerprint,
     commit_snapshot,
     ensure_bootstrap_anchor,
@@ -309,6 +310,120 @@ def test_bootstrap_fingerprint_ignores_nested_gym_log_directory() -> None:
         cast(Any, _DumpedConfig(semantic_changed))
     )
     assert base["env"]["nemo_gym"]["nemo_gym_log_dir"] == "/run/one/nemo_gym"
+
+
+def test_bootstrap_fingerprint_ignores_nemo_gym_service_routing() -> None:
+    base = {
+        "env": {
+            "nemo_gym": {
+                "genrm_model": {
+                    "responses_api_models": {
+                        "genrm_model": {
+                            "base_url": "http://genrm-one/v1",
+                            "model": "genrm-model-a",
+                        }
+                    }
+                },
+                "nl2bash_judge_model": {
+                    "responses_api_models": {
+                        "local_vllm_model": {
+                            "base_url": "http://nl2bash-one/v1",
+                            "model": "nl2bash-model-a",
+                        }
+                    }
+                },
+            }
+        }
+    }
+    routing_changed = {
+        "env": {
+            "nemo_gym": {
+                "genrm_model": {
+                    "responses_api_models": {
+                        "genrm_model": {
+                            "base_url": "http://genrm-two/v1",
+                            "model": "genrm-model-a",
+                        }
+                    }
+                },
+                "nl2bash_judge_model": {
+                    "responses_api_models": {
+                        "local_vllm_model": {
+                            "base_url": "http://nl2bash-two/v1",
+                            "model": "nl2bash-model-a",
+                        }
+                    }
+                },
+            }
+        }
+    }
+    model_changed = {
+        "env": {
+            "nemo_gym": {
+                **base["env"]["nemo_gym"],
+                "genrm_model": {
+                    "responses_api_models": {
+                        "genrm_model": {
+                            "base_url": "http://genrm-two/v1",
+                            "model": "genrm-model-b",
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    fingerprint = bootstrap_fingerprint(cast(Any, _DumpedConfig(base)))
+    assert fingerprint == bootstrap_fingerprint(
+        cast(Any, _DumpedConfig(routing_changed))
+    )
+    assert fingerprint != bootstrap_fingerprint(cast(Any, _DumpedConfig(model_changed)))
+    identity = bootstrap_compatibility_identity(cast(Any, _DumpedConfig(base)))
+    assert (
+        "base_url"
+        not in identity.environment["nemo_gym"]["genrm_model"]["responses_api_models"][
+            "genrm_model"
+        ]
+    )
+    assert (
+        "base_url"
+        not in identity.environment["nemo_gym"]["nl2bash_judge_model"][
+            "responses_api_models"
+        ]["local_vllm_model"]
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    sorted(rollout_checkpoint._BOOTSTRAP_ENV_RUNTIME_FIELDS),
+)
+def test_bootstrap_fingerprint_ignores_declared_environment_runtime_fields(
+    field: str,
+) -> None:
+    base = {
+        "env": {
+            "nemo_gym": {
+                "service": {
+                    "model": "model-a",
+                    field: "runtime-one",
+                }
+            }
+        }
+    }
+    runtime_changed = {
+        "env": {
+            "nemo_gym": {
+                "service": {
+                    "model": "model-a",
+                    field: "runtime-two",
+                }
+            }
+        }
+    }
+
+    assert bootstrap_fingerprint(cast(Any, _DumpedConfig(base))) == (
+        bootstrap_fingerprint(cast(Any, _DumpedConfig(runtime_changed)))
+    )
 
 
 def test_prune_bootstrap_snapshots_requires_durable_trainer_checkpoint(tmp_path):
