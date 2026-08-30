@@ -1412,6 +1412,9 @@ def _create_checkpoint_config(
         "ckpt_fully_parallel_save_process_group",
         "ckpt_fully_parallel_load_process_group",
         "ckpt_fully_parallel_load_exchange_algo",
+        "fully_parallel_save",
+        "fully_parallel_load",
+        "load_rng",
     )
     for field in _optional_ckpt_fields:
         if field in cfg:
@@ -2187,14 +2190,22 @@ def setup_reference_model_state(
     pre_load_checkpoint_hook: Optional[Callable] = None,
 ) -> dict:
     """Setup the reference model for inference and return its state dict."""
-    # Create reference checkpoint config
-    ref_checkpoint_config = CheckpointConfig(
+    # Create reference checkpoint config. Mirror the user-overridable load
+    # knobs from _create_checkpoint_config so the reference model honors the
+    # same checkpoint-I/O preferences; absent keys keep the historical
+    # hard-coded values.
+    ref_ckpt_kwargs: dict[str, Any] = dict(
         pretrained_checkpoint=pretrained_path,
         save=None,
         load=None,
         fully_parallel_load=True,
         load_rng=False,
     )
+    ckpt_cfg = config["megatron_cfg"].get("checkpoint") or {}
+    for knob in ("fully_parallel_load", "load_rng"):
+        if knob in ckpt_cfg:
+            ref_ckpt_kwargs[knob] = ckpt_cfg[knob]
+    ref_checkpoint_config = CheckpointConfig(**ref_ckpt_kwargs)
 
     ref_ckpt_context = init_checkpointing_context(ref_checkpoint_config)
 

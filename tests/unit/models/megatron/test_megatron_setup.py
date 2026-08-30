@@ -2054,6 +2054,42 @@ class TestCreateCheckpointConfig:
         assert checkpoint_config.async_save is False
         assert checkpoint_config.ckpt_assume_constant_structure is True
 
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("fully_parallel_save", False),
+            ("fully_parallel_load", False),
+            ("load_rng", True),
+        ],
+    )
+    def test_parallel_io_and_rng_knobs_forwarded(self, tmp_path, field, value):
+        """Explicit fully_parallel_save/load and load_rng override the historical values."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            ckpt_cfg={field: value},
+        )
+
+        assert getattr(checkpoint_config, field) is value
+
+    def test_parallel_io_and_rng_knobs_absent_keep_historical_defaults(self, tmp_path):
+        """An empty checkpoint block keeps the historical hard-coded values."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            ckpt_cfg={},
+        )
+
+        assert checkpoint_config.fully_parallel_save is True
+        assert checkpoint_config.fully_parallel_load is True
+        assert checkpoint_config.load_rng is False
+
     def test_absent_ckpt_assume_constant_structure_uses_bridge_default(self, tmp_path):
         """ckpt_assume_constant_structure is omitted unless set in YAML."""
         from megatron.bridge.training.config import (
