@@ -180,10 +180,10 @@ token_capture:
   enabled: false
   staging_partition: rollout_staging
 
-# Restore-only policy for unfinished token-capture groups. "sibling" reuses
-# already sealed generations; "prompt_group" regenerates every sibling when
-# any sibling was unfinished at the checkpoint. Agent overrides win over task
-# overrides. Live in-process retries remain sibling-level.
+# Retry and restore policy for unfinished token-capture groups. "sibling" reuses
+# already sealed generations; "prompt_group" regenerates every sibling when any
+# sibling fails in-process or was unfinished at a checkpoint. Agent overrides win
+# over task overrides.
 rollout_recovery:
   default_granularity: sibling
   agent_granularity_overrides: {}
