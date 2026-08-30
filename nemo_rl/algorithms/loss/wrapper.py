@@ -144,15 +144,12 @@ class SequencePackingLossWrapper:
             loss_accum += loss
             for k, v in metrics.items():
                 # ``*_min``/``*_max`` are extrema, not additive quantities. Use
-                # the same substring rule the workers apply to this very dict
-                # downstream -- megatron_value_worker.py:611,
-                # megatron_policy_worker.py:1034 and :1779,
-                # dtensor_policy_worker.py:940, automodel/train.py:531 -- so a
-                # metric is not summed here and then min/max-ed there. The
-                # previous allowlist named only the four probs_ratio keys and
-                # so missed MseValueLossFn's values_min/values_max.
-                is_min = "_min" in k
-                is_max = "_max" in k
+                # the same suffix rule as downstream workers so a metric is not
+                # summed here and then min/max-ed there. The previous allowlist
+                # named only the four probs_ratio keys and so missed
+                # MseValueLossFn's values_min/values_max.
+                is_min = k.endswith("_min")
+                is_max = k.endswith("_max")
                 if k not in metrics_accum:
                     if is_min:
                         metrics_accum[k] = float("inf")

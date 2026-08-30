@@ -613,7 +613,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                     for x in losses_reduced:
                         loss_metrics = {}
                         for k in x.keys():
-                            if "_min" in k or "_max" in k:
+                            if k.endswith(("_min", "_max")):
                                 loss_metrics[k] = x[k]
                             else:
                                 loss_metrics[k] = x[k] / num_global_batches
