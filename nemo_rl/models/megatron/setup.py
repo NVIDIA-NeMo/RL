@@ -476,6 +476,62 @@ def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
     return os.path.join(path, iter_subdirs[-1])
 
 
+def apply_fp32_lm_head(model_chunks: list, use_tf32: bool = False) -> None:
+    """Run the LM output-layer GEMM in fp32 (MiniMax-M1-style, arXiv:2506.13585).
+
+    bf16 rounding of the logits (magnitude ~15-30, bf16 ulp 0.125-0.25) is the
+    dominant contributor to generation/training logprob mismatch
+    (train/token_mult_prob_error). Upcasting the head input and weight to fp32
+    removes that rounding. The casts are part of the autograd graph, so
+    training gradients flow to the bf16 weight through the fp32 cast.
+
+    Note: has no effect on the fused linear+CE path
+    (megatron_cfg.use_fused_linear_logprobs), which bypasses output_layer's
+    standalone forward.
+
+    With ``use_tf32`` (megatron_cfg.fp32_lm_head: "tf32"), the fp32 head GEMM
+    runs with TF32 tensor cores. The inputs are exact bf16 values (<= 8-bit
+    mantissa), so TF32's 10-bit input rounding loses nothing; accumulation and
+    output stay fp32. Numerically equivalent to full fp32 here, at near-bf16
+    tensor-core throughput.
+    """
+    if not isinstance(model_chunks, (list, tuple)):
+        model_chunks = [model_chunks]
+    for chunk in model_chunks:
+        module = chunk
+        while hasattr(module, "module"):
+            module = module.module
+        output_layer = getattr(module, "output_layer", None)
+        if output_layer is None:
+            continue  # not the last pipeline stage
+        original_forward = output_layer.forward
+
+        def _fp32_forward(
+            input_,
+            *args,
+            weight=None,
+            _orig_forward=original_forward,
+            _layer=output_layer,
+            _tf32=use_tf32,
+            **kwargs,
+        ):
+            w = weight if weight is not None else _layer.weight
+            if not _tf32:
+                return _orig_forward(input_.float(), *args, weight=w.float(), **kwargs)
+            prev = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = True
+            try:
+                return _orig_forward(input_.float(), *args, weight=w.float(), **kwargs)
+            finally:
+                torch.backends.cuda.matmul.allow_tf32 = prev
+
+        output_layer.forward = _fp32_forward
+        print(
+            "[fp32_lm_head] output layer will compute logits in fp32"
+            + (" (tf32 tensor cores)" if use_tf32 else "")
+        )
+
+
 def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     """Validate and setup model paths.
 
@@ -690,6 +746,14 @@ def setup_model_config(
     # Optional layernorm epsilon
     if "layernorm_epsilon" in config["megatron_cfg"]:
         model_cfg.layernorm_epsilon = config["megatron_cfg"]["layernorm_epsilon"]
+
+    # Optional fp32 residual stream. Reduces generation/training logprob
+    # mismatch (train/token_mult_prob_error) by accumulating the residual in
+    # fp32; supported by both transformer and mamba layers.
+    if "fp32_residual_connection" in config["megatron_cfg"]:
+        model_cfg.fp32_residual_connection = config["megatron_cfg"][
+            "fp32_residual_connection"
+        ]
 
     # Provider objects loaded from checkpoint metadata otherwise retain the
     # serialized defaults. Apply explicit recipe controls before model

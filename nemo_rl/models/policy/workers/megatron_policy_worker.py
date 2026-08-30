@@ -549,6 +549,11 @@ class MegatronPolicyWorkerImpl(
 
         self.mcore_state = model_and_optimizer_state.state
         self.model = model_and_optimizer_state.model
+        fp32_lm_head = self.cfg["megatron_cfg"].get("fp32_lm_head")
+        if fp32_lm_head:
+            from nemo_rl.models.megatron.setup import apply_fp32_lm_head
+
+            apply_fp32_lm_head(self.model, use_tf32=(fp32_lm_head == "tf32"))
         self.optimizer = model_and_optimizer_state.optimizer
         self.scheduler = model_and_optimizer_state.scheduler
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
