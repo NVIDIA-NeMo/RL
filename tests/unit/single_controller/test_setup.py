@@ -71,6 +71,7 @@ from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -184,7 +185,9 @@ def _make_master_config(
             "save_optimizer": False,
         },
         logger={"wandb_enabled": False, "wandb": {}},
-        cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
+        cluster=ClusterConfig.model_validate(
+            {"num_nodes": 2, "gpus_per_node": 8, "segment_size": None}
+        ),
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
         env=env if env is not None else {},
         async_rl=AsyncRLConfig(

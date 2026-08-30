@@ -115,7 +115,7 @@ def _validate_pair_safe_packing(
     # of pairs. Validate the user-facing batch setting before the packer emits
     # a derived min_bin_count/bin_count_multiple error at the first step.
     if packing_config.get("max_sequences_per_bin") == 1:
-        world_size = cluster_config["num_nodes"] * cluster_config["gpus_per_node"]
+        world_size = cluster_config.num_nodes * cluster_config.gpus_per_node
         model_parallel_size = (
             megatron_config["tensor_model_parallel_size"]
             * megatron_config["pipeline_model_parallel_size"]
@@ -130,8 +130,8 @@ def _validate_pair_safe_packing(
                     "parallel degree when "
                     "policy.sequence_packing.max_sequences_per_bin=1; "
                     f"got train_global_batch_size={train_gbs}, DP={dp_size} from "
-                    f"{cluster_config['num_nodes']} nodes x "
-                    f"{cluster_config['gpus_per_node']} GPUs."
+                    f"{cluster_config.num_nodes} nodes x "
+                    f"{cluster_config.gpus_per_node} GPUs."
                 )
 
 
