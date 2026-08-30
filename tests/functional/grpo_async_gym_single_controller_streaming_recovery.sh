@@ -156,7 +156,7 @@ expected_claimed = int(sys.argv[4])
 
 assert manifest["rolled_back_train_group_count"] >= expected_claimed, manifest
 assert len(replay["groups"]) >= expected_claimed, replay
-assert lineage["open_train_step"] is None, lineage
+assert "open_train_step" not in lineage, lineage
 PY
 
 echo "=== Phase 2: restore claimed rows and finish without duplicate steps ==="
