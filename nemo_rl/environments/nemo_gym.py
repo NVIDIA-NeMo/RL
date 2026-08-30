@@ -231,7 +231,8 @@ _POLICY_SERVER_NAME = "policy_model"
 _NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
-# Mirrors nemo_gym.token_id_capture.sink.UNCOMMITTED_CALL_REASON: the poison
+# Mirrors nemo_gym.token_id_capture.staging.records.UNCOMMITTED_CALL_REASON:
+# the poison
 # reason for an admitted call that finished without worker coordinates (no
 # completion was ever served for it).
 _UNCOMMITTED_CALL_REASON = "request_finished_without_staged_coordinates"
@@ -974,7 +975,7 @@ Depending on your data shape, you may want to change these values."""
         and poisons.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture.staging.attribution import resolve_terminal
+        from nemo_gym.token_id_capture.staging import resolve_terminal
         from nemo_gym.token_id_capture.staging.records import CallRecord
         from nemo_gym.token_id_capture.staging.terminal import select_terminal_call
 
