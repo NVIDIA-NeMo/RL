@@ -30,6 +30,7 @@ from nemo_rl.data.utils import setup_response_data
 from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -108,153 +109,164 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
-    with rl_init_timer.time("ray_connect"):
-        # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
-        maybe_configure_data_plane_env(config.data_plane)
-        init_ray()
-
-    # setup tokenizer
-    with rl_init_timer.time("tokenizer"):
-        tokenizer = get_tokenizer(config.policy["tokenizer"])
-        assert config.policy["generation"] is not None, (
-            "A generation config is required for GRPO"
-        )
-        has_refit_draft_weights = bool(config.policy["draft"]["enabled"])
-        megatron_cfg = config.policy.get("megatron_cfg") or {}
-        trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
-        config.policy["generation"] = configure_generation_config(
-            config.policy["generation"],
-            tokenizer,
-            has_refit_draft_weights=has_refit_draft_weights,
-            trains_mtp=trains_mtp,
-        )
-
-    # setup data
-    with rl_init_timer.time("data"):
-        dataset, val_dataset, task_to_env, val_task_to_env = setup_response_data(
-            tokenizer, config.data, config.env
-        )
-
-    # Pick the policy factory at the launcher level so the legacy trainer
-    # stays data-plane-agnostic (architectural invariant — see
-    # tests/data_plane/unit/test_architecture_invariants.py).
-    _dp_cfg = config.data_plane or {}
-    if _dp_cfg.get("enabled", False):
-        from nemo_rl.models.policy.tq_policy import TQPolicy
-
-        def _make_policy(**kwargs):
-            return TQPolicy(**kwargs, dp_cfg=_dp_cfg)
-
-        _policy_factory = _make_policy
-    else:
-        _policy_factory = None  # setup() defaults to plain Policy
-
-    with rl_init_timer.time("setup"):
-        (
-            policy,
-            policy_generation,
-            _nemo_gym,
-            cluster,
-            dataloader,
-            val_dataloader,
-            loss_fn,
-            logger,
-            checkpointer,
-            grpo_state,
-            master_config,
-            teacher_worker_groups,
-            alias_to_group_alias,
-        ) = setup(
-            config,
-            tokenizer,
-            dataset,
-            val_dataset,
-            policy_factory=_policy_factory,
-        )
-
-    rl_init_timer.record("total", time.perf_counter() - main_start)
-
-    rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
-    print("\n" + "=" * 60)
-    print(" " * 14 + "RL INIT TIMING BREAKDOWN")
-    for label, value in sorted(rl_init_metrics.items()):
-        if isinstance(value, (int, float)):
-            print(f"  {label}: {value:.1f}s")
-    print("=" * 60 + "\n", flush=True)
+    # Initialise telemetry on the driver BEFORE init_ray() so the resolved
+    # NEMO_RL_OTEL_* env is snapshotted into the Ray runtime_env and inherited
+    # by every worker. No-op unless nemo-lens is installed and telemetry is on.
+    init_telemetry_driver(config, algorithm="grpo")
 
     try:
-        # Check if async mode is enabled
-        if config.grpo.async_grpo.enabled:
-            # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
-            if config.grpo.use_dynamic_sampling:
-                raise NotImplementedError(
-                    "use_dynamic_sampling is not supported with async GRPO"
-                )
-            if config.grpo.reward_scaling.enabled:
-                raise NotImplementedError(
-                    "reward_scaling is not supported with async GRPO"
-                )
-            if config.grpo.reward_shaping.enabled:
-                raise NotImplementedError(
-                    "reward_shaping is not supported with async GRPO"
-                )
+        with rl_init_timer.time("ray_connect"):
+            # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
+            maybe_configure_data_plane_env(config.data_plane)
+            init_ray()
 
-            # Async GRPO does not support multiple dataloaders
-            if config.data["use_multiple_dataloader"]:
-                raise NotImplementedError(
-                    "use_multiple_dataloader is not supported with async GRPO"
-                )
-
-            from nemo_rl.algorithms.grpo import async_grpo_train
-
-            print("🚀 Running async GRPO training")
-
-            # Run async GRPO training
-            async_grpo_train(
-                policy=policy,
-                policy_generation=policy_generation,
-                dataloader=dataloader,
-                val_dataloader=val_dataloader,
-                tokenizer=tokenizer,
-                loss_fn=loss_fn,
-                task_to_env=task_to_env,
-                val_task_to_env=val_task_to_env,
-                logger=logger,
-                checkpointer=checkpointer,
-                grpo_save_state=grpo_state,
-                master_config=master_config,
-                max_trajectory_age_steps=config.grpo.async_grpo.max_trajectory_age_steps,
-                teacher_worker_groups=teacher_worker_groups,
-                alias_to_group_alias=alias_to_group_alias,
+        # setup tokenizer
+        with rl_init_timer.time("tokenizer"):
+            tokenizer = get_tokenizer(config.policy["tokenizer"])
+            assert config.policy["generation"] is not None, (
+                "A generation config is required for GRPO"
             )
+            has_refit_draft_weights = bool(config.policy["draft"]["enabled"])
+            megatron_cfg = config.policy.get("megatron_cfg") or {}
+            trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
+            config.policy["generation"] = configure_generation_config(
+                config.policy["generation"],
+                tokenizer,
+                has_refit_draft_weights=has_refit_draft_weights,
+                trains_mtp=trains_mtp,
+            )
+
+        # setup data
+        with rl_init_timer.time("data"):
+            dataset, val_dataset, task_to_env, val_task_to_env = setup_response_data(
+                tokenizer, config.data, config.env
+            )
+
+        # Pick the policy factory at the launcher level so the legacy trainer
+        # stays data-plane-agnostic (architectural invariant — see
+        # tests/data_plane/unit/test_architecture_invariants.py).
+        _dp_cfg = config.data_plane or {}
+        if _dp_cfg.get("enabled", False):
+            from nemo_rl.models.policy.tq_policy import TQPolicy
+
+            def _make_policy(**kwargs):
+                return TQPolicy(**kwargs, dp_cfg=_dp_cfg)
+
+            _policy_factory = _make_policy
         else:
-            # Two parallel synchronous trainers (verl-style — main_ppo.py vs
-            # main_ppo_sync.py). data_plane.enabled selects which one runs.
-            trainer = _select_trainer(master_config)
-            # grpo_train_sync defers checkpoint finalization to the checkpointer's
-            # background threads; the context manager guarantees they are flushed on
-            # exit. (grpo_train also flushes internally; shutdown() is idempotent.)
-            with checkpointer:
-                trainer(
-                    policy,
-                    policy_generation,
-                    dataloader,
-                    val_dataloader,
-                    tokenizer,
-                    loss_fn,
-                    task_to_env,
-                    val_task_to_env,
-                    logger,
-                    checkpointer,
-                    grpo_state,
-                    master_config,
-                )
-    finally:
-        shutdown_environments(task_to_env, val_task_to_env)
+            _policy_factory = None  # setup() defaults to plain Policy
+
+        with rl_init_timer.time("setup"):
+            (
+                policy,
+                policy_generation,
+                _nemo_gym,
+                cluster,
+                dataloader,
+                val_dataloader,
+                loss_fn,
+                logger,
+                checkpointer,
+                grpo_state,
+                master_config,
+                teacher_worker_groups,
+                alias_to_group_alias,
+            ) = setup(
+                config,
+                tokenizer,
+                dataset,
+                val_dataset,
+                policy_factory=_policy_factory,
+            )
+
+        rl_init_timer.record("total", time.perf_counter() - main_start)
+
+        rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
+        print("\n" + "=" * 60)
+        print(" " * 14 + "RL INIT TIMING BREAKDOWN")
+        for label, value in sorted(rl_init_metrics.items()):
+            if isinstance(value, (int, float)):
+                print(f"  {label}: {value:.1f}s")
+        print("=" * 60 + "\n", flush=True)
+
         try:
-            policy_generation.shutdown()
-        except Exception as error:
-            print(f"Error shutting down generation: {error}", flush=True)
+            # Check if async mode is enabled
+            if config.grpo.async_grpo.enabled:
+                # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
+                if config.grpo.use_dynamic_sampling:
+                    raise NotImplementedError(
+                        "use_dynamic_sampling is not supported with async GRPO"
+                    )
+                if config.grpo.reward_scaling.enabled:
+                    raise NotImplementedError(
+                        "reward_scaling is not supported with async GRPO"
+                    )
+                if config.grpo.reward_shaping.enabled:
+                    raise NotImplementedError(
+                        "reward_shaping is not supported with async GRPO"
+                    )
+
+                # Async GRPO does not support multiple dataloaders
+                if config.data["use_multiple_dataloader"]:
+                    raise NotImplementedError(
+                        "use_multiple_dataloader is not supported with async GRPO"
+                    )
+
+                from nemo_rl.algorithms.grpo import async_grpo_train
+
+                print("🚀 Running async GRPO training")
+
+                # Run async GRPO training
+                async_grpo_train(
+                    policy=policy,
+                    policy_generation=policy_generation,
+                    dataloader=dataloader,
+                    val_dataloader=val_dataloader,
+                    tokenizer=tokenizer,
+                    loss_fn=loss_fn,
+                    task_to_env=task_to_env,
+                    val_task_to_env=val_task_to_env,
+                    logger=logger,
+                    checkpointer=checkpointer,
+                    grpo_save_state=grpo_state,
+                    master_config=master_config,
+                    max_trajectory_age_steps=config.grpo.async_grpo.max_trajectory_age_steps,
+                    teacher_worker_groups=teacher_worker_groups,
+                    alias_to_group_alias=alias_to_group_alias,
+                )
+            else:
+                # Two parallel synchronous trainers (verl-style — main_ppo.py vs
+                # main_ppo_sync.py). data_plane.enabled selects which one runs.
+                trainer = _select_trainer(master_config)
+                # grpo_train_sync defers checkpoint finalization to the checkpointer's
+                # background threads; the context manager guarantees they are flushed on
+                # exit. (grpo_train also flushes internally; shutdown() is idempotent.)
+                with checkpointer:
+                    trainer(
+                        policy,
+                        policy_generation,
+                        dataloader,
+                        val_dataloader,
+                        tokenizer,
+                        loss_fn,
+                        task_to_env,
+                        val_task_to_env,
+                        logger,
+                        checkpointer,
+                        grpo_state,
+                        master_config,
+                    )
+        finally:
+            shutdown_environments(task_to_env, val_task_to_env)
+            try:
+                policy_generation.shutdown()
+            except Exception as error:
+                print(f"Error shutting down generation: {error}", flush=True)
+    finally:
+        # Flush on the failure paths too, and before cluster teardown: the OTel
+        # SDK's own atexit hook is registered ahead of Ray's and so runs after
+        # it. No-op when telemetry is inactive.
+        shutdown_telemetry()
 
 
 if __name__ == "__main__":
