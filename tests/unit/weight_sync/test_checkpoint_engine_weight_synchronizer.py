@@ -166,6 +166,20 @@ def _checkpoint_sync(
 
 class TestCheckpointEngineWeightSynchronizer:
     @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_sglang_init_skips_legacy_refit_metadata(self, _mock_ray):
+        policy = _mock_policy()
+        generation = _mock_generation(cfg={"backend": SGLANG_BACKEND})
+        sync = CheckpointEngineWeightSynchronizer(
+            policy, generation, _checkpoint_engine_cfg()
+        )
+        sync._checkpoint_engine_ready = True
+
+        sync.init_communicator()
+
+        policy.prepare_refit_info.assert_not_called()
+        generation.prepare_refit_info.assert_not_called()
+
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
     def test_sglang_dispatches_directly_to_generation_actors(self, mock_ray):
         policy = _mock_policy()
         policy.worker_group = _CheckpointWorkerGroup()
