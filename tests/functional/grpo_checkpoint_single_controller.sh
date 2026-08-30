@@ -51,6 +51,7 @@ TRAIN_CMD=(
     checkpointing.checkpoint_dir=$CKPT_DIR
     checkpointing.save_period=2
     checkpointing.metric_name=null
+    checkpointing.save_data_plane=true
     data_plane.enabled=true
     data_plane.impl=transfer_queue
     data_plane.backend=simple
@@ -84,17 +85,22 @@ for artifact in \
     "$STEP1/config.yaml" \
     "$STEP1/policy/weights" \
     "$STEP1/train_dataloader.pt" \
-    "$STEP1/replay_buffer.pt"; do
+    "$STEP1/replay_buffer_metadata.pt" \
+    "$STEP1/data_plane"; do
     if [[ ! -e "$artifact" ]]; then
         echo "FAIL: expected checkpoint artifact missing: $artifact"
         exit 1
     fi
 done
+if [[ -e "$STEP1/replay_buffer.pt" ]]; then
+    echo "FAIL: legacy tensor-bearing replay_buffer.pt should not be written"
+    exit 1
+fi
 if compgen -G "$CKPT_DIR/tmp_step_*" > /dev/null; then
     echo "FAIL: tmp_step_* leftovers — async finalization was not flushed"
     exit 1
 fi
-echo "✅ step_1 checkpoint complete (weights, dataloader, replay buffer), no tmp leftovers"
+echo "✅ step_1 checkpoint complete (weights, dataloader, TQ replay), no tmp leftovers"
 
 if ! grep -q '"current_step": 1' "$STEP1/training_info.json"; then
     echo "FAIL: training_info.json does not record current_step=1"
@@ -119,7 +125,7 @@ if ! grep -q "Restoring dataloader state from checkpoint" $EXP_DIR/run2.log; the
     echo "FAIL: dataloader restore log line not found in run2 output"
     exit 1
 fi
-if ! grep -q "Restoring replay buffer from checkpoint" $EXP_DIR/run2.log; then
+if ! grep -q "Restoring replay buffer metadata" $EXP_DIR/run2.log; then
     echo "FAIL: replay buffer restore log line not found in run2 output"
     exit 1
 fi
@@ -132,6 +138,14 @@ echo "✅ dataloader and replay buffer restored from checkpoint"
 STEP4=$CKPT_DIR/step_4
 if [[ ! -e "$STEP4/training_info.json" ]]; then
     echo "FAIL: run2 did not produce step_4 (resume did not reach step 4)"
+    exit 1
+fi
+if [[ ! -f "$STEP4/replay_buffer_metadata.pt" || ! -d "$STEP4/data_plane" ]]; then
+    echo "FAIL: resumed run did not produce native TQ replay artifacts at step_4"
+    exit 1
+fi
+if [[ -e "$STEP4/replay_buffer.pt" ]]; then
+    echo "FAIL: resumed run wrote legacy tensor-bearing replay_buffer.pt"
     exit 1
 fi
 if ! grep -q '"current_step": 4' "$STEP4/training_info.json"; then

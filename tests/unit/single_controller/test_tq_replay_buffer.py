@@ -17,17 +17,20 @@
 from __future__ import annotations
 
 import asyncio
-import io
+import threading
 from typing import Any
 
 import pytest
 import torch
-from tensordict import TensorDict
 
 import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+    REPLAY_BUFFER_METADATA_STORAGE,
+    DataPlaneCheckpointBarrier,
     PostWriteEnrichmentError,
     TQReplayBuffer,
+    replay_manifest_digest,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -68,6 +71,7 @@ class FakeDataPlaneClient:
         self._rows: dict[str, dict[str, Any]] = {}
         self.put_calls: list[dict[str, Any]] = []
         self.clear_calls: list[list[str]] = []
+        self.clear_thread_ids: list[int] = []
         self.get_calls: list[dict[str, Any]] = []
 
     def put_samples(
@@ -99,10 +103,15 @@ class FakeDataPlaneClient:
 
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         assert partition_id == self._partition_id
+        self.clear_thread_ids.append(threading.get_ident())
         ids = list(sample_ids) if sample_ids is not None else list(self._rows)
         self.clear_calls.append(list(ids))
         for sid in ids:
             self._rows.pop(sid, None)
+
+    def list_sample_ids(self, partition_id: str) -> list[str]:
+        assert partition_id == self._partition_id
+        return sorted(self._rows)
 
     def get_samples(
         self,
@@ -119,7 +128,7 @@ class FakeDataPlaneClient:
                 ),
             }
         )
-        # Opaque per-group payload; load_state_dict must re-put it verbatim.
+        # Opaque payload used by tests that inspect direct DataPlane reads.
         return {"payload_for": list(sample_ids)}
 
     def depth(self) -> int:
@@ -140,14 +149,22 @@ class FailAfterPutDataPlaneClient(FakeDataPlaneClient):
         raise RuntimeError("injected put failure")
 
 
+class FailAfterPutAndClearDataPlaneClient(FailAfterPutDataPlaneClient):
+    """Fail both the canonical write and its deterministic-ID rollback."""
+
+    def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
+        del sample_ids, partition_id
+        raise OSError("injected rollback failure")
+
+
 def _run(coro):
     return asyncio.run(coro)
 
 
-def _make_record() -> PromptGroupRecord:
+def _make_record(*, prompt_idx: int = 0) -> PromptGroupRecord:
     """Opaque PromptGroupRecord — converter is stubbed, so contents are unused."""
     return PromptGroupRecord(
-        prompt_idx=0,
+        prompt_idx=prompt_idx,
         prompt=[],
         extra_env_info=None,
         metadata={},
@@ -160,13 +177,18 @@ def _make_buffer(
     dp: FakeDataPlaneClient,
     *,
     require_routed_experts: bool = False,
+    checkpoint_barrier: DataPlaneCheckpointBarrier | None = None,
 ) -> TQReplayBuffer:
-    return TQReplayBuffer(
+    buffer = TQReplayBuffer(
         dp,
         partition_id="rollout_data",
         pad_value_dict={"token_ids": 0},
         require_routed_experts=require_routed_experts,
     )
+    buffer.set_data_plane_checkpoint_barrier(
+        checkpoint_barrier or DataPlaneCheckpointBarrier()
+    )
+    return buffer
 
 
 def _add_group(
@@ -188,7 +210,132 @@ def _add_group(
     )
 
 
+class TestDataPlaneCheckpointBarrier:
+    def test_mutation_and_checkpoint_cuts_expire_on_context_exit(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+
+            async with barrier.mutation() as mutation_cut:
+                mutation_cut.require_live()
+            with pytest.raises(RuntimeError, match="no longer active"):
+                mutation_cut.require_live()
+
+            async with barrier.checkpoint() as checkpoint_cut:
+                checkpoint_cut.require_live()
+            with pytest.raises(RuntimeError, match="no longer active"):
+                checkpoint_cut.require_live()
+
+        asyncio.run(exercise())
+
+    def test_mutations_run_concurrently_without_checkpoint(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            both_entered = asyncio.Event()
+            release = asyncio.Event()
+            active = 0
+
+            async def mutate() -> None:
+                nonlocal active
+                async with barrier.mutation():
+                    active += 1
+                    if active == 2:
+                        both_entered.set()
+                    await release.wait()
+                    active -= 1
+
+            tasks = [asyncio.create_task(mutate()) for _ in range(2)]
+            await asyncio.wait_for(both_entered.wait(), timeout=5.0)
+            assert active == 2
+            release.set()
+            await asyncio.gather(*tasks)
+
+        asyncio.run(exercise())
+
+    def test_checkpoint_waits_for_active_mutation(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            mutation_entered = asyncio.Event()
+            release_mutation = asyncio.Event()
+            checkpoint_entered = asyncio.Event()
+
+            async def mutate() -> None:
+                async with barrier.mutation():
+                    mutation_entered.set()
+                    await release_mutation.wait()
+
+            async def checkpoint() -> None:
+                async with barrier.checkpoint():
+                    checkpoint_entered.set()
+
+            mutation_task = asyncio.create_task(mutate())
+            await mutation_entered.wait()
+            checkpoint_task = asyncio.create_task(checkpoint())
+            await asyncio.sleep(0)
+            assert not checkpoint_entered.is_set()
+
+            release_mutation.set()
+            await asyncio.gather(mutation_task, checkpoint_task)
+            assert checkpoint_entered.is_set()
+
+        asyncio.run(exercise())
+
+    def test_two_checkpoints_serialize_without_deadlock(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            release = asyncio.Event()
+            entered: list[str] = []
+
+            async def checkpoint(tag: str) -> None:
+                async with barrier.checkpoint():
+                    entered.append(f"{tag}-enter")
+                    await release.wait()
+                    entered.append(f"{tag}-exit")
+
+            first = asyncio.create_task(checkpoint("first"))
+            await asyncio.sleep(0)
+            second = asyncio.create_task(checkpoint("second"))
+            await asyncio.sleep(0)
+            assert entered == ["first-enter"]
+
+            release.set()
+            await asyncio.wait_for(asyncio.gather(first, second), timeout=5.0)
+            assert entered == [
+                "first-enter",
+                "first-exit",
+                "second-enter",
+                "second-exit",
+            ]
+
+        asyncio.run(exercise())
+
+
 class TestTQReplayBufferReserveCommit:
+    def test_commit_waits_for_active_checkpoint(self):
+        async def exercise() -> None:
+            dp = FakeDataPlaneClient()
+            checkpoint_barrier = DataPlaneCheckpointBarrier()
+            buf = _make_buffer(dp, checkpoint_barrier=checkpoint_barrier)
+            group_id = buf.reserve(weight_version=3)
+
+            async with checkpoint_barrier.checkpoint():
+                commit_task = asyncio.create_task(
+                    buf.commit(
+                        group_id,
+                        _make_record(),
+                        start_weight_version=3,
+                        end_weight_version=3,
+                    )
+                )
+                await asyncio.sleep(0)
+                assert dp.put_calls == []
+                assert buf.ready_list == [False]
+
+            await commit_task
+            assert len(dp.put_calls) == 1
+            assert buf.ready_list == [True]
+
+        asyncio.run(exercise())
+
     def test_commit_enriches_after_put_before_slot_becomes_ready(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
@@ -254,6 +401,29 @@ class TestTQReplayBufferReserveCommit:
         assert buf.ready_list == [False]
         assert buf.meta_list == [None]
 
+    def test_commit_reports_both_write_and_rollback_failures(self):
+        dp = FailAfterPutAndClearDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=3)
+
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            _run(
+                buf.commit(
+                    group_id,
+                    _make_record(),
+                    start_weight_version=3,
+                    end_weight_version=3,
+                )
+            )
+
+        assert exc_info.value.subgroup(RuntimeError) is not None
+        assert exc_info.value.subgroup(OSError) is not None
+        # The failed rollback leaves uncertain external rows and an unready local
+        # slot. Both failures must remain visible so callers abort instead of retrying
+        # the same stable group ID over potentially orphaned data.
+        assert dp.depth() == _N_GENS
+        assert buf.ready_list == [False]
+
     def test_reserve_appends_placeholder_unready(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
@@ -283,7 +453,7 @@ class TestTQReplayBufferReserveCommit:
         meta = _run(
             buf.commit(
                 group_id,
-                _make_record(),
+                _make_record(prompt_idx=418),
                 start_weight_version=3,
                 end_weight_version=4,
             )
@@ -300,8 +470,8 @@ class TestTQReplayBufferReserveCommit:
         assert buf.end_weight_list == [4]
         assert buf.ready_list == [True]
         assert buf.meta_list[0].sample_ids == meta.sample_ids
-        # TQ tag uses start_weight_version (dispatch time).
-        assert meta.tags == [{"weight_version": 3}] * _N_GENS
+        # TQ tags preserve both dispatch-time weight and dataset identity.
+        assert meta.tags == [{"weight_version": 3, "prompt_idx": 418}] * _N_GENS
         assert len(dp.put_calls) == 1
         assert len(trace_calls) == 1
         assert trace_calls[0]["keys"] == meta.sample_ids
@@ -392,6 +562,61 @@ class TestTQReplayBufferReserveCommit:
 
 
 class TestTQReplayBufferRemove:
+    def test_remove_with_dp_clear_fails_without_bound_checkpoint_barrier(self):
+        dp = FakeDataPlaneClient()
+        buf = TQReplayBuffer(
+            dp,
+            partition_id="rollout_data",
+            pad_value_dict={"token_ids": 0},
+        )
+
+        with pytest.raises(RuntimeError, match="must be bound"):
+            _run(buf.remove([0], remove_in_dp=True))
+
+        assert dp.clear_calls == []
+
+    def test_dp_clear_waits_for_active_checkpoint(self):
+        async def exercise() -> None:
+            dp = FakeDataPlaneClient()
+            checkpoint_barrier = DataPlaneCheckpointBarrier()
+            buf = _make_buffer(dp, checkpoint_barrier=checkpoint_barrier)
+            group_id = buf.reserve(weight_version=0)
+            await buf.commit(
+                group_id,
+                _make_record(),
+                start_weight_version=0,
+                end_weight_version=0,
+            )
+
+            async with checkpoint_barrier.checkpoint():
+                remove_task = asyncio.create_task(buf.remove([0], remove_in_dp=True))
+                await asyncio.sleep(0)
+                assert dp.clear_calls == []
+
+            await remove_task
+            assert dp.clear_calls == [dp.put_calls[0]["sample_ids"]]
+
+        asyncio.run(exercise())
+
+    def test_dp_clear_does_not_block_actor_event_loop(self):
+        async def exercise() -> tuple[FakeDataPlaneClient, int]:
+            dp = FakeDataPlaneClient()
+            buf = _make_buffer(dp)
+            group_id = buf.reserve(weight_version=0)
+            await buf.commit(
+                group_id,
+                _make_record(),
+                start_weight_version=0,
+                end_weight_version=0,
+            )
+            event_loop_thread_id = threading.get_ident()
+            await buf.remove([0], remove_in_dp=True)
+            return dp, event_loop_thread_id
+
+        dp, event_loop_thread_id = asyncio.run(exercise())
+        assert dp.clear_thread_ids
+        assert dp.clear_thread_ids[0] != event_loop_thread_id
+
     def test_remove_drops_indices_and_clears_dp_when_requested(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
@@ -594,20 +819,23 @@ def _make_group_entry(
         "end_weight": weight,
         "target_step": target_step,
         "group_id": group_id,
-        "fields_data": {"payload_for": sids},
     }
 
 
-def _make_envelope(
+def _make_metadata_envelope(
     groups: list[dict[str, Any]],
     *,
     partition_id: str = "rollout_data",
     saved_capacity: int = 8,
 ) -> dict[str, Any]:
+    metadata_groups = [dict(group) for group in groups]
     return {
+        "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+        "storage": REPLAY_BUFFER_METADATA_STORAGE,
         "partition_id": partition_id,
         "saved_capacity": saved_capacity,
-        "groups": list(groups),
+        "manifest_digest": replay_manifest_digest(metadata_groups),
+        "groups": metadata_groups,
     }
 
 
@@ -618,74 +846,82 @@ def _load(
     max_groups: int = 8,
     expected_partition_id: str = "rollout_data",
     expected_group_size: int = _N_GENS,
+    expected_manifest_digest: str | None = None,
 ) -> int:
+    if expected_manifest_digest is None:
+        expected_manifest_digest = str(state.get("manifest_digest", ""))
     return _run(
         buf.load_state_dict(
             state,
             max_groups=max_groups,
             expected_partition_id=expected_partition_id,
             expected_group_size=expected_group_size,
+            expected_manifest_digest=expected_manifest_digest,
         )
     )
 
 
+class TestReplayManifestDigest:
+    def test_rejects_non_json_metadata_with_field_path(self):
+        group = _make_group_entry("group-1", weight=1)
+        assert group["meta"].tags is not None
+        group["meta"].tags[0]["unsupported"] = torch.tensor(1)
+
+        with pytest.raises(
+            TypeError,
+            match=r"groups\[0\]\.meta\.tags\[0\]\.unsupported",
+        ):
+            replay_manifest_digest([group])
+
+    def test_mapping_order_does_not_change_digest(self):
+        first = _make_group_entry("group-1", weight=1)
+        second = _make_group_entry("group-1", weight=1)
+        first["meta"].extra_info = {"a": 1, "b": [2, 3]}
+        second["meta"].extra_info = {"b": [2, 3], "a": 1}
+
+        assert replay_manifest_digest([first]) == replay_manifest_digest([second])
+
+
 class TestTQReplayBufferStateDict:
-    def test_state_dict_serializes_ready_and_skips_unready(self):
+    def test_metadata_state_dict_omits_tensors_and_data_plane_reads(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
         metas = [_add_group(buf, weight=w) for w in (1, 2)]
-        buf.reserve(weight_version=3)  # in-flight: must be excluded
+        buf.reserve(weight_version=3)
 
-        state = _run(buf.state_dict(saved_capacity=8))
+        state = buf.metadata_state_dict(saved_capacity=8)
 
-        assert state["partition_id"] == "rollout_data"
-        assert state["saved_capacity"] == 8
+        assert state["schema_version"] == REPLAY_BUFFER_METADATA_SCHEMA_VERSION
+        assert state["storage"] == REPLAY_BUFFER_METADATA_STORAGE
         assert len(state["groups"]) == 2
-        assert [g["start_weight"] for g in state["groups"]] == [1, 2]
-        assert [g["end_weight"] for g in state["groups"]] == [1, 2]
-        assert [g["target_step"] for g in state["groups"]] == [None, None]
-        assert [g["group_id"] for g in state["groups"]] == [
-            _group_id_of(metas[0]),
-            _group_id_of(metas[1]),
+        assert all("fields_data" not in group for group in state["groups"])
+        assert [group["meta"].sample_ids for group in state["groups"]] == [
+            list(meta.sample_ids) for meta in metas
         ]
-        # Payloads are fetched from the DataPlane rows of each group.
-        assert [c["sample_ids"] for c in dp.get_calls] == [
-            list(metas[0].sample_ids),
-            list(metas[1].sample_ids),
-        ]
-        assert dp.get_calls[0]["select_fields"] == list(metas[0].fields)
-        assert state["groups"][0]["fields_data"] == {
-            "payload_for": list(metas[0].sample_ids)
-        }
+        assert state["manifest_digest"] == replay_manifest_digest(state["groups"])
+        assert dp.get_calls == []
 
-    def test_round_trip_restores_lists_and_rows(self):
+    def test_native_tq_round_trip_restores_index_without_reputting_rows(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
         metas = [_add_group(buf, weight=w) for w in (1, 2)]
-        state = _run(buf.state_dict(saved_capacity=8))
+        state = buf.metadata_state_dict(saved_capacity=8)
 
-        dp2 = FakeDataPlaneClient()
-        buf2 = _make_buffer(dp2)
-        restored = _load(buf2, state)
+        restored_dp = FakeDataPlaneClient()
+        restored_buf = _make_buffer(restored_dp)
+        restored = _load(
+            restored_buf,
+            state,
+            expected_manifest_digest=state["manifest_digest"],
+        )
 
         assert restored == 2
-        assert buf2.size() == 2
-        # Parallel lists rebuilt in order, all ready.
-        assert buf2.start_weight_list == [1, 2]
-        assert buf2.end_weight_list == [1, 2]
-        assert buf2.target_step_list == [None, None]
-        assert buf2.ready_list == [True, True]
-        assert buf2._group_ids == [_group_id_of(m) for m in metas]
-        assert [m.sample_ids for m in buf2.meta_list] == [
-            list(metas[0].sample_ids),
-            list(metas[1].sample_ids),
+        assert restored_buf.start_weight_list == [1, 2]
+        assert restored_buf.ready_list == [True, True]
+        assert [meta.sample_ids for meta in restored_buf.meta_list] == [
+            list(meta.sample_ids) for meta in metas
         ]
-        # Rows re-put with identical sample_ids / fields payload / tags.
-        assert len(dp2.put_calls) == 2
-        for put, meta in zip(dp2.put_calls, metas):
-            assert put["sample_ids"] == list(meta.sample_ids)
-            assert put["fields"] == {"payload_for": list(meta.sample_ids)}
-            assert put["tags"] == [dict(t) for t in meta.tags]
+        assert restored_dp.put_calls == []
 
     def test_round_trip_preserves_end_weight_and_target_step(self):
         # start != end and a non-None target_step must survive the round-trip:
@@ -695,7 +931,7 @@ class TestTQReplayBufferStateDict:
         buf = _make_buffer(dp)
         _add_group(buf, weight=1, end_weight=2)
         _add_group(buf, weight=5, target_step=7)
-        state = _run(buf.state_dict(saved_capacity=8))
+        state = buf.metadata_state_dict(saved_capacity=8)
 
         buf2 = _make_buffer(FakeDataPlaneClient())
         assert _load(buf2, state) == 2
@@ -707,7 +943,7 @@ class TestTQReplayBufferStateDict:
     def test_round_trip_empty_buffer(self):
         # Common resume shape: no group committed before the checkpoint.
         buf = _make_buffer(FakeDataPlaneClient())
-        state = _run(buf.state_dict(saved_capacity=8))
+        state = buf.metadata_state_dict(saved_capacity=8)
         assert state["groups"] == []
 
         dp2 = FakeDataPlaneClient()
@@ -725,7 +961,7 @@ class TestTQReplayBufferStateDict:
         buf.reserve(weight_version=2)  # in-flight, sandwiched
         third = _add_group(buf, weight=3)
 
-        state = _run(buf.state_dict(saved_capacity=8))
+        state = buf.metadata_state_dict(saved_capacity=8)
 
         assert [g["start_weight"] for g in state["groups"]] == [1, 3]
         assert [g["group_id"] for g in state["groups"]] == [
@@ -737,36 +973,23 @@ class TestTQReplayBufferStateDict:
             list(third.sample_ids),
         ]
 
-    def test_round_trip_tensordict_payload_through_torch_save(self):
-        # The production checkpoint file is torch.save(envelope) with
-        # TensorDict-valued fields_data; exercise that serialization for real
-        # (mixed dtypes + a non-contiguous view) instead of the opaque fake.
-        fields = TensorDict(
-            {
-                "input_ids": torch.arange(12, dtype=torch.long).reshape(2, 6),
-                "prev_logprobs": torch.randn(2, 12, dtype=torch.float32)[:, ::2],
-                "sample_mask": torch.ones(2, dtype=torch.long),
-            },
-            batch_size=(2,),
-        )
-        group = _make_group_entry("g0", weight=1)
-        group["fields_data"] = fields
-        state = _make_envelope([group])
-
-        buffer_bytes = io.BytesIO()
-        torch.save(state, buffer_bytes)
-        buffer_bytes.seek(0)
-        loaded_state = torch.load(buffer_bytes, weights_only=False)
-
+    def test_state_dict_skips_older_long_tail_unready_group(self):
+        # Model a long-running rollout reserved on an older weight while newer
+        # rollouts finish. Completed-rollout recovery must checkpoint only the
+        # ready group; recovering the unfinished group belongs to partial-
+        # rollout checkpointing.
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
-        assert (
-            _load(buf, loaded_state, expected_group_size=len(group["meta"].sample_ids))
-            == 1
-        )
-        put_fields = dp.put_calls[0]["fields"]
-        for key in fields.keys():
-            assert torch.equal(put_fields[key], fields[key])
+        unfinished_group_id = buf.reserve(weight_version=1)
+        completed = _add_group(buf, weight=7)
+
+        state = buf.metadata_state_dict(saved_capacity=8)
+
+        assert [g["start_weight"] for g in state["groups"]] == [7]
+        assert [g["group_id"] for g in state["groups"]] == [_group_id_of(completed)]
+        assert unfinished_group_id not in {
+            group["group_id"] for group in state["groups"]
+        }
 
 
 class TestTQReplayBufferLoadPreflight:
@@ -784,20 +1007,26 @@ class TestTQReplayBufferLoadPreflight:
         self._assert_rejected({"groups": []}, match="missing required keys")
 
     def test_partition_id_mismatch(self):
-        state = _make_envelope([], partition_id="other_partition")
+        state = _make_metadata_envelope([], partition_id="other_partition")
         self._assert_rejected(state, match="partition_id mismatch")
 
     def test_group_missing_keys(self):
+        state = _make_metadata_envelope([_make_group_entry("g0", weight=1)])
+        del state["groups"][0]["group_id"]
+        self._assert_rejected(state, match="group missing keys")
+
+    def test_group_with_tensor_payload_is_rejected(self):
         group = _make_group_entry("g0", weight=1)
-        del group["fields_data"]
-        self._assert_rejected(_make_envelope([group]), match="group missing keys")
+        group["fields_data"] = {"input_ids": torch.ones(2, 3)}
+        state = _make_metadata_envelope([group])
+        self._assert_rejected(state, match="must not contain fields_data")
 
     def test_group_misaligned_sequence_lengths(self):
         group = _make_group_entry("g0", weight=1, sequence_lengths=[3])
-        self._assert_rejected(_make_envelope([group]), match="misaligned")
+        self._assert_rejected(_make_metadata_envelope([group]), match="misaligned")
 
     def test_group_size_mismatch(self):
-        state = _make_envelope([_make_group_entry("g0", weight=1, n=2)])
+        state = _make_metadata_envelope([_make_group_entry("g0", weight=1, n=2)])
         self._assert_rejected(state, match="misaligned", expected_group_size=3)
 
     def test_duplicate_sample_ids_across_groups(self):
@@ -805,75 +1034,38 @@ class TestTQReplayBufferLoadPreflight:
         g1 = _make_group_entry(
             "g1", weight=2, sample_ids=["g0_g0", "g1_g1"]
         )  # g0_g0 collides
-        self._assert_rejected(_make_envelope([g0, g1]), match="duplicate sample_id")
-
-
-class TestTQReplayBufferLoadTruncation:
-    def test_capacity_change_truncates_to_freshest(self, monkeypatch):
-        state = _make_envelope(
-            [_make_group_entry(f"g{w}", weight=w) for w in (1, 2, 3)],
-            saved_capacity=8,
-        )
-        dp = FakeDataPlaneClient()
-        buf = _make_buffer(dp)
-        printed: list[str] = []
-        monkeypatch.setattr(
-            "builtins.print",
-            lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
+        self._assert_rejected(
+            _make_metadata_envelope([g0, g1]), match="duplicate sample_id"
         )
 
-        restored = _load(buf, state, max_groups=2)
+    def test_metadata_only_restore_rejects_tq_digest_mismatch(self):
+        state = _make_metadata_envelope([_make_group_entry("g0", weight=1)])
+        self._assert_rejected(
+            state,
+            match="does not match the loaded TQ checkpoint",
+            expected_manifest_digest="wrong-digest",
+        )
 
-        assert restored == 2
-        # The freshest max_groups groups survive, original order preserved.
-        assert buf.start_weight_list == [2, 3]
-        put_sample_ids = [sid for c in dp.put_calls for sid in c["sample_ids"]]
-        assert "g1_g0" not in put_sample_ids and "g1_g1" not in put_sample_ids
-        assert any("capacity changed" in line for line in printed)
-
-    def test_over_capacity_target_stamped_groups_raise(self):
-        # start_weight and target_step are both monotonic for the InOrder
-        # family, so freshest-first would keep the far-future targets and drop
-        # the near-term ones. InOrderSampler.evict only drops
-        # target < current_train_weight, so those permits are never released:
-        # rollout blocks on capacity while the train pump waits for a target
-        # that can no longer be filled. Fail loudly instead of truncating.
-        state = _make_envelope(
-            [_make_group_entry(f"g{w}", weight=w, target_step=w) for w in (1, 2, 3)],
-            saved_capacity=8,
+    def test_metadata_only_restore_rejects_capacity_truncation(self):
+        state = _make_metadata_envelope(
+            [_make_group_entry(f"g{w}", weight=w) for w in (1, 2, 3)]
         )
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
 
-        with pytest.raises(ValueError, match="max_buffered_rollouts >= 3"):
-            _load(buf, state, max_groups=2)
+        with pytest.raises(ValueError) as exc_info:
+            _load(
+                buf,
+                state,
+                max_groups=2,
+                expected_manifest_digest=state["manifest_digest"],
+            )
 
-        # Preflight semantics: nothing reached the DataPlane or the buffer.
+        message = str(exc_info.value)
+        assert "checkpoint=3, current=2" in message
+        assert "async_rl.max_buffered_rollouts >= 3" in message
+        assert "Deleting replay_buffer_metadata.pt" in message
+        assert "skips loading the matching TQ checkpoint" in message
+        assert "dataloader has already moved past them" in message
         assert dp.put_calls == []
         assert buf.size() == 0
-
-    def test_over_capacity_mixed_stamps_raise(self):
-        # One target-stamped group is enough to make truncation unsafe.
-        state = _make_envelope(
-            [
-                _make_group_entry("g1", weight=1),
-                _make_group_entry("g2", weight=2),
-                _make_group_entry("g3", weight=3, target_step=3),
-            ],
-            saved_capacity=8,
-        )
-        buf = _make_buffer(FakeDataPlaneClient())
-
-        with pytest.raises(ValueError, match="target_step stamps"):
-            _load(buf, state, max_groups=2)
-
-    def test_target_stamped_groups_within_capacity_load_fine(self):
-        # The guard is scoped to the over-capacity case only.
-        state = _make_envelope(
-            [_make_group_entry(f"g{w}", weight=w, target_step=w) for w in (1, 2)],
-            saved_capacity=8,
-        )
-        buf = _make_buffer(FakeDataPlaneClient())
-
-        assert _load(buf, state, max_groups=2) == 2
-        assert buf.target_step_list == [1, 2]

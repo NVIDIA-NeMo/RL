@@ -129,6 +129,7 @@ def pack_payload(
     *,
     weight_version: int,
     group_id: str,
+    prompt_idx: int,
 ) -> tuple[list[str], TensorDict, list[dict[str, Any]]]:
     """Pack a producer batch into (sample_ids, fields, tags) for put_samples.
 
@@ -136,6 +137,7 @@ def pack_payload(
         train_batch: Mapping with at least input_lengths plus the tensor/object fields to send.
         weight_version: Trainer weight version stamped on every row's tag.
         group_id: Per-group identifier used as the sample_id prefix; the caller owns uniqueness.
+        prompt_idx: Stable dataset prompt index stamped on every row's tag.
 
     Returns:
         sample_ids of the form {group_id}_g{i}, a jagged-packed TensorDict, and per-row
@@ -154,5 +156,12 @@ def pack_payload(
     )
     sample_ids = [f"{group_id}_g{i}" for i in range(n)]
     violations = train_batch.get(_VIOLATION_COUNTS_KEY, [{}] * n)
-    tags = [{"weight_version": weight_version, **violations[i]} for i in range(n)]
+    tags = [
+        {
+            "weight_version": weight_version,
+            "prompt_idx": prompt_idx,
+            **violations[i],
+        }
+        for i in range(n)
+    ]
     return sample_ids, fields_td, tags

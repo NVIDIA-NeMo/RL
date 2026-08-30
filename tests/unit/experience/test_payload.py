@@ -124,6 +124,7 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
         train_batch,
         weight_version=3,
         group_id="group",
+        prompt_idx=17,
     )
     assert sample_ids == ["group_g0", "group_g1"]
     assert "routed_experts" in fields
@@ -138,8 +139,8 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
         "num_assistant_messages": 1,
     }
     assert tags == [
-        {"weight_version": 3, **no_violations},
-        {"weight_version": 3, **no_violations},
+        {"weight_version": 3, "prompt_idx": 17, **no_violations},
+        {"weight_version": 3, "prompt_idx": 17, **no_violations},
     ]
 
 
@@ -156,6 +157,7 @@ def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
         train_batch,
         weight_version=3,
         group_id="group",
+        prompt_idx=17,
     )
     assert "routed_experts" not in fields
 
@@ -195,7 +197,12 @@ def test_record_to_train_batch_backfills_routes_for_failed_completion() -> None:
     # It is fully loss-masked either way.
     assert train_batch["token_mask"][1, :2].tolist() == [0, 0]
 
-    _, fields, _ = pack_payload(train_batch, weight_version=3, group_id="group")
+    _, fields, _ = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+        prompt_idx=17,
+    )
     assert "routed_experts" in fields
     assert list(fields["routed_experts"].unbind())[1].shape == (2, 2, 2)
 
@@ -214,24 +221,32 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
         _record(completions),
         pad_value_dict={"token_ids": 0, "input_ids": 0},
     )
-    _, fields, tags = pack_payload(train_batch, weight_version=7, group_id="g")
+    _, fields, tags = pack_payload(
+        train_batch,
+        weight_version=7,
+        group_id="g",
+        prompt_idx=17,
+    )
 
     assert "violation_counts" not in fields
     assert tags == [
         {
             "weight_version": 7,
+            "prompt_idx": 17,
             "num_invalid_tool_calls": 1,
             "num_malformed_thinking": 0,
             "num_assistant_messages": 1,
         },
         {
             "weight_version": 7,
+            "prompt_idx": 17,
             "num_invalid_tool_calls": 0,
             "num_malformed_thinking": 1,
             "num_assistant_messages": 1,
         },
         {
             "weight_version": 7,
+            "prompt_idx": 17,
             "num_invalid_tool_calls": 0,
             "num_malformed_thinking": 0,
             "num_assistant_messages": 0,

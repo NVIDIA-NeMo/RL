@@ -40,23 +40,41 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import io
 import logging
 import math
 import os
 import threading
 import time
+import uuid
 import warnings
 from collections import deque
 from collections.abc import Iterator
 from functools import partial
-from typing import Any, Awaitable, Callable, Optional, Union
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Optional, Union, cast
 
 import ray
 import torch
 from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms import opd as opd_module
-from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DATA_PLANE_CHECKPOINT_DIR,
+    LEGACY_REPLAY_BUFFER_FILENAME,
+    REPLACEMENT_RESERVE_FILENAME,
+    REPLAY_BUFFER_METADATA_FILENAME,
+    REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+    DataPlaneCheckpointBarrier,
+    DataPlaneCheckpointMetadata,
+    DataPlaneMutationCut,
+    TQReplayMetadataState,
+)
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    TransactionalAdmissionSampler,
+    create_sampler,
+)
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _write_latest_checkpoint_status,
@@ -81,7 +99,8 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     tensor_field,
 )
 from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
+from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
@@ -89,6 +108,14 @@ from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
+from nemo_rl.experience.rollout_recovery import (
+    ROLLOUT_RECOVERY_SCHEMA_VERSION,
+    ROLLOUT_RECOVERY_STATE_FILENAME,
+    PromptGroupPhase,
+    RolloutRecoveryState,
+    build_rollout_recovery_state,
+    parse_rollout_recovery_state,
+)
 from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -251,6 +278,9 @@ class SingleControllerActor:
         # already defaulted any fields missing from older checkpoints.
         self._save_state: GRPOSaveState = actor_args.save_state
         self._last_checkpoint_path: Optional[str] = actor_args.last_checkpoint_path
+        self._data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = (
+            actor_args.data_plane_checkpoint_metadata
+        )
         self._consumed_samples: int = actor_args.save_state.consumed_samples
         self._total_valid_tokens: int = actor_args.save_state.total_valid_tokens
 
@@ -258,9 +288,45 @@ class SingleControllerActor:
         self._train_cluster = actor_args.train_cluster
         self._inference_cluster = actor_args.inference_cluster
 
+        restored_trainer_version = (
+            actor_args.save_state.trainer_version
+            if actor_args.save_state.trainer_version is not None
+            else actor_args.save_state.current_step
+        )
         num_prompts_per_step = self._algo_cfg.num_prompts_per_step
         self._sampler = create_sampler(self._buffer, self._async_cfg.sampler)
-        self._sampler.set_dispatch_index(actor_args.save_state.current_step)
+        restored_dispatch_index = actor_args.save_state.sampler_dispatch_index
+        if restored_dispatch_index is None:
+            # Checkpoints predating exact sampler state reconstruct the original
+            # fresh-step invariant from the restored trainer version.
+            self._sampler.set_dispatch_index(restored_trainer_version)
+        else:
+            self._sampler.restore_dispatch_index(restored_dispatch_index)
+        if (
+            self._master_config.checkpointing["enabled"]
+            and self._sampler.supports_buffer_checkpoint
+            and not self._master_config.checkpointing.get("save_data_plane")
+        ):
+            raise ValueError(
+                "SingleController checkpointing with a replay-checkpoint-capable "
+                "sampler requires checkpointing.save_data_plane=true so "
+                "completed, unconsumed rollouts are recoverable."
+            )
+        restoring_rollout_recovery = bool(
+            self._data_plane_checkpoint_metadata is not None
+            and self._data_plane_checkpoint_metadata.get(
+                "rollout_recovery_payload_sha256"
+            )
+            is not None
+        )
+        self._rollout_recovery_enabled = bool(
+            restoring_rollout_recovery
+            or (
+                self._master_config.checkpointing["enabled"]
+                and self._master_config.checkpointing.get("save_data_plane")
+                and self._sampler.supports_buffer_checkpoint
+            )
+        )
         required_capacity = self._sampler.required_buffer_capacity(num_prompts_per_step)
         validate_sampler_buffer_capacity(
             self._async_cfg,
@@ -269,6 +335,18 @@ class SingleControllerActor:
         )
 
         # ── asyncio state ──────────────────────────────────────────────────
+        # Commits and destructive clears use this lock with TQ snapshots. This
+        # makes the native snapshot match the controller's metadata-only replay
+        # index exactly. Generation may continue, but completed rollouts wait at
+        # commit; _buffer_capacity bounds reservations and eventually stalls
+        # dispatch instead of allowing unbounded TQ growth.
+        # A future staging/finalizer path must join the same barrier before
+        # native restore can be authoritative.
+        self._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        self._buffer.set_data_plane_checkpoint_barrier(
+            self._data_plane_checkpoint_barrier
+        )
+
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
         self._rollout_permitted.set()
@@ -321,7 +399,7 @@ class SingleControllerActor:
             self._async_cfg.max_buffered_rollouts
         )
 
-        self._trainer_version: int = actor_args.save_state.current_step
+        self._trainer_version: int = restored_trainer_version
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
@@ -358,7 +436,10 @@ class SingleControllerActor:
             await self._sync_weights()
         self._rollout_manager.set_weight_version(self._trainer_version)
 
-        await self._maybe_restore_replay_buffer()
+        restored_replay_groups = await self._maybe_restore_replay_buffer()
+        await self._maybe_restore_rollout_recovery(
+            restored_replay_groups=restored_replay_groups
+        )
         await self._maybe_restore_replacement_reserve()
 
         # Start the rollout and train pumps, plus the watchdog
@@ -423,50 +504,456 @@ class SingleControllerActor:
 
     # ── internal helpers ───────────────────────────────────────────────────
 
-    async def _maybe_restore_replay_buffer(self) -> None:
-        """Restore replay-buffer groups from the previous run's checkpoint.
+    async def _maybe_restore_replay_buffer(self) -> int:
+        """Restore the local replay index for the native TQ checkpoint.
 
-        Skipped with a warning when the checkpoint was written under a
-        different sampler: restored groups carry the saving sampler's
-        weight/target-step stamps, which another policy may never select.
+        Recovery is authoritative only for samplers that explicitly support
+        buffered-group restoration. The native snapshot and replay metadata file
+        must both be present and agree on their manifest and group count.
         """
         if self._last_checkpoint_path is None:
-            return
-        buffer_path = os.path.join(self._last_checkpoint_path, "replay_buffer.pt")
-        if not os.path.exists(buffer_path):
+            return 0
+        metadata_path = os.path.join(
+            self._last_checkpoint_path, REPLAY_BUFFER_METADATA_FILENAME
+        )
+        if (
+            os.path.exists(metadata_path)
+            and not self._sampler.supports_buffer_checkpoint
+        ):
+            raise RuntimeError(
+                "The checkpoint contains native replay state, but the configured "
+                f"sampler {self._async_cfg.sampler.name!r} does not support "
+                "replay-buffer recovery"
+            )
+        if not self._sampler.supports_buffer_checkpoint:
+            return 0
+        if not os.path.exists(metadata_path):
+            legacy_path = os.path.join(
+                self._last_checkpoint_path, LEGACY_REPLAY_BUFFER_FILENAME
+            )
+            if os.path.exists(legacy_path):
+                raise RuntimeError(
+                    "Checkpoint contains legacy replay_buffer.pt state, which "
+                    "predates authoritative native TQ replay recovery. Resume it "
+                    "with the older implementation or explicitly start without "
+                    "restoring buffered rollouts."
+                )
             print(
-                f"⚠️ No replay buffer checkpoint found at {buffer_path}. "
+                f"⚠️ No native replay metadata found at {metadata_path}. "
                 "Starting with an empty replay buffer.",
                 flush=True,
             )
-            return
-        saved_sampler_name = self._save_state.sampler_name
-        current_sampler_name = self._async_cfg.sampler.name
-        if saved_sampler_name != current_sampler_name:
-            print(
-                f"⚠️ Replay buffer checkpoint was saved with sampler "
-                f"{saved_sampler_name!r} but this run uses "
-                f"{current_sampler_name!r}; skipping the buffer restore.",
-                flush=True,
-            )
-            return
-        print(f"📦 Restoring replay buffer from checkpoint: {buffer_path}")
-        # weights_only=False: groups hold pickled KVBatchMeta/TensorDicts,
-        # not plain tensors. The checkpoint is a trusted same-job artifact.
+            return 0
+        print(f"📦 Restoring replay buffer metadata: {metadata_path}")
+        # weights_only=False: the replay metadata file contains pickled KVBatchMeta
+        # objects but no rollout tensor payloads. It is a trusted same-job artifact.
         buffer_state = await asyncio.to_thread(
-            torch.load, buffer_path, weights_only=False
+            torch.load, metadata_path, weights_only=False
         )
+        if self._data_plane_checkpoint_metadata is None:
+            raise RuntimeError(
+                "Found metadata-only replay checkpoint, but the matching "
+                "native TQ checkpoint was not restored during setup"
+            )
+        expected_manifest_digest_value = self._data_plane_checkpoint_metadata.get(
+            "replay_manifest_digest"
+        )
+        if not isinstance(expected_manifest_digest_value, str):
+            raise ValueError(
+                "Restored TQ checkpoint metadata is missing a replay manifest digest"
+            )
+        expected_group_count = self._data_plane_checkpoint_metadata.get(
+            "replay_group_count"
+        )
+        groups = buffer_state.get("groups")
+        if (
+            not isinstance(expected_group_count, int)
+            or not isinstance(groups, list)
+            or len(groups) != expected_group_count
+        ):
+            raise ValueError(
+                "Replay-buffer metadata group count does not match the "
+                "loaded TQ checkpoint metadata"
+            )
         restored = await self._buffer.load_state_dict(
             buffer_state,
             max_groups=self._async_cfg.max_buffered_rollouts,
             expected_partition_id=self._partition_id,
             expected_group_size=self._algo_cfg.num_generations_per_prompt,
+            expected_manifest_digest=expected_manifest_digest_value,
         )
-        # Each buffered group holds one _buffer_capacity permit; the load
-        # truncation guarantees restored <= capacity, so this never blocks.
+        await self._validate_replay_inventory(buffer_state)
+
+        # Each buffered group holds one _buffer_capacity permit. Restore fails
+        # above if the saved group count exceeds current capacity.
         assert restored <= self._async_cfg.max_buffered_rollouts
         for _ in range(restored):
             await self._buffer_capacity.acquire()
+        return restored
+
+    async def _maybe_restore_rollout_recovery(
+        self,
+        *,
+        restored_replay_groups: int,
+    ) -> None:
+        """Restore unfinished ownership for prioritized rollout-pump redispatch."""
+        if self._last_checkpoint_path is None:
+            return
+        recovery_path = Path(
+            self._last_checkpoint_path,
+            ROLLOUT_RECOVERY_STATE_FILENAME,
+        )
+        metadata = self._data_plane_checkpoint_metadata or {}
+        expected_payload_sha256 = metadata.get("rollout_recovery_payload_sha256")
+        if expected_payload_sha256 is None:
+            if recovery_path.is_file():
+                raise RuntimeError(
+                    f"{ROLLOUT_RECOVERY_STATE_FILENAME} exists, but the matching "
+                    "native TQ checkpoint does not advertise rollout recovery"
+                )
+            return
+        if not isinstance(expected_payload_sha256, str):
+            raise TypeError(
+                "rollout_recovery_payload_sha256 must be a string in native "
+                "TQ checkpoint metadata"
+            )
+        expected_schema_version = metadata.get("rollout_recovery_schema_version")
+        if (
+            isinstance(expected_schema_version, bool)
+            or expected_schema_version != ROLLOUT_RECOVERY_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "native TQ checkpoint rollout recovery schema mismatch: "
+                f"checkpoint={expected_schema_version!r}, "
+                f"expected={ROLLOUT_RECOVERY_SCHEMA_VERSION}"
+            )
+        expected_group_count = metadata.get("rollout_recovery_group_count")
+        if (
+            isinstance(expected_group_count, bool)
+            or not isinstance(expected_group_count, int)
+            or expected_group_count < 0
+        ):
+            raise TypeError(
+                "rollout_recovery_group_count must be an integer in native "
+                "TQ checkpoint metadata"
+            )
+        if not recovery_path.is_file():
+            raise FileNotFoundError(
+                "native TQ checkpoint advertises rollout recovery, but the "
+                f"sidecar is missing at {recovery_path}"
+            )
+
+        payload = await asyncio.to_thread(recovery_path.read_bytes)
+        actual_payload_sha256 = hashlib.sha256(payload).hexdigest()
+        if actual_payload_sha256 != expected_payload_sha256:
+            raise ValueError(
+                "rollout recovery sidecar checksum mismatch: "
+                f"checkpoint={expected_payload_sha256}, "
+                f"actual={actual_payload_sha256}"
+            )
+        state = await asyncio.to_thread(
+            torch.load,
+            io.BytesIO(payload),
+            weights_only=True,
+        )
+        parsed_state = parse_rollout_recovery_state(state)
+        if len(parsed_state.ledger_state["groups"]) != expected_group_count:
+            raise ValueError(
+                "rollout recovery sidecar group count does not match native "
+                "TQ checkpoint metadata"
+            )
+
+        recovery_ledger = self._rollout_manager.recovery_ledger
+        async with self._data_plane_checkpoint_barrier.mutation() as cut:
+            recovery_ledger.load_state_dict(cut, parsed_state.ledger_state)
+            self._batch_shortfall = parsed_state.batch_shortfall
+            canonical_state = self._buffer.metadata_state_dict(
+                saved_capacity=self._async_cfg.max_buffered_rollouts
+            )
+            canonical_group_ids = {
+                group["group_id"] for group in canonical_state["groups"]
+            }
+            recovery_ledger.discard_canonical_groups(cut, canonical_group_ids)
+            await self._rehydrate_rollout_recovery_prompts(cut)
+        self._sampler_stamps_target_steps = (
+            parsed_state.sampler_stamps_target_steps
+            if parsed_state.sampler_stamps_target_steps is not None
+            else any(
+                group.target_step is not None for group in recovery_ledger.groups()
+            )
+            or any(
+                group.get("target_step") is not None
+                for group in canonical_state["groups"]
+            )
+        )
+
+        groups_to_recover = recovery_ledger.groups()
+        if groups_to_recover:
+            print(
+                f"📦 Loaded {len(groups_to_recover)} unfinished rollout "
+                f"group(s) next to {restored_replay_groups} canonical group(s); "
+                "the rollout pump will redispatch them before new dataloader work",
+                flush=True,
+            )
+
+    async def _rehydrate_rollout_recovery_prompts(
+        self,
+        cut: DataPlaneMutationCut,
+    ) -> None:
+        """Resolve positional prompt references against a stable map-style dataset.
+
+        This assumes the dataset exposes integer ``__getitem__`` and retains the
+        same ordering across checkpoint and restart.
+        """
+        recovery_ledger = self._rollout_manager.recovery_ledger
+        groups = recovery_ledger.groups()
+        if not groups:
+            return
+
+        dataset = getattr(self._dataloader, "dataset", None)
+        if dataset is None:
+            raise RuntimeError(
+                "cannot restore unfinished rollouts because the dataloader does "
+                "not expose its source dataset"
+            )
+
+        resolved_prompts: dict[str, DatumSpec] = {}
+        for group in groups:
+            sample_id = group.prompt_ref.sample_id
+            try:
+                sample_index = int(sample_id)
+            except ValueError as error:
+                raise ValueError(
+                    f"recovery group {group.group_id!r} has a non-integer "
+                    f"dataset sample_id={sample_id!r}"
+                ) from error
+            if sample_index < 0 or str(sample_index) != sample_id:
+                raise ValueError(
+                    f"recovery group {group.group_id!r} has a non-canonical "
+                    f"dataset sample_id={sample_id!r}"
+                )
+
+            prompt = resolved_prompts.get(sample_id)
+            if prompt is None:
+                try:
+                    dataset_prompt = await asyncio.to_thread(
+                        dataset.__getitem__, sample_index
+                    )
+                except (IndexError, KeyError) as error:
+                    raise RuntimeError(
+                        f"cannot rehydrate recovery group {group.group_id!r}: "
+                        f"dataset sample_id={sample_id!r} is unavailable"
+                    ) from error
+                if not isinstance(dataset_prompt, dict):
+                    raise TypeError(
+                        f"dataset sample_id={sample_id!r} resolved to "
+                        f"{type(dataset_prompt).__name__}, expected a DatumSpec "
+                        "dictionary"
+                    )
+
+                # Re-run one-row collation to reconstruct the tensor scalars,
+                # optional fields, and multimodal wrappers expected by RolloutManager.
+                collate_fn = getattr(self._dataloader, "collate_fn", None)
+                if collate_fn is None:
+                    prompt = dataset_prompt
+                else:
+                    prompt_batch = await asyncio.to_thread(
+                        collate_fn,
+                        [dataset_prompt],
+                    )
+                    if isinstance(prompt_batch, BatchedDataDict):
+                        if prompt_batch.size != 1:
+                            raise ValueError(
+                                "recovery collation must return exactly one prompt; "
+                                f"sample_id={sample_id!r}, size={prompt_batch.size}"
+                            )
+                        prompt = {key: value[0] for key, value in prompt_batch.items()}
+                    elif isinstance(prompt_batch, dict):
+                        # Identity-style collators used by lightweight/custom
+                        # dataloaders may return the DatumSpec directly.
+                        prompt = prompt_batch
+                    else:
+                        raise TypeError(
+                            "recovery collation for "
+                            f"sample_id={sample_id!r} returned "
+                            f"{type(prompt_batch).__name__}, expected a mapping"
+                        )
+                resolved_prompts[sample_id] = cast(DatumSpec, prompt)
+            recovery_ledger.bind_runtime_prompt(
+                cut,
+                group.group_id,
+                cast(DatumSpec, prompt),
+            )
+
+    async def _admit_reserved_prompt_groups(
+        self,
+        group_ids: list[str],
+    ) -> tuple[Optional[int], list[str], int]:
+        """Commit one admission and atomically reconcile restored canonical groups.
+
+        Returns:
+            The target-step stamp, IDs that still require rollout dispatch, and the
+            number of already-canonical groups that replaced reservations in this
+            admission.
+        """
+        if not group_ids:
+            raise ValueError("sampler admission requires at least one prompt group")
+
+        def _commit(
+            cut: DataPlaneMutationCut,
+            target_step: Optional[int],
+        ) -> tuple[Optional[int], list[str], int]:
+            if target_step is not None:
+                self._sampler_stamps_target_steps = True
+            for group_id in group_ids:
+                self._rollout_manager.mark_prompt_group_admitted(
+                    cut,
+                    group_id,
+                    target_step=target_step,
+                )
+
+            buffered = 0
+            dispatch_group_ids = group_ids
+            if target_step is not None:
+                buffered = self._buffer.count_for_target_step(target_step)
+                if buffered:
+                    dispatch_count = max(0, len(group_ids) - buffered)
+                    dispatch_group_ids = group_ids[:dispatch_count]
+                    for group_id in group_ids[dispatch_count:]:
+                        self._rollout_manager.discard_prompt_group(cut, group_id)
+            return target_step, dispatch_group_ids, buffered
+
+        if isinstance(self._sampler, TransactionalAdmissionSampler):
+            await self._sampler.wait_until_admissible(
+                trainer_version_fn=lambda: self._trainer_version
+            )
+            async with self._data_plane_checkpoint_barrier.mutation() as cut:
+                target_step = self._sampler.commit_admission(cut)
+                return _commit(cut, target_step)
+
+        # Custom samplers retain their existing monolithic admission API. Hold
+        # the mutation cut across it for correctness. Contract: a custom admit()
+        # must not wait on anything beyond a single trainer_version increment --
+        # a checkpoint drains mutation slots while blocking the train pump, so a
+        # longer wait deadlocks the run. Implement TransactionalAdmissionSampler
+        # to keep the gate wait outside the mutation cut entirely.
+        async with self._data_plane_checkpoint_barrier.mutation() as cut:
+            target_step = await self._sampler.admit(
+                trainer_version_fn=lambda: self._trainer_version
+            )
+            return _commit(cut, target_step)
+
+    async def _redispatch_restored_rollouts(
+        self,
+        launch: Callable[[DatumSpec, Optional[int], str], Awaitable[None]],
+    ) -> None:
+        """Prioritize durable unfinished groups while the train pump drains TQ.
+
+        Launching happens inside the ordinary rollout pump so restored groups use
+        the same in-flight and replay-capacity semaphores as new work. The train
+        pump runs concurrently and releases replay capacity as it consumes
+        canonical or newly recovered groups; therefore recovery cannot deadlock
+        merely because the checkpoint contained more unfinished ownership records
+        than free replay slots.
+        """
+        recovery_ledger = self._rollout_manager.recovery_ledger
+        groups_to_recover = recovery_ledger.groups()
+        if not groups_to_recover:
+            return
+
+        recognized_phases = (
+            PromptGroupPhase.ADMITTED,
+            PromptGroupPhase.RESERVED,
+        )
+        unhandled_groups = [
+            group for group in groups_to_recover if group.phase not in recognized_phases
+        ]
+        if unhandled_groups:
+            details = ", ".join(
+                f"{group.group_id}={group.phase!r}" for group in unhandled_groups
+            )
+            raise RuntimeError(f"unrecognized rollout recovery phase(s): {details}")
+
+        # ADMITTED groups may be the only work capable of advancing the trainer and
+        # opening the sampler gate. Launch them before waiting to re-admit RESERVED
+        # groups, or restore can deadlock with the trainer waiting for recovered work
+        # that this method has not launched yet.
+        redispatched = 0
+        for group in groups_to_recover:
+            if group.phase is PromptGroupPhase.ADMITTED:
+                await launch(
+                    group.prompt_payload,
+                    group.target_step,
+                    group.group_id,
+                )
+                redispatched += 1
+
+        # A checkpoint may land after dataloader ownership is recorded but before
+        # sampler admission commits. Re-admit each original dataloader batch once and
+        # launch it immediately; do not wait for every reserved batch to pass its gate.
+        reserved_admissions: dict[str, list[str]] = {}
+        for group in groups_to_recover:
+            if group.phase is PromptGroupPhase.RESERVED:
+                reserved_admissions.setdefault(group.admission_id, []).append(
+                    group.group_id
+                )
+        for group_ids in reserved_admissions.values():
+            _, dispatch_group_ids, _ = await self._admit_reserved_prompt_groups(
+                group_ids
+            )
+            for group_id in dispatch_group_ids:
+                group = recovery_ledger.get_group(group_id)
+                await launch(
+                    group.prompt_payload,
+                    group.target_step,
+                    group.group_id,
+                )
+                redispatched += 1
+
+        print(
+            f"📦 Redispatched {redispatched} unfinished rollout "
+            "group(s) before new dataloader work",
+            flush=True,
+        )
+
+    async def _validate_replay_inventory(
+        self, replay_metadata: TQReplayMetadataState
+    ) -> None:
+        """Require the canonical TQ keys to match the SC replay index exactly.
+
+        Live checkpoint callers must hold the exclusive data-plane barrier so
+        commits and clears cannot race this inventory read. Restore calls are
+        also safe before the rollout and train pumps start any live writers.
+        """
+        expected_sample_ids = {
+            sample_id
+            for group in replay_metadata["groups"]
+            for sample_id in group["meta"].sample_ids
+        }
+        actual_sample_ids = set(
+            await call_data_plane(
+                self._dp_client,
+                "list_sample_ids",
+                offload_sync=True,
+                partition_id=self._partition_id,
+            )
+        )
+        missing_sample_ids = sorted(expected_sample_ids - actual_sample_ids)
+        unexpected_sample_ids = sorted(actual_sample_ids - expected_sample_ids)
+        if missing_sample_ids or unexpected_sample_ids:
+            raise RuntimeError(
+                "Native TQ checkpoint inventory does not match "
+                f"{REPLAY_BUFFER_METADATA_FILENAME}: "
+                f"missing={missing_sample_ids[:10]!r} "
+                f"(total={len(missing_sample_ids)}), "
+                f"unexpected={unexpected_sample_ids[:10]!r} "
+                f"(total={len(unexpected_sample_ids)})"
+            )
+        print(
+            "📦 Native TQ replay inventory validated: "
+            f"samples={len(actual_sample_ids)}",
+            flush=True,
+        )
 
     async def _maybe_restore_replacement_reserve(self) -> None:
         """Restore spare prompts diverted before the previous run's checkpoint.
@@ -485,7 +972,7 @@ class SingleControllerActor:
         if self._last_checkpoint_path is None:
             return
         reserve_path = os.path.join(
-            self._last_checkpoint_path, "replacement_reserve.pt"
+            self._last_checkpoint_path, REPLACEMENT_RESERVE_FILENAME
         )
         # Absent for every run that never diverted a batch, which is every run that
         # does not use "replace" -- so silence here rather than the buffer restore's
@@ -518,6 +1005,95 @@ class SingleControllerActor:
         if asyncio.iscoroutine(result):
             return await result
         return result
+
+    async def _clear_data_plane_samples(self, sample_ids: list[str]) -> None:
+        """Clear consumed rows without overlapping a data-plane checkpoint."""
+        async with self._data_plane_checkpoint_barrier.mutation():
+            await call_data_plane(
+                self._dp_client,
+                "clear_samples",
+                offload_sync=True,
+                sample_ids=sample_ids,
+                partition_id=self._partition_id,
+            )
+
+    async def _save_data_plane_checkpoint(
+        self,
+        checkpoint_path: PathLike,
+        replay_metadata: Optional[TQReplayMetadataState] = None,
+        rollout_recovery_payload_sha256: Optional[str] = None,
+        rollout_recovery_group_count: Optional[int] = None,
+    ) -> None:
+        """Save a required TQ snapshot inside an SC checkpoint bundle.
+
+        A sampler with replay-buffer recovery writes an authoritative native
+        TQ snapshot bound to its metadata-only replay index by a digest. Other
+        samplers retain shadow-mode snapshots until their recovery contract is
+        defined. Failures propagate so a finalized bundle never silently omits
+        the advertised data-plane component.
+        """
+        checkpoint_dir = os.path.join(
+            checkpoint_path,
+            DATA_PLANE_CHECKPOINT_DIR,
+        )
+        save_state = self._save_state
+        checkpoint_trainer_version = save_state.trainer_version
+        if checkpoint_trainer_version is None:
+            raise RuntimeError(
+                "Cannot save a data-plane checkpoint before trainer_version "
+                "is captured in the controller save state"
+            )
+        metadata: DataPlaneCheckpointMetadata = {
+            "data_plane_checkpoint_schema_version": (
+                DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
+            ),
+            "single_controller_train_steps": save_state.current_step,
+            "single_controller_trainer_version": checkpoint_trainer_version,
+            "single_controller_epoch": save_state.current_epoch,
+            "partition_id": self._partition_id,
+            "sampler_name": self._async_cfg.sampler.name,
+            "mode": "authoritative" if replay_metadata is not None else "shadow",
+        }
+        if replay_metadata is not None:
+            metadata["replay_metadata_schema_version"] = (
+                REPLAY_BUFFER_METADATA_SCHEMA_VERSION
+            )
+            metadata["replay_manifest_digest"] = replay_metadata["manifest_digest"]
+            metadata["replay_group_count"] = len(replay_metadata["groups"])
+        if rollout_recovery_payload_sha256 is not None:
+            if rollout_recovery_group_count is None:
+                raise ValueError("rollout recovery payload hash requires a group count")
+            metadata["rollout_recovery_schema_version"] = (
+                ROLLOUT_RECOVERY_SCHEMA_VERSION
+            )
+            metadata["rollout_recovery_payload_sha256"] = (
+                rollout_recovery_payload_sha256
+            )
+            metadata["rollout_recovery_group_count"] = rollout_recovery_group_count
+        elif rollout_recovery_group_count is not None:
+            raise ValueError("rollout recovery group count requires a payload hash")
+        started = time.monotonic()
+        print(f"data-plane checkpoint save started: {checkpoint_dir}", flush=True)
+        try:
+            await call_data_plane(
+                self._dp_client,
+                "save_checkpoint",
+                offload_sync=True,
+                checkpoint_dir=checkpoint_dir,
+                metadata=metadata,
+            )
+        except Exception as error:
+            print(
+                "data-plane checkpoint save failed: "
+                f"{checkpoint_dir} ({type(error).__name__}: {error})",
+                flush=True,
+            )
+            raise
+        print(
+            "data-plane checkpoint save completed: "
+            f"{checkpoint_dir} ({time.monotonic() - started:.2f}s)",
+            flush=True,
+        )
 
     # ── the three pumps + the inline advantage stage ───────────────────────
 
@@ -553,6 +1129,7 @@ class SingleControllerActor:
         async def _dispatch_one_prompt(
             prompt: DatumSpec,
             target_step: Optional[int],
+            lineage_group_id: Optional[str],
             task_started_event: asyncio.Event,
         ) -> None:
             task_started_event.set()
@@ -567,11 +1144,19 @@ class SingleControllerActor:
             try:
                 while True:
                     try:
-                        outcome = await self._rollout_manager.generate_and_push(
-                            prompt,
-                            target_step=target_step,
-                            inflight_registry=self._inflight_by_group_id,
-                        )
+                        if lineage_group_id is None:
+                            outcome = await self._rollout_manager.generate_and_push(
+                                prompt,
+                                target_step=target_step,
+                                inflight_registry=self._inflight_by_group_id,
+                            )
+                        else:
+                            outcome = await self._rollout_manager.generate_and_push(
+                                prompt,
+                                target_step=target_step,
+                                inflight_registry=self._inflight_by_group_id,
+                                lineage_group_id=lineage_group_id,
+                            )
                     except BaseException:
                         # On success ownership transfers to the train pump, which
                         # releases this permit after consuming the committed group.
@@ -581,12 +1166,42 @@ class SingleControllerActor:
                     if outcome is not RolloutOutcome.SKIPPED:
                         break
 
-                    replacement = self._take_replacement(target_step, replacements)
+                    if self._rollout_recovery_enabled:
+                        assert lineage_group_id is not None
+                        async with (
+                            self._data_plane_checkpoint_barrier.mutation()
+                        ) as cut:
+                            replacement = self._take_replacement(
+                                target_step, replacements
+                            )
+                            # A skipped tracked prompt remains ledger-owned until this
+                            # controller transition. Dropping the old owner, reserving
+                            # a replacement, or crediting the target step short must be
+                            # one checkpoint-atomic decision.
+                            self._rollout_manager.discard_prompt_group(
+                                cut, lineage_group_id
+                            )
+                            if replacement is not None:
+                                lender_step = self._promote_into_step(target_step)
+                                if lender_step is not None:
+                                    target_step = lender_step
+                                lineage_group_id = (
+                                    self._rollout_manager.reserve_prompt_group(
+                                        cut,
+                                        replacement,
+                                        target_step=target_step,
+                                    )
+                                )
+                            else:
+                                self._credit_shortfall(target_step)
+                    else:
+                        replacement = self._take_replacement(target_step, replacements)
                     if replacement is None:
                         # Nothing was committed, so the train pump will never see this
                         # group and never release its permit on our behalf.
                         self._buffer_capacity.release()
-                        self._credit_shortfall(target_step)
+                        if not self._rollout_recovery_enabled:
+                            self._credit_shortfall(target_step)
                         return
 
                     replacements += 1
@@ -601,9 +1216,10 @@ class SingleControllerActor:
                     # Attempted only now that a spare is in hand, because the borrow is a
                     # debt and the spare is what repays it. Borrowing without one would
                     # leave the lender short instead: the same hole, one step later.
-                    lender_step = self._promote_into_step(target_step)
-                    if lender_step is not None:
-                        target_step = lender_step
+                    if not self._rollout_recovery_enabled:
+                        lender_step = self._promote_into_step(target_step)
+                        if lender_step is not None:
+                            target_step = lender_step
                     # A substitution is a fresh rollout, not a continuation of the one
                     # that failed, so it observes the same pause a first dispatch does
                     # instead of pushing new generation into a weight-sync window.
@@ -638,7 +1254,16 @@ class SingleControllerActor:
                 self._buffer_capacity.release()
                 sem.release()
 
-        async def _launch(prompt: DatumSpec, target_step: Optional[int]) -> None:
+        async def _launch(
+            prompt: DatumSpec,
+            target_step: Optional[int],
+            lineage_group_id: Optional[str],
+        ) -> None:
+            if self._rollout_recovery_enabled and lineage_group_id is None:
+                raise RuntimeError(
+                    "recovery-enabled rollout dispatch requires a pre-reserved "
+                    "prompt-group ID"
+                )
             # check if buffer is full
             await self._buffer_capacity.acquire()
             # check if inflight rollouts is full
@@ -649,7 +1274,12 @@ class SingleControllerActor:
             task_started_event = asyncio.Event()
             # dispatch rollout
             task = rollout_tasks.create_task(
-                _dispatch_one_prompt(prompt, target_step, task_started_event)
+                _dispatch_one_prompt(
+                    prompt,
+                    target_step,
+                    lineage_group_id,
+                    task_started_event,
+                )
             )
             self._dispatched_rollouts.add(task)
             task.add_done_callback(self._dispatched_rollouts.discard)
@@ -662,36 +1292,88 @@ class SingleControllerActor:
 
         max_epochs = self._algo_cfg.max_num_epochs
         async with asyncio.TaskGroup() as rollout_tasks:
+            if self._rollout_recovery_enabled:
+                await self._redispatch_restored_rollouts(_launch)
             while max_epochs is None or self._current_epoch < max_epochs:
-                for prompt_batch in self._dataloader:
-                    if self._divert_batch_to_reserve(prompt_batch):
-                        continue
+                if not self._rollout_recovery_enabled:
+                    for prompt_batch in self._dataloader:
+                        if self._divert_batch_to_reserve(prompt_batch):
+                            continue
+                        target_step = await self._sampler.admit(
+                            trainer_version_fn=lambda: self._trainer_version
+                        )
+                        if target_step is not None:
+                            self._sampler_stamps_target_steps = True
+                        num_prompts = prompt_batch.size
+                        if target_step is not None:
+                            buffered = self._buffer.count_for_target_step(target_step)
+                            if buffered:
+                                num_prompts = max(0, prompt_batch.size - buffered)
+                                print(
+                                    f"  target_step={target_step}: {buffered} group(s) "
+                                    f"already buffered; dispatching {num_prompts} of "
+                                    f"{prompt_batch.size} prompt(s), dropping the rest",
+                                    flush=True,
+                                )
+                        for prompt_idx in range(num_prompts):
+                            prompt: DatumSpec = {  # type: ignore
+                                k: v[prompt_idx] for k, v in prompt_batch.items()
+                            }
+                            await _launch(prompt, target_step, None)
+                    self._current_epoch += 1
+                    continue
 
-                    target_step = await self._sampler.admit(
-                        trainer_version_fn=lambda: self._trainer_version
+                dataloader_iterator = iter(self._dataloader)
+                while True:
+                    prompt_dispatches: list[tuple[DatumSpec, str]] = []
+                    async with self._data_plane_checkpoint_barrier.mutation() as cut:
+                        try:
+                            prompt_batch = next(dataloader_iterator)
+                        except StopIteration:
+                            self._current_epoch += 1
+                            break
+                        if self._divert_batch_to_reserve(prompt_batch):
+                            continue
+                        admission_id = str(uuid.uuid4())
+                        for prompt_idx in range(prompt_batch.size):
+                            prompt = {  # type: ignore
+                                k: v[prompt_idx] for k, v in prompt_batch.items()
+                            }
+                            group_id = self._rollout_manager.reserve_prompt_group(
+                                cut,
+                                prompt,
+                                target_step=None,
+                                admitted=False,
+                                admission_id=admission_id,
+                            )
+                            prompt_dispatches.append((prompt, group_id))
+
+                    (
+                        target_step,
+                        dispatch_group_ids,
+                        buffered,
+                    ) = await self._admit_reserved_prompt_groups(
+                        [group_id for _, group_id in prompt_dispatches]
                     )
-                    if target_step is not None:
-                        self._sampler_stamps_target_steps = True
 
-                    num_prompts = prompt_batch.size
                     if target_step is not None:
-                        buffered = self._buffer.count_for_target_step(target_step)
                         if buffered:
-                            num_prompts = max(0, prompt_batch.size - buffered)
                             print(
                                 f"  target_step={target_step}: {buffered} group(s) "
-                                f"already buffered; dispatching {num_prompts} of "
-                                f"{prompt_batch.size} prompt(s), dropping the rest",
+                                f"already buffered; dispatching "
+                                f"{len(dispatch_group_ids)} of "
+                                f"{len(prompt_dispatches)} prompt(s), dropping the rest",
                                 flush=True,
                             )
+                            dispatch_group_id_set = set(dispatch_group_ids)
+                            prompt_dispatches = [
+                                (prompt, group_id)
+                                for prompt, group_id in prompt_dispatches
+                                if group_id in dispatch_group_id_set
+                            ]
 
-                    for prompt_idx in range(num_prompts):
-                        prompt: DatumSpec = {  # type: ignore
-                            k: v[prompt_idx] for k, v in prompt_batch.items()
-                        }
-                        await _launch(prompt, target_step)
-
-                self._current_epoch += 1
+                    for prompt, group_id in prompt_dispatches:
+                        await _launch(prompt, target_step, group_id)
 
         # Only now that every dispatched rollout has settled is the pool genuinely
         # spare. Draining it inside the group above would race them for it, and a
@@ -752,7 +1434,8 @@ class SingleControllerActor:
         return True
 
     async def _drain_reserve_into_steps(
-        self, launch: Callable[[DatumSpec, Optional[int]], Awaitable[None]]
+        self,
+        launch: Callable[[DatumSpec, Optional[int], Optional[str]], Awaitable[None]],
     ) -> None:
         """Train on the leftover spares once the dataloader has nothing more to give.
 
@@ -776,6 +1459,46 @@ class SingleControllerActor:
         """
         num_prompts_per_step = self._algo_cfg.num_prompts_per_step
         while len(self._replacement_reserve) >= num_prompts_per_step:
+            if self._rollout_recovery_enabled:
+                prompt_dispatches: list[tuple[DatumSpec, str]] = []
+                async with self._data_plane_checkpoint_barrier.mutation() as cut:
+                    step_prompts = [
+                        self._replacement_reserve.popleft()
+                        for _ in range(num_prompts_per_step)
+                    ]
+                    admission_id = str(uuid.uuid4())
+                    for prompt in step_prompts:
+                        group_id = self._rollout_manager.reserve_prompt_group(
+                            cut,
+                            prompt,
+                            target_step=None,
+                            admitted=False,
+                            admission_id=admission_id,
+                        )
+                        prompt_dispatches.append((prompt, group_id))
+                (
+                    target_step,
+                    dispatch_group_ids,
+                    buffered,
+                ) = await self._admit_reserved_prompt_groups(
+                    [group_id for _, group_id in prompt_dispatches]
+                )
+                dispatch_group_id_set = set(dispatch_group_ids)
+                prompt_dispatches = [
+                    (prompt, group_id)
+                    for prompt, group_id in prompt_dispatches
+                    if group_id in dispatch_group_id_set
+                ]
+                print(
+                    f"  dataloader exhausted; training on {len(prompt_dispatches)} "
+                    f"pooled spare(s) as target_step={target_step}"
+                    + (f" ({buffered} group(s) already buffered)" if buffered else ""),
+                    flush=True,
+                )
+                for prompt, group_id in prompt_dispatches:
+                    await launch(prompt, target_step, group_id)
+                continue
+
             # Take the step's prompts out before the first await. A drop resolving
             # concurrently draws from this same pool, and could otherwise claim one of
             # them and leave the step it is filling one group short.
@@ -791,7 +1514,7 @@ class SingleControllerActor:
                 flush=True,
             )
             for prompt in step_prompts:
-                await launch(prompt, target_step)
+                await launch(prompt, target_step, None)
 
         if self._replacement_reserve:
             print(
@@ -1199,11 +1922,7 @@ class SingleControllerActor:
                         min_sample_version = curr_min_sample_version
 
                     # Remove consumed sample_ids from the buffer
-                    await self._call_dp(
-                        "clear_samples",
-                        sample_ids=list(train_meta.sample_ids),
-                        partition_id=self._partition_id,
-                    )
+                    await self._clear_data_plane_samples(list(train_meta.sample_ids))
 
                     groups_dispatched += num_groups
                     chunks_dispatched += 1
@@ -1935,20 +2654,39 @@ class SingleControllerActor:
 
     async def _abort_stale_inflight(self) -> int:
         """Abort in-flight rollouts that the sampler can no longer select."""
-        stale_tasks = [
-            task
-            for task, start_version in self._inflight_by_group_id.values()
-            if self._sampler.should_abort_inflight(
-                start_weight_version=start_version,
-                current_train_weight=self._trainer_version,
-            )
-        ]
-        if not stale_tasks:
+
+        def _stale_groups() -> list[tuple[str, asyncio.Task[None]]]:
+            stale_groups: list[tuple[str, asyncio.Task[None]]] = []
+            for group_id, inflight in self._inflight_by_group_id.items():
+                task, start_version = inflight
+                if self._sampler.should_abort_inflight(
+                    start_weight_version=start_version,
+                    current_train_weight=self._trainer_version,
+                ):
+                    stale_groups.append((group_id, task))
+            return stale_groups
+
+        if self._rollout_recovery_enabled:
+            async with self._data_plane_checkpoint_barrier.mutation() as cut:
+                # Re-evaluate after acquiring the cut: a rollout may have completed
+                # while a checkpoint holder delayed this mutation.
+                stale_groups = _stale_groups()
+                for group_id, _ in stale_groups:
+                    # This is an intentional live abort, not a process failure. Remove
+                    # durable ownership before cancellation cleanup removes the unready
+                    # TQ slot, so a concurrent checkpoint cannot resurrect the prompt.
+                    self._rollout_manager.discard_prompt_group(cut, group_id)
+                for _, task in stale_groups:
+                    task.cancel()
+        else:
+            stale_groups = _stale_groups()
+            for _, task in stale_groups:
+                task.cancel()
+
+        if not stale_groups:
             return 0
 
-        for task in stale_tasks:
-            task.cancel()
-
+        stale_tasks = [task for _, task in stale_groups]
         results = await asyncio.gather(*stale_tasks, return_exceptions=True)
         failures = [
             result
@@ -1982,26 +2720,6 @@ class SingleControllerActor:
         stepped.
         """
         save_state = self._save_state
-        save_state.current_step = self._train_steps
-        save_state.total_steps = self._train_steps
-        save_state.current_epoch = self._current_epoch
-        save_state.consumed_samples = self._consumed_samples
-        save_state.total_valid_tokens = self._total_valid_tokens
-        # The restore skips the replay buffer when the resuming run uses a
-        # different sampler (its stamps may never be selectable there).
-        save_state.sampler_name = self._async_cfg.sampler.name
-        # Snapshot before any await so it can't interleave with
-        # _rollout_pump iterating this same dataloader.
-        dataloader_state = self._dataloader.state_dict()
-        # The spare pool has to be saved with that snapshot, not left out of the
-        # checkpoint: diverting a batch already advanced the iterator, so the state
-        # above records those prompts as consumed while they are still only in memory.
-        # Without this a resumed replace-mode run comes back with an empty pool and a
-        # dataloader positioned past the diverted batch, silently losing it -- and
-        # losing it for good, since _drain_reserve_into_steps only ever recovers spares
-        # held by the process that diverted them. Snapshotted here, in the same
-        # await-free window, so the pair cannot disagree.
-        reserve_state = list(self._replacement_reserve)
         # SC has no validation loop yet; drop the default sentinel instead of
         # persisting a bogus val_reward.
         if hasattr(save_state, "val_reward"):
@@ -2031,12 +2749,81 @@ class SingleControllerActor:
         await asyncio.to_thread(self._checkpointer.finalize_pending)
 
         print(f"Saving checkpoint for step {self._train_steps}...")
-        checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
-            self._checkpointer.init_tmp_checkpoint,
-            self._train_steps,
-            vars(save_state),
-            self._master_config,
-        )
+        replay_metadata: Optional[TQReplayMetadataState] = None
+        rollout_recovery_state: Optional[RolloutRecoveryState] = None
+        rollout_recovery_payload: Optional[bytes] = None
+        rollout_recovery_payload_sha256: Optional[str] = None
+
+        # Admission, dataloader movement, replay mutations, and canonical TQ writes
+        # all take the mutation side of this barrier. Capture every restart-facing
+        # controller artifact under the exclusive side so the checkpoint cannot
+        # contain a cursor without its prompt owner, or two durable owners for one
+        # canonical group.
+        async with self._data_plane_checkpoint_barrier.checkpoint():
+            save_state.current_step = self._train_steps
+            save_state.total_steps = self._train_steps
+            save_state.trainer_version = self._trainer_version
+            save_state.current_epoch = self._current_epoch
+            save_state.consumed_samples = self._consumed_samples
+            save_state.total_valid_tokens = self._total_valid_tokens
+            save_state.sampler_name = self._async_cfg.sampler.name
+            save_state.sampler_dispatch_index = self._sampler.dispatch_index
+            dataloader_state = self._dataloader.state_dict()
+            # The spare pool and dataloader advance together under the same mutation
+            # cut in recovery-enabled dispatch, so preserve them in this cut too.
+            reserve_state = list(self._replacement_reserve)
+
+            checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
+                self._checkpointer.init_tmp_checkpoint,
+                self._train_steps,
+                vars(save_state),
+                self._master_config,
+            )
+
+            if self._master_config.checkpointing.get("save_data_plane"):
+                if self._sampler.supports_buffer_checkpoint:
+                    replay_metadata = self._buffer.metadata_state_dict(
+                        saved_capacity=self._async_cfg.max_buffered_rollouts
+                    )
+                if replay_metadata is not None:
+                    await self._validate_replay_inventory(replay_metadata)
+
+                if self._rollout_recovery_enabled:
+                    rollout_recovery_state = build_rollout_recovery_state(
+                        self._rollout_manager.recovery_ledger,
+                        batch_shortfall=self._batch_shortfall,
+                        sampler_stamps_target_steps=(self._sampler_stamps_target_steps),
+                    )
+                    if replay_metadata is not None:
+                        canonical_group_ids = {
+                            group["group_id"] for group in replay_metadata["groups"]
+                        }
+                        rollout_recovery_state["groups"] = [
+                            group
+                            for group in rollout_recovery_state["groups"]
+                            if group["group_id"] not in canonical_group_ids
+                        ]
+                    payload_buffer = io.BytesIO()
+                    await asyncio.to_thread(
+                        torch.save,
+                        rollout_recovery_state,
+                        payload_buffer,
+                    )
+                    rollout_recovery_payload = payload_buffer.getvalue()
+                    rollout_recovery_payload_sha256 = hashlib.sha256(
+                        rollout_recovery_payload
+                    ).hexdigest()
+
+                await self._save_data_plane_checkpoint(
+                    checkpoint_path,
+                    replay_metadata=replay_metadata,
+                    rollout_recovery_payload_sha256=(rollout_recovery_payload_sha256),
+                    rollout_recovery_group_count=(
+                        len(rollout_recovery_state["groups"])
+                        if rollout_recovery_state is not None
+                        else None
+                    ),
+                )
 
         # Save value model
         if self._is_ppo:
@@ -2088,17 +2875,22 @@ class SingleControllerActor:
             await asyncio.to_thread(
                 torch.save,
                 reserve_state,
-                os.path.join(checkpoint_path, "replacement_reserve.pt"),
+                os.path.join(checkpoint_path, REPLACEMENT_RESERVE_FILENAME),
             )
-        buffer_state = await self._buffer.state_dict(
-            saved_capacity=self._async_cfg.max_buffered_rollouts
-        )
-        await asyncio.to_thread(
-            torch.save,
-            buffer_state,
-            os.path.join(checkpoint_path, "replay_buffer.pt"),
-        )
-
+        if replay_metadata is not None:
+            await asyncio.to_thread(
+                torch.save,
+                replay_metadata,
+                os.path.join(checkpoint_path, REPLAY_BUFFER_METADATA_FILENAME),
+            )
+        if rollout_recovery_payload is not None:
+            await asyncio.to_thread(
+                Path(
+                    checkpoint_path,
+                    ROLLOUT_RECOVERY_STATE_FILENAME,
+                ).write_bytes,
+                rollout_recovery_payload,
+            )
         # Rename happens in the background once the async weight writes
         # finish; flushed at the next save or on exit.
         self._checkpointer.begin_finalization(
@@ -2361,7 +3153,8 @@ class SingleControllerActor:
             return meta, True
         adv_cfg = self._advantage_cfg
 
-        data = await self._call_dp(
+        data = await call_data_plane(
+            self._dp_client,
             "get_samples",
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
