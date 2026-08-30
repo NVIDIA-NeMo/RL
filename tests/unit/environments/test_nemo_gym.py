@@ -52,7 +52,11 @@ from nemo_rl.environments.nemo_gym_multimodal import (
     nemo_gym_example_to_video_datum_spec,
     normalize_media_in_examples,
 )
-from nemo_rl.environments.nemo_gym_request import _metadata_extra_body
+from nemo_rl.environments.nemo_gym_request import (
+    _chat_template_kwargs_for_processor,
+    _deep_merge_dict,
+    _metadata_extra_body,
+)
 from nemo_rl.environments.nemotron_utils import (
     _expand_nemotron_video_placeholders,
     _flatten_nemotron_video_frame_messages,
@@ -341,6 +345,54 @@ def test_video_metadata_rejects_invalid_extra_body(extra_body):
 
     with pytest.raises((TypeError, ValueError), match="extra_body"):
         _metadata_extra_body(example)
+
+
+@pytest.mark.parametrize(
+    "chat_template_kwargs",
+    [
+        {"enable_thinking": False},
+        '{"enable_thinking": false}',
+    ],
+)
+def test_chat_template_kwargs_for_processor_accepts_mapping_or_json(
+    chat_template_kwargs,
+):
+    example = {
+        "responses_create_params": {
+            "metadata": {"chat_template_kwargs": chat_template_kwargs}
+        }
+    }
+
+    assert _chat_template_kwargs_for_processor(example) == {
+        "chat_template_kwargs": {"enable_thinking": False},
+        "enable_thinking": False,
+    }
+
+
+def test_chat_template_kwargs_for_processor_defaults_to_empty():
+    assert _chat_template_kwargs_for_processor({}) == {}
+
+
+def test_chat_template_kwargs_for_processor_rejects_invalid_json():
+    example = {
+        "responses_create_params": {
+            "metadata": {"chat_template_kwargs": "not-json"}
+        }
+    }
+
+    with pytest.raises(ValueError, match="chat_template_kwargs"):
+        _chat_template_kwargs_for_processor(example)
+
+
+def test_deep_merge_dict_merges_nested_values_without_mutating_inputs():
+    base = {"nested": {"left": 1}, "unchanged": [1]}
+    update = {"nested": {"right": 2}, "unchanged": [2]}
+
+    merged = _deep_merge_dict(base, update)
+
+    assert merged == {"nested": {"left": 1, "right": 2}, "unchanged": [2]}
+    assert base == {"nested": {"left": 1}, "unchanged": [1]}
+    assert update == {"nested": {"right": 2}, "unchanged": [2]}
 
 
 def test_video_metadata_canonicalizes_mapping_extra_body_to_json_string():
