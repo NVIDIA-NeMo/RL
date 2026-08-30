@@ -1224,14 +1224,21 @@ class VllmGeneration(GenerationInterface):
             else "prepare_refit_info"
         )
 
-        # Use run_all_workers_single_data to send data to all workers
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name,
-            state_dict_info=state_dict_info,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-
-        # Wait for all futures to complete
+        # Surviving leaders only, like update_weights_from_collective and the reshard
+        # plan distribution. run_all_workers_single_data walks the WHOLE group, so once a
+        # shard is lost this called its dead actor and raised ActorDiedError -- out of
+        # reconcile_communicator, past the recovery, and into the run. Job 6718090: the
+        # rebuild had just succeeded ("rebuilding communicator over shards [1]") and this
+        # line killed the run 20s later. It is reached on the recovery path precisely
+        # because a shard is absent, so the whole-group fan-out is wrong exactly when it
+        # runs.
+        #
+        # rank_0_only over tensor_parallel/pipeline_parallel is what the group call did,
+        # and _refit_leader_workers is the same set restricted to the live membership.
+        futures = [
+            getattr(worker, method_name).remote(state_dict_info=state_dict_info)
+            for worker in self._refit_leader_workers()
+        ]
         ray.get(futures)
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
