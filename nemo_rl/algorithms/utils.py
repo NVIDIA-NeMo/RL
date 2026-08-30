@@ -32,6 +32,46 @@ from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
 
 
+ACTOR_TOKEN_COUNT_METRIC = "num_valid_actor_tokens"
+ACTOR_TOKEN_MEAN_METRICS = frozenset(
+    {"probs_ratio", "probs_ratio_clamped", "approx_entropy"}
+)
+
+
+def finalize_actor_token_metrics(metrics: dict[str, Any]) -> None:
+    """Normalize actor-mask metric numerators after global aggregation.
+
+    ``ClippedPGLossFn`` emits raw numerator fragments for metrics reduced over
+    its narrowed actor mask, together with the matching valid-token count.
+    Callers must first sum both across every microbatch and data-parallel rank,
+    then call this helper exactly once. Normalizing fragments locally would
+    weight sparse shards and packed sequences equally instead of by their
+    retained-token counts.
+
+    Args:
+        metrics: Step metrics whose loss fragments have already been summed.
+            The mapping is updated in place.
+    """
+    if ACTOR_TOKEN_COUNT_METRIC not in metrics:
+        return
+
+    num_valid_actor_tokens = float(metrics[ACTOR_TOKEN_COUNT_METRIC])
+    if num_valid_actor_tokens < 0:
+        raise ValueError(
+            f"{ACTOR_TOKEN_COUNT_METRIC} must be non-negative, "
+            f"got {num_valid_actor_tokens}"
+        )
+
+    for metric_name in ACTOR_TOKEN_MEAN_METRICS:
+        if metric_name not in metrics:
+            continue
+        metrics[metric_name] = (
+            float(metrics[metric_name]) / num_valid_actor_tokens
+            if num_valid_actor_tokens > 0
+            else 0.0
+        )
+
+
 def get_gdpo_reward_component_keys(batch) -> list[str]:
     """Return batch keys that are named reward components (e.g. reward/correctness) in sorted order."""
     return sorted(

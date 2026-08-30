@@ -131,6 +131,29 @@ class TestAggregateStepMetrics:
         assert out["moe/load_balance"] == pytest.approx(4.0)
         assert out["mtp/acc"] == pytest.approx(4.0)
 
+    def test_actor_metrics_weight_uneven_microbatches_and_ranks_by_tokens(
+        self,
+    ) -> None:
+        """Raw fragments produce one global mean, not a sum of local means."""
+        # Flattened order is rank0/mb0, rank0/mb1, rank1/mb0, rank1/mb1.
+        # The last shard retained no actor tokens; the other three contain
+        # ratio sums/counts (4/2), (2/1), and (15/3).
+        result = {
+            "all_mb_metrics": {
+                "probs_ratio": [4.0, 2.0, 15.0, 0.0],
+                "probs_ratio_clamped": [3.0, 1.0, 6.0, 0.0],
+                "approx_entropy": [2.0, 4.0, 9.0, 0.0],
+                "num_valid_actor_tokens": [2.0, 1.0, 3.0, 0.0],
+            }
+        }
+
+        out = aggregate_step_metrics(result)
+
+        assert out["num_valid_actor_tokens"] == pytest.approx(6.0)
+        assert out["probs_ratio"] == pytest.approx(3.5)
+        assert out["probs_ratio_clamped"] == pytest.approx(10.0 / 6.0)
+        assert out["approx_entropy"] == pytest.approx(2.5)
+
 
 class TestReduceAdvantagePumpMetrics:
     def test_reward_and_advantages_and_tokens(self) -> None:

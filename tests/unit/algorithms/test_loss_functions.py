@@ -31,7 +31,12 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
-from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.algorithms.utils import (
+    ACTOR_TOKEN_COUNT_METRIC,
+    calculate_kl,
+    finalize_actor_token_metrics,
+    masked_mean,
+)
 from nemo_rl.algorithms.x_token.loss_utils import (
     build_exact_token_map,
     chunk_average_log_probs,
@@ -165,10 +170,17 @@ _GVS = torch.tensor(1.0)
 
 def _run_with_and_without_keep(loss_fn, **data_kwargs):
     """Returns (all, kept) for the same loss with and without the keep mask."""
-    return (
-        loss_fn(_CURR_LOGPROBS, _keep_mask_data(None, **data_kwargs), _GVS, _GVT),
-        loss_fn(_CURR_LOGPROBS, _keep_mask_data(_KEEP, **data_kwargs), _GVS, _GVT),
-    )
+    results = []
+    for keep_mask in (None, _KEEP):
+        loss, metrics = loss_fn(
+            _CURR_LOGPROBS,
+            _keep_mask_data(keep_mask, **data_kwargs),
+            _GVS,
+            _GVT,
+        )
+        finalize_actor_token_metrics(metrics)
+        results.append((loss, metrics))
+    return tuple(results)
 
 
 def test_keep_mask_narrows_the_sequence_level_ratio():
@@ -232,11 +244,65 @@ def test_keep_mask_narrows_the_reported_ratio_means():
     """probs_ratio and probs_ratio_clamped are the headline train/inference
     mismatch numbers. The existing test pins only probs_ratio_max, which comes
     from a separate un-narrowed reduction, so both means were uncovered."""
-    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.5))
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.5,
+            ratio_clip_min=5.0,
+            ratio_clip_max=5.0,
+        )
+    )
     (_, m_all), (_, m_kept) = _run_with_and_without_keep(loss_fn)
 
     assert m_kept["probs_ratio"] != pytest.approx(m_all["probs_ratio"])
     assert m_kept["probs_ratio_clamped"] != pytest.approx(m_all["probs_ratio_clamped"])
+
+
+def test_actor_mask_metric_fragments_have_exact_global_mean_and_preserve_kl():
+    """Actor diagnostics use their retained-token count; KL keeps the full mask."""
+    log_two = math.log(2.0)
+    curr_logprobs = torch.tensor([[-3.0, log_two - 3.0, 0.0]])
+    curr_logprobs_unfiltered = torch.tensor([[-3.0, log_two - 3.0, -4.0]])
+    data = BatchedDataDict(
+        {
+            "token_mask": torch.ones(1, 4),
+            "sample_mask": torch.ones(1),
+            "advantages": torch.zeros(1, 4),
+            "prev_logprobs": torch.tensor([[0.0, -3.0, -3.0, -3.0]]),
+            "generation_logprobs": torch.tensor([[0.0, -3.0, log_two - 3.0, -5.0]]),
+            "reference_policy_logprobs": torch.tensor([[0.0, -2.0, -2.0, -2.0]]),
+            "curr_logprobs_unfiltered": curr_logprobs_unfiltered,
+            "curr_logprobs_keep_mask": torch.tensor([[1.0, 1.0, 0.0]]),
+        }
+    )
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.5))
+
+    _, metrics = loss_fn(
+        curr_logprobs,
+        data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(3.0),
+    )
+
+    # Ratios on the two retained tokens are [1, 2], and their default-clamped
+    # values are [1, 1.2]. Loss metrics emit additive numerator fragments.
+    assert metrics[ACTOR_TOKEN_COUNT_METRIC] == pytest.approx(2.0)
+    assert metrics["probs_ratio"] == pytest.approx(3.0)
+    assert metrics["probs_ratio_clamped"] == pytest.approx(2.2)
+    assert metrics["approx_entropy"] == pytest.approx(6.0 - log_two)
+
+    expected_kl = calculate_kl(
+        logprobs=curr_logprobs_unfiltered,
+        logprobs_reference=data["reference_policy_logprobs"][:, 1:],
+        kl_type="k3",
+    ).mean()
+    assert metrics["kl_penalty"] == pytest.approx(expected_kl.item())
+
+    finalize_actor_token_metrics(metrics)
+    assert metrics["probs_ratio"] == pytest.approx(1.5)
+    assert metrics["probs_ratio_clamped"] == pytest.approx(1.1)
+    assert metrics["approx_entropy"] == pytest.approx(3.0 - log_two / 2.0)
+    # Finalizing actor diagnostics must not touch the full-mask KL fragment.
+    assert metrics["kl_penalty"] == pytest.approx(expected_kl.item())
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
@@ -820,6 +886,7 @@ def test_clipped_pg_loss_force_on_policy_ratio():
         ),
         **loss_input,
     )
+    finalize_actor_token_metrics(metrics)
 
     # Loss should match the on-policy expectation
     torch.testing.assert_close(actual_loss, expected_loss, rtol=1e-3, atol=1e-3)
@@ -884,6 +951,8 @@ def test_clipped_pg_loss_force_on_policy_ratio_ignores_prev_logprobs():
         ),
         **loss_input_2,
     )
+    finalize_actor_token_metrics(metrics_1)
+    finalize_actor_token_metrics(metrics_2)
 
     # Both should produce identical loss and ratios since prev_logprobs is ignored
     torch.testing.assert_close(loss_1, loss_2)
@@ -2016,6 +2085,7 @@ def test_clipped_pg_loss_entropy():
         global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
         **loss_input,
     )
+    finalize_actor_token_metrics(metrics)
 
     torch.testing.assert_close(
         torch.tensor(metrics["approx_entropy"], device=device),
@@ -3101,15 +3171,17 @@ class TestMetricNormalizationAdvertisement:
         assert norms["kl_penalty"] is MetricNormalizer.TOKENS
         assert norms["sampling_importance_ratio"] is MetricNormalizer.TOKENS
         for key in (
-            "probs_ratio",
-            "probs_ratio_clamped",
             "token_mult_prob_error",
             "gen_kl_error",
             "policy_kl_error",
             "js_divergence_error",
-            "approx_entropy",
         ):
             assert norms[key] is MetricNormalizer.TOKENS
+        # Actor-mask diagnostics are additive numerator fragments paired with
+        # a retained-token count, then normalized after global aggregation.
+        for key in ("probs_ratio", "probs_ratio_clamped", "approx_entropy"):
+            assert norms[key] is MetricNormalizer.NONE
+        assert norms[ACTOR_TOKEN_COUNT_METRIC] is MetricNormalizer.NONE
         # raw counts / local means / extrema are never rescaled
         assert norms["num_valid_samples"] is MetricNormalizer.NONE
         assert norms["positive_nll_loss"] is MetricNormalizer.NONE
@@ -3131,7 +3203,7 @@ class TestMetricNormalizationAdvertisement:
         assert norms["sampling_importance_ratio"] is MetricNormalizer.SEQUENCES
         # the always-token diagnostics do NOT follow loss_type
         assert norms["token_mult_prob_error"] is MetricNormalizer.TOKENS
-        assert norms["probs_ratio"] is MetricNormalizer.TOKENS
+        assert norms["probs_ratio"] is MetricNormalizer.NONE
 
     def test_seq_mask_tis_with_token_level_loss(self):
         """is_oob_ratio keys on the TIS type, not loss_type: seq-mask-tis
@@ -3241,6 +3313,10 @@ def test_split_rescale_matches_sync_normalization():
     assert raw_totals["num_valid_samples"] == pytest.approx(
         sync_totals["num_valid_samples"]
     )
+    finalize_actor_token_metrics(sync_totals)
+    finalize_actor_token_metrics(raw_totals)
+    for key in ("probs_ratio", "probs_ratio_clamped", "approx_entropy"):
+        assert raw_totals[key] == pytest.approx(sync_totals[key])
 
 
 # ---------------------------------------------------------------------------

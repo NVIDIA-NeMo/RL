@@ -23,7 +23,12 @@ from nemo_rl.algorithms.loss.interfaces import (
     LossType,
     MetricNormalizer,
 )
-from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.algorithms.utils import (
+    ACTOR_TOKEN_COUNT_METRIC,
+    ACTOR_TOKEN_MEAN_METRICS,
+    calculate_kl,
+    masked_mean,
+)
 from nemo_rl.algorithms.x_token.loss_utils import (
     LocalizedAlignment,
     build_exact_token_map,
@@ -341,14 +346,19 @@ class ClippedPGLossFn(LossFunction):
             # Normalized like the gradient (loss_type-dependent).
             "loss": grad_normalizer,
             "kl_penalty": grad_normalizer,
-            # Token-normalized diagnostics, independent of loss_type.
-            "probs_ratio": MetricNormalizer.TOKENS,
-            "probs_ratio_clamped": MetricNormalizer.TOKENS,
+            # Actor-mask means are emitted as raw numerator fragments and
+            # normalized once their matching retained-token counts have been
+            # summed across microbatches and ranks.
+            **{
+                metric_name: MetricNormalizer.NONE
+                for metric_name in ACTOR_TOKEN_MEAN_METRICS
+            },
+            ACTOR_TOKEN_COUNT_METRIC: MetricNormalizer.NONE,
+            # Full-token diagnostics, independent of loss_type.
             "token_mult_prob_error": MetricNormalizer.TOKENS,
             "gen_kl_error": MetricNormalizer.TOKENS,
             "policy_kl_error": MetricNormalizer.TOKENS,
             "js_divergence_error": MetricNormalizer.TOKENS,
-            "approx_entropy": MetricNormalizer.TOKENS,
             # Keyed on sequence_level_importance_ratios, NOT loss_type.
             "sampling_importance_ratio": (
                 MetricNormalizer.SEQUENCES
@@ -421,6 +431,7 @@ class ClippedPGLossFn(LossFunction):
         keep_mask = data.get("curr_logprobs_keep_mask")
         actor_token_mask = token_mask if keep_mask is None else token_mask * keep_mask
         actor_mask = actor_token_mask * sample_mask.unsqueeze(-1)
+        num_valid_actor_tokens = actor_mask.sum()
 
         # For truly on-policy training, use curr_logprobs as prev_logprobs
         # This avoids computing prev_logprobs upstream
@@ -736,10 +747,13 @@ class ClippedPGLossFn(LossFunction):
         # Approximating entropy as E_{s ~ \pi_{gen}(s)}[-(\pi_{curr}/\pi_{gen})log(\pi_{curr}(s))]
         # See more details and other metrics in docs/guides/grpo.md#metrics
         with torch.no_grad():
-            seq_entropy_approx = -masked_mean(
-                torch.exp(curr_logprobs - generation_logprobs) * curr_logprobs,
-                actor_mask,
-                global_normalization_factor=global_valid_toks,
+            # Keep this as a numerator fragment. The narrowed token count is
+            # only known after every microbatch/rank has run, so downstream
+            # aggregation divides the global sum by the global actor-token sum.
+            seq_entropy_approx = -torch.sum(
+                torch.exp(curr_logprobs - generation_logprobs)
+                * curr_logprobs
+                * actor_mask
             )
 
         # -----------------------------------------------------------------
@@ -760,16 +774,10 @@ class ClippedPGLossFn(LossFunction):
 
         loss = actor_loss + kl + self.positive_example_nll_weight * nll_loss
         with torch.no_grad():
-            probs_ratio = masked_mean(
-                ratios.detach(),
-                actor_mask,
-                global_normalization_factor=global_valid_toks,
-            ).item()
-            probs_ratio_clamped = masked_mean(
-                ratios_clamped.detach(),
-                actor_mask,
-                global_normalization_factor=global_valid_toks,
-            ).item()
+            # These are numerator fragments, not per-microbatch means. A local
+            # mean cannot be added across packed sequences or uneven DP shards.
+            probs_ratio = torch.sum(ratios.detach() * actor_mask).item()
+            probs_ratio_clamped = torch.sum(ratios_clamped.detach() * actor_mask).item()
 
             # Calculate min/max values for ratios (only for valid tokens)
             masked_ratios = ratios.detach()[actor_mask.bool()]
@@ -787,9 +795,10 @@ class ClippedPGLossFn(LossFunction):
                 probs_ratio_clamped_min = float("inf")
                 probs_ratio_clamped_max = float("-inf")
 
-        # If you provided a global_valid_{seqs/toks}, all metrics here are globally normalized
-        # by either sequence or token count, depending on particular metric.
-        # To get the true metric, you'll need to sum over the microbatch.
+        # Most metrics are fragments normalized by global_valid_{seqs/toks} and
+        # become the true step value after summing microbatches. Actor-mask means
+        # are raw numerator fragments paired with num_valid_actor_tokens instead;
+        # callers sum both globally and finalize that ratio once per step.
         return (
             loss,
             {
@@ -807,6 +816,7 @@ class ClippedPGLossFn(LossFunction):
                 "js_divergence_error": js_divergence_error,
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
+                ACTOR_TOKEN_COUNT_METRIC: num_valid_actor_tokens.item(),
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
                 "positive_nll_loss": nll_loss.item(),

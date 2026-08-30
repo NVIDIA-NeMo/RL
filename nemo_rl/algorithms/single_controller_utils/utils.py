@@ -22,6 +22,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.algorithms.utils import finalize_actor_token_metrics
 from nemo_rl.data_plane import KVBatchMeta
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
@@ -87,6 +88,7 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
             metrics[k] = float(np.mean(v))
         else:
             metrics[k] = float(np.sum(v))
+    finalize_actor_token_metrics(metrics)
     return metrics
 
 
