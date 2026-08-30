@@ -92,6 +92,9 @@ def _patch_vllm_init_workers_ray(
         "NCCL_CUMEM_ENABLE",
         "NCCL_NVLS_ENABLE",
         "RAY_ENABLE_UV_RUN_RUNTIME_ENV",
+        # fp32 LM head opt-in must reach the TP ray workers that execute the
+        # model, not just the leader actor (see _patch_vllm_nemotron_h_fp32_lm_head).
+        "NRL_VLLM_FP32_LM_HEAD",
         *(extra_env_vars or []),
     ]
     additional_env_str = ", ".join(f'"{env_var}"' for env_var in additional_env_vars)
@@ -165,6 +168,103 @@ def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
         write_back(content)
 
     logger.info("Successfully patched llama_eagle3 lm_head ownership.")
+
+
+def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> None:
+    """Compute NemotronH logits with an fp32 LM head (MiniMax-M1-style).
+
+    bf16 rounding of the logits GEMM output is the dominant contributor to
+    generation/training logprob mismatch (train/token_mult_prob_error). With
+    this patch the sampled-token logprobs come from fp32 logits, matching a
+    trainer that enables megatron_cfg.fp32_lm_head.
+
+    This must be a source patch (not a monkeypatch): the model executes in
+    vLLM's EngineCore worker subprocesses, which import vllm independently of
+    this process. The patched code is opt-in at runtime via
+    NRL_VLLM_FP32_LM_HEAD=1 (set it through policy.generation.vllm_cfg.env_vars
+    so worker processes inherit it). Costs one fp32 copy of the vocab-sharded
+    head weight per rank.
+
+    IMPORTANT: a one-sided fp32 head (trainer fp32, vLLM bf16) is WORSE than
+    all-bf16 — two bf16 heads round to the same grid and their errors partially
+    cancel. So if the feature is requested but the patch cannot be applied,
+    fail loudly instead of degrading silently.
+    """
+    fp32_head_requested = os.environ.get("NRL_VLLM_FP32_LM_HEAD", "0") == "1"
+
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/nemotron_h.py")
+    except RuntimeError:
+        if fp32_head_requested:
+            raise RuntimeError(
+                "NRL_VLLM_FP32_LM_HEAD=1 is set but nemotron_h.py could not be "
+                "located in the vLLM installation. Refusing to run with a "
+                "one-sided fp32 LM head (it is worse than all-bf16)."
+            )
+        logger.warning("Could not locate nemotron_h.py for the fp32 LM head patch.")
+        return
+
+    old_snippet = """        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits"""
+    new_snippet = """        import os as _os
+
+        if _os.environ.get("NRL_VLLM_FP32_LM_HEAD", "0") == "1":
+            # NeMo-RL patch: fp32 LM head (MiniMax-M1-style). bf16 rounding of
+            # the logits is the dominant gen/train logprob mismatch source.
+            _fp32_head = getattr(self, "_nrl_lm_head_fp32", None)
+            if _fp32_head is None and not torch.cuda.is_current_stream_capturing():
+                # Skipped under graph capture: an allocation there lives in the
+                # graph's memory pool and is not valid for later eager replays.
+                # Capture output is discarded anyway, so bf16 is fine for it.
+                import copy as _copy
+
+                _fp32_head = _copy.deepcopy(self.lm_head).float()
+                # object.__setattr__ bypasses nn.Module.__setattr__: registering
+                # this as a submodule would add a vocab-sized parameter to
+                # named_parameters(), which the refit weight mapping is built from.
+                object.__setattr__(self, "_nrl_lm_head_fp32", _fp32_head)
+                self._nrl_lm_head_fp32_dirty = False
+                print(
+                    "[fp32_lm_head] built fp32 head in forward shape=%s"
+                    % (tuple(_fp32_head.weight.shape),),
+                    flush=True,
+                )
+            elif _fp32_head is not None and getattr(
+                self, "_nrl_lm_head_fp32_dirty", False
+            ):
+                # Refreshed in place: replacing the module would leave any
+                # captured CUDA graph pointing at the old storage.
+                _fp32_head.weight.data.copy_(self.lm_head.weight)
+                if getattr(_fp32_head, "bias", None) is not None:
+                    _fp32_head.bias.data.copy_(self.lm_head.bias)
+                self._nrl_lm_head_fp32_dirty = False
+                print("[fp32_lm_head] refreshed cached head in forward", flush=True)
+            if _fp32_head is not None:
+                return self.logits_processor(_fp32_head, hidden_states.float())
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits"""
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if "NRL_VLLM_FP32_LM_HEAD" in content:
+            logger.info("NemotronH fp32 LM head patch already present.")
+            return
+        if content.count(old_snippet) != 1:
+            if fp32_head_requested:
+                raise RuntimeError(
+                    "NRL_VLLM_FP32_LM_HEAD=1 is set but the fp32 LM head patch "
+                    f"anchor was not found exactly once in {file_to_patch} "
+                    "(vLLM version changed?). Refusing to run with a one-sided "
+                    "fp32 LM head (it is worse than all-bf16)."
+                )
+            logger.warning(
+                "NemotronH fp32 LM head patch anchor not found exactly once "
+                "in %s; patch not applied.",
+                file_to_patch,
+            )
+            return
+        write_back(content.replace(old_snippet, new_snippet, 1))
+
+    logger.info("Applied NemotronH fp32 LM head source patch.")
 
 
 def _patch_vllm_hermes_tool_parser_thread_safety(logger) -> None:
@@ -295,3 +395,4 @@ def _apply_vllm_patches(
 
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_hermes_tool_parser_thread_safety(patch_logger)
+    _patch_vllm_nemotron_h_fp32_lm_head(patch_logger)

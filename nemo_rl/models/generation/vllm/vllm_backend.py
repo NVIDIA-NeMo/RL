@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import os
 import re
 import traceback
 from typing import Any
@@ -352,6 +353,107 @@ class VllmInternalWorkerExtension:
             self.model_runner.model.load_weights(weights=policy_weights)
 
         self._load_draft_weights(draft_weights)
+        # Every refit transport funnels through here (IPC ZMQ and collective on
+        # this branch), so this is where the fp32 LM head cache is invalidated.
+        self._mark_fp32_lm_head_dirty()
+
+    def _get_drafter_model(self) -> Any:
+        draft_owner = getattr(self.model_runner, "drafter", None)
+        return getattr(draft_owner, "model", None) if draft_owner else None
+
+    def _mark_fp32_lm_head_dirty(self) -> None:
+        """Flag the NRL_VLLM_FP32_LM_HEAD cached head for refresh.
+
+        The patch keeps an fp32 copy of lm_head that the just-loaded weights
+        supersede; compute_logits refreshes it in place on the next forward.
+        Set on every batch of a multi-batch refit so the copy stays dirty until
+        the whole update lands.
+        """
+        if os.environ.get("NRL_VLLM_FP32_LM_HEAD", "0") != "1":
+            return
+        marked = []
+        for label, model in (
+            ("policy", self.model_runner.model),
+            ("drafter", self._get_drafter_model()),
+        ):
+            if model is None:
+                continue
+            if getattr(model, "_nrl_lm_head_fp32", None) is not None:
+                model._nrl_lm_head_fp32_dirty = True
+                marked.append(label)
+            else:
+                # No cache yet: the first compute_logits after this refit builds
+                # it, which is already correct (post-refit) weights.
+                marked.append(f"{label}:none-yet")
+        # Logged once per worker: _load_weights runs per refit batch.
+        if not getattr(self, "_nrl_fp32_dirty_logged", False):
+            self._nrl_fp32_dirty_logged = True
+            print(f"[fp32_lm_head] refit marked: {marked}", flush=True)
+
+    def _sync_fp32_lm_head(self) -> None:
+        """Rebuild the fp32 LM head cache from the weights refit just loaded.
+
+        The NRL_VLLM_FP32_LM_HEAD source patch keeps an fp32 copy of lm_head.
+        Engines start on dummy weights, so that copy is stale after every
+        refit. Building it here (eager, post-refit) rather than lazily in
+        compute_logits also keeps the allocation out of any CUDA graph pool.
+
+        Covers the drafter too when speculative decoding is on: it is a
+        separate module with its own head and its own refit stream.
+        """
+        if os.environ.get("NRL_VLLM_FP32_LM_HEAD", "0") != "1":
+            return
+        for label, model in (
+            ("policy", self.model_runner.model),
+            ("drafter", self._get_drafter_model()),
+        ):
+            if model is not None:
+                self._sync_fp32_lm_head_for(label, model)
+
+    def _sync_fp32_lm_head_for(self, label: str, model: Any) -> None:
+        lm_head = getattr(model, "lm_head", None)
+        if lm_head is None:
+            # Drafters commonly tie their head to the policy's; nothing to sync.
+            print(
+                f"[fp32_lm_head] {label} ({type(model).__name__}) has no lm_head; skipping",
+                flush=True,
+            )
+            return
+
+        cached = getattr(model, "_nrl_lm_head_fp32", None)
+        if cached is None:
+            import copy
+
+            cached = copy.deepcopy(lm_head).float()
+            # Bypass nn.Module.__setattr__: registering this as a submodule
+            # would add a vocab-sized parameter to named_parameters(), which
+            # the refit weight mapping is built from.
+            object.__setattr__(model, "_nrl_lm_head_fp32", cached)
+            print(
+                f"[fp32_lm_head] {label}: built fp32 head cache after refit "
+                f"shape={tuple(cached.weight.shape)}",
+                flush=True,
+            )
+        else:
+            probe = slice(0, 16)
+            drift = (
+                (
+                    cached.weight.flatten()[probe]
+                    - lm_head.weight.flatten()[probe].float()
+                )
+                .abs()
+                .max()
+                .item()
+            )
+            cached.weight.data.copy_(lm_head.weight)
+            if getattr(cached, "bias", None) is not None:
+                cached.bias.data.copy_(lm_head.bias)
+            print(
+                f"[fp32_lm_head] {label}: refreshed fp32 head cache after refit "
+                f"(pre-refresh drift={drift:.6g})",
+                flush=True,
+            )
+        model._nrl_lm_head_fp32_dirty = False
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
@@ -380,6 +482,7 @@ class VllmInternalWorkerExtension:
                         process_weights_after_loading(
                             self.model_runner.model, self.model_config, self.device
                         )
+                    self._sync_fp32_lm_head()
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
@@ -468,6 +571,7 @@ class VllmInternalWorkerExtension:
             process_weights_after_loading(
                 self.model_runner.model, self.model_config, self.device
             )
+            self._sync_fp32_lm_head()
             self._maybe_process_fp8_kv_cache()
 
         except Exception as e:
