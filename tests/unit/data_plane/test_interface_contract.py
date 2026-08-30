@@ -20,6 +20,8 @@ be installed, so CI exercises the contract on every push.
 
 from __future__ import annotations
 
+import pickle
+
 import pytest
 import torch
 from tensordict import TensorDict
@@ -65,8 +67,10 @@ def test_register_put_get_clear(client: DataPlaneClient):
 
     out = client.get_samples(sample_ids=keys, partition_id="p", select_fields=["x"])
     assert torch.equal(out["x"], torch.arange(4))
+    assert client.list_sample_ids("p") == keys
 
     client.clear_samples(sample_ids=None, partition_id="p")
+    assert client.list_sample_ids("p") == []
     with pytest.raises(KeyError):
         client.get_samples(sample_ids=keys, partition_id="p", select_fields=["x"])
 
@@ -124,3 +128,82 @@ def test_kv_batch_put_rejects_non_tensor_leaves(client: DataPlaneClient):
 def test_close_is_idempotent(client: DataPlaneClient):
     client.close()
     client.close()
+
+
+def test_checkpoint_round_trip_restores_data_and_consumption(tmp_path) -> None:
+    checkpoint_dir = tmp_path / "data-plane"
+    source = NoOpDataPlaneClient()
+    source.register_partition(
+        partition_id="p",
+        fields=["x"],
+        num_samples=3,
+        consumer_tasks=["train"],
+    )
+    source.put_samples(
+        sample_ids=["a", "b", "c"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.tensor([10, 20, 30])}, batch_size=[3]),
+    )
+    consumed = source.claim_meta(
+        partition_id="p",
+        task_name="train",
+        required_fields=["x"],
+        batch_size=1,
+    )
+    source.save_checkpoint(checkpoint_dir, metadata={"step": 7})
+
+    restored = NoOpDataPlaneClient()
+    metadata = restored.load_checkpoint(checkpoint_dir)
+    assert metadata == {"step": 7}
+    data = restored.get_samples(
+        sample_ids=["a", "b", "c"],
+        partition_id="p",
+        select_fields=["x"],
+    )
+    assert torch.equal(data["x"], torch.tensor([10, 20, 30]))
+
+    remaining = restored.claim_meta(
+        partition_id="p",
+        task_name="train",
+        required_fields=["x"],
+        batch_size=3,
+    )
+    assert consumed.sample_ids[0] not in remaining.sample_ids
+    assert set(consumed.sample_ids + remaining.sample_ids) == {"a", "b", "c"}
+    assert restored.check_consumption_status("p", ["train"])
+
+    source.close()
+    restored.close()
+
+
+def test_checkpoint_load_requires_clean_client(tmp_path) -> None:
+    checkpoint_dir = tmp_path / "data-plane"
+    source = NoOpDataPlaneClient()
+    source.save_checkpoint(checkpoint_dir)
+
+    source.register_partition(
+        partition_id="already-used",
+        fields=["x"],
+        num_samples=1,
+        consumer_tasks=["train"],
+    )
+    with pytest.raises(RuntimeError, match="clean data-plane client"):
+        source.load_checkpoint(checkpoint_dir)
+    source.close()
+
+
+def test_noop_checkpoint_load_explains_missing_partitions(tmp_path) -> None:
+    checkpoint_dir = tmp_path / "data-plane"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "noop_state.pkl"
+    with checkpoint_file.open("wb") as state_file:
+        pickle.dump({"metadata": {}}, state_file)
+
+    client = NoOpDataPlaneClient()
+    with pytest.raises(ValueError) as exc_info:
+        client.load_checkpoint(checkpoint_dir)
+
+    message = str(exc_info.value)
+    assert str(checkpoint_file) in message
+    assert "has no 'partitions' key" in message
+    assert "Delete it and re-run the test" in message

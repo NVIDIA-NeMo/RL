@@ -19,18 +19,34 @@ from __future__ import annotations
 import contextlib
 import threading
 from pathlib import Path
+from typing import Any, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 from omegaconf import OmegaConf
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DATA_PLANE_CHECKPOINT_DIR,
+    LEGACY_REPLAY_BUFFER_FILENAME,
+    REPLAY_BUFFER_METADATA_FILENAME,
+    REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+    DataPlaneCheckpointMetadata,
+)
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    CustomSamplerConfig,
     ReadyFirstSamplerConfig,
     SamplerConfig,
+    WindowedSampler,
+    WindowedSamplerConfig,
 )
-from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
+    GRPOSaveState,
+    _initial_grpo_save_state,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.single_controller_utils import (
@@ -39,6 +55,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     SingleControllerActorArgs,
     setup_single_controller,
 )
+from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -46,6 +63,24 @@ from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 # Captured at import, before the patched_factories fixture swaps it for a mock.
 _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
+
+
+class _CheckpointingCustomSampler(WindowedSampler):
+    """Custom sampler whose static capability must be validated during setup."""
+
+    supports_buffer_checkpoint = True
+
+    def __init__(self, buffer: Any) -> None:
+        super().__init__(buffer, max_staleness_versions=1)
+
+
+class _NonCheckpointingCustomSampler(WindowedSampler):
+    """Custom sampler that explicitly opts out of replay recovery."""
+
+    supports_buffer_checkpoint = False
+
+    def __init__(self, buffer: Any) -> None:
+        super().__init__(buffer, max_staleness_versions=1)
 
 
 def _make_master_config(
@@ -87,7 +122,11 @@ def _make_master_config(
         }
         policy_config["model_name"] = "test-model"
     return MasterConfig.model_construct(
-        data_plane={"enabled": dp_enabled, "impl": "transfer_queue"},
+        data_plane={
+            "enabled": dp_enabled,
+            "impl": "transfer_queue",
+            "backend": "simple",
+        },
         data={
             "use_multiple_dataloader": use_multiple_dataloader,
             "shuffle": False,
@@ -127,6 +166,35 @@ def _make_master_config(
             **({} if sampler_cfg is None else {"sampler": sampler_cfg}),
         ),
     )
+
+
+def _native_tq_metadata(
+    *, step: int = 3, trainer_version: Optional[int] = None, epoch: int = 1
+) -> DataPlaneCheckpointMetadata:
+    return {
+        "data_plane_checkpoint_schema_version": (DATA_PLANE_CHECKPOINT_SCHEMA_VERSION),
+        "single_controller_train_steps": step,
+        "single_controller_trainer_version": (
+            step if trainer_version is None else trainer_version
+        ),
+        "single_controller_epoch": epoch,
+        "partition_id": "rollout_data",
+        "sampler_name": "in_order",
+        "mode": "authoritative",
+        "replay_metadata_schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+        "replay_manifest_digest": "digest-1",
+        "replay_group_count": 2,
+    }
+
+
+def _save_state(
+    *, step: int = 3, trainer_version: Optional[int] = None, epoch: int = 1
+) -> GRPOSaveState:
+    state = _initial_grpo_save_state()
+    state.current_step = step
+    state.current_epoch = epoch
+    state.trainer_version = trainer_version
+    return state
 
 
 @pytest.fixture
@@ -366,6 +434,78 @@ class TestSetup:
         mc = _make_master_config(dp_enabled=False)
         with pytest.raises(ValueError, match="data_plane.enabled=True"):
             setup_single_controller(mc, MagicMock())
+
+    def test_rejects_mooncake_data_plane_checkpointing(self):
+        mc = _make_master_config()
+        mc.data_plane["backend"] = "mooncake_cpu"
+        mc.checkpointing["save_data_plane"] = True
+        with pytest.raises(NotImplementedError, match="backend='mooncake_cpu'"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_rejects_windowed_checkpointing_without_native_tq(self):
+        mc = _make_master_config()
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = False
+        mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
+        mc.data_plane["backend"] = "simple"
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "replay-checkpoint-capable sampler requires "
+                "checkpointing.save_data_plane=true"
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_checkpointing_error_explains_mooncake_incompatibility(self):
+        mc = _make_master_config()
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = False
+        mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
+        mc.data_plane["backend"] = "mooncake_cpu"
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "backend='mooncake_cpu'.*backend='simple'.*checkpointing.enabled=false"
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_rejects_checkpointing_custom_sampler_without_native_tq(self):
+        mc = _make_master_config()
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = False
+        mc.async_rl.sampler = CustomSamplerConfig(
+            target=f"{__name__}:_CheckpointingCustomSampler"
+        )
+        mc.data_plane["backend"] = "simple"
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "replay-checkpoint-capable sampler requires "
+                "checkpointing.save_data_plane=true"
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_warns_when_custom_sampler_cannot_recover_buffered_rollouts(
+        self, patched_factories
+    ):
+        mc = _make_master_config()
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = False
+        mc.async_rl.sampler = CustomSamplerConfig(
+            target=f"{__name__}:_NonCheckpointingCustomSampler"
+        )
+        mc.data_plane["backend"] = "simple"
+
+        with pytest.warns(
+            UserWarning, match="cannot recover completed buffered rollouts"
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_multiple_dataloader_not_supported(self):
         mc = _make_master_config(use_multiple_dataloader=True)
@@ -1240,3 +1380,147 @@ class TestSetup:
             match="not supported for the MegatronGeneration generation backend",
         ):
             sc_setup_mod._maybe_attach_fleet_health(generation, mc)
+
+
+class TestNativeTQRecoverySetup:
+    def test_setup_loads_tq_before_creating_single_controller_client(
+        self, tmp_path, patched_factories
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        torch.save({}, checkpoint_path / "train_dataloader.pt")
+        save_state = _save_state()
+        policy = patched_factories["fake_policy"]
+        events: list[str] = []
+        policy.load_data_plane_checkpoint.side_effect = lambda checkpoint_dir: (
+            events.append("load") or _native_tq_metadata()
+        )
+        patched_factories["build_data_plane_client"].side_effect = (
+            lambda *args, **kwargs: (
+                events.append("build") or MagicMock(name="dp_client")
+            )
+        )
+        checkpointer = MagicMock()
+        checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
+        checkpointer.load_training_info.return_value = vars(save_state)
+        checkpointer.get_resume_paths.return_value = (None, None)
+        mc = _make_master_config()
+
+        with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert events == ["load", "build"]
+        assert actor_args.data_plane_checkpoint_metadata == _native_tq_metadata()
+
+    def test_loads_authoritative_tq_checkpoint_when_metadata_file_exists(
+        self, tmp_path
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        policy = MagicMock()
+        metadata = _native_tq_metadata()
+        policy.load_data_plane_checkpoint.return_value = metadata
+        save_state = _save_state()
+
+        restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+            policy,
+            last_checkpoint_path=str(checkpoint_path),
+            save_state=save_state,
+            partition_id="rollout_data",
+            sampler_name="in_order",
+        )
+
+        assert restored == metadata
+        policy.load_data_plane_checkpoint.assert_called_once_with(
+            checkpoint_path / DATA_PLANE_CHECKPOINT_DIR
+        )
+
+    def test_validates_trainer_version_independently_from_train_step(self, tmp_path):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        policy = MagicMock()
+        metadata = _native_tq_metadata(step=3, trainer_version=7)
+        policy.load_data_plane_checkpoint.return_value = metadata
+
+        restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+            policy,
+            last_checkpoint_path=str(checkpoint_path),
+            save_state=_save_state(trainer_version=7),
+            partition_id="rollout_data",
+            sampler_name="in_order",
+        )
+
+        assert restored == metadata
+
+    def test_legacy_replay_checkpoint_is_rejected(self, tmp_path):
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir()
+        (checkpoint_path / LEGACY_REPLAY_BUFFER_FILENAME).touch()
+        policy = MagicMock()
+
+        with pytest.raises(RuntimeError, match="legacy replay_buffer.pt"):
+            sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+                policy,
+                last_checkpoint_path=str(checkpoint_path),
+                save_state=_save_state(),
+                partition_id="rollout_data",
+                sampler_name="in_order",
+            )
+
+        policy.load_data_plane_checkpoint.assert_not_called()
+
+    def test_checkpoint_without_replay_artifacts_does_not_load_tq(
+        self, tmp_path, capsys
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir()
+        policy = MagicMock()
+
+        restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+            policy,
+            last_checkpoint_path=str(checkpoint_path),
+            save_state=_save_state(),
+            partition_id="rollout_data",
+            sampler_name="in_order",
+        )
+
+        assert restored is None
+        policy.load_data_plane_checkpoint.assert_not_called()
+        output = capsys.readouterr().out
+        assert REPLAY_BUFFER_METADATA_FILENAME in output
+        assert "matching TQ checkpoint will not be loaded" in output
+        assert "dataloader cursor is still restored" in output
+        assert "buffered at checkpoint time will be discarded" in output
+
+    def test_metadata_file_requires_matching_tq_directory(self, tmp_path):
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir()
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+
+        with pytest.raises(FileNotFoundError, match="matching native TQ checkpoint"):
+            sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+                MagicMock(),
+                last_checkpoint_path=str(checkpoint_path),
+                save_state=_save_state(),
+                partition_id="rollout_data",
+                sampler_name="in_order",
+            )
+
+    def test_rejects_tq_checkpoint_from_different_training_step(self, tmp_path):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        policy = MagicMock()
+        policy.load_data_plane_checkpoint.return_value = _native_tq_metadata(step=2)
+
+        with pytest.raises(ValueError, match="does not match the trainer checkpoint"):
+            sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+                policy,
+                last_checkpoint_path=str(checkpoint_path),
+                save_state=_save_state(),
+                partition_id="rollout_data",
+                sampler_name="in_order",
+            )
