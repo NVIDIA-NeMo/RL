@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import os
 import tempfile
 from unittest.mock import MagicMock, Mock, patch
@@ -40,7 +39,6 @@ try:
         DTensorPolicyWorkerV2Impl,
         _maybe_adapt_tensor_to_hf,
         dtensor_params_generator,
-        get_train_context,
     )
 
     NEMO_AUTOMODEL_AVAILABLE = True
@@ -469,6 +467,7 @@ def test_dtensor_v2_checkpoint_save_and_load(
                 optimizer_path=optimizer_path,
                 checkpointing_cfg=checkpointing_config,
             )
+            policy.finalize_async_save()
 
             # Verify checkpoint files were created
             assert os.path.exists(weights_path), "Weights path should exist after save"
@@ -871,186 +870,28 @@ def test_prepare_refit_info_preserves_fp32_router_correction_bias():
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-class TestGetTrainContext:
-    """Tests for the get_train_context context manager function."""
+class TestAutocastContext:
+    """Tests for the precision context retained by the policy worker."""
 
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
-    )
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.create_context_parallel_ctx"
-    )
-    def test_no_cp_with_autocast(self, mock_create_cp_ctx, mock_get_train_ctx_am):
-        """Test context creation without context parallel but with autocast."""
-        # Arrange
-        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
+    def test_disabled_returns_noop_context(self):
+        worker = object.__new__(DTensorPolicyWorkerV2Impl)
+        worker.autocast_enabled = False
 
-        cp_size = 1
-        cp_mesh = None
-        cp_buffers = []
-        sequence_dim = 1
-        dtype = torch.bfloat16
+        with worker._autocast_context():
+            assert not torch.is_autocast_enabled("cuda")
 
-        # Act
-        with get_train_context(
-            cp_size=cp_size,
-            cp_mesh=cp_mesh,
-            cp_buffers=cp_buffers,
-            sequence_dim=sequence_dim,
-            dtype=dtype,
-            autocast_enabled=True,
-        ):
-            pass
+    @patch("nemo_rl.models.policy.workers.dtensor_policy_worker_v2.torch.autocast")
+    def test_enabled_uses_worker_dtype(self, mock_autocast):
+        worker = object.__new__(DTensorPolicyWorkerV2Impl)
+        worker.autocast_enabled = True
+        worker.dtype = torch.bfloat16
+        expected_context = MagicMock()
+        mock_autocast.return_value = expected_context
 
-        # Assert - CP context should not be created when cp_size=1
-        mock_create_cp_ctx.assert_not_called()
-        mock_get_train_ctx_am.assert_called_once_with(False, False, None)
+        result = worker._autocast_context()
 
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
-    )
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.create_context_parallel_ctx"
-    )
-    def test_with_cp_and_autocast(self, mock_create_cp_ctx, mock_get_train_ctx_am):
-        """Test context creation with context parallel and autocast."""
-        # Arrange
-        mock_cp_ctx = MagicMock()
-        mock_create_cp_ctx.return_value = mock_cp_ctx
-        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
-
-        cp_size = 2
-        cp_mesh = MagicMock()
-        cp_buffers = [torch.randn(2, 10), torch.randn(2, 10)]
-        sequence_dim = 1
-        dtype = torch.bfloat16
-
-        # Act
-        with get_train_context(
-            cp_size=cp_size,
-            cp_mesh=cp_mesh,
-            cp_buffers=cp_buffers,
-            sequence_dim=sequence_dim,
-            dtype=dtype,
-            autocast_enabled=True,
-        ):
-            pass
-
-        # Assert - CP context should be created when cp_size > 1
-        mock_create_cp_ctx.assert_called_once_with(
-            cp_mesh=cp_mesh,
-            cp_buffers=cp_buffers,
-            cp_seq_dims=[sequence_dim] * len(cp_buffers),
-            cp_no_restore_buffers=set(cp_buffers),
-        )
-        mock_get_train_ctx_am.assert_called_once_with(False, False, mock_cp_ctx)
-
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
-    )
-    def test_autocast_disabled(self, mock_get_train_ctx_am):
-        """Test context creation with autocast disabled."""
-        # Arrange
-        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
-
-        cp_size = 1
-        cp_mesh = None
-        cp_buffers = []
-        sequence_dim = 1
-        dtype = torch.bfloat16
-
-        # Act
-        with get_train_context(
-            cp_size=cp_size,
-            cp_mesh=cp_mesh,
-            cp_buffers=cp_buffers,
-            sequence_dim=sequence_dim,
-            dtype=dtype,
-            autocast_enabled=False,
-        ):
-            # Verify we're NOT in autocast mode
-            assert not torch.is_autocast_enabled("cuda"), (
-                "Autocast should be disabled when autocast_enabled=False"
-            )
-
-        # Assert
-        mock_get_train_ctx_am.assert_called_once_with(False, False, None)
-
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
-    )
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.create_context_parallel_ctx"
-    )
-    def test_cp_buffers_empty_when_cp_size_one(
-        self, mock_create_cp_ctx, mock_get_train_ctx_am
-    ):
-        """Test that CP context is not created when cp_size is 1."""
-        # Arrange
-        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
-
-        cp_size = 1
-        cp_mesh = MagicMock()
-        cp_buffers = []  # Empty buffers for cp_size=1
-        sequence_dim = 1
-        dtype = torch.float32
-
-        # Act
-        with get_train_context(
-            cp_size=cp_size,
-            cp_mesh=cp_mesh,
-            cp_buffers=cp_buffers,
-            sequence_dim=sequence_dim,
-            dtype=dtype,
-            autocast_enabled=True,
-        ):
-            pass
-
-        # Assert - CP context should not be created when cp_size=1
-        mock_create_cp_ctx.assert_not_called()
-
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
-    )
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.create_context_parallel_ctx"
-    )
-    def test_multiple_cp_buffers_sequence_dim_replication(
-        self, mock_create_cp_ctx, mock_get_train_ctx_am
-    ):
-        """Test that sequence_dim is properly replicated for each CP buffer."""
-        # Arrange
-        mock_cp_ctx = MagicMock()
-        mock_create_cp_ctx.return_value = mock_cp_ctx
-        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
-
-        cp_size = 2
-        cp_mesh = MagicMock()
-        # Three buffers
-        cp_buffers = [torch.randn(2, 10), torch.randn(2, 10), torch.randn(2, 10)]
-        sequence_dim = 1
-        dtype = torch.float16
-
-        # Act
-        with get_train_context(
-            cp_size=cp_size,
-            cp_mesh=cp_mesh,
-            cp_buffers=cp_buffers,
-            sequence_dim=sequence_dim,
-            dtype=dtype,
-            autocast_enabled=True,
-        ):
-            pass
-
-        # Assert - sequence_dim should be replicated for each buffer
-        mock_create_cp_ctx.assert_called_once()
-        call_kwargs = mock_create_cp_ctx.call_args[1]
-        assert call_kwargs["cp_seq_dims"] == [
-            sequence_dim,
-            sequence_dim,
-            sequence_dim,
-        ], "sequence_dim should be replicated for each buffer"
-        assert len(call_kwargs["cp_seq_dims"]) == 3
+        assert result is expected_context
+        mock_autocast.assert_called_once_with(device_type="cuda", dtype=torch.bfloat16)
 
 
 def _init_v2_worker_mocked(
