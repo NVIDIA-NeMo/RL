@@ -497,7 +497,8 @@ class MegatronConfig(TypedDict):
     first_last_layers_bf16: NotRequired[bool]
     num_layers_at_start_in_bf16: NotRequired[int]
     num_layers_at_end_in_bf16: NotRequired[int]
-    # TE per-module precision recipe YAML.
+    # Path to a per-module Transformer Engine precision recipe loaded into
+    # Megatron quant_recipe.
     te_precision_config_file: NotRequired[str]
     # Passed through to the Megatron model's freeze() method.
     # Supported keys are model-specific, such as freeze_vision_model,
