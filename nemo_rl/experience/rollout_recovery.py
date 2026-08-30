@@ -34,7 +34,11 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 4
+_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {
+    3,
+    ROLLOUT_RECOVERY_SCHEMA_VERSION,
+}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -249,7 +253,9 @@ class SiblingSealResult:
     """One terminal sibling result waiting for an atomic prompt-group seal."""
 
     gate_rollout_id: str
-    receipt: dict[str, Any]
+    # None is an explicit terminal capture failure. The finalizer turns it
+    # into a masked placeholder, matching the base token-capture contract.
+    receipt: Optional[dict[str, Any]]
     reward: float
 
 
@@ -260,8 +266,10 @@ def _new_attempt() -> RolloutAttemptRecord:
     )
 
 
-def _receipt_staging_keys(receipt: dict[str, Any]) -> list[str]:
-    """Validate a sealed Gate receipt and return its ordered staging keys."""
+def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
+    """Validate a terminal Gate receipt and return its ordered staging keys."""
+    if receipt is None:
+        return []
     manifest = receipt.get("manifest")
     if not isinstance(manifest, list):
         raise ValueError("sealed rollout receipt must contain a manifest list")
@@ -555,7 +563,7 @@ class RolloutRecoveryLedger:
         *,
         generation_index: int,
         gate_rollout_id: str,
-        receipt: dict[str, Any],
+        receipt: Optional[dict[str, Any]],
         reward: float,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
@@ -574,7 +582,7 @@ class RolloutRecoveryLedger:
                 "streamed rollout identity mismatch: "
                 f"result={gate_rollout_id!r}, expected={expected_gate_rollout_id!r}"
             )
-        if receipt.get("rollout_id") != gate_rollout_id:
+        if receipt is not None and receipt.get("rollout_id") != gate_rollout_id:
             raise ValueError(
                 "receipt rollout identity mismatch: "
                 f"receipt={receipt.get('rollout_id')!r}, expected={gate_rollout_id!r}"
@@ -651,7 +659,10 @@ class RolloutRecoveryLedger:
                     f"result={result.gate_rollout_id!r}, "
                     f"expected={expected_gate_rollout_id!r}"
                 )
-            if result.receipt.get("rollout_id") != expected_gate_rollout_id:
+            if (
+                result.receipt is not None
+                and result.receipt.get("rollout_id") != expected_gate_rollout_id
+            ):
                 raise ValueError(
                     "receipt rollout identity mismatch: "
                     f"receipt={result.receipt.get('rollout_id')!r}, "
@@ -703,20 +714,21 @@ class RolloutRecoveryLedger:
 
     def finalization_inputs(
         self, group_id: str
-    ) -> tuple[list[str], list[str], list[dict[str, Any]], list[float]]:
+    ) -> tuple[
+        list[str], list[str], list[Optional[dict[str, Any]]], list[float]
+    ]:
         """Return physical IDs, canonical IDs, receipts and rewards in sibling order."""
         record = self._require_group(group_id)
         if record.status != PromptGroupStatus.READY_TO_FINALIZE:
             raise ValueError(
                 f"group {group_id!r} is not ready to finalize: {record.status.value!r}"
             )
-        receipts: list[dict[str, Any]] = []
+        receipts: list[Optional[dict[str, Any]]] = []
         rewards: list[float] = []
         for sibling in record.siblings:
             attempt = sibling.current_attempt
             if (
                 attempt.status != RolloutAttemptStatus.SEALED
-                or attempt.receipt is None
                 or attempt.reward is None
             ):
                 raise ValueError(
@@ -996,10 +1008,15 @@ class RolloutRecoveryLedger:
                 "rollout recovery state must be a dictionary, got "
                 f"{type(state).__name__}"
             )
-        if state.get("schema_version") != ROLLOUT_RECOVERY_SCHEMA_VERSION:
+        schema_version = state.get("schema_version")
+        if (
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
+        ):
             raise ValueError(
                 "Unsupported rollout-recovery schema version: "
-                f"{state.get('schema_version')!r}"
+                f"{schema_version!r}"
             )
         raw_groups = state.get("groups")
         if not isinstance(raw_groups, list):
@@ -1011,6 +1028,7 @@ class RolloutRecoveryLedger:
             record = cls._group_from_state(
                 raw_group,
                 seen_attempt_uuids=seen_attempt_uuids,
+                schema_version=schema_version,
             )
             if record.group_id in ledger._groups:
                 raise ValueError(f"duplicate recovery group_id={record.group_id!r}")
@@ -1096,6 +1114,7 @@ class RolloutRecoveryLedger:
         raw_group: Any,
         *,
         seen_attempt_uuids: set[uuid.UUID],
+        schema_version: int,
     ) -> PromptGroupRecoveryRecord:
         if not isinstance(raw_group, dict):
             raise ValueError("rollout-recovery group must be a mapping")
@@ -1191,14 +1210,28 @@ class RolloutRecoveryLedger:
                 ):
                     raise ValueError("staging_keys must be a list of strings")
                 if attempt_status == RolloutAttemptStatus.SEALED:
-                    if not isinstance(receipt, dict) or not isinstance(
-                        reward, (int, float)
-                    ):
-                        raise ValueError("sealed attempts require receipt and reward")
-                    if receipt.get("rollout_id") != gate_id:
-                        raise ValueError("sealed receipt identity mismatch")
-                    if _receipt_staging_keys(receipt) != staging_keys:
-                        raise ValueError("sealed receipt staging manifest mismatch")
+                    if not isinstance(reward, (int, float)):
+                        raise ValueError("sealed attempts require a reward")
+                    if receipt is None:
+                        if schema_version < 4:
+                            raise ValueError(
+                                "sealed attempts require a receipt before schema v4"
+                            )
+                        if staging_keys:
+                            raise ValueError(
+                                "sealed missing-receipt attempt cannot own staging keys"
+                            )
+                    elif isinstance(receipt, dict):
+                        if receipt.get("rollout_id") != gate_id:
+                            raise ValueError("sealed receipt identity mismatch")
+                        if _receipt_staging_keys(receipt) != staging_keys:
+                            raise ValueError(
+                                "sealed receipt staging manifest mismatch"
+                            )
+                    else:
+                        raise ValueError(
+                            "sealed attempt receipt must be a mapping or None"
+                        )
                 elif receipt is not None or reward is not None or staging_keys:
                     raise ValueError("only sealed attempts may retain receipt data")
                 attempts.append(
@@ -1411,11 +1444,16 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
             "rollout recovery sidecar must contain a dictionary, got "
             f"{type(state).__name__}"
         )
-    if state.get("schema_version") != ROLLOUT_RECOVERY_SCHEMA_VERSION:
+    schema_version = state.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
+    ):
         raise ValueError(
             "unsupported rollout recovery schema_version="
-            f"{state.get('schema_version')!r}; expected "
-            f"{ROLLOUT_RECOVERY_SCHEMA_VERSION}"
+            f"{schema_version!r}; supported versions are "
+            f"{sorted(_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
         )
     groups = state.get("groups")
     if not isinstance(groups, list):
@@ -1428,7 +1466,7 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
         )
 
     ledger_state: RolloutRecoveryState = {
-        "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "groups": groups,
         "open_train_step": state.get("open_train_step"),
     }

@@ -544,6 +544,81 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
     assert retry.siblings[1].current_attempt.status is RolloutAttemptStatus.RESERVED
 
 
+@pytest.mark.parametrize(
+    "recovery_granularity",
+    [RecoveryGranularity.SIBLING, RecoveryGranularity.PROMPT_GROUP],
+)
+def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
+    recovery_granularity: RecoveryGranularity,
+) -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        agent_name=None,
+        recovery_granularity=recovery_granularity,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    gate_ids = group.gate_rollout_ids
+    receipts = [
+        None,
+        {
+            "rollout_id": gate_ids[1],
+            "manifest": [{"staging_key": f"{gate_ids[1]}/call"}],
+        },
+    ]
+
+    if recovery_granularity is RecoveryGranularity.SIBLING:
+        for generation_index, receipt in enumerate(receipts):
+            _mutate(
+                lambda cut, generation_index=generation_index, receipt=receipt: (
+                    ledger.mark_sibling_sealed(
+                        cut,
+                        "g7",
+                        generation_index=generation_index,
+                        gate_rollout_id=gate_ids[generation_index],
+                        receipt=receipt,
+                        reward=float(generation_index),
+                    )
+                )
+            )
+    else:
+        _mutate(
+            lambda cut: ledger.mark_group_sealed(
+                cut,
+                "g7",
+                {
+                    generation_index: SiblingSealResult(
+                        gate_rollout_id=gate_ids[generation_index],
+                        receipt=receipt,
+                        reward=float(generation_index),
+                    )
+                    for generation_index, receipt in enumerate(receipts)
+                },
+            )
+        )
+
+    state = ledger.state_dict()
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    physical_ids, _, restored_receipts, rewards = restored.finalization_inputs("g7")
+
+    assert physical_ids == gate_ids
+    assert restored_receipts[0] is None
+    assert restored_receipts[1] == receipts[1]
+    assert rewards == [0.0, 1.0]
+
+    state["schema_version"] = 3
+    with pytest.raises(ValueError, match="before schema v4"):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
 def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> None:
     ledger = RolloutRecoveryLedger()
     _reserve(
