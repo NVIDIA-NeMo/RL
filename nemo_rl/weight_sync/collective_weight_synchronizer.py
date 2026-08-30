@@ -280,6 +280,17 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             flush=True,
         )
 
+        # RECORDED BEFORE THE FIRST DISPATCH, not merely before the last one. Every refit
+        # dispatch resolves its targets through _refit_leader_workers, which falls back to
+        # the whole fleet while no membership is recorded -- so a dispatch that runs before
+        # this line addresses the shard the reconcile is in the middle of removing.
+        #
+        # This sat 21 lines lower, after prepare_refit_info, and job 6718736 died there:
+        # ActorDiedError out of reconcile_communicator, 20s after the rebuild had already
+        # succeeded. Every collective-transport recovery variant failed and every
+        # nccl_reshard one passed, because _build on that side records it first.
+        self._generation.set_refit_membership(membership)
+
         # Re-run for the whole fleet, not just for new shards. A restarted engine has no
         # state_dict_info at all -- update_weights_from_collective asserts on it -- and
         # this is metadata rather than weights, so redistributing it to shards that
@@ -301,12 +312,6 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             train_world_size=membership.train_world_size,
             nccl_peer=sender_spec.nccl_peer,
         )
-        # Recorded before dispatching, so nothing downstream can fall back to the old
-        # membership. Rebuilding the communicator is only half of it: the refit dispatch
-        # walks the worker group, so without this it keeps calling the dead shard's actor
-        # and the next sync_weights fails with RayActorError -- the run still dies, just
-        # later and with a less obvious cause.
-        self._generation.set_refit_membership(membership)
         futures_inference = self._generation.rebuild_collective(membership, ip, port)
         ray.get(futures_train + futures_inference)
         self._built_membership = membership
