@@ -89,9 +89,15 @@ _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
 
 def _reduce_tensor_modified(*args, **kwargs):
     output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
-    output_args = _modify_tuple(
-        output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
-    )
+    # ``reduce_tensor`` has different rebuild functions and argument layouts
+    # for CUDA, CPU, meta, sparse, and nested tensors. Only the dense CUDA path
+    # returns our patched CUDA rebuild function with the device at index 6.
+    # Applying the CUDA layout unconditionally breaks CPU tensors staged by
+    # async checkpointing, whose rebuild arguments contain only three items.
+    if output_fn is _rebuild_cuda_tensor_modified:
+        output_args = _modify_tuple(
+            output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
+        )
     return output_fn, output_args
 
 

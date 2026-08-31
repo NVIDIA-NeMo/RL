@@ -186,7 +186,12 @@ ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 # Verify with: python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 ENV CUDNN_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
-ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
+# TileLang's $ORIGIN-relative RUNPATH breaks when uv installs worker venvs in
+# symlink mode: libtvm_compiler.so resolves into TileLang's cache directory and
+# cannot find libz3.so in Z3's separate cache directory.
+# TODO: Remove this workaround once the upstream issue is resolved.
+# See https://github.com/tile-ai/tilelang/issues/3075
+ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/z3/lib:/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./

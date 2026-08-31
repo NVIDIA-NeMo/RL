@@ -388,6 +388,74 @@ class TestAutomodelCheckpointManager:
         assert manager.tp_mesh is mock_tp_mesh
 
     @patch("torch.distributed.get_rank")
+    def test_finalize_async_save_waits_on_checkpointer(
+        self, mock_get_rank, mock_meshes
+    ):
+        """finalize_async_save must block on staging *and* upload completion.
+
+        The manager is initialized with is_async=True by DTensorPolicyWorkerV2,
+        so dcp.async_save writes from a separate process. Skipping either wait
+        lets the caller rename tmp_step_N to step_N mid-write, producing a
+        checkpoint with no optimizer shards and no .metadata.
+        """
+        from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
+
+        mock_get_rank.return_value = 0
+        mock_dp_mesh, mock_tp_mesh = mock_meshes
+
+        manager = AutomodelCheckpointManager(
+            dp_mesh=mock_dp_mesh,
+            tp_mesh=mock_tp_mesh,
+        )
+        manager.checkpointer = MagicMock()
+
+        manager.finalize_async_save()
+
+        manager.checkpointer.maybe_wait_for_staging.assert_called_once_with()
+        manager.checkpointer.async_wait.assert_called_once_with()
+
+    @patch("torch.distributed.get_rank")
+    def test_finalize_async_save_without_checkpointer_is_noop(
+        self, mock_get_rank, mock_meshes
+    ):
+        """Finalizing before any save was issued must not raise."""
+        from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
+
+        mock_get_rank.return_value = 0
+        mock_dp_mesh, mock_tp_mesh = mock_meshes
+
+        manager = AutomodelCheckpointManager(
+            dp_mesh=mock_dp_mesh,
+            tp_mesh=mock_tp_mesh,
+        )
+        assert manager.checkpointer is None
+
+        manager.finalize_async_save()
+
+    def test_dtensor_worker_overrides_finalize_async_save(self):
+        """The worker must not inherit the base class no-op.
+
+        DTensorPolicyWorkerV2 passes is_async=True, so grpo.py's
+        wait_fn=policy.finalize_async_save has to resolve to a real wait.
+        """
+        from nemo_rl.models.policy.workers.base_policy_worker import (
+            AbstractPolicyWorker,
+        )
+        from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
+            DTensorPolicyWorkerV2Impl,
+        )
+
+        assert (
+            DTensorPolicyWorkerV2Impl.finalize_async_save
+            is not AbstractPolicyWorker.finalize_async_save
+        )
+
+        worker = object.__new__(DTensorPolicyWorkerV2Impl)
+        worker.checkpoint_manager = MagicMock()
+        worker.finalize_async_save()
+        worker.checkpoint_manager.finalize_async_save.assert_called_once_with()
+
+    @patch("torch.distributed.get_rank")
     def test_save_checkpoint_without_checkpointer_raises(
         self, mock_get_rank, mock_meshes
     ):
@@ -587,6 +655,43 @@ class TestSaveCheckpointFunctional:
         mock_tp_mesh.get_group.return_value = MagicMock()
 
         return mock_dp_mesh, mock_tp_mesh
+
+    @patch("torch.distributed.get_rank")
+    @patch("nemo_rl.models.automodel.checkpoint.Checkpointer")
+    def test_save_passes_peft_config_only_to_save_model(
+        self, mock_checkpointer_cls, mock_get_rank, mock_meshes, mock_model
+    ):
+        """PEFT config is a save argument, not an Automodel config field."""
+        mock_get_rank.return_value = 0
+        mock_dp_mesh, mock_tp_mesh = mock_meshes
+
+        mock_checkpointer = MagicMock()
+        mock_checkpointer_cls.return_value = mock_checkpointer
+        peft_config = MagicMock()
+
+        manager = AutomodelCheckpointManager(
+            dp_mesh=mock_dp_mesh,
+            tp_mesh=mock_tp_mesh,
+        )
+        manager.init_checkpointer()
+
+        with TemporaryDirectory() as tmp_dir:
+            weights_path = os.path.join(tmp_dir, "weights")
+            manager.save_checkpoint(
+                model=mock_model,
+                weights_path=weights_path,
+                checkpointing_cfg={
+                    "enabled": True,
+                    "peft_config": peft_config,
+                },
+            )
+
+        mock_checkpointer.save_model.assert_called_once_with(
+            model=mock_model,
+            weights_path=weights_path,
+            peft_config=peft_config,
+            tokenizer=None,
+        )
 
     @patch("torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.checkpoint.Checkpointer")

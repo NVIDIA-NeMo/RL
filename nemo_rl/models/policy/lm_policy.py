@@ -53,7 +53,7 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
-    get_default_hf_config,
+    get_hf_config,
     get_theoretical_tflops,
 )
 from nemo_rl.utils.multimodal_payload_metrics import (
@@ -377,7 +377,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # initialize FLOPs tracker
         try:
             self.flops_tracker = FLOPTracker.from_config(
-                config["model_name"], get_default_hf_config(config["model_name"])
+                config["model_name"],
+                get_hf_config(
+                    config["model_name"],
+                    **(config.get("hf_config_overrides") or {}),
+                ),
             )
         except ValueError as e:
             self.flops_tracker = None
@@ -1199,6 +1203,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def broadcast_weights_for_collective(
         self,
         kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
@@ -1207,6 +1212,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_for_collective",
             kv_scales=kv_scales,
+            refit_timeout_s=refit_timeout_s,
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
         )
@@ -1255,11 +1261,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         results = ray.get(futures)
         return results[0]
 
-    def nccl_reshard_refit(self, kv_scales=None) -> list[ray.ObjectRef]:
+    def nccl_reshard_refit(
+        self, kv_scales=None, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
         """Transfer weights to gen workers via nccl_reshard (xferdtensor)."""
         futures = self.worker_group.run_all_workers_single_data(
             "nccl_reshard_refit",
             kv_scales=kv_scales,
+            refit_timeout_s=refit_timeout_s,
         )
         return futures
 
