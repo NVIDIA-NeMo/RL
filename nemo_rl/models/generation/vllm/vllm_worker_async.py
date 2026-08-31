@@ -67,6 +67,17 @@ from nemo_rl.utils.routed_experts_ref import (
 
 LOGGER = logging.getLogger(__name__)
 
+_CONTEXT_LENGTH_ERROR_MARKERS = (
+    "maximum context length",
+    "fills or exceeds max_model_len",
+)
+
+
+def _is_context_length_error(error: BaseException) -> bool:
+    """Return whether an exception describes a prompt exceeding model context."""
+    message = str(error)
+    return any(marker in message for marker in _CONTEXT_LENGTH_ERROR_MARKERS)
+
 
 class VllmAsyncGenerationWorkerImpl(
     VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker
@@ -870,11 +881,17 @@ class VllmAsyncGenerationWorkerImpl(
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
                 )
-            except VLLMValidationError as e:
+            except (ValueError, VLLMValidationError) as e:
                 # vLLM raises VLLMValidationError for prompts exceeding
-                # max_model_len during tokenization, instead of returning an
-                # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
-                # detect context-length overflow and handle it gracefully.
+                # max_model_len during tokenization. NeMo-RL's post-prefix
+                # clamp raises ValueError for the same condition. Convert only
+                # those context-length failures to HTTP 400 so the Gym proxy
+                # treats them as prompt-specific instead of retrying a 500.
+                if (
+                    not isinstance(e, VLLMValidationError)
+                    and not _is_context_length_error(e)
+                ):
+                    raise
                 return JSONResponse(
                     content={
                         "error": {
@@ -981,7 +998,7 @@ class VllmAsyncGenerationWorkerImpl(
         class MaxContextLengthFilter(LoggingFilter):
             def filter(self, record: LogRecord) -> bool:
                 if record.exc_info and record.exc_info[1]:
-                    if "maximum context length" in str(record.exc_info[1]):
+                    if _is_context_length_error(record.exc_info[1]):
                         return False
                 return True
 
