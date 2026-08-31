@@ -219,6 +219,13 @@ Deep dive into NeMo RL's architecture, APIs, and design decisions for scalable R
 Tools and techniques for debugging distributed Ray applications and RL training runs.
 :::
 
+:::{grid-item-card} {octicon}`graph` Observability
+:link: observability/index
+:link-type: doc
+
+OpenTelemetry traces and `rl.*` metrics via nemo-lens: span groups, configuration, vLLM tracing, and an OTLP export stack.
+:::
+
 :::{grid-item-card} {octicon}`zap` FP8 Quantization
 :link: fp8
 :link-type: doc
@@ -351,6 +358,12 @@ guides/use-custom-vllm.md
 ```
 
 ```{toctree}
+:caption: Observability
+
+observability/index.md
+```
+
+```{toctree}
 :caption: Design Docs
 
 design-docs/design-and-philosophy.md
@@ -373,6 +386,7 @@ design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md
 design-docs/nccl-reshard-refit.md
 design-docs/media-token-validity-mask.md
+design-docs/automodel-context-parallel.md
 ```
 
 ```{toctree}
