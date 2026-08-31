@@ -459,6 +459,33 @@ def test_reattach_static_multimodal_payload_to_rollout_user_message():
     assert target[1]["pixel_values"] is payload
 
 
+def test_reattach_static_multimodal_payload_reconciles_media_runs():
+    payload = PackedTensor([torch.ones(2, 3)], dim_to_pack=0)
+    source = [
+        {
+            "role": "user",
+            "content": "",
+            "pixel_values": payload,
+            "_media_placeholder_token_id": 99,
+            "_media_placeholder_run_lengths": [2, 3],
+        }
+    ]
+    target = [
+        {
+            "role": "user",
+            "content": "question",
+            "token_ids": torch.tensor([1, 99, 2, 99, 3]),
+        }
+    ]
+
+    attach_static_multimodal_payload(target, source)
+
+    torch.testing.assert_close(
+        target[0]["token_ids"], torch.tensor([1, 99, 99, 2, 99, 99, 99, 3])
+    )
+    assert target[0]["pixel_values"] is payload
+
+
 def test_video_datum_uses_temporal_processor_contract(monkeypatch, tmp_path):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"video")
@@ -881,7 +908,13 @@ def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():
     )
 
 
-def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "processor_name",
+    ["NemotronNanoVLV2Processor", "NemotronH_Omni_Reasoning_V3Processor"],
+)
+def test_nemotron_cached_video_uses_native_lossless_manifest(
+    monkeypatch, tmp_path, processor_name
+):
     frame_paths = []
     for index in range(4):
         frame_path = tmp_path / f"frame_{index:04d}.png"
@@ -942,13 +975,18 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
         name_or_path = "nemotron-test"
         model_input_names = ["input_ids"]
 
-    class NemotronNanoVLV2Processor:
-        model_input_names = ["input_ids", "pixel_values", "imgs_sizes"]
-        tokenizer = _Tokenizer()
+    processor_class = type(
+        processor_name,
+        (),
+        {
+            "model_input_names": ["input_ids", "pixel_values", "imgs_sizes"],
+            "tokenizer": _Tokenizer(),
+        },
+    )
 
     datum = nemo_gym_example_to_video_datum_spec(
         example,
-        processor=NemotronNanoVLV2Processor(),
+        processor=processor_class(),
         max_seq_length=None,
         idx=3,
         task_name="nemo_gym",

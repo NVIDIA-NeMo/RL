@@ -16,6 +16,7 @@ import pytest
 import torch
 from PIL import Image
 
+from nemo_rl.data.multimodal_utils import uses_image_placeholder
 from nemo_rl.environments.nemo_gym import _attach_multimodal_data_to_user_message
 
 # --------------------------------------------------------------------------
@@ -57,6 +58,14 @@ class NemotronNanoVLV2Processor:
         return processed
 
 
+class NemotronH_Omni_Reasoning_V3Processor(NemotronNanoVLV2Processor):
+    """Super-Omni checkpoint processor, which uses the same placeholder path."""
+
+
+def test_super_omni_processor_uses_placeholder_multimodal_path():
+    assert uses_image_placeholder(NemotronH_Omni_Reasoning_V3Processor(None))
+
+
 def _ragged(*shapes: tuple[int, ...]) -> NemotronNanoVLV2Processor:
     return NemotronNanoVLV2Processor(
         [torch.ones(*shape) for shape in shapes],
@@ -81,6 +90,20 @@ def test_ragged_output_requested_only_for_multi_image_turns():
         assert processor.calls[0]["return_tensors"] == expected, (
             f"images={count} flag={flag}"
         )
+
+
+def test_fixed_tile_processor_keeps_static_metadata_contract():
+    processor = NemotronNanoVLV2Processor(torch.zeros(1, 3, 4, 4))
+    user_message: dict = {}
+    _attach_multimodal_data_to_user_message(
+        user_message,
+        images=_images(1),
+        processor=processor,
+    )
+
+    assert "pixel_values" in user_message
+    assert "imgs_sizes" not in user_message
+    assert "num_frames" not in user_message
 
 
 def test_ragged_pixel_values_are_padded_to_one_tensor():

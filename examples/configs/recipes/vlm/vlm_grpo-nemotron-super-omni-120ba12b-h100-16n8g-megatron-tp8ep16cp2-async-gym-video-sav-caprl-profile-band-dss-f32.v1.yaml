@@ -1,0 +1,43 @@
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-h100-16n8g-megatron-tp8ep16cp2-async-gym-video-sav-caprl-profile-band.v1.yaml
+
+# Full-DSS variant for:
+#   caprl_video_frame_cache_n5_e2h_lt60s_20260802_f32@v0
+#   segment_anything_video@v4
+#
+# DSS materialization locations differ by cluster. Set DSS_CAPRL_VIDEO_DATA_PATH
+# and DSS_SAV_TRACKING_DATA_PATH to cluster-local JSONL manifests after
+# materialization. Both manifests must contain absolute frame paths valid on
+# every training node. Preserve SAV frames as still-image inputs; do not add
+# _is_video_frame or _video_source markers to its interleaved Frame-N prompts.
+#
+# The available CAPRL DSS snapshot has 32 cached frames per example. This is a
+# deliberate f32 variant and is not data-equivalent to Arushi's f64 recipe.
+data:
+  train:
+  - data_path: ${oc.env:DSS_CAPRL_VIDEO_DATA_PATH}
+  - data_path: ${oc.env:DSS_SAV_TRACKING_DATA_PATH}
+  validation:
+  - data_path: ${oc.env:DSS_CAPRL_VIDEO_DATA_PATH}
+  - data_path: ${oc.env:DSS_SAV_TRACKING_DATA_PATH}
+  default:
+    num_frames: 32
+
+policy:
+  generation:
+    vllm_cfg:
+      video:
+        num_frames: 32
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 32
+        video:
+          count: 1
+          num_frames: 32
+      media_io_kwargs:
+        video:
+          num_frames: 32
+
+logger:
+  wandb:
+    project: Nemotron-omni-RL-debug
+    name: dfw-h100-super-sav-caprl-dss-f32-rpb

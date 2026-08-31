@@ -34,6 +34,7 @@ from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     attach_image_model_inputs_to_message,
     image_to_data_url,
+    nemo_gym_image_max_num_tiles,
 )
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -115,8 +116,17 @@ def test_attach_initial_nemo_gym_image_payloads_attaches_once(monkeypatch):
     processor = _Processor()
     calls = []
 
-    def fake_attach(message, *, images, processor, pad_dynamic_image_shapes=False):
-        calls.append((message, images, processor, pad_dynamic_image_shapes))
+    def fake_attach(
+        message,
+        *,
+        images,
+        processor,
+        pad_dynamic_image_shapes=False,
+        max_num_tiles=None,
+    ):
+        calls.append(
+            (message, images, processor, pad_dynamic_image_shapes, max_num_tiles)
+        )
         message["pixel_values"] = attached
 
     monkeypatch.setattr(
@@ -131,6 +141,7 @@ def test_attach_initial_nemo_gym_image_payloads_attaches_once(monkeypatch):
     assert calls[0][1][0].size == (2, 3)
     assert calls[0][2] is processor
     assert calls[0][3] is False
+    assert calls[0][4] is None
     assert batch["message_log"][0][0]["pixel_values"] is attached
 
 
@@ -200,6 +211,170 @@ def test_attach_image_model_inputs_keeps_rollout_tokens_and_packs_media():
     # token_ids remain authoritative.
     assert message["token_ids"] is rollout_tokens
     assert "input_ids" not in message
+
+
+def test_attach_image_model_inputs_resizes_only_media_placeholder_runs():
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class _TextTokenizer:
+        model_input_names = ["input_ids"]
+
+    class _Processor:
+        image_token = "<image>"
+        image_token_id = 99
+        image_processor = _ImageProcessor()
+        tokenizer = _TextTokenizer()
+        model_input_names = ["input_ids", "pixel_values"]
+
+        def __call__(self, *, text, images, return_tensors):
+            assert text == "<image>" * len(images)
+            return {
+                "input_ids": torch.tensor([[10, 99, 99, 11, 99, 99, 99, 12]]),
+                "pixel_values": torch.ones(2, 1),
+            }
+
+    message = {
+        "role": "user",
+        "content": "",
+        "token_ids": torch.tensor([1, 99, 2, 99, 3]),
+    }
+
+    attach_image_model_inputs_to_message(
+        message,
+        images=[Image.new("RGB", (2, 3)), Image.new("RGB", (2, 3))],
+        processor=_Processor(),
+    )
+
+    torch.testing.assert_close(
+        message["token_ids"], torch.tensor([1, 99, 99, 2, 99, 99, 99, 3])
+    )
+    assert message["_media_placeholder_token_id"] == 99
+    assert message["_media_placeholder_run_lengths"] == [2, 3]
+
+
+def test_attach_image_model_inputs_prefers_processor_media_token_counts():
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class _TextTokenizer:
+        model_input_names = ["input_ids"]
+
+    class _Processor:
+        image_token = "<image>"
+        image_token_id = 99
+        image_processor = _ImageProcessor()
+        tokenizer = _TextTokenizer()
+        model_input_names = ["input_ids", "pixel_values"]
+
+        def __call__(self, *, text, images, return_tensors):
+            assert text == "<image>" * len(images)
+            return {
+                # Some BatchFeature paths do not preserve an input_ids tensor
+                # that can be inspected for media runs. num_tokens is the
+                # image processor's direct projected-feature contract.
+                "input_ids": [[10, 11, 12]],
+                "num_tokens": [2, 3],
+                "pixel_values": torch.ones(2, 1),
+            }
+
+    message = {
+        "role": "user",
+        "content": "",
+        "token_ids": torch.tensor([1, 99, 2, 99, 3]),
+    }
+
+    attach_image_model_inputs_to_message(
+        message,
+        images=[Image.new("RGB", (2, 3)), Image.new("RGB", (2, 3))],
+        processor=_Processor(),
+    )
+
+    torch.testing.assert_close(
+        message["token_ids"], torch.tensor([1, 99, 99, 2, 99, 99, 99, 3])
+    )
+    assert message["_media_placeholder_run_lengths"] == [2, 3]
+
+
+def test_attach_image_model_inputs_forwards_still_image_tile_cap():
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+        max_num_tiles = 12
+
+    class _Tokenizer:
+        model_input_names = ["input_ids"]
+
+    class _Processor:
+        image_token = "<image>"
+        image_processor = _ImageProcessor()
+        tokenizer = _Tokenizer()
+        model_input_names = ["input_ids", "pixel_values"]
+
+        def __call__(self, *, text, images, return_tensors):
+            assert text == "<image>"
+            assert len(images) == 1
+            assert return_tensors == "pt"
+            assert self.image_processor.max_num_tiles == 1
+            return {
+                "input_ids": torch.tensor([[18]]),
+                "pixel_values": torch.ones(1, 3, 2, 2),
+            }
+
+    message = {"role": "user", "content": "", "token_ids": torch.tensor([18])}
+    processor = _Processor()
+    attach_image_model_inputs_to_message(
+        message,
+        images=[Image.new("RGB", (2, 2))],
+        processor=processor,
+        max_num_tiles=1,
+    )
+
+    assert isinstance(message["pixel_values"], PackedTensor)
+    assert processor.image_processor.max_num_tiles == 12
+
+
+def test_attach_image_model_inputs_maps_tile_cap_to_dynamic_patch_budget():
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+        min_num_patches = 1024
+        max_num_patches = 13312
+
+    class _Tokenizer:
+        model_input_names = ["input_ids"]
+
+    class _Processor:
+        image_token = "<image>"
+        image_processor = _ImageProcessor()
+        tokenizer = _Tokenizer()
+        model_input_names = ["input_ids", "pixel_values"]
+
+        def __call__(self, *, text, images, return_tensors):
+            assert text == "<image>"
+            assert len(images) == 1
+            assert return_tensors == "pt"
+            assert self.image_processor.max_num_patches == 1024
+            return {
+                "input_ids": torch.tensor([[18]]),
+                "pixel_values": torch.ones(1, 3, 2, 2),
+            }
+
+    message = {"role": "user", "content": "", "token_ids": torch.tensor([18])}
+    processor = _Processor()
+    attach_image_model_inputs_to_message(
+        message,
+        images=[Image.new("RGB", (2, 2))],
+        processor=processor,
+        max_num_tiles=1,
+    )
+
+    assert isinstance(message["pixel_values"], PackedTensor)
+    assert processor.image_processor.max_num_patches == 13312
+
+
+def test_nemo_gym_image_tile_cap_reads_internal_metadata():
+    example = {"_nemo_rl_image_max_num_tiles": 1}
+
+    assert nemo_gym_image_max_num_tiles(example) == 1
 
 
 def test_attach_image_model_inputs_is_a_noop_without_images_or_processor():

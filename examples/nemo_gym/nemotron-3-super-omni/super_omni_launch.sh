@@ -64,12 +64,24 @@ _read_cluster_key() {
 SBATCH_NUM_NODES="${SBATCH_NUM_NODES:-$(_read_cluster_key num_nodes)}"
 SBATCH_GPUS_PER_NODE="${SBATCH_GPUS_PER_NODE:-$(_read_cluster_key gpus_per_node)}"
 SBATCH_GPUS_PER_NODE="${SBATCH_GPUS_PER_NODE:-8}"
+export GPUS_PER_NODE="${GPUS_PER_NODE:-${SBATCH_GPUS_PER_NODE}}"
 EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
 EXTRA_HYDRA_ARGS="${EXTRA_HYDRA_ARGS:-}"
+RUNTIME_PYTHONPATH="${RUNTIME_PYTHONPATH:-}"
+# Prefetched Super/Ultra images carry a tested Megatron Bridge + Megatron-LM
+# pair.  Set this for those images to avoid mixing their cached Ray worker
+# venvs with a different checkout's Megatron packages.
+USE_CONTAINER_MEGATRON="${USE_CONTAINER_MEGATRON:-false}"
 NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
 GYM_VENV_DIR="${GYM_VENV_DIR:-/opt/gym_venvs}"
 WANDB_PROJ="${WANDB_PROJ:-grpo-super-omni}"
 DRY_RUN="${DRY_RUN:-false}"
+JOB_CYCLES="${JOB_CYCLES:-1}"
+
+if ! [[ "${JOB_CYCLES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: JOB_CYCLES must be a positive integer, got ${JOB_CYCLES}." >&2
+    exit 1
+fi
 
 CHECKPOINT_DIR="results/${EXP_NAME}"
 LOG_DIR="logs/${EXP_NAME}"
@@ -80,6 +92,7 @@ MEGATRON_CONFIG_LOCK_DIR="${PERSISTENT_CACHE}/hf_config_locks"
 NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-${PERSISTENT_CACHE}/megatron_ckpt_cache}"
 HF_MODULES_CACHE_DIR="${HF_MODULES_CACHE:-${PERSISTENT_CACHE}/hf_modules/${EXP_NAME}}"
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-${MODEL_PATH}/chat_template.jinja}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-$(printf '%s' "${EXP_NAME}" | sha256sum | cut -c1-16)}"
 
 if [[ -z "${SBATCH_NUM_NODES}" ]]; then
     echo "Error: could not read cluster.num_nodes from ${CONFIG_PATH}" >&2
@@ -125,17 +138,35 @@ echo "Refreshing tracked files in code snapshot: ${SNAPSHOT_DIR}"
 (
     cd "${CODE_DIR}"
     rsync -a --files-from=<(git ls-files --recurse-submodules --cached --full-name) ./ "${SNAPSHOT_DIR}/"
+    # Pre-commit smoke tests may depend on a newly created recipe parent that
+    # is intentionally still untracked. Copy only explicitly named paths into
+    # the immutable snapshot; normal tracked-file behavior remains unchanged.
+    for extra_snapshot_file in ${EXTRA_SNAPSHOT_FILES:-}; do
+        if [[ "${extra_snapshot_file}" == /* || "${extra_snapshot_file}" == *..* || ! -f "${extra_snapshot_file}" ]]; then
+            echo "Error: invalid EXTRA_SNAPSHOT_FILES entry: ${extra_snapshot_file}" >&2
+            exit 1
+        fi
+        rsync -aR "${extra_snapshot_file}" "${SNAPSHOT_DIR}/"
+    done
 )
 cd "${SNAPSHOT_DIR}"
 
-# Megatron is imported from the checkout rather than the container's
-# site-packages. Ray starts its interpreters before COMMAND runs, so the module
-# cache must be exported from the submitting shell for isolated actors to
-# import trust_remote_code classes while deserializing their arguments.
 MEGATRON_BRIDGE_SRC="${SNAPSHOT_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src"
 MEGATRON_LM_SRC="${SNAPSHOT_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+RUNTIME_PYTHONPATH_PREFIX="${RUNTIME_PYTHONPATH:+${RUNTIME_PYTHONPATH}:}"
+if [[ "${USE_CONTAINER_MEGATRON}" == true ]]; then
+    export NRL_USE_CONTAINER_MEGATRON=1
+    MEGATRON_PYTHONPATH="${RUNTIME_PYTHONPATH_PREFIX}${HF_MODULES_CACHE_DIR}:${SNAPSHOT_DIR}"
+    MEGATRON_PREFLIGHT="/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/bin/python -c \"from nemo_rl.models.megatron.community_import import resolve_hf_bridge; from nemo_rl.models.policy.workers.megatron_policy_worker import FullyShardedDataParallelV1 as policy_fsdp_v1, FullyShardedDataParallelV2 as policy_fsdp_v2; from megatron.bridge.models.conversion import model_bridge; from megatron.core.distributed import DistributedDataParallel as ddp, TorchFullyShardedDataParallel as torch_fsdp; from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as mcore_fsdp; from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP; from megatron.core.transformer.module import Float16Module; import megatron.core.distributed as distributed; wrappers=(ddp,torch_fsdp,mcore_fsdp,Float16Module,MegatronFSDP,policy_fsdp_v1,policy_fsdp_v2); assert all(isinstance(wrapper,type) for wrapper in wrappers), [(wrapper,type(wrapper)) for wrapper in wrappers]; bridge=resolve_hf_bridge('${MODEL_PATH}'); keys=model_bridge.get_model_bridge._exact_types; required={'NemotronH_Super_Omni_Reasoning_V3','NemotronH_Omni_Reasoning_V3'}; assert required <= set(keys), required-set(keys); assert bridge is not None; print('Verified matched container Megatron pair:', distributed.__file__); print('Verified NeMo RL FSDP import compatibility'); print('Verified container Omni AutoBridge resolution:', type(bridge._model_bridge).__name__)\" ;"
+else
+    unset NRL_USE_CONTAINER_MEGATRON
+    # Ray starts its interpreters before COMMAND runs, so checkout Megatron
+    # paths must be exported from the submitting shell when this mode is used.
+    MEGATRON_PYTHONPATH="${RUNTIME_PYTHONPATH_PREFIX}${HF_MODULES_CACHE_DIR}:${SNAPSHOT_DIR}:${MEGATRON_BRIDGE_SRC}:${MEGATRON_LM_SRC}"
+    MEGATRON_PREFLIGHT=""
+fi
 export HF_MODULES_CACHE="${HF_MODULES_CACHE_DIR}"
-export PYTHONPATH="${HF_MODULES_CACHE_DIR}:${SNAPSHOT_DIR}:${MEGATRON_BRIDGE_SRC}:${MEGATRON_LM_SRC}:${PYTHONPATH:-}"
+export PYTHONPATH="${MEGATRON_PYTHONPATH}:${PYTHONPATH:-}"
 
 export RAY_DEDUP_LOGS=1
 export LISTEN_PORT=6000
@@ -145,7 +176,8 @@ export SANDBOX_COMMAND="/start-with-nginx.sh"
 export SANDBOX_ENV_VARS="NEMO_SKILLS_SANDBOX_PORT=${NEMO_SKILLS_SANDBOX_PORT}"
 
 export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
-    export PYTHONPATH=${HF_MODULES_CACHE_DIR}:${SNAPSHOT_DIR}:${MEGATRON_BRIDGE_SRC}:${MEGATRON_LM_SRC}:\${PYTHONPATH:-} ; \
+    export PYTHONPATH=${MEGATRON_PYTHONPATH}:\${PYTHONPATH:-} ; \
+    ${MEGATRON_PREFLIGHT} \
     python -c \"from transformers import AutoConfig, AutoProcessor, AutoTokenizer; p='${MODEL_PATH}'; AutoConfig.from_pretrained(p, trust_remote_code=True); AutoProcessor.from_pretrained(p, trust_remote_code=True, use_fast=True); AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); print('Prewarmed HF dynamic modules cache')\" ; \
     date ; \
     NRL_WG_USE_RAY_REF=1 \
@@ -158,13 +190,14 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
     FLASHINFER_CUBIN_DIR=${FLASHINFER_CUBIN_CACHE} \
     FLASHINFER_WORKSPACE_BASE=${FLASHINFER_WS_BASE} \
     NEMO_GYM_VENV_DIR=${GYM_VENV_DIR} \
+    NEMO_RL_VIDEO_MEDIA_ROOT=${NEMO_RL_VIDEO_MEDIA_ROOT:-} \
     NRL_VLLM_USE_V1=1 \
     NRL_IGNORE_VERSION_MISMATCH=1 \
     WANDB_MODE=${WANDB_MODE} \
     VLLM_ATTENTION_BACKEND=FLASH_ATTN \
     NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS} \
     RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
-    PYTHONPATH=${SNAPSHOT_DIR}:\${PYTHONPATH:-} \
+    PYTHONPATH=${RUNTIME_PYTHONPATH_PREFIX}${SNAPSHOT_DIR}:\${PYTHONPATH:-} \
     uv run --no-sync ./${ENTRYPOINT} \
     --config ${CONFIG_PATH} \
     ++env.nemo_gym.uv_venv_dir=${GYM_VENV_DIR} \
@@ -177,6 +210,8 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
     logger.wandb_enabled=True \
     logger.wandb.name=${EXP_NAME} \
     logger.wandb.project=${WANDB_PROJ} \
+    ++logger.wandb.id=${WANDB_RUN_ID} \
+    ++logger.wandb.resume=allow \
     data.train.data_path=${TRAIN_PATH} \
     data.validation.data_path=${VAL_PATH} \
     ${EXTRA_HYDRA_ARGS}"
@@ -184,8 +219,13 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
 export CONTAINER
 export SANDBOX_CONTAINER
 BASE_MOUNTS="${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"
-BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:${SNAPSHOT_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
-BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+if [[ "${USE_CONTAINER_MEGATRON}" != true ]]; then
+    BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:${SNAPSHOT_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+fi
+# Mount the immutable per-run snapshot, not the live checkout. This keeps a
+# submitted experiment pinned to its Gym verifier when the next research branch
+# is checked out while the job is still queued or running.
+BASE_MOUNTS+=",${SNAPSHOT_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 
 # The checkpoint, dataset and caches live outside the code snapshot, so their
@@ -194,6 +234,7 @@ export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 # fails with "Repo id must be in the form 'repo_name' or 'namespace/repo_name'",
 # which says nothing about mounts. Check here instead.
 mount_checked_vars=(MODEL_PATH TRAIN_PATH VAL_PATH PERSISTENT_CACHE)
+[[ -n "${RUNTIME_PYTHONPATH}" ]] && mount_checked_vars+=(RUNTIME_PYTHONPATH)
 # GYM_VENV_DIR defaults to a container-internal path, which needs no mount. It
 # only has to be checked when pointed at host storage -- worth doing, because
 # putting it on a shared filesystem is how Gym's skip_venv_if_present actually
@@ -222,8 +263,10 @@ echo " Experiment : ${EXP_NAME}"
 echo " Config     : ${CONFIG_PATH}"
 echo " Entrypoint : ${ENTRYPOINT}"
 echo " Nodes      : ${SBATCH_NUM_NODES}"
+echo " Job cycles : ${JOB_CYCLES} (sequential array)"
 echo " Model      : ${MODEL_PATH}"
 echo " Container  : ${CONTAINER}"
+echo " Megatron   : $([[ "${USE_CONTAINER_MEGATRON}" == true ]] && echo container || echo snapshot)"
 echo "========================================"
 
 SBATCH_ARGS=(
@@ -236,8 +279,11 @@ SBATCH_ARGS=(
     --gres=gpu:"${SBATCH_GPUS_PER_NODE}"
     --exclusive
     --dependency=singleton
-    ray.sub
 )
+if (( JOB_CYCLES > 1 )); then
+    SBATCH_ARGS+=(--array="0-$((JOB_CYCLES - 1))%1")
+fi
+SBATCH_ARGS+=(ray.sub)
 
 if [[ "${DRY_RUN}" == true ]]; then
     echo "[dry-run] COMMAND:"

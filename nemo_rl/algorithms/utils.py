@@ -359,11 +359,30 @@ def get_tokenizer(
     maybe_patch_fastokens(bool(tokenizer_config.get("use_fastokens")))
 
     processor = None
+    processor_config = None
 
     if get_processor:
         processor = AutoProcessor.from_pretrained(
             tokenizer_config["name"], trust_remote_code=True, use_fast=True
         )
+        from transformers import AutoConfig
+
+        processor_config = AutoConfig.from_pretrained(
+            tokenizer_config["name"], trust_remote_code=True
+        )
+        if hasattr(processor, "tokenizer"):
+            from nemo_rl.models.nano_v3_vl import (
+                DynamicResolutionProcessor,
+                is_dynamic_resolution_model,
+            )
+
+            if is_dynamic_resolution_model(processor_config):
+                print("Using DynamicResolutionProcessor (matching vLLM RADIO tiling)")
+                processor = DynamicResolutionProcessor(
+                    processor.tokenizer,
+                    processor_config,
+                    chat_template=processor.tokenizer.chat_template,
+                )
         tokenizer = processor.tokenizer
     else:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -373,10 +392,15 @@ def get_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    def set_chat_template(chat_template: str) -> None:
+        tokenizer.chat_template = chat_template
+        if processor is not None:
+            processor.chat_template = chat_template
+
     if "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
-            tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
+            set_chat_template(COMMON_CHAT_TEMPLATES.passthrough_prompt_response)
         elif tokenizer_config["chat_template"].lower() == "default":
             print("Using tokenizer's default chat template")
         elif tokenizer_config["chat_template"].endswith(".jinja"):
@@ -384,10 +408,10 @@ def get_tokenizer(
             template_path = tokenizer_config["chat_template"]
             print(f"Loading chat template from file: {template_path}")
             with open(template_path, "r") as f:
-                tokenizer.chat_template = f.read()
+                set_chat_template(f.read())
         else:
             print("Using custom chat template")
-            tokenizer.chat_template = tokenizer_config["chat_template"]
+            set_chat_template(tokenizer_config["chat_template"])
     else:
         print("No chat template provided, using tokenizer's default")
 

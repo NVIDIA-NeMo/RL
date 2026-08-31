@@ -1,0 +1,20 @@
+#!/opt/nemo_rl_venv/bin/python3
+import os
+import sys
+
+from ray.scripts.scripts import main
+
+if __name__ == "__main__":
+    # The OCI-flattened SquashFS does not expose NVML to Ray's auto-detector,
+    # even though Slurm/Pyxis assigned all eight GPUs.  Advertise the allocation
+    # explicitly for Ray daemons; leave every other Ray subcommand untouched.
+    if len(sys.argv) > 1 and sys.argv[1] == "start" and not any(
+        arg == "--num-gpus" or arg.startswith("--num-gpus=") for arg in sys.argv[2:]
+    ):
+        dedicated_head = (
+            "--head" in sys.argv[2:]
+            and os.environ.get("NRL_DEDICATED_RAY_HEAD", "0") == "1"
+        )
+        num_gpus = "0" if dedicated_head else os.environ.get("GPUS_PER_NODE", "8")
+        sys.argv.append(f"--num-gpus={num_gpus}")
+    sys.exit(main())

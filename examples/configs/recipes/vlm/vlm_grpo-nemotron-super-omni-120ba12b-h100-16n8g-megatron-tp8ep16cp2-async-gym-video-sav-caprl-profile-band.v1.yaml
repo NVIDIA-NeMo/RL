@@ -1,0 +1,88 @@
+# Combined VideoMME/CAPRL + SAV point-tracking RL recipe.
+#
+# This recipe is cluster-neutral. Materialize or copy each dataset onto a
+# filesystem visible from every training node, then set CAPRL_VIDEO_DATA_PATH
+# and SAV_TRACKING_DATA_PATH to the resulting JSONL manifests. The SAV
+# manifest must use absolute, cluster-local image paths while preserving SAV's
+# interleaved Frame-N labels as still-image inputs. Do not mark SAV images as
+# _is_video_frame: Nemotron tubelet-video placeholders must be contiguous, but
+# SAV intentionally alternates text labels and images.
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-h100-16n8g-megatron-tp8ep16cp2-async-gym-video-profile-band.v1.yaml
+
+data:
+  _override_: true
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 0
+
+  # Async GRPO does not support multiple dataloaders. A list with this flag
+  # disabled concatenates both datasets into one shuffled training dataset.
+  use_multiple_dataloader: false
+  train:
+  - data_path: ${oc.env:CAPRL_VIDEO_DATA_PATH}
+  - data_path: ${oc.env:SAV_TRACKING_DATA_PATH}
+  # Match Arushi's successful combined reference run: validate over the same
+  # CAPRL + SAV mixture (validation is disabled in the inherited run config,
+  # but keeping the two lists identical prevents a later val enablement from
+  # silently exercising only CAPRL).
+  validation:
+  - data_path: ${oc.env:CAPRL_VIDEO_DATA_PATH}
+  - data_path: ${oc.env:SAV_TRACKING_DATA_PATH}
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+    num_frames: 64
+    video_sampling_style: nemotron_vl
+    video_target_num_patches: 1024
+    video_temporal_patch_size: 2
+    video_maintain_aspect_ratio: true
+    # Bound SAV still-image tiling independently from CAPRL video resolution.
+    # The largest 16-image tracking prompt then uses 4096 visual tokens.
+    image_max_num_tiles: 1
+
+logger:
+  wandb:
+    project: Nemotron-omni-RL-debug
+    name: dfw-h100-super-sav-caprl-rpb
+
+policy:
+  # Match Arushi's successful combined Super run. The 64-frame CAPRL prompts
+  # are already around 16.5K tokens, so a 16K model context leaves no room for
+  # generation. Keep policy packing, vLLM, and Gym on the same 64K limit.
+  max_total_sequence_length: 65536
+  sequence_packing:
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+  dynamic_batching:
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+  generation:
+    max_new_tokens: 16384
+    vllm_cfg:
+      max_model_len: 65536
+    vllm_kwargs:
+      max_num_batched_tokens: 65536
+      # Arushi's TP4 layout exposes twice as many vLLM engines. DFW H100 needs
+      # TP8 for Super to fit, so double per-engine concurrency to preserve the
+      # same 128 active sequences and avoid the 30-minute idle-job reaper while
+      # policy GPUs wait for the initial async buffer. The profiled KV cache can
+      # hold 66 full 64K sequences per engine, leaving ample headroom at 16.
+      max_num_seqs: 16
+      # Still-image rows receive max_num_tiles=1 per request from
+      # data.default.image_max_num_tiles below. The async worker maps that
+      # logical cap to max_num_patches=1024 for Super's dynamic-resolution
+      # processor so vLLM and Megatron emit identical media-token counts.
+
+env:
+  nemo_gym:
+    policy_max_input_tokens: 65536
+    # Exact environment set from Arushi's successful
+    # async_grpo_super35_sav_caprl_profile_band_allchanges run.
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/string_match/configs/string_match.yaml
+    - resources_servers/sav_tracks/configs/sav_tracks.yaml

@@ -13,6 +13,7 @@
 # limitations under the License.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import cache
 from typing import Any, NotRequired, Optional, TypedDict, Union
 
 import ray
@@ -39,6 +40,15 @@ _ROUTED_EXPERTS_DTYPE_NAMES = {
     torch.int16: "int16",
     torch.int32: "int32",
 }
+
+
+@cache
+def _warn_unsupported_in_flight_refit_pause_once(backend_name: str) -> None:
+    """Warn once per backend type when native refit pause is unavailable."""
+    print(
+        f"⚠️ {backend_name} has no native generation pause/resume support; "
+        "continuing with the backend's existing in-flight refit behavior"
+    )
 
 
 def get_num_routed_experts(hf_config: Any) -> Optional[int]:
@@ -485,6 +495,35 @@ class GenerationInterface(ABC):
     # Optional hook; backends may override to invalidate any reusable caches
     # (e.g., vLLM prefix/KV caches) after weight updates.
     def invalidate_kv_cache(self) -> bool:
+        return False
+
+    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
+        """Pause in-flight generation while preserving request state.
+
+        Backends with native in-flight refit support override this hook. The default
+        implementation warns once per backend type and lets the refit continue with
+        the backend's existing in-flight behavior. On supported backends, in-flight
+        requests are frozen rather than aborted and resume from
+        :meth:`resume_generation_after_refit`; new requests queue until then.
+
+        Args:
+            clear_cache: Also clear the engine's reusable caches at pause time so
+                preserved requests recompute their KV after the weight update.
+
+        Returns:
+            True if every engine paused; False when the backend has no native pause
+            support. Backends with native support raise when pausing fails.
+        """
+        _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
+        return False
+
+    def resume_generation_after_refit(self) -> bool:
+        """Resume generation paused by :meth:`pause_generation_for_refit`.
+
+        Returns True if every engine resumed. The default implementation returns
+        False for backends without native pause/resume support.
+        """
+        _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
     def blocks_training(self) -> bool:

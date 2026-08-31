@@ -1,0 +1,156 @@
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+
+cluster:
+  num_nodes: 16
+  gpus_per_node: 8
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  max_num_steps: 100000
+  max_num_epochs: 1000
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  advantage_clip_low: -50
+  advantage_clip_high: 50
+  seq_logprob_error_threshold: 2
+  zero_variance_prompt_filtering: false
+  use_dynamic_sampling: false
+  deduplicate_multimodal_data: true
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  length_penalty:
+    default:
+      enabled: true
+      length_type: tokens
+      profile_band_total: false
+      profile_band_reasoning: true
+      profile_band_answer: false
+    profile_band:
+      enabled: true
+      defaults:
+        reasoning:
+          a: 1024
+          b: 4096
+          f: 0.95
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: true
+  token_level_loss: false
+  use_sequence_length_scaling: false
+  logprob_chunk_size: 2048
+
+checkpointing:
+  enabled: true
+  metric_name: null
+  save_period: 2
+  keep_top_k: 5
+  save_optimizer: true
+  save_replay_buffer: false
+
+policy:
+  is_vlm: true
+  model_name: /lustre/fsw/portfolios/llmservice/users/arushig/pretrained_models/supermpo252k
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: ${policy.model_name}/chat_template.jinja
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  train_global_batch_size: 2048
+  max_total_sequence_length: 16384
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    tensor_model_parallel_size: 8
+    expert_model_parallel_size: 16
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 2
+    mtp_num_layers: 0
+    radio_force_cpe_eval_mode: true
+    # Match Arushi's validated Super video launcher. The vLLM refit mapping
+    # does not cover the vision tower/projector, so training either module
+    # would make rollout vision weights stale after the first optimizer step.
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    freeze_sound_encoder: true
+    freeze_sound_projection: true
+    optimizer:
+      lr: 3.0e-6
+      min_lr: 2.0e-9
+      adam_beta2: 0.99
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-8
+      lr_decay_iters: 100000
+  generation:
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 1.0
+    vllm_cfg:
+      # The ~247 GB Super checkpoint cannot leave any KV-cache capacity at
+      # TP4 on 80 GB H100s. Match the validated Super launcher: one TP8 vLLM
+      # replica per inference node, leaving eight replicas across eight nodes.
+      tensor_parallel_size: 8
+      load_format: auto
+      logprobs_mode: raw_logprobs
+      gpu_memory_utilization: 0.7
+      reset_encoder_cache_after_weight_update: true
+      video:
+        sampling_style: nemotron_vl
+        num_frames: 64
+        temporal_patch_size: 2
+    vllm_kwargs:
+      allowed_local_media_path: /lustre
+      mm_processor_cache_gb: 0
+      max_num_seqs: 8
+      max_num_batched_tokens: 32768
+      limit_mm_per_prompt:
+        image: 64
+        video:
+          count: 1
+          num_frames: 64
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 8
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 0
+  train:
+    data_path: /lustre/fsw/portfolios/llmservice/users/arushig/nemo_gym_rl_video_0803/nemo-rl/results/video_frame_cache_caprl_passrate_n5_easy_to_hard_lt60s_20260806_f64/stable_split_95_5/train_exclude_line6215.jsonl
+  validation:
+    data_path: ${data.train.data_path}
+  default:
+    num_frames: 64
+    video_target_num_patches: 1024
+    video_maintain_aspect_ratio: true
+
+env:
+  should_log_nemo_gym_responses: false
+  reject_generated_media_tokens: true
+  nemo_gym:
+    skip_venv_if_present: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: Nemotron-omni-RL-debug
+    name: dfw-h100-super-video-rpb-mpo252k

@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:1
+#SBATCH --time=02:00:00
+#SBATCH --job-name=s35-container-64391373
+
+set -euo pipefail
+
+readonly image_ref=gitlab-master.nvidia.com#dl/joc/nemo-ci/main-mirror/rl-gym:pipe.64391373
+readonly output_dir=${SLURM_SUBMIT_DIR}/.cache/containers
+readonly output_file=${output_dir}/rl-gym-pipe-64391373-a32bc350.sqsh
+readonly partial_file=${output_file}.job-${SLURM_JOB_ID}.inprogress
+readonly claim_dir=${output_file}.import-claim
+
+test ! -e "${output_file}"
+test ! -e "${partial_file}"
+mkdir -p "${output_dir}"
+if ! mkdir "${claim_dir}" 2>/dev/null; then
+  echo "SUPER_CONTAINER_IMPORT_SKIP job=${SLURM_JOB_ID} reason=another-importer-claimed"
+  exit 0
+fi
+printf '%s\n' "${SLURM_JOB_ID}" >"${claim_dir}/owner"
+
+cleanup() {
+  local rc=$?
+  if [[ -e "${partial_file}" ]]; then
+    rm -f -- "${partial_file}"
+  fi
+  if [[ -f "${claim_dir}/owner" ]] && [[ "$(<"${claim_dir}/owner")" == "${SLURM_JOB_ID}" ]]; then
+    rm -f -- "${claim_dir}/owner"
+    rmdir -- "${claim_dir}"
+  fi
+  exit "${rc}"
+}
+trap cleanup EXIT
+
+echo "SUPER_CONTAINER_IMPORT_START job=${SLURM_JOB_ID} account=${SLURM_JOB_ACCOUNT} partition=${SLURM_JOB_PARTITION}"
+echo "image=${image_ref} output=${output_file}"
+
+srun \
+  --mpi=pmix \
+  --no-container-mount-home \
+  --container-image="${image_ref}" \
+  --container-save="${partial_file}" \
+  bash -lc '
+    set -euo pipefail
+    main_python=/opt/nemo_rl_venv/bin/python
+    generation_python=/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
+    gym_python=/opt/gym_venvs/responses_api_models/vllm_model/.venv/bin/python
+
+    test -x "${main_python}"
+    test -x "${generation_python}"
+    test -x "${gym_python}"
+    "${main_python}" -c "import sys; print(\"MAIN_PYTHON\", sys.version)"
+    "${generation_python}" -c "import vllm; print(\"GENERATION_VLLM\", vllm.__version__, vllm.__file__)"
+    "${gym_python}" -c "import vllm; print(\"GYM_VLLM\", vllm.__version__, vllm.__file__)"
+    sha256sum /opt/nemo-rl/pyproject.toml /opt/nemo-rl/uv.lock
+    nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+  '
+
+unsquashfs -s "${partial_file}"
+mv "${partial_file}" "${output_file}"
+rm -f -- "${claim_dir}/owner"
+rmdir -- "${claim_dir}"
+trap - EXIT
+echo "SUPER_CONTAINER_IMPORT_PASS job=${SLURM_JOB_ID} output=${output_file}"

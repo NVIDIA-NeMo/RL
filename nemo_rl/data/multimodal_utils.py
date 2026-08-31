@@ -14,6 +14,7 @@
 
 import base64
 import inspect
+import json
 import logging
 import re
 import uuid
@@ -62,9 +63,17 @@ DEFAULT_MEDIA_EXTENSIONS = {
 _PLACEHOLDER_STYLE_PROCESSOR_NAMES = frozenset(
     {
         "NemotronNanoVLV2Processor",
+        "DynamicResolutionProcessor",
+        "NemotronH_Omni_Reasoning_V3Processor",
         "NemotronH_Nano_Omni_Reasoning_V3Processor",
     }
 )
+
+# The legacy Nano V2 image processor returns a fixed batch of image tiles and
+# ``num_patches`` but no dynamic-resolution metadata.  Adding ``imgs_sizes`` to
+# that output changes which image-encoding branch Megatron-Bridge selects and
+# makes training disagree with the HF/vLLM rollout model.
+_FIXED_TILE_IMAGE_PROCESSOR_NAMES = frozenset({"NemotronNanoVLV2Processor"})
 
 
 # different media namings maybe used in the raw dataset,
@@ -99,6 +108,11 @@ def uses_image_placeholder(processor: Any) -> bool:
         rather than tokenized ``apply_chat_template``.
     """
     return type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSOR_NAMES
+
+
+def uses_fixed_tile_image_processor(processor: Any) -> bool:
+    """Return whether stacked image tiles must keep their legacy metadata contract."""
+    return type(processor).__name__ in _FIXED_TILE_IMAGE_PROCESSOR_NAMES
 
 
 class PackedTensor:
@@ -757,6 +771,7 @@ def extract_multimodal_model_inputs(
     processed = dict(processed)
     if (
         uses_image_placeholder(processor)
+        and not uses_fixed_tile_image_processor(processor)
         and "pixel_values" in processed
         and "imgs_sizes" not in processed
         and processed["pixel_values"].ndim == 4
@@ -890,12 +905,32 @@ def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
     return f"data:image/{fmt.lower()};base64,{encoded}"
 
 
-def _encode_single_image_source(source: str) -> str:
-    """Resolve and encode one image source."""
+def _encode_single_image_source(
+    source: str, square_size: int | None = None
+) -> str:
+    """Resolve and encode one image source, optionally as a square image.
+
+    ``square_size`` is used by old tile-based HF processors paired with the
+    newer vLLM dynamic-resolution frontend.  With one tile configured, the HF
+    processor first resizes every image to its square base resolution. Sending
+    that same square image to vLLM makes its dynamic tiler choose the identical
+    patch grid instead of spending the whole remaining context on the source
+    resolution.
+    """
     image = resolve_to_image(source)
+    resized: Image.Image | None = None
     try:
-        data_url = image_to_data_url(image)
+        if square_size is not None:
+            if square_size < 1:
+                raise ValueError("square_size must be at least 1.")
+            if image.size != (square_size, square_size):
+                resized = image.resize(
+                    (square_size, square_size), Image.Resampling.BICUBIC
+                )
+        data_url = image_to_data_url(resized or image)
     finally:
+        if resized is not None:
+            resized.close()
         image.close()
     return data_url
 
@@ -1007,12 +1042,146 @@ def _restore_tensors(processed: dict[str, Any]) -> None:
                 continue
 
 
+_MEDIA_PLACEHOLDER_TOKEN_ID_KEY = "_media_placeholder_token_id"
+_MEDIA_PLACEHOLDER_RUN_LENGTHS_KEY = "_media_placeholder_run_lengths"
+
+
+def _media_placeholder_run_lengths(
+    token_ids: torch.Tensor, media_token_id: int
+) -> list[int]:
+    """Return contiguous media-token run lengths in encounter order."""
+    if token_ids.ndim == 2:
+        if token_ids.shape[0] != 1:
+            raise ValueError(
+                "Media placeholder metadata expects one token row, got "
+                f"{tuple(token_ids.shape)}."
+            )
+        token_ids = token_ids[0]
+    if token_ids.ndim != 1:
+        raise ValueError(
+            "Media placeholder metadata expects one-dimensional token ids, got "
+            f"{tuple(token_ids.shape)}."
+        )
+
+    is_media = token_ids == media_token_id
+    run_lengths: list[int] = []
+    cursor = 0
+    while cursor < len(token_ids):
+        if not bool(is_media[cursor]):
+            cursor += 1
+            continue
+        run_end = cursor + 1
+        while run_end < len(token_ids) and bool(is_media[run_end]):
+            run_end += 1
+        run_lengths.append(run_end - cursor)
+        cursor = run_end
+    return run_lengths
+
+
+def _processor_media_token_counts(processed: dict[str, Any]) -> list[int]:
+    """Read authoritative per-image placeholder counts from a processor result."""
+    counts = processed.get("num_tokens")
+    if isinstance(counts, torch.Tensor):
+        counts = counts.detach().cpu().reshape(-1).tolist()
+    if not isinstance(counts, (list, tuple)):
+        return []
+
+    result: list[int] = []
+    for count in counts:
+        if isinstance(count, torch.Tensor):
+            if count.numel() != 1:
+                return []
+            count = count.item()
+        try:
+            value = int(count)
+        except (TypeError, ValueError):
+            return []
+        if value <= 0:
+            return []
+        result.append(value)
+    return result
+
+
+def reconcile_message_media_placeholder_runs(message: dict[str, Any]) -> None:
+    """Resize Gym media runs to the checkpoint processor's exact lengths.
+
+    vLLM returns the authoritative prompt and generation tokens, but its built-in
+    Nemotron media processor can choose a different dynamic image tiling than the
+    checkpoint processor used to build Megatron's pixel tensors. Keep every
+    non-media Gym token in place and change only contiguous ``<image>`` run
+    lengths so there is one placeholder per projected feature.
+
+    A pre-rollout placeholder message has no media runs yet and is intentionally
+    left untouched. Its reference metadata survives prompt deduplication and is
+    applied after the Gym result is reattached.
+    """
+    media_token_id = message.get(_MEDIA_PLACEHOLDER_TOKEN_ID_KEY)
+    reference_lengths = message.get(_MEDIA_PLACEHOLDER_RUN_LENGTHS_KEY)
+    token_ids = message.get("token_ids")
+    if (
+        not isinstance(media_token_id, int)
+        or not isinstance(reference_lengths, (list, tuple))
+        or not isinstance(token_ids, torch.Tensor)
+    ):
+        return
+
+    target_lengths = _media_placeholder_run_lengths(token_ids, media_token_id)
+    if not target_lengths:
+        return
+    expected_lengths = [int(length) for length in reference_lengths]
+    if len(target_lengths) != len(expected_lengths):
+        raise ValueError(
+            "Gym/checkpoint media-region mismatch: Gym returned "
+            f"{len(target_lengths)} placeholder runs, but the checkpoint processor "
+            f"created {len(expected_lengths)} media regions."
+        )
+    if target_lengths == expected_lengths:
+        return
+
+    for key in ("routed_experts", "token_type_ids", "mm_token_type_ids"):
+        value = message.get(key)
+        if isinstance(value, torch.Tensor) and value.shape[0] == token_ids.shape[0]:
+            raise ValueError(
+                "Cannot resize media placeholder runs while sequence-aligned "
+                f"{key!r} is attached."
+            )
+
+    is_media = token_ids == media_token_id
+    pieces: list[torch.Tensor] = []
+    cursor = 0
+    run_index = 0
+    while cursor < len(token_ids):
+        if not bool(is_media[cursor]):
+            next_media = cursor + 1
+            while next_media < len(token_ids) and not bool(is_media[next_media]):
+                next_media += 1
+            pieces.append(token_ids[cursor:next_media])
+            cursor = next_media
+            continue
+        run_end = cursor + 1
+        while run_end < len(token_ids) and bool(is_media[run_end]):
+            run_end += 1
+        pieces.append(
+            torch.full(
+                (expected_lengths[run_index],),
+                media_token_id,
+                dtype=token_ids.dtype,
+                device=token_ids.device,
+            )
+        )
+        run_index += 1
+        cursor = run_end
+
+    message["token_ids"] = torch.cat(pieces) if pieces else token_ids.new_empty(0)
+
+
 def attach_image_model_inputs_to_message(
     message: dict[str, Any],
     *,
     images: list[Image.Image],
     processor: Any,
     pad_dynamic_image_shapes: bool = False,
+    max_num_tiles: int | None = None,
 ) -> None:
     """Attach processor-owned image tensors without replacing rollout tokens."""
     if not images or processor is None:
@@ -1024,14 +1193,84 @@ def attach_image_model_inputs_to_message(
     # would make it stack those and fail before the exact imgs_sizes are read off
     # them. Off by default, so every other caller keeps the stacked path.
     allow_ragged_output = pad_dynamic_image_shapes and len(images) > 1
-    processed = processor(
-        text=image_token * len(images),
-        images=images,
-        return_tensors=None if allow_ragged_output else "pt",
-    )
+    image_processor = getattr(processor, "image_processor", None)
+    original_max_num_tiles: int | None = None
+    original_max_num_patches: int | None = None
+    restore_max_num_tiles = False
+    restore_max_num_patches = False
+    if max_num_tiles is not None:
+        if max_num_tiles < 1:
+            raise ValueError("max_num_tiles must be at least 1.")
+        if image_processor is not None and hasattr(image_processor, "max_num_tiles"):
+            # InternVL-style processors expose the tile cap directly.
+            original_max_num_tiles = image_processor.max_num_tiles
+            image_processor.max_num_tiles = max_num_tiles
+            restore_max_num_tiles = True
+        elif image_processor is not None and all(
+            hasattr(image_processor, name)
+            for name in ("min_num_patches", "max_num_patches")
+        ):
+            # Dynamic-resolution Nemotron processors always emit one image
+            # tile. Their equivalent budget is expressed in pre-shuffle image
+            # patches: one base tile is min_num_patches, two tiles are twice
+            # that budget, and so on.
+            min_num_patches = image_processor.min_num_patches
+            if (
+                not isinstance(min_num_patches, int)
+                or isinstance(min_num_patches, bool)
+                or min_num_patches < 1
+            ):
+                raise ValueError(
+                    "The configured dynamic image processor has an invalid "
+                    "min_num_patches value."
+                )
+            original_max_num_patches = image_processor.max_num_patches
+            image_processor.max_num_patches = min_num_patches * max_num_tiles
+            restore_max_num_patches = True
+        else:
+            raise ValueError(
+                "The configured image processor supports neither max_num_tiles "
+                "nor a dynamic min_num_patches/max_num_patches budget."
+            )
+        # These checkpoint processors omit the controls from their strict
+        # ProcessorMixin ImagesKwargs schema. Temporarily setting the image
+        # processor defaults is schema-independent.
+    try:
+        processed = processor(
+            text=image_token * len(images),
+            images=images,
+            return_tensors=None if allow_ragged_output else "pt",
+        )
+    finally:
+        if restore_max_num_tiles:
+            image_processor.max_num_tiles = original_max_num_tiles
+        if restore_max_num_patches:
+            image_processor.max_num_patches = original_max_num_patches
     processed = dict(processed)
     if allow_ragged_output:
         processed = _materialize_ragged_pixel_values(processed, processor)
+
+    reference_input_ids = processed.get("input_ids")
+    media_token_id = getattr(processor, "image_token_id", None)
+    if media_token_id is None:
+        tokenizer = getattr(processor, "tokenizer", None)
+        convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
+        if callable(convert_tokens_to_ids):
+            media_token_id = convert_tokens_to_ids(image_token)
+    if isinstance(media_token_id, int):
+        # Nemotron Super exposes the exact projected feature count for each
+        # image as ``num_tokens``. Prefer that direct image-processor contract:
+        # reconstructing the same values from tokenized placeholder text is
+        # unnecessary and can fail when BatchFeature leaves input_ids ragged.
+        reference_lengths = _processor_media_token_counts(processed)
+        if not reference_lengths and isinstance(reference_input_ids, torch.Tensor):
+            reference_lengths = _media_placeholder_run_lengths(
+                reference_input_ids, media_token_id
+            )
+        if reference_lengths:
+            message[_MEDIA_PLACEHOLDER_TOKEN_ID_KEY] = media_token_id
+            message[_MEDIA_PLACEHOLDER_RUN_LENGTHS_KEY] = reference_lengths
+
     model_inputs = extract_multimodal_model_inputs(processor, processed)
     message.update(
         {
@@ -1040,9 +1279,54 @@ def attach_image_model_inputs_to_message(
             if isinstance(value, PackedTensor)
         }
     )
+    reconcile_message_media_placeholder_runs(message)
 
 
-def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
+def nemo_gym_image_max_num_tiles(example: Any) -> int | None:
+    """Read the still-image tile cap injected into a NeMo-Gym request."""
+    if not isinstance(example, dict):
+        return None
+    direct_value = example.get("_nemo_rl_image_max_num_tiles")
+    if (
+        isinstance(direct_value, int)
+        and not isinstance(direct_value, bool)
+        and direct_value > 0
+    ):
+        return direct_value
+    params = example.get("responses_create_params")
+    if not isinstance(params, dict):
+        return None
+
+    extra_bodies: list[Any] = [params.get("extra_body")]
+    metadata = params.get("metadata")
+    if isinstance(metadata, dict):
+        extra_bodies.append(metadata.get("extra_body"))
+
+    for extra_body in extra_bodies:
+        if isinstance(extra_body, str):
+            try:
+                extra_body = json.loads(extra_body)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(extra_body, dict):
+            continue
+        mm_processor_kwargs = extra_body.get("mm_processor_kwargs")
+        if not isinstance(mm_processor_kwargs, dict):
+            continue
+        value = mm_processor_kwargs.get("max_num_tiles")
+        images_kwargs = mm_processor_kwargs.get("images_kwargs")
+        if value is None and isinstance(images_kwargs, dict):
+            value = images_kwargs.get("max_num_tiles")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def encode_images_in_examples(
+    nemo_gym_examples: list[dict],
+    *,
+    single_tile_image_size: int | None = None,
+) -> list[dict]:
     """Replace local image paths in NeMo Gym examples with base64 data URLs.
 
     Walks each example's ``responses_create_params.input[].content[]`` items,
@@ -1060,17 +1344,26 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
         nemo_gym_examples: List of NeMo Gym example dicts. Each example is
             expected to contain a ``responses_create_params`` mapping with an
             ``input`` list of Responses API messages.
+        single_tile_image_size: Square base resolution used for examples that
+            explicitly request one image tile. ``None`` preserves source sizes.
 
     Returns:
         The same ``nemo_gym_examples`` list, with local image references
         rewritten to base64 data URLs in place.
     """
-    targets_by_source: dict[str, list[tuple[dict, str]]] = {}
+    targets_by_source_and_size: dict[
+        tuple[str, int | None], list[tuple[dict, str]]
+    ] = {}
 
     for example in nemo_gym_examples:
         input_items = example.get("responses_create_params", {}).get("input", [])
         if not isinstance(input_items, list):
             continue
+        square_size = (
+            single_tile_image_size
+            if nemo_gym_image_max_num_tiles(example) == 1
+            else None
+        )
         for item in input_items:
             if not isinstance(item, dict):
                 continue
@@ -1096,25 +1389,30 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
                     continue
                 if url.startswith(("http://", "https://", "data:")):
                     continue
-                targets_by_source.setdefault(url, []).append((part, media_key))
+                targets_by_source_and_size.setdefault((url, square_size), []).append(
+                    (part, media_key)
+                )
 
-    sources = list(targets_by_source)
-    if sources:
+    source_and_sizes = list(targets_by_source_and_size)
+    if source_and_sizes:
         with ThreadPoolExecutor(
             max_workers=NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS
         ) as executor:
-            encoded_by_source = dict(
+            encoded_by_source_and_size = dict(
                 zip(
-                    sources,
-                    executor.map(_encode_single_image_source, sources),
+                    source_and_sizes,
+                    executor.map(
+                        lambda item: _encode_single_image_source(*item),
+                        source_and_sizes,
+                    ),
                     strict=True,
                 )
             )
 
         # Keep payload mutation on the caller thread after worker-owned images
         # have been closed and every unique source has been encoded.
-        for source, targets in targets_by_source.items():
-            data_url = encoded_by_source[source]
+        for source_and_size, targets in targets_by_source_and_size.items():
+            data_url = encoded_by_source_and_size[source_and_size]
             for part, media_key in targets:
                 part[media_key] = data_url
     return nemo_gym_examples

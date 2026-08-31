@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 import warnings
+from functools import wraps
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -56,6 +57,102 @@ from nemo_rl.models.generation.openai_server_utils import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _cap_nano_dynamic_image_processor(
+    processor: Any, max_num_tiles: int | None
+) -> None:
+    """Map vLLM's logical tile cap to its dynamic image patch budget."""
+    if max_num_tiles is None:
+        return
+    if (
+        not isinstance(max_num_tiles, int)
+        or isinstance(max_num_tiles, bool)
+        or max_num_tiles < 1
+    ):
+        raise ValueError("max_num_tiles must be a positive integer")
+
+    dynamic_tiler = getattr(processor, "dynamic_tiler", None)
+    if dynamic_tiler is None:
+        return
+
+    min_attr = next(
+        (
+            name
+            for name in ("_min_num_patches", "min_num_patches")
+            if hasattr(dynamic_tiler, name)
+        ),
+        None,
+    )
+    max_attr = next(
+        (
+            name
+            for name in ("_max_num_patches", "max_num_patches")
+            if hasattr(dynamic_tiler, name)
+        ),
+        None,
+    )
+    if min_attr is None or max_attr is None:
+        raise AttributeError(
+            "vLLM's dynamic image tiler does not expose a min/max patch budget"
+        )
+
+    min_num_patches = getattr(dynamic_tiler, min_attr)
+    if (
+        not isinstance(min_num_patches, int)
+        or isinstance(min_num_patches, bool)
+        or min_num_patches < 1
+    ):
+        raise ValueError("vLLM's dynamic image tiler has an invalid patch minimum")
+
+    max_num_patches = min_num_patches * max_num_tiles
+    setattr(dynamic_tiler, max_attr, max_num_patches)
+    LOGGER.info(
+        "Applied dynamic image cap: max_num_tiles=%d max_num_patches=%d",
+        max_num_tiles,
+        max_num_patches,
+    )
+
+
+def _install_nano_dynamic_image_tile_cap_adapter() -> None:
+    """Teach the container's vLLM processor to honor per-request tile caps.
+
+    The vLLM version used by the Super container accepts ``max_num_tiles`` in
+    ``NanoNemotronVLProcessor.__init__`` but ignores it when the checkpoint
+    selects its dynamic-resolution tiler. NeMo RL uses the same logical tile
+    cap for Megatron preprocessing, so adapt it once when each cached vLLM
+    processor instance is constructed.
+    """
+    from vllm.transformers_utils.processors.nano_nemotron_vl import (
+        NanoNemotronVLProcessor,
+    )
+
+    if getattr(
+        NanoNemotronVLProcessor,
+        "_nemo_rl_dynamic_image_tile_cap_adapter_installed",
+        False,
+    ):
+        return
+
+    original_init = NanoNemotronVLProcessor.__init__
+
+    @wraps(original_init)
+    def adapted_init(
+        self: Any,
+        *args: Any,
+        max_num_tiles: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        original_init(
+            self,
+            *args,
+            max_num_tiles=max_num_tiles,
+            **kwargs,
+        )
+        _cap_nano_dynamic_image_processor(self, max_num_tiles)
+
+    NanoNemotronVLProcessor.__init__ = adapted_init
+    NanoNemotronVLProcessor._nemo_rl_dynamic_image_tile_cap_adapter_installed = True
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -167,6 +264,8 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.v1.metrics.loggers import PrometheusStatLogger
+
+        _install_nano_dynamic_image_tile_cap_adapter()
 
         # Workaround: convert compilation_config dict to CompilationConfig object
         # since AsyncEngineArgs doesn't handle the dict-to-pydantic conversion.
@@ -370,10 +469,26 @@ class VllmAsyncGenerationWorkerImpl(
             TokenizeCompletionRequest,
             TokenizeResponse,
         )
-        from vllm.entrypoints.serve.tokenize.serving import (
-            ServingTokenization,
-        )
-        from vllm.renderers.online_renderer import OnlineRenderer
+        try:
+            from vllm.entrypoints.serve.tokenize.serving import (
+                ServingTokenization,
+            )
+            from vllm.renderers.online_renderer import OnlineRenderer
+
+            legacy_serving_api = False
+        except ImportError:
+            # vLLM 0.20 uses OpenAIServingRender/OpenAIServingTokenization;
+            # vLLM 0.25 renamed and rewired both classes. Super's validated
+            # training container is based on the older API, while NeMo RL's
+            # default container uses the newer one.
+            from vllm.entrypoints.serve.render.serving import (
+                OpenAIServingRender as OnlineRenderer,
+            )
+            from vllm.entrypoints.serve.tokenize.serving import (
+                OpenAIServingTokenization as ServingTokenization,
+            )
+
+            legacy_serving_api = True
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
@@ -484,16 +599,26 @@ class VllmAsyncGenerationWorkerImpl(
                     if actual_request_max_tokens is not None:
                         self._set_max_tokens(request, 1)
 
+                preprocess_kwargs = dict(
+                    request=request,
+                    messages=messages,
+                    default_template=default_template,
+                    default_template_content_format=default_template_content_format,
+                    default_template_kwargs=default_template_kwargs,
+                    tool_dicts=tool_dicts,
+                    skip_mm_cache=skip_mm_cache,
+                )
+                if legacy_serving_api:
+                    preprocess_kwargs.update(
+                        tool_parser=None,
+                        reasoning_parser=parser,
+                    )
+                else:
+                    preprocess_kwargs["parser"] = parser
+
                 try:
                     res = await super().preprocess_chat(
-                        request=request,
-                        messages=messages,
-                        default_template=default_template,
-                        default_template_content_format=default_template_content_format,
-                        default_template_kwargs=default_template_kwargs,
-                        tool_dicts=tool_dicts,
-                        parser=parser,
-                        skip_mm_cache=skip_mm_cache,
+                        **preprocess_kwargs,
                     )
                 except (ValueError, VLLMValidationError) as e:
                     if "maximum context length" in str(e):
@@ -538,15 +663,12 @@ class VllmAsyncGenerationWorkerImpl(
                     update={"add_generation_prompt": False}
                 )
 
+                corresponding_preprocess_kwargs = preprocess_kwargs | {
+                    "request": modified_request,
+                    "messages": messages_to_last_assistant_message,
+                }
                 corresponding_res = await super().preprocess_chat(
-                    request=modified_request,
-                    messages=messages_to_last_assistant_message,
-                    default_template=default_template,
-                    default_template_content_format=default_template_content_format,
-                    default_template_kwargs=default_template_kwargs,
-                    tool_dicts=tool_dicts,
-                    parser=parser,
-                    skip_mm_cache=skip_mm_cache,
+                    **corresponding_preprocess_kwargs
                 )
                 actual_corresponding_token_ids = corresponding_res[1][0][
                     "prompt_token_ids"
@@ -696,7 +818,7 @@ class VllmAsyncGenerationWorkerImpl(
         default_chat_template_kwargs: dict[str, Any] = (
             serving_chat_kwargs["default_chat_template_kwargs"] or {}
         )
-        online_renderer = NeMoRLOnlineRenderer(
+        online_renderer_kwargs = dict(
             model_config=engine_client.model_config,
             renderer=engine_client.renderer,
             request_logger=serving_chat_kwargs["request_logger"],
@@ -715,14 +837,28 @@ class VllmAsyncGenerationWorkerImpl(
             # here keeps the two endpoints rendering identical prompts.
             default_chat_template_kwargs=default_chat_template_kwargs,
         )
+        if legacy_serving_api:
+            online_renderer_kwargs.update(
+                model_registry=openai_serving_models.registry,
+                trust_request_chat_template=serving_chat_kwargs.get(
+                    "trust_request_chat_template", False
+                ),
+                exclude_tools_when_tool_choice_none=serving_chat_kwargs.get(
+                    "exclude_tools_when_tool_choice_none", False
+                ),
+                log_error_stack=serving_chat_kwargs.get("log_error_stack", False),
+            )
+        online_renderer = NeMoRLOnlineRenderer(**online_renderer_kwargs)
         serving_chat_kwargs.update(
             dict(
                 engine_client=engine_client,
                 models=openai_serving_models,
-                online_renderer=online_renderer,
                 return_tokens_as_token_ids=True,
             )
         )
+        serving_chat_kwargs[
+            "openai_serving_render" if legacy_serving_api else "online_renderer"
+        ] = online_renderer
         openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
 
         generation_config = self.cfg
@@ -823,8 +959,17 @@ class VllmAsyncGenerationWorkerImpl(
 
         # Tokenize path delegates to OnlineRenderer.preprocess_chat,
         # where the prefix-token override lives.
-        class NeMoRLServingTokenization(ServingTokenization):
-            pass
+        if legacy_serving_api:
+
+            class NeMoRLServingTokenization(
+                NeMoRLOpenAIServingMixin, ServingTokenization
+            ):
+                pass
+
+        else:
+
+            class NeMoRLServingTokenization(ServingTokenization):
+                pass
 
         serving_tokenization_kwargs = dict(
             request_logger=serving_chat_kwargs["request_logger"],
@@ -833,12 +978,18 @@ class VllmAsyncGenerationWorkerImpl(
                 "chat_template_content_format"
             ],
             models=serving_chat_kwargs["models"],
-            online_renderer=online_renderer,
             # ServingTokenization reads its own copy in preprocess_chat rather
             # than the renderer's, so /tokenize would otherwise render with {}
             # and diverge from /v1/chat/completions under multi-turn.
             default_chat_template_kwargs=default_chat_template_kwargs,
         )
+        if legacy_serving_api:
+            serving_tokenization_kwargs.update(
+                engine_client=engine_client,
+                openai_serving_render=online_renderer,
+            )
+        else:
+            serving_tokenization_kwargs["online_renderer"] = online_renderer
         openai_serving_tokenization = NeMoRLServingTokenization(
             **serving_tokenization_kwargs
         )
@@ -1567,6 +1718,34 @@ class VllmAsyncGenerationWorkerImpl(
         await self.llm.reset_prefix_cache()
         gc.collect()
         torch.cuda.empty_cache()
+
+    async def pause_generation_async(self, *, clear_cache: bool) -> bool:
+        """Pause vLLM generation for an in-flight weight update."""
+        assert self.llm is not None, (
+            "Attempting to pause generation with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "pause_generation_async can only be used with async_engine=True"
+            )
+
+        await self.llm.pause_generation(mode="keep", clear_cache=clear_cache)
+        return True
+
+    async def resume_generation_async(self) -> bool:
+        """Resume vLLM generation paused for an in-flight weight update."""
+        assert self.llm is not None, (
+            "Attempting to resume generation with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "resume_generation_async can only be used with async_engine=True"
+            )
+
+        await self.llm.resume_generation()
+        return True
 
     async def sleep_async(self):
         """Async version of sleep."""

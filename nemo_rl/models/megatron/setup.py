@@ -231,6 +231,7 @@ from nemo_rl.models.generation.megatron.config import (
 from nemo_rl.models.megatron.community_import import (
     import_model_from_hf_name,
     iter_vlm_config_overrides,
+    resolve_hf_bridge,
 )
 from nemo_rl.models.megatron.config import (
     ColocatedReshardPlan,
@@ -2186,9 +2187,11 @@ def finalize_megatron_setup(
     )
 
     dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
-    megatron_bridge = AutoBridge.from_hf_pretrained(
-        hf_model_name, trust_remote_code=True
-    )
+    # Every policy worker constructs its own AutoBridge during finalization.
+    # Do not rely on HF->Megatron import to register the Super Omni auto-map
+    # alias: once the converted checkpoint is cached, import is skipped and a
+    # fresh worker process would otherwise reject the same supported model.
+    megatron_bridge = resolve_hf_bridge(hf_model_name)
 
     should_disable_forward_pre_hook = (
         config["megatron_cfg"]["optimizer"]["use_distributed_optimizer"]

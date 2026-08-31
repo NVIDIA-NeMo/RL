@@ -17,6 +17,7 @@ import os
 import sys
 import tempfile
 from collections import defaultdict
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -91,6 +92,183 @@ def test_nemo_gym_data_processor_without_task_data_spec():
     assert result["idx"] == 3
     assert result["task_name"] == "nemo_gym"
     assert result["length"] == 0
+    assert result["message_log"][0]["token_ids"].dtype == torch.long
+
+
+def test_nemo_gym_video_config_allows_still_image_rows(monkeypatch):
+    """Mixed Gym manifests may contain SAV images alongside CAPRL videos."""
+    extra_env_info = {
+        "agent_ref": {"name": "sav_pt_tracks_agent"},
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Track this point."},
+                        {"type": "input_image", "image_url": "/images/frame.jpg"},
+                    ],
+                }
+            ]
+        },
+    }
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym_video.nemo_gym_example_to_video_datum_spec",
+        lambda *args, **kwargs: None,
+    )
+    task_data_spec = TaskDataSpec(
+        task_name="nemo_gym",
+        prompt_file=None,
+        system_prompt_file=None,
+        video_sampling_style="nemotron_vl",
+        num_frames=64,
+        video_target_num_patches=1024,
+        video_maintain_aspect_ratio=True,
+        video_temporal_patch_size=2,
+    )
+    processor = SimpleNamespace(
+        apply_chat_template=lambda *args, **kwargs: "",
+        tokenizer=object(),
+    )
+
+    result = nemo_gym_data_processor(
+        datum_dict={
+            "extra_env_info": json.dumps(extra_env_info),
+            "task_name": "nemo_gym",
+        },
+        task_data_spec=task_data_spec,
+        tokenizer=processor,
+        max_seq_length=65536,
+        idx=7,
+    )
+
+    assert result["extra_env_info"] == extra_env_info
+    assert result["task_name"] == "nemo_gym"
+    assert result["idx"] == 7
+    assert result["length"] == 0
+    assert result["message_log"][0]["token_ids"].dtype == torch.long
+
+
+def test_nemo_gym_video_data_processor_allows_still_image_rows():
+    """Video defaults must not force every row in a mixed dataset to be video."""
+    extra_env_info = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Track this point."},
+                        {
+                            "type": "input_image",
+                            "image_url": "/frames/frame_0001.jpg",
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+    processor = SimpleNamespace(
+        apply_chat_template=lambda *args, **kwargs: None,
+        tokenizer=object(),
+    )
+
+    result = nemo_gym_data_processor(
+        datum_dict={
+            "extra_env_info": json.dumps(extra_env_info),
+            "task_name": "nemo_gym",
+        },
+        task_data_spec=TaskDataSpec(
+            task_name="nemo_gym",
+            video_sampling_style="nemotron_vl",
+        ),
+        tokenizer=processor,
+        max_seq_length=128,
+        idx=4,
+    )
+
+    assert result["extra_env_info"] == extra_env_info
+    assert result["message_log"][0]["role"] == "user"
+    assert result["message_log"][0]["token_ids"].numel() == 0
+    assert result["message_log"][0]["token_ids"].dtype == torch.long
+    assert result["length"] == 0
+    assert result["idx"] == 4
+
+
+def test_nemo_gym_still_image_tile_cap_is_forwarded_to_vllm():
+    extra_env_info = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "/frames/frame_0001.jpg",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    processor = SimpleNamespace(
+        image_processor=SimpleNamespace(
+            min_num_patches=1024,
+            max_num_patches=13312,
+        )
+    )
+
+    result = nemo_gym_data_processor(
+        datum_dict={
+            "extra_env_info": json.dumps(extra_env_info),
+            "task_name": "nemo_gym",
+        },
+        task_data_spec=TaskDataSpec(
+            task_name="nemo_gym",
+            image_max_num_tiles=1,
+        ),
+        tokenizer=processor,
+        max_seq_length=128,
+        idx=5,
+    )
+
+    assert result["extra_env_info"]["_nemo_rl_image_max_num_tiles"] == 1
+    extra_body = json.loads(
+        result["extra_env_info"]["responses_create_params"]["metadata"][
+            "extra_body"
+        ]
+    )
+    assert extra_body["mm_processor_kwargs"] == {"max_num_tiles": 1}
+
+
+def test_nemo_gym_still_image_tile_processor_forwards_tile_cap():
+    result = nemo_gym_data_processor(
+        datum_dict={
+            "extra_env_info": json.dumps(
+                {
+                    "responses_create_params": {
+                        "input": [{"role": "user", "content": []}]
+                    }
+                }
+            ),
+            "task_name": "nemo_gym",
+        },
+        task_data_spec=TaskDataSpec(
+            task_name="nemo_gym",
+            image_max_num_tiles=2,
+        ),
+        tokenizer=SimpleNamespace(
+            image_processor=SimpleNamespace(max_num_tiles=12)
+        ),
+        max_seq_length=128,
+        idx=6,
+    )
+
+    extra_body = json.loads(
+        result["extra_env_info"]["responses_create_params"]["metadata"][
+            "extra_body"
+        ]
+    )
+    assert extra_body["mm_processor_kwargs"] == {"max_num_tiles": 2}
 
 
 def test_math_data_processor():

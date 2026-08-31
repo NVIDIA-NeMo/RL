@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 from contextlib import contextmanager
 from functools import wraps
@@ -37,8 +38,6 @@ G_FLASHINFER_TRTLLM_RAY_EXECUTOR_ORIGINAL_ATTR = "_nrl_original_collective_rpc"
 G_FLASHINFER_TRTLLM_RAY_EXECUTOR_WORKERS_PATCHED_ATTR = (
     "_nrl_flashinfer_trtllm_refit_workers_patched"
 )
-
-
 def _get_vllm_file(relative_path: str) -> str:
     """Return absolute path to a vLLM file or raise if it cannot be found.
 
@@ -624,6 +623,25 @@ def _apply_vllm_flashinfer_trtllm_refit_buffer_runtime_patch(
     original_setup_kernel = UnquantizedFusedMoEMethod._setup_kernel
     original_forward_native = UnquantizedFusedMoEMethod.forward_native
     original_apply_monolithic = UnquantizedFusedMoEMethod.apply_monolithic
+
+    # The Super-Omni vLLM 0.20 container carries the earlier fused-MoE API:
+    # ``forward_native(..., shared_experts_input)``.  The 0.25.1 refit patch
+    # below targets the newer API that split that state into
+    # ``shared_experts`` and ``shared_experts_input``.  Installing the newer
+    # signature over the legacy class makes vLLM's own ``forward_cuda`` call
+    # fail during the profile run, before any rollout is served.  The legacy
+    # container has its own refit-compatible MoE implementation (and is the
+    # one used by the established Super-Omni runs), so retain its native path.
+    forward_native_parameters = inspect.signature(
+        original_forward_native
+    ).parameters
+    if "shared_experts" not in forward_native_parameters:
+        logger.info(
+            "Skipping vLLM FlashInfer TRTLLM refit buffer patch for the "
+            "legacy forward_native API (%s).",
+            ", ".join(forward_native_parameters),
+        )
+        return
 
     def _load_shape_numel(load_shape: tuple[int, ...]) -> int:
         numel = 1

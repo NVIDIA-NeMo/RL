@@ -34,10 +34,19 @@ from megatron.bridge.training.utils.train_utils import (
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-    FullyShardedDataParallelV1,
-    FullyShardedDataParallelV2,
-)
+try:
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+        FullyShardedDataParallelV1,
+        FullyShardedDataParallelV2,
+    )
+except ImportError:
+    # Older matched Bridge/MCore container pairs expose a single MCore FSDP
+    # wrapper. These aliases are used only for isinstance checks below.
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+        FullyShardedDataParallel as FullyShardedDataParallelV1,
+    )
+
+    FullyShardedDataParallelV2 = FullyShardedDataParallelV1
 from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (

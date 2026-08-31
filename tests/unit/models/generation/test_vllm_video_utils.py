@@ -347,3 +347,21 @@ def test_video_config_rejects_unknown_sampling_fields():
 
     with pytest.raises(ValueError, match="sampling_stlye"):
         resolve_vllm_video_config(generation)
+
+
+def test_video_config_rejects_legacy_video_loader_key():
+    generation = {
+        "vllm_cfg": {
+            "video_loader": {
+                "sampling_style": "nemotron_vl",
+                "num_frames": 64,
+                "temporal_patch_size": 2,
+            }
+        }
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"vllm_cfg\.video_loader.*vllm_cfg\.video",
+    ):
+        resolve_vllm_video_config(generation)

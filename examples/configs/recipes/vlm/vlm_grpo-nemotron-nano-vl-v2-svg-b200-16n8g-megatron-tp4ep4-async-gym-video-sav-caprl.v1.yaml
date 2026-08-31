@@ -1,0 +1,35 @@
+defaults: vlm_grpo-nemotron-nano-vl-v2-svg-b200-2n8g-megatron-tp4ep4-sync-gym-video-sav-caprl.v1.yaml
+
+# Production 16-node SVG B200 async GRPO recipe for combined CAPRL video and
+# interleaved SAV tracking. Two nodes train the Nano policy and fourteen serve
+# non-colocated async vLLM, matching the established Nano async topology.
+cluster:
+  num_nodes: 16
+  gpus_per_node: 8
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 16
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+
+policy:
+  train_global_batch_size: 64
+  generation_batch_size: 64
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 14
+        gpus_per_node: 8
+
+checkpointing:
+  save_replay_buffer: true
+  checkpoint_must_save_by: 00:03:10:00
+
+logger:
+  wandb:
+    name: nano-vl-v2-svg-b200-16n8g-async-sav-caprl

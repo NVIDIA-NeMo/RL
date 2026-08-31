@@ -109,6 +109,110 @@ def _install_runtime_stubs_for_hf_import(monkeypatch):
     core_module.tensor_parallel = tensor_parallel
 
 
+def test_vlm_config_overrides_skip_null_inherited_tower_controls(monkeypatch):
+    module = _load_community_import_module(monkeypatch)
+
+    overrides = dict(
+        module.iter_vlm_config_overrides(
+            {
+                "radio_force_cpe_eval_mode": None,
+                "freeze_vision_model": True,
+                "freeze_vision_projection": False,
+            }
+        )
+    )
+
+    assert overrides == {
+        "freeze_vision_model": True,
+        "freeze_vision_projection": False,
+    }
+
+
+def test_resolve_hf_bridge_routes_legacy_moe_nano_to_omni(monkeypatch):
+    module = _load_community_import_module(monkeypatch)
+
+    hf_config = SimpleNamespace(
+        architectures=["NemotronH_Nano_VL_V2"],
+        llm_config=SimpleNamespace(n_routed_experts=128),
+    )
+    original_bridge = SimpleNamespace(
+        hf_pretrained=SimpleNamespace(config=hf_config),
+        hf_config=hf_config,
+    )
+
+    class FakeAutoBridge:
+        @staticmethod
+        def from_hf_pretrained(*args, **kwargs):
+            return original_bridge
+
+    class FakeOmniBridge:
+        pass
+
+    class FakeOmniModel:
+        pass
+
+    _ensure_package(monkeypatch, "megatron.bridge.models")
+    _ensure_package(monkeypatch, "megatron.bridge.models.conversion")
+    omni_module = ModuleType("megatron.bridge.models.nemotron_omni")
+    omni_module.NemotronOmniBridge = FakeOmniBridge
+    omni_module.NemotronOmniModel = FakeOmniModel
+    monkeypatch.setitem(
+        sys.modules, "megatron.bridge.models.nemotron_omni", omni_module
+    )
+    registrations = []
+    model_bridge_module = ModuleType(
+        "megatron.bridge.models.conversion.model_bridge"
+    )
+    model_bridge_module.register_bridge_implementation = lambda **kwargs: (
+        registrations.append(kwargs)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.bridge.models.conversion.model_bridge",
+        model_bridge_module,
+    )
+    monkeypatch.setattr(module, "AutoBridge", FakeAutoBridge)
+    monkeypatch.setattr(module, "_register_super_omni_auto_map_alias", lambda: None)
+
+    routed = module.resolve_hf_bridge("/models/nano")
+    provider = SimpleNamespace()
+    module._apply_legacy_nano_v2_token_ids(routed, provider)
+
+    assert routed is original_bridge
+    assert registrations == [
+        {
+            "source": "NemotronH_Nano_VL_V2",
+            "target": FakeOmniModel,
+            "bridge_class": FakeOmniBridge,
+        }
+    ]
+    assert provider.img_start_token_id == 19
+    assert provider.img_end_token_id == 20
+
+
+def test_resolve_hf_bridge_keeps_dense_nano_v2_bridge(monkeypatch):
+    module = _load_community_import_module(monkeypatch)
+
+    original_bridge = SimpleNamespace(
+        hf_pretrained=SimpleNamespace(
+            config=SimpleNamespace(
+                architectures=["NemotronH_Nano_VL_V2"],
+                llm_config=SimpleNamespace(n_routed_experts=None),
+            )
+        )
+    )
+
+    class FakeAutoBridge:
+        @staticmethod
+        def from_hf_pretrained(*args, **kwargs):
+            return original_bridge
+
+    monkeypatch.setattr(module, "AutoBridge", FakeAutoBridge)
+    monkeypatch.setattr(module, "_register_super_omni_auto_map_alias", lambda: None)
+
+    assert module.resolve_hf_bridge("/models/nano") is original_bridge
+
+
 def test_prefer_nvrx_is_noop_when_strategy_import_fails(monkeypatch):
     module = _load_community_import_module(monkeypatch)
     # Force this import to fail even if real megatron modules were preloaded by
@@ -242,6 +346,7 @@ def test_import_model_from_hf_name_calls_bridge_save(monkeypatch):
             return fake_bridge
 
     monkeypatch.setattr(module, "AutoBridge", FakeAutoBridge)
+    monkeypatch.setattr(module, "_register_super_omni_auto_map_alias", lambda: None)
 
     module.import_model_from_hf_name("fake/hf-model", "/tmp/out")
 

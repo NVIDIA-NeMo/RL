@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${RACE_CLAIM_DIR:?RACE_CLAIM_DIR must identify a unique shared claim directory}"
+: "${RAY_SUB_PATH:?RAY_SUB_PATH must point to the checkout ray.sub}"
+
+array_job_id="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:?}}"
+owner_file="${RACE_CLAIM_DIR}/owner"
+
+if mkdir "${RACE_CLAIM_DIR}" 2>/dev/null; then
+  owner_tmp="${owner_file}.tmp.${SLURM_JOB_ID}"
+  printf '%s\n' "${array_job_id}" >"${owner_tmp}"
+  mv "${owner_tmp}" "${owner_file}"
+fi
+
+for _attempt in {1..50}; do
+  [[ -s "${owner_file}" ]] && break
+  sleep 0.1
+done
+
+if [[ ! -s "${owner_file}" ]]; then
+  echo "ERROR: scheduler-race owner was not published: ${owner_file}" >&2
+  exit 1
+fi
+
+read -r owner_job_id <"${owner_file}"
+if [[ "${owner_job_id}" != "${array_job_id}" ]]; then
+  echo "SCHEDULER_RACE_LOSER array_job_id=${array_job_id} owner=${owner_job_id}; cancelling losing array"
+  /cm/shared/apps/slurm/current/bin/scancel "${array_job_id}" || true
+  exit 0
+fi
+
+echo "SCHEDULER_RACE_WINNER array_job_id=${array_job_id} account=${SLURM_JOB_ACCOUNT:-unknown} partition=${SLURM_JOB_PARTITION:-unknown}"
+exec bash "${RAY_SUB_PATH}" "$@"

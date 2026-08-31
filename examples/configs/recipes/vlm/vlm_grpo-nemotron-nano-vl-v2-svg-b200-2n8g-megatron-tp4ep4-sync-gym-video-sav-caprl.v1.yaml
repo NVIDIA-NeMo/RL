@@ -1,0 +1,179 @@
+defaults: vlm_grpo-nemotron-omni-30ba3b-2n8g-megatron-tp4ep4-gym-video.v1.yaml
+
+# Two-node SVG B200 synchronous Nano GRPO on combined SAV tracking and CAPRL
+# video data. This is the reproducible small-scale validation recipe for the
+# shared dynamic-resolution processor contract used by policy and generation.
+grpo:
+  max_num_steps: 100000
+  max_num_epochs: 1000
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 2
+  seq_logprob_error_threshold: 2
+  debug_payload_metrics: true
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  async_grpo:
+    enabled: false
+    in_flight_weight_updates: false
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  length_penalty:
+    default:
+      enabled: false
+      length_type: tokens
+      profile_band_total: false
+      profile_band_reasoning: false
+      profile_band_answer: false
+    profile_band:
+      enabled: false
+    agent_overrides:
+      mcqa_simple_agent:
+        enabled: false
+      sav_pt_tracks_agent:
+        enabled: false
+      sav_box_tracks_agent:
+        enabled: false
+      sav_ref_tracks_agent:
+        enabled: false
+
+loss_fn:
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_type: null
+
+policy:
+  train_global_batch_size: 8
+  generation_batch_size: 4
+  max_total_sequence_length: 65536
+  refit_buffer_size_gb: 5
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+    video:
+      num_frames: 64
+  megatron_cfg:
+    # The generic Omni ancestor enables the Super RADIO/CPE control. Nano VL
+    # V2 has a plain vision provider, so null the inherited optional override.
+    radio_force_cpe_eval_mode: null
+    moe_per_layer_logging: false
+    clear_memory_caches_before_refit: true
+  generation:
+    max_new_tokens: 2048
+    bad_words:
+    - <image>
+    - <img>
+    - </img>
+    - <so_embedding>
+    - <so_start>
+    - <so_end>
+    colocated:
+      enabled: true
+      resources:
+        num_nodes: 2
+        gpus_per_node: 8
+    vllm_cfg:
+      max_model_len: 65536
+      # Nano VL V2 has a non-gated MoE intermediate size that is not divisible
+      # by the refit kernel's 128-element padding boundary under MoE TP4. EP4
+      # keeps each expert intact and matches the policy's expert parallelism.
+      expert_parallel_size: 4
+      gpu_memory_utilization: 0.6
+      enforce_eager: true
+      reset_encoder_cache_after_weight_update: false
+      video:
+        sampling_style: nemotron_vl
+        num_frames: 64
+        temporal_patch_size: 2
+      http_server_serving_chat_kwargs:
+        chat_template_content_format: string
+        reasoning_parser: nemotron_v3
+    vllm_kwargs:
+      # The checkpoint sidecar caps the RADIO dynamic tiler at 2040 patches.
+      # Both vLLM and the training processor read that same config value.
+      # vLLM 0.20 defaults to FlashInfer TRTLLM, which pads Nano VL V2's
+      # 1856-wide non-gated experts. Triton preserves the canonical weight
+      # layout required by repeated NeMo-RL refits.
+      moe_backend: triton
+      allowed_local_media_path: /scratch
+      max_num_seqs: 1
+      max_num_batched_tokens: 65536
+      enable_chunked_prefill: true
+      limit_mm_per_prompt:
+        image: 64
+        video:
+          count: 1
+          num_frames: 64
+      media_io_kwargs:
+        video:
+          num_frames: 64
+
+data:
+  max_input_seq_length: 65536
+  shuffle: true
+  default:
+    # Preserve enough context budget for the entire diagnostic response after
+    # the video processor dynamically selects visual tokens.
+    min_generation_tokens: 2048
+    num_frames: 64
+    video_sampling_style: nemotron_vl
+    video_temporal_patch_size: 2
+    video_target_num_patches: 1024
+    video_maintain_aspect_ratio: true
+  train:
+    data_path: /path/to/combined-caprl-sav-train.jsonl
+  validation:
+    data_path: /path/to/combined-caprl-sav-validation.jsonl
+
+env:
+  should_log_nemo_gym_responses: false
+  should_mask_flagged_samples: true
+  reject_generated_media_tokens: true
+  nemo_gym:
+    policy_max_input_tokens: 65536
+    pad_dynamic_image_shapes: true
+    sav_tracks:
+      resources_servers:
+        sav_tracks:
+          iou_threshold: 0.5
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/string_match/configs/string_match.yaml
+    - resources_servers/sav_tracks/configs/sav_tracks.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          extra_body:
+            bad_words:
+            - <image>
+            - <img>
+            - </img>
+            - <so_embedding>
+            - <so_start>
+            - <so_end>
+            chat_template_kwargs:
+              enable_thinking: true
+
+checkpointing:
+  enabled: true
+  metric_name: null
+  higher_is_better: true
+  save_period: 20
+  keep_top_k: 2
+  save_optimizer: true
+  save_replay_buffer: false
+  checkpoint_must_save_by: 00:03:10:00
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: Nemotron-omni-RL-debug
+    name: nano-vl-v2-svg-b200-2n8g-sync-sav-caprl
+
+cluster:
+  num_nodes: 2
+  gpus_per_node: 8

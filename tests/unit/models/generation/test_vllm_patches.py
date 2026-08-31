@@ -454,6 +454,44 @@ def test_flashinfer_trtllm_refit_patch_preserves_kernel_weight_storage(
     assert fake_vllm.kernels[-1].apply_monolithic_args[2] is w2_kernel
 
 
+def test_flashinfer_trtllm_refit_patch_skips_legacy_forward_native_api(
+    fake_vllm_unquantized_moe_modules,
+    caplog,
+):
+    fake_vllm = fake_vllm_unquantized_moe_modules
+
+    class LegacyUnquantizedFusedMoEMethod(fake_vllm.method_cls):
+        def forward_native(
+            self,
+            layer,
+            x,
+            topk_weights,
+            topk_ids,
+            shared_experts_input,
+        ):
+            del layer, x, topk_weights, topk_ids, shared_experts_input
+            return "legacy-forward-native"
+
+    method_module = sys.modules[
+        "vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method"
+    ]
+    method_module.UnquantizedFusedMoEMethod = LegacyUnquantizedFusedMoEMethod
+    original_forward_native = LegacyUnquantizedFusedMoEMethod.forward_native
+
+    with caplog.at_level(logging.INFO):
+        patches._apply_vllm_flashinfer_trtllm_refit_buffer_runtime_patch(
+            logging.getLogger(__name__)
+        )
+
+    assert LegacyUnquantizedFusedMoEMethod.forward_native is original_forward_native
+    assert not getattr(
+        LegacyUnquantizedFusedMoEMethod,
+        patches.G_FLASHINFER_TRTLLM_PATCH_ATTR,
+        False,
+    )
+    assert "legacy forward_native API" in caplog.text
+
+
 def test_flashinfer_trtllm_refit_patch_leaves_other_backends_on_original_paths(
     fake_vllm_unquantized_moe_modules,
 ):

@@ -1,0 +1,118 @@
+defaults: vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+
+# HSG exposes each GB200 NVL72 compute tray as a four-GPU Slurm node. The
+# runtime divides the allocation into eight training and eight non-colocated
+# generation nodes, so its topology segment must divide each role. Mirror this
+# value in the Slurm --segment request so each role can occupy one complete
+# topology block. The Super model parallelism remains TP8/EP16/CP2.
+cluster:
+  num_nodes: 16
+  gpus_per_node: 4
+  segment_size: 8
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  max_num_steps: 100000
+  max_num_epochs: 1000
+  deduplicate_multimodal_data: true
+  length_penalty:
+    default:
+      enabled: true
+      length_type: tokens
+      profile_band_total: false
+      profile_band_reasoning: true
+      profile_band_answer: false
+    profile_band:
+      enabled: true
+      defaults:
+        reasoning:
+          a: 1024
+          b: 4096
+          f: 0.95
+
+loss_fn:
+  sequence_level_importance_ratios: true
+
+policy:
+  train_global_batch_size: 2048
+  hf_config_overrides:
+    video_maintain_aspect_ratio: true
+    video_target_num_patches: 1024
+    video_temporal_patch_size: 2
+  # Keep the official Super topology and refit settings. In particular, do
+  # not inherit the TP2/CP1 topology from the 30B video reference recipe.
+  megatron_cfg:
+    tensor_model_parallel_size: 8
+    expert_model_parallel_size: 16
+    context_parallel_size: 2
+    freeze_vision_model: true
+    freeze_vision_projection: true
+  generation:
+    max_new_tokens: 8192
+    vllm_cfg:
+      # The current loader consumes this key. `video_loader` is unsupported.
+      video:
+        sampling_style: nemotron_vl
+        num_frames: 32
+        temporal_patch_size: 2
+      # The Super vision tower is not covered by trainer->vLLM refit. Load the
+      # real checkpoint so visual weights never remain dummy-initialized.
+      load_format: auto
+      reset_mm_cache_after_refit: false
+      logprobs_mode: raw_logprobs
+    vllm_kwargs:
+      allowed_local_media_path: /lustre
+      # Super's processor reads these from the nested vision config. Apply
+      # them in place so vLLM and Megatron expand identical video token grids.
+      hf_subconfig_overrides:
+        vision_config:
+          video_maintain_aspect_ratio: true
+          video_target_num_patches: 1024
+          video_temporal_patch_size: 2
+      mm_processor_cache_gb: 0
+      max_num_seqs: 8
+      max_num_batched_tokens: 32768
+      enable_chunked_prefill: false
+      limit_mm_per_prompt:
+        image: 64
+        video:
+          count: 1
+          num_frames: 32
+      media_io_kwargs:
+        video:
+          num_frames: 32
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 8
+
+data:
+  shuffle: true
+  num_workers: 0
+  validation:
+    data_path: ${data.train.data_path}
+  default:
+    num_frames: 32
+    video_target_num_patches: 1024
+    video_temporal_patch_size: 2
+    video_maintain_aspect_ratio: true
+
+env:
+  should_log_nemo_gym_responses: false
+  reject_generated_media_tokens: true
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+
+checkpointing:
+  checkpoint_dir: results/nemotron-super-omni-video-profile-band
+  save_period: 5
+
+logger:
+  log_dir: logs/nemotron-super-omni-video-profile-band
+  wandb:
+    project: Nemotron-omni-RL-debug
+    name: s35-super-video-rpb-hsg

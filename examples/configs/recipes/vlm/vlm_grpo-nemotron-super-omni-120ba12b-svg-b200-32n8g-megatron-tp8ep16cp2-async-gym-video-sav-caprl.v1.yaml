@@ -1,0 +1,147 @@
+defaults: vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+
+# Production 32-node SVG B200 async GRPO recipe for combined CAPRL video and
+# interleaved SAV tracking. It uses the original Gym rewards; profile-band and
+# other reward shaping stay disabled until the mixed-data training baseline is
+# established. Sixteen nodes train the policy and sixteen serve async vLLM.
+cluster:
+  num_nodes: 32
+  gpus_per_node: 8
+
+grpo:
+  max_num_steps: 100000
+  max_num_epochs: 1000
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  val_period: 8
+  val_at_start: false
+  val_at_end: true
+  val_num_generations_per_prompt: 1
+  max_val_samples: null
+  val_batch_size: null
+  seq_logprob_error_threshold: 2
+  debug_payload_metrics: true
+  deduplicate_multimodal_data: true
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  length_penalty:
+    default:
+      enabled: false
+      length_type: tokens
+      profile_band_total: false
+      profile_band_reasoning: false
+      profile_band_answer: false
+    profile_band:
+      enabled: false
+    agent_overrides:
+      mcqa_simple_agent:
+        enabled: false
+      sav_pt_tracks_agent:
+        enabled: false
+      sav_box_tracks_agent:
+        enabled: false
+      sav_ref_tracks_agent:
+        enabled: false
+
+loss_fn:
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: true
+  token_level_loss: false
+
+policy:
+  train_global_batch_size: 2048
+  generation_batch_size: 64
+  max_total_sequence_length: 65536
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  megatron_cfg:
+    context_parallel_size: 2
+    activation_checkpointing: true
+  generation:
+    max_new_tokens: 16384
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.7
+      max_model_len: 65536
+      reset_encoder_cache_after_weight_update: false
+      load_format: auto
+      video:
+        sampling_style: nemotron_vl
+        num_frames: 64
+        temporal_patch_size: 2
+    vllm_kwargs:
+      allowed_local_media_path: /scratch
+      mm_processor_cache_gb: 0
+      max_num_seqs: 8
+      max_num_batched_tokens: 65536
+      limit_mm_per_prompt:
+        image: 64
+        video:
+          count: 1
+          num_frames: 64
+      compilation_config:
+        backend: eager
+        cudagraph_mode: FULL_AND_PIECEWISE
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 16
+        gpus_per_node: 8
+
+data:
+  max_input_seq_length: 65536
+  shuffle: true
+  num_workers: 0
+  default:
+    min_generation_tokens: 16384
+    num_frames: 64
+    video_sampling_style: nemotron_vl
+    video_temporal_patch_size: 2
+    video_target_num_patches: 1024
+    video_maintain_aspect_ratio: false
+  train:
+    data_path: /path/to/combined-caprl-sav-train.jsonl
+  validation:
+    data_path: /path/to/combined-caprl-sav-validation.jsonl
+
+env:
+  should_log_nemo_gym_responses: false
+  should_mask_flagged_samples: true
+  reject_generated_media_tokens: true
+  nemo_gym:
+    policy_max_input_tokens: 65536
+    pad_dynamic_image_shapes: true
+    sav_tracks:
+      resources_servers:
+        sav_tracks:
+          iou_threshold: 0.5
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/string_match/configs/string_match.yaml
+    - resources_servers/sav_tracks/configs/sav_tracks.yaml
+
+checkpointing:
+  enabled: true
+  metric_name: null
+  save_period: 20
+  keep_top_k: 2
+  save_optimizer: true
+  save_replay_buffer: true
+  checkpoint_must_save_by: 00:03:10:00
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: Nemotron-omni-RL-debug
+    name: super-svg-b200-32n8g-async-sav-caprl

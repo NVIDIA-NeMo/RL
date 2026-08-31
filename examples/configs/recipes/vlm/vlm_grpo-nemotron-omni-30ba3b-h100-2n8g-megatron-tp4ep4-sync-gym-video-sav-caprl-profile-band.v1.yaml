@@ -1,0 +1,55 @@
+defaults: ./vlm_grpo-nemotron-omni-30ba3b-h100-2n8g-megatron-tp4ep4-sync-gym-video-adi-profile-band.v1.yaml
+
+# Two-node Nano smoke test for the same CAPRL + SAV mixture used by the
+# 16-node Super combined run. CAPRL keeps contiguous cached-video markers;
+# SAV keeps its interleaved Frame-N labels and unmarked still-image inputs.
+data:
+  _override_: true
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: false
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+  - data_path: ${oc.env:COMBINED_SMOKE_DATA_PATH}
+  validation:
+  - data_path: ${oc.env:COMBINED_SMOKE_DATA_PATH}
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+    num_frames: 64
+    video_sampling_style: nemotron_vl
+    video_target_num_patches: 1024
+    video_temporal_patch_size: 2
+    video_maintain_aspect_ratio: true
+    # SAV prompts may carry up to 16 still images. One 512x512 tile per image
+    # keeps the full multimodal prompt within the 16k sequence budget.
+    image_max_num_tiles: 1
+
+env:
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/string_match/configs/string_match.yaml
+    - resources_servers/sav_tracks/configs/sav_tracks.yaml
+
+logger:
+  wandb:
+    project: Nemotron-omni-RL-debug
+    name: dfw-h100-nano-sav-caprl-smoke
+
+policy:
+  generation:
+    # Keep this validation leaf fast; the production recipes inherit 8192.
+    max_new_tokens: 256
+    vllm_kwargs:
+      # Match vLLM's prompt expansion to the Megatron policy preprocessing.
+      mm_processor_kwargs:
+        max_num_tiles: 1
+    vllm_cfg:
+      # The vision tower/projector are frozen and omitted from policy refit.
+      # Load their trained checkpoint weights instead of dummy initialization.
+      load_format: auto

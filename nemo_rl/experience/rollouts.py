@@ -48,6 +48,8 @@ from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     attach_image_model_inputs_to_message,
     extract_input_images_from_responses_messages,
+    nemo_gym_image_max_num_tiles,
+    reconcile_message_media_placeholder_runs,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
@@ -113,7 +115,7 @@ def attach_initial_nemo_gym_image_payloads(
         images = extract_input_images_from_responses_messages(initial_messages)
         if not images:
             continue
-        if processor is None or getattr(processor, "image_processor", None) is None:
+        if processor is None or not getattr(processor, "model_input_names", None):
             raise ValueError(
                 "NeMo Gym image deduplication requires the multimodal processor "
                 "to be passed to GRPO."
@@ -131,6 +133,7 @@ def attach_initial_nemo_gym_image_payloads(
             images=images,
             processor=processor,
             pad_dynamic_image_shapes=pad_dynamic_image_shapes,
+            max_num_tiles=nemo_gym_image_max_num_tiles(extra_env_info),
         )
 
 
@@ -233,8 +236,17 @@ def attach_static_multimodal_payload(
         )
     for source, target in zip(source_users, target_users):
         for key, value in source.items():
-            if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
+            if (
+                isinstance(value, PackedTensor)
+                or key in NATIVE_MULTIMODAL_KEYS
+                or key
+                in {
+                    "_media_placeholder_token_id",
+                    "_media_placeholder_run_lengths",
+                }
+            ):
                 target[key] = value
+        reconcile_message_media_placeholder_runs(target)
 
 
 def _add_r3_fallback_metrics(

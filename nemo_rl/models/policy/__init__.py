@@ -354,13 +354,13 @@ class MegatronConfig(TypedDict):
     context_parallel_size: int
     # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
     # provider's checkpoint/default value.
-    radio_force_cpe_eval_mode: NotRequired[bool]
+    radio_force_cpe_eval_mode: NotRequired[bool | None]
     # Nemotron Omni tower freeze booleans. Omit any field to retain the model
     # provider's checkpoint/default value.
-    freeze_vision_model: NotRequired[bool]
-    freeze_vision_projection: NotRequired[bool]
-    freeze_sound_encoder: NotRequired[bool]
-    freeze_sound_projection: NotRequired[bool]
+    freeze_vision_model: NotRequired[bool | None]
+    freeze_vision_projection: NotRequired[bool | None]
+    freeze_sound_encoder: NotRequired[bool | None]
+    freeze_sound_projection: NotRequired[bool | None]
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool

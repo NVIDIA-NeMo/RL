@@ -128,7 +128,12 @@ class TestMMPRTinyDataset:
             MMPRTinyDataset(download_dir="")
 
 
-def _make_stub_nemotron_processor(*, include_imgs_sizes=True, num_tiles=1):
+def _make_stub_nemotron_processor(
+    *,
+    include_imgs_sizes=True,
+    num_tiles=1,
+    processor_class_name="NemotronNanoVLV2Processor",
+):
     """Build a minimal stub whose class name is NemotronNanoVLV2Processor.
 
     The stub implements just enough of the AutoProcessor interface for
@@ -172,6 +177,7 @@ def _make_stub_nemotron_processor(*, include_imgs_sizes=True, num_tiles=1):
                 result["imgs_sizes"] = torch.tensor([[224, 224]] * num_tiles)
             return result
 
+    NemotronNanoVLV2Processor.__name__ = processor_class_name
     return NemotronNanoVLV2Processor()
 
 
@@ -253,7 +259,9 @@ class TestVLMProcessorMMPRTiny:
         assert result["vllm_content"] == "preprocessed"
         assert processor.captured_call_text == "preprocessed"
 
-    def test_historical_tiled_processor_gets_media_metadata(self, tiny_image_path):
+    def test_historical_tiled_processor_keeps_static_metadata_contract(
+        self, tiny_image_path
+    ):
         from nemo_rl.data.interfaces import TaskDataSpec
         from nemo_rl.data.processors import vlm_hf_data_processor
 
@@ -272,6 +280,18 @@ class TestVLMProcessorMMPRTiny:
             max_seq_length=8192,
             idx=0,
         )
+
+        user_message = result["message_log"][0]
+        assert "imgs_sizes" not in user_message
+        assert "num_frames" not in user_message
+
+    def test_dynamic_placeholder_processor_gets_media_metadata(self, tiny_image_path):
+        processor = _make_stub_nemotron_processor(
+            include_imgs_sizes=False,
+            num_tiles=3,
+            processor_class_name="NemotronH_Nano_Omni_Reasoning_V3Processor",
+        )
+        result, _ = _run_processor(tiny_image_path, processor=processor)
 
         user_message = result["message_log"][0]
         assert torch.equal(

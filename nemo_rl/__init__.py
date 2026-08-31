@@ -52,16 +52,26 @@ importable too.
 Since users may pip install NeMo RL, this is a convenience so they do not
 have to manually run with PYTHONPATH=3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM.
 """
-megatron_path = (
-    Path(__file__).parent.parent
-    / "3rdparty"
-    / "Megatron-Bridge-workspace"
-    / "Megatron-Bridge"
-    / "3rdparty"
-    / "Megatron-LM"
-)
-if megatron_path.exists() and str(megatron_path) not in sys.path:
-    sys.path.append(str(megatron_path))
+# Prefetched Super/Ultra containers carry a matched Megatron Bridge + MCore
+# pair.  Their cached Ray worker environments already expose that pair.  Do
+# not append a mounted checkout's MCore in that mode: mixing the container's
+# Bridge with a newer checkout MCore changes some wrapper classes into factory
+# functions and breaks Bridge's model unwrapping during HF weight import.
+if os.environ.get("NRL_USE_CONTAINER_MEGATRON", "").lower() not in {
+    "1",
+    "true",
+    "yes",
+}:
+    megatron_path = (
+        Path(__file__).parent.parent
+        / "3rdparty"
+        / "Megatron-Bridge-workspace"
+        / "Megatron-Bridge"
+        / "3rdparty"
+        / "Megatron-LM"
+    )
+    if megatron_path.exists() and str(megatron_path) not in sys.path:
+        sys.path.append(str(megatron_path))
 
 from nemo_rl.package_info import (
     __contact_emails__,

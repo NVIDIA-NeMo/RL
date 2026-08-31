@@ -81,6 +81,19 @@ def test_encode_images_encodes_local_paths_and_file_urls(tmp_path):
     assert parts[2] == {"type": "input_text", "text": "describe"}
 
 
+def test_encode_images_normalizes_single_tile_rows_for_vllm(tmp_path):
+    source = _write_png(tmp_path, "wide.png", (12, 5))
+    example = _example({"type": "input_image", "image_url": source})
+    example["_nemo_rl_image_max_num_tiles"] = 1
+
+    encode_images_in_examples([example], single_tile_image_size=8)
+
+    encoded = example["responses_create_params"]["input"][0]["content"][0][
+        "image_url"
+    ]
+    assert resolve_to_image(encoded).size == (8, 8)
+
+
 def test_encode_images_passes_through_http_and_data_urls():
     data_url = image_to_data_url(Image.new("RGB", (2, 2)))
     examples = [

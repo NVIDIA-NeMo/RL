@@ -1,0 +1,140 @@
+defaults: vlm_grpo-nemotron-omni-30ba3b-2n8g-megatron-tp4ep4-gym-video.v1.yaml
+
+# Two-node synchronous smoke variant of the 16-node async profile-band run.
+# The supported 2n topology keeps TP4/EP4 and colocates generation; model,
+# data, video sampling, and reward parameters match the async experiment.
+grpo:
+  max_num_steps: 100000
+  max_num_epochs: 1000
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  advantage_clip_low: -50
+  advantage_clip_high: 50
+  seq_logprob_error_threshold: 2
+  zero_variance_prompt_filtering: false
+  use_dynamic_sampling: false
+  deduplicate_multimodal_data: true
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  length_penalty:
+    default:
+      enabled: true
+      length_type: tokens
+      profile_band_total: false
+      profile_band_reasoning: true
+      profile_band_answer: false
+    profile_band:
+      enabled: true
+      defaults:
+        reasoning:
+          a: 1024
+          b: 4096
+          f: 0.95
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  # The supported synchronous recipe disables importance-sampling correction.
+  use_importance_sampling_correction: false
+  sequence_level_importance_ratios: true
+  token_level_loss: false
+  use_sequence_length_scaling: false
+  logprob_chunk_size: 2048
+
+checkpointing:
+  enabled: true
+  metric_name: val:reward
+  higher_is_better: true
+  save_period: 2
+  keep_top_k: 5
+  save_optimizer: true
+  save_replay_buffer: false
+
+policy:
+  is_vlm: true
+  model_name: /lustre/fsw/portfolios/llmservice/users/arushig/workspace/output/generalist-49k-video-mpo-20260812-113202/checkpoints/tp_1_hf/iter_0000125/mcore_to_hf
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: ${policy.model_name}/chat_template.jinja
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  train_global_batch_size: 4
+  max_total_sequence_length: 16384
+  megatron_cfg:
+    empty_unused_memory_level: 2
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    moe_shared_expert_overlap: true
+    moe_per_layer_logging: false
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-8
+      lr_decay_iters: 100000
+  generation:
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 1.0
+    vllm_cfg:
+      gpu_memory_utilization: 0.6
+      enforce_eager: true
+      reset_mm_cache_after_refit: false
+      video:
+        sampling_style: nemotron_vl
+        num_frames: 64
+        temporal_patch_size: 2
+      http_server_serving_chat_kwargs:
+        chat_template: ${policy.tokenizer.chat_template}
+        chat_template_content_format: string
+        reasoning_parser: nemotron_v3
+    vllm_kwargs:
+      reasoning_parser: nemotron_v3
+      allowed_local_media_path: /lustre
+      mm_processor_cache_gb: 0
+      max_num_seqs: 1
+      max_num_batched_tokens: ${policy.max_total_sequence_length}
+      limit_mm_per_prompt:
+        image: 64
+        video:
+          count: 1
+          num_frames: 64
+      media_io_kwargs:
+        video:
+          num_frames: 64
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 0
+  train:
+    data_path: /lustre/fsw/portfolios/llmservice/users/arushig/nemo_gym_rl_video_0803/nemo-rl/results/video_frame_cache_caprl_passrate_n5_easy_to_hard_lt60s_20260806_f64/stable_split_95_5/train_exclude_line6215.jsonl
+  validation:
+    data_path: ${data.train.data_path}
+  default:
+    num_frames: 64
+    video_target_num_patches: 1024
+    video_maintain_aspect_ratio: true
+
+env:
+  should_log_nemo_gym_responses: false
+  reject_generated_media_tokens: true
+  nemo_gym:
+    skip_venv_if_present: true
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          extra_body:
+            bad_words:
+              - <img>
+              - </img>
+              - <image>
+            thinking_token_budget: 5120
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: Nemotron-omni-RL-debug
+    name: s35v-sync2-rpb-mpo125

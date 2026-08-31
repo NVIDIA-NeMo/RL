@@ -76,7 +76,7 @@ class _FakeApp:
         return self._register(path)
 
 
-def _install_fake_vllm(monkeypatch):
+def _install_fake_vllm(monkeypatch, *, legacy_serving_api=False):
     """Stub exactly the vLLM surface _setup_vllm_openai_api_server imports."""
     for name in (
         "vllm",
@@ -86,6 +86,7 @@ def _install_fake_vllm(monkeypatch):
         "vllm.entrypoints.openai.engine",
         "vllm.entrypoints.openai.models",
         "vllm.entrypoints.serve",
+        "vllm.entrypoints.serve.render",
         "vllm.entrypoints.serve.tokenize",
         "vllm.reasoning",
         "vllm.renderers",
@@ -134,11 +135,21 @@ def _install_fake_vllm(monkeypatch):
         TokenizeCompletionRequest=placeholder("TokenizeCompletionRequest"),
         TokenizeResponse=placeholder("TokenizeResponse"),
     )
-    module(
-        "vllm.entrypoints.serve.tokenize.serving",
-        ServingTokenization=_ServingTokenization,
-    )
-    module("vllm.renderers.online_renderer", OnlineRenderer=_OnlineRenderer)
+    if legacy_serving_api:
+        module(
+            "vllm.entrypoints.serve.tokenize.serving",
+            OpenAIServingTokenization=_ServingTokenization,
+        )
+        module(
+            "vllm.entrypoints.serve.render.serving",
+            OpenAIServingRender=_OnlineRenderer,
+        )
+    else:
+        module(
+            "vllm.entrypoints.serve.tokenize.serving",
+            ServingTokenization=_ServingTokenization,
+        )
+        module("vllm.renderers.online_renderer", OnlineRenderer=_OnlineRenderer)
     module(
         "vllm.exceptions",
         VLLMValidationError=type("VLLMValidationError", (Exception,), {}),
@@ -161,9 +172,9 @@ def _install_fake_vllm(monkeypatch):
         built.clear()
 
 
-def _build_server(monkeypatch, serving_chat_kwargs):
+def _build_server(monkeypatch, serving_chat_kwargs, *, legacy_serving_api=False):
     """Run the real server setup and hand back the three consumer stubs."""
-    _install_fake_vllm(monkeypatch)
+    _install_fake_vllm(monkeypatch, legacy_serving_api=legacy_serving_api)
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker.cfg = {
@@ -243,3 +254,20 @@ def test_absent_kwargs_render_as_empty_dict(monkeypatch):
 
     assert renderer[0].kwargs["default_chat_template_kwargs"] == {}
     assert tokenization[0].kwargs["default_chat_template_kwargs"] == {}
+
+
+def test_legacy_vllm_serving_api_uses_render_and_tokenization_contracts(monkeypatch):
+    renderer, serving_chat, tokenization = _build_server(
+        monkeypatch,
+        {"default_chat_template_kwargs": {"enable_thinking": False}},
+        legacy_serving_api=True,
+    )
+
+    assert renderer[0].kwargs["model_registry"] is not None
+    assert serving_chat[0].kwargs["openai_serving_render"] is renderer[0]
+    assert "online_renderer" not in serving_chat[0].kwargs
+    assert tokenization[0].kwargs["engine_client"] is not None
+    assert tokenization[0].kwargs["openai_serving_render"] is renderer[0]
+    assert tokenization[0].kwargs["default_chat_template_kwargs"] == {
+        "enable_thinking": False
+    }

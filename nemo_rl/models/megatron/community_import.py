@@ -29,8 +29,9 @@ def iter_vlm_config_overrides(
 ) -> Iterator[tuple[str, Any]]:
     """Yield explicitly configured Nemotron Omni provider overrides.
 
-    Only keys present in the recipe are yielded, so omitting one keeps the
-    provider's own default rather than silently forcing False.
+    Only non-null keys present in the recipe are yielded, so omitting one (or
+    explicitly nulling an inherited key) keeps the provider's own default
+    rather than silently forcing a tower control onto an incompatible model.
     """
     keys = (
         "radio_force_cpe_eval_mode",
@@ -40,7 +41,7 @@ def iter_vlm_config_overrides(
         "freeze_sound_projection",
     )
     for key in keys:
-        if key in megatron_config:
+        if key in megatron_config and megatron_config[key] is not None:
             yield key, megatron_config[key]
 
 
@@ -60,6 +61,102 @@ def to_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
         if key in aliases:
             return aliases[key]
     raise ValueError(f"Unknown dtype: {dtype}")
+
+
+def _register_super_omni_auto_map_alias() -> None:
+    """Register the HF remote-code class name used by Super Omni checkpoints.
+
+    Super Omni configs identify the architecture as
+    ``NemotronH_Super_Omni_Reasoning_V3`` but map AutoModelForCausalLM to the
+    shared implementation class ``NemotronH_Omni_Reasoning_V3``. AutoBridge
+    dispatches on the auto-map class name when it is present, so both names
+    must resolve to the same bridge.
+    """
+    from megatron.bridge.models.conversion import model_bridge
+
+    architecture = "NemotronH_Super_Omni_Reasoning_V3"
+    auto_map_class = "NemotronH_Omni_Reasoning_V3"
+    registry = model_bridge.get_model_bridge._exact_types
+    if auto_map_class in registry or architecture not in registry:
+        return
+
+    from megatron.bridge.models.conversion.model_bridge import (
+        register_bridge_implementation,
+    )
+    from megatron.bridge.models.nemotron_omni import (
+        NemotronOmniBridge,
+        NemotronOmniModel,
+    )
+
+    register_bridge_implementation(
+        source=auto_map_class,
+        target=NemotronOmniModel,
+        bridge_class=NemotronOmniBridge,
+    )
+
+
+def _is_legacy_nano_v2_omni_bridge(bridge: Any) -> bool:
+    """Return whether a V2-labeled Nano checkpoint has the Omni MoE layout."""
+    hf_pretrained = getattr(bridge, "hf_pretrained", None)
+    hf_config = getattr(hf_pretrained, "config", None) or getattr(
+        bridge, "hf_config", None
+    )
+    architectures = getattr(hf_config, "architectures", None) or []
+    llm_config = getattr(hf_config, "llm_config", None)
+    return (
+        "NemotronH_Nano_VL_V2" in architectures
+        and llm_config is not None
+        and getattr(llm_config, "n_routed_experts", None) is not None
+    )
+
+
+def resolve_hf_bridge(hf_model_name: str, **config_overrides: Any) -> Any:
+    """Resolve an HF bridge, including legacy labels for canonical Omni models.
+
+    Early Nano Omni checkpoints kept the historical ``NemotronH_Nano_VL_V2``
+    architecture label even though their language tower is the MoE Omni model.
+    The older bridge bundled in prefetched containers sends every checkpoint
+    with that label through the dense VL/LLaVA provider, whose FP8 RADIO default
+    constructs 16 class tokens. Those checkpoints contain 10 class tokens and
+    use the canonical expanded-sequence Omni namespace, so route only the
+    MoE-shaped V2 variant through the container's existing Omni bridge.
+    """
+    _register_super_omni_auto_map_alias()
+    bridge = AutoBridge.from_hf_pretrained(
+        hf_model_name, trust_remote_code=True, **config_overrides
+    )
+    if not _is_legacy_nano_v2_omni_bridge(bridge):
+        return bridge
+
+    from megatron.bridge.models.conversion.model_bridge import (
+        register_bridge_implementation,
+    )
+    from megatron.bridge.models.nemotron_omni import (
+        NemotronOmniBridge,
+        NemotronOmniModel,
+    )
+
+    # AutoBridge is the public wrapper that owns to_megatron_provider(), weight
+    # streaming, and refit. Replace its registry dispatch for this worker
+    # process instead of returning the underlying bridge implementation.
+    register_bridge_implementation(
+        source="NemotronH_Nano_VL_V2",
+        target=NemotronOmniModel,
+        bridge_class=NemotronOmniBridge,
+    )
+    bridge._nrl_legacy_nano_v2_omni = True
+    return bridge
+
+
+def _apply_legacy_nano_v2_token_ids(bridge: Any, model_provider: Any) -> None:
+    """Preserve the historical V2 image wrapper IDs on the Omni provider."""
+    if not getattr(bridge, "_nrl_legacy_nano_v2_omni", False):
+        return
+    hf_config = bridge.hf_pretrained.config
+    model_provider.img_start_token_id = (
+        getattr(hf_config, "img_start_token_id", None) or 19
+    )
+    model_provider.img_end_token_id = getattr(hf_config, "img_end_token_id", None) or 20
 
 
 @contextmanager
@@ -126,11 +223,10 @@ def import_model_from_hf_name(
         **config_overrides: Extra keyword arguments forwarded to
             ``AutoBridge.from_hf_pretrained``.
     """
-    bridge = AutoBridge.from_hf_pretrained(
-        hf_model_name, trust_remote_code=True, **config_overrides
-    )
+    bridge = resolve_hf_bridge(hf_model_name, **config_overrides)
 
     model_provider = bridge.to_megatron_provider(load_weights=True)
+    _apply_legacy_nano_v2_token_ids(bridge, model_provider)
 
     if megatron_config is not None:
         for key, value in iter_vlm_config_overrides(megatron_config):
@@ -262,6 +358,7 @@ def export_model_from_megatron(
     except ImportError:
         raise ImportError("megatron.bridge.training is not available.")
 
+    _register_super_omni_auto_map_alias()
     bridge = AutoBridge.from_hf_pretrained(
         hf_model_name, trust_remote_code=True, **hf_overrides
     )

@@ -19,7 +19,7 @@ import sys
 import types
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
@@ -44,11 +44,34 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _cap_nano_dynamic_image_processor,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
+
+
+def test_cap_nano_dynamic_image_processor_maps_tiles_to_patches():
+    dynamic_tiler = types.SimpleNamespace(
+        _min_num_patches=1024,
+        _max_num_patches=13312,
+    )
+    processor = types.SimpleNamespace(dynamic_tiler=dynamic_tiler)
+
+    _cap_nano_dynamic_image_processor(processor, max_num_tiles=2)
+
+    assert dynamic_tiler._max_num_patches == 2048
+
+
+def test_cap_nano_dynamic_image_processor_leaves_fixed_tiler_unchanged():
+    processor = types.SimpleNamespace(dynamic_tiler=None)
+
+    _cap_nano_dynamic_image_processor(processor, max_num_tiles=1)
+
+    assert processor.dynamic_tiler is None
+
+
 # Define basic vLLM test config
 basic_vllm_test_config: VllmConfig = {
     "backend": "vllm",
@@ -166,6 +189,73 @@ def test_context_capped_max_new_tokens():
             input_length=8192,
             max_model_len=8192,
         )
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = MagicMock(
+        pause_generation=AsyncMock(),
+        resume_generation=AsyncMock(),
+    )
+
+    assert await worker.pause_generation_async(clear_cache=False)
+    assert await worker.resume_generation_async()
+
+    worker.llm.pause_generation.assert_awaited_once_with(
+        mode="keep", clear_cache=False
+    )
+    worker.llm.resume_generation.assert_awaited_once_with()
+
+
+def test_vllm_generation_broadcasts_native_refit_pause_and_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": True}}
+    generation.worker_group = MagicMock()
+    generation.worker_group.workers = [object(), object()]
+    futures = [object(), object()]
+    generation.worker_group.run_all_workers_single_data.return_value = futures
+    ray_get = MagicMock(side_effect=[[True, True], [True, True]])
+    monkeypatch.setattr(ray, "get", ray_get)
+
+    assert generation.pause_generation_for_refit(clear_cache=True)
+    assert generation.resume_generation_after_refit()
+
+    generation.worker_group.run_all_workers_single_data.assert_any_call(
+        "pause_generation_async",
+        clear_cache=True,
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+    generation.worker_group.run_all_workers_single_data.assert_any_call(
+        "resume_generation_async",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+
+
+def test_vllm_generation_rejects_partial_refit_pause_and_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": True}}
+    generation.worker_group = MagicMock()
+    generation.worker_group.workers = [object(), object()]
+    generation.worker_group.run_all_workers_single_data.return_value = [
+        object(),
+        object(),
+    ]
+    monkeypatch.setattr(
+        ray,
+        "get",
+        MagicMock(side_effect=[[True, False], [False, True]]),
+    )
+
+    with pytest.raises(RuntimeError, match="pause every async vLLM engine"):
+        generation.pause_generation_for_refit(clear_cache=False)
+    with pytest.raises(RuntimeError, match="resume every async vLLM engine"):
+        generation.resume_generation_after_refit()
 
 
 def test_sampling_params_preserve_bad_words():
@@ -500,6 +590,20 @@ def test_configure_generation_config_uses_real_startup_weights_without_draft_ref
             is_eval=False,
             has_refit_draft_weights=False,
         )
+
+    assert configured["vllm_cfg"]["load_format"] == "auto"
+
+
+def test_configure_generation_config_preserves_explicit_load_format():
+    """Explicit recipe settings must survive training-mode configuration."""
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_cfg"]["load_format"] = "auto"
+
+    configured = configure_generation_config(
+        vllm_config,
+        MagicMock(pad_token_id=0, eos_token_id=1),
+        is_eval=False,
+    )
 
     assert configured["vllm_cfg"]["load_format"] == "auto"
 

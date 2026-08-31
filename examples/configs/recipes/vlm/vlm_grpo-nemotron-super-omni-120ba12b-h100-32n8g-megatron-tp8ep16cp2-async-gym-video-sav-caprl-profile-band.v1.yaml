@@ -1,0 +1,20 @@
+# 32x8-GPU scaling leaf for the validated combined CAPRL video + SAV
+# tracking profile-band recipe. Keep half of the nodes for the Megatron
+# policy and half for non-colocated TP8 vLLM rollout workers.
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-h100-16n8g-megatron-tp8ep16cp2-async-gym-video-sav-caprl-profile-band.v1.yaml
+
+cluster:
+  num_nodes: 32
+  gpus_per_node: 8
+
+policy:
+  generation:
+    colocated:
+      resources:
+        gpus_per_node: 8
+        num_nodes: 16
+
+logger:
+  wandb:
+    project: Nemotron-omni-RL-debug
+    name: dfw-h100-super-fullgen10k-sav-caprl-rpb-32n
