@@ -74,9 +74,6 @@ conflicts = [[
     { package = "nemo-rl", extra = "trtllm" },
 ]]
 
-[options]
-prerelease-mode = "allow"
-
 [manifest]
 members = [
     "nemo-gym",
