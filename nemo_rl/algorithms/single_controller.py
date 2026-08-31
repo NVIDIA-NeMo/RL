@@ -72,6 +72,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    SamplerSelection,
     TransactionalAdmissionSampler,
     create_sampler,
 )
@@ -1742,20 +1743,18 @@ class SingleControllerActor:
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
-                        train_meta, num_groups = await self._sampler.select(
+                        selection = await self._sampler.select(
                             current_train_weight=self._trainer_version,
                             min_prompt_groups=min_prompt_groups,
                             max_prompt_groups=max_prompt_groups,
                         )
-                        # getattr, not a Protocol member: a sampler loaded by FQN
-                        # from outside this repo need not provide it, and then
-                        # simply reports no staleness.
-                        step_trajectory_ages.extend(
-                            getattr(
-                                self._sampler, "last_selection_trajectory_ages", None
-                            )
-                            or ()
-                        )
+                        if isinstance(selection, SamplerSelection):
+                            train_meta = selection.meta
+                            num_groups = selection.num_groups
+                            step_trajectory_ages.extend(selection.trajectory_ages)
+                        else:
+                            # Preserve the two-tuple contract for external samplers.
+                            train_meta, num_groups = selection
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:

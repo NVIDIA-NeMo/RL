@@ -35,6 +35,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     PromptGroupSampler,
     ReadyFirstSampler,
     ReadyFirstSamplerConfig,
+    SamplerSelection,
     SamplerConfig,
     TransactionalAdmissionSampler,
     WeightFifoSampler,
@@ -422,10 +423,10 @@ class TestWindowedSelect:
         buf.add("b", weight=5)  # current
         buf.add("c", weight=1)  # below window (5-2=3)
         s = WindowedSampler(buf, max_staleness_versions=2)
-        meta, n = _run(
+        selection = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
         )
-        assert n == 2  # a(3) and b(5); c(1) excluded
+        assert selection.num_groups == 2  # a(3) and b(5); c(1) excluded
         assert len(buf.start_weight_list) == 1  # only c remains
 
     def test_below_min_returns_none(self):
@@ -434,7 +435,7 @@ class TestWindowedSelect:
         s = WindowedSampler(buf, max_staleness_versions=2)
         assert _run(
             s.select(current_train_weight=5, min_prompt_groups=2, max_prompt_groups=8)
-        ) == (None, 0)
+        ) == SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
 
     def test_unready_excluded(self):
         buf = FakeBuffer()
@@ -442,18 +443,18 @@ class TestWindowedSelect:
         s = WindowedSampler(buf, max_staleness_versions=2)
         assert _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
-        ) == (None, 0)
+        ) == SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
 
     def test_freshest_first_orders_by_lag(self):
         buf = FakeBuffer()
         buf.add("old", weight=1)
         buf.add("new", weight=5)
         s = WindowedSampler(buf, max_staleness_versions=10, sample_freshest_first=True)
-        meta, n = _run(
+        selection = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1)
         )
         # freshest (weight 5) picked first -> "old" (weight 1) remains.
-        assert n == 1
+        assert selection.num_groups == 1
         assert buf.start_weight_list == [1]
 
 
@@ -464,10 +465,10 @@ class TestWeightFifoSelect:
         buf.add("new", weight=5)
         buf.add("old2", weight=3)
         s = WeightFifoSampler(buf, max_staleness_versions=5)
-        meta, n = _run(
+        selection = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
         )
-        assert n == 2  # both weight-3 groups; weight-5 waits its turn
+        assert selection.num_groups == 2  # both weight-3 groups; weight-5 waits
         assert buf.start_weight_list == [5]
 
     def test_waits_for_partial_oldest_batch(self):
@@ -478,7 +479,7 @@ class TestWeightFifoSelect:
         # ahead to a newer weight.
         assert _run(
             s.select(current_train_weight=5, min_prompt_groups=2, max_prompt_groups=8)
-        ) == (None, 0)
+        ) == SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
 
     def test_empty_window_returns_none(self):
         buf = FakeBuffer()
@@ -486,7 +487,7 @@ class TestWeightFifoSelect:
         s = WeightFifoSampler(buf, max_staleness_versions=2)
         assert _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
-        ) == (None, 0)
+        ) == SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
 
 
 class TestReadyFirstSelect:
@@ -498,13 +499,13 @@ class TestReadyFirstSelect:
         buf.add("future", weight=4)
         s = ReadyFirstSampler(buf, max_staleness_versions=1)
 
-        meta, n = _run(
+        selection = _run(
             s.select(current_train_weight=3, min_prompt_groups=3, max_prompt_groups=3)
         )
 
-        assert n == 3
-        assert meta is not None
-        assert meta.sample_ids == ["old_g0", "current_g0", "middle_g0"]
+        assert selection.num_groups == 3
+        assert selection.meta is not None
+        assert selection.meta.sample_ids == ["old_g0", "current_g0", "middle_g0"]
         assert buf.start_weight_list == [4]
 
     def test_no_eviction_keeps_late_straggler_selectable(self):
@@ -513,13 +514,13 @@ class TestReadyFirstSelect:
         s = ReadyFirstSampler(buf, max_staleness_versions=1)
 
         assert _run(s.evict(current_train_weight=5)) == 0
-        meta, n = _run(
+        selection = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1)
         )
 
-        assert n == 1
-        assert meta is not None
-        assert meta.sample_ids == ["late_g0"]
+        assert selection.num_groups == 1
+        assert selection.meta is not None
+        assert selection.meta.sample_ids == ["late_g0"]
         assert buf.remove_calls == [([0], False)]
 
 
@@ -529,10 +530,10 @@ class TestInOrderSelect:
         # weight far outside any window, but target_step == trainer version.
         buf.add("g", weight=100, target_step=5)
         s = InOrderSampler(buf, max_lookahead_versions=1)
-        meta, n = _run(
+        selection = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
         )
-        assert n == 1
+        assert selection.num_groups == 1
 
     def test_non_matching_target_not_selected(self):
         buf = FakeBuffer()
@@ -540,7 +541,7 @@ class TestInOrderSelect:
         s = InOrderSampler(buf, max_lookahead_versions=1)
         assert _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
-        ) == (None, 0)
+        ) == SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
 
 
 class TestDefaultEvictSkipsUnready:
@@ -641,7 +642,7 @@ class EchoSampler(InOrderSampler):
 
 
 class TestSelectionStaleness:
-    """``last_selection_trajectory_ages`` reports the age of what select returned.
+    """The selection result reports the age of every returned group.
 
     The two existing staleness metrics count only what was discarded, and both
     are structurally zero under ready_first: its ``evict`` returns 0 and it
@@ -655,13 +656,13 @@ class TestSelectionStaleness:
             buf.add(f"g{i}", weight=weight)
         s = ReadyFirstSampler(buf, max_staleness_versions=1)
 
-        meta, n = _run(
+        selection = _run(
             s.select(current_train_weight=9, min_prompt_groups=1, max_prompt_groups=3)
         )
 
-        assert n == 3
-        assert meta is not None
-        assert s.last_selection_trajectory_ages == [7, 4, 2]
+        assert selection.num_groups == 3
+        assert selection.meta is not None
+        assert selection.trajectory_ages == (7, 4, 2)
 
     def test_reports_only_the_groups_actually_selected(self):
         buf = FakeBuffer()
@@ -669,24 +670,28 @@ class TestSelectionStaleness:
             buf.add(f"g{i}", weight=weight)
         s = ReadyFirstSampler(buf, max_staleness_versions=1)
 
-        _, n = _run(
+        selection = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=2)
         )
 
-        assert n == 2
-        assert s.last_selection_trajectory_ages == [5, 4]
+        assert selection.num_groups == 2
+        assert selection.trajectory_ages == (5, 4)
 
     def test_selecting_nothing_clears_the_previous_reading(self):
         buf = FakeBuffer()
         buf.add("g0", weight=1)
         s = ReadyFirstSampler(buf, max_staleness_versions=1)
 
-        _run(s.select(current_train_weight=4, min_prompt_groups=1, max_prompt_groups=1))
-        assert s.last_selection_trajectory_ages == [3]
+        selection = _run(
+            s.select(current_train_weight=4, min_prompt_groups=1, max_prompt_groups=1)
+        )
+        assert selection.trajectory_ages == (3,)
 
         # Buffer now empty: a stale reading must not survive into the next step.
-        _run(s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1))
-        assert s.last_selection_trajectory_ages == []
+        selection = _run(
+            s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1)
+        )
+        assert selection.trajectory_ages == ()
 
     def test_unready_groups_are_not_counted(self):
         buf = FakeBuffer()
@@ -694,12 +699,12 @@ class TestSelectionStaleness:
         buf.add("g1", weight=3, ready=True)
         s = ReadyFirstSampler(buf, max_staleness_versions=1)
 
-        _, n = _run(
+        selection = _run(
             s.select(current_train_weight=6, min_prompt_groups=1, max_prompt_groups=4)
         )
 
-        assert n == 1
-        assert s.last_selection_trajectory_ages == [3]
+        assert selection.num_groups == 1
+        assert selection.trajectory_ages == (3,)
 
     @pytest.mark.parametrize(
         "sampler_factory",
@@ -715,12 +720,12 @@ class TestSelectionStaleness:
         buf.add("g0", weight=3)
         s = sampler_factory(buf)
 
-        _, n = _run(
+        selection = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1)
         )
 
-        assert n == 1
-        assert s.last_selection_trajectory_ages == [2]
+        assert selection.num_groups == 1
+        assert selection.trajectory_ages == (2,)
 
     def test_in_order_reports_it_too(self):
         """InOrderSampler selects on target_step, but still reports by weight.
@@ -735,12 +740,12 @@ class TestSelectionStaleness:
         buf.add("g0", weight=3, target_step=5)
         s = InOrderSampler(buf, max_lookahead_versions=4)
 
-        _, n = _run(
+        selection = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1)
         )
 
-        assert n == 1
-        assert s.last_selection_trajectory_ages == [2]
+        assert selection.num_groups == 1
+        assert selection.trajectory_ages == (2,)
 
     def test_age_is_reported_unclamped(self):
         """A group newer than the trainer reports a negative age, not zero.
@@ -755,12 +760,12 @@ class TestSelectionStaleness:
         buf.add("g0", weight=7, target_step=5)
         s = InOrderSampler(buf, max_lookahead_versions=4)
 
-        _, n = _run(
+        selection = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1)
         )
 
-        assert n == 1
-        assert s.last_selection_trajectory_ages == [-2]
+        assert selection.num_groups == 1
+        assert selection.trajectory_ages == (-2,)
 
 
 class CheckpointingEchoSampler(EchoSampler):

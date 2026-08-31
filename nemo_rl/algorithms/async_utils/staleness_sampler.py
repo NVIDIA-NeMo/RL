@@ -41,6 +41,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import importlib
+from dataclasses import dataclass
 from typing import (
     Annotated,
     Callable,
@@ -62,6 +63,18 @@ from nemo_rl.data_plane import KVBatchMeta
 
 # Poll interval for the rollout-pump admission gate.
 _GATE_POLL_SECONDS = 0.005
+
+
+@dataclass(frozen=True)
+class SamplerSelection:
+    """One sampler selection and the metadata needed to diagnose it."""
+
+    meta: Optional[KVBatchMeta]
+    num_groups: int
+    trajectory_ages: tuple[int, ...]
+
+
+SamplerSelectionResult = SamplerSelection | tuple[Optional[KVBatchMeta], int]
 
 
 @runtime_checkable
@@ -91,8 +104,8 @@ class PromptGroupSampler(Protocol):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
-        """Pick up to ``max_prompt_groups`` eligible groups; drop them locally."""
+    ) -> SamplerSelectionResult:
+        """Pick eligible groups and optionally return trajectory-age metadata."""
         ...
 
     async def evict(self, *, current_train_weight: int) -> int:
@@ -164,30 +177,6 @@ class BaseSampler(abc.ABC):
         # Pre-incremented before each admitted batch, so -1 lets the first
         # batch through a zero-staleness gate.
         self._dispatch_index: int = -1
-        # Trajectory age of the groups the most recent ``select`` returned, in
-        # trainer versions. Reset by every ``select``, including one that
-        # selects nothing.
-        self._last_selection_trajectory_ages: list[int] = []
-
-    @property
-    def last_selection_trajectory_ages(self) -> list[int]:
-        """Per-group trajectory age of the last ``select``, in trainer versions.
-
-        ``current_train_weight - start_weight`` for each returned group: how
-        many optimizer steps separate the policy that generated the tokens from
-        the one about to be updated on them. Empty when the last ``select``
-        returned nothing.
-
-        Same quantity the pre-SC async GRPO path reports as
-        ``avg_trajectory_age`` (``ReplayBuffer.sample``), which is why the
-        metric keeps that name -- "staleness" in this module names the
-        admission/selection policy, not the measurement.
-
-        Read by the SC train pump for metrics. Not part of
-        ``PromptGroupSampler`` -- an out-of-repo sampler that doesn't define it
-        simply reports no age rather than failing.
-        """
-        return self._last_selection_trajectory_ages
 
     @property
     def dispatch_index(self) -> int:
@@ -235,7 +224,7 @@ class BaseSampler(abc.ABC):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]: ...
+    ) -> SamplerSelection: ...
 
     async def evict(self, *, current_train_weight: int) -> int:
         """Default: drop *ready* groups below the weight window.
@@ -293,16 +282,15 @@ class BaseSampler(abc.ABC):
         max_prompt_groups: int,
         *,
         current_train_weight: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+    ) -> SamplerSelection:
         """Cap, drop from the buffer, and concat the chosen groups.
 
         Greedy without waiting: returns all currently-eligible groups up to
         ``max_prompt_groups`` (never fewer on purpose, never waits to fill it),
-        or ``(None, 0)`` below ``min_prompt_groups``.
+        or an empty selection below ``min_prompt_groups``.
         """
-        self._last_selection_trajectory_ages = []
         if len(valid_idxs) < min_prompt_groups:
-            return None, 0
+            return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
         requested_groups = min(len(valid_idxs), max_prompt_groups)
         selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
@@ -310,14 +298,15 @@ class BaseSampler(abc.ABC):
         # the version that generated the tokens, so this is the age of the data
         # the next gradient step consumes -- the off-policyness the importance
         # ratio has to correct for.
-        self._last_selection_trajectory_ages = [
+        trajectory_ages = tuple(
             current_train_weight - self._buffer.start_weight_list[i]
             for i in selected_idxs
-        ]
+        )
         await self._buffer.remove(selected_idxs, remove_in_dp=False)
-        return (
-            selected_metas[0].concat(*selected_metas[1:]),  # type: ignore
-            len(selected_idxs),
+        return SamplerSelection(
+            meta=selected_metas[0].concat(*selected_metas[1:]),  # type: ignore
+            num_groups=len(selected_idxs),
+            trajectory_ages=trajectory_ages,
         )
 
 
@@ -385,7 +374,7 @@ class WindowedSampler(BaseSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+    ) -> SamplerSelection:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
         valid_idxs = [
@@ -499,7 +488,7 @@ class ReadyFirstSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+    ) -> SamplerSelection:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         valid_idxs = [
             i
@@ -538,7 +527,7 @@ class WeightFifoSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+    ) -> SamplerSelection:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
         in_window = [
@@ -547,7 +536,7 @@ class WeightFifoSampler(_GatedSampler):
             if min_valid_version <= weight <= current_train_weight
         ]
         if not in_window:
-            return None, 0
+            return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
         target_version = min(in_window)
         valid_idxs = [
             i
@@ -611,7 +600,7 @@ class InOrderSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+    ) -> SamplerSelection:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         valid_idxs = [
             i
