@@ -260,6 +260,8 @@ fi
 
 COMMON_SRUN_ARGS="$GRES_ARG"
 COMMON_SRUN_ARGS+=" --no-container-mount-home"
+COMMON_SRUN_ARGS+=" --container-remap-root"
+COMMON_SRUN_ARGS+=" --container-writable"
 COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
