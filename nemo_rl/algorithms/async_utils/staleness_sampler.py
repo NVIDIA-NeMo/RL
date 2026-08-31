@@ -672,6 +672,8 @@ SamplerConfig = Annotated[
 def required_buffer_capacity_for_config(
     cfg: SamplerConfig,
     groups_per_step: int,
+    *,
+    min_groups_for_streaming_train: int,
 ) -> int:
     """Return a sampler config's required capacity without constructing it."""
     if isinstance(cfg, ReadyFirstSamplerConfig):
@@ -689,6 +691,8 @@ def required_buffer_capacity_for_config(
             groups_per_step,
             gate_window=cfg.peak_lookahead_versions,
         )
+    if isinstance(cfg, WindowedSamplerConfig):
+        return min_groups_for_streaming_train
     return groups_per_step
 
 

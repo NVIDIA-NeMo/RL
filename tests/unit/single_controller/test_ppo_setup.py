@@ -163,6 +163,16 @@ def _ppo_master_config(**kwargs) -> MasterConfig:
     return _make_master_config(**kwargs)
 
 
+def _colocated_megatron_ppo_config(
+    *, policy_training_start_step: int = 0
+) -> MasterConfig:
+    mc = _ppo_master_config(megatron_enabled=True)
+    mc.ppo.policy_training_start_step = policy_training_start_step
+    mc.policy["generation"]["backend"] = "megatron"
+    mc.policy["generation"]["colocated"]["enabled"] = True
+    return mc
+
+
 class TestAlgorithmBlockValidator:
     """Exactly-one-block, enforced at construction so no reader sees a bad pair."""
 
@@ -235,8 +245,19 @@ class TestAlgoConfigSelection:
 
 
 class TestPPOValidation:
-    def test_accepts_a_well_formed_ppo_config(self):
-        validate_single_controller_config(_ppo_master_config())
+    @pytest.mark.parametrize(
+        "make_config",
+        [
+            _ppo_master_config,
+            _colocated_megatron_ppo_config,
+            # Warmup steps wake the stood-down engine through the
+            # (frozen-weight) sync, so the combination is legal.
+            lambda: _colocated_megatron_ppo_config(policy_training_start_step=2),
+        ],
+        ids=["base", "colocated_megatron", "colocated_megatron_warmup"],
+    )
+    def test_accepts_a_well_formed_ppo_config(self, make_config):
+        validate_single_controller_config(make_config())
 
     def test_rejects_message_penalties_without_nemo_gym(self):
         mc = _ppo_master_config()

@@ -2095,12 +2095,13 @@ class SingleControllerActor:
                 )
 
                 # ---- 6. Refit the model ----
-                # Critic warmup doesn't need refit, and the version still advances.
+                # Critic warmup doesn't need a refit and the version still advances.
+                # But a colocated engine that was stood down still needs to be woken up via reshard.
                 aborted_stale_inflight_groups = 0
-                if is_policy_training_step:
+                if is_policy_training_step or self._gen.blocks_training():
                     if defer_wake_for_save:
-                        # Wake-deferral (colocated): the engine is about to be saved,
-                        # so leave it asleep. Record `weight_sync` for consistency in reports.
+                        # Wake-deferral (colocated): the engine is about to be saved; let it sleep.
+                        # Record `weight_sync` for consistency in reports.
                         with self._timer.time("weight_sync"):
                             pass
                         with self._timer.time("offload_before_refit"):
@@ -2149,6 +2150,7 @@ class SingleControllerActor:
                         )
                     if defer_wake_for_save:
                         # The save is done; wake the engine unless the loop is about to exit.
+                        # Deliberately a bare wake, not `_sync_weights`.
                         loop_will_exit = is_last_step or should_save_by_timeout
                         if not loop_will_exit:
                             with self._timer.time("weight_sync"):
@@ -2779,11 +2781,10 @@ class SingleControllerActor:
     ) -> None:
         """Write a full checkpoint for the just-finished train step.
 
-        Everything except the (possibly async) policy weight write must be
-        on disk before begin_finalization. Non-colocated engines keep serving
-        rollouts throughout; a colocated engine is held stood-down through the
-        save. The policy optimizer is skipped during critic warmup -- it has
-        never stepped.
+        Everything except the (possibly async) policy weight write must be on disk
+        before `begin_finalization`. Non-colocated engines keep serving rollouts throughout.
+        Colocated engines are stood down for the save.
+        The policy optimizer is skipped during critic warmup: it has never stepped.
         """
         save_state = self._save_state
         # SC has no validation loop yet; drop the default sentinel instead of
@@ -3051,8 +3052,9 @@ class SingleControllerActor:
     ) -> int:
         """Pause new rollout dispatches, synchronize weights, resume.
 
-        SC owns the pause gate. vLLM serves through the refit;
-        its async engine supports weight updates during pending requests.
+        SC owns the pause gate. vLLM serves through the refit; it supports live weight updates.
+        A colocated engine is instead already stood down: the synchronizer's sync is the wake,
+        and step 4 resumes dispatch.
 
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches

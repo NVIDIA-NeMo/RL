@@ -297,8 +297,8 @@ def _build_clusters(
 ]:
     """Allocate student clusters while leaving validated nodes for teachers.
 
-    The colocated branch is unreachable on a real run -- validation rejects
-    colocated.enabled=true -- and is kept for when SC can support that mode.
+    Colocated (Megatron generation only) shares one cluster for policy and generation and
+    returns it for both arms; other backends split nodes into train + inference clusters.
     """
     cluster_config = master_config.cluster
     generation_config = master_config.policy["generation"]
@@ -530,7 +530,8 @@ def _build_generation(
             "defer_model_load is only supported for the vllm backend"
         )
         assert tokenizer is not None, "Megatron generation requires a tokenizer"
-        # Non-colocated only (colocated is rejected at config validation).
+        # Non-colocated only: colocated Megatron routes to `_build_trainer_then_megatron_generation`
+        # at the dispatch and never reaches here.
         # The inference and trainer policies build in parallel;
         # the inference engine only becomes live at the initial refit, which delivers weights.
         gen = MegatronGeneration(
@@ -1110,13 +1111,19 @@ def setup_single_controller(
     if megatron_backend:
         generation_config["model_name"] = master_config.policy["model_name"]
 
-    def _build_trainer_and_value() -> tuple[Any, Optional[TQValue], dict[str, float]]:
+    def _build_trainer_and_value(
+        reserved_http_server_port: Optional[int] = None,
+    ) -> tuple[Any, Optional[TQValue], dict[str, float]]:
         """Build the trainer, then the critic when this is a PPO run.
 
         Serial, and with the trainer offloaded in between, because both worker
         groups live on the same training GPUs: leaving the policy resident
         while the critic loads is what OOMs a tight fit. The trainer comes back
         to GPU before returning so callers see the same state GRPO leaves them.
+
+        Args:
+            reserved_http_server_port: Pre-published OpenAI server port for the trainer's rank 0;
+                only the colocated Megatron serial build passes one.
 
         Returns:
             A tuple of (TQPolicy trainer, TQValue critic or None, per-phase wall
@@ -1130,11 +1137,7 @@ def setup_single_controller(
             processor,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
-            # Colocated Megatron generation serves from the trainer's workers,
-            # so rank 0 of the trainer adopts the pre-published OpenAI socket.
-            reserved_http_server_port=(
-                reserved_http_server_port if megatron_backend and colocated else None
-            ),
+            reserved_http_server_port=reserved_http_server_port,
         )
         if not is_ppo_run(master_config):
             return trainer, None, time_metrics
@@ -1190,11 +1193,8 @@ def setup_single_controller(
     ]:
         """Build the trainer (and critic), then colocated Megatron generation.
 
-        Serial by construction: colocated generation wraps the trainer's
-        policy (shared worker group), so the trainer must exist first; the
-        reserved OpenAI port is adopted by the trainer's rank 0. Non-colocated
-        Megatron generation never comes through here — it builds a dedicated
-        inference policy in parallel with the trainer via ``_build_generation``.
+        Serial by construction: colocated generation wraps the trainer's policy, so the trainer
+        must exist first; the reserved OpenAI port is adopted by the trainer's rank 0.
 
         Returns:
             A tuple of (MegatronGeneration, TQPolicy trainer, TQValue critic or
@@ -1203,7 +1203,11 @@ def setup_single_controller(
         """
         time_metrics = {}
 
-        trainer, value, train_side_metrics = _build_trainer_and_value()
+        # Colocated Megatron generation serves from the trainer's workers,
+        # so rank 0 of the trainer adopts the pre-published OpenAI socket.
+        trainer, value, train_side_metrics = _build_trainer_and_value(
+            reserved_http_server_port=reserved_http_server_port,
+        )
         time_metrics.update(train_side_metrics)
 
         t0 = time.perf_counter()
@@ -1281,9 +1285,8 @@ def setup_single_controller(
         )
 
     if megatron_backend and colocated:
-        # Colocated Megatron generation wraps the trainer's worker group, so
-        # the trainer must come first; serial by construction. Non-colocated
-        # Megatron takes the parallel path below.
+        # Colocated Megatron generation wraps the trainer's worker group,
+        # so the trainer must come first; serial by construction.
         build_tasks["generation_trainer"] = _build_trainer_then_megatron_generation
     elif colocated:
         # Colocated: vLLM prefers a clean GPU at load time, so generation comes up before the trainer.

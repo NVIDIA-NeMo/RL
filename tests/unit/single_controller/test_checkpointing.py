@@ -344,37 +344,33 @@ class _BlockingDPClient(_FakeDPClient):
 
 
 class _FakeGeneration:
-    """Continuous-serving stand-in; the pump asks it before every train step."""
+    """Generation stand-in. Continuous-serving by default; given an ``events``
+    list it plays the colocated engine: blocks training, records the
+    stand-down/wake choreography, and its wake carries the weight update."""
 
-    def blocks_training(self) -> bool:
-        return False
-
-
-class _BlockingGeneration:
-    """Colocated stand-in: blocks training, and its wake carries the update."""
-
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events: Optional[list[str]] = None) -> None:
         self._events = events
 
     def blocks_training(self) -> bool:
-        return True
+        return self._events is not None
 
     def wake_carries_weight_updates(self) -> bool:
         return True
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        self._events.append("finish_generation")
+        self._events.append("finish_generation")  # type: ignore[union-attr]
         return True
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
-        self._events.append("wake")
+        self._events.append("wake")  # type: ignore[union-attr]
         return True
 
 
 class _FakeWeightSynchronizer:
-    def __init__(self) -> None:
+    def __init__(self, events: Optional[list[str]] = None) -> None:
         self.sync_count = 0
         self.shutdown_count = 0
+        self._events = events
 
     @property
     def is_stale(self) -> bool:
@@ -382,20 +378,12 @@ class _FakeWeightSynchronizer:
         return self.sync_count == 0
 
     def sync_weights(self, *, kv_scales: Any = None) -> None:
+        if self._events is not None:
+            self._events.append("sync")
         self.sync_count += 1
 
     def shutdown(self) -> None:
         self.shutdown_count += 1
-
-
-class _EventRecordingSynchronizer(_FakeWeightSynchronizer):
-    def __init__(self, events: list[str]) -> None:
-        super().__init__()
-        self._events = events
-
-    def sync_weights(self, *, kv_scales: Any = None) -> None:
-        self._events.append("sync")
-        super().sync_weights(kv_scales=kv_scales)
 
 
 class _RefitRecordingTrainer(_FakeTrainer):
@@ -933,21 +921,70 @@ class TestSaveTrigger:
         assert (ckpt_dir / "step_2" / "policy" / "optimizer").is_dir()
         assert (ckpt_dir / "step_4" / "policy" / "tokenizer").is_dir()
 
-    def test_blocking_engine_stays_down_through_saves(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("mc_kwargs", "expected_steps", "expected_dirs", "expected_events"),
+        [
+            pytest.param(
+                dict(max_num_steps=4, save_period=2),
+                4,
+                {"step_2", "step_4"},
+                [
+                    # step 1: stand down, then the plain wake inside _sync_weights.
+                    "finish_generation",
+                    "sync",
+                    # step 2: save-bound — no sync; the wake is deferred past the save.
+                    "finish_generation",
+                    "offload_before_refit",
+                    "save",
+                    "offload_after_refit",
+                    "wake",
+                    # step 3: back to the plain shape.
+                    "finish_generation",
+                    "sync",
+                    # step 4: save on the last step — no wake at all.
+                    "finish_generation",
+                    "offload_before_refit",
+                    "save",
+                ],
+                id="periodic_saves",
+            ),
+            pytest.param(
+                dict(
+                    max_num_steps=4,
+                    save_period=100,
+                    checkpoint_must_save_by="00:00:00:00",
+                ),
+                1,
+                {"step_1"},
+                # The timeout latch fires on step 1: stood-down save, no wake.
+                ["finish_generation", "offload_before_refit", "save"],
+                id="timeout_save_exits",
+            ),
+        ],
+    )
+    def test_blocking_engine_stays_down_through_saves(
+        self, tmp_path, mc_kwargs, expected_steps, expected_dirs, expected_events
+    ):
         """Save-bound steps defer the blocking engine's wake past the save.
 
-        Four steps, save_period=2. Non-save steps wake through the
-        synchronizer as usual. The step-2 save runs against a stood-down
-        engine and a closed gate: offload_before_refit replaces the sync,
-        and offload_after_refit + wake follow the save. The step-4 save is
-        on the last step, so the wake is skipped and the gate stays closed
-        for teardown.
+        periodic_saves: four steps, save_period=2. Non-save steps wake through
+        the synchronizer as usual; the step-2 save runs against a stood-down
+        engine and a closed gate (offload_before_refit replaces the sync, and
+        offload_after_refit + wake follow the save); the step-4 save is on the
+        last step, so the wake is skipped and the gate stays closed for
+        teardown.
+
+        timeout_save_exits: checkpoint_must_save_by fires the one-shot timeout
+        latch on step 1. The save runs stood-down like any deferred save, the
+        wake is skipped because the loop is about to exit, and the loop really
+        does exit -- pinning that loop_will_exit's timeout arm agrees with the
+        loop's actual break.
         """
-        mc = _actor_master_config(tmp_path, max_num_steps=4, save_period=2)
+        mc = _actor_master_config(tmp_path, **mc_kwargs)
         events: list[str] = []
         trainer = _RefitRecordingTrainer(events)
-        gen = _BlockingGeneration(events)
-        synchronizer = _EventRecordingSynchronizer(events)
+        gen = _FakeGeneration(events)
+        synchronizer = _FakeWeightSynchronizer(events)
 
         actor = _run_train_pump(
             mc,
@@ -957,28 +994,12 @@ class TestSaveTrigger:
             seed=lambda actor: trainer.set_gate_probe(actor._rollout_permitted.is_set),
         )
 
-        assert _step_dir_names(tmp_path / "checkpoints") == {"step_2", "step_4"}
-        assert events == [
-            # step 1: stand down, then the plain wake inside _sync_weights.
-            "finish_generation",
-            "sync",
-            # step 2: save-bound — no sync; the wake is deferred past the save.
-            "finish_generation",
-            "offload_before_refit",
-            "save",
-            "offload_after_refit",
-            "wake",
-            # step 3: back to the plain shape.
-            "finish_generation",
-            "sync",
-            # step 4: save on the last step — no wake at all.
-            "finish_generation",
-            "offload_before_refit",
-            "save",
-        ]
-        # The gate was closed during both saves and never reopened after the
+        assert actor._train_steps == expected_steps
+        assert _step_dir_names(tmp_path / "checkpoints") == expected_dirs
+        assert events == expected_events
+        # The gate was closed during every save and never reopened after the
         # final one (run()'s teardown cancels the pumps, so nothing hangs).
-        assert trainer.gate_open_during_save == [False, False]
+        assert trainer.gate_open_during_save == [False] * len(expected_dirs)
         assert not actor._rollout_permitted.is_set()
 
     def test_last_step_saves_off_period_boundary(self, tmp_path):

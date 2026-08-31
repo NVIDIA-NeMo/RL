@@ -979,6 +979,7 @@ class _ChunkedSampler(_EmptySampler):
     the reason ``keep_train_buffers`` exists: every chunk after the first runs
     against an already-open train step. ``groups_per_chunk`` covers the blocking
     (colocated) shape, where the whole step arrives as one multi-group chunk.
+    ``select_bounds`` records the (min, max) the pump asked for on each select.
     """
 
     def __init__(
@@ -987,9 +988,12 @@ class _ChunkedSampler(_EmptySampler):
         self._meta = meta
         self._remaining = chunks
         self._groups_per_chunk = groups_per_chunk
+        self.select_bounds: list[tuple[int, int]] = []
 
     async def select(self, **kwargs):
-        del kwargs
+        self.select_bounds.append(
+            (kwargs["min_prompt_groups"], kwargs["max_prompt_groups"])
+        )
         if self._remaining == 0:
             return None, 0
         self._remaining -= 1
@@ -1038,13 +1042,26 @@ class _NoOpTrainer:
 
 
 class _LpRecordingTrainer(_NoOpTrainer):
-    """Records the ``keep_train_buffers`` flag the pump passes on each chunk."""
+    """Records ``keep_train_buffers`` flags and the per-chunk call order.
 
-    def __init__(self) -> None:
+    ``calls`` may be shared with other doubles so a test can assert the
+    interleaving (e.g. the engine stand-down against trainer GPU work).
+    """
+
+    def __init__(self, calls: list[object] | None = None) -> None:
         self.keep_train_buffers_calls: list[bool] = []
+        self.calls: list[object] = [] if calls is None else calls
 
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         self.keep_train_buffers_calls.append(keep_train_buffers)
+        self.calls.append("lp_inference_prep")
+
+    def prepare_for_training(self) -> None:
+        self.calls.append("prepare_for_training")
+
+    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+        del meta
+        self.calls.append("train")
 
     def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
         del meta
@@ -1521,21 +1538,12 @@ def test_train_pump_chunked_step_by_engine_regime(
         sequence_lengths=[1],
         tags=[{"weight_version": 0}],
     )
-    select_bounds: list[tuple[int, int]] = []
-
-    class _BoundsRecordingSampler(_ChunkedSampler):
-        async def select(self, **kwargs):
-            select_bounds.append(
-                (kwargs["min_prompt_groups"], kwargs["max_prompt_groups"])
-            )
-            return await super().select(**kwargs)
-
     # num_prompts_per_step is 2 in the harness: two single-group chunks close
     # the streaming step, one two-group chunk the blocking one.
     sampler = (
-        _BoundsRecordingSampler(meta, chunks=1, groups_per_chunk=2)
+        _ChunkedSampler(meta, chunks=1, groups_per_chunk=2)
         if engine_blocks_training
-        else _BoundsRecordingSampler(meta, chunks=2)
+        else _ChunkedSampler(meta, chunks=2)
     )
     ctrl = _train_pump_controller(sampler=sampler)
     if engine_blocks_training:
@@ -1544,22 +1552,10 @@ def test_train_pump_chunked_step_by_engine_regime(
     ctrl._policy_logprobs_required = True
     calls: list[object] = []
 
-    class _RecordingTrainer(_LpRecordingTrainer):
-        def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
-            super().prepare_for_lp_inference(keep_train_buffers)
-            calls.append("lp_inference_prep")
-
-        def prepare_for_training(self) -> None:
-            calls.append("prepare_for_training")
-
-        def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
-            del meta
-            calls.append("train")
-
     def _finish_generation() -> None:
         calls.append(("finish_generation", ctrl._rollout_permitted.is_set()))
 
-    trainer = _RecordingTrainer()
+    trainer = _LpRecordingTrainer(calls)
     ctrl._trainer = trainer
     ctrl._gen = SimpleNamespace(
         requires_kv_scale_sync=False,
@@ -1583,12 +1579,12 @@ def test_train_pump_chunked_step_by_engine_regime(
         assert calls == [("finish_generation", False)] + chunk
         assert trainer.keep_train_buffers_calls == [False]
         assert not ctrl._rollout_permitted.is_set()
-        assert select_bounds == [(2, 2)]
+        assert sampler.select_bounds == [(2, 2)]
     else:
         assert calls == chunk * 2
         assert trainer.keep_train_buffers_calls == [False, True]
         assert ctrl._rollout_permitted.is_set()
-        assert select_bounds[0] == (1, 2)
+        assert sampler.select_bounds[0] == (1, 2)
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
 
 
@@ -1810,12 +1806,18 @@ def test_train_pump_skips_the_critic_on_an_empty_chunk(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("ppo_epochs", [1, 2])
+@pytest.mark.parametrize(
+    "engine_blocks_training", [False, True], ids=["streaming", "blocking"]
+)
 def test_train_pump_freezes_the_policy_during_critic_warmup(
-    monkeypatch, capsys, ppo_epochs
+    monkeypatch, capsys, ppo_epochs, engine_blocks_training
 ) -> None:
     """Below policy_training_start_step the critic trains alone: no optimizer
     step, and no weight transfer to generation either. The frozen policy does
-    not shorten the critic's own epoch loop."""
+    not shorten the critic's own epoch loop. A blocking (colocated) engine is
+    the one exception on the sync: it was stood down at step start and its
+    wake rides the sync, so the sync runs for the wake alone -- a reshard of
+    the frozen weights."""
     critic_ppo_epochs = 3
     meta = _single_group_meta()
     ctrl, value = _ppo_train_pump_controller(
@@ -1824,6 +1826,18 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
         ppo_epochs=ppo_epochs,
         critic_ppo_epochs=critic_ppo_epochs,
     )
+    stand_downs: list[bool] = []
+    if engine_blocks_training:
+        ctrl._gen = SimpleNamespace(
+            requires_kv_scale_sync=False,
+            blocks_training=lambda: True,
+            wake_carries_weight_updates=lambda: True,
+            finish_generation=lambda: stand_downs.append(
+                ctrl._rollout_permitted.is_set()
+            ),
+        )
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
     trainer = MagicMock(spec=_NoOpTrainer)
     ctrl._trainer = trainer
     ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
@@ -1835,7 +1849,13 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
     trainer.prepare_for_training.assert_not_called()
     trainer.begin_train_step.assert_not_called()
     trainer.finish_train_step.assert_not_called()
-    ctrl._sync_weights.assert_not_awaited()
+    if engine_blocks_training:
+        # Stood down once per step (not per epoch), with the gate already
+        # closed; the sync (mocked -- the real one reopens the gate) is the wake.
+        assert stand_downs == [False]
+        ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    else:
+        ctrl._sync_weights.assert_not_awaited()
     # The step still closed and published the new version, so staleness
     # accounting keeps working through the warmup.
     assert ctrl._train_steps == 1

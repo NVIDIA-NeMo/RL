@@ -50,7 +50,7 @@ uv run ng_prepare_data "+config_paths=[resources_servers/workplace_assistant/con
 cd -
 
 # This trimming of the workplace assistant dataset is necessary b/c with all the tools the first prompt is >4000 tokens
-# which will cause vllm to return nothing on the first prompt and crash RL. Since we want to keep this test short to
+# which will cause the generation engine to return nothing on the first prompt and crash RL. Since we want to keep this test short to
 # smoke test, we trim all but the first tool
 TRAIN_PATH=$DATA_DIR/workplace_assistant_train.jsonl
 VALIDATION_PATH=$DATA_DIR/workplace_assistant_validation.jsonl

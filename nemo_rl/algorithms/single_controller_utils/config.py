@@ -811,13 +811,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     if generation_config["colocated"]["enabled"]:
         if generation_config["backend"] != "megatron":
             raise ValueError(
-                "The SingleController path requires "
-                "policy.generation.colocated.enabled=false for the "
-                f"{generation_config['backend']!r} backend: SC drives rollout "
-                "via RolloutManager.generate_and_push, which is only supported "
-                "on the disaggregated async engine. Colocated generation is "
-                "supported only with backend='megatron', which shares the "
-                "training policy's worker group."
+                "The SingleController path requires policy.generation.colocated.enabled=false "
+                f"for the {generation_config['backend']!r} backend: SC drives rollout via "
+                "RolloutManager.generate_and_push, which is only supported on the disaggregated "
+                "async engine. Colocated generation is supported only with backend='megatron'."
             )
         if async_config.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step:
             raise ValueError(
@@ -985,6 +982,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     required_capacity = required_buffer_capacity_for_config(
         async_config.sampler,
         algo_cfg.num_prompts_per_step,
+        min_groups_for_streaming_train=async_config.min_groups_for_streaming_train,
     )
     validate_sampler_buffer_capacity(
         async_config,
