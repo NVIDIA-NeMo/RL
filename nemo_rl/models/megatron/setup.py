@@ -229,6 +229,7 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
+    merged_inference_megatron_cfg,
 )
 from nemo_rl.models.megatron.community_import import (
     import_model_from_hf_name,
@@ -259,6 +260,199 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.models.value.config import ValueConfig
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def enable_batch_invariant_mode(config: PolicyConfig) -> None:
+    """Enable Megatron-Core batch-invariant kernels before CUDA initialization.
+
+    The mode is deliberately limited to the topology for which Megatron
+    generation and policy scoring can execute the same arithmetic.
+    Megatron-Core performs the remaining model-specific validation when the
+    provider is finalized. Sampling parameters do not affect this validation:
+    generation samples from the processed distribution while generation and
+    policy scoring both report raw model logprobs.
+
+    Args:
+        config: Policy configuration for this Megatron worker.
+
+    Raises:
+        ValueError: If batch-invariant mode is requested with an unsupported
+            NeMo-RL topology, generation backend, or precision.
+        AssertionError: If the installed Transformer Engine cannot pin the
+            requested FlashAttention version.
+    """
+    megatron_cfg = config["megatron_cfg"]
+    if not megatron_cfg.get("batch_invariant_mode"):
+        return
+
+    required_fields = (
+        "batch_invariant_backend",
+        "batch_invariant_collective",
+        "flash_attention_version",
+    )
+    missing_fields = [field for field in required_fields if field not in megatron_cfg]
+    if missing_fields:
+        raise ValueError(
+            "batch_invariant_mode=True requires policy.megatron_cfg fields: "
+            f"{', '.join(missing_fields)}."
+        )
+
+    if config["precision"] != "bfloat16":
+        raise ValueError(
+            "batch_invariant_mode=True requires policy.precision='bfloat16'."
+        )
+    if megatron_cfg["context_parallel_size"] != 1:
+        raise ValueError(
+            "batch_invariant_mode=True currently requires training context "
+            "parallel size 1."
+        )
+    if megatron_cfg.get("use_fused_linear_logprobs"):
+        raise ValueError(
+            "batch_invariant_mode=True is incompatible with "
+            "use_fused_linear_logprobs=True because generation parity requires "
+            "the shared float-log_softmax-gather path."
+        )
+    if megatron_cfg.get("attention_backend") != "flash":
+        raise ValueError(
+            "batch_invariant_mode=True requires "
+            "policy.megatron_cfg.attention_backend='flash'."
+        )
+    if megatron_cfg["flash_attention_version"] not in (3, 4):
+        raise ValueError(
+            "batch_invariant_mode=True requires "
+            "policy.megatron_cfg.flash_attention_version to be 3 or 4."
+        )
+
+    generation_cfg = config.get("generation")
+    if generation_cfg is None or generation_cfg["backend"] != "megatron":
+        raise ValueError(
+            "batch_invariant_mode=True requires policy.generation.backend='megatron'."
+        )
+    inference_cfg = merged_inference_megatron_cfg(config)
+    matching_fields = (
+        "tensor_model_parallel_size",
+        "context_parallel_size",
+        "batch_invariant_mode",
+        "batch_invariant_backend",
+        "batch_invariant_collective",
+        "attention_backend",
+        "flash_attention_version",
+    )
+    mismatched_fields = [
+        field
+        for field in matching_fields
+        if inference_cfg[field] != megatron_cfg[field]
+    ]
+    if mismatched_fields:
+        raise ValueError(
+            "Training and generation must use the same Megatron settings for "
+            f"batch invariance: {', '.join(mismatched_fields)}."
+        )
+
+    collective = megatron_cfg["batch_invariant_collective"]
+
+    # Keep optional Megatron GPU kernels out of imports when the mode is disabled.
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        assert_te_supports_batch_invariant_attention,
+    )
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        enable_batch_invariant_mode as enable_mcore_batch_invariant_mode,
+    )
+
+    assert_te_supports_batch_invariant_attention()
+    enable_mcore_batch_invariant_mode(
+        backend=megatron_cfg["batch_invariant_backend"], collective=collective
+    )
+
+
+def enable_zero_train_gen_kl(
+    config: PolicyConfig, *, apply_kernels: bool = True
+) -> None:
+    """Resolve zero_train_gen_mismatch into sub-knobs and enable batch-invariant mode.
+
+    With ``policy.generation.backend='megatron'`` this flag carries the zero
+    train/gen KL contract. Recipes must set ``moe_permute_fusion=false`` and
+    ``enable_chunked_prefill=false``. ``batch_invariant_mode`` and
+    ``logprobs_mode=raw_logprobs`` are applied here; generation may be colocated
+    or not and may use either ``transformer_engine`` or ``inference_optimized``.
+    Call with ``apply_kernels=True`` before CUDA initialization so Megatron-Core
+    batch-invariant kernels are active for the worker lifetime.
+
+    Raises:
+        ValueError: If ``moe_permute_fusion`` / ``enable_chunked_prefill`` are
+            not False, or if batch-invariant mode validation fails.
+    """
+    if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
+        return
+
+    mc = config["megatron_cfg"]
+    generation = config.get("generation")
+
+    # Forced knobs that otherwise read log-probs off another path.
+    forced = [
+        (
+            mc,
+            "policy.megatron_cfg",
+            {"batch_invariant_mode": True},
+        )
+    ]
+    if generation is not None:
+        forced.append(
+            (
+                generation["mcore_generation_config"],
+                "policy.generation.mcore_generation_config",
+                {
+                    # processed_logprobs routes through FlashInfer
+                    # log(renorm(softmax)); training uses F.log_softmax.
+                    "logprobs_mode": "raw_logprobs",
+                },
+            )
+        )
+    for cfg, config_path, values in forced:
+        for key, value in values.items():
+            if key in cfg and cfg[key] != value:
+                warnings.warn(
+                    f"zero_train_gen_mismatch=true overrides {config_path}.{key}"
+                    f"={cfg[key]!r} with {value!r}: the configured value would "
+                    "reintroduce train/generation mismatch.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            cfg[key] = value
+
+    if mc.get("moe_permute_fusion", False):
+        raise ValueError(
+            "zero_train_gen_mismatch=true requires "
+            "policy.megatron_cfg.moe_permute_fusion=false "
+            f"(got {mc.get('moe_permute_fusion')!r})."
+        )
+    mc["moe_permute_fusion"] = False
+
+    if generation is not None:
+        mcore_gen = generation["mcore_generation_config"]
+        if mcore_gen.get("enable_chunked_prefill", False):
+            raise ValueError(
+                "zero_train_gen_mismatch=true requires "
+                "policy.generation.mcore_generation_config.enable_chunked_prefill="
+                f"false (got {mcore_gen.get('enable_chunked_prefill')!r})."
+            )
+        mcore_gen["enable_chunked_prefill"] = False
+
+    # Seeded for enable_batch_invariant_mode; FA4 is what the zero-KL beds are
+    # certified on, but the attention backend stays a user choice when set.
+    mc.setdefault("attention_backend", "flash")
+    mc.setdefault("flash_attention_version", 4)
+    mc.setdefault("batch_invariant_backend", "te_native")
+    mc.setdefault("batch_invariant_collective", "ordered")
+
+    if not apply_kernels:
+        return
+
+    # Starve PyTorch's own cuBLAS workspace so non-TE aten::mm/addmm paths also
+    # pick workspace-free (splitK=1, reduction=NONE) algorithms.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")
+    os.environ.setdefault("CUBLASLT_WORKSPACE_SIZE", "0")
+    enable_batch_invariant_mode(config)
 
 
 def destroy_parallel_state():
@@ -360,6 +554,10 @@ def validate_and_set_config(
             "with TP>1: set policy.megatron_cfg.sequence_parallel=true."
         )
 
+    # Resolve zero-KL config knobs before sampling_params so batch_invariant_mode
+    # is visible when deciding whether to recompute raw training logprobs.
+    enable_zero_train_gen_kl(config, apply_kernels=False)
+
     # Handle generation configuration
     is_generation_colocated = None
     sampling_params = None
@@ -367,12 +565,15 @@ def validate_and_set_config(
         generation_cfg = config["generation"]
         # set generation colocated
         is_generation_colocated = generation_cfg["colocated"]["enabled"]
-        # set sampling params
-        sampling_params = TrainingSamplingParams(
-            top_k=generation_cfg["top_k"],
-            top_p=generation_cfg["top_p"],
-            temperature=generation_cfg["temperature"],
-        )
+        # Batch-invariant Megatron inference returns raw model logprobs even
+        # when token sampling uses temperature, top-k, or top-p. Match
+        # Megatron-RL by recomputing raw training logprobs as well.
+        if not config["megatron_cfg"].get("batch_invariant_mode"):
+            sampling_params = TrainingSamplingParams(
+                top_k=generation_cfg["top_k"],
+                top_p=generation_cfg["top_p"],
+                temperature=generation_cfg["temperature"],
+            )
 
     # Setup data types
     dtype_map = {
@@ -1258,6 +1459,21 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 f"Invalid attention backend: {attention_backend}. "
                 f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
+
+    flash_attention_version = config["megatron_cfg"].get("flash_attention_version")
+    if flash_attention_version is not None:
+        model_cfg.flash_attention_version = flash_attention_version
+
+    if "batch_invariant_mode" in config["megatron_cfg"]:
+        model_cfg.batch_invariant_mode = config["megatron_cfg"]["batch_invariant_mode"]
+    if "batch_invariant_backend" in config["megatron_cfg"]:
+        model_cfg.batch_invariant_backend = config["megatron_cfg"][
+            "batch_invariant_backend"
+        ]
+    if "batch_invariant_collective" in config["megatron_cfg"]:
+        model_cfg.batch_invariant_collective = config["megatron_cfg"][
+            "batch_invariant_collective"
+        ]
 
     # These overrides need to be applied before the workers spawn.
     if "transformer_impl" in config["megatron_cfg"]:
