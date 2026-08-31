@@ -255,9 +255,18 @@ def _uses_model_owned_ipc_replication(config: PolicyConfig) -> bool:
     )
 
 
-def _refit_dtype(tensor: torch.Tensor, target_dtype: torch.dtype) -> torch.dtype:
-    """Cast floating-point model state for rollout while preserving exact buffers."""
-    return target_dtype if tensor.is_floating_point() else tensor.dtype
+def _refit_wire_dtype(
+    tensor: torch.Tensor, _target_dtype: torch.dtype
+) -> torch.dtype:
+    """Preserve the dtype selected by the AutoModel state-dict adapter.
+
+    Models may intentionally mix parameter dtypes even when their main rollout
+    precision is BF16. Casting every floating-point tensor to the rollout dtype
+    before refit would irreversibly quantize FP32 state such as GatedDeltaNet
+    ``A_log`` and ``dt_bias``. The destination loader remains responsible for
+    casting when the live rollout parameter uses a different storage dtype.
+    """
+    return tensor.dtype
 
 
 def dtensor_params_generator(
@@ -270,14 +279,15 @@ def dtensor_params_generator(
 
     Args:
         model: The model whose parameters to generate.
-        target_dtype: The dtype to convert tensors to.
+        target_dtype: Rollout dtype used by model-owned replication. Ordinary
+            tensors preserve the dtype exported by the model adapter.
         replicate_model_owned_dtensors: Broadcast model-owned checkpoint views
             one at a time to every owner rank. This is required when each
             colocated rollout rank needs a complete checkpoint-key stream.
 
     Yields:
-        Tuples of (fully_qualified_name, tensor) where tensors are converted to
-        the refit dtype and made contiguous.
+        Tuples of ``(fully_qualified_name, tensor)`` with the adapter-selected
+        dtype and contiguous storage.
     """
     module_map = dict(model.named_modules())
     parameter_map = dict(model.named_parameters())
@@ -355,10 +365,9 @@ def dtensor_params_generator(
                     model, name, merged_tensor
                 )
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            # Parameters follow the rollout precision, but integer/bool buffers
-            # (for example BrightDelta's PLE hash constants) must remain exact.
+            wire_dtype = _refit_wire_dtype(adapted_tensor, target_dtype)
             refit_tensor = adapted_tensor.to(
-                _refit_dtype(adapted_tensor, target_dtype), non_blocking=True
+                wire_dtype, non_blocking=True
             ).contiguous()
             yield adapted_fqn, refit_tensor
             del refit_tensor
@@ -1335,7 +1344,7 @@ class DTensorPolicyWorkerV2Impl(
             adapted_manifest = {
                 adapted_fqn: (
                     adapted_tensor.shape,
-                    _refit_dtype(adapted_tensor, self.dtype),
+                    _refit_wire_dtype(adapted_tensor, self.dtype),
                 )
                 for adapted_fqn, adapted_tensor in adapted_fqn_tensors
             }
