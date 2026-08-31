@@ -26,7 +26,10 @@ from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
-from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    BaseSampler,
+    SamplerSelection,
+)
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
@@ -1097,7 +1100,7 @@ class _EmptySampler:
 
     async def select(self, **kwargs):
         del kwargs
-        return None, 0
+        return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
 
 
 class _OneThenEmptySampler(_EmptySampler):
@@ -1107,10 +1110,10 @@ class _OneThenEmptySampler(_EmptySampler):
     async def select(self, **kwargs):
         del kwargs
         if self._meta is None:
-            return None, 0
+            return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
         meta = self._meta
         self._meta = None
-        return meta, 1
+        return SamplerSelection(meta=meta, num_groups=1, trajectory_ages=(0,))
 
 
 class _EvictingSampler(_OneThenEmptySampler):
@@ -1119,14 +1122,21 @@ class _EvictingSampler(_OneThenEmptySampler):
         return 2
 
     async def select(self, **kwargs):
-        meta, num_groups = await super().select(**kwargs)
-        return meta, 2 if num_groups else 0
+        selection = await super().select(**kwargs)
+        num_groups = 2 if selection.num_groups else 0
+        ages = selection.trajectory_ages * num_groups
+        return SamplerSelection(selection.meta, num_groups, ages)
 
 
 class _FullStepSampler(_OneThenEmptySampler):
     async def select(self, **kwargs):
-        meta, num_groups = await super().select(**kwargs)
-        return meta, 2 if num_groups else 0
+        selection = await super().select(**kwargs)
+        num_groups = 2 if selection.num_groups else 0
+        return SamplerSelection(
+            selection.meta,
+            num_groups,
+            selection.trajectory_ages * num_groups,
+        )
 
 
 class _ChunkedSampler(_EmptySampler):
@@ -1152,9 +1162,13 @@ class _ChunkedSampler(_EmptySampler):
             (kwargs["min_prompt_groups"], kwargs["max_prompt_groups"])
         )
         if self._remaining == 0:
-            return None, 0
+            return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
         self._remaining -= 1
-        return self._meta, self._groups_per_chunk
+        return SamplerSelection(
+            self._meta,
+            self._groups_per_chunk,
+            (0,) * self._groups_per_chunk,
+        )
 
 
 class _SequenceSampler(_EmptySampler):
@@ -1164,8 +1178,8 @@ class _SequenceSampler(_EmptySampler):
     async def select(self, **kwargs):
         del kwargs
         if not self._metas:
-            return None, 0
-        return self._metas.pop(0), 1
+            return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
+        return SamplerSelection(self._metas.pop(0), 1, (0,))
 
 
 class _EmptyBuffer:
@@ -1487,10 +1501,10 @@ class _DroppingSampler(_OneThenEmptySampler):
         BaseSampler._validate_group_bounds(
             kwargs["min_prompt_groups"], kwargs["max_prompt_groups"]
         )
-        meta, num_groups = await super().select(**kwargs)
-        if meta is None and not self._credit_in_evict:
+        selection = await super().select(**kwargs)
+        if selection.meta is None and not self._credit_in_evict:
             self._credit()
-        return meta, num_groups
+        return selection
 
 
 def _dropping_controller(*, credit_in_evict: bool):
@@ -1590,15 +1604,13 @@ class _AgeReportingSampler(_EmptySampler):
     def __init__(self, meta: KVBatchMeta, age_batches: list[list[int]]) -> None:
         self._meta = meta
         self._age_batches = list(age_batches)
-        self.last_selection_trajectory_ages: list[int] = []
 
     async def select(self, **kwargs):
         del kwargs
         if not self._age_batches:
-            self.last_selection_trajectory_ages = []
-            return None, 0
-        self.last_selection_trajectory_ages = self._age_batches.pop(0)
-        return self._meta, 1
+            return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
+        ages = tuple(self._age_batches.pop(0))
+        return SamplerSelection(self._meta, 1, ages)
 
 
 def _age_meta() -> KVBatchMeta:
@@ -1639,10 +1651,14 @@ def test_train_pump_accumulates_trajectory_age_across_every_select(monkeypatch):
 
 
 def test_train_pump_omits_trajectory_age_when_no_ages_are_reported(monkeypatch):
-    """A sampler that reports no ages must leave the keys out, not divide by
-    zero. This is the path every sampler without the property takes -- the
-    metric is deliberately not on the Protocol."""
-    ctrl = _train_pump_controller(sampler=_OneThenEmptySampler(_age_meta()))
+    """A legacy two-tuple sampler must leave trajectory-age metrics out."""
+
+    class _LegacyOneThenEmptySampler(_OneThenEmptySampler):
+        async def select(self, **kwargs):
+            selection = await super().select(**kwargs)
+            return selection.meta, selection.num_groups
+
+    ctrl = _train_pump_controller(sampler=_LegacyOneThenEmptySampler(_age_meta()))
     ctrl._master_config.grpo.num_prompts_per_step = 1
     ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()

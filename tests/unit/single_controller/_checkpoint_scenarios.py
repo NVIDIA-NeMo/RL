@@ -477,14 +477,15 @@ async def _round_trip(
             current_train_weight=select_current_train_weight
         )
         evicted_after_restore = groups_before_evict - set(buf_b._group_ids)
-        selected_meta, selected_count = await sampler_b.select(
+        selection = await sampler_b.select(
             current_train_weight=select_current_train_weight,
             min_prompt_groups=select_min_prompt_groups,
             max_prompt_groups=select_max_prompt_groups,
         )
-        if selected_meta is not None:
+        selected_count = selection.num_groups
+        if selection.meta is not None:
             selected = {
-                sample_id.rpartition("_g")[0] for sample_id in selected_meta.sample_ids
+                sample_id.rpartition("_g")[0] for sample_id in selection.meta.sample_ids
             }
     return RoundTrip(
         recovered=recovered,
