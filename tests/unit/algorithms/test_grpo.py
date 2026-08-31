@@ -2782,7 +2782,9 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     synchronizer = MagicMock()
     nemo_gym_actor = object()
     spinup_nemo_gym_actor = MagicMock(return_value=nemo_gym_actor)
-    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: MagicMock())
+    dummy_logger = MagicMock()
+    dummy_logger.base_log_dir = "/tmp/grpo-test-results"
+    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: dummy_logger)
     monkeypatch.setattr(
         grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
     )
@@ -2819,6 +2821,9 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     assert inference_cluster.kwargs["node_resource_constraints"] is None
     assert result[1].dp_openai_server_base_urls == ["http://dynamo-wrapper.example/v1"]
     assert result[2] is nemo_gym_actor
+    assert master_config.env["nemo_gym"]["nemo_gym_log_dir"] == (
+        "/tmp/grpo-test-results/nemo_gym"
+    )
     dynamo_config = dynamo_init.call_args.kwargs["config"]
     assert dynamo_init.call_args.kwargs["cluster"] is inference_cluster
     assert DynamoConfig.model_validate(dynamo_config).engine_world_size == 4
@@ -2943,6 +2948,8 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
     from nemo_rl.algorithms import grpo as grpo_mod
 
     class DummyLogger:
+        base_log_dir = "/tmp/grpo-test-results"
+
         def log_hyperparams(self, *_args, **_kwargs):
             pass
 
@@ -3092,6 +3099,8 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     from nemo_rl.algorithms import grpo as grpo_mod
 
     class DummyLogger:
+        base_log_dir = "/tmp/grpo-test-results"
+
         def log_hyperparams(self, *_args, **_kwargs):
             pass
 
