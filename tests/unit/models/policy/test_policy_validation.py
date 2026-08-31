@@ -470,3 +470,59 @@ def test_world_size_validation_megatron(
             )
         # For failing cases, worker group should not be created
         mock_ray_worker_group.assert_not_called()
+
+
+@pytest.mark.mcore
+@patch("nemo_rl.models.policy.lm_policy.RayQueue")
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_batch_invariant_te_native_pins_worker_cublaslt_workspace(
+    mock_ray_worker_group,
+    _mock_ray_queue,
+):
+    """The te_native backend pins cuBLASLt before actor CUDA imports."""
+    cluster = create_mock_cluster(world_size=2)
+    tokenizer = create_mock_tokenizer()
+    config = create_megatron_config("unused-model", tp=1)
+    config["megatron_cfg"].update(
+        {
+            "batch_invariant_mode": True,
+            "batch_invariant_backend": "te_native",
+            "env_vars": {"CUBLASLT_WORKSPACE_SIZE": "1048576"},
+        }
+    )
+
+    with patch(
+        "nemo_rl.models.policy.lm_policy.get_default_hf_config",
+        side_effect=ValueError("unused in this test"),
+    ):
+        Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+
+    assert mock_ray_worker_group.call_args.kwargs["env_vars"] == {
+        "CUBLASLT_WORKSPACE_SIZE": "0",
+        "CUBLAS_WORKSPACE_CONFIG": ":0:0",
+    }
+
+
+@pytest.mark.mcore
+@patch("nemo_rl.models.policy.lm_policy.RayQueue")
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_zero_train_gen_mismatch_pins_worker_cublaslt_workspace(
+    mock_ray_worker_group,
+    _mock_ray_queue,
+):
+    """zero_train_gen_mismatch pins cuBLASLt before worker-side BI resolve."""
+    cluster = create_mock_cluster(world_size=2)
+    tokenizer = create_mock_tokenizer()
+    config = create_megatron_config("unused-model", tp=1)
+    config["megatron_cfg"]["zero_train_gen_mismatch"] = True
+
+    with patch(
+        "nemo_rl.models.policy.lm_policy.get_default_hf_config",
+        side_effect=ValueError("unused in this test"),
+    ):
+        Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+
+    assert mock_ray_worker_group.call_args.kwargs["env_vars"] == {
+        "CUBLASLT_WORKSPACE_SIZE": "0",
+        "CUBLAS_WORKSPACE_CONFIG": ":0:0",
+    }

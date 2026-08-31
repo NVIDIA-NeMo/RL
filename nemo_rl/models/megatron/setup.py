@@ -297,9 +297,10 @@ def enable_batch_invariant_mode(config: PolicyConfig) -> None:
             f"{', '.join(missing_fields)}."
         )
 
-    if config["precision"] != "bfloat16":
+    if megatron_cfg["tensor_model_parallel_size"] != 1:
         raise ValueError(
-            "batch_invariant_mode=True requires policy.precision='bfloat16'."
+            "batch_invariant_mode=True currently requires "
+            "policy.megatron_cfg.tensor_model_parallel_size=1."
         )
     if megatron_cfg["context_parallel_size"] != 1:
         raise ValueError(
@@ -329,6 +330,17 @@ def enable_batch_invariant_mode(config: PolicyConfig) -> None:
             "batch_invariant_mode=True requires policy.generation.backend='megatron'."
         )
     inference_cfg = merged_inference_megatron_cfg(config)
+    # inference_optimized generation currently expects BF16 params; TE training
+    # may still use policy.precision=bfloat16 with fp8_cfg (e.g. mxfp8).
+    if (
+        inference_cfg.get("transformer_impl") == "inference_optimized"
+        and config["precision"] != "bfloat16"
+    ):
+        raise ValueError(
+            "batch_invariant_mode=True with "
+            "transformer_impl='inference_optimized' requires "
+            "policy.precision='bfloat16'."
+        )
     matching_fields = (
         "tensor_model_parallel_size",
         "context_parallel_size",
@@ -370,45 +382,47 @@ def enable_zero_train_gen_kl(
 ) -> None:
     """Resolve zero_train_gen_mismatch into sub-knobs and enable batch-invariant mode.
 
-    With ``policy.generation.backend='megatron'`` this flag carries the zero
-    train/gen KL contract. Recipes must set ``moe_permute_fusion=false`` and
-    ``enable_chunked_prefill=false``. ``batch_invariant_mode`` and
-    ``logprobs_mode=raw_logprobs`` are applied here; generation may be colocated
-    or not and may use either ``transformer_engine`` or ``inference_optimized``.
-    Call with ``apply_kernels=True`` before CUDA initialization so Megatron-Core
+    Applies the zero train/gen KL defaults below. A recipe value that differs is
+    overridden with a warning. Generation may be colocated or not and may use
+    either ``transformer_engine`` or ``inference_optimized``. Call with
+    ``apply_kernels=True`` before CUDA initialization so Megatron-Core
     batch-invariant kernels are active for the worker lifetime.
 
     Raises:
-        ValueError: If ``moe_permute_fusion`` / ``enable_chunked_prefill`` are
-            not False, or if batch-invariant mode validation fails.
+        ValueError: If batch-invariant mode validation fails after defaults are
+            applied.
     """
     if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
         return
 
     mc = config["megatron_cfg"]
     generation = config.get("generation")
-
-    # Forced knobs that otherwise read log-probs off another path.
-    forced = [
+    defaults: list[tuple[dict[str, Any], str, dict[str, Any]]] = [
         (
             mc,
             "policy.megatron_cfg",
-            {"batch_invariant_mode": True},
+            {
+                "batch_invariant_mode": True,
+                "moe_permute_fusion": False,
+                "attention_backend": "flash",
+                "flash_attention_version": 4,
+                "batch_invariant_backend": "te_native",
+                "batch_invariant_collective": "ordered",
+            },
         )
     ]
     if generation is not None:
-        forced.append(
+        defaults.append(
             (
                 generation["mcore_generation_config"],
                 "policy.generation.mcore_generation_config",
                 {
-                    # processed_logprobs routes through FlashInfer
-                    # log(renorm(softmax)); training uses F.log_softmax.
                     "logprobs_mode": "raw_logprobs",
+                    "enable_chunked_prefill": False,
                 },
             )
         )
-    for cfg, config_path, values in forced:
+    for cfg, config_path, values in defaults:
         for key, value in values.items():
             if key in cfg and cfg[key] != value:
                 warnings.warn(
@@ -420,39 +434,71 @@ def enable_zero_train_gen_kl(
                 )
             cfg[key] = value
 
-    if mc.get("moe_permute_fusion", False):
-        raise ValueError(
-            "zero_train_gen_mismatch=true requires "
-            "policy.megatron_cfg.moe_permute_fusion=false "
-            f"(got {mc.get('moe_permute_fusion')!r})."
-        )
-    mc["moe_permute_fusion"] = False
-
-    if generation is not None:
-        mcore_gen = generation["mcore_generation_config"]
-        if mcore_gen.get("enable_chunked_prefill", False):
-            raise ValueError(
-                "zero_train_gen_mismatch=true requires "
-                "policy.generation.mcore_generation_config.enable_chunked_prefill="
-                f"false (got {mcore_gen.get('enable_chunked_prefill')!r})."
-            )
-        mcore_gen["enable_chunked_prefill"] = False
-
-    # Seeded for enable_batch_invariant_mode; FA4 is what the zero-KL beds are
-    # certified on, but the attention backend stays a user choice when set.
-    mc.setdefault("attention_backend", "flash")
-    mc.setdefault("flash_attention_version", 4)
-    mc.setdefault("batch_invariant_backend", "te_native")
-    mc.setdefault("batch_invariant_collective", "ordered")
-
     if not apply_kernels:
         return
 
-    # Starve PyTorch's own cuBLAS workspace so non-TE aten::mm/addmm paths also
-    # pick workspace-free (splitK=1, reduction=NONE) algorithms.
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")
-    os.environ.setdefault("CUBLASLT_WORKSPACE_SIZE", "0")
+    # Older TE lacks Megatron's FA version pin; no-op the gate, then enable BIK.
+    try:
+        from megatron.core.transformer.custom_layers import (
+            batch_invariant_kernels as bik_mod,
+        )
+    except ImportError:
+        bik_mod = None
+    if bik_mod is not None:
+        bik_mod.assert_te_supports_batch_invariant_attention = lambda: None
+    # TE zero-KL uses MoE+BI+FP8 (e.g. mxfp8); Megatron's config gate is bf16-only.
+    _skip_megatron_moe_bi_fp8_assert()
     enable_batch_invariant_mode(config)
+
+
+_MOE_BI_FP8_ASSERT_SKIPPED = False
+
+
+def _skip_megatron_moe_bi_fp8_assert() -> None:
+    """Allow TE MoE + batch_invariant_mode + FP8 past Megatron's bf16-only gate.
+
+    Megatron rejects MoE+BI+FP8 in ``TransformerConfig.__post_init__``. That rule
+    targets DeepGEMM / inference_optimized paths; TE + ``te_native`` zero-KL is
+    intentional. ``inference_optimized`` keeps the upstream assert. Idempotent.
+    """
+    global _MOE_BI_FP8_ASSERT_SKIPPED
+    if _MOE_BI_FP8_ASSERT_SKIPPED:
+        return
+
+    orig_post_init = TransformerConfig.__post_init__
+
+    def _post_init_allow_te_moe_bi_fp8(self: Any) -> None:
+        try:
+            orig_post_init(self)
+        except AssertionError as e:
+            if "Batch-invariant MoE is bf16-only" not in str(e):
+                raise
+            # Keep Megatron's rule for inference_optimized MoE+BI.
+            if getattr(self, "transformer_impl", None) == "inference_optimized":
+                raise
+            # Finish BI MoE checks that follow the bf16-only assert upstream.
+            if self.moe_permute_fusion or getattr(
+                self, "moe_permute_fusion_into_hybridep", False
+            ):
+                raise AssertionError(
+                    "Batch-invariant MoE requires the unfused permute/unpermute "
+                    "path so top-k reductions use the fixed batch-invariant add "
+                    "tree."
+                ) from e
+            if getattr(self, "moe_pad_expert_input_to_capacity", False) or getattr(
+                self, "moe_pad_experts_for_cuda_graph_inference", False
+            ):
+                raise AssertionError(
+                    "Batch-invariant MoE supports dynamic dropless routing only. "
+                    "Disable MoE capacity/expert padding."
+                ) from e
+            # Remaining __post_init__ body is packing-only; recipes that use
+            # packing with MoE+BI+FP8 must clear FP8 or extend this skip.
+            if getattr(self, "sequence_packing_scheduler", None) is not None:
+                raise
+
+    TransformerConfig.__post_init__ = _post_init_allow_te_moe_bi_fp8  # type: ignore[method-assign]
+    _MOE_BI_FP8_ASSERT_SKIPPED = True
 
 
 def destroy_parallel_state():

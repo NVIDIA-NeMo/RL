@@ -151,6 +151,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
             env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
+            # te_native / zero-KL invariance needs workspace-free cuBLASLt and
+            # PyTorch cuBLAS algos. Set in the actor env before CUDA init:
+            # importing the Megatron worker can initialize CUDA before __init__
+            # calls enable_batch_invariant_mode().
+            if (
+                config["megatron_cfg"].get("batch_invariant_mode")
+                and config["megatron_cfg"].get("batch_invariant_backend")
+                == "te_native"
+            ) or config["megatron_cfg"].get("zero_train_gen_mismatch"):
+                env_vars["CUBLASLT_WORKSPACE_SIZE"] = "0"
+                env_vars["CUBLAS_WORKSPACE_CONFIG"] = ":0:0"
 
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 raise RuntimeError(

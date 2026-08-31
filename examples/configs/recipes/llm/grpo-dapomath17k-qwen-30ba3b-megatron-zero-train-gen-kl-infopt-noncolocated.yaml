@@ -1,5 +1,5 @@
 # Qwen3-30B-A3B DAPO 8K — non-colocated Megatron inference with zero train/gen KL
-defaults: grpo-dapomath17k-qwen-30ba3b-megatron-zero-train-gen-kl-mxfp8
+defaults: grpo-dapomath17k-qwen-30ba3b-megatron-zero-train-gen-kl-mxfp8.yaml
 
 policy:
   megatron_cfg:
