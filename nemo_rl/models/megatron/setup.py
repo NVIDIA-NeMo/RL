@@ -260,6 +260,26 @@ from nemo_rl.models.value.config import ValueConfig
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
+_OPTIMIZER_DTYPE_KEYS = (
+    "params_dtype",
+    "main_grads_dtype",
+    "main_params_dtype",
+    "exp_avg_dtype",
+    "exp_avg_sq_dtype",
+)
+
+
+def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Resolve optimizer dtype strings."""
+    from megatron.bridge.utils.activation_map import str_to_dtype
+
+    resolved = dict(optimizer_cfg)
+    for key in _OPTIMIZER_DTYPE_KEYS:
+        value = resolved.get(key)
+        if isinstance(value, str):
+            resolved[key] = str_to_dtype(value)
+    return resolved
+
 
 def destroy_parallel_state():
     """Safely destroy parallel state and reset async call tracking.
@@ -1501,7 +1521,7 @@ def _create_megatron_config(
         "overlap_param_gather"
     ]
     optimizer_kwargs = {
-        **config["megatron_cfg"]["optimizer"],
+        **_resolve_optimizer_dtype_kwargs(config["megatron_cfg"]["optimizer"]),
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
