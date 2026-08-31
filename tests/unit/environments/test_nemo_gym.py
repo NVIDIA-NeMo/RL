@@ -1391,11 +1391,22 @@ def test_nemo_gym_postprocess_keeps_ray_routes_as_two_views_of_one_object():
 def test_nemo_gym_training_sample_logging_config_defaults_off():
     assert should_log_nemo_gym_training_samples({}) is False
     assert should_log_nemo_gym_training_samples({"nemo_gym": {}}) is False
+    assert should_log_nemo_gym_training_samples({"log_training_samples": True}) is True
+    # Retain compatibility with the initially implemented nested spelling.
     assert (
         should_log_nemo_gym_training_samples(
             {"nemo_gym": {"log_training_samples": True}}
         )
         is True
+    )
+    assert (
+        should_log_nemo_gym_training_samples(
+            {
+                "log_training_samples": False,
+                "nemo_gym": {"log_training_samples": True},
+            }
+        )
+        is False
     )
 
 

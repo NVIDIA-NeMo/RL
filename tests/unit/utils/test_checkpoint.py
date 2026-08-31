@@ -1171,6 +1171,22 @@ class TestFTKeepLatestK:
 
         assert self._remaining_steps(checkpoint_dir) == [6, 7]
 
+    def test_keep_marker_protects_checkpoint(self, checkpoint_dir):
+        """A step_N/.keep marker overrides all configured retention limits."""
+        manager = self._make_manager(
+            checkpoint_dir, ft_keep_latest_k=1, save_period=100
+        )
+
+        tmp = manager.init_tmp_checkpoint(1, {"loss": 1.0})
+        manager.finalize_checkpoint(tmp)
+        (checkpoint_dir / "step_1" / ".keep").touch()
+
+        for step in range(2, 5):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [1, 4]
+
     def test_keep_top_k_only(self, checkpoint_dir):
         """keep_top_k=2 alone keeps the 2 most recent (no metric, save_period=1)."""
         manager = self._make_manager(checkpoint_dir, keep_top_k=2)

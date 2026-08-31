@@ -2223,7 +2223,7 @@ class TestAsyncTrajectoryCollector:
         assert collector.current_weight_version == 2
         assert collector._generation_lead_steps == 3
         assert collector._max_trajectory_age_steps == 5
-        assert collector._calculate_target_weights(2) == [3, 4, 5]
+        assert collector._calculate_target_weights(2) == [2, 3, 4, 5]
 
     def test_collector_grpo_window_remains_fixed(self):
         collector = self.create_local_collector()
@@ -2238,7 +2238,7 @@ class TestAsyncTrajectoryCollector:
         assert collector.current_weight_version == 5
         assert collector._generation_lead_steps == 2
         assert collector._max_trajectory_age_steps == 2
-        assert collector._calculate_target_weights(5) == [6, 7]
+        assert collector._calculate_target_weights(5) == [5, 6, 7]
 
     def test_collector_rejects_generation_lead_above_validity_age(self):
         collector = self.create_local_collector()
@@ -2958,6 +2958,7 @@ class TestAsyncTrajectoryCollector:
             }
         )
         rollout_calls = 0
+        rollout_call_task_indices = []
 
         def _rollout_result(task_index):
             return SimpleNamespace(
@@ -2967,7 +2968,7 @@ class TestAsyncTrajectoryCollector:
             )
 
         async def fake_rollouts(**kwargs):
-            nonlocal rollout_calls
+            nonlocal rollout_calls, rollout_call_task_indices
             assert kwargs["generation_config"]["stop_token_ids"] is None
             assert kwargs["generation_config"]["stop_strings"] is None
             assert kwargs["log_full_result_tables"] is False
@@ -2979,6 +2980,12 @@ class TestAsyncTrajectoryCollector:
             )
             assert kwargs["target_weight_version"] == target_weight
             assert kwargs["log_training_samples"] is True
+            rollout_call_task_indices.append(
+                [
+                    row["_ng_task_index"]
+                    for row in kwargs["input_batch"]["extra_env_info"]
+                ]
+            )
             rollout_calls += 1
             yield _rollout_result(7)
             if rollout_calls == 1:
@@ -3004,6 +3011,7 @@ class TestAsyncTrajectoryCollector:
         )
 
         assert rollout_calls == 2
+        assert rollout_call_task_indices == [[7, 7, 8, 8], [8, 8]]
         assert replay_buffer.add.task_indices == [7, 8]
         assert target_weight not in collector._generating_targets
 
@@ -3031,6 +3039,93 @@ class TestAsyncTrajectoryCollector:
         )
 
         assert target_weight not in collector._generating_targets
+
+    def test_nemo_gym_partial_batch_exhaustion_wakes_gap_fill(self, monkeypatch):
+        """A Gym batch with useful partial progress is not a fatal failure."""
+
+        class _ReadyResult:
+            def __await__(self):
+                async def _resolve():
+                    return "success"
+
+                return _resolve().__await__()
+
+        class _AddRemote:
+            def __init__(self):
+                self.task_indices = []
+
+            def remote(self, trajectory_group, *args):
+                self.task_indices.append(trajectory_group["_ng_task_index"])
+                return _ReadyResult()
+
+        class _ReplayBuffer:
+            def __init__(self):
+                self.add = _AddRemote()
+
+        replay_buffer = _ReplayBuffer()
+        collector = self.create_local_collector(
+            replay_buffer=replay_buffer, max_generation_failures=0
+        )
+        collector.running = True
+        target_weight = 16
+        collector._generating_targets.add(target_weight)
+        collector._generation_limit_cleared.clear()
+        repeated_batch = BatchedDataDict(
+            {
+                "extra_env_info": [
+                    {"_ng_task_index": 7},
+                    {"_ng_task_index": 7},
+                    {"_ng_task_index": 8},
+                    {"_ng_task_index": 8},
+                ],
+                "loss_multiplier": torch.ones(4),
+            }
+        )
+        rollout_call_task_indices = []
+
+        async def fake_rollouts(**kwargs):
+            task_indices = [
+                row["_ng_task_index"] for row in kwargs["input_batch"]["extra_env_info"]
+            ]
+            rollout_call_task_indices.append(task_indices)
+            if len(rollout_call_task_indices) == 1:
+                yield SimpleNamespace(
+                    task_index=7,
+                    final_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+                    rollout_metrics={},
+                )
+            raise RuntimeError("persistent stream failure")
+
+        async def no_sleep(delay):
+            return None
+
+        import nemo_rl.experience.rollouts as rollouts_mod
+
+        monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_rollouts)
+        monkeypatch.setattr(trajectory_collector_mod.asyncio, "sleep", no_sleep)
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=repeated_batch,
+                generation_weight_version=3,
+                target_weight_version=target_weight,
+                num_generations=2,
+                use_nemo_gym=True,
+            )
+        )
+
+        assert rollout_call_task_indices == [
+            [7, 7, 8, 8],
+            [8, 8],
+            [8, 8],
+            [8, 8],
+        ]
+        assert replay_buffer.add.task_indices == [7]
+        assert collector._failure_count == 0
+        assert collector._fatal_error_message is None
+        assert collector._generation_limit_cleared.is_set()
+        assert target_weight not in collector._generating_targets
+        collector.check_health()
 
     def test_rollouts_state_retrieval(self):
         collector = self.create_local_collector(next_nemo_gym_task_index=123)
