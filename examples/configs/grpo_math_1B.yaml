@@ -125,6 +125,10 @@ checkpointing:
   model_save_format: "safetensors"
   save_consolidated: false
   save_optimizer: true
+  # SingleController only: include native TQ state and the metadata-only replay
+  # index. Required for recovery-capable samplers to preserve completed,
+  # unconsumed rollouts.
+  save_data_plane: false
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
