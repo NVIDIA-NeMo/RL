@@ -109,7 +109,14 @@ def prepare_loss_input(
             # mask out negative infinity logprobs
             # prev_logprobs is already masked out in the previous step
             mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-            logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+            logprobs, keep = mask_out_neg_inf_logprobs(
+                logprobs, mask[:, 1:], "curr_logprobs"
+            )
+            # Publish the narrowing instead of folding it into ``token_mask``:
+            # the actor term must drop these positions, but the
+            # reference-policy KL reduces with ``token_mask`` and is computed
+            # from ``curr_logprobs_unfiltered``, which is finite here.
+            data["curr_logprobs_keep_mask"] = keep
 
             # compute unfiltered logprobs for reference policy KL penalty
             if (
@@ -422,7 +429,14 @@ def prepare_packed_loss_input(
     # use filtered curr_logprobs for actor loss, but keep unfiltered values for KL.
     if need_top_k_or_top_p_filtering(sampling_params):
         mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-        logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+        logprobs, keep = mask_out_neg_inf_logprobs(
+            logprobs, mask[:, 1:], "curr_logprobs"
+        )
+        # Publish the narrowing instead of folding it into ``token_mask``:
+        # the actor term must drop these positions, but the
+        # reference-policy KL reduces with ``token_mask`` and is computed
+        # from ``curr_logprobs_unfiltered``, which is finite here.
+        data["curr_logprobs_keep_mask"] = keep
 
         if (
             hasattr(loss_fn, "reference_policy_kl_penalty")

@@ -28,6 +28,7 @@ from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
     get_tokenizer,
+    mask_out_neg_inf_logprobs,
     maybe_pad_last_batch,
     print_efficiency_summary,
     print_performance_metrics,
@@ -910,3 +911,55 @@ class TestPrintEfficiencySummary:
         assert result["efficiency/total_waste_s"] == 60.0
         assert result["efficiency/productive_time_s"] == 0.0
         assert result["efficiency/efficiency_pct"] == 0.0
+
+
+class TestMaskOutNegInfLogprobs:
+    """The narrowed mask has to reach the caller.
+
+    ``mask_out_neg_inf_logprobs`` substitutes ``0.0`` for -inf logprobs, which
+    is log p = 0, i.e. p = 1 -- the opposite of "masked out". Every consumer
+    compares these against ``generation_logprobs``, which is finite by
+    construction, so the position has to leave the reduction mask as well.
+    """
+
+    def test_returns_keep_marking_the_neg_inf_positions(self):
+        # Position 1 fell outside the training policy's top-k/top-p set.
+        curr_logprobs = torch.tensor([[-0.5, float("-inf"), -1.5]])
+        mask = torch.ones(1, 3)
+
+        masked, keep = mask_out_neg_inf_logprobs(curr_logprobs, mask, "curr_logprobs")
+
+        assert keep.tolist() == [[1.0, 0.0, 1.0]]
+        assert masked[0, 1].item() == 0.0
+        # The finite positions are untouched.
+        assert masked[0, 0].item() == pytest.approx(-0.5)
+        assert masked[0, 2].item() == pytest.approx(-1.5)
+
+    def test_keep_is_what_stops_the_substituted_value_dominating(self):
+        """Without folding ``keep`` in, the fabricated 0.0 swamps the metric.
+
+        This mirrors ``token_mult_prob_error`` in ``ClippedPGLossFn``:
+        ``exp(|generation_logprobs - curr_logprobs| * mask)``.
+        """
+        curr_logprobs = torch.tensor([[-0.5, float("-inf"), -1.5]])
+        # vLLM sampled this token, so its logprob is finite and around -5.
+        generation_logprobs = torch.tensor([[-0.5, -5.41, -1.5]])
+        mask = torch.ones(1, 3)
+
+        masked, keep = mask_out_neg_inf_logprobs(curr_logprobs, mask, "curr_logprobs")
+        lp_error = torch.abs(generation_logprobs - masked)
+
+        # Reduction over the original mask still sees exp(5.41) at position 1.
+        assert torch.exp(lp_error * mask)[0, 1].item() > 200
+        # Folding ``keep`` in neutralizes it.
+        assert torch.exp(lp_error * (mask * keep))[0, 1].item() == pytest.approx(1.0)
+
+    def test_all_finite_logprobs_are_unchanged(self):
+        logprobs = torch.tensor([[-0.5, -1.0, -1.5]])
+        mask = torch.tensor([[1.0, 1.0, 0.0]])
+
+        masked, keep = mask_out_neg_inf_logprobs(logprobs, mask, "curr_logprobs")
+
+        assert keep.tolist() == [[1.0, 1.0, 1.0]]
+        # Positions outside the incoming mask are still zeroed, as before.
+        assert masked.tolist() == [[-0.5, -1.0, 0.0]]

@@ -32,6 +32,46 @@ from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
 
 
+ACTOR_TOKEN_COUNT_METRIC = "num_valid_actor_tokens"
+ACTOR_TOKEN_MEAN_METRICS = frozenset(
+    {"probs_ratio", "probs_ratio_clamped", "approx_entropy"}
+)
+
+
+def finalize_actor_token_metrics(metrics: dict[str, Any]) -> None:
+    """Normalize actor-mask metric numerators after global aggregation.
+
+    ``ClippedPGLossFn`` emits raw numerator fragments for metrics reduced over
+    its narrowed actor mask, together with the matching valid-token count.
+    Callers must first sum both across every microbatch and data-parallel rank,
+    then call this helper exactly once. Normalizing fragments locally would
+    weight sparse shards and packed sequences equally instead of by their
+    retained-token counts.
+
+    Args:
+        metrics: Step metrics whose loss fragments have already been summed.
+            The mapping is updated in place.
+    """
+    if ACTOR_TOKEN_COUNT_METRIC not in metrics:
+        return
+
+    num_valid_actor_tokens = float(metrics[ACTOR_TOKEN_COUNT_METRIC])
+    if num_valid_actor_tokens < 0:
+        raise ValueError(
+            f"{ACTOR_TOKEN_COUNT_METRIC} must be non-negative, "
+            f"got {num_valid_actor_tokens}"
+        )
+
+    for metric_name in ACTOR_TOKEN_MEAN_METRICS:
+        if metric_name not in metrics:
+            continue
+        metrics[metric_name] = (
+            float(metrics[metric_name]) / num_valid_actor_tokens
+            if num_valid_actor_tokens > 0
+            else 0.0
+        )
+
+
 def get_gdpo_reward_component_keys(batch) -> list[str]:
     """Return batch keys that are named reward components (e.g. reward/correctness) in sorted order."""
     return sorted(
@@ -226,7 +266,7 @@ def masked_mean(
 
 def mask_out_neg_inf_logprobs(
     logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Mask out negative infinity log probabilities.
 
     Handling sampling mask mismatch:
@@ -235,13 +275,22 @@ def mask_out_neg_inf_logprobs(
     token X may fall outside the training policy's top-k/p set -> curr_logprobs[X] = -inf, prev_logprobs[X] = -inf
     Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
 
+    The substituted ``0.0`` is *not* a neutral value: it means log p = 0, i.e.
+    p = 1, while ``generation_logprobs`` at the same position is finite and
+    typically around -5. Anything that compares the two -- the importance ratio,
+    ``token_mult_prob_error``, the sequence-level weights -- reads a large
+    fabricated difference unless the position is also dropped from the reduction
+    mask. Callers must therefore fold ``keep`` into their own mask; returning it
+    is what makes the warning above true.
+
     Args:
         logprobs: Log probabilities.
         mask: Mask.
         logprobs_name: Name of the logprobs tensor. Used for printing warning messages.
 
     Returns:
-        Masked log probabilities.
+        ``(logprobs, keep)``, where ``keep`` is 0 at positions whose logprob was
+        -inf and 1 elsewhere, with the same shape as ``mask``.
     """
     is_neginf = torch.isinf(logprobs)
     neginf_count = (is_neginf & mask.bool()).sum().item()
@@ -251,10 +300,11 @@ def mask_out_neg_inf_logprobs(
             "(policy top-k/top-p mismatch). Masking out these positions."
         )
 
-    mask = mask * (~is_neginf).float()
+    keep = (~is_neginf).to(mask.dtype)
+    mask = mask * keep
     logprobs = torch.where(mask.bool(), logprobs, 0.0)
 
-    return logprobs
+    return logprobs, keep
 
 
 def masked_var(
