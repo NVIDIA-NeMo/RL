@@ -32,18 +32,12 @@ def _fallback_routes(count: int) -> torch.Tensor:
     return torch.arange(2, dtype=torch.int16).view(1, 1, 2).expand(count, 2, 2)
 
 
-def _sampling_support(token_ids: tuple[int, ...]) -> torch.Tensor:
-    rows = [[token_id, token_id + 100, token_id + 200] for token_id in token_ids]
-    return torch.tensor(rows, dtype=torch.int32)
-
-
 def _completion(
     route_start: int,
     reward: float,
     *,
     env_token_ids: tuple[int, ...] = (30,),
     with_routes: bool = True,
-    with_sampling_mask: bool = False,
 ) -> Completion:
     message_log = [
         {
@@ -69,9 +63,6 @@ def _completion(
     if not with_routes:
         for message in message_log:
             message.pop("routed_experts")
-    if with_sampling_mask:
-        message_log[1]["sampling_mask_token_ids"] = _sampling_support((20, 21))
-        message_log[1]["sampling_mask_sizes"] = torch.tensor([3, 2], dtype=torch.int32)
     return Completion(
         message_log=message_log,
         env_extras=None,
@@ -169,48 +160,6 @@ def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
         prompt_idx=17,
     )
     assert "routed_experts" not in fields
-
-
-def test_record_to_train_batch_preserves_sampling_mask_pair() -> None:
-    record = _record(
-        [
-            _completion(
-                route_start=10,
-                reward=1.0,
-                with_routes=False,
-                with_sampling_mask=True,
-            ),
-            _completion(
-                route_start=30,
-                reward=2.0,
-                env_token_ids=(30, 31),
-                with_routes=False,
-                with_sampling_mask=True,
-            ),
-        ]
-    )
-
-    train_batch = record_to_train_batch(
-        record,
-        pad_value_dict={"token_ids": 0, "input_ids": 0},
-    )
-
-    assert train_batch["sampling_mask_token_ids"].shape == (2, 6, 3)
-    assert train_batch["sampling_mask_token_ids"].dtype == torch.int32
-    assert train_batch["sampling_mask_sizes"].dtype == torch.int32
-    assert train_batch["sampling_mask_sizes"][0, :5].tolist() == [0, 0, 3, 2, 0]
-    assert train_batch["sampling_mask_sizes"][1].tolist() == [0, 0, 3, 2, 0, 0]
-
-    _, fields, _ = pack_payload(
-        train_batch,
-        weight_version=3,
-        group_id="group",
-        prompt_idx=17,
-    )
-    assert fields["sampling_mask_token_ids"].is_nested
-    assert fields["sampling_mask_sizes"].is_nested
-    assert list(fields["sampling_mask_token_ids"].unbind())[0].shape == (5, 3)
-    assert list(fields["sampling_mask_sizes"].unbind())[1].shape == (6,)
 
 
 def _failed_completion() -> Completion:

@@ -51,13 +51,9 @@ from transformers.models.gemma3.modeling_gemma3 import (
 )
 
 from nemo_rl.algorithms.logits_sampling_utils import (
-    SamplingMask,
     TrainingSamplingParams,
-    apply_sampling_mask,
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
-    sampling_mask_from_data,
-    validate_sampling_mask_for_active_tokens,
 )
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
@@ -86,7 +82,6 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ScoreOutputSpec,
 )
-from nemo_rl.models.policy.sampling_mask_replay import sampling_mask_replay_enabled
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_runtime_env_for_policy_worker,
@@ -256,7 +251,6 @@ class DTensorPolicyWorkerImpl(
                 top_k=generation_cfg["top_k"],
                 top_p=generation_cfg["top_p"],
                 temperature=generation_cfg["temperature"],
-                replay_sampling_mask=sampling_mask_replay_enabled(config),
             )
 
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
@@ -1053,16 +1047,6 @@ class DTensorPolicyWorkerImpl(
             else self.cfg["logprob_batch_size"]
         )
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
-        replay_sampling_mask = bool(
-            self.sampling_params is not None
-            and self.sampling_params.replay_sampling_mask
-        )
-        if replay_sampling_mask and self.enable_seq_packing:
-            raise NotImplementedError(
-                "Sampling-mask replay is not supported by the legacy DTensor "
-                "packed previous-logprob path. Disable sequence packing or "
-                "sampling-mask replay."
-            )
 
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
@@ -1078,22 +1062,6 @@ class DTensorPolicyWorkerImpl(
 
         with unshard_fsdp2_model(self.model), torch.no_grad():
             data.to("cuda")
-            if replay_sampling_mask:
-                sampling_mask = sampling_mask_from_data(data)
-                if sampling_mask is None:
-                    raise ValueError(
-                        "Sampling-mask replay is enabled, but the previous-logprob "
-                        "batch has no sampling-mask metadata."
-                    )
-                active_token_mask = data["token_mask"] * data["sample_mask"].unsqueeze(
-                    -1
-                )
-                validate_sampling_mask_for_active_tokens(
-                    sampling_mask,
-                    data["input_ids"],
-                    active_token_mask,
-                )
-
             dummy_iterator = iter([])
             if self.cfg["dynamic_batching"]["enabled"]:
                 mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
@@ -1125,14 +1093,6 @@ class DTensorPolicyWorkerImpl(
             ):
                 step += 1
                 input_ids = lp_batch.get("input_ids").cuda()
-                mb_sampling_mask = (
-                    sampling_mask_from_data(lp_batch) if replay_sampling_mask else None
-                )
-                if replay_sampling_mask and mb_sampling_mask is None:
-                    raise ValueError(
-                        "Sampling-mask replay metadata was lost while creating a "
-                        "previous-logprob microbatch."
-                    )
                 input_lengths = lp_batch.get("input_lengths")
                 vlm_kwargs = lp_batch.get_multimodal_dict(
                     as_tensors=True, device=input_ids.device
@@ -1273,7 +1233,6 @@ class DTensorPolicyWorkerImpl(
                             seq_index_tensor,
                             chunk_size=logprob_chunk_size,
                             sampling_params=self.sampling_params,
-                            sampling_mask=mb_sampling_mask,
                         )
 
                         assert token_logprobs.shape[1] == seq_len - 1
@@ -1284,76 +1243,9 @@ class DTensorPolicyWorkerImpl(
                                 input_ids,
                                 chunk_size=logprob_chunk_size,
                                 sampling_params=self.sampling_params,
-                                sampling_mask=mb_sampling_mask,
                             )
                         else:
-                            if mb_sampling_mask is not None:
-                                next_tokens = input_ids[:, 1:]
-                                shifted_sampling_mask = SamplingMask(
-                                    token_ids=mb_sampling_mask.token_ids[:, 1:, :],
-                                    sizes=mb_sampling_mask.sizes[:, 1:],
-                                )
-                                if logprob_chunk_size is not None:
-                                    logits_seq_len = int(logits.shape[1]) - 1
-                                    num_chunks = (
-                                        logits_seq_len + logprob_chunk_size - 1
-                                    ) // logprob_chunk_size
-                                    chunked_token_logprobs = []
-                                    for chunk_idx in range(num_chunks):
-                                        chunk_start = chunk_idx * logprob_chunk_size
-                                        chunk_end = min(
-                                            logits_seq_len,
-                                            (chunk_idx + 1) * logprob_chunk_size,
-                                        )
-                                        chunk_target = next_tokens[
-                                            :, chunk_start:chunk_end
-                                        ]
-                                        chunk_logits = logits[
-                                            :, chunk_start:chunk_end, :
-                                        ].to(torch.float32)
-                                        chunk_logits, _ = apply_sampling_mask(
-                                            chunk_logits,
-                                            chunk_target,
-                                            SamplingMask(
-                                                token_ids=shifted_sampling_mask.token_ids[
-                                                    :, chunk_start:chunk_end, :
-                                                ],
-                                                sizes=shifted_sampling_mask.sizes[
-                                                    :, chunk_start:chunk_end
-                                                ],
-                                            ),
-                                        )
-                                        chunk_log_probs = (
-                                            torch.nn.functional.log_softmax(
-                                                chunk_logits, dim=-1
-                                            )
-                                        )
-                                        chunked_token_logprobs.append(
-                                            chunk_log_probs.gather(
-                                                dim=-1,
-                                                index=chunk_target.unsqueeze(-1),
-                                            ).squeeze(-1)
-                                        )
-                                    token_logprobs = torch.cat(
-                                        chunked_token_logprobs, dim=1
-                                    )
-                                    del chunked_token_logprobs
-                                else:
-                                    next_token_logits, _ = apply_sampling_mask(
-                                        logits[:, :-1, :].to(torch.float32),
-                                        next_tokens,
-                                        shifted_sampling_mask,
-                                    )
-                                    next_token_log_probs = (
-                                        torch.nn.functional.log_softmax(
-                                            next_token_logits, dim=-1
-                                        )
-                                    )
-                                    token_logprobs = next_token_log_probs.gather(
-                                        dim=-1, index=next_tokens.unsqueeze(-1)
-                                    ).squeeze(-1)
-                                    del next_token_log_probs
-                            elif logprob_chunk_size is not None:
+                            if logprob_chunk_size is not None:
                                 logits_seq_len = int(logits.shape[1])
                                 num_chunks = (
                                     logits_seq_len + logprob_chunk_size - 1
@@ -1445,7 +1337,7 @@ class DTensorPolicyWorkerImpl(
         token_logprobs = torch.cat(all_log_probs_padded, dim=0)
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
-        if replay_sampling_mask or need_top_k_or_top_p_filtering(self.sampling_params):
+        if need_top_k_or_top_p_filtering(self.sampling_params):
             mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
             token_logprobs = mask_out_neg_inf_logprobs(
                 token_logprobs, mask, "prev_logprobs"
@@ -1916,7 +1808,6 @@ class DTensorPolicyWorkerImpl(
                     top_k=None,  # Disable top-k
                     top_p=1.0,  # Disable top-p
                     temperature=saved_sampling_params.temperature,  # Keep temperature
-                    replay_sampling_mask=False,
                 )
             else:
                 self.sampling_params = None

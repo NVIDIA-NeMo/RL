@@ -94,7 +94,6 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.models.policy.sampling_mask_replay import sampling_mask_replay_enabled
 from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
 from nemo_rl.telemetry.config import TelemetryConfig
@@ -325,11 +324,6 @@ def setup(
 
     # Extract individual configs for easier access
     policy_config = master_config.policy
-    if sampling_mask_replay_enabled(policy_config):
-        raise ValueError(
-            "policy.sampling_mask_replay.enabled is not supported by the "
-            "classic PPO data path yet; use GRPO or disable sampling-mask replay."
-        )
     value_config = master_config.value
     generation_config = master_config.policy["generation"]
     env_configs = master_config.env

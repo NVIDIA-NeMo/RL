@@ -35,14 +35,6 @@ from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
-def test_ppo_setup_rejects_sampling_mask_replay_before_initialization() -> None:
-    from nemo_rl.algorithms import ppo as ppo_mod
-
-    master_config = SimpleNamespace(policy={"sampling_mask_replay": {"enabled": True}})
-    with pytest.raises(ValueError, match="classic PPO data path"):
-        ppo_mod.setup(master_config, MagicMock(), MagicMock(), None)
-
-
 def _make_loss_config(
     kl_penalty: float = 0.0,
     kl_type: str = "k1",

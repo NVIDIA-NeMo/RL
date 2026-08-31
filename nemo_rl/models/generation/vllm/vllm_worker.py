@@ -45,14 +45,12 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
-    resolve_vllm_sampling_mask_top_k,
     resolve_vllm_video_config,
 )
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
-    pad_and_align_sampling_mask,
 )
 from nemo_rl.models.generation.vllm.video_utils import (
     register_torchcodec_vllm_video_loader,
@@ -979,17 +977,10 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 - ``generation_lengths``: Lengths of each response
                 - ``unpadded_sequence_lengths``: Lengths of each input + generated sequence
         """
-        sampling_mask_top_k = resolve_vllm_sampling_mask_top_k(self.cfg)
-        if sampling_mask_top_k is not None and greedy:
-            raise ValueError(
-                "vLLM sampling-mask replay requires temperature > 0 and does not "
-                "support greedy generation"
-            )
-
         # Handle empty input case
         if len(data["input_ids"]) == 0:
             # Return empty BatchedDataDict with all required fields
-            empty_result = BatchedDataDict[GenerationOutputSpec](
+            return BatchedDataDict[GenerationOutputSpec](
                 {
                     "output_ids": torch.zeros((0, 0), dtype=torch.long),
                     "logprobs": torch.zeros((0, 0), dtype=torch.float),
@@ -998,14 +989,6 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                     "truncated": torch.zeros(0, dtype=torch.bool),
                 }
             )
-            if sampling_mask_top_k is not None:
-                empty_result["sampling_mask_token_ids"] = torch.zeros(
-                    (0, 0, sampling_mask_top_k), dtype=torch.int32
-                )
-                empty_result["sampling_mask_sizes"] = torch.zeros(
-                    (0, 0), dtype=torch.int32
-                )
-            return empty_result
 
         input_ids = data["input_ids"]
         input_lengths = data["input_lengths"]
@@ -1065,8 +1048,6 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
         logprobs_list = []
-        sampling_mask_token_ids_list = []
-        sampling_mask_sizes_list = []
         routed_experts_list = []
         r3_missing_routes = []
         r3_expected_routes = []
@@ -1122,20 +1103,6 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                     traceback.print_exc()
 
             logprobs_list.append(full_logprobs)
-
-            if sampling_mask_top_k is not None:
-                sampling_mask_token_ids, sampling_mask_sizes = (
-                    pad_and_align_sampling_mask(
-                        generation,
-                        generated_tokens,
-                        prompt_length=int(sequence_length),
-                        padded_length=total_length,
-                        top_k=sampling_mask_top_k,
-                        device=full_output.device,
-                    )
-                )
-                sampling_mask_token_ids_list.append(sampling_mask_token_ids)
-                sampling_mask_sizes_list.append(sampling_mask_sizes)
 
             response_length = sequence_length + len(generated_tokens)
             full_routed_experts, r3_stats = pad_and_align_routed_expert_indices(
@@ -1207,11 +1174,6 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         )
         if routed_experts_list:
             return_data["routed_experts"] = torch.stack(routed_experts_list)
-        if sampling_mask_top_k is not None:
-            return_data["sampling_mask_token_ids"] = torch.stack(
-                sampling_mask_token_ids_list
-            )
-            return_data["sampling_mask_sizes"] = torch.stack(sampling_mask_sizes_list)
         if r3_missing_routes:
             return_data["r3_routed_experts_missing_routes"] = torch.tensor(
                 r3_missing_routes, dtype=torch.long

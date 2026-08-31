@@ -72,7 +72,6 @@ from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
-from nemo_rl.models.policy.sampling_mask_replay import sampling_mask_replay_enabled
 
 _HF_CONFIG_PATCHED = False
 
@@ -373,7 +372,6 @@ def validate_and_set_config(
             top_k=generation_cfg["top_k"],
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
-            replay_sampling_mask=sampling_mask_replay_enabled(config),
         )
 
     # Setup data types

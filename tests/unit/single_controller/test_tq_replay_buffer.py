@@ -177,7 +177,6 @@ def _make_buffer(
     dp: FakeDataPlaneClient,
     *,
     require_routed_experts: bool = False,
-    require_sampling_mask: bool = False,
     checkpoint_barrier: DataPlaneCheckpointBarrier | None = None,
 ) -> TQReplayBuffer:
     buffer = TQReplayBuffer(
@@ -185,7 +184,6 @@ def _make_buffer(
         partition_id="rollout_data",
         pad_value_dict={"token_ids": 0},
         require_routed_experts=require_routed_experts,
-        require_sampling_mask=require_sampling_mask,
     )
     buffer.set_data_plane_checkpoint_barrier(
         checkpoint_barrier or DataPlaneCheckpointBarrier()
@@ -487,28 +485,6 @@ class TestTQReplayBufferReserveCommit:
         with pytest.raises(
             RuntimeError,
             match="router_replay.enabled=true requires routed_experts",
-        ):
-            _run(
-                buf.commit(
-                    group_id,
-                    _make_record(),
-                    start_weight_version=3,
-                    end_weight_version=3,
-                )
-            )
-
-        assert dp.put_calls == []
-        assert dp.depth() == 0
-        assert buf.ready_list == [False]
-
-    def test_commit_requires_sampling_mask_pair_before_tq_write(self):
-        dp = FakeDataPlaneClient()
-        buf = _make_buffer(dp, require_sampling_mask=True)
-        group_id = buf.reserve(weight_version=3)
-
-        with pytest.raises(
-            RuntimeError,
-            match="sampling_mask_replay.enabled=true requires",
         ):
             _run(
                 buf.commit(

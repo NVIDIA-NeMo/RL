@@ -53,7 +53,6 @@ from nemo_rl.models.automodel.config import (
     RuntimeConfig,
 )
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
-from nemo_rl.models.policy.sampling_mask_replay import sampling_mask_replay_enabled
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
 
 STRING_TO_DTYPE = {
@@ -265,7 +264,6 @@ def validate_and_prepare_config(
             top_k=generation_cfg["top_k"],
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
-            replay_sampling_mask=sampling_mask_replay_enabled(config),
         )
 
     # Explicitly set NCCL_CUMEM_ENABLE for non-colocated refit.

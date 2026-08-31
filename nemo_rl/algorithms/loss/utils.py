@@ -17,11 +17,8 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from nemo_rl.algorithms.logits_sampling_utils import (
-    SamplingMask,
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
-    sampling_mask_from_data,
-    validate_sampling_mask_for_active_tokens,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
@@ -41,40 +38,6 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
         ContextParallelSharder,
     )
-
-
-def _get_actor_sampling_mask(
-    data: BatchedDataDict[Any],
-    sampling_params: Optional[TrainingSamplingParams],
-) -> Optional[SamplingMask]:
-    """Return and validate replay metadata for actor logprob computation.
-
-    Reference-policy contexts disable top-k/top-p in ``sampling_params`` and
-    intentionally remain unfiltered even though the actor batch still carries
-    sampling-mask fields.
-    """
-    if sampling_params is None or not sampling_params.replay_sampling_mask:
-        return None
-
-    sampling_mask = sampling_mask_from_data(data)
-    if sampling_mask is None:
-        raise ValueError(
-            "Sampling-mask replay is enabled, but sampling_mask_token_ids and "
-            "sampling_mask_sizes are missing from the actor batch."
-        )
-
-    if "token_mask" not in data or "sample_mask" not in data:
-        raise ValueError(
-            "Sampling-mask replay requires token_mask and sample_mask so active "
-            "actor-loss positions can be validated."
-        )
-    active_token_mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-    validate_sampling_mask_for_active_tokens(
-        sampling_mask,
-        data["input_ids"],
-        active_token_mask,
-    )
-    return sampling_mask
 
 
 def prepare_loss_input(
@@ -119,19 +82,12 @@ def prepare_loss_input(
         loss_input = {"logits": logits}
 
     elif loss_fn.input_type == LossInputType.LOGPROB:
-        sampling_mask = _get_actor_sampling_mask(data, sampling_params)
         # Linear CE fusion patch returns precomputed next-token logprobs (2D tensor).
         # Keep normal path unchanged for standard logits (3D tensor).
         if (
             hasattr(loss_fn, "use_fused_linear_logprobs")
             and loss_fn.use_fused_linear_logprobs
         ):
-            if sampling_mask is not None:
-                raise NotImplementedError(
-                    "Sampling-mask replay is incompatible with fused linear "
-                    "logprobs because the fused path has already normalized "
-                    "over the full vocabulary."
-                )
             logprobs = logits
             logprobs = logprobs.to(torch.float32)
             logprobs = logprobs[:, : data["input_ids"].shape[1] - 1]
@@ -144,13 +100,12 @@ def prepare_loss_input(
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
                 sampling_params=sampling_params,
-                sampling_mask=sampling_mask,
                 chunk_size=chunk_size,
                 cp_sharder=cp_sharder,
             )
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
-        if sampling_mask is not None or need_top_k_or_top_p_filtering(sampling_params):
+        if need_top_k_or_top_p_filtering(sampling_params):
             # mask out negative infinity logprobs
             # prev_logprobs is already masked out in the previous step
             mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
@@ -418,12 +373,6 @@ def prepare_packed_loss_input(
     assert vocab_parallel_rank is not None, (
         "vocab_parallel_rank must be provided with vocab_parallel_group."
     )
-    sampling_mask = _get_actor_sampling_mask(data, sampling_params)
-    if sampling_mask is not None:
-        raise NotImplementedError(
-            "Sampling-mask replay is not yet supported by fused Megatron "
-            "sequence-packing loss. Set policy.sequence_packing.fuse_loss=false."
-        )
 
     input_ids = data["input_ids"]
     unpacked_seqlen = input_ids.shape[1]

@@ -53,8 +53,6 @@ TOKEN_ALIGNED_FIELDS = frozenset(
         "token_mask",
         "sample_mask",
         "routed_experts",
-        "sampling_mask_token_ids",
-        "sampling_mask_sizes",
     }
 )
 

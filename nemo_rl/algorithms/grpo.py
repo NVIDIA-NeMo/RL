@@ -131,11 +131,6 @@ from nemo_rl.models.megatron.router_replay import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.models.policy.sampling_mask_replay import (
-    backfill_missing_sampling_masks,
-    configure_vllm_for_sampling_mask_replay,
-    sampling_mask_replay_enabled,
-)
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     Bucket,
@@ -814,10 +809,6 @@ def setup(
     # NeMo Gym is initialized inside setup() (rather than by the caller) so its
     # spinup can overlap with vLLM model loading via deferred model load.
     enable_nemo_gym = should_use_nemo_gym(master_config)
-    configure_vllm_for_sampling_mask_replay(
-        policy_config,
-        use_nemo_gym=enable_nemo_gym,
-    )
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
@@ -2120,9 +2111,9 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
     generated assistant messages have generation_logprobs, so use that field as the
     trainable-token marker. This function mutates each message in-place by adding a
     token_loss_mask and, when missing, a zero-valued generation_logprobs tensor.
-    Router-replay routes and sampling-mask replay metadata get the same treatment,
-    so every per-token field is defined for every tokenized message before the
-    batch is flattened.
+    Router-replay routes get the same treatment via
+    :func:`backfill_missing_routed_experts`, so every per-token field is defined
+    for every tokenized message before the batch is flattened.
 
     Args:
         message_logs: Batch of tokenized message logs. Each message must contain a
@@ -2130,7 +2121,6 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
             ``generation_logprobs`` are treated as rollout-generated messages.
     """
     backfill_missing_routed_experts(message_logs)
-    backfill_missing_sampling_masks(message_logs)  # type: ignore[arg-type]
     for message_log in message_logs:
         for message in message_log:
             role = cast(str, message["role"])
@@ -2327,27 +2317,6 @@ def _preserve_router_replay_routed_experts(
         target["routed_experts"] = flat_messages["routed_experts"]
 
 
-def _preserve_sampling_mask_replay_fields(
-    target: BatchedDataDict,
-    flat_messages: BatchedDataDict,
-    policy_config: PolicyConfig,
-) -> None:
-    """Carry rollout sampling support into current-policy inputs when enabled."""
-    if not sampling_mask_replay_enabled(policy_config):
-        return
-
-    fields = ("sampling_mask_token_ids", "sampling_mask_sizes")
-    present = tuple(field in flat_messages for field in fields)
-    if not all(present):
-        missing = [field for field, has_field in zip(fields, present) if not has_field]
-        raise RuntimeError(
-            "policy.sampling_mask_replay.enabled=true requires both sampling-mask "
-            f"fields after message-log flattening; missing {missing}."
-        )
-    for field in fields:
-        target[field] = flat_messages[field]
-
-
 def _policy_dtype(policy_config: PolicyConfig) -> torch.dtype:
     """Resolve the configured policy precision to its matching torch dtype."""
     return getattr(torch, policy_config["precision"])
@@ -2370,7 +2339,6 @@ def _build_async_grpo_train_data(
         }
     )
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
-    _preserve_sampling_mask_replay_fields(train_data, flat_messages, policy_config)
     # update multimodal data unconditionally
     extra_multimodal_data = flat_messages.get_multimodal_dict(
         as_tensors=False, pixel_dtype=_policy_dtype(policy_config)
@@ -3371,7 +3339,6 @@ def grpo_train(
                     # Must precede prompt extraction: it reuses the same message
                     # dicts, so this also protects the prompt flatten below.
                     backfill_missing_routed_experts(repeated_batch["message_log"])
-                    backfill_missing_sampling_masks(repeated_batch["message_log"])
 
                     # Extract original prompt messages using the length field
                     # This correctly handles multi-turn prompts that contain assistant messages
@@ -3460,9 +3427,6 @@ def grpo_train(
                     _preserve_router_replay_routed_experts(
                         train_data, flat_messages, master_config.policy
                     )
-                    _preserve_sampling_mask_replay_fields(
-                        train_data, flat_messages, master_config.policy
-                    )
                     train_data.to("cpu")
 
                     metrics_logging_data["content"] = flat_messages["content"]
@@ -3507,9 +3471,6 @@ def grpo_train(
                     # =False short-circuits before the field is read), so a
                     # present-but-unused field here is safe.
                     _preserve_router_replay_routed_experts(
-                        logprob_data, flat_messages, master_config.policy
-                    )
-                    _preserve_sampling_mask_replay_fields(
                         logprob_data, flat_messages, master_config.policy
                     )
 
@@ -5184,7 +5145,6 @@ def async_grpo_train(
                     # Must precede prompt extraction: it reuses the same message
                     # dicts, so this also protects the prompt flatten below.
                     backfill_missing_routed_experts(repeated_batch["message_log"])
-                    backfill_missing_sampling_masks(repeated_batch["message_log"])
 
                     # Extract original prompt messages using the length field
                     # This correctly handles multi-turn prompts that contain assistant messages

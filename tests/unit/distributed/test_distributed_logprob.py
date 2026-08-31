@@ -24,11 +24,6 @@ import functools
 import pytest
 import torch
 
-from nemo_rl.algorithms.logits_sampling_utils import (
-    SamplingMask,
-    TrainingSamplingParams,
-    apply_sampling_mask,
-)
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
@@ -37,57 +32,6 @@ from nemo_rl.distributed.model_utils import (
     _compute_distributed_log_softmax,
     get_next_token_logprobs_from_logits,
 )
-
-
-def test_get_next_token_logprobs_replays_token_aligned_support() -> None:
-    """Metadata at token t must restrict the logits that predicted token t."""
-    input_ids = torch.tensor([[0, 1, 2, 3]])
-    logits = torch.tensor(
-        [
-            [
-                [0.0, 0.4, -1.0, -2.0, 1.2, 9.0],
-                [8.0, -1.0, 0.3, -2.0, -3.0, 1.4],
-                [-0.2, 7.0, -3.0, 0.5, -2.0, -1.0],
-                [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            ]
-        ],
-        requires_grad=True,
-    )
-    sampling_mask = SamplingMask(
-        token_ids=torch.tensor([[[0, 0], [1, 4], [2, 5], [3, 0]]], dtype=torch.int32),
-        sizes=torch.tensor([[0, 2, 2, 2]], dtype=torch.int32),
-    )
-
-    actual = get_next_token_logprobs_from_logits(
-        input_ids,
-        logits,
-        # These values would independently retain a different singleton. The
-        # supplied rollout support must take precedence over reconstruction.
-        sampling_params=TrainingSamplingParams(top_k=1, top_p=0.01),
-        sampling_mask=sampling_mask,
-    )
-
-    targets = input_ids[:, 1:]
-    expected_logits, expected_keep = apply_sampling_mask(
-        logits[:, :-1],
-        targets,
-        SamplingMask(
-            token_ids=sampling_mask.token_ids[:, 1:, :],
-            sizes=sampling_mask.sizes[:, 1:],
-        ),
-    )
-    expected = (
-        torch.log_softmax(expected_logits, dim=-1)
-        .gather(-1, targets.unsqueeze(-1))
-        .squeeze(-1)
-    )
-    torch.testing.assert_close(actual, expected)
-    assert torch.isfinite(actual).all()
-
-    actual.sum().backward()
-    assert logits.grad is not None
-    assert torch.equal(logits.grad[:, :-1] != 0, expected_keep)
-    assert torch.count_nonzero(logits.grad[:, -1]) == 0
 
 
 def _torch_baseline_logprob(full_logits, target):

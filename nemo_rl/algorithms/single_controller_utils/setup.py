@@ -79,7 +79,6 @@ from nemo_rl.data_plane import (
 from nemo_rl.data_plane.schema import (
     SC_ROLLOUT_SCHEMA_FIELDS,
     fields_with_optional_routed_experts,
-    fields_with_optional_sampling_mask,
 )
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
@@ -122,10 +121,6 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.policy.tq_policy import TQPolicy
-from nemo_rl.models.policy.sampling_mask_replay import (
-    configure_vllm_for_sampling_mask_replay,
-    sampling_mask_replay_enabled,
-)
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
@@ -504,10 +499,6 @@ def _build_generation(
     generation_config = master_config.policy["generation"]
     generation_config["model_name"] = master_config.policy["model_name"]
     backend = generation_config["backend"]
-    configure_vllm_for_sampling_mask_replay(
-        master_config.policy,
-        use_nemo_gym=should_use_nemo_gym(master_config),
-    )
 
     if backend == "vllm":
         vllm_config = cast(VllmConfig, generation_config)
@@ -1368,12 +1359,9 @@ def setup_single_controller(
     # concurrent; TransferQueue otherwise registers field names lazily.
     dp_client.register_partition(
         partition_id=partition_id,
-        fields=fields_with_optional_sampling_mask(
-            fields_with_optional_routed_experts(
-                SC_ROLLOUT_SCHEMA_FIELDS,
-                enabled=router_replay_enabled(policy_config),
-            ),
-            enabled=sampling_mask_replay_enabled(policy_config),
+        fields=fields_with_optional_routed_experts(
+            SC_ROLLOUT_SCHEMA_FIELDS,
+            enabled=router_replay_enabled(policy_config),
         ),
         num_samples=(
             master_config.async_rl.max_buffered_rollouts
@@ -1415,7 +1403,6 @@ def setup_single_controller(
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
         require_routed_experts=router_replay_enabled(policy_config),
-        require_sampling_mask=sampling_mask_replay_enabled(policy_config),
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,

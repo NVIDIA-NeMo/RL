@@ -35,8 +35,6 @@ from megatron.core.utils import StragglerDetector, get_model_config
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
-    sampling_mask_from_data,
-    validate_sampling_mask_for_active_tokens,
 )
 from nemo_rl.algorithms.loss import (
     DraftLossWrapper,
@@ -636,41 +634,12 @@ class LogprobsPostProcessor:
             Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
         """
         unpacked_input_ids = data_dict["input_ids"]
-        sampling_mask = None
-        if (
-            self.sampling_params is not None
-            and self.sampling_params.replay_sampling_mask
-        ):
-            sampling_mask = sampling_mask_from_data(data_dict)
-            if sampling_mask is None:
-                raise ValueError(
-                    "Sampling-mask replay is enabled, but its fields are missing "
-                    "from the prev-logprob batch."
-                )
-            active_token_mask = data_dict["token_mask"] * data_dict[
-                "sample_mask"
-            ].unsqueeze(-1)
-            validate_sampling_mask_for_active_tokens(
-                sampling_mask,
-                unpacked_input_ids,
-                active_token_mask,
-            )
 
         def processor_fn_inner(output_tensor):
             if self.use_fused_linear_logprobs:
-                if sampling_mask is not None:
-                    raise NotImplementedError(
-                        "Sampling-mask replay is incompatible with fused linear "
-                        "logprobs."
-                    )
                 token_logprobs = output_tensor.to(torch.float32)
                 token_logprobs = token_logprobs[:, : original_seq_length - 1]
             elif self.cfg["sequence_packing"]["enabled"]:
-                if sampling_mask is not None:
-                    raise NotImplementedError(
-                        "Sampling-mask replay is not yet supported for packed "
-                        "Megatron prev-logprob computation. Disable sequence packing."
-                    )
                 tp_grp = get_tensor_model_parallel_group()
                 tp_rank = get_tensor_model_parallel_rank()
                 logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
@@ -700,7 +669,6 @@ class LogprobsPostProcessor:
                     inference_only=True,
                     chunk_size=logprob_chunk_size,
                     sampling_params=self.sampling_params,
-                    sampling_mask=sampling_mask,
                 )
 
             # Prepend 0 logprob for first token to maintain same sequence length as input
@@ -709,9 +677,7 @@ class LogprobsPostProcessor:
             )
 
             # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
-            if sampling_mask is not None or need_top_k_or_top_p_filtering(
-                self.sampling_params
-            ):
+            if need_top_k_or_top_p_filtering(self.sampling_params):
                 mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
                 token_logprobs = mask_out_neg_inf_logprobs(
                     token_logprobs, mask, "prev_logprobs"
