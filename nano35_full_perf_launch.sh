@@ -111,7 +111,11 @@ USE_SNAPSHOT=0           # live worktree, same as the smoke A/B
 NRL_FORCE_REBUILD_VENVS=false
 NRL_FORCE_REBUILD_VENVS_LIST="nemo_rl.environments.nemo_gym.NemoGym,nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
 NRL_DRIVER_PYTHONPATH="/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
-NRL_DRIVER_PIP_INSTALL="orjson"
+# nemo-lens: base dep since main #3655; the image-baked /opt/nemo_rl_venv
+# (2026-08-10) predates it and --no-sync skips it, so nemo_rl.telemetry's
+# module-scope `from nemo.lens import ...` killed the driver (job 6739202).
+# Same git rev the lock pins.
+NRL_DRIVER_PIP_INSTALL="orjson nemo-lens[sdk]@git+https://github.com/NVIDIA-NeMo/Lens.git@b85578fc2b736a1804705e537001b5f45e9c715d"
 NRL_DRIVER_UV_RUN_FLAGS="--locked --no-sync"
 NRL_TQ_SKIP_RUNTIME_ENV_PIN=1
 NRL_VENV_SYNC_FROZEN=1
