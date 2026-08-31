@@ -2625,18 +2625,7 @@ def test_validate_dispatches_rollout_by_engine_mode(monkeypatch, async_engine):
 
 
 class TestDynamicSamplingIsRejected:
-    """``ppo.use_dynamic_sampling`` has no implementation on the PPO path.
-
-    ``nemo_rl.algorithms.ppo.dynamic_sampling`` was copied from ``grpo.py`` but
-    has never been called from any commit since it was added -- ``grpo.py``
-    holds the only production call site, reaching its own copy. Setup
-    nonetheless accepted the flag and scaled the rollout batch by
-    ``batch_multiplier``, so the batch grew and nothing filtered it.
-
-    Async PPO already refuses the flag (``examples/run_ppo.py``) and so does
-    the SingleController path (``single_controller_utils/config.py``); the
-    synchronous driver was the one that neither implemented nor refused it.
-    """
+    """The synchronous PPO path must reject its unimplemented sampling knob."""
 
     @staticmethod
     def _master_config(**ppo_overrides):
@@ -2677,12 +2666,18 @@ class TestDynamicSamplingIsRejected:
                 self._master_config(use_dynamic_sampling=False, batch_multiplier=2.0)
             )
 
-    def test_the_shipped_default_is_not_refused(self):
-        """The guard must not fire on the config as shipped.
+    def test_the_shipped_default_is_not_refused(self, monkeypatch):
+        """The shipped config must advance past the dynamic-sampling guard."""
 
-        Setup fails later on the mock dataset -- that is what keeps this from
-        passing vacuously if the guard were made unconditional.
-        """
-        with pytest.raises(Exception) as excinfo:
+        class ReachedDataloader(Exception):
+            pass
+
+        import nemo_rl.algorithms.ppo as ppo_mod
+
+        monkeypatch.setattr(
+            ppo_mod,
+            "StatefulDataLoader",
+            MagicMock(side_effect=ReachedDataloader),
+        )
+        with pytest.raises(ReachedDataloader):
             self._run_setup(self._master_config())
-        assert "use_dynamic_sampling" not in str(excinfo.value)
