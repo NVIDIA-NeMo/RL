@@ -71,7 +71,9 @@ def _completion(
     )
 
 
-def _record(completions: list[Completion]) -> PromptGroupRecord:
+def _record(
+    completions: list[Completion], *, loss_multiplier: float = 1.0
+) -> PromptGroupRecord:
     return PromptGroupRecord(
         prompt_idx=0,
         prompt=[
@@ -85,6 +87,7 @@ def _record(completions: list[Completion]) -> PromptGroupRecord:
         metadata={"task_name": "test"},
         completions=completions,
         rollout_metrics={},
+        loss_multiplier=loss_multiplier,
     )
 
 
@@ -252,3 +255,27 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
             "num_assistant_messages": 0,
         },
     ]
+
+
+def test_record_to_train_batch_preserves_fractional_loss_multiplier() -> None:
+    record = _record(
+        [
+            _completion(route_start=10, reward=1.0),
+            _completion(route_start=20, reward=0.0),
+        ],
+        loss_multiplier=0.25,
+    )
+
+    batch = record_to_train_batch(record, pad_value_dict={"token_ids": 0})
+
+    torch.testing.assert_close(batch["sample_mask"], torch.full((2,), 0.25))
+
+
+def test_record_to_train_batch_drops_zero_weight_prompt() -> None:
+    record = _record(
+        [_completion(route_start=10, reward=1.0)], loss_multiplier=0.0
+    )
+
+    batch = record_to_train_batch(record, pad_value_dict={"token_ids": 0})
+
+    torch.testing.assert_close(batch["sample_mask"], torch.zeros(1))

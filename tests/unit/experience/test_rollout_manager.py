@@ -691,7 +691,8 @@ def test_async_rollout_manager(
     - completions hold independent (not aliased) message_log objects
     """
     vllm_generation, tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
-    input_sample = single_multi_step_calculator_input_sample
+    input_sample = deepcopy(single_multi_step_calculator_input_sample)
+    input_sample["loss_multiplier"] = 0.25
     num_generations = 2
     max_seq_len = 1024
     max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
@@ -711,6 +712,7 @@ def test_async_rollout_manager(
     vllm_generation.finish_generation()
 
     assert isinstance(record, PromptGroupRecord)
+    assert record.loss_multiplier == 0.25
     assert len(record.completions) == num_generations, (
         f"Expected {num_generations} completions, got {len(record.completions)}"
     )
@@ -789,7 +791,8 @@ def test_async_rollout_manager_matches_original(
     TODO: remove this test together with run_async_multi_turn_rollout when the legacy path is deleted.
     """
     vllm_generation, tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
-    input_sample = single_multi_step_calculator_input_sample
+    input_sample = deepcopy(single_multi_step_calculator_input_sample)
+    input_sample["loss_multiplier"] = 0.25
     num_generations = 2
     max_seq_len = 1024
     max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
@@ -835,6 +838,7 @@ def test_async_rollout_manager_matches_original(
     # Both should produce N results
     assert len(original_batch["message_log"]) == num_generations
     assert len(record.completions) == num_generations
+    assert record.loss_multiplier == 0.25
 
     for i in range(num_generations):
         orig_msg_log = original_batch["message_log"][i]
@@ -950,7 +954,7 @@ def test_async_nemo_gym_rollout_manager(
         "extra_env_info": input_batch["extra_env_info"][0],
         "task_name": "nemo_gym",
         "idx": 0,
-        "loss_multiplier": float(input_batch["loss_multiplier"][0]),
+        "loss_multiplier": 0.25,
     }
     num_generations = 2
 
@@ -965,6 +969,7 @@ def test_async_nemo_gym_rollout_manager(
     record = asyncio.run(manager.run_rollout(single_prompt))
 
     assert isinstance(record, PromptGroupRecord)
+    assert record.loss_multiplier == 0.25
     assert len(record.completions) == num_generations, (
         f"Expected {num_generations} completions, got {len(record.completions)}"
     )

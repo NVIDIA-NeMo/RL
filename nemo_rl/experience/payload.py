@@ -107,7 +107,9 @@ def record_to_train_batch(
     total_reward = torch.tensor(
         [float(c.reward) for c in completions], dtype=torch.float32
     )
-    sample_mask = torch.ones(n, dtype=torch.float32)
+    sample_mask = torch.full(
+        (n,), float(record.loss_multiplier), dtype=torch.float32
+    )
 
     train_data: dict[str, Any] = {
         "input_ids": flat["token_ids"],
