@@ -16,14 +16,15 @@ EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
 JSON_METRICS=$EXP_DIR/metrics.json
 RUN_LOG=$EXP_DIR/run.log
+SC_ENTRYPOINT=${SC_TEST_ENTRYPOINT:-$PROJECT_ROOT/examples/run_grpo_single_controller.py}
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
 rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
-uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
-    $PROJECT_ROOT/examples/run_grpo_single_controller.py \
+uv run --group test coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
+    $SC_ENTRYPOINT \
     policy.model_name=Qwen/Qwen3-0.6B \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
@@ -48,13 +49,15 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     $@ \
     2>&1 | tee $RUN_LOG
 
-uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
+    uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-uv run tests/check_metrics.py $JSON_METRICS \
-    'max(data["train/num_masked_seqs_by_logprob_error"]) == 0' \
-    'max(data["train/max_seq_mult_prob_error"]) < 1000' \
-    'max(data["train/gen_kl_error"]) < 0.002' \
-    'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
-    'max(data["train/probs_ratio_clamped_min"]) < 1.21' \
-    'min(data["train/probs_ratio_clamped_max"]) > 0.79' \
-    'max(data["train/probs_ratio_clamped_max"]) < 1.21'
+    uv run tests/check_metrics.py $JSON_METRICS \
+        'max(data["train/num_masked_seqs_by_logprob_error"]) == 0' \
+        'max(data["train/max_seq_mult_prob_error"]) < 1000' \
+        'max(data["train/gen_kl_error"]) < 0.002' \
+        'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
+        'max(data["train/probs_ratio_clamped_min"]) < 1.21' \
+        'min(data["train/probs_ratio_clamped_max"]) > 0.79' \
+        'max(data["train/probs_ratio_clamped_max"]) < 1.21'
+fi

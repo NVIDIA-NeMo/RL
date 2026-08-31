@@ -63,6 +63,7 @@ from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.utils import load_quantization_recipe
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
@@ -232,6 +233,7 @@ from nemo_rl.models.generation.megatron.config import (
 from nemo_rl.models.megatron.community_import import (
     import_model_from_hf_name,
     iter_vlm_config_overrides,
+    megatron_conversion_is_complete,
 )
 from nemo_rl.models.megatron.config import (
     ColocatedReshardPlan,
@@ -311,8 +313,21 @@ def destroy_parallel_state():
         pass
 
 
-def setup_distributed() -> None:
+def configure_refit_environment(config) -> None:
+    """Set the refit allocator mode before NCCL caches the value."""
+    generation_cfg = config.get("generation")
+    if generation_cfg is not None and not generation_cfg["colocated"]["enabled"]:
+        # Explicitly set NCCL_CUMEM_ENABLE for non-colocated refit.
+        # SGLang requires 0; the other refit communicators require 1.
+        # NCCL caches this process-wide at its first communicator creation, so
+        # set it before the training process group. See issue #564.
+        backend = generation_cfg["backend"]
+        os.environ["NCCL_CUMEM_ENABLE"] = "0" if backend == "sglang" else "1"
+
+
+def setup_distributed(config) -> None:
     """Handle NCCL settings, dtype mapping, and basic config setup."""
+    configure_refit_environment(config)
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles
     configure_dynamo_cache()
@@ -329,6 +344,8 @@ def validate_and_set_config(
     pretrained_path,
     weights_path,
     optimizer_path,
+    *,
+    skip_weight_load: bool = False,
 ):
     # inference_optimized layers hard-require SP with TP>1; fail here with the config key.
     # This guards the training cfg; the inference cfg is guarded in
@@ -356,11 +373,6 @@ def validate_and_set_config(
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
         )
-
-    # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
-    # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
-    if not is_generation_colocated:
-        os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
     # Setup data types
     dtype_map = {
@@ -410,6 +422,7 @@ def validate_and_set_config(
         pretrained_path,
         weights_path,
         optimizer_path,
+        skip_weight_load=skip_weight_load,
     )
 
     final_padded_vocab_size = calculate_padded_vocab_size(
@@ -576,9 +589,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
         overrides_hash = _get_hf_config_overrides_hash(hf_config_overrides)
         hf_model_subdir = f"{hf_model_subdir}__hfovr_{overrides_hash}"
     pretrained_path = os.path.join(get_megatron_checkpoint_dir(), hf_model_subdir)
-    pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
-        os.path.join(pretrained_path, "iter_0000000")
-    )
+    pt_checkpoint_exists = megatron_conversion_is_complete(pretrained_path)
     return hf_model_name, pretrained_path, pt_checkpoint_exists
 
 
@@ -590,16 +601,30 @@ def setup_model_config(
     pretrained_path: str,
     weights_path: Optional[str] = None,
     optimizer_path: Optional[str] = None,
+    *,
+    skip_weight_load: bool = False,
 ) -> tuple[ConfigContainer, Any]:
-    """Handle all the model configuration logic."""
+    """Handle all the model configuration logic.
+
+    Args:
+        config: Policy config.
+        rank: Global rank (used in error messages).
+        dtype: Training dtype.
+        hf_model_name: HF model id (or local path).
+        pretrained_path: Path to the pretrained Megatron checkpoint.
+        weights_path: Path to save/load training weights.
+        optimizer_path: Path to the optimizer state (None if not resuming).
+        skip_weight_load: This policy never loads the checkpoint (weights arrive via refit).
+    """
     pretrained_ckpt = config.get("pretrained_checkpoint")
     fmt = pretrained_ckpt["format"] if pretrained_ckpt is not None else None
     validate_router_replay_config(config)
 
-    if fmt == "megatron_lm":
-        # For megatron_lm format: build the model config from the HF architecture.
-        # pretrained_path has already been resolved to a specific iter dir by
-        # validate_model_paths, so no conversion step is needed.
+    derive_provider_from_hf = fmt == "megatron_lm" or (
+        skip_weight_load and fmt != "megatron_bridge"
+    )
+
+    if derive_provider_from_hf:
         from transformers import AutoConfig
 
         hf_config_overrides = config.get("hf_config_overrides", {}) or {}
@@ -709,8 +734,8 @@ def setup_model_config(
 
     # Reconstructed providers must be finalized so derived fields reflect the
     # merged config. Without overrides, preserve the existing checkpoint-load
-    # behavior: only megatron_lm providers need finalization here.
-    if fmt == "megatron_lm" or model_overrides:
+    # behavior: only HF-derived providers need finalization here.
+    if derive_provider_from_hf or model_overrides:
         model_cfg.finalize()
 
     model_cfg.__post_init__()
@@ -722,23 +747,26 @@ def setup_model_config(
         fp8_cfg and fp8_cfg.get("enabled", False) and fp8_cfg.get("fp8_param", False)
     )
 
+    # Refit-fed policies never read the pretrained checkpoint (weights arrive via refit).
+    ckpt_pretrained_path: Optional[str] = None if skip_weight_load else pretrained_path
+
     # When fp8_param starts from a pretrained checkpoint, model params may already
     # be quantized before optimizer main params are initialized. Load main params
     # from the checkpoint state dict to preserve the original checkpoint precision.
     load_main_params_from_ckpt = (
         fp8_param_enabled
-        and pretrained_path is not None
+        and ckpt_pretrained_path is not None
         and weights_path is None
         and optimizer_path is None
     )
 
-    # Create checkpoint configs
+    # Create checkpoint configs. A refit-fed policy neither saves nor loads checkpoints.
     checkpoint_config = _create_checkpoint_config(
-        pretrained_path,
+        ckpt_pretrained_path,
         weights_path,
         optimizer_path,
         load_main_params_from_ckpt,
-        ckpt_cfg=config["megatron_cfg"].get("checkpoint"),
+        ckpt_cfg=None if skip_weight_load else config["megatron_cfg"].get("checkpoint"),
     )
 
     # Validate training configuration
@@ -1040,6 +1068,74 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.mtp_detach_heads = megatron_cfg["mtp_detach_heads"]
 
 
+def _quant_recipe_name(recipe: Any) -> str | None:
+    if recipe is None:
+        return None
+    return str(getattr(recipe, "value", recipe))
+
+
+def _validate_te_precision_config(
+    quant_recipe: Any, fp8_cfg: Mapping[str, Any] | None
+) -> None:
+    fp8_cfg_enabled = fp8_cfg is not None and fp8_cfg.get("enabled", False)
+    fp8_cfg_recipe = (
+        _quant_recipe_name(fp8_cfg.get("fp8_recipe")) if fp8_cfg_enabled else None
+    )
+
+    # A recipe can store primary weights in FP8/FP4 through its own
+    # fp8_param/fp4_param fields, which are separate from fp8_cfg.fp8_param.
+    # NeMo-RL derives sequence padding, refit export, and reshard validation
+    # from fp8_cfg alone, so such weights would reach the inference engine as
+    # if they were BF16. Reject until the refit path understands them.
+    for config_key in sorted({m.config_key for m in quant_recipe.matchers}):
+        payload = quant_recipe.configs.get(config_key) or {}
+        for block in ("training_recipe", "evaluation_recipe"):
+            block_cfg = payload.get(block) or {}
+            if block_cfg.get("fp8_param") or block_cfg.get("fp4_param"):
+                raise ValueError(
+                    "megatron_cfg.te_precision_config_file sets fp8_param or "
+                    f"fp4_param in '{config_key}.{block}'. NeMo-RL reads "
+                    "megatron_cfg.fp8_cfg for all FP8 behavior, so these "
+                    "weights would be sent to the inference engine as BF16. "
+                    "Use megatron_cfg.fp8_cfg for FP8 parameter storage."
+                )
+
+            if not fp8_cfg_enabled:
+                continue
+
+            fp4_recipe = _quant_recipe_name(block_cfg.get("fp4_quantization_recipe"))
+            if fp4_recipe is not None:
+                raise ValueError(
+                    "megatron_cfg.te_precision_config_file sets "
+                    f"fp4_quantization_recipe={fp4_recipe!r} in "
+                    f"'{config_key}.{block}', but megatron_cfg.fp8_cfg is enabled. "
+                    "NeMo-RL derives sequence padding and FP8 refit behavior from "
+                    "megatron_cfg.fp8_cfg.fp8_recipe, so mixed FP4/FP8 precision "
+                    "recipes are not supported."
+                )
+
+            fp8_recipe = _quant_recipe_name(block_cfg.get("fp8_quantization_recipe"))
+            if fp8_recipe is None:
+                continue
+            if fp8_cfg_recipe is None:
+                raise ValueError(
+                    "megatron_cfg.te_precision_config_file sets "
+                    f"fp8_quantization_recipe={fp8_recipe!r} in "
+                    f"'{config_key}.{block}', but megatron_cfg.fp8_cfg.fp8_recipe "
+                    "is not set. Set megatron_cfg.fp8_cfg.fp8_recipe to the same "
+                    "recipe or remove the per-module FP8 recipe."
+                )
+            if fp8_recipe != fp8_cfg_recipe:
+                raise ValueError(
+                    "megatron_cfg.te_precision_config_file sets "
+                    f"fp8_quantization_recipe={fp8_recipe!r} in "
+                    f"'{config_key}.{block}', but megatron_cfg.fp8_cfg.fp8_recipe "
+                    f"is {fp8_cfg_recipe!r}. NeMo-RL derives sequence padding and "
+                    "FP8 refit behavior from megatron_cfg.fp8_cfg.fp8_recipe, so "
+                    "mixed FP8 precision recipes are not supported."
+                )
+
+
 def _apply_precision_config(
     model_cfg: Any, config: PolicyConfig, dtype: torch.dtype
 ) -> None:
@@ -1062,6 +1158,29 @@ def _apply_precision_config(
         "float16": torch.float16,
     }
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
+
+    te_precision_config_file = config["megatron_cfg"].get("te_precision_config_file")
+    if te_precision_config_file is not None:
+        te_precision_config_exists = os.path.isfile(te_precision_config_file)
+        if not te_precision_config_exists:
+            raise FileNotFoundError(
+                "megatron_cfg.te_precision_config_file does not exist: "
+                f"{te_precision_config_file}"
+            )
+        fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+        fp8_cfg_enabled = fp8_cfg is not None and fp8_cfg.get("enabled", False)
+        if fp8_cfg_enabled:
+            warnings.warn(
+                "Both megatron_cfg.fp8_cfg and megatron_cfg.te_precision_config_file "
+                "are set; modules matched by the precision recipe use the recipe's "
+                "per-module quantization config instead of fp8_cfg.",
+                stacklevel=2,
+            )
+        # NeMo-RL constructs TransformerConfig directly and therefore bypasses
+        # Megatron-LM's CLI path that normally turns this file into quant_recipe.
+        quant_recipe = load_quantization_recipe(te_precision_config_file)
+        _validate_te_precision_config(quant_recipe, fp8_cfg)
+        model_cfg.quant_recipe = quant_recipe
 
 
 def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -1249,7 +1368,7 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
 
 
 def _create_checkpoint_config(
-    pretrained_path: str,
+    pretrained_path: Optional[str],
     weights_path: Optional[str],
     optimizer_path: Optional[str],
     load_main_params_from_ckpt: bool = False,
@@ -1386,6 +1505,14 @@ def _create_megatron_config(
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
+    # OptimizerConfig.__post_init__ treats fp8_recipe=None as "no fp8 params" and
+    # lets the precision-aware optimizer keep fp32 masters inside FusedAdam,
+    # leaving None placeholders in shard_fp32_from_float16_groups; with
+    # reuse_grad_buf_for_mxfp8_param_ag the shared param buffer must be refilled
+    # from those masters each step, so the recipe has to be plumbed to the
+    # optimizer just like Megatron pretrain's get_megatron_optimizer_config does.
+    if fp8_cfg is not None and fp8_cfg.get("enabled", False):
+        optimizer_kwargs["fp8_recipe"] = fp8_cfg.get("fp8_recipe")
 
     # Fused linear logprobs run the decoder but read output_layer.weight directly
     # instead of calling output_layer.forward(). Megatron's distributed-optimizer
@@ -2044,6 +2171,7 @@ def handle_model_import(
         model_post_wrap_hook=model_post_wrap_hook,
         transformer_layer_spec=transformer_layer_spec,
         mamba_stack_spec=mamba_stack_spec,
+        overwrite=force_reconvert,
         **hf_config_overrides,
     )
 

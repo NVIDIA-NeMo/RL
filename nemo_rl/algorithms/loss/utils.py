@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -29,12 +29,16 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     _get_tokens_on_this_cp_rank,
     from_parallel_logits_to_logprobs_packed_sequences,
-    gather_logits_at_global_indices,
     gather_vocab_parallel_logprobs_at_indices,
+    get_cp_sharded_next_token_logprobs,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
-    vocab_parallel_log_softmax,
 )
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.context_parallel import (
+        ContextParallelSharder,
+    )
 
 
 def prepare_loss_input(
@@ -47,6 +51,7 @@ def prepare_loss_input(
     sampling_params: Optional[TrainingSamplingParams] = None,
     d2t: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 
@@ -62,6 +67,9 @@ def prepare_loss_input(
         chunk_size: Sequence-dim chunk size for the vocab-parallel logprob
             computation (policy.logprob_chunk_size); avoids materializing
             full-size float32 logits during training.
+        cp_sharder: Automodel ``ContextParallelSharder`` owning this forward's
+            sequence layout (V2 automodel worker with cp_size > 1); ``logits``
+            are then this rank's CP-local shard while ``data`` stays canonical.
 
     Notes:
         vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
@@ -94,6 +102,7 @@ def prepare_loss_input(
                 context_parallel_group=context_parallel_group,
                 sampling_params=sampling_params,
                 chunk_size=chunk_size,
+                cp_sharder=cp_sharder,
             )
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
@@ -118,6 +127,7 @@ def prepare_loss_input(
                     sampling_params=None,  # no filtering
                     # Only reachable with top-k/top-p sampling active that has its own kernel path so don't chunk here
                     chunk_size=None,
+                    cp_sharder=cp_sharder,
                 )
 
         loss_input = {"next_token_logprobs": logprobs}
@@ -153,31 +163,25 @@ def prepare_loss_input(
             vocab_start_index = 0
             vocab_end_index = logits.shape[-1]
 
-        local_logprobs = vocab_parallel_log_softmax(
-            logits,
-            temperature=1.0,
-            tp_group=active_tp_group,
+        target_indices = (
+            data["input_ids"]
+            .roll(shifts=-1, dims=-1)
+            .to(device=logits.device, dtype=torch.long)
+            .unsqueeze(-1)
         )
-        current_support_logprobs = gather_logits_at_global_indices(
-            local_logprobs,
-            support_indices,
+        selected_indices = torch.cat([support_indices, target_indices], dim=-1)
+        selected_logprobs = gather_vocab_parallel_logprobs_at_indices(
+            logits,
+            selected_indices,
             tp_group=active_tp_group,
             vocab_start_index=vocab_start_index,
             vocab_end_index=vocab_end_index,
-        )
-        current_target_logprobs = get_next_token_logprobs_from_logits(
-            input_ids=data["input_ids"],
-            next_token_logits=logits,
-            seq_index=data.get("seq_index", None),
-            vocab_parallel_rank=vocab_parallel_rank,
-            vocab_parallel_group=vocab_parallel_group,
-            context_parallel_group=None,
-            sampling_params=sampling_params,
             chunk_size=chunk_size,
         )
+        support_size = support_indices.shape[-1]
         loss_input = {
-            "next_token_logprobs": current_target_logprobs,
-            "current_support_logprobs": current_support_logprobs[:, :-1],
+            "next_token_logprobs": selected_logprobs[:, :-1, support_size],
+            "current_support_logprobs": selected_logprobs[:, :-1, :support_size],
         }
 
     elif loss_fn.input_type == LossInputType.DISTILLATION:
@@ -192,6 +196,7 @@ def prepare_loss_input(
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
+                cp_sharder=cp_sharder,
             )
         )
 
@@ -219,6 +224,7 @@ def prepare_loss_input(
             projection_matrix_paths=loss_fn.projection_matrix_paths,
             vocab_parallel_group=vocab_parallel_group,
             context_parallel_group=context_parallel_group,
+            cp_sharder=cp_sharder,
         )
         loss_input = {
             "logits": logits,
@@ -228,6 +234,55 @@ def prepare_loss_input(
             "tp_group": tp_group,
             "cp_group": cp_group,
         }
+        if cp_sharder is not None:
+            next_token_logprobs = get_cp_sharded_next_token_logprobs(
+                logits,
+                data["input_ids"],
+                cp_sharder,
+                chunk_size=chunk_size,
+            )
+            # The sharder gathers canonical log-probabilities on every CP rank.
+            # Give each rank one disjoint canonical window for CE backward so
+            # every token contributes exactly once across the CP group. Append
+            # the unused final-token slot first so partitioning uses the original
+            # sequence length rather than the next-token length.
+            full_logprobs = torch.cat(
+                [next_token_logprobs, torch.zeros_like(next_token_logprobs[:, :1])],
+                dim=1,
+            )
+            cp_size = (
+                torch.distributed.get_world_size(context_parallel_group)
+                if context_parallel_group is not None
+                else 1
+            )
+            full_seq_len = full_logprobs.shape[1]
+            if full_seq_len % cp_size != 0:
+                raise ValueError(
+                    "Student sequence length must be divisible by the student "
+                    "context parallel size, but got "
+                    f"sequence_length={full_seq_len}, cp_size={cp_size}. "
+                    "Set policy.make_sequence_length_divisible_by to a multiple of "
+                    "policy.dtensor_cfg.context_parallel_size."
+                )
+            cp_rank = (
+                torch.distributed.get_rank(context_parallel_group)
+                if context_parallel_group is not None
+                else 0
+            )
+            local_seq_len = full_seq_len // cp_size
+            seq_start = cp_rank * local_seq_len
+            next_token_mask = (
+                data["token_mask"].to(full_logprobs.device).roll(shifts=-1, dims=1)
+            )
+            next_token_mask[:, -1] = 0
+            loss_input.update(
+                student_next_token_logprobs=full_logprobs.narrow(
+                    1, seq_start, local_seq_len
+                ).contiguous(),
+                student_next_token_mask=next_token_mask.narrow(
+                    1, seq_start, local_seq_len
+                ).contiguous(),
+            )
     elif loss_fn.input_type == LossInputType.DRAFT:
         from megatron.core.transformer.multi_token_prediction import roll_tensor
 

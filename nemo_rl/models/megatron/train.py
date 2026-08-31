@@ -53,9 +53,7 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
-    gather_logits_at_global_indices,
     gather_vocab_parallel_logprobs_at_indices,
-    vocab_parallel_log_softmax,
 )
 from nemo_rl.models.megatron.config import MegatronModule
 from nemo_rl.models.megatron.data import ProcessedMicrobatch
@@ -273,6 +271,7 @@ def forward_with_post_processing_fn(
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
     mtp_loss_mask = processed_mb.mtp_loss_mask
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
+    original_seq_length = processed_mb.original_seq_length
     media_token_validity_mask = processed_mb.media_token_validity_mask
 
     if use_router_replay:
@@ -354,15 +353,19 @@ def forward_with_post_processing_fn(
             global_valid_toks=global_valid_toks,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
+        assert original_seq_length is not None
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             input_ids=input_ids,
             cu_seqlens_padded=cu_seqlens_padded,
+            original_seq_length=original_seq_length,
         )
     elif isinstance(post_processing_fn, TopkLogitsPostProcessor):
+        assert original_seq_length is not None
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
+            original_seq_length=original_seq_length,
         )
     elif isinstance(post_processing_fn, SupportLogprobsPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(data_dict=data_dict)
@@ -624,6 +627,7 @@ class LogprobsPostProcessor:
         data_dict: BatchedDataDict[Any],
         input_ids: torch.Tensor,
         cu_seqlens_padded: torch.Tensor,
+        original_seq_length: int,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
 
@@ -634,12 +638,12 @@ class LogprobsPostProcessor:
             data_dict: Batched data dictionary containing input sequences
             input_ids: Processed input token IDs
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
+            original_seq_length: Sequence width before dense padding was applied
 
         Returns:
             Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
         """
         unpacked_input_ids = data_dict["input_ids"]
-        original_seq_length = unpacked_input_ids.shape[1]
 
         def processor_fn_inner(output_tensor):
             if self.use_fused_linear_logprobs:
@@ -689,6 +693,8 @@ class LogprobsPostProcessor:
                     token_logprobs, mask, "prev_logprobs"
                 )
 
+            token_logprobs = token_logprobs[:, :original_seq_length]
+
             return torch.tensor(0.0, device=token_logprobs.device), {
                 "logprobs": token_logprobs
             }
@@ -706,6 +712,7 @@ class TopkLogitsPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
         cu_seqlens_padded: torch.Tensor,
+        original_seq_length: int,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes top-k logits and indices.
 
@@ -716,6 +723,7 @@ class TopkLogitsPostProcessor:
         Args:
             data_dict: Batched data dictionary
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
+            original_seq_length: Sequence width before dense padding was applied
 
         Returns:
             Callable: Function that takes output tensor and returns a dummy loss
@@ -928,20 +936,22 @@ class TopkLogitsPostProcessor:
                 return output_tensor.new_zeros(()), result
             else:
                 result = {
-                    "topk_logits": topk_vals_full,
-                    "topk_indices": topk_idx_full,
+                    "topk_logits": topk_vals_full[:, :original_seq_length],
+                    "topk_indices": topk_idx_full[:, :original_seq_length],
                 }
                 if self.return_logprobs:
                     assert support_logprobs_full is not None
                     assert target_logprobs_full is not None
-                    result["topk_logprobs"] = support_logprobs_full
+                    result["topk_logprobs"] = support_logprobs_full[
+                        :, :original_seq_length
+                    ]
                     result["logprobs"] = torch.cat(
                         [
                             torch.zeros_like(target_logprobs_full[:, :1]),
                             target_logprobs_full[:, :-1],
                         ],
                         dim=1,
-                    )
+                    )[:, :original_seq_length]
                 return output_tensor.new_zeros(()), result
 
         return processor_fn_inner
@@ -992,17 +1002,13 @@ class SupportLogprobsPostProcessor:
             vocab_shard_size = output_tensor.shape[-1]
             vocab_start_index = tp_rank * vocab_shard_size
             active_tp_grp = tp_grp if torch.distributed.is_initialized() else None
-            local_logprobs = vocab_parallel_log_softmax(
+            support_logprobs = gather_vocab_parallel_logprobs_at_indices(
                 output_tensor,
-                temperature=1.0,
-                tp_group=active_tp_grp,
-            )
-            support_logprobs = gather_logits_at_global_indices(
-                local_logprobs,
                 support_indices.to(device=output_tensor.device, dtype=torch.long),
                 tp_group=active_tp_grp,
                 vocab_start_index=vocab_start_index,
                 vocab_end_index=vocab_start_index + vocab_shard_size,
+                chunk_size=self.cfg.get("logprob_chunk_size", None),
             )
             return output_tensor.new_zeros(()), {"support_logprobs": support_logprobs}
 

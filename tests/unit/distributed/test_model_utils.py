@@ -43,7 +43,21 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 
 
-def test_gather_vocab_parallel_logprobs_at_indices_chunks_and_keeps_gradients():
+def test_gather_vocab_parallel_logprobs_at_indices_chunks_and_keeps_gradients(
+    monkeypatch,
+):
+    from nemo_rl.distributed.model_utils import vocab_parallel_log_softmax
+
+    chunk_seq_lens = []
+
+    def _recording_log_softmax(logits, **kwargs):
+        chunk_seq_lens.append(logits.shape[1])
+        return vocab_parallel_log_softmax(logits, **kwargs)
+
+    monkeypatch.setattr(
+        "nemo_rl.distributed.model_utils.vocab_parallel_log_softmax",
+        _recording_log_softmax,
+    )
     logits = torch.tensor(
         [
             [
@@ -67,6 +81,7 @@ def test_gather_vocab_parallel_logprobs_at_indices_chunks_and_keeps_gradients():
     )
     expected = logits.log_softmax(dim=-1).gather(-1, indices)
 
+    assert chunk_seq_lens == [2, 2, 1]
     torch.testing.assert_close(actual, expected)
     actual.sum().backward()
     assert logits.grad is not None
