@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import math
 import os
 import subprocess
@@ -521,16 +522,19 @@ class NemoGym(EnvironmentInterface):
                 "serve rollouts until it is spun up again."
             )
 
-    def health_check(self) -> None:
+    async def health_check(self) -> None:
         """Raise if the Gym head server or any subprocess server has died.
 
         Thin wrapper over NeMo-Gym's own ``RunHelper.poll``, which is what ``gym env
         start`` calls every 60s from ``run_forever``. NeMo-RL only calls ``rh.start``,
         so without this the check Gym already implements never runs and a dead tool
         server surfaces as unexplained rollout timeouts instead of a named process.
+
+        Run the synchronous poll in a worker thread so this probe does not block
+        concurrent rollouts on the actor's event loop.
         """
         self._require_spinup()
-        self.rh.poll()
+        await asyncio.to_thread(self.rh.poll)
 
     def _spinup(self) -> None:
         """Start the NeMo-Gym head server and rollout collection helper.

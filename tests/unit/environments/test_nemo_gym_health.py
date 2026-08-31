@@ -24,6 +24,8 @@ __init__ only, which does not start the Gym servers, so a restarted NemoGym reac
 state and previously surfaced it as an AttributeError from deep inside a rollout.
 """
 
+import asyncio
+
 import pytest
 
 from nemo_rl.environments.nemo_gym import NemoGym
@@ -58,8 +60,22 @@ class TestHealthCheck:
     def test_a_healthy_gym_polls_the_run_helper(self):
         env = _unspun()
         env.rh = _FakeRunHelper()
-        env.health_check()
+        asyncio.run(env.health_check())
         assert env.rh.polls == 1
+
+    def test_poll_runs_off_the_actor_event_loop(self, monkeypatch):
+        env = _unspun()
+        env.rh = _FakeRunHelper()
+        submitted = []
+
+        async def _to_thread(function):
+            submitted.append(function)
+            function()
+
+        monkeypatch.setattr(asyncio, "to_thread", _to_thread)
+        asyncio.run(env.health_check())
+
+        assert submitted == [env.rh.poll]
 
     def test_a_dead_subprocess_server_propagates_with_its_name(self):
         env = _unspun()
@@ -67,21 +83,19 @@ class TestHealthCheck:
             RuntimeError("Process `workplace_assistant` finished unexpectedly!")
         )
         with pytest.raises(RuntimeError, match="workplace_assistant"):
-            env.health_check()
+            asyncio.run(env.health_check())
 
 
 class TestUnspunActor:
     def test_health_check_explains_the_restarted_actor_state(self):
         with pytest.raises(RuntimeError, match="_spinup\\(\\) was never called"):
-            _unspun().health_check()
+            asyncio.run(_unspun().health_check())
 
     def test_run_rollouts_refuses_rather_than_raising_attribute_error(self):
         env = _unspun()
         with pytest.raises(RuntimeError, match="_spinup\\(\\) was never called"):
             # run_rollouts is an async generator, so the guard fires on first advance.
             gen = env.run_rollouts([{"agent_ref": {"name": "a"}}], None, "timing/x")
-            import asyncio
-
             asyncio.run(anext(gen))
 
     def test_shutdown_is_a_noop_so_teardown_does_not_mask_the_real_error(self):
