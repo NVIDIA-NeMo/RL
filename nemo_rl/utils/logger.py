@@ -425,19 +425,8 @@ class WandbLogger(LoggerInterface):
             self.run = None
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
-        """Log histogram metrics to wandb.
-
-        Args:
-            histogram: List of histogram values
-            step: Global step value
-            name: Name of the metric
-        """
-        try:
-            self.run.log({name: wandb.Histogram(histogram)}, step=step)
-        except ValueError:
-            # When all values are identical, numpy cannot create finite-sized bins.
-            # Log the scalar value instead.
-            self.run.log({name: histogram[0] if len(histogram) > 0 else 0}, step=step)
+        """Skip histogram metrics for wandb to keep history payloads bounded."""
+        return None
 
 
 class SwanlabLogger(LoggerInterface):
