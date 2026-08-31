@@ -18,6 +18,7 @@ import torch
 
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
 
 def rescale_loss_metrics(
@@ -351,8 +352,8 @@ def reconstruct_opd_full_teacher_logits(
 
 def _pack_input_ids(
     input_ids: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_q_padded: torch.Tensor,
+    cu_seqlens_q: CpuIntTuple,
+    cu_seqlens_q_padded: CpuIntTuple,
     cp_rank: int = 0,
     cp_size: int = 1,
     roll_shift: int = 0,
@@ -375,14 +376,14 @@ def _pack_input_ids(
             next-token prediction.
     """
     batch_size = input_ids.shape[0]
-    total_packed_len = int(cu_seqlens_q_padded[-1].item()) // cp_size
+    total_packed_len = cu_seqlens_q_padded[-1] // cp_size
     packed = torch.zeros(
         total_packed_len, dtype=input_ids.dtype, device=input_ids.device
     )
     for i in range(batch_size):
-        actual_len = int((cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item())
-        padded_len = int((cu_seqlens_q_padded[i + 1] - cu_seqlens_q_padded[i]).item())
-        packed_start = int(cu_seqlens_q_padded[i].item())
+        actual_len = cu_seqlens_q[i + 1] - cu_seqlens_q[i]
+        padded_len = cu_seqlens_q_padded[i + 1] - cu_seqlens_q_padded[i]
+        packed_start = cu_seqlens_q_padded[i]
         seq = torch.zeros(padded_len, dtype=input_ids.dtype, device=input_ids.device)
         # The packer absorbs bin-level alignment padding into the last
         # sequence's effective length (see _get_pack_sequence_parameters_for_megatron),
