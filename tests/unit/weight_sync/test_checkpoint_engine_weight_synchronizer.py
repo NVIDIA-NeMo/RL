@@ -548,13 +548,16 @@ class TestCheckpointEngineWeightSynchronizer:
         )
         sync._checkpoint_engine_ready = True
 
-        # Plain recovery failure: rolled back inside _recover -> retryable.
+        # Plain recovery failure: rolled back inside _recover -> retryable,
+        # but readiness must not survive it — the rolled-back ``None`` slots
+        # invalidate whatever the communicator thought it was bound to.
         generation.recover_updatable_engines.side_effect = RuntimeError(
             "replacement init died"
         )
         with pytest.raises(RuntimeError, match="replacement init died"):
             sync.sync_weights()
         assert sync._terminal_error is None
+        assert sync._checkpoint_engine_ready is False
         with pytest.raises(RuntimeError, match="replacement init died"):
             sync.sync_weights()
         assert generation.recover_updatable_engines.call_count == 2
@@ -570,6 +573,74 @@ class TestCheckpointEngineWeightSynchronizer:
         with pytest.raises(RuntimeError, match="terminal error state"):
             sync.sync_weights()
         generation.recover_updatable_engines.assert_not_called()
+
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_sglang_recovery_rebind_failure_is_terminal_with_zero_later_rpcs(
+        self, mock_ray
+    ):
+        """A failed rebind of a recovered cohort latches; later syncs are RPC-free.
+
+        NIXL ``prepare()``/``add_remote_agent()`` are not transactional, so
+        the recovery-forced re-init failing partway leaves hidden partial
+        state — the first sync must latch terminal and every subsequent sync
+        must raise before issuing a single session or transfer RPC.
+        """
+        policy = _mock_policy()
+        policy.worker_group = _CheckpointWorkerGroup()
+        generation = _mock_generation(cfg={"backend": SGLANG_BACKEND})
+        generation.sglang_cfg = {"sglang_cfg": {"use_fault_tolerance": True}}
+        generation.run_checkpoint_engine_method.return_value = ["generation-init"]
+        generation.get_updatable_engines_and_lock.return_value = (
+            ["engine-0"],
+            object(),
+            1,  # a freshly recovered replacement forces the rebind
+            [1],
+            [0],
+        )
+        sync = CheckpointEngineWeightSynchronizer(
+            policy, generation, _checkpoint_engine_cfg()
+        )
+        sync._checkpoint_engine_ready = True
+        sync._bucket_size_bytes = 1024**2
+        mock_ray.get.side_effect = RuntimeError("rebind died")
+
+        with pytest.raises(RuntimeError, match="rebind died"):
+            sync.sync_weights()
+        assert sync._terminal_error is not None
+
+        generation.reset_mock()
+        policy.worker_group.calls.clear()
+        mock_ray.reset_mock()
+        mock_ray.get.side_effect = None
+        with pytest.raises(RuntimeError, match="terminal error state"):
+            sync.sync_weights()
+        generation.recover_updatable_engines.assert_not_called()
+        generation.run_checkpoint_engine_method.assert_not_called()
+        assert policy.worker_group.calls == []
+        mock_ray.get.assert_not_called()
+
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_shutdown_after_terminal_latch_is_a_zero_rpc_noop(self, mock_ray):
+        """Controller teardown reaches ``shutdown()`` directly; after a
+        terminal failure the NIXL state is unknown and
+        ``finalize_checkpoint_engine`` is not idempotent over it, so the
+        public method itself must honor the latch — not just ``sync_weights``'s
+        internal finally."""
+        policy = _mock_policy()
+        policy.worker_group = _CheckpointWorkerGroup()
+        generation = _mock_generation(cfg={"backend": SGLANG_BACKEND})
+        sync = CheckpointEngineWeightSynchronizer(
+            policy, generation, _checkpoint_engine_cfg()
+        )
+        sync._checkpoint_engine_ready = True
+        sync._set_terminal(RuntimeError("transfer died mid-stream"))
+
+        sync.shutdown()
+
+        assert sync._checkpoint_engine_ready is False
+        assert policy.worker_group.calls == []
+        generation.run_checkpoint_engine_method.assert_not_called()
+        mock_ray.get.assert_not_called()
 
     @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
     def test_sglang_does_not_open_a_session_when_the_kv_flush_fails(self, mock_ray):
@@ -925,6 +996,49 @@ class TestCheckpointEngineFactory:
         gen.cfg["sglang_cfg"]["pp_size"] = 2
 
         with pytest.raises(NotImplementedError, match="pp_size=1"):
+            create_weight_synchronizer(
+                policy=_mock_policy(cfg={}),
+                generation=gen,
+                generation_backend=SGLANG_BACKEND,
+                colocated=False,
+            )
+
+    def test_checkpoint_engine_rejects_sglang_fault_tolerance_on_custom_backend(
+        self,
+    ):
+        """Recovery rebinds through the built-in NIXL disconnect-before-connect
+        path; a plugin engine has no reconnect contract, so FT must refuse it
+        at setup instead of silently reusing stale transport after a restart."""
+        gen = _mock_generation(cfg=_sglang_refit_cfg())
+        gen.pause_generation_mode = "retract"
+        # Custom engines are selected by a module:ClassName path (a bare name
+        # fails transport validation before the guard under test is reached).
+        plugin = "my_plugin.engines:MooncakeCheckpointEngine"
+        gen.cfg["refit_transport"] = plugin
+        gen.cfg["refit_cfg"] = {plugin: {"device": "cpu", "release_after_refit": False}}
+        gen.cfg["sglang_cfg"]["use_fault_tolerance"] = True
+
+        with pytest.raises(NotImplementedError, match="built-in 'nixl' backend"):
+            create_weight_synchronizer(
+                policy=_mock_policy(cfg={}),
+                generation=gen,
+                generation_backend=SGLANG_BACKEND,
+                colocated=False,
+            )
+
+    def test_checkpoint_engine_rejects_sglang_quantized_schemes(self):
+        """The sender streams raw BF16 tensors without the quantized
+        weight-group expansion; anything but bf16 must fail at setup.
+
+        Today a non-bf16 scheme already fails schema validation (ValueError);
+        the factory's own NotImplementedError takes over once the supported
+        set grows. Either way: loud, and before any transfer.
+        """
+        gen = _mock_generation(cfg=_sglang_refit_cfg())
+        gen.pause_generation_mode = "retract"
+        gen.cfg["sglang_cfg"]["quantization"] = {"scheme": "fp8"}
+
+        with pytest.raises((NotImplementedError, ValueError), match="bf16"):
             create_weight_synchronizer(
                 policy=_mock_policy(cfg={}),
                 generation=gen,

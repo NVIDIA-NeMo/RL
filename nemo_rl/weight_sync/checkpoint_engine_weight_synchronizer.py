@@ -132,6 +132,13 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
             except RecoveryRollbackError as exc:
                 self._set_terminal(exc)
                 raise
+            except BaseException:
+                # The cohort was rolled back to ``None`` slots; readiness must
+                # not survive that — a no-op init or teardown over restored
+                # slots would trust peers the next successful recovery is
+                # about to replace. Retryable, so no terminal latch.
+                self._checkpoint_engine_ready = False
+                raise
             (_, _, num_new_engines, _, _) = (
                 self._generation.get_updatable_engines_and_lock()
             )
@@ -414,6 +421,13 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
         self._generation.continue_generation()
 
     def shutdown(self) -> None:
+        if self._terminal_error is not None:
+            # After a terminal rebind/transfer failure the NIXL state is
+            # unknown and possibly in-flight; ``finalize_checkpoint_engine``
+            # is not idempotent over it. Zero RPCs — drop readiness so normal
+            # controller teardown stays a no-op too.
+            self._checkpoint_engine_ready = False
+            return
         if not self._checkpoint_engine_ready:
             return
         ray.get(
