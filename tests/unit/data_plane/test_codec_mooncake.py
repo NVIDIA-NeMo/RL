@@ -234,6 +234,7 @@ def test_get_samples_uses_static_shape_schema(monkeypatch) -> None:
     monkeypatch.setattr(tq_adapter.tq, "kv_batch_get", fake_kv_batch_get)
     client = object.__new__(tq_adapter.TQDataPlaneClient)
     client._promote_1d = True
+    client._data_operations_started = False
 
     restored = client.get_samples(
         ["a", "b", "c"], "train", ["total_reward", "input_ids"]
@@ -268,6 +269,7 @@ def test_get_samples_densifies_uniform_rows_without_1d_promotion(monkeypatch) ->
     monkeypatch.setattr(tq_adapter.tq, "kv_batch_get", fake_kv_batch_get, raising=False)
     client = object.__new__(tq_adapter.TQDataPlaneClient)
     client._promote_1d = False
+    client._data_operations_started = False
 
     restored = client.get_samples(["a", "b"], "train", ["input_ids"])
 

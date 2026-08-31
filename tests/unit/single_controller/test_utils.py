@@ -204,6 +204,34 @@ class TestReduceAdvantagePumpMetrics:
         assert out["num_masked_seqs_by_logprob_error"] == 3
         assert out["masked_correct_pct"] == pytest.approx(1.0 / 3)
 
+    def test_violation_rates_from_per_sample_counts(self) -> None:
+        out = reduce_advantage_pump_metrics(
+            rewards=[],
+            masked_advantages=[],
+            sequence_lengths=[],
+            num_invalid_tool_calls=[1, 0, 1],
+            num_malformed_thinking=[0, 1, 0],
+            num_assistant_messages=[2, 1, 1],
+        )
+        assert out["invalid_tool_call_rate"] == pytest.approx(0.5)
+        assert out["malformed_thinking_rate"] == pytest.approx(0.25)
+        assert out["num_invalid_tool_calls"] == pytest.approx(2.0)
+        assert out["num_malformed_thinking"] == pytest.approx(1.0)
+        assert out["num_assistant_messages"] == pytest.approx(4.0)
+
+    def test_no_assistant_messages_omits_violation_metrics(self) -> None:
+        assert (
+            reduce_advantage_pump_metrics(
+                [],
+                [],
+                [],
+                num_invalid_tool_calls=[0],
+                num_malformed_thinking=[0],
+                num_assistant_messages=[0],
+            )
+            == {}
+        )
+
 
 class TestFieldsForPut:
     def test_no_sequence_lengths_packs_contiguous(self) -> None:

@@ -128,6 +128,7 @@ checkpointing:
   # the buffered window fresh instead of reusing completed groups (which skew
   # toward short rollouts at a save boundary).
   load_replay_buffer: true
+  save_data_plane: false
   model_save_format: "safetensors"
   save_consolidated: false
   save_optimizer: true
