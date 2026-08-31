@@ -589,7 +589,8 @@ class TestCheckpointEngineWeightSynchronizer:
         policy.worker_group = _CheckpointWorkerGroup()
         generation = _mock_generation(cfg={"backend": SGLANG_BACKEND})
         generation.sglang_cfg = {"sglang_cfg": {"use_fault_tolerance": True}}
-        generation.run_checkpoint_engine_method.return_value = ["generation-init"]
+        generation.run_checkpoint_engine_method.return_value = ["generation-prepare"]
+        generation.init_checkpoint_engine_process_groups.return_value = ["pg-init"]
         generation.get_updatable_engines_and_lock.return_value = (
             ["engine-0"],
             object(),
@@ -602,11 +603,39 @@ class TestCheckpointEngineWeightSynchronizer:
         )
         sync._checkpoint_engine_ready = True
         sync._bucket_size_bytes = 1024**2
-        mock_ray.get.side_effect = RuntimeError("rebind died")
+        # Receiver init and the prepare gather SUCCEED; the failure is the
+        # non-transactional process-group rebind itself (the third ray.get).
+        mock_ray.get.side_effect = [
+            ["init-ok"],
+            [
+                {"rank": 0, "agent_name": "policy-0"},
+                {"rank": 0, "agent_name": "rollout-new"},
+            ],
+            RuntimeError("process-group rebind died"),
+        ]
 
-        with pytest.raises(RuntimeError, match="rebind died"):
+        with pytest.raises(RuntimeError, match="process-group rebind died"):
             sync.sync_weights()
         assert sync._terminal_error is not None
+
+        # The first (failing) call must not have issued a single session,
+        # transfer, or count-clear RPC past the rebind.
+        generation.clear_updatable_num_new_engines.assert_not_called()
+        engine_methods = [
+            call.args[0]
+            for call in generation.run_checkpoint_engine_method.call_args_list
+        ]
+        assert not (
+            {
+                "begin_weight_update",
+                "update_weights_from_checkpoint_engine",
+                "end_weight_update",
+            }
+            & set(engine_methods)
+        ), engine_methods
+        assert "send_weights_via_checkpoint_engine" not in [
+            checkpoint_method for _, checkpoint_method in policy.worker_group.calls
+        ]
 
         generation.reset_mock()
         policy.worker_group.calls.clear()
@@ -1039,6 +1068,33 @@ class TestCheckpointEngineFactory:
         gen.cfg["sglang_cfg"]["quantization"] = {"scheme": "fp8"}
 
         with pytest.raises((NotImplementedError, ValueError), match="bf16"):
+            create_weight_synchronizer(
+                policy=_mock_policy(cfg={}),
+                generation=gen,
+                generation_backend=SGLANG_BACKEND,
+                colocated=False,
+            )
+
+    def test_checkpoint_engine_factory_guard_rejects_non_bf16_schemes(
+        self, monkeypatch
+    ):
+        """Mutation test for the factory's OWN bf16 guard.
+
+        Schema validation currently rejects non-bf16 first, so the guard is
+        forward-protection for when the supported set grows. Bypass the schema
+        by patching the scheme accessor: the factory itself must still refuse.
+        """
+        from nemo_rl.models.generation.sglang import config as sglang_config
+
+        monkeypatch.setattr(
+            sglang_config,
+            "get_sglang_quantization_scheme",
+            lambda quantization_config: "fp8",
+        )
+        gen = _mock_generation(cfg=_sglang_refit_cfg())
+        gen.pause_generation_mode = "retract"
+
+        with pytest.raises(NotImplementedError, match="'bf16' quantization scheme"):
             create_weight_synchronizer(
                 policy=_mock_policy(cfg={}),
                 generation=gen,
