@@ -56,6 +56,28 @@ def test_multimodal_preprocessing_requires_policy_processor():
 
 
 @pytest.mark.mcore
+def test_multimodal_preprocessing_forwards_vision_model_type():
+    class _ImageWrapper:
+        supports_image = True
+
+    worker = object.__new__(MegatronGenerationMixin)
+    worker._get_megatron_inference_wrapper_cls = lambda: _ImageWrapper
+    worker.processor = SimpleNamespace(
+        image_processor=SimpleNamespace(
+            patch_size=14,
+            min_num_patches=1,
+            max_num_patches=32,
+            norm_mean=[0.1, 0.2, 0.3],
+            norm_std=[0.4, 0.5, 0.6],
+        )
+    )
+
+    config = worker._build_image_preprocessing_config({"vision_model_type": "qwen-vl"})
+
+    assert config.vision_model_type == "qwen-vl"
+
+
+@pytest.mark.mcore
 def test_direct_megatron_media_request_preserves_preexpanded_prompt():
     def fake_sample_vision_tensors(data, index):
         return torch.ones(1, 2, 4), torch.tensor([[2, 2]]), None

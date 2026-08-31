@@ -61,6 +61,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # Raw media preprocessing corresponding with Megatron's
     # ImageProcessingConfig / VideoProcessingConfig.
     # `video_num_frames` is required for video.
+    vision_model_type: NotRequired[str]
     image_dynamic_resolution: NotRequired[bool]
     video_num_frames: NotRequired[int]  # Frames sampled per video.
     video_temporal_patch_size: NotRequired[int]  # Frames per temporal patch.

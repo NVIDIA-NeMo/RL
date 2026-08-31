@@ -43,10 +43,12 @@ def test_build_image_config_handles_dict_patch_and_downsample_ratio():
             downsample_ratio=0.5,
         ),
         dynamic_resolution=True,
+        vision_model_type="qwen-vl",
     )
 
     assert config.patch_dim == 16
     assert config.dynamic_resolution is True
+    assert config.vision_model_type == "qwen-vl"
     assert config.pixel_shuffle is True
     assert config.spatial_merge_size == 2
     assert config.dynamic_resolution_min_patches == 1
@@ -63,9 +65,7 @@ def test_build_image_config_handles_dict_patch_and_downsample_ratio():
         ({}, 1),
     ],
 )
-def test_build_image_config_merge_size_fallbacks(
-    merge_fields, expected_merge_size
-):
+def test_build_image_config_merge_size_fallbacks(merge_fields, expected_merge_size):
     config = build_image_preprocessing_config(_image_processor(**merge_fields))
 
     assert config.spatial_merge_size == expected_merge_size

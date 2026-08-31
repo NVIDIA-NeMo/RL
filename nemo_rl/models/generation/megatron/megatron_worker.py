@@ -195,6 +195,10 @@ class MegatronGenerationMixin:
             image_kwargs["dynamic_resolution"] = bool(
                 generation_config["image_dynamic_resolution"]
             )
+        if "vision_model_type" in generation_config:
+            image_kwargs["vision_model_type"] = str(
+                generation_config["vision_model_type"]
+            )
         return build_image_preprocessing_config(
             processor.image_processor,
             **image_kwargs,
