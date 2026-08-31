@@ -152,8 +152,6 @@ class CheckpointingConfig(TypedDict):
         consolidating checkpoint shards.
     v4_compatible (bool): Whether consolidated checkpoints use the original
         Transformers v4-compatible model configuration.
-    allow_legacy_pickle_restore (bool): Whether trusted legacy pickle-based
-        Automodel training state may be restored.
     model_cache_dir (str): Directory for model cache (for safetensors format).
     model_repo_id (str): Repository ID for the model (for safetensors format).
     is_peft (bool): Whether the model uses PEFT.
@@ -191,7 +189,6 @@ class CheckpointingConfig(TypedDict):
     cpu_offload: NotRequired[bool]  # Default: False
     staging_dir: NotRequired[str | None]  # Default: None
     v4_compatible: NotRequired[bool]  # Default: False
-    allow_legacy_pickle_restore: NotRequired[bool]  # Default: False
     model_cache_dir: NotRequired[str]  # Default: ""
     model_repo_id: NotRequired[str]  # Default: ""
     is_peft: NotRequired[bool]  # Default: False
@@ -203,6 +200,7 @@ class CheckpointingConfig(TypedDict):
     diffusers_compatible: NotRequired[bool]
     best_metric_key: NotRequired[str]
     max_recent_checkpoints: NotRequired[int | None]
+    allow_legacy_pickle_restore: NotRequired[bool]  # Rejected by NeMo-RL.
 
 
 def should_save_as_final_checkpoint(

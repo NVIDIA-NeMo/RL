@@ -105,6 +105,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
         **kwargs: Any,
     ):
         """Initialize the DTensorValueWorkerV2.
@@ -182,15 +183,24 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         self.cp_size = distributed_manager.cp_size
 
         # Initialize checkpoint manager
-        self._init_checkpoint_manager(
-            config_updates={
+        checkpoint_config = dict(checkpointing_cfg or {})
+        checkpoint_config.update(
+            {
                 "model_repo_id": config["model_name"],
                 "dequantize_base_checkpoint": config.get(
                     "dequantize_base_checkpoint", False
                 ),
                 "is_peft": self.lora_enabled,
                 "skip_task_head_prefixes_for_base_model": ["score."],
-            },
+            }
+        )
+        self._init_checkpoint_manager(
+            config_updates=checkpoint_config,
+            checkpoint_root=(
+                str(checkpointing_cfg["checkpoint_dir"])
+                if checkpointing_cfg is not None
+                else None
+            ),
         )
 
         # Set up model and optimizer

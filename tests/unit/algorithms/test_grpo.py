@@ -4716,12 +4716,18 @@ def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
-def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
+def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys, tmp_path):
     """Test that GRPO training loop exits when timeout is reached"""
     # Set max steps and epochs to large numbers
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.max_num_steps = 100
     master_config.grpo.max_num_epochs = 10
+    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing["metric_name"] = None
+    mock_grpo_components["checkpointer"].init_tmp_checkpoint.return_value = str(
+        tmp_path / "tmp_step"
+    )
+    mock_grpo_components["checkpointer"].checkpoint_dir = tmp_path
 
     grpo_save_state = _initial_grpo_save_state()
 
@@ -4738,7 +4744,10 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
-    with patch("nemo_rl.algorithms.grpo.TimeoutChecker") as mock_timeout_class:
+    with (
+        patch("nemo_rl.algorithms.grpo.torch.save"),
+        patch("nemo_rl.algorithms.grpo.TimeoutChecker") as mock_timeout_class,
+    ):
         mock_timeout_instance = MagicMock()
         check_results = [False] * 7 + [True]
         mock_timeout_instance.check_save.side_effect = check_results

@@ -1253,6 +1253,8 @@ def setup(
         if reserved_http_server_port is not None:
             # Colocated Megatron generation serves HTTP from the training workers.
             extra_policy_kwargs["reserved_http_server_port"] = reserved_http_server_port
+        if policy_factory is None:
+            extra_policy_kwargs["checkpointing_cfg"] = checkpointing_config
         p = _make_policy(
             cluster=train_cluster,
             config=policy_config,

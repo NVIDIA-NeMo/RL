@@ -215,6 +215,7 @@ class DTensorPolicyWorkerV2Impl(
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
         init_reference_model: bool = True,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorkerV2."""
@@ -294,15 +295,24 @@ class DTensorPolicyWorkerV2Impl(
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Initialize checkpoint manager now that distributed is set up
-        self._init_checkpoint_manager(
-            config_updates={
+        checkpoint_config = dict(checkpointing_cfg or {})
+        checkpoint_config.update(
+            {
                 "model_repo_id": config["model_name"],
                 "dequantize_base_checkpoint": config.get(
                     "dequantize_base_checkpoint", False
                 ),
                 "is_peft": self.lora_enabled,
                 "is_async": True,
-            },
+            }
+        )
+        self._init_checkpoint_manager(
+            config_updates=checkpoint_config,
+            checkpoint_root=(
+                str(checkpointing_cfg["checkpoint_dir"])
+                if checkpointing_cfg is not None
+                else None
+            ),
         )
 
         # Set up model and optimizer.

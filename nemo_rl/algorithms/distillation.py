@@ -619,6 +619,7 @@ def setup(
         cluster=train_cluster,
         config=policy_config,
         tokenizer=tokenizer,
+        checkpointing_cfg=checkpointing_config,
         weights_path=weights_path,
         optimizer_path=optimizer_path,
         init_optimizer=True,

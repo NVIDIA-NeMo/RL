@@ -368,15 +368,23 @@ def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
     assert train_metric_calls[-1].args[0]["mean_gen_tokens_per_sample"] == 3.0
 
 
-def test_exit_on_timeout(mock_components, capsys):
+def test_exit_on_timeout(mock_components, capsys, tmp_path):
     """Test that training loop exits when timeout is reached"""
     # Set max steps to large number
     mock_components["master_config"].distillation.max_num_steps = 100
+    mock_components["master_config"].checkpointing["enabled"] = True
+    mock_components["master_config"].checkpointing["metric_name"] = None
+    mock_components["checkpointer"].init_tmp_checkpoint.return_value = str(
+        tmp_path / "tmp_step"
+    )
 
     distillation_save_state = _initial_distillation_save_state()
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
-    with patch("nemo_rl.algorithms.distillation.TimeoutChecker") as mock_timeout_class:
+    with (
+        patch("nemo_rl.algorithms.distillation.torch.save"),
+        patch("nemo_rl.algorithms.distillation.TimeoutChecker") as mock_timeout_class,
+    ):
         mock_timeout_instance = MagicMock()
         # Create a side_effect that returns False 7 times, then True
         check_results = [False] * 7 + [True]

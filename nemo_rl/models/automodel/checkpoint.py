@@ -56,7 +56,6 @@ _IN_PLACE_MUTABLE_FIELDS = frozenset(
 )
 _AUTOMODEL_CONFIG_FIELDS = frozenset(
     {
-        "allow_legacy_pickle_restore",
         "consolidation_timeout_minutes",
         "cpu_offload",
         "dequantize_base_checkpoint",
@@ -76,6 +75,7 @@ _AUTOMODEL_CONFIG_FIELDS = frozenset(
 # checkpoint selection/retention, and does not expose Diffusers checkpoints.
 _UNSUPPORTED_AUTOMODEL_CONFIG_FIELDS = frozenset(
     {
+        "allow_legacy_pickle_restore",
         "best_metric_key",
         "diffusers_compatible",
         "max_recent_checkpoints",
@@ -98,7 +98,8 @@ def _extract_automodel_config_updates(
             "save finalization, checkpoint metric selection, and checkpoint "
             "retention; use metric_name, keep_top_k, and ft_keep_latest_k for "
             "the corresponding NeMo-RL behavior. Diffusers checkpoint export is "
-            "not supported by NeMo-RL."
+            "not supported by NeMo-RL. Automodel's legacy pickle restore only "
+            "applies to training-state loaders that NeMo-RL does not use."
         )
 
     return {

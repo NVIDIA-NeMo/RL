@@ -103,6 +103,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         worker_extension_cls_fqn: Optional[str] = None,
         skip_weight_load: bool = False,
         reserved_http_server_port: Optional[int] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ):
         self.debug_payload_metrics = False
         if weights_path:
@@ -285,6 +286,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             # DTensor v2 workers reconstruct tokenizer/processor locally to avoid
             # pickling across incompatible transformers versions (v4 head → v5 worker).
             config["tokenizer"]["use_processor"] = processor is not None
+            worker_kwargs["checkpointing_cfg"] = checkpointing_cfg
         else:
             worker_kwargs["tokenizer"] = tokenizer
             worker_kwargs["processor"] = processor

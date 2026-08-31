@@ -29,6 +29,12 @@ checkpointing:
   save_period: 50
   checkpoint_must_save_by: null
   save_optimizer: true
+  save_consolidated: "false"
+  single_rank_consolidation: false
+  consolidation_timeout_minutes: 30
+  cpu_offload: false
+  staging_dir: null
+  v4_compatible: false
 
 policy:
   model_name: "meta-llama/Llama-3.2-1B-Instruct"

@@ -23,6 +23,14 @@ checkpointing:
   save_period: 10
   checkpoint_must_save_by: null
   save_optimizer: true
+  model_save_format: "safetensors"
+  # Canonical Automodel modes: "false", "final", or "every".
+  save_consolidated: "false"
+  single_rank_consolidation: false
+  consolidation_timeout_minutes: 30
+  cpu_offload: false
+  staging_dir: null
+  v4_compatible: false
   # pretrained_checkpoint: load weights from an existing megatron-bridge or
   # Megatron-LM checkpoint instead of converting from HuggingFace.
   # pretrained_checkpoint:

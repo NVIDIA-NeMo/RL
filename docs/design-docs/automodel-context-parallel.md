@@ -99,7 +99,7 @@ model = model_class.from_pretrained(
   YAML boolean `false`, and use `"every"` instead of `true`. Timeout-triggered saves
   remain resumable recovery checkpoints and are not marked as terminal saves.
   NeMo RL also forwards Automodel's checkpoint CPU offload, consolidation staging,
-  Transformers v4 compatibility, and trusted legacy-restore settings. NeMo RL retains
+  and Transformers v4 compatibility settings. NeMo RL retains
   ownership of async-save finalization, metric selection, and checkpoint retention, so
   overlapping or otherwise unsupported upstream settings are rejected instead of
   silently ignored.
