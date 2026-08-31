@@ -1690,9 +1690,11 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     Also applies TE cuBLAS workspace shrink via patches.py, MoE fixed-order
     unpermute, router replay, and inference-compatible TP=1 log-softmax via
     moe_determinism_patches.py, Mamba train/prefill/decode alignment via
-    mamba_alignment_patches.py, and defaults env vars for cuBLAS/MoE/Mamba
-    if not already set by the environment. Router replay and moe_grouped_gemm
-    must be configured explicitly.
+    mamba_alignment_patches.py, generation ``logprobs_mode=raw_logprobs`` so
+    gen uses ``F.log_softmax`` (not FlashInfer processed log-probs), and
+    defaults env vars for cuBLAS/MoE/Mamba if not already set by the
+    environment. Router replay and moe_grouped_gemm must be configured
+    explicitly.
     """
     if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
         return
@@ -1717,6 +1719,9 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     generation = config.get("generation")
     if generation is not None and "mcore_generation_config" in generation:
         generation["mcore_generation_config"]["transformer_impl"] = "transformer_engine"
+        # Match the TP=1 train log-softmax patch: Megatron processed_logprobs
+        # routes through FlashInfer log(renorm(softmax)), not F.log_softmax.
+        generation["mcore_generation_config"]["logprobs_mode"] = "raw_logprobs"
     apply_te_gemm_cublas_pinned_patch()
     apply_moe_determinism_patches()
     apply_mamba_alignment_patch(required=policy_uses_mamba_layers(config))

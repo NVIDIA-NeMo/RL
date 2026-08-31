@@ -344,12 +344,12 @@ def _nrl_inference_compatible_log_softmax(
 
 
 def apply_log_softmax_determinism_patch() -> None:
-    """Match TP=1 train/logprob normalization to Megatron inference.
+    """Match TP=1 train/logprob normalization to Megatron raw inference.
 
-    Dynamic inference computes generated-token log probabilities with
-    ``F.log_softmax(logits.float())`` over full-vocabulary logits. NeMo-RL's
-    logprob path already casts logits to fp32, so replacing its algebraically
-    equivalent max/exp/sum/log decomposition removes a numerical mismatch.
+    With ``logprobs_mode=raw_logprobs``, generation uses
+    ``F.log_softmax(logits.float())``. Train/logprob still uses a max/exp/sum/log
+    decomposition that is algebraically equivalent but not bit-identical, so
+    this patch replaces that path with ``F.log_softmax`` when TP is one.
     """
     global _DISTRIBUTED_LOG_SOFTMAX_ORIG, _LOG_SOFTMAX_PATCHED
     if _LOG_SOFTMAX_PATCHED:
