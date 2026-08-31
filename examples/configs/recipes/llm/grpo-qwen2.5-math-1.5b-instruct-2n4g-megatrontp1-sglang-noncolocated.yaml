@@ -1,0 +1,22 @@
+defaults: ./grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-noncolocated.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-2n4g-megatrontp1-sglang-noncolocated
+
+policy:
+  generation:
+    colocated:
+      resources:
+        gpus_per_node: 4
+    sglang_cfg:
+      tp_size: 1
+      sglang_server_config:
+        num_gpus: 4
+
+logger:
+  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-2n4g-megatrontp1-sglang-noncolocated
+  wandb:
+    name: grpo-qwen2.5-math-1.5b-instruct-2n4g-megatrontp1-sglang-noncolocated
+
+cluster:
+  gpus_per_node: 4

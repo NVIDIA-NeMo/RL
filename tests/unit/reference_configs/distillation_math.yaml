@@ -288,3 +288,7 @@ cluster:
     master_port_range_low: 1400
     master_port_range_high: 1999
     segment_size: null
+
+# OpenTelemetry instrumentation; null = disabled (default). Mirrors the optional
+# field on the MasterConfig, which stays None unless a run opts in.
+telemetry: null
