@@ -216,9 +216,6 @@ mcore = [
   # uv mcore extra fork omits flash-attn-4 transitive deps; pin explicitly for worker venvs.
   # Bare nvidia-cutlass-dsl is a stub wheel; libs-base is excluded project-wide (see exclude-dependencies).
   "nvidia-cutlass-dsl[cu13]==4.6.0.dev0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  # flash-attn-4 4.0.0b25 needs >=0.1.12 for map_dataclass_to_tuple in cute.compile.
-  "apache-tvm-ffi>=0.1.12,<0.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  # mamba-ssm/causal-conv1d LOOK redundant (megatron-bridge[ssm] pulls them), but do not
   # remove them: [tool.uv.sources] git pins only attach to direct requirements, and the
   # conflicting extras resolve in separate forks — without these direct deps the mcore fork
   # silently falls back to the PyPI releases instead of the pinned git revs.
@@ -226,8 +223,6 @@ mcore = [
   "causal-conv1d",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # Megatron batch_invariant_mode with MoE (Nano hybrid) requires DeepGEMM bf16 grouped GEMM.
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",
