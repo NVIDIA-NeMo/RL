@@ -51,6 +51,7 @@ from nemo_rl.telemetry.instrumentation import trace_fn
 from nemo_rl.telemetry.metrics import warn_once
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils.fastokens import normalize_fastokens_env
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
     collect_sharded_multimodal_payload_metrics,
@@ -248,6 +249,8 @@ class VllmGeneration(GenerationInterface):
             )
         else:
             worker_builder = RayWorkerBuilder(worker_cls, config)
+
+        normalize_fastokens_env()
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
         env_vars = {}
