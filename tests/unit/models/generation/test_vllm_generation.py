@@ -184,6 +184,70 @@ async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
     worker.llm.resume_generation.assert_awaited_once_with()
 
 
+@pytest.mark.asyncio
+async def test_async_vllm_worker_propagates_prefix_reset_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = MagicMock(reset_prefix_cache=AsyncMock(return_value=False))
+    empty_cache = MagicMock()
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+
+    assert await worker.reset_prefix_cache_async() is False
+
+    worker.llm.reset_prefix_cache.assert_awaited_once_with()
+    empty_cache.assert_called_once_with()
+
+
+def test_sync_vllm_worker_propagates_prefix_reset_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+    reset_prefix_cache = MagicMock(return_value=False)
+    worker.llm = types.SimpleNamespace(
+        llm_engine=types.SimpleNamespace(reset_prefix_cache=reset_prefix_cache)
+    )
+    empty_cache = MagicMock()
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+
+    assert worker.reset_prefix_cache() is False
+
+    reset_prefix_cache.assert_called_once_with()
+    empty_cache.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("worker_results", "expected"),
+    [
+        ([True, None], True),
+        ([False, None], False),
+        ([None, None], False),
+    ],
+)
+def test_vllm_generation_reports_prefix_reset_result(
+    monkeypatch: pytest.MonkeyPatch,
+    worker_results: list[bool | None],
+    expected: bool,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": True}}
+    generation.worker_group = MagicMock()
+    futures = [object(), object()]
+    generation.worker_group.run_all_workers_single_data.return_value = futures
+    ray_get = MagicMock(return_value=worker_results)
+    monkeypatch.setattr(ray, "get", ray_get)
+
+    assert generation.invalidate_kv_cache() is expected
+
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "reset_prefix_cache_async",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+    ray_get.assert_called_once_with(futures)
+
+
 def test_vllm_generation_broadcasts_native_refit_pause_and_resume(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

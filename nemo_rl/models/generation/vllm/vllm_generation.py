@@ -1450,8 +1450,8 @@ class VllmGeneration(GenerationInterface):
                 method_name,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
-            results = ray.get(futures)
-            return all(result for result in results if result is not None)
+            results = [result for result in ray.get(futures) if result is not None]
+            return bool(results) and all(results)
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")
             return False

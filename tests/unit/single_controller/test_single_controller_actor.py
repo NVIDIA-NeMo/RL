@@ -466,7 +466,9 @@ def test_sync_weights_honors_recompute_kv_cache_config(
         sync_weights=MagicMock(side_effect=lambda **_: events.append("sync"))
     )
     ctrl._gen = SimpleNamespace(
-        invalidate_kv_cache=MagicMock(side_effect=lambda: events.append("invalidate")),
+        invalidate_kv_cache=MagicMock(
+            side_effect=lambda: (events.append("invalidate") or True)
+        ),
         pause_generation_for_refit=MagicMock(
             side_effect=lambda **_: (
                 events.append("pause") or generation_pause_supported
@@ -507,6 +509,31 @@ def test_sync_weights_honors_recompute_kv_cache_config(
         *(["invalidate"] if expected_invalidation_calls else []),
     ]
     assert ctrl._rollout_permitted.is_set()
+
+
+def test_sync_weights_rejects_unconfirmed_inflight_kv_recomputation() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig(recompute_kv_cache_after_weight_updates=True)
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._gen_fleet = None
+    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._gen = SimpleNamespace(
+        invalidate_kv_cache=MagicMock(return_value=False),
+        pause_generation_for_refit=MagicMock(return_value=False),
+        requires_kv_scale_sync=False,
+        resume_generation_after_refit=MagicMock(return_value=False),
+    )
+    ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
+    ctrl._master_config = SimpleNamespace(env={})
+
+    with pytest.raises(NotImplementedError, match="active-request KV state"):
+        asyncio.run(ctrl._sync_weights())
+
+    ctrl._gen.invalidate_kv_cache.assert_called_once_with()
+    assert not ctrl._rollout_permitted.is_set()
 
 
 def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
@@ -572,6 +599,33 @@ def test_sync_weights_keeps_dispatch_paused_when_generation_resume_fails() -> No
         asyncio.run(ctrl._sync_weights())
 
     ctrl._weight_synchronizer.sync_weights.assert_called_once_with(kv_scales=None)
+    assert not ctrl._rollout_permitted.is_set()
+
+
+def test_sync_weights_keeps_dispatch_paused_when_generation_pause_fails() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig()
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._gen_fleet = None
+    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._gen = SimpleNamespace(
+        pause_generation_for_refit=MagicMock(
+            side_effect=RuntimeError("Failed to pause every async vLLM engine")
+        ),
+        requires_kv_scale_sync=False,
+        resume_generation_after_refit=MagicMock(return_value=True),
+    )
+    ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
+    ctrl._master_config = SimpleNamespace(env={})
+
+    with pytest.raises(RuntimeError, match="pause every async vLLM engine"):
+        asyncio.run(ctrl._sync_weights())
+
+    ctrl._weight_synchronizer.sync_weights.assert_not_called()
+    ctrl._gen.resume_generation_after_refit.assert_not_called()
     assert not ctrl._rollout_permitted.is_set()
 
 

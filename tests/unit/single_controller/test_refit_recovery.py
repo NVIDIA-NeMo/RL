@@ -197,12 +197,16 @@ class TestDeathInsideTheCollective:
 
     def test_generation_stays_paused_across_the_recovery_retry(self):
         ctrl, _, sync = _make_controller(ABORTED)
+        sync_calls_when_resumed: list[int] = []
+        ctrl._gen.resume_generation_after_refit = MagicMock(
+            side_effect=lambda: sync_calls_when_resumed.append(sync.sync_calls) or True
+        )
 
         asyncio.run(ctrl._sync_weights())
 
         assert sync.sync_calls == 2
         ctrl._gen.pause_generation_for_refit.assert_called_once_with(clear_cache=False)
-        ctrl._gen.resume_generation_after_refit.assert_called_once_with()
+        assert sync_calls_when_resumed == [2]
 
     def test_survivors_are_pulled_from_service_then_given_back(self):
         """Partial weights must not serve -- and must not be stranded either.
@@ -478,6 +482,21 @@ class TestTheControllerStopsWaitingForASilentRank:
 
         never.set()
         assert elapsed < 10.0, "it must give up, not wait on a rank that never answers"
+
+    def test_a_generation_lifecycle_call_uses_the_same_bound(self):
+        never = threading.Event()
+        ctrl = self._ctrl(0.1, lambda **_: None)
+        ctrl._REFIT_UNWIND_GRACE_S = 0.1
+
+        with pytest.raises(RefitAborted, match="generation pause before refit"):
+            asyncio.run(
+                ctrl._run_refit_call_within(
+                    never.wait,
+                    what="generation pause before refit",
+                )
+            )
+
+        never.set()
 
     def test_giving_up_is_recognised_as_an_abort(self):
         """So it lands in the existing `except (RefitAborted, RayActorError)` recovery."""
