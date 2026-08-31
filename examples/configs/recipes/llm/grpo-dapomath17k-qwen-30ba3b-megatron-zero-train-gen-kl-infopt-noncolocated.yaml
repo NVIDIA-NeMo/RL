@@ -1,0 +1,41 @@
+# Qwen3-30B-A3B DAPO 8K — non-colocated Megatron inference with zero train/gen KL
+defaults: grpo-dapomath17k-qwen-30ba3b-megatron-zero-train-gen-kl-mxfp8
+
+policy:
+  megatron_cfg:
+    zero_train_gen_mismatch: true
+    moe_permute_fusion: false
+    fp8_cfg:
+      # mxfp8 is not supported for zero_train_gen_mismatch with inference_optimized mode
+      enabled: false 
+  
+  generation:
+    backend: megatron
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1      
+    mcore_generation_config:
+      transformer_impl: "inference_optimized"
+      moe_router_dtype: fp32
+      logprobs_mode: raw_logprobs
+      enable_chunked_prefill: false
+      cuda_graph_impl: "local"
+      inference_cuda_graph_scope: "block"
+      inference_moe_token_dispatcher_type: "nvls"
+      inference_grouped_gemm_backend: "vllm"
+      moe_pad_experts_for_cuda_graph_inference: false
+      buffer_size_gb: 20
+      num_cuda_graphs: -1
+      block_size_tokens: 256
+      use_cuda_graphs_for_non_decode_steps: true
+      kv_cache_management_mode: "persist"
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      # use nccl for inter-node communication with IB
+      refit_backend: "nvshmem"
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2

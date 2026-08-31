@@ -20,6 +20,10 @@ policy:
   logprob_chunk_size: 2048 # requires defer_fp32_logits
   megatron_cfg:
     zero_train_gen_mismatch: true
+    moe_permute_fusion: false
+    fp8_cfg:
+      enabled: true
+      fp8_recipe: mxfp8
     activation_checkpointing: true
     defer_fp32_logits: true
     tensor_model_parallel_size: 1
@@ -43,6 +47,8 @@ policy:
       lr_warmup_init: 1.0e-06
   generation:
     backend: megatron
+    colocated:
+      enabled: true
     max_new_tokens: 8192
     mcore_generation_config:
       # CUDA graphs are off for now
@@ -51,6 +57,7 @@ policy:
       num_cuda_graphs: 0
       inference_cuda_graph_scope: none
       enable_prefix_caching: false
+      enable_chunked_prefill: false
       kv_cache_management_mode: recompute
       static_kv_memory_pointers: false
       buffer_size_gb: 16
