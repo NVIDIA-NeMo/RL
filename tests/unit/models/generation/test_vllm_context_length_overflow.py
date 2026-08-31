@@ -12,27 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Guards the context-length overflow contract with the NeMo Gym vLLM proxy.
+"""Pins the context-length overflow contract between NeMo-RL and NeMo Gym.
 
 When a prompt no longer fits the context window, Gym's vllm_model proxy ends
-the rollout gracefully — it returns an empty completion with
+the rollout gracefully -- it returns an empty completion with
 finish_reason="length" rather than failing the sample. That recovery only
-happens when our chat endpoint answers with HTTP 400 *and* a body Gym
-recognises:
+happens when this repo's chat endpoint answers with HTTP 400 *and* a body Gym
+classifies as an overflow.
 
-    # Gym responses_api_models/vllm_model/app.py
-    is_out_of_context_length = e.status == 400 and (
-        "context length" in result_content_str or "max_tokens" in result_content_str
-    )
+Neither side can see the whole contract, and breaking it is silent: the
+rollout just burns its retry budget on 500s and fails. So rather than restating
+Gym's rule here (a copy would stay green while Gym drifted), these tests
+evaluate Gym's *actual* predicate, lifted from its source at
+``responses_api_models/vllm_model/app.py``. A change on either side that breaks
+the alignment fails the test:
 
-Both halves are easy to break from either side: returning 500 (an uncaught
-ValueError), or rewording the message so the substring check misses. Either
-regression is silent — the rollout just burns its retry budget and fails — so
-the predicate is mirrored here rather than described in prose.
+* reword our message, or return a status other than 400 -> Gym's expression
+  evaluates False against what we send;
+* change Gym's substrings, status check, or variable names -> the extracted
+  expression stops accepting our response, or stops being found at all.
 """
+
+import ast
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import nemo_rl
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     CONTEXT_LENGTH_ERROR_MARKER,
     context_length_overflow_message,
@@ -40,10 +47,46 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 )
 
 
+GYM_PROXY_SOURCE = (
+    Path(nemo_rl.__file__).resolve().parents[1]
+    / "3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py"
+)
+GYM_PREDICATE_VAR = "is_out_of_context_length"
+
+
+def _gym_overflow_predicates() -> list[ast.expr]:
+    """Lift Gym's overflow classifier expressions out of its source.
+
+    Returns every right-hand side assigned to ``is_out_of_context_length`` (the
+    proxy applies the same rule on more than one path). Evaluating these keeps
+    the test honest: it exercises Gym's real rule, not a restatement of it.
+    """
+    tree = ast.parse(GYM_PROXY_SOURCE.read_text())
+    predicates = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            getattr(target, "id", "") == GYM_PREDICATE_VAR for target in node.targets
+        )
+    ]
+    assert predicates, (
+        f"no `{GYM_PREDICATE_VAR}` assignment in {GYM_PROXY_SOURCE}. Gym's "
+        "overflow handling moved or was renamed; re-point this test at it and "
+        "confirm NeMo-RL still satisfies the new rule."
+    )
+    return predicates
+
+
 def gym_recovers(status_code: int, body: str) -> bool:
-    """Mirror of Gym's classifier in responses_api_models/vllm_model/app.py."""
-    return status_code == 400 and (
-        "context length" in body or "max_tokens" in body
+    """Whether Gym's own classifier treats this response as an overflow."""
+    namespace = {
+        "e": SimpleNamespace(status=status_code),
+        "result_content_str": body,
+    }
+    return all(
+        bool(eval(compile(ast.Expression(predicate), "<gym-proxy>", "eval"), {}, namespace))
+        for predicate in _gym_overflow_predicates()
     )
 
 
