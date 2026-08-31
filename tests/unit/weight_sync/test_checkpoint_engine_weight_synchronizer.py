@@ -619,20 +619,25 @@ class TestCheckpointEngineWeightSynchronizer:
         assert sync._terminal_error is not None
 
         # The first (failing) call must not have issued a single session,
-        # transfer, or count-clear RPC past the rebind.
+        # transfer, or count-clear RPC past the rebind. The session lifecycle
+        # (pause -> begin -> ... -> end -> continue) is called DIRECTLY on the
+        # generation object, so assert those direct mocks — not the
+        # run_checkpoint_engine_method wrapper, which production never uses
+        # for them.
         generation.clear_updatable_num_new_engines.assert_not_called()
-        engine_methods = [
+        generation.prepare_for_generation.assert_not_called()
+        generation.pause_generation.assert_not_called()
+        generation.invalidate_kv_cache.assert_not_called()
+        generation.begin_weight_update.assert_not_called()
+        generation.end_weight_update.assert_not_called()
+        generation.continue_generation.assert_not_called()
+        transfer_rpcs = {
             call.args[0]
             for call in generation.run_checkpoint_engine_method.call_args_list
-        ]
-        assert not (
-            {
-                "begin_weight_update",
-                "update_weights_from_checkpoint_engine",
-                "end_weight_update",
-            }
-            & set(engine_methods)
-        ), engine_methods
+        }
+        assert "update_weights_from_checkpoint_engine" not in transfer_rpcs, (
+            transfer_rpcs
+        )
         assert "send_weights_via_checkpoint_engine" not in [
             checkpoint_method for _, checkpoint_method in policy.worker_group.calls
         ]
@@ -643,8 +648,9 @@ class TestCheckpointEngineWeightSynchronizer:
         mock_ray.get.side_effect = None
         with pytest.raises(RuntimeError, match="terminal error state"):
             sync.sync_weights()
-        generation.recover_updatable_engines.assert_not_called()
-        generation.run_checkpoint_engine_method.assert_not_called()
+        # The terminal retry must touch the generation object not at all:
+        # no recover, no wrapper RPCs, no direct lifecycle calls, nothing.
+        assert generation.method_calls == []
         assert policy.worker_group.calls == []
         mock_ray.get.assert_not_called()
 
