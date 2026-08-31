@@ -72,6 +72,10 @@ TokenizerType = PreTrainedTokenizerBase
 _MAX_NEMO_GYM_STREAM_RETRIES = 3
 _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
 _REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
+# Safety-net re-check interval for the generation-limit pause. The primary
+# wake-ups are the event set() (weight update / worker failure) and the
+# immediate post-clear() re-check; this only bounds a missed corner case.
+_GENERATION_LIMIT_RECHECK_SECONDS = 60.0
 
 
 def _stamped_task_indices(batch: BatchedDataDict[DatumSpec]) -> list[int]:
@@ -258,7 +262,9 @@ class AsyncTrajectoryCollector:
         self._failure_count: int = 0
         self._fatal_error_message: str | None = None
 
-    def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
+    def _calculate_target_weights(
+        self, generation_weight_version: int, last_consumed_target: int
+    ) -> list[int]:
         """Calculate target weight versions for given generation weight version.
 
         The list of versions returned enumerate the possible version a generation
@@ -293,9 +299,6 @@ class AsyncTrajectoryCollector:
         # Start at the first target training has not consumed instead. Callers
         # still skip targets <= last_consumed_target, so only genuine holes
         # surface.
-        last_consumed_target = ray.get(
-            self.replay_buffer.get_last_target_weight_already_generated.remote()
-        )
         target_start = min(generation_weight_version + 1, last_consumed_target + 1)
         return list(
             range(target_start, generation_weight_version + generation_lead + 1)
@@ -305,12 +308,14 @@ class AsyncTrajectoryCollector:
         self, generation_weight_version: int
     ) -> Optional[int]:
         """Get the next target weight that needs generation (if any)."""
-        target_weights = self._calculate_target_weights(generation_weight_version)
-        num_prompts = self._num_prompts_per_step
-        max_age_steps = self._max_trajectory_age_steps
         last_consumed_target = ray.get(
             self.replay_buffer.get_last_target_weight_already_generated.remote()
         )
+        target_weights = self._calculate_target_weights(
+            generation_weight_version, last_consumed_target
+        )
+        num_prompts = self._num_prompts_per_step
+        max_age_steps = self._max_trajectory_age_steps
 
         with self._generation_check_lock:
             for target_weight in target_weights:
@@ -380,12 +385,14 @@ class AsyncTrajectoryCollector:
     def _should_pause_for_generation_limits(self) -> bool:
         """Check if collection should be paused due to generation limits."""
         try:
-            target_weights = self._calculate_target_weights(self.current_weight_version)
-            num_prompts = self._num_prompts_per_step
-            max_age_steps = self._max_trajectory_age_steps
             last_consumed_target = ray.get(
                 self.replay_buffer.get_last_target_weight_already_generated.remote()
             )
+            target_weights = self._calculate_target_weights(
+                self.current_weight_version, last_consumed_target
+            )
+            num_prompts = self._num_prompts_per_step
+            max_age_steps = self._max_trajectory_age_steps
 
             with self._generation_check_lock:
                 # Check if any target weight in our range needs generation
@@ -408,6 +415,57 @@ class AsyncTrajectoryCollector:
             return True
         except Exception:
             return False
+
+    def _pause_for_generation_limits(self) -> None:
+        """Pause collection until a target needs generation again.
+
+        Wakes on the ``_generation_limit_cleared`` event (weight updates and
+        failed-worker cleanup call ``set()``). Two recovery paths guard the
+        wake against being lost:
+
+        - Immediately after ``clear()``, the pause condition is re-checked: a
+          worker's ``set()`` that landed between the caller's pause check and
+          the ``clear()`` would otherwise be erased and its wake missed.
+        - The wait is bounded by ``_GENERATION_LIMIT_RECHECK_SECONDS`` and the
+          condition is re-checked on every timeout: a permanently-failed
+          prompt group leaves the buffer short forever, so training cannot
+          step and no weight update ever fires the event; re-evaluating lets
+          the loop resume and gap-fill the shortfall with fresh prompts.
+        """
+        self._generation_limit_cleared.clear()
+        # Primary race recovery: never lose a set() that raced the clear().
+        if not self._should_pause_for_generation_limits():
+            self._generation_limit_cleared.set()
+            return
+
+        # Only log warning once per weight version
+        if self._last_limit_warning_version != self.current_weight_version:
+            target_weights = self._calculate_target_weights(
+                self.current_weight_version,
+                ray.get(
+                    self.replay_buffer.get_last_target_weight_already_generated.remote()
+                ),
+            )
+            print(
+                f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
+                f"already exist in buffer. Waiting for weight update..."
+            )
+            self._last_limit_warning_version = self.current_weight_version
+
+        with self._efficiency_timer.time("idle/generation_limit_pause"):
+            while not self._generation_limit_cleared.is_set() and self.running:
+                self._generation_limit_cleared.wait(
+                    timeout=_GENERATION_LIMIT_RECHECK_SECONDS
+                )
+                if self._generation_limit_cleared.is_set() or not self.running:
+                    break
+                if not self._should_pause_for_generation_limits():
+                    print(
+                        "🔓 Generation-limit pause released by re-check: "
+                        "a target needs more trajectories (likely a "
+                        "failed prompt group) — resuming to gap-fill"
+                    )
+                    break
 
     def start_collection(
         self, dataloader: StatefulDataLoader | CyclingDataLoader
@@ -482,43 +540,7 @@ class AsyncTrajectoryCollector:
 
                 # Check if generation limits require pausing collection
                 if self._should_pause_for_generation_limits() and self.running:
-                    self._generation_limit_cleared.clear()
-
-                    # Only log warning once per weight version
-                    if self._last_limit_warning_version != self.current_weight_version:
-                        target_weights = self._calculate_target_weights(
-                            self.current_weight_version
-                        )
-                        print(
-                            f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                            f"already exist in buffer. Waiting for weight update..."
-                        )
-                        self._last_limit_warning_version = self.current_weight_version
-
-                    # Wait for generation limits to clear, but re-check the
-                    # pause condition periodically: an unbounded wait deadlocks
-                    # when a prompt group fails permanently (e.g. deterministic
-                    # context-overflow 500s) after the pause leaves the buffer
-                    # short forever — training can't step, so no weight update
-                    # ever fires this event. Re-evaluating lets the loop wake
-                    # up and gap-fill the shortfall with new prompts.
-                    with self._efficiency_timer.time("idle/generation_limit_pause"):
-                        while (
-                            not self._generation_limit_cleared.is_set() and self.running
-                        ):
-                            self._generation_limit_cleared.wait(timeout=60.0)
-                            if (
-                                self._generation_limit_cleared.is_set()
-                                or not self.running
-                            ):
-                                break
-                            if not self._should_pause_for_generation_limits():
-                                print(
-                                    "🔓 Generation-limit pause released by re-check: "
-                                    "a target needs more trajectories (likely a "
-                                    "failed prompt group) — resuming to gap-fill"
-                                )
-                                break
+                    self._pause_for_generation_limits()
 
                     # Double-check we're still running after being woken up
                     if not self.running:
