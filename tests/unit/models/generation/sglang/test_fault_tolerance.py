@@ -556,6 +556,10 @@ def test_recover_rolls_back_the_cohort_when_replacement_init_fails(monkeypatch):
     assert gen.all_engines == ["survivor", None]
     assert gen.num_new_engines == 0
     assert killed == [fake_actor]
+    # Rollback mirrors the health monitor's kill path: a best-effort graceful
+    # shutdown (router deregistration + server process tree) precedes the
+    # ray.kill. Here the graceful ray.get raises (same mock) — tolerated.
+    fake_actor.shutdown.remote.assert_called_once_with()
 
 
 def test_recover_escalates_when_the_rollback_itself_fails(monkeypatch):
@@ -588,3 +592,99 @@ def test_recover_escalates_when_the_rollback_itself_fails(monkeypatch):
 
     with pytest.raises(RecoveryRollbackError, match="rollback"):
         gen._recover()
+
+
+def test_recover_rolls_back_when_start_engines_itself_fails(monkeypatch):
+    """A synchronous mid-start failure must roll back what was published.
+
+    ``_start_engines`` mutates ``all_engines`` and ``num_new_engines`` while
+    it runs, so an exception during actor creation or port allocation —
+    before any init is awaited — already leaves a partial cohort visible.
+    """
+    from unittest.mock import MagicMock
+
+    from nemo_rl.models.generation.sglang import sglang_generation
+
+    gen = _bare_generation_for_recover()
+    # A nonzero unconsumed count is real: the constructor's _start_engines
+    # reports the whole startup fleet until the first successful communicator
+    # setup consumes it. Rollback must RESTORE it, not zero it.
+    gen.num_new_engines = 3
+    fake_actor = MagicMock()
+
+    def fake_start_engines(port_cursors=None):
+        gen.all_engines[1] = fake_actor
+        gen.num_new_engines = 1
+        raise RuntimeError("port allocation died")
+
+    gen._start_engines = fake_start_engines
+    killed = []
+    monkeypatch.setattr(sglang_generation.ray, "get", MagicMock())
+    monkeypatch.setattr(
+        sglang_generation.ray, "kill", lambda actor: killed.append(actor)
+    )
+
+    with pytest.raises(RuntimeError, match="port allocation died"):
+        gen._recover()
+
+    assert gen.all_engines == ["survivor", None]
+    assert gen.num_new_engines == 3
+    assert killed == [fake_actor]
+
+
+def test_recover_rolls_back_when_the_offload_transition_fails(monkeypatch):
+    """Post-init recovery work is part of the same atomic attempt.
+
+    If the ``needs_offload`` release/resume RPCs fail after the replacement
+    initialized, leaving the cohort published would make the next recovery
+    see no dead slot and rebind a partially transitioned engine. The whole
+    attempt must roll back — including a graceful shutdown of the (fully
+    initialized) replacement so no orphan server or router entry survives.
+    """
+    from unittest.mock import MagicMock
+
+    from nemo_rl.models.generation.sglang import sglang_generation
+
+    gen = _bare_generation_for_recover()
+    gen.needs_offload = True
+
+    class _StubMonitor:
+        check_timeout = 7.5
+
+        def arm_first_wait(self):
+            pass
+
+    gen._health_monitor = _StubMonitor()
+    fake_actor = MagicMock()
+
+    def fake_start_engines(port_cursors=None):
+        gen.all_engines[1] = fake_actor
+        gen.num_new_engines = 1
+        return (["init-handle"], {})
+
+    gen._start_engines = fake_start_engines
+
+    get_calls = []
+
+    def fake_get(handles, timeout=None):
+        get_calls.append((handles, timeout))
+        if len(get_calls) == 2:  # the first offload release RPC batch
+            raise RuntimeError("offload transition died")
+
+    killed = []
+    monkeypatch.setattr(sglang_generation.ray, "get", fake_get)
+    monkeypatch.setattr(
+        sglang_generation.ray, "kill", lambda actor: killed.append(actor)
+    )
+
+    with pytest.raises(RuntimeError, match="offload transition died"):
+        gen._recover()
+
+    assert gen.all_engines == ["survivor", None]
+    assert gen.num_new_engines == 0
+    assert killed == [fake_actor]
+    fake_actor.shutdown.remote.assert_called_once_with()
+    # The graceful step is BOUNDED by the monitor's configured per-RPC
+    # timeout — an unbounded ray.get could hang the rollback forever on a
+    # wedged replacement.
+    assert get_calls[2][1] == 7.5

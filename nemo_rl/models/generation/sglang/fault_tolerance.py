@@ -85,6 +85,11 @@ class RolloutHealthMonitor:
         # Held for the duration of one check round so pause() can wait it out.
         self._check_lock = threading.Lock()
 
+    @property
+    def check_timeout(self) -> float:
+        """Per-RPC bound for kill/shutdown paths that mirror this monitor's."""
+        return self._check_timeout
+
     def arm_first_wait(self) -> None:
         """Hold off probing until ``rollout_health_check_first_wait`` has elapsed.
 

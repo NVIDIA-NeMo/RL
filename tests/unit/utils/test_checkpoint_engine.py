@@ -1372,3 +1372,47 @@ def test_replacement_rebind_disconnects_the_dead_peer_and_binds_the_new_agent(
 
     assert sender.next_agent == "rollout-new"
     assert removed == ["rollout-old"]
+
+
+def test_replacement_rebind_reconnects_the_survivor_peer():
+    """Survivors re-run the same init and must reconnect, not degrade.
+
+    In a 2x2 fleet where only rollout rank 0 was replaced, rank 1's policy
+    sender re-initializes with the refreshed fleet metadata like everyone
+    else. Its pair is unchanged, so the re-init must be a clean
+    disconnect-before-connect of the SAME agent — proving a fleet-wide rebind
+    is safe for the engines that never died.
+    """
+    engine = NIXLCheckpointEngine.__new__(NIXLCheckpointEngine)
+    engine.prev_agent = None
+    engine.next_agent = None
+    engine._target_weight_layout = None
+    engine.shard_expert_weights = True
+    engine.agent = MagicMock()
+    engine.agent.add_remote_agent.side_effect = lambda metadata: metadata["name"]
+
+    survivor_layout = {"layer.1": {}}
+
+    def fleet_metadata(rollout_0_name):
+        return [
+            {"name": "policy-0"},
+            {"name": "policy-1"},
+            {"name": rollout_0_name, "weight_layout": {"layer.0": {}}},
+            {"name": "rollout-1", "weight_layout": survivor_layout},
+        ]
+
+    kwargs = dict(worker_rank=1, train_world_size=2, rollout_world_size=2)
+    engine.init_policy_process_group(**kwargs, metadata=fleet_metadata("rollout-0"))
+    assert engine.next_agent == "rollout-1"
+    engine.agent.remove_remote_agent.assert_not_called()
+
+    # Rollout rank 0 died and was replaced; rank 1's pair did not change.
+    engine.init_policy_process_group(
+        **kwargs, metadata=fleet_metadata("rollout-0-replacement")
+    )
+
+    assert engine.next_agent == "rollout-1"
+    assert engine.get_target_weight_layout() is survivor_layout
+    # Exactly one disconnect — of its own (surviving) peer — then a rebind.
+    engine.agent.remove_remote_agent.assert_called_once_with("rollout-1")
+    assert engine.agent.add_remote_agent.call_count == 2
