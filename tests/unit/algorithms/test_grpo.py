@@ -31,10 +31,6 @@ from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
-from nemo_rl.experience.trace_replay import (
-    normalize_mixed_physical_trace_groups,
-    validate_trace_replay_groups,
-)
 from nemo_rl.algorithms.grpo import (
     AdvEstimatorConfig,
     AsyncGRPOConfig,
@@ -68,6 +64,8 @@ from nemo_rl.algorithms.grpo import (
     shutdown_environments,
     validate,
 )
+from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
+from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.physical_trace_training import (
     PhysicalTraceTrainingBatch,
     maybe_prepare_physical_trace_training_batch,
@@ -75,8 +73,6 @@ from nemo_rl.algorithms.physical_trace_training import (
     physical_trace_materialization_required,
     validate_physical_trace_training_config,
 )
-from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
-from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -104,6 +100,10 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.experience.rollouts import NemoGymRolloutResult, calculate_rewards
 from nemo_rl.experience.trace_batch_materialization import PreparedTraceBatch
+from nemo_rl.experience.trace_replay import (
+    normalize_mixed_physical_trace_groups,
+    validate_trace_replay_groups,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts

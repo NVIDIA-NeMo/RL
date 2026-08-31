@@ -24,7 +24,6 @@ from nemo_rl.models.generation.interfaces import (
 )
 from tests.unit.trace_test_utils import trace_bundle
 
-
 _PAD_TOKEN_ID = 999
 
 
@@ -168,14 +167,30 @@ def test_prepare_trace_batch_owns_projection_and_worker_inputs():
     assert prepared.metrics()["physical_trace_training/physical_rows"] == 4
 
 
-def test_duplicate_prompts_in_distinct_groups_are_allowed():
+def test_distinct_groups_preserve_logical_to_physical_ownership():
+    identity = _fixture(compacted=False)
+    compacted = _fixture(compacted=True)
     prepared = _prepare(
-        [_fixture(compacted=False), _fixture(compacted=True)],
+        [identity, compacted],
         advantages=[1.0, -1.0],
         prompt_ids=torch.tensor([[1, 2, 3], [1, 2, 3]]),
     )
 
     assert prepared.logical_rollout_count == 2
+    assert prepared.padding_row_count == 0
+    assert prepared.parent_indices.tolist() == [0, 1, 1, 1]
+    assert prepared.row_rollout_ids == [
+        identity["rollout_id"],
+        compacted["rollout_id"],
+        compacted["rollout_id"],
+        compacted["rollout_id"],
+    ]
+    assert prepared.train_data["advantages"][:, 0].tolist() == [
+        1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+    ]
 
 
 def test_async_batch_allows_distinct_policy_versions_across_complete_groups():

@@ -2229,9 +2229,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             assert num_returns == "streaming"
             return self
 
-        def remote(
-            self, inputs, timer_prefix, *, num_generations_per_prompt
-        ):
+        def remote(self, inputs, timer_prefix, *, num_generations_per_prompt):
             assert num_generations_per_prompt == 2
             del inputs, timer_prefix
             return _Stream()
@@ -2311,9 +2309,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
             assert num_returns == "streaming"
             return self
 
-        def remote(
-            self, inputs, timer_prefix, *, num_generations_per_prompt
-        ):
+        def remote(self, inputs, timer_prefix, *, num_generations_per_prompt):
             assert num_generations_per_prompt == 2
             del inputs, timer_prefix
             return _DuplicateStream()

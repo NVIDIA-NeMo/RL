@@ -24,7 +24,6 @@ import torch
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-
 _REPLAY_CONTENT_FIELDS = (
     "rollout_id",
     "group_id",

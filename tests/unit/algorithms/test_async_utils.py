@@ -179,9 +179,7 @@ class TestReplayBufferImplCheckpointing:
         }
 
     def test_local_add_is_idempotent_for_identical_trace_retry(self):
-        buffer = ReplayBufferImpl(
-            max_size=10, drop_incomplete_targets_on_restore=False
-        )
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
         trajectory = self._trace_trajectory()
 
         assert buffer.add(trajectory, 0, 1) == "success"
@@ -192,9 +190,7 @@ class TestReplayBufferImplCheckpointing:
         assert buffer.target_weight_versions == [1]
 
     def test_local_add_rejects_conflicting_trace_identity(self):
-        buffer = ReplayBufferImpl(
-            max_size=10, drop_incomplete_targets_on_restore=False
-        )
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
         trajectory = self._trace_trajectory()
         conflicting = self._trace_trajectory()
         conflicting["batch"]["total_reward"][0] = 0.0

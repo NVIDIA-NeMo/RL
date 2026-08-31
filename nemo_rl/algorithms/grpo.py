@@ -30,10 +30,6 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms import opd as opd_module
-from nemo_rl.experience.trace_replay import (
-    normalize_mixed_physical_trace_groups,
-    validate_trace_replay_groups,
-)
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
     GDPOAdvantageEstimator,
@@ -114,6 +110,10 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
+)
+from nemo_rl.experience.trace_replay import (
+    normalize_mixed_physical_trace_groups,
+    validate_trace_replay_groups,
 )
 from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import (
