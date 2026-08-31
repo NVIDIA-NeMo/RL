@@ -375,9 +375,7 @@ def test_chat_template_kwargs_for_processor_defaults_to_empty():
 
 def test_chat_template_kwargs_for_processor_rejects_invalid_json():
     example = {
-        "responses_create_params": {
-            "metadata": {"chat_template_kwargs": "not-json"}
-        }
+        "responses_create_params": {"metadata": {"chat_template_kwargs": "not-json"}}
     }
 
     with pytest.raises(ValueError, match="chat_template_kwargs"):

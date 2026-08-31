@@ -170,6 +170,7 @@ data:
 ```
 
 - `image_dynamic_resolution` preserves variable image shapes instead of forcing one fixed resolution; for example, a wide image uses a wider patch grid than a square image.
+- `vision_model_type` optionally selects the MCore vision encoder type used by image and video preprocessing. Set it to the encoder expected by the inference wrapper; when omitted, MCore uses its default (`radio`).
 - `num_frames` controls uniform video-frame sampling. Use `video_num_frames` for the corresponding MCore key.
 - `video_temporal_patch_size` groups sampled frames into temporal tubelets; for example, size `2` turns 16 frames into 8 temporal groups.
 - `video_target_num_patches` sets `num_patches_per_frame = patch_height * patch_width <= video_target_num_patches`, which produces `num_patches_per_frame * num_frames / video_temporal_patch_size` total video patches prior to spatial merging (i.e. further grouped / concatenated into MxM patch blocks) that are provided to the vision encoder.

@@ -131,12 +131,15 @@ def build_image_preprocessing_config(
     image_processor: Any,
     *,
     dynamic_resolution: bool | None = None,
+    vision_model_type: str | None = None,
 ) -> ImageProcessingConfig:
     """Translate an HF image processor to an MCore config.
 
     Args:
         image_processor: HF image processor to read patch/normalization fields from.
         dynamic_resolution: Override for `ImageProcessingConfig.dynamic_resolution`.
+            `None` leaves MCore's own default in place.
+        vision_model_type: Override for `ImageProcessingConfig.vision_model_type`.
             `None` leaves MCore's own default in place.
     """
 
@@ -191,6 +194,11 @@ def build_image_preprocessing_config(
             {}
             if dynamic_resolution is None
             else {"dynamic_resolution": dynamic_resolution}
+        ),
+        **(
+            {}
+            if vision_model_type is None
+            else {"vision_model_type": vision_model_type}
         ),
         use_tiling=False,
         pixel_shuffle=merge_size > 1,
