@@ -473,6 +473,46 @@ def test_nemo_gym_postprocess_marks_runtime_rejected_structured_call_invalid():
     assert assistant["tool_call_payload_chars"] == 0
 
 
+def test_nemo_gym_postprocess_uses_gym_invalid_structured_call_signal():
+    class _Tokenizer:
+        def batch_decode(self, batch):
+            return [" ".join(map(str, token_ids)) for token_ids in batch]
+
+    nemo_gym_result = {
+        "invalid_structured_tool_call_call_ids": ["call-bad"],
+        "response": {
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call-bad",
+                    "name": "str_replace_editor",
+                    "arguments": "{}",
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3, 4],
+                    "generation_log_probs": [-0.1, -0.2],
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-bad",
+                    "output": "runtime rejected this call",
+                },
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+    class _MockSelf:
+        cfg = {}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    assert result["message_log"][1]["is_invalid_tool_call"] is True
+
+
 def test_nemo_gym_postprocess_replaces_padding_with_minimal_dummy_tokens():
     class _Tokenizer:
         pad_token_id = 17

@@ -465,13 +465,20 @@ Depending on your data shape, you may want to change these values."""
         # runtime-confirmed failures; validating raw JSON against the advertised
         # schema here would be wrong because OpenHands fills some action fields
         # from assistant reasoning/content.
-        invalid_structured_tool_call_ids = {
-            item.get("call_id")
-            for item in nemo_gym_result["response"]["output"]
-            if item.get("type") == "function_call_output"
-            and str(item.get("output", "")).startswith("Validation failure for ")
-            and item.get("call_id")
-        }
+        gym_invalid_call_ids = nemo_gym_result.get("invalid_structured_tool_call_call_ids")
+        if gym_invalid_call_ids is not None:
+            # New Gym versions explicitly report validation failures. This is a
+            # stable interface, not a dependency on human-readable error text.
+            invalid_structured_tool_call_ids = {str(call_id) for call_id in gym_invalid_call_ids}
+        else:
+            # Compatibility with trajectories produced by an older Gym.
+            invalid_structured_tool_call_ids = {
+                item.get("call_id")
+                for item in nemo_gym_result["response"]["output"]
+                if item.get("type") == "function_call_output"
+                and str(item.get("output", "")).startswith("Validation failure for ")
+                and item.get("call_id")
+            }
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
