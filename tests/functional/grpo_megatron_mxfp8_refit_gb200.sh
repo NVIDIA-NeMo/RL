@@ -97,18 +97,20 @@ uv run coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PR
 
 uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 
-# The setup timing proves that the initial load ran, while the per-step transfer
-# timing proves that the post-update refit ran. Raw rollout log-probs are compared
-# against BF16 policy recomputation; the bounds allow the established MXFP8
-# quantization delta while rejecting a bad refit.
+# The setup weight-sync timing proves that the initial refit ran, while the
+# per-step transfer timing proves that the post-update refit ran. Raw rollout
+# log-probs are compared against BF16 policy recomputation; the bounds allow the
+# established MXFP8 quantization delta while rejecting a bad refit.
 uv run tests/check_metrics.py "$JSON_METRICS" \
     'len(data["train/loss"]) == 2' \
-    'len(data["timing/setup/generation_init_load_time_s"]) == 1' \
-    'min(data["timing/setup/generation_init_load_time_s"]) > 0' \
+    'len(data["timing/setup/weight_sync_time_s"]) == 1' \
+    'min(data["timing/setup/weight_sync_time_s"]) > 0' \
     'len(data["timing/train/prepare_for_generation/transfer_and_update_weights"]) == 1' \
     'min(data["timing/train/prepare_for_generation/transfer_and_update_weights"]) > 0' \
+    'len(data["train/gen_kl_error"]) == 2' \
     'max(data["train/gen_kl_error"]) < 0.15' \
-    'max(data["train/token_mult_prob_error"]) < 2.0'
+    'len(data["train/token_mult_prob_error"]) == 2' \
+    'max(data["train/token_mult_prob_error"]) < 1.5'
 
 assert_grep 'cuda graph warmup' "$RUN_LOG"
 
