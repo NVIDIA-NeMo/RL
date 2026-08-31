@@ -422,11 +422,11 @@ class TestWandbLogger:
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
         step = 10
-        logger.log_metrics(metrics, step)
+        logger.log_metrics(metrics, step, step_finished=True)
 
-        # Check that log was called with metrics and step
+        # W&B's internal row step is implicit; the caller step is a custom axis.
         mock_run = mock_wandb.init.return_value
-        mock_run.log.assert_called_once_with(metrics, step=step)
+        mock_run.log.assert_called_once_with({**metrics, "nemo_rl/step": step})
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_prefix(self, mock_wandb):
@@ -437,12 +437,16 @@ class TestWandbLogger:
         metrics = {"loss": 0.5, "accuracy": 0.8}
         step = 10
         prefix = "train"
-        logger.log_metrics(metrics, step, prefix)
+        logger.log_metrics(metrics, step, prefix, step_finished=True)
 
-        # Check that log was called with prefixed metrics and step
+        # Check that prefixed metrics retain the caller step as a custom axis.
         mock_run = mock_wandb.init.return_value
-        expected_metrics = {"train/loss": 0.5, "train/accuracy": 0.8}
-        mock_run.log.assert_called_once_with(expected_metrics, step=step)
+        expected_metrics = {
+            "train/loss": 0.5,
+            "train/accuracy": 0.8,
+            "nemo_rl/step": step,
+        }
+        mock_run.log.assert_called_once_with(expected_metrics)
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_step_metric(self, mock_wandb):
@@ -459,10 +463,12 @@ class TestWandbLogger:
 
         logger.log_metrics(metrics, step, step_metric=step_metric)
 
-        # Check that log was called with metrics and commit=False
-        # When using step_metric, step should be ignored and commit=False should be used
+        # The requested custom metric supplies the series x-axis. Independent
+        # event streams must not also carry the trainer-step axis.
         mock_run = mock_wandb.init.return_value
-        mock_run.log.assert_called_once_with(metrics, commit=False)
+        mock_run.log.assert_called_once_with(metrics)
+        mock_run.define_metric.assert_any_call("loss", step_metric="iteration")
+        mock_run.define_metric.assert_any_call("accuracy", step_metric="iteration")
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_prefix_and_step_metric(self, mock_wandb):
@@ -480,15 +486,58 @@ class TestWandbLogger:
 
         logger.log_metrics(metrics, step, prefix=prefix, step_metric=step_metric)
 
-        # Check that log was called with prefixed metrics and commit=False
-        # The step_metric key gets prefixed based on the current implementation
+        # The step_metric key gets prefixed based on the current implementation.
         mock_run = mock_wandb.init.return_value
         expected_metrics = {
             "train/loss": 0.5,
             "train/accuracy": 0.8,
             "train/iteration": 15,
         }
-        mock_run.log.assert_called_once_with(expected_metrics, commit=False)
+        mock_run.log.assert_called_once_with(expected_metrics)
+        mock_run.define_metric.assert_any_call(
+            "train/loss", step_metric="train/iteration"
+        )
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_independent_events_do_not_reuse_wandb_internal_step(self, mock_wandb):
+        """Telemetry commits must not make a later trainer step stale."""
+        logger = WandbLogger({})
+
+        logger.log_metrics({"loss": 1.0}, step=1, prefix="train")
+        logger.log_metrics({"seconds": 5.0}, step=1, prefix="timing/train")
+        logger.log_metrics(
+            {"telemetry/wall_time_seconds": 30.0, "tokens_per_second": 10.0},
+            step=1,
+            prefix="rollout/throughput",
+            step_metric="telemetry/wall_time_seconds",
+        )
+        logger.log_metrics(
+            {"tokens_per_second": 20.0},
+            step=1,
+            prefix="performance",
+            step_finished=True,
+        )
+        logger.log_metrics({"loss": 0.5}, step=2, prefix="train", step_finished=True)
+
+        mock_run = mock_wandb.init.return_value
+        assert mock_run.log.call_args_list == [
+            call(
+                {
+                    "telemetry/wall_time_seconds": 30.0,
+                    "rollout/throughput/tokens_per_second": 10.0,
+                }
+            ),
+            call(
+                {
+                    "train/loss": 1.0,
+                    "timing/train/seconds": 5.0,
+                    "performance/tokens_per_second": 20.0,
+                    "nemo_rl/step": 1,
+                }
+            ),
+            call({"train/loss": 0.5, "nemo_rl/step": 2}),
+        ]
+        assert all("step" not in kwargs for _, kwargs in mock_run.log.call_args_list)
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric(self, mock_wandb):
@@ -499,11 +548,124 @@ class TestWandbLogger:
         # Define metric pattern and step metric
         logger.define_metric("ray/*", step_metric="ray/ray_step")
 
-        # Check that define_metric was called
-        mock_run = mock_wandb.init.return_value
-        mock_run.define_metric.assert_called_once_with(
-            "ray/*", step_metric="ray/ray_step"
+        logger.log_metrics(
+            {"ray/ray_step": 15.0, "gpu_utilization": 80.0},
+            step=10,
+            prefix="ray",
+            step_metric="ray/ray_step",
         )
+        logger.log_metrics(
+            {"ray/ray_step": 16.0, "gpu_utilization": 81.0},
+            step=11,
+            prefix="ray",
+            step_metric="ray/ray_step",
+        )
+
+        # Patterns stay local; W&B receives deterministic exact-name rules.
+        mock_run = mock_wandb.init.return_value
+        assert call("ray/*", step_metric="ray/ray_step") not in (
+            mock_run.define_metric.call_args_list
+        )
+        mock_run.define_metric.assert_any_call("ray/ray_step", hidden=True)
+        mock_run.define_metric.assert_any_call(
+            "ray/gpu_utilization", step_metric="ray/ray_step"
+        )
+        assert (
+            mock_run.define_metric.call_args_list.count(
+                call("ray/gpu_utilization", step_metric="ray/ray_step")
+            )
+            == 1
+        )
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_define_metric_rejects_conflicting_registration(self, mock_wandb):
+        logger = WandbLogger({})
+        logger.define_metric("ray/*", step_metric="ray/ray_step")
+
+        with pytest.raises(ValueError, match="already registered"):
+            logger.define_metric("ray/*", step_metric="other/step")
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_define_metric_rejects_non_terminal_wildcard(self, mock_wandb):
+        logger = WandbLogger({})
+
+        with pytest.raises(ValueError, match="exactly one trailing"):
+            logger.define_metric("ray/*/util", step_metric="ray/ray_step")
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_log_metrics_requires_registered_step_metric(self, mock_wandb):
+        logger = WandbLogger({})
+        logger.define_metric(
+            "rollout/throughput/*",
+            step_metric="telemetry/wall_time_seconds",
+        )
+
+        with pytest.raises(ValueError, match="is missing from the logged event"):
+            logger.log_metrics(
+                {"rollout/throughput/tokens_per_second": 10.0},
+                step=0,
+            )
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_define_metric_uses_longest_matching_prefix(self, mock_wandb):
+        logger = WandbLogger({})
+        logger.define_metric("rollout/*", step_metric="rollout/step")
+        logger.define_metric(
+            "rollout/throughput/*",
+            step_metric="telemetry/wall_time_seconds",
+        )
+
+        logger.log_metrics(
+            {
+                "telemetry/wall_time_seconds": 30.0,
+                "rollout/throughput/tokens_per_second": 10.0,
+            },
+            step=0,
+        )
+
+        mock_run = mock_wandb.init.return_value
+        mock_run.define_metric.assert_any_call(
+            "rollout/throughput/tokens_per_second",
+            step_metric="telemetry/wall_time_seconds",
+        )
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_does_not_define_catch_all_metric(self, mock_wandb):
+        """Overlapping W&B globs must not choose axes nondeterministically."""
+        WandbLogger({})
+
+        mock_run = mock_wandb.init.return_value
+        assert call("*", step_metric="nemo_rl/step") not in (
+            mock_run.define_metric.call_args_list
+        )
+
+    @patch("nemo_rl.utils.logger.atexit.register")
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_registers_teardown_flush(self, mock_wandb, mock_atexit_register):
+        """Driver entrypoints flush the final pending row at process exit."""
+        logger = WandbLogger({})
+        logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
+
+        mock_atexit_register.assert_called_once_with(logger.finish)
+        callback = mock_atexit_register.call_args.args[0]
+        callback()
+
+        mock_run = mock_wandb.init.return_value
+        mock_run.log.assert_called_once_with({"train/loss": 0.5, "nemo_rl/step": 7})
+        mock_run.finish.assert_called_once_with()
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_finish_flushes_pending_trainer_row(self, mock_wandb):
+        """A final incomplete step is not lost during logger teardown."""
+        logger = WandbLogger({})
+        logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
+
+        mock_run = mock_wandb.init.return_value
+        mock_run.log.assert_not_called()
+        logger.finish()
+
+        mock_run.log.assert_called_once_with({"train/loss": 0.5, "nemo_rl/step": 7})
+        mock_run.finish.assert_called_once_with()
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_hyperparams(self, mock_wandb):
@@ -1837,6 +1999,34 @@ class TestLogger:
             10,
             "generation_metrics/validation/histogram/gen_tokens_length",
         )
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
+    def test_define_metric_only_targets_wandb(
+        self, mock_tb_logger, mock_wandb_logger, temp_dir
+    ):
+        cfg = {
+            "wandb_enabled": True,
+            "tensorboard_enabled": True,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": False,
+            "wandb": {"project": "test-project"},
+            "tensorboard": {"log_dir": "test_logs"},
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        logger.define_metric(
+            "rollout/throughput/*",
+            step_metric="telemetry/wall_time_seconds",
+        )
+
+        mock_wandb_logger.return_value.define_metric.assert_called_once_with(
+            "rollout/throughput/*",
+            step_metric="telemetry/wall_time_seconds",
+        )
+        assert not mock_tb_logger.return_value.define_metric.called
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")

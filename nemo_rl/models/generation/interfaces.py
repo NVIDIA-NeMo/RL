@@ -623,3 +623,12 @@ class GenerationInterface(ABC):
             Dictionary of metrics. Format may vary by backend.
         """
         return {}
+
+    def drain_latest_logger_metrics(self) -> dict[str, Any]:
+        """Consume a bounded latest-value snapshot for frequent telemetry polls.
+
+        Implementations may clear or compact their accumulated metric histories.
+        Callers must not assume that a later ``get_logger_metrics`` includes values
+        observed before this drain.
+        """
+        return self.get_logger_metrics()

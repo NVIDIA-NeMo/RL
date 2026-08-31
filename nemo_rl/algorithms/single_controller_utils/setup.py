@@ -104,6 +104,7 @@ from nemo_rl.experience.rollout_manager import (
     RolloutRetryPolicy,
     RolloutTimeouts,
 )
+from nemo_rl.experience.rollout_recovery import ROLLOUT_RECOVERY_STATE_FILENAME
 from nemo_rl.experience.rollouts import should_mask_flagged_samples
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
@@ -159,6 +160,7 @@ class SingleControllerActorArgs:
     last_checkpoint_path: Optional[str]
     finalizer_actors: list[Any]
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
+    rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
     bootstrap_fingerprint: Optional[str] = None
     # None when async_rl.generation_fleet_health is disabled.
     fleet_monitor: Optional[GenerationFleetHealth] = None
@@ -949,6 +951,38 @@ def setup_single_controller(
         "single_controller_utils.setup requires policy.generation in master_config"
     )
 
+    telemetry_interval_s = master_config.rollout_checkpointing.telemetry_interval_s
+    if telemetry_interval_s is not None:
+        generation_backend = generation_config["backend"]
+        if generation_backend != "vllm":
+            warnings.warn(
+                "rollout_checkpointing.telemetry_interval_s is enabled with "
+                f"policy.generation.backend={generation_backend!r}. Canonical "
+                "rollout telemetry will be recorded, but vLLM token, request, "
+                "and KV-cache signals are unavailable for this backend.",
+                stacklevel=2,
+            )
+        else:
+            vllm_cfg = generation_config["vllm_cfg"]
+            if not vllm_cfg.get("enable_vllm_metrics_logger"):
+                warnings.warn(
+                    "rollout_checkpointing.telemetry_interval_s is enabled, but "
+                    "policy.generation.vllm_cfg.enable_vllm_metrics_logger is "
+                    "false. Canonical rollout telemetry will be recorded, but "
+                    "vLLM token, request, and KV-cache signals will be absent.",
+                    stacklevel=2,
+                )
+            elif not vllm_cfg["async_engine"]:
+                warnings.warn(
+                    "rollout_checkpointing.telemetry_interval_s and "
+                    "policy.generation.vllm_cfg.enable_vllm_metrics_logger are "
+                    "enabled, but vLLM metric collection requires "
+                    "policy.generation.vllm_cfg.async_engine=true. Canonical "
+                    "rollout telemetry will be recorded, but vLLM token, request, "
+                    "and KV-cache signals will be absent.",
+                    stacklevel=2,
+                )
+
     if data_config["use_multiple_dataloader"]:
         raise NotImplementedError(
             "single_controller_utils does not support "
@@ -1136,6 +1170,16 @@ def setup_single_controller(
             f"without considering newer periodic snapshots: {trainer_checkpoint_path}",
             flush=True,
         )
+    recovery_path = (
+        Path(recovery_checkpoint_path) if recovery_checkpoint_path is not None else None
+    )
+    has_rollout_checkpoint_payload = recovery_path is not None and (
+        (recovery_path / REPLAY_BUFFER_METADATA_FILENAME).is_file()
+        or (recovery_path / ROLLOUT_RECOVERY_STATE_FILENAME).is_file()
+    )
+    rollout_checkpoint_load_metrics: Optional[dict[str, float]] = (
+        {} if has_rollout_checkpoint_payload else None
+    )
 
     # ==========================
     # Setup Dataset & Environments
@@ -1172,7 +1216,12 @@ def setup_single_controller(
         print(
             f"📦 Restoring dataloader state from checkpoint: {recovery_checkpoint_path}"
         )
+        dataloader_load_started = time.monotonic()
         load_dataloader_state(dataloader, recovery_checkpoint_path, data_config)
+        if rollout_checkpoint_load_metrics is not None:
+            rollout_checkpoint_load_metrics["dataloader_load_seconds"] = (
+                time.monotonic() - dataloader_load_started
+            )
 
     _clamp_max_num_steps(master_config, dataloader)
     _maybe_inject_megatron_train_iters(master_config)
@@ -1365,6 +1414,7 @@ def setup_single_controller(
     # Native TQ restore must run through the trainer's bootstrap client before
     # the normal SC data-plane client is created or any rollout/train data-plane
     # operation starts.
+    data_plane_load_started = time.monotonic()
     data_plane_checkpoint_metadata = _maybe_restore_native_data_plane_checkpoint(
         trainer,
         last_checkpoint_path=recovery_checkpoint_path,
@@ -1372,6 +1422,10 @@ def setup_single_controller(
         partition_id=partition_id,
         sampler_name=master_config.async_rl.sampler.name,
     )
+    if rollout_checkpoint_load_metrics is not None:
+        rollout_checkpoint_load_metrics["tq_load_seconds"] = (
+            time.monotonic() - data_plane_load_started
+        )
 
     if use_nemo_gym:
         env_handles["nemo_gym"], gym_time = results["nemo_gym"]
@@ -1585,6 +1639,7 @@ def setup_single_controller(
         save_state=save_state,
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
+        rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         bootstrap_fingerprint=bootstrap_digest,
         finalizer_actors=finalizer_actors,
         fleet_monitor=fleet_monitor,
