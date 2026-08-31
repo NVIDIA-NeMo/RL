@@ -122,6 +122,7 @@ from nemo_rl.models.megatron.train import (
     megatron_forward_backward,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.deferred import attach_deferred_topk_logits
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -1067,6 +1068,7 @@ class MegatronPolicyWorkerImpl(
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
+        deferred_topk_logits: Optional[dict[str, torch.Tensor]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
@@ -1079,6 +1081,7 @@ class MegatronPolicyWorkerImpl(
             "check_dim_skip_keys is only supported by the v2 DTensor worker; "
             "Megatron does not run cross-tokenizer distillation."
         )
+        attach_deferred_topk_logits(data, deferred_topk_logits)
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
