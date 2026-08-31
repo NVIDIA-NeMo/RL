@@ -197,8 +197,13 @@ def _record() -> PromptGroupRecord:
     )
 
 
-def _stub_converter(record: PromptGroupRecord, *, pad_value_dict: Any):
-    del record, pad_value_dict
+def _stub_converter(
+    record: PromptGroupRecord,
+    *,
+    pad_value_dict: Any,
+    include_message_violation_fields: bool,
+):
+    del record, pad_value_dict, include_message_violation_fields
     return BatchedDataDict[Any](
         {
             "input_ids": torch.ones((ROLLOUTS_PER_GROUP, 3), dtype=torch.long),
