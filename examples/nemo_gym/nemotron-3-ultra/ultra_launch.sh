@@ -89,7 +89,7 @@ set -euo pipefail
 : "${TRAIN_PATH:?TRAIN_PATH is required (training data jsonl path)}"
 : "${VAL_PATH:?VAL_PATH is required (validation data jsonl path)}"
 : "${CONTAINER:?CONTAINER is required (NGC image URI or .sqsh path)}"
-: "${SANDBOX_CONTAINER:?SANDBOX_CONTAINER is required (nemo-skills sandbox image)}"
+: "${SANDBOX_CONTAINER?SANDBOX_CONTAINER must be set (nemo-skills sandbox image; empty string disables the sidecar)}"
 : "${PERSISTENT_CACHE:?PERSISTENT_CACHE is required (Lustre dir for vLLM/Triton/Inductor caches)}"
 : "${SLURM_PARTITION:?SLURM_PARTITION is required}"
 : "${SLURM_ACCOUNT:?SLURM_ACCOUNT is required}"
@@ -587,7 +587,13 @@ fi
 # NeMo Skills sandbox (for math_formal_lean, ns_tools, etc.)
 # =============================================================================
 export SANDBOX_CONTAINER
-export SANDBOX_COMMAND="${SANDBOX_COMMAND:-/start-with-nginx.sh}"
+# Empty container disables the sidecar; ray.sub gates on BOTH being non-empty,
+# so keep the command empty too instead of default-filling it.
+if [[ -n "${SANDBOX_CONTAINER}" ]]; then
+  export SANDBOX_COMMAND="${SANDBOX_COMMAND:-/start-with-nginx.sh}"
+else
+  export SANDBOX_COMMAND=""
+fi
 export NEMO_SKILLS_SANDBOX_PORT="${NEMO_SKILLS_SANDBOX_PORT:-6000}"
 
 # =============================================================================
