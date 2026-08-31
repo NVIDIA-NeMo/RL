@@ -101,9 +101,13 @@ checkpointing:
   checkpoint_must_save_by: null
   model_save_format: "safetensors"
   # Canonical Automodel modes: "false", "final", or "every".
-  save_consolidated: "final"
+  save_consolidated: "false"
   single_rank_consolidation: false
   consolidation_timeout_minutes: 30
+  cpu_offload: false
+  allow_legacy_pickle_restore: false
+  staging_dir: null
+  v4_compatible: false
   save_optimizer: true
 
 policy:

@@ -4791,6 +4791,12 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
 
         # Verify training stopped at 8 steps (when check_save returned True)
         assert mock_grpo_components["policy"].train.call_count == 8
+        assert (
+            mock_grpo_components["policy"].save_checkpoint.call_args.kwargs[
+                "is_final_checkpoint"
+            ]
+            is False
+        )
 
         # Verify the timeout message was printed and training actually stopped
         captured = capsys.readouterr()

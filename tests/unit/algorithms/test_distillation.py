@@ -402,6 +402,12 @@ def test_exit_on_timeout(mock_components, capsys):
 
         # Verify training stopped at 8 steps (when check_save returned True)
         assert mock_components["student_policy"].train.call_count == 8
+        assert (
+            mock_components["student_policy"].save_checkpoint.call_args.kwargs[
+                "is_final_checkpoint"
+            ]
+            is False
+        )
 
         # Verify the timeout message was printed and training actually stopped
         captured = capsys.readouterr()

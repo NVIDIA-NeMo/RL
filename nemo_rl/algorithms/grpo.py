@@ -142,7 +142,11 @@ from nemo_rl.telemetry.instrumentation import (
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+    should_save_as_final_checkpoint,
+)
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
@@ -3852,10 +3856,9 @@ def grpo_train(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
                             checkpointing_cfg=master_config.checkpointing,
-                            is_final_checkpoint=(
-                                is_last_step
-                                or early_stop_message is not None
-                                or should_save_by_timeout
+                            is_final_checkpoint=should_save_as_final_checkpoint(
+                                is_last_step=is_last_step,
+                                early_stop_requested=early_stop_message is not None,
                             ),
                         )
                         if master_config.data["use_multiple_dataloader"]:
@@ -5716,10 +5719,9 @@ def async_grpo_train(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
                             checkpointing_cfg=master_config.checkpointing,
-                            is_final_checkpoint=(
-                                is_last_step
-                                or early_stop_message is not None
-                                or should_save_by_timeout
+                            is_final_checkpoint=should_save_as_final_checkpoint(
+                                is_last_step=is_last_step,
+                                early_stop_requested=early_stop_message is not None,
                             ),
                         )
                         # Save the dataloader state at the checkpoint cut

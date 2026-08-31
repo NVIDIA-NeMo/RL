@@ -124,9 +124,13 @@ checkpointing:
   load_replay_buffer: true
   model_save_format: "safetensors"
   # Canonical Automodel modes: "false", "final", or "every".
-  save_consolidated: "final"
+  save_consolidated: "false"
   single_rank_consolidation: false
   consolidation_timeout_minutes: 30
+  cpu_offload: false
+  allow_legacy_pickle_restore: false
+  staging_dir: null
+  v4_compatible: false
   save_optimizer: true
   # SingleController only: include native TQ state and the metadata-only replay
   # index. Required for recovery-capable samplers to preserve completed,

@@ -913,7 +913,7 @@ class TestSaveTrigger:
 
         assert actor._train_steps == 1
         assert len(trainer.save_calls) == 1
-        assert trainer.save_calls[0]["is_final_checkpoint"] is True
+        assert trainer.save_calls[0]["is_final_checkpoint"] is False
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
 
     def test_rollout_exhaustion_saves_final_checkpoint(self, tmp_path):

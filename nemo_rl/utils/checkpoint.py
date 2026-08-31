@@ -146,6 +146,14 @@ class CheckpointingConfig(TypedDict):
     single_rank_consolidation (bool): Whether only rank 0 consolidates the checkpoint.
     consolidation_timeout_minutes (int): Timeout for the dedicated distributed
         consolidation process group.
+    cpu_offload (bool): Whether Automodel moves checkpoint state tensors to CPU
+        before saving.
+    staging_dir (str | None): Optional local staging directory used while
+        consolidating checkpoint shards.
+    v4_compatible (bool): Whether consolidated checkpoints use the original
+        Transformers v4-compatible model configuration.
+    allow_legacy_pickle_restore (bool): Whether trusted legacy pickle-based
+        Automodel training state may be restored.
     model_cache_dir (str): Directory for model cache (for safetensors format).
     model_repo_id (str): Repository ID for the model (for safetensors format).
     is_peft (bool): Whether the model uses PEFT.
@@ -180,11 +188,39 @@ class CheckpointingConfig(TypedDict):
     ]  # Automodel default: "final"
     single_rank_consolidation: NotRequired[bool]  # Default: False
     consolidation_timeout_minutes: NotRequired[int]  # Default: 30
+    cpu_offload: NotRequired[bool]  # Default: False
+    staging_dir: NotRequired[str | None]  # Default: None
+    v4_compatible: NotRequired[bool]  # Default: False
+    allow_legacy_pickle_restore: NotRequired[bool]  # Default: False
     model_cache_dir: NotRequired[str]  # Default: ""
     model_repo_id: NotRequired[str]  # Default: ""
     is_peft: NotRequired[bool]  # Default: False
     peft_config: NotRequired[Any]  # Default: None
     is_async: NotRequired[bool]  # Default: False
+    # Keep known upstream-only keys through Pydantic parsing so the Automodel
+    # wrapper can reject them explicitly instead of silently dropping them.
+    wait_for_staging: NotRequired[bool]
+    diffusers_compatible: NotRequired[bool]
+    best_metric_key: NotRequired[str]
+    max_recent_checkpoints: NotRequired[int | None]
+
+
+def should_save_as_final_checkpoint(
+    *, is_last_step: bool, early_stop_requested: bool = False
+) -> bool:
+    """Return whether a checkpoint represents a completed training run.
+
+    A timeout-triggered checkpoint is a resumable interruption point, not a
+    completed run, so timeout state is intentionally not accepted here.
+
+    Args:
+        is_last_step: Whether the algorithm reached its final training step.
+        early_stop_requested: Whether the algorithm deliberately ended early.
+
+    Returns:
+        True when downstream checkpoint logic should apply final-save behavior.
+    """
+    return is_last_step or early_stop_requested
 
 
 class CheckpointManager:

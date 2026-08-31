@@ -81,7 +81,10 @@ from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointManager,
+    should_save_as_final_checkpoint,
+)
 from nemo_rl.utils.logger import Logger, print_message_log_samples
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
@@ -1193,10 +1196,9 @@ def grpo_train_sync(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
                             checkpointing_cfg=master_config.checkpointing,
-                            is_final_checkpoint=(
-                                is_last_step
-                                or early_stop_message is not None
-                                or should_save_by_timeout
+                            is_final_checkpoint=should_save_as_final_checkpoint(
+                                is_last_step=is_last_step,
+                                early_stop_requested=early_stop_message is not None,
                             ),
                         )
                         if master_config.data["use_multiple_dataloader"]:

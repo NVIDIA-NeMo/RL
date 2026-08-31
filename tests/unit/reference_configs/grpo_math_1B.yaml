@@ -130,9 +130,13 @@ checkpointing:
   load_replay_buffer: true
   save_data_plane: false
   model_save_format: "safetensors"
-  save_consolidated: "final"
+  save_consolidated: "false"
   single_rank_consolidation: false
   consolidation_timeout_minutes: 30
+  cpu_offload: false
+  allow_legacy_pickle_restore: false
+  staging_dir: null
+  v4_compatible: false
   save_optimizer: true
 
 policy:

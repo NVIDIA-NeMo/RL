@@ -50,6 +50,25 @@ def checkpoint_manager(checkpoint_config):
     return CheckpointManager(checkpoint_config)
 
 
+@pytest.mark.parametrize(
+    ("is_last_step", "early_stop_requested", "expected"),
+    [
+        (False, False, False),
+        (True, False, True),
+        (False, True, True),
+        (True, True, True),
+    ],
+)
+def test_should_save_as_final_checkpoint(is_last_step, early_stop_requested, expected):
+    assert (
+        checkpoint_module.should_save_as_final_checkpoint(
+            is_last_step=is_last_step,
+            early_stop_requested=early_stop_requested,
+        )
+        is expected
+    )
+
+
 def test_init_tmp_checkpoint(checkpoint_manager, checkpoint_dir):
     # Test creating a new checkpoint
     step = 1

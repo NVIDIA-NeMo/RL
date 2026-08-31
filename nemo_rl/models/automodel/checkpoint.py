@@ -17,9 +17,10 @@ This module provides a wrapper class around the nemo_automodel Checkpointer
 for saving and loading model checkpoints in DTensor-based policy workers.
 """
 
+import logging
 import os
 from dataclasses import fields, replace
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import torch
 from nemo_automodel.components._peft.lora import PeftConfig
@@ -33,6 +34,7 @@ from nemo_automodel.components.checkpoint.config import (
     CheckpointingConfig as AutomodelCheckpointingConfig,
 )
 from nemo_automodel.components.checkpoint.config import SaveConsolidatedMode
+from nemo_automodel.components.checkpoint.utils import is_cloud_path
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoTokenizer
@@ -40,19 +42,23 @@ from transformers import AutoTokenizer
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.native_checkpoint import save_tokenizer_on_rank0
 
+logger = logging.getLogger(__name__)
 
-_CHECKPOINTER_RESOURCE_FIELDS = frozenset(
+
+_IN_PLACE_MUTABLE_FIELDS = frozenset(
     {
-        "consolidation_timeout_minutes",
-        "is_async",
-        "is_peft",
-        "model_save_format",
-        "single_rank_consolidation",
+        "checkpoint_dir",
+        "dequantize_base_checkpoint",
+        "model_cache_dir",
+        "model_repo_id",
+        "skip_task_head_prefixes_for_base_model",
     }
 )
 _AUTOMODEL_CONFIG_FIELDS = frozenset(
     {
+        "allow_legacy_pickle_restore",
         "consolidation_timeout_minutes",
+        "cpu_offload",
         "dequantize_base_checkpoint",
         "is_async",
         "is_peft",
@@ -62,8 +68,44 @@ _AUTOMODEL_CONFIG_FIELDS = frozenset(
         "save_consolidated",
         "single_rank_consolidation",
         "skip_task_head_prefixes_for_base_model",
+        "staging_dir",
+        "v4_compatible",
     }
 )
+# NeMo-RL always finalizes async saves before promoting tmp_step_N, owns
+# checkpoint selection/retention, and does not expose Diffusers checkpoints.
+_UNSUPPORTED_AUTOMODEL_CONFIG_FIELDS = frozenset(
+    {
+        "best_metric_key",
+        "diffusers_compatible",
+        "max_recent_checkpoints",
+        "wait_for_staging",
+    }
+)
+
+
+def _extract_automodel_config_updates(
+    config_updates: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return supported Automodel fields and reject known unsupported ones."""
+    unsupported_fields = sorted(
+        _UNSUPPORTED_AUTOMODEL_CONFIG_FIELDS.intersection(config_updates)
+    )
+    if unsupported_fields:
+        raise ValueError(
+            "Unsupported checkpointing field(s) for NeMo-RL's Automodel "
+            f"integration: {', '.join(unsupported_fields)}. NeMo-RL owns async "
+            "save finalization, checkpoint metric selection, and checkpoint "
+            "retention; use metric_name, keep_top_k, and ft_keep_latest_k for "
+            "the corresponding NeMo-RL behavior. Diffusers checkpoint export is "
+            "not supported by NeMo-RL."
+        )
+
+    return {
+        key: value
+        for key, value in config_updates.items()
+        if key in _AUTOMODEL_CONFIG_FIELDS
+    }
 
 
 def _patch_qwen_vl_vision_key_mapping() -> None:
@@ -121,9 +163,7 @@ def _patch_qwen_vl_vision_key_mapping() -> None:
 try:
     _patch_qwen_vl_vision_key_mapping()
 except Exception as e:  # pragma: no cover - defensive: never break import
-    import logging
-
-    logging.getLogger(__name__).warning(
+    logger.warning(
         "Failed to apply Qwen2.5-VL vision-tower key-mapping patch "
         "(transformers #44627/#45358 workaround): %s",
         e,
@@ -191,11 +231,7 @@ class AutomodelCheckpointManager:
         # Let Automodel own defaults and normalization for its checkpoint fields.
         # In particular, its canonical default is save_consolidated="final" and
         # legacy booleans are normalized to false/every in __post_init__.
-        automodel_config_updates = {
-            key: value
-            for key, value in config_updates.items()
-            if key in _AUTOMODEL_CONFIG_FIELDS
-        }
+        automodel_config_updates = _extract_automodel_config_updates(config_updates)
         base_cfg = AutomodelCheckpointingConfig(
             enabled=True,
             checkpoint_dir=checkpoint_root or "",
@@ -236,15 +272,12 @@ class AutomodelCheckpointManager:
         current_config: AutomodelCheckpointingConfig,
         updated_config: AutomodelCheckpointingConfig,
     ) -> bool:
-        """Return whether an update changes Checkpointer-owned resources."""
-        resource_field_changed = any(
-            getattr(current_config, field_name) != getattr(updated_config, field_name)
-            for field_name in _CHECKPOINTER_RESOURCE_FIELDS
+        """Conservatively rebuild unless every changed field is known-safe."""
+        return any(
+            getattr(current_config, field.name) != getattr(updated_config, field.name)
+            for field in fields(updated_config)
+            if field.name not in _IN_PLACE_MUTABLE_FIELDS
         )
-        consolidation_group_requirement_changed = (
-            current_config.save_consolidated != SaveConsolidatedMode.FALSE
-        ) != (updated_config.save_consolidated != SaveConsolidatedMode.FALSE)
-        return resource_field_changed or consolidation_group_requirement_changed
 
     @staticmethod
     def _apply_config_in_place(
@@ -267,19 +300,18 @@ class AutomodelCheckpointManager:
         old_checkpointer.async_wait()
         new_checkpointer = self._build_checkpointer(config)
 
-        try:
-            old_checkpointer.close()
-        except Exception as close_error:
-            try:
-                new_checkpointer.close()
-            except Exception as cleanup_error:
-                close_error.add_note(
-                    f"Replacement Checkpointer cleanup also failed: {cleanup_error!r}"
-                )
-            raise
-
+        # Publish the fully constructed replacement before best-effort cleanup.
+        # A rank-local close failure must not make only that rank close the new
+        # process groups or leave the manager pointing at a partially closed object.
         self.checkpointer = new_checkpointer
         self.checkpoint_config = config
+        try:
+            old_checkpointer.close()
+        except Exception:
+            logger.exception(
+                "Failed to close the replaced Automodel Checkpointer; "
+                "continuing with the new instance"
+            )
 
     def update_checkpointer_config(
         self,
@@ -292,8 +324,8 @@ class AutomodelCheckpointManager:
         If no checkpointer exists, this method does nothing.
 
         Checkpointer construction creates async stagers and dedicated process groups.
-        Changes to fields that own those resources close and rebuild the Checkpointer on
-        every rank. Other changes are copied onto the existing config after validation.
+        Only explicitly known-safe fields are updated in place; every other change
+        closes and rebuilds the Checkpointer on every rank.
 
         Args:
             config_updates: Dict of CheckpointingConfig fields to update.
@@ -307,14 +339,39 @@ class AutomodelCheckpointManager:
 
         assert self.checkpoint_config is not None
         cfg = self.checkpoint_config
-        updated_cfg = self._updated_config(cfg, config_updates, checkpoint_root)
+        updates = dict(config_updates)
+        if checkpoint_root is not None:
+            updates["checkpoint_dir"] = checkpoint_root
+
+        changed_updates: dict[str, Any] = {}
+        for field_name, value in updates.items():
+            current_value = getattr(cfg, field_name)
+            if isinstance(current_value, (SerializationFormat, SaveConsolidatedMode)):
+                current_value = current_value.value
+            if isinstance(value, (SerializationFormat, SaveConsolidatedMode)):
+                value = value.value
+            if current_value != value:
+                changed_updates[field_name] = value
+
+        if not changed_updates:
+            return
+
+        # checkpoint_dir changes for every step and is read through the shared
+        # config object. Avoid replace(), which reruns Automodel __post_init__
+        # and repeats configuration warnings on every rank and checkpoint.
+        if changed_updates.keys() == {"checkpoint_dir"} and is_cloud_path(
+            cfg.checkpoint_dir
+        ) == is_cloud_path(changed_updates["checkpoint_dir"]):
+            cfg.checkpoint_dir = changed_updates["checkpoint_dir"]
+            return
+
+        updated_cfg = self._updated_config(cfg, changed_updates, None)
 
         if self._requires_checkpointer_rebuild(cfg, updated_cfg):
             self._replace_checkpointer(updated_cfg)
             return
 
         self._apply_config_in_place(cfg, updated_cfg)
-        self.checkpoint_config = cfg
 
     def finalize_async_save(self) -> None:
         """Block until in-flight async checkpoint writes have landed on disk.
@@ -376,12 +433,7 @@ class AutomodelCheckpointManager:
                 "checkpointing_cfg must be provided when saving checkpoint"
             )
 
-        # Extract only the checkpointing configuration keys that exist
-        checkpoint_kwargs = {
-            key: value
-            for key, value in checkpointing_cfg.items()
-            if key in _AUTOMODEL_CONFIG_FIELDS
-        }
+        checkpoint_kwargs = _extract_automodel_config_updates(checkpointing_cfg)
         save_peft_config = checkpointing_cfg.get("peft_config")
         if lora_enabled:
             checkpoint_kwargs["is_peft"] = True
@@ -439,7 +491,37 @@ class AutomodelCheckpointManager:
             "Call init_checkpointer() first."
         )
 
-        model_save_format, is_peft = detect_checkpoint_format(weights_path)
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            detection: list[tuple[str | None, bool | None, str | None]] = [
+                (None, None, None)
+            ]
+            if torch.distributed.get_rank() == 0:
+                # Broadcast every ordinary detection failure; otherwise peers
+                # would wait forever after rank 0 exits before the collective.
+                try:
+                    model_save_format, is_peft = detect_checkpoint_format(weights_path)
+                except Exception as error:
+                    detection[0] = (
+                        None,
+                        None,
+                        f"{type(error).__name__}: {error}",
+                    )
+                else:
+                    detection[0] = (model_save_format, is_peft, None)
+
+            torch.distributed.broadcast_object_list(detection, src=0)
+            model_save_format, is_peft, detection_error = detection[0]
+            if detection_error is not None:
+                raise RuntimeError(
+                    "Rank 0 failed to detect the checkpoint format at "
+                    f"{weights_path}: {detection_error}"
+                )
+            assert model_save_format is not None and is_peft is not None
+        else:
+            model_save_format, is_peft = detect_checkpoint_format(weights_path)
 
         weights_dir = os.path.dirname(weights_path)
         checkpoint_root = (
@@ -488,27 +570,32 @@ def detect_checkpoint_format(weights_path: str) -> tuple[str, bool]:
         tuple: (model_save_format, is_peft) where:
                model_save_format is "torch_save" for DCP or "safetensors" for safetensors
                is_peft is True if PEFT/adapter patterns are detected
+
+    Raises:
+        OSError: If the checkpoint directory cannot be traversed completely.
     """
     is_peft = False
     model_save_format = "safetensors"
-    try:
-        # Iterate through all subdirectories and files recursively
-        all_files = []
-        for root, dirs, files in os.walk(weights_path):
-            all_files.extend(files)
+    if not os.path.isdir(weights_path):
+        raise FileNotFoundError(f"Checkpoint path does not exist: {weights_path}")
 
-        if any(f.endswith(".distcp") for f in all_files):
-            model_save_format = "torch_save"
-        elif any(f.endswith(".safetensors") for f in all_files):
-            model_save_format = "safetensors"
-        elif any(f.endswith((".bin", ".pt", ".pth")) for f in all_files):
-            model_save_format = "torch_save"
+    def raise_walk_error(error: OSError) -> None:
+        raise error
 
-        if not is_peft:
-            is_peft = any("adapter" in f.lower() for f in all_files)
+    # Iterate through all subdirectories and fail loudly on incomplete scans.
+    all_files = []
+    for _, _, files in os.walk(weights_path, onerror=raise_walk_error):
+        all_files.extend(files)
 
-    except (OSError, PermissionError):
-        pass
+    if any(f.endswith(".distcp") for f in all_files):
+        model_save_format = "torch_save"
+    elif any(f.endswith(".safetensors") for f in all_files):
+        model_save_format = "safetensors"
+    elif any(f.endswith((".bin", ".pt", ".pth")) for f in all_files):
+        model_save_format = "torch_save"
+
+    if not is_peft:
+        is_peft = any("adapter" in f.lower() for f in all_files)
 
     return model_save_format, is_peft
 

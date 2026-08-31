@@ -122,7 +122,11 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
-from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
+from nemo_rl.utils.checkpoint import (
+    CheckpointManager,
+    PathLike,
+    should_save_as_final_checkpoint,
+)
 from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
@@ -2094,8 +2098,8 @@ class SingleControllerActor:
                         await self._save_checkpoint(
                             step_metrics,
                             is_policy_training_step=is_policy_training_step,
-                            is_final_checkpoint=(
-                                is_last_step or should_save_by_timeout
+                            is_final_checkpoint=should_save_as_final_checkpoint(
+                                is_last_step=is_last_step
                             ),
                         )
 
