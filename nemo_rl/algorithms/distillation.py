@@ -941,13 +941,31 @@ def distillation_train(
                         tracer=_tracer,
                     ),
                 ):
-                    teacher_topk = teacher_policy.get_topk_logits(
-                        train_data,
-                        k=master_config.distillation.topk_logits_k,
-                        timer=timer,
-                    )
-                    train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
-                    train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                    deferred_topk_logits = None
+                    if (
+                        isinstance(student_policy, Policy)
+                        and isinstance(teacher_policy, Policy)
+                        and student_policy.can_consume_deferred_topk_from(
+                            teacher_policy,
+                            train_data,
+                            student_policy.cfg["train_global_batch_size"],
+                        )
+                    ):
+                        deferred_topk_logits = teacher_policy.get_topk_logits_deferred(
+                            train_data,
+                            k=master_config.distillation.topk_logits_k,
+                            timer=timer,
+                        )
+                    else:
+                        teacher_topk = teacher_policy.get_topk_logits(
+                            train_data,
+                            k=master_config.distillation.topk_logits_k,
+                            timer=timer,
+                        )
+                        train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
+                        train_data["teacher_topk_indices"] = teacher_topk[
+                            "topk_indices"
+                        ]
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -965,11 +983,20 @@ def distillation_train(
                         **{"rl.iteration": total_steps + 1},
                     ),
                 ):
-                    train_results = student_policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    if deferred_topk_logits is not None:
+                        assert isinstance(student_policy, Policy)
+                        train_results = student_policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                            deferred_topk_logits=deferred_topk_logits,
+                        )
+                    else:
+                        train_results = student_policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
