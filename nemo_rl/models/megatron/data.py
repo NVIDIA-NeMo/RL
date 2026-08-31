@@ -42,7 +42,15 @@ from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
 )
-from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
+from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
+
+
+@dataclass(frozen=True)
+class PackedSequenceMetadata:
+    """CPU sequence boundaries retained for loss post-processing."""
+
+    cu_seqlens: tuple[int, ...]
+    cu_seqlens_padded: tuple[int, ...]
 
 
 @dataclass
@@ -61,6 +69,7 @@ class ProcessedInputs:
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
     media_token_validity_mask: Optional[torch.Tensor] = None
+    packed_sequence_metadata: Optional[PackedSequenceMetadata] = None
 
 
 @dataclass
@@ -87,6 +96,8 @@ class ProcessedMicrobatch:
         media_token_validity_mask: Which media-token positions actually anchor a
             projected feature, in the model's own token layout. None when the
             batch needs no correction and the model should derive its own.
+        packed_sequence_metadata: CPU cumulative boundaries retained so loss
+            post-processing does not read CUDA scalars after the model forward.
     """
 
     data_dict: BatchedDataDict[Any]
@@ -102,6 +113,43 @@ class ProcessedMicrobatch:
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
     media_token_validity_mask: Optional[torch.Tensor] = None
+    packed_sequence_metadata: Optional[PackedSequenceMetadata] = None
+
+
+def _build_packed_sequence_metadata(
+    seq_lengths: CpuIntTuple,
+    *,
+    pad_individual_seqs_to_multiple_of: int,
+    pad_packed_seq_to_multiple_of: int,
+    pad_full_seq_to: Optional[int],
+    use_padded_boundaries_for_unpadded: bool = False,
+) -> PackedSequenceMetadata:
+    """Build the CPU cumulative boundaries used by packed loss preparation."""
+
+    def _cumulative(lengths: CpuIntTuple) -> tuple[int, ...]:
+        values = [0]
+        for length in lengths:
+            values.append(values[-1] + length)
+        return tuple(values)
+
+    unpadded = _cumulative(seq_lengths)
+    padded_lengths = [
+        _round_up_to_multiple(length, pad_individual_seqs_to_multiple_of)
+        for length in seq_lengths
+    ]
+    padded = list(_cumulative(padded_lengths))
+    if padded:
+        if pad_full_seq_to is not None:
+            padded[-1] = pad_full_seq_to
+        elif pad_packed_seq_to_multiple_of > 1:
+            padded[-1] = _round_up_to_multiple(
+                padded[-1], pad_packed_seq_to_multiple_of
+            )
+    padded_tuple = tuple(padded)
+    return PackedSequenceMetadata(
+        cu_seqlens=(padded_tuple if use_padded_boundaries_for_unpadded else unpadded),
+        cu_seqlens_padded=padded_tuple,
+    )
 
 
 def make_processed_microbatch_iterator(
@@ -141,6 +189,11 @@ def make_processed_microbatch_iterator(
     pack_sequences = cfg["sequence_packing"]["enabled"]
 
     for data_dict in raw_iterator:
+        seq_lengths_cpu = None
+        if pack_sequences:
+            assert seq_length_key is not None
+            seq_lengths_cpu = to_cpu_int_tuple(data_dict[seq_length_key])
+
         # Move to GPU
         data_dict = data_dict.to("cuda")
 
@@ -158,6 +211,7 @@ def make_processed_microbatch_iterator(
             straggler_timer=straggler_timer,
             create_packed_seq_padding_mask=create_packed_seq_padding_mask,
             prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
+            seq_lengths_cpu=seq_lengths_cpu,
         )
 
         yield ProcessedMicrobatch(
@@ -174,6 +228,7 @@ def make_processed_microbatch_iterator(
             routed_experts_cp_sharded=processed_inputs.routed_experts_cp_sharded,
             original_seq_length=processed_inputs.original_seq_length,
             media_token_validity_mask=processed_inputs.media_token_validity_mask,
+            packed_sequence_metadata=processed_inputs.packed_sequence_metadata,
         )
 
 
@@ -364,6 +419,7 @@ def process_microbatch(
     straggler_timer: Optional[StragglerDetector] = None,
     create_packed_seq_padding_mask: bool = False,
     prepad_packed_seq_for_hybridep: bool = False,
+    seq_lengths_cpu: Optional[CpuIntTuple] = None,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
     if create_packed_seq_padding_mask and model_slices_context_parallel_inputs:
@@ -403,6 +459,7 @@ def process_microbatch(
         mtp_loss_mask = None
         padding_mask = None
         media_token_validity_mask = None
+        packed_sequence_metadata = None
 
         if pack_sequences:
             # For packed sequences with padded input, we need sequence lengths
@@ -415,6 +472,8 @@ def process_microbatch(
 
             # Get sequence lengths and context parallel size
             seq_lengths = data_dict[seq_length_key]
+            if seq_lengths_cpu is None:
+                seq_lengths_cpu = to_cpu_int_tuple(seq_lengths)
 
             if delegate_pack_to_model:
                 has_mtp_loss_mask = "mtp_loss_mask" in data_dict
@@ -457,9 +516,16 @@ def process_microbatch(
                     cu_seqlens_padded,
                 ) = _prepare_vlm_batch_for_megatron(
                     input_ids,
-                    seq_lengths,
+                    seq_lengths_cpu,
                     pad_individual_seqs_to_multiple_of,
                     pad_full_seq_to=pad_full_seq_to,
+                )
+                packed_sequence_metadata = _build_packed_sequence_metadata(
+                    seq_lengths_cpu,
+                    pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
+                    pad_packed_seq_to_multiple_of=1,
+                    pad_full_seq_to=pad_full_seq_to,
+                    use_padded_boundaries_for_unpadded=True,
                 )
                 if has_mtp_loss_mask:
                     source_mtp_loss_mask = data_dict["mtp_loss_mask"]
@@ -497,12 +563,24 @@ def process_microbatch(
                     cu_seqlens_padded,
                 ) = _pack_sequences_for_megatron(
                     input_ids,
-                    seq_lengths,
+                    seq_lengths_cpu,
                     pad_individual_seqs_to_multiple_of,
                     pad_packed_seq_to_multiple_of,
                     pad_full_seq_to,
                     cp_rank=get_context_parallel_rank(),
                     cp_size=get_context_parallel_world_size(),
+                )
+                packed_sequence_metadata = _build_packed_sequence_metadata(
+                    seq_lengths_cpu,
+                    pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
+                    pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+                    pad_full_seq_to=pad_full_seq_to,
+                    # The default Megatron packer exposes padded boundaries as
+                    # cu_seqlens_q. Models that slice CP themselves replace
+                    # that field with the true, unpadded boundaries below.
+                    use_padded_boundaries_for_unpadded=(
+                        not model_slices_context_parallel_inputs
+                    ),
                 )
                 if model_slices_context_parallel_inputs:
                     packed_seq_params = PackedSeqParams(
@@ -535,6 +613,7 @@ def process_microbatch(
                     input_ids_cp_sharded = local_input_ids
                 if create_packed_seq_padding_mask:
                     if prepad_packed_seq_for_hybridep:
+                        original_cu_seqlens_padded = cu_seqlens_padded
                         (
                             input_ids,
                             input_ids_cp_sharded,
@@ -549,6 +628,16 @@ def process_microbatch(
                             cp_rank=get_context_parallel_rank(),
                             cp_size=get_context_parallel_world_size(),
                         )
+                        if cu_seqlens_padded is not original_cu_seqlens_padded:
+                            assert packed_sequence_metadata is not None
+                            final_boundaries = (
+                                *packed_sequence_metadata.cu_seqlens_padded[:-1],
+                                input_ids.shape[1],
+                            )
+                            packed_sequence_metadata = PackedSequenceMetadata(
+                                cu_seqlens=final_boundaries,
+                                cu_seqlens_padded=final_boundaries,
+                            )
                     full_padding_mask = get_packed_seq_padding_mask(
                         cu_seqlens=cu_seqlens,
                         cu_seqlens_padded=cu_seqlens_padded,
@@ -652,7 +741,7 @@ def process_microbatch(
                         _,
                     ) = _pack_sequences_for_megatron(
                         data_dict["mtp_loss_mask"],
-                        seq_lengths,
+                        seq_lengths_cpu,
                         pad_individual_seqs_to_multiple_of,
                         pad_packed_seq_to_multiple_of,
                         pad_full_seq_to,
@@ -691,7 +780,7 @@ def process_microbatch(
                         data_dict["media_token_validity_mask"].to(
                             data_dict["input_ids"].dtype
                         ),
-                        seq_lengths,
+                        seq_lengths_cpu,
                         pad_individual_seqs_to_multiple_of,
                         pad_packed_seq_to_multiple_of,
                         pad_full_seq_to,
@@ -775,6 +864,7 @@ def process_microbatch(
         routed_experts_cp_sharded=routed_experts_cp_sharded,
         original_seq_length=original_seq_length,
         media_token_validity_mask=media_token_validity_mask,
+        packed_sequence_metadata=packed_sequence_metadata,
     )
 
 
@@ -1022,8 +1112,8 @@ def _prepare_vlm_batch_for_megatron(
     device = input_ids.device
     align = max(1, pad_individual_seqs_to_multiple_of)
 
-    # One CPU-GPU sync per call via .tolist(); per-seq arithmetic runs on CPU
-    # ints (fast) instead of .item() in a loop (which sync'd per seq).
+    # The production iterator supplies CPU integers captured before H2D. Direct
+    # callers with a tensor pay at most one .tolist() transfer here.
     lengths_list = list(to_cpu_int_tuple(seq_lengths))
     padded_lens = [_round_up_to_multiple(L, align) for L in lengths_list]
 
