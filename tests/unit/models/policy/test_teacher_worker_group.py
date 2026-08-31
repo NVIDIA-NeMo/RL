@@ -547,6 +547,7 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
+        expert_tensor_parallel_size=1,
         expert_model_parallel_size=1,
         num_nodes=1,
         gpus_per_node=1,

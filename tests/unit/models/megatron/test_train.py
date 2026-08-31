@@ -1376,6 +1376,7 @@ class TestTopkLogitsPostProcessor:
                     }
                 ),
                 cu_seqlens_padded=None,
+                original_seq_length=2,
             )(logits)
 
         torch.testing.assert_close(
@@ -1438,7 +1439,11 @@ class TestTopkLogitsPostProcessor:
                 },
                 k=2,
                 return_logprobs=True,
-            )(data, cu_seqlens_padded=None)(unpacked_logits)
+            )(
+                data,
+                cu_seqlens_padded=None,
+                original_seq_length=input_ids.shape[1],
+            )(unpacked_logits)
             _, packed = TopkLogitsPostProcessor(
                 cfg={
                     "sequence_packing": {"enabled": True},
@@ -1447,7 +1452,11 @@ class TestTopkLogitsPostProcessor:
                 },
                 k=2,
                 return_logprobs=True,
-            )(data, cu_seqlens_padded=cu_seqlens_padded)(packed_logits)
+            )(
+                data,
+                cu_seqlens_padded=cu_seqlens_padded,
+                original_seq_length=input_ids.shape[1],
+            )(packed_logits)
 
         packed_target_indices = gather_selected.call_args.args[1][..., -1]
         torch.testing.assert_close(
