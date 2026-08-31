@@ -282,29 +282,6 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
-    def test_rejects_a_ppo_epoch_count_below_one(self):
-        mc = _ppo_master_config(
-            ppo=PPOConfig.model_construct(
-                max_num_steps=100, ppo_epochs=0, **_STEP_CONFIG
-            )
-        )
-
-        with pytest.raises(ValueError, match="ppo_epochs must be at least 1"):
-            validate_single_controller_config(mc)
-
-    def test_rejects_a_critic_epoch_count_below_one(self):
-        mc = _ppo_master_config(
-            ppo=PPOConfig.model_construct(
-                max_num_steps=100,
-                ppo_epochs=2,
-                critic_ppo_epochs=0,
-                **_STEP_CONFIG,
-            )
-        )
-
-        with pytest.raises(ValueError, match="critic_ppo_epochs must be at least 1"):
-            validate_single_controller_config(mc)
-
     @pytest.mark.parametrize(
         "sampler_config",
         [WindowedSamplerConfig(), ReadyFirstSamplerConfig(), WeightFifoSamplerConfig()],

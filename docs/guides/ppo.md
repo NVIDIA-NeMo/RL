@@ -225,7 +225,7 @@ The path is a `step_<n>` directory holding a `value/` subtree — the layout a P
 - `value.megatron_cfg.optimizer.lr` and `.min_lr` — they feed `max_lr`/`min_lr` and are the *first* two fields checked. They live in the optimizer block, not the scheduler block.
 - `value.megatron_cfg.scheduler`.
 - `value.train_global_batch_size` — it multiplies `lr_decay_steps`, `wd_incr_steps` and `lr_warmup_steps`.
-- the tick budget `train_iters`. A synchronous run sets it to `min(max_num_steps, max_num_epochs × len(dataloader)) × ppo_epochs`; an async run sets it to `max_num_steps × ppo_epochs`, since async requires `max_num_epochs: -1`. `len(dataloader)` is prompt batches per epoch, so on a synchronous run the dataset size and `num_prompts_per_step` are part of the budget whenever the epoch term is the smaller one — as it is for the shipped recipes that set `max_num_epochs: 15`. Matching `max_num_steps` and `ppo_epochs` alone is not enough there.
+- the tick budget `train_iters`. A synchronous run sets it to `min(max_num_steps, max_num_epochs × len(dataloader)) × critic_ppo_epochs`; an async run sets it to `max_num_steps × critic_ppo_epochs`, since async requires `max_num_epochs: -1`. `len(dataloader)` is prompt batches per epoch, so on a synchronous run the dataset size and `num_prompts_per_step` are part of the budget whenever the epoch term is the smaller one — as it is for the shipped recipes that set `max_num_epochs: 15`. Matching `max_num_steps` and `critic_ppo_epochs` alone is not enough there.
 
 A mismatch fails during critic init. Which field is named depends on which input differs: a batch-size difference reports `warmup iterations`, a learning-rate difference reports `learning rate`.
 

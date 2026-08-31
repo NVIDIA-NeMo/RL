@@ -192,7 +192,8 @@ class PPOConfig(BaseModel, extra="allow"):
     batch_multiplier: float = 1.0
     # Number of actor (policy) passes over each rollout batch.
     ppo_epochs: int = 4
-    # Number of critic (value) passes over each rollout batch.
+    # Number of critic (value) passes over each rollout batch. Defaults to
+    # ppo_epochs (see validate_epoch) unless explicitly set.
     critic_ppo_epochs: int = 4
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
@@ -217,16 +218,18 @@ class PPOConfig(BaseModel, extra="allow"):
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
     async_ppo: AsyncPPOConfig | None = Field(default_factory=AsyncPPOConfig)
 
-    def validate_epoch_settings(self) -> None:
-        """Validate the actor and critic update counts."""
+    @model_validator(mode="after")
+    def validate_epoch(self) -> "PPOConfig":
+        if "critic_ppo_epochs" not in self.model_fields_set:
+            self.critic_ppo_epochs = self.ppo_epochs
         if self.ppo_epochs < 1:
             raise ValueError("ppo.ppo_epochs must be at least 1")
         if self.critic_ppo_epochs < 1:
             raise ValueError("ppo.critic_ppo_epochs must be at least 1")
+        return self
 
     @model_validator(mode="after")
-    def validate_settings(self) -> "PPOConfig":
-        self.validate_epoch_settings()
+    def validate_async_warmup(self) -> "PPOConfig":
         if (
             self.async_ppo is not None
             and self.async_ppo.enabled

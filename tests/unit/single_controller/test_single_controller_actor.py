@@ -1636,11 +1636,13 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
     """Below policy_training_start_step the critic trains alone: no optimizer
     step, and no weight transfer to generation either. The frozen policy does
     not shorten the critic's own epoch loop."""
+    critic_ppo_epochs = 3
     meta = _single_group_meta()
     ctrl, value = _ppo_train_pump_controller(
         sampler=_OneThenEmptySampler(meta),
         policy_training_start_step=1,
         ppo_epochs=ppo_epochs,
+        critic_ppo_epochs=critic_ppo_epochs,
     )
     trainer = MagicMock(spec=_NoOpTrainer)
     ctrl._trainer = trainer
@@ -1649,7 +1651,7 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert value.calls.count("train_from_meta") == ppo_epochs
+    assert value.calls.count("train_from_meta") == critic_ppo_epochs
     trainer.prepare_for_training.assert_not_called()
     trainer.begin_train_step.assert_not_called()
     trainer.finish_train_step.assert_not_called()
