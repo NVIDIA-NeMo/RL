@@ -43,6 +43,7 @@ import numpy as np
 import ray
 import torch
 
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
@@ -316,7 +317,7 @@ class SyncRolloutActor:
         if ROUTED_EXPERTS_FIELD in flat:
             bulk_batch[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
         for k, v in flat.get_multimodal_dict(as_tensors=False).items():
-            if isinstance(v, torch.Tensor):
+            if isinstance(v, (torch.Tensor, PackedTensor)):
                 bulk_batch[k] = v
         # ``content`` (raw assistant text per sample) — rides TQ as a
         # NonTensorStack so the driver can fetch it back at jsonl time

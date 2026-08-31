@@ -18,6 +18,11 @@ from typing import Literal, Sequence
 # Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
 Layout = Literal["padded", "jagged"]
 
+# Companion column used to carry the row lengths and reconstruction settings for
+# a PackedTensor field. The payload itself keeps the original model-input name.
+PACKED_TENSOR_META_PREFIX = "__nrl_packed_tensor_meta__"
+MULTIMODAL_AUXILIARY_FIELDS = ("token_type_ids", "mm_token_type_ids")
+
 # Per-shard packing metadata keys in `KVBatchMeta.extra_info`.
 MICRO_BATCH_INDICES = "micro_batch_indices"
 MICRO_BATCH_LENGTHS = "micro_batch_lengths"
@@ -126,4 +131,39 @@ def fields_with_optional_routed_experts(
     out = list(fields)
     if enabled and ROUTED_EXPERTS_FIELD not in out:
         out.append(ROUTED_EXPERTS_FIELD)
+    return out
+
+
+def fields_with_packed_tensor_payload(
+    fields: Sequence[str],
+    available_fields: Sequence[str],
+) -> list[str]:
+    """Include PackedTensor payload/metadata columns present in a TQ record."""
+    out = list(fields)
+    available = set(available_fields)
+    for field in MULTIMODAL_AUXILIARY_FIELDS:
+        if field in available and field not in out:
+            out.append(field)
+    for field in available_fields:
+        if not field.startswith(PACKED_TENSOR_META_PREFIX):
+            continue
+        payload_field = field.removeprefix(PACKED_TENSOR_META_PREFIX)
+        if payload_field not in available:
+            continue
+        if payload_field not in out:
+            out.append(payload_field)
+        if field not in out:
+            out.append(field)
+    return out
+
+
+def packed_tensor_wire_fields(field_names: Sequence[str]) -> list[str]:
+    """Return payload and companion-column names to pre-register for model inputs."""
+    out: list[str] = []
+    for field in field_names:
+        if field not in out:
+            out.append(field)
+        meta_field = f"{PACKED_TENSOR_META_PREFIX}{field}"
+        if meta_field not in out:
+            out.append(meta_field)
     return out

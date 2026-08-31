@@ -149,18 +149,24 @@ def test_model_cp_slicing_capability_is_detected():
     assert not _model_slices_context_parallel_inputs(object())
 
 
-def test_model_cp_slicing_rejects_transfer_queue_setup():
+def test_model_cp_slicing_supports_transfer_queue_setup():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.model_slices_context_parallel_inputs = True
+    worker._dp_client = None
+    cfg = MagicMock()
+    client = MagicMock()
 
-    with pytest.raises(
-        NotImplementedError, match="TransferQueue/SingleController does not yet support"
-    ):
-        worker.setup_data_plane(MagicMock())
+    with patch(
+        "nemo_rl.data_plane.build_data_plane_client", return_value=client
+    ) as build_client:
+        worker.setup_data_plane(cfg)
+
+    build_client.assert_called_once_with(cfg, bootstrap=False)
+    assert worker._dp_client is client
 
 
 def test_refit_size_estimate_preserves_integral_buffer_dtype():
@@ -749,6 +755,31 @@ def test_prepare_for_generation_disables_param_gather_hook_before_wake(
         "wake_engine",
     ]
     assert model.config.flash_decode is False
+
+
+def test_move_retained_vlm_media_preserves_shared_tensors() -> None:
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationMixin,
+    )
+
+    shared_imgs = torch.ones(2)
+    first_request = SimpleNamespace(imgs=shared_imgs)
+    second_request = SimpleNamespace(imgs=shared_imgs)
+    text_request = SimpleNamespace()
+    worker = MegatronGenerationMixin()
+    worker.dynamic_inference_engine = SimpleNamespace(
+        requests={
+            1: SimpleNamespace(record=[first_request]),
+            2: SimpleNamespace(record=[second_request]),
+            3: SimpleNamespace(record=[text_request]),
+        }
+    )
+
+    worker._move_retained_vlm_media(torch.device("meta"))
+
+    assert first_request.imgs.device.type == "meta"
+    assert second_request.imgs is first_request.imgs
+    assert not hasattr(text_request, "imgs")
 
 
 def create_megatron_test_config(

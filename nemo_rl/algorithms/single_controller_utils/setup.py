@@ -79,6 +79,7 @@ from nemo_rl.data_plane import (
 from nemo_rl.data_plane.schema import (
     SC_ROLLOUT_SCHEMA_FIELDS,
     fields_with_optional_routed_experts,
+    packed_tensor_wire_fields,
 )
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
@@ -1013,6 +1014,8 @@ def setup_single_controller(
     # ==========================
     # TODO: add validate dataset wiring.
     use_nemo_gym = should_use_nemo_gym(master_config)
+    data_tokenizer = processor if processor is not None else tokenizer
+    is_vlm = processor is not None
     if use_nemo_gym and generation_config["backend"] not in ("vllm", "megatron"):
         raise NotImplementedError(
             "SC NeMo-Gym integration currently supports the vllm and megatron backends only; got "
@@ -1023,13 +1026,18 @@ def setup_single_controller(
     if use_nemo_gym:
         # NeMo-Gym creates the env actor outside setup_response_data; we wire
         # it in after generation is up (it needs the OpenAI server URLs).
-        response_data = setup_response_data(tokenizer, data_config, env_configs=None)
+        response_data = setup_response_data(
+            data_tokenizer, data_config, env_configs=None, is_vlm=is_vlm
+        )
         assert len(response_data) == 2
         dataset, _val_dataset = response_data
         env_handles: dict[str, EnvironmentInterface] = {}
     else:
         response_data = setup_response_data(
-            tokenizer, data_config, env_configs=master_config.env
+            data_tokenizer,
+            data_config,
+            env_configs=master_config.env,
+            is_vlm=is_vlm,
         )
         assert len(response_data) == 4
         dataset, _val_dataset, env_handles, _val_env_handles = response_data
@@ -1093,6 +1101,7 @@ def setup_single_controller(
     megatron_reserved_url = None
     megatron_port_holder = None
     reserved_http_server_port = None
+    weight_synchronizer: Optional[WeightSynchronizer] = None
     if megatron_backend:
         generation_config["model_name"] = master_config.policy["model_name"]
 
@@ -1252,7 +1261,6 @@ def setup_single_controller(
         build_tasks["trainer"] = _build_trainer_and_value
 
     # Submit build tasks and get results
-    weight_synchronizer: Optional[WeightSynchronizer] = None
     try:
         with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
             submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
@@ -1279,7 +1287,9 @@ def setup_single_controller(
                     train_cluster=train_cluster,
                     inference_cluster=inference_cluster,
                     refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+                    refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
                 )
+                generation.weight_synchronizer = weight_synchronizer
                 weight_synchronizer.init_communicator()
                 setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
                 t0 = time.perf_counter()
@@ -1357,12 +1367,21 @@ def setup_single_controller(
     # SingleController reuses one partition for the run. Warm every known
     # tensor field before rollout, policy, and teacher writers become
     # concurrent; TransferQueue otherwise registers field names lazily.
+    partition_fields = fields_with_optional_routed_experts(
+        SC_ROLLOUT_SCHEMA_FIELDS,
+        enabled=router_replay_enabled(policy_config),
+    )
+    if processor is not None:
+        partition_fields.extend(
+            field
+            for field in packed_tensor_wire_fields(
+                getattr(processor, "model_input_names", ())
+            )
+            if field not in partition_fields
+        )
     dp_client.register_partition(
         partition_id=partition_id,
-        fields=fields_with_optional_routed_experts(
-            SC_ROLLOUT_SCHEMA_FIELDS,
-            enabled=router_replay_enabled(policy_config),
-        ),
+        fields=partition_fields,
         num_samples=(
             master_config.async_rl.max_buffered_rollouts
             * algo_cfg.num_generations_per_prompt
@@ -1383,6 +1402,7 @@ def setup_single_controller(
             refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
             refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
         )
+        generation.weight_synchronizer = weight_synchronizer
         weight_synchronizer.init_communicator()
         setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
 

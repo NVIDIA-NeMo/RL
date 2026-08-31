@@ -923,6 +923,26 @@ class TestSetup:
         assert call_kwargs["env_configs"] == {"math": math_env_cfg}
         assert actor_args.env_handles is patched_factories["env_handles"]
 
+    def test_vlm_processor_used_for_data_and_environment_setup(
+        self, patched_factories
+    ):
+        mc = _make_master_config(env={"clevr-cogent": {"some": "value"}})
+        tokenizer = MagicMock(pad_token_id=0)
+        processor = MagicMock(tokenizer=tokenizer)
+        processor.model_input_names = ["input_ids", "pixel_values", "image_grid_thw"]
+
+        actor_args, _ = setup_single_controller(mc, tokenizer, processor=processor)
+
+        call_args, call_kwargs = patched_factories["setup_response_data"].call_args
+        assert call_args[0] is processor
+        assert call_kwargs["env_configs"] == {
+            "clevr-cogent": {"some": "value"}
+        }
+        assert call_kwargs["is_vlm"] is True
+        warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs["fields"]
+        assert "pixel_values" in warmup_fields
+        assert "__nrl_packed_tensor_meta__pixel_values" in warmup_fields
+
     def test_weight_sync_factory_args(self, patched_factories):
         """create_weight_synchronizer receives policy / generation / topology."""
         mc = _make_master_config(colocated=False, backend="vllm")
@@ -1358,13 +1378,15 @@ class TestSetup:
         mock_megatron.return_value.finish_generation.assert_called_once_with()
         if gym:
             # Gym spins up on the reserved URL, before the served-address
-            # cross-check — so the mismatch leg sees it too.
+            # cross-check — so the mismatch leg sees it too. The initial refit
+            # must happen during that wait because it starts Megatron's server.
             _, spinup_kwargs = mock_spinup.call_args
             assert spinup_kwargs["base_urls"] == [reserved_url]
             # The initial refit ran in setup, against the collective brought up
             # there; the served-address check reads the URLs it populated.
             weight_sync.init_communicator.assert_called_once_with()
             weight_sync.sync_weights.assert_called_once_with()
+            assert mock_megatron.return_value.weight_synchronizer is weight_sync
         else:
             mock_spinup.assert_not_called()
             # Native: the actor's startup sync performs the initial refit.

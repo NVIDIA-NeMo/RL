@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import torch
 
+from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.codec import materialize
+from nemo_rl.data_plane.schema import PACKED_TENSOR_META_PREFIX
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 
@@ -160,6 +163,43 @@ def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
         prompt_idx=17,
     )
     assert "routed_experts" not in fields
+
+
+def test_multimodal_packed_tensor_round_trips_through_tq_payload() -> None:
+    completions = [
+        _completion(route_start=10, reward=1.0, with_routes=False),
+        _completion(route_start=30, reward=2.0, with_routes=False),
+    ]
+    media_rows = [
+        torch.arange(8, dtype=torch.float32).reshape(2, 4),
+        torch.arange(4, dtype=torch.float32).reshape(1, 4) + 20,
+    ]
+    for completion, media in zip(completions, media_rows, strict=True):
+        completion.message_log[0]["pixel_values"] = PackedTensor(
+            media, dim_to_pack=0
+        )
+
+    train_batch = record_to_train_batch(
+        _record(completions),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+    )
+    assert isinstance(train_batch["pixel_values"], PackedTensor)
+
+    _, fields, _ = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+        prompt_idx=17,
+    )
+    assert "pixel_values" in fields
+    assert f"{PACKED_TENSOR_META_PREFIX}pixel_values" in fields
+
+    restored = materialize(fields)
+    restored_media = restored["pixel_values"]
+    assert isinstance(restored_media, PackedTensor)
+    assert len(restored_media) == 2
+    assert restored_media.logical_segment_counts_by_row() == [1, 1]
+    assert torch.equal(restored_media.as_tensor(), torch.cat(media_rows))
 
 
 def _failed_completion() -> Completion:

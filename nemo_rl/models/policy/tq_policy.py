@@ -45,6 +45,7 @@ from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     LP_SEED_FIELDS,
     fields_with_optional_routed_experts,
+    fields_with_packed_tensor_payload,
 )
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
@@ -139,7 +140,9 @@ class TQPolicy(TQDriverMixin, Policy):
     def shutdown(self) -> bool:  # type: ignore[override]
         """Close the TQ client before shutting down the worker group."""
         try:
-            self.dp_client.close()
+            dp_client = getattr(self, "dp_client", None)
+            if dp_client is not None:
+                dp_client.close()
         except Exception as e:
             warnings.warn(f"Error closing data-plane client: {e}")
         return super().shutdown()
@@ -216,9 +219,9 @@ class TQPolicy(TQDriverMixin, Policy):
     ) -> None:
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
-        Logprob workers need only LP_SEED_FIELDS — narrow the meta's
-        field list so ``_fetch`` doesn't pull rollout-only payload (e.g.
-        multimodal). The same shape is used for both prev_lp and ref_lp.
+        Logprob workers need LP_SEED_FIELDS plus any multimodal model inputs
+        encoded in the rollout payload. The same shape is used for both prev_lp
+        and ref_lp.
         Workers compute the per-token tensor and commit it to TQ via the
         leader-rank ``_write_back_result_field``; the Ray return is
         always None, so this dispatcher just waits for completion.
@@ -226,9 +229,12 @@ class TQPolicy(TQDriverMixin, Policy):
         spa, dba = self._packing_args("logprob_mb_tokens")
         lp_meta = self._isolated_meta(
             meta,
-            fields=fields_with_optional_routed_experts(
-                LP_SEED_FIELDS,
-                enabled=self._router_replay_enabled and include_router_replay,
+            fields=fields_with_packed_tensor_payload(
+                fields_with_optional_routed_experts(
+                    LP_SEED_FIELDS,
+                    enabled=self._router_replay_enabled and include_router_replay,
+                ),
+                meta.fields,
             ),
             task_name=task_name,
         )
@@ -333,8 +339,11 @@ class TQPolicy(TQDriverMixin, Policy):
         # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
         train_meta = self._isolated_meta(
             meta,
-            fields=fields_with_optional_routed_experts(
-                train_fields, enabled=self._router_replay_enabled
+            fields=fields_with_packed_tensor_payload(
+                fields_with_optional_routed_experts(
+                    train_fields, enabled=self._router_replay_enabled
+                ),
+                meta.fields,
             ),
             task_name="train",
         )
@@ -456,8 +465,11 @@ class TQPolicy(TQDriverMixin, Policy):
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._isolated_meta(
             meta,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            fields=fields_with_packed_tensor_payload(
+                fields_with_optional_routed_experts(
+                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                ),
+                meta.fields,
             ),
             task_name="train",
         )
