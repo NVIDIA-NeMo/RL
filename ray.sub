@@ -616,10 +616,17 @@ fi
 # exit codes to stay non-fatal.
 set -o pipefail
 
-# If this node can't see the canary, LOG_DIR is not shared. Fail now instead of
-# waiting forever for signal files the submit host writes but this node can't read.
+# If this node can't see the canary, LOG_DIR is not shared. Allow a bounded
+# grace period first: the canary is written on the submit host seconds before
+# this container starts, and Lustre metadata visibility can lag briefly. Then
+# fail instead of waiting forever for signal files this node can't read.
+_canary_wait=0
+while [[ ! -f "$LOG_DIR/.shared_fs_canary" && \$_canary_wait -lt 60 ]]; do
+  sleep 2
+  _canary_wait=\$(( _canary_wait + 2 ))
+done
 if [[ ! -f "$LOG_DIR/.shared_fs_canary" ]]; then
-  echo "[ERROR] $LOG_DIR/.shared_fs_canary not visible on the head node; LOG_DIR must be on a shared filesystem." >&2
+  echo "[ERROR] $LOG_DIR/.shared_fs_canary not visible on the head node after \${_canary_wait}s; LOG_DIR must be on a shared filesystem." >&2
   touch "$LOG_DIR/ENDED" 2>/dev/null || true
   exit 1
 fi
@@ -852,8 +859,15 @@ echo "[INFO] Worker \$SLURM_PROCID on node \$SLURMD_NODENAME"
 
 # Fail fast if LOG_DIR is not actually shared with the submit host -- the worker
 # gates on STARTED_RAY_HEAD and other signal files that would otherwise never appear.
+# Bounded grace period first: Lustre metadata visibility can lag briefly behind
+# the submit-host write (see the head-container check above).
+_canary_wait=0
+while [[ ! -f "$LOG_DIR/.shared_fs_canary" && \$_canary_wait -lt 60 ]]; do
+  sleep 2
+  _canary_wait=\$(( _canary_wait + 2 ))
+done
 if [[ ! -f "$LOG_DIR/.shared_fs_canary" ]]; then
-  echo "[ERROR] Worker \$SLURM_PROCID: $LOG_DIR/.shared_fs_canary not visible; LOG_DIR must be on a shared filesystem." >&2
+  echo "[ERROR] Worker \$SLURM_PROCID: $LOG_DIR/.shared_fs_canary not visible after \${_canary_wait}s; LOG_DIR must be on a shared filesystem." >&2
   exit 1
 fi
 
