@@ -51,6 +51,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     materialize_only_last_token_logits: bool
     enable_chunked_prefill: bool
     enable_prefix_caching: bool
+    # Generation log-probs: "processed_logprobs" (sampling-filtered, default)
+    # or "raw_logprobs" (F.log_softmax of model logits). Zero-KL forces raw.
+    logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
 
     refit_backend: Literal["gloo", "nccl", "nvshmem"]
     num_speculative_tokens: int
