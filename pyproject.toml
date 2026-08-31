@@ -210,12 +210,10 @@ mcore = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  # mamba-ssm/causal-conv1d LOOK redundant (megatron-bridge[ssm] pulls them), but do not
   # TE v2.15 Megatron attention_backend=flash requires flash_attn.cute (FA4).
   # flash-attn-4 pulls nvidia-cutlass-dsl==4.6.0.dev0; [cu13] installs libs-cu13 (the `cutlass` module).
-  "flash-attn-4>=4.0.0b20 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  # uv mcore extra fork omits flash-attn-4 transitive deps; pin explicitly for worker venvs.
-  # Bare nvidia-cutlass-dsl is a stub wheel; libs-base is excluded project-wide (see exclude-dependencies).
-  "nvidia-cutlass-dsl[cu13]==4.6.0.dev0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "flash-attn-4==4.0.0b20 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # remove them: [tool.uv.sources] git pins only attach to direct requirements, and the
   # conflicting extras resolve in separate forks — without these direct deps the mcore fork
   # silently falls back to the PyPI releases instead of the pinned git revs.
@@ -227,7 +225,7 @@ mcore = [
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  "nvidia-cutlass-dsl[cu13]==4.5.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cutlass-dsl[cu13]==4.6.0.dev0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
@@ -461,7 +459,7 @@ constraint-dependencies = [
   # whose [tool.uv.sources] pins them to git. uv requires such URL deps to also appear as a
   # direct requirement or constraint of the root project. Keep these URLs/revs in sync with
   # Megatron-LM's [tool.uv.sources] (uv errors loudly on mismatch after a submodule bump).
-  "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0",
+  "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.3.0",
   "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca",
   # Same story for megatron-fsdp, which nemo-automodel (r0.6.0) resolves from a
   # Megatron-LM fork via its own [tool.uv.sources] instead of PyPI. Keep this URL/rev
