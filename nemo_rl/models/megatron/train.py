@@ -55,7 +55,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
 )
 from nemo_rl.models.megatron.config import MegatronModule
-from nemo_rl.models.megatron.data import ProcessedMicrobatch
+from nemo_rl.models.megatron.data import PackedSequenceMetadata, ProcessedMicrobatch
 from nemo_rl.models.megatron.draft.hidden_capture import (
     get_capture_context,
 )
@@ -272,6 +272,7 @@ def forward_with_post_processing_fn(
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
     original_seq_length = processed_mb.original_seq_length
     media_token_validity_mask = processed_mb.media_token_validity_mask
+    packed_sequence_metadata = processed_mb.packed_sequence_metadata
 
     if use_router_replay:
         if routed_experts_cp_sharded is None:
@@ -362,6 +363,7 @@ def forward_with_post_processing_fn(
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             packed_seq_params=packed_seq_params,
+            packed_sequence_metadata=packed_sequence_metadata,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
         )
@@ -370,7 +372,11 @@ def forward_with_post_processing_fn(
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             input_ids=input_ids,
-            cu_seqlens_padded=cu_seqlens_padded,
+            cu_seqlens_padded=(
+                packed_sequence_metadata.cu_seqlens_padded
+                if packed_sequence_metadata is not None
+                else cu_seqlens_padded
+            ),
             original_seq_length=original_seq_length,
         )
     elif isinstance(post_processing_fn, TopkLogitsPostProcessor):
@@ -508,6 +514,7 @@ class LossPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
         packed_seq_params: Optional[PackedSeqParams] = None,
+        packed_sequence_metadata: Optional[PackedSequenceMetadata] = None,
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
@@ -520,6 +527,8 @@ class LossPostProcessor:
         Args:
             data_dict: Batched data dictionary for the current microbatch
             packed_seq_params: Parameters for packed sequences (optional)
+            packed_sequence_metadata: CPU cumulative sequence boundaries retained
+                during input packing.
             global_valid_seqs: Global valid sequence count for loss normalization
             global_valid_toks: Global valid token count for loss normalization
 
@@ -552,11 +561,19 @@ class LossPostProcessor:
                     "Disable fuse_loss for the value model."
                 )
 
-            cu_seqlens_q = to_cpu_int_tuple(packed_seq_params.cu_seqlens_q)
-            padded_boundaries = (
-                packed_seq_params.cu_seqlens_q_padded
-                if packed_seq_params.cu_seqlens_q_padded is not None
+            cu_seqlens_q = to_cpu_int_tuple(
+                packed_sequence_metadata.cu_seqlens
+                if packed_sequence_metadata is not None
                 else packed_seq_params.cu_seqlens_q
+            )
+            padded_boundaries = (
+                packed_sequence_metadata.cu_seqlens_padded
+                if packed_sequence_metadata is not None
+                else (
+                    packed_seq_params.cu_seqlens_q_padded
+                    if packed_seq_params.cu_seqlens_q_padded is not None
+                    else packed_seq_params.cu_seqlens_q
+                )
             )
             cu_seqlens_q_padded = to_cpu_int_tuple(padded_boundaries)
             if fuse_loss:
