@@ -26,6 +26,7 @@ import functools
 import pytest
 import torch
 
+import nemo_rl.algorithms.loss.utils as loss_utils
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
@@ -36,6 +37,40 @@ from nemo_rl.algorithms.loss import (
     prepare_packed_loss_input,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def test_prepare_packed_loss_input_excludes_filtered_neg_inf_logprobs(monkeypatch):
+    """The fused caller must publish the narrowed mask used by the actor loss."""
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[0, 1, 2, 3]]),
+            "token_mask": torch.ones(1, 4),
+            "sample_mask": torch.ones(1),
+        }
+    )
+    filtered_logprobs = torch.tensor([[-0.5, float("-inf"), -1.5]])
+    monkeypatch.setattr(
+        loss_utils,
+        "from_parallel_logits_to_logprobs_packed_sequences",
+        lambda *_args, **_kwargs: filtered_logprobs,
+    )
+
+    loss_input, updated_data = prepare_packed_loss_input(
+        torch.empty(1, 4, 4),
+        data,
+        ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.0)),
+        cu_seqlens_q=torch.tensor([0, 4], dtype=torch.int32),
+        cu_seqlens_q_padded=torch.tensor([0, 4], dtype=torch.int32),
+        vocab_parallel_rank=0,
+        vocab_parallel_group=object(),
+        sampling_params=TrainingSamplingParams(top_k=1),
+    )
+
+    assert loss_input["next_token_logprobs"].tolist() == [[-0.5, 0.0, -1.5]]
+    assert updated_data["curr_logprobs_keep_mask"].tolist() == [[1.0, 0.0, 1.0]]
+    # ``token_mask`` stays intact: it also reduces the reference-policy KL,
+    # which reads the unfiltered logprobs and is finite at this position.
+    assert updated_data["token_mask"].tolist() == [[1.0, 1.0, 1.0, 1.0]]
 
 
 def _setup_2d_process_groups(rank, world_size, cp_size, tp_size):

@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import math
 
 import pytest
 import torch
 
+import nemo_rl.algorithms.loss.utils as loss_utils
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
@@ -41,6 +44,199 @@ from nemo_rl.distributed.model_utils import (
     cp_shift_next,
     vocab_parallel_gather_columns,
 )
+
+
+def test_prepare_loss_input_excludes_filtered_neg_inf_logprobs(monkeypatch):
+    """The caller must persist the narrowed mask used by the actor loss."""
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[0, 1, 2, 3]]),
+            "token_mask": torch.ones(1, 4),
+            "sample_mask": torch.ones(1),
+        }
+    )
+    filtered_logprobs = torch.tensor([[-0.5, float("-inf"), -1.5]])
+    monkeypatch.setattr(
+        loss_utils,
+        "get_next_token_logprobs_from_logits",
+        lambda **_: filtered_logprobs,
+    )
+
+    loss_input, updated_data = prepare_loss_input(
+        torch.empty(1, 4, 4),
+        data,
+        ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.0)),
+        sampling_params=TrainingSamplingParams(top_k=1),
+    )
+
+    assert loss_input["next_token_logprobs"].tolist() == [[-0.5, 0.0, -1.5]]
+    assert updated_data["curr_logprobs_keep_mask"].tolist() == [[1.0, 0.0, 1.0]]
+    # token_mask must not be narrowed: the reference-policy KL reduces with it
+    # and is computed from unfiltered logprobs, which are finite here.
+    assert updated_data["token_mask"].tolist() == [[1.0, 1.0, 1.0, 1.0]]
+
+
+def test_filtered_positions_leave_the_actor_term_but_not_the_kl():
+    """Dropping a filtered position must not weaken the reference-policy KL.
+
+    The substituted 0.0 only corrupts the actor term. ``curr_logprobs_unfiltered``
+    is finite at the same position, so the KL there is real -- and it is exactly
+    where the policies disagree most, since the token was filtered for having
+    near-zero probability under the training policy. Narrowing the KL reduction
+    would systematically remove its largest contributions.
+    """
+    batch, seq = 1, 4
+
+    def make_data(keep_mask):
+        data = BatchedDataDict(
+            {
+                "token_mask": torch.ones(batch, seq),
+                "sample_mask": torch.ones(batch),
+                "advantages": torch.full((batch, seq), 0.5),
+                "prev_logprobs": torch.full((batch, seq), -1.0),
+                "generation_logprobs": torch.full((batch, seq), -1.0),
+                "reference_policy_logprobs": torch.full((batch, seq), -2.0),
+                # large divergence at the position the training policy filtered
+                "curr_logprobs_unfiltered": torch.tensor([[-0.5, -0.6, -3.0]]),
+            }
+        )
+        if keep_mask is not None:
+            data["curr_logprobs_keep_mask"] = keep_mask
+        return data
+
+    curr_logprobs = torch.tensor([[-0.5, -0.6, 0.0]])  # third is the substitute
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.5))
+    global_valid_toks = torch.tensor(3.0)
+    global_valid_seqs = torch.tensor(1.0)
+
+    keep = torch.tensor([[1.0, 1.0, 0.0]])
+    loss_all, metrics_all = loss_fn(
+        curr_logprobs, make_data(None), global_valid_seqs, global_valid_toks
+    )
+    loss_kept, metrics_kept = loss_fn(
+        curr_logprobs, make_data(keep), global_valid_seqs, global_valid_toks
+    )
+
+    assert metrics_kept["kl_penalty"] == pytest.approx(metrics_all["kl_penalty"]), (
+        "the keep mask must not reach the KL reduction"
+    )
+    assert metrics_kept["token_mult_prob_error"] == pytest.approx(
+        metrics_all["token_mult_prob_error"]
+    ), "mismatch diagnostics read prev/generation logprobs and stay un-narrowed"
+
+    # The actor side must move: the substituted logprob fabricates a ratio of
+    # exp(0.0 - (-1.0)) = e at the filtered position.
+    assert metrics_all["probs_ratio_max"] == pytest.approx(math.e)
+    assert metrics_kept["probs_ratio_max"] < metrics_all["probs_ratio_max"]
+    assert loss_kept.item() != pytest.approx(loss_all.item())
+
+
+def _keep_mask_data(keep_mask, *, rewards=None):
+    """The same fixture as the test above, reused by the reductions below.
+
+    Three positions, the third filtered. ``curr_logprobs`` carries the
+    substituted ``0.0`` there, so every reduction that fails to drop it reads a
+    fabricated ratio of ``exp(0.0 - (-1.0)) = e``.
+    """
+    batch, seq = 1, 4
+    data = BatchedDataDict(
+        {
+            "token_mask": torch.ones(batch, seq),
+            "sample_mask": torch.ones(batch),
+            "advantages": torch.full((batch, seq), 0.5),
+            "prev_logprobs": torch.full((batch, seq), -1.0),
+            "generation_logprobs": torch.full((batch, seq), -1.0),
+            "reference_policy_logprobs": torch.full((batch, seq), -2.0),
+            "curr_logprobs_unfiltered": torch.tensor([[-0.5, -0.6, -3.0]]),
+        }
+    )
+    if keep_mask is not None:
+        data["curr_logprobs_keep_mask"] = keep_mask
+    if rewards is not None:
+        data["rewards"] = rewards
+    return data
+
+
+_CURR_LOGPROBS = torch.tensor([[-0.5, -0.6, 0.0]])
+_KEEP = torch.tensor([[1.0, 1.0, 0.0]])
+_GVT = torch.tensor(3.0)
+_GVS = torch.tensor(1.0)
+
+
+def _run_with_and_without_keep(loss_fn, **data_kwargs):
+    """Returns (all, kept) for the same loss with and without the keep mask."""
+    return (
+        loss_fn(_CURR_LOGPROBS, _keep_mask_data(None, **data_kwargs), _GVS, _GVT),
+        loss_fn(_CURR_LOGPROBS, _keep_mask_data(_KEEP, **data_kwargs), _GVS, _GVT),
+    )
+
+
+def test_keep_mask_narrows_the_sequence_level_ratio():
+    """The GSPO sequence ratio is a masked_mean with NO global normalization
+    factor, so a filtered position corrupts both the numerator and the divisor
+    -- and the result is exponentiated, so the error compounds."""
+    # Wide clip on purpose. At the default 0.2 both ratios land above 1.2 and
+    # clamp to the same value, so the loss is identical either way and this
+    # would assert nothing -- the metrics below still differ, which is what
+    # makes the degenerate case easy to miss.
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            sequence_level_importance_ratios=True,
+            token_level_loss=False,
+            ratio_clip_min=5.0,
+            ratio_clip_max=5.0,
+        )
+    )
+    (loss_all, m_all), (loss_kept, m_kept) = _run_with_and_without_keep(loss_fn)
+
+    assert loss_kept.item() != pytest.approx(loss_all.item())
+    assert m_kept["probs_ratio"] != pytest.approx(m_all["probs_ratio"])
+
+
+def test_keep_mask_narrows_the_sequence_level_actor_loss():
+    """SEQUENCE_LEVEL reduces token-first over the actor mask. The inner
+    masked_mean normalizes by the mask sum, so the filtered position both
+    injects a fabricated clip_loss and inflates its own divisor. This one moves
+    the gradient, not a dashboard number."""
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            token_level_loss=False,
+            ratio_clip_min=5.0,
+            ratio_clip_max=5.0,
+        )
+    )
+    (loss_all, _), (loss_kept, _) = _run_with_and_without_keep(loss_fn)
+
+    assert loss_kept.item() != pytest.approx(loss_all.item())
+
+
+def test_keep_mask_narrows_the_positive_example_nll():
+    """VAPO's positive-example NLL normalizes by its own mask sum, so on a
+    revert the filtered position contributes -0.0 to the numerator and +1 to
+    the denominator: the term is deflated rather than merely noisy."""
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            positive_example_nll_weight=1.0,
+        )
+    )
+    rewards = torch.ones(1)
+    (_, m_all), (_, m_kept) = _run_with_and_without_keep(loss_fn, rewards=rewards)
+
+    assert m_kept["positive_nll_loss"] != pytest.approx(m_all["positive_nll_loss"])
+
+
+def test_keep_mask_narrows_the_reported_ratio_means():
+    """probs_ratio and probs_ratio_clamped are the headline train/inference
+    mismatch numbers. The existing test pins only probs_ratio_max, which comes
+    from a separate un-narrowed reduction, so both means were uncovered."""
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.5))
+    (_, m_all), (_, m_kept) = _run_with_and_without_keep(loss_fn)
+
+    assert m_kept["probs_ratio"] != pytest.approx(m_all["probs_ratio"])
+    assert m_kept["probs_ratio_clamped"] != pytest.approx(m_all["probs_ratio_clamped"])
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
@@ -3131,3 +3327,96 @@ def test_vocab_parallel_gather_columns_tp_sharded(monkeypatch):
     ref[..., idx].float().backward(grad_out)
     torch.testing.assert_close(shards[0].grad, ref.grad[..., :v_local])
     torch.testing.assert_close(shards[1].grad, ref.grad[..., v_local:])
+
+
+# ---------------------------------------------------------------------------
+# force_on_policy_ratio aliases prev_logprobs to curr_logprobs, which puts the
+# substituted 0.0 into the quantities that read prev. Those must narrow too.
+#
+# Both tests below assert INDEPENDENCE rather than a fixed number: they vary
+# generation_logprobs at the filtered position only. A quantity that still sees
+# the substituted value moves; one that correctly dropped the position cannot.
+# ---------------------------------------------------------------------------
+
+_ON_POLICY_SEQ = 4
+_ON_POLICY_CURR = torch.tensor([[-0.5, -0.6, 0.0]])  # third entry is the substitute
+_ON_POLICY_KEEP = torch.tensor([[1.0, 1.0, 0.0]])
+
+
+def _on_policy_data(filtered_gen_logprob, keep):
+    """generation_logprobs differs ONLY at the filtered position."""
+    data = BatchedDataDict(
+        {
+            "token_mask": torch.ones(1, _ON_POLICY_SEQ),
+            "sample_mask": torch.ones(1),
+            "advantages": torch.full((1, _ON_POLICY_SEQ), 0.5),
+            "prev_logprobs": torch.full((1, _ON_POLICY_SEQ), -1.0),
+            "generation_logprobs": torch.tensor(
+                [[-1.0, -0.5, -0.6, filtered_gen_logprob]]
+            ),
+            "reference_policy_logprobs": torch.full((1, _ON_POLICY_SEQ), -2.0),
+        }
+    )
+    if keep is not None:
+        data["curr_logprobs_keep_mask"] = keep
+    return data
+
+
+def _run_on_policy(cfg_kwargs, filtered_gen_logprob, keep):
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            force_on_policy_ratio=True,
+            **cfg_kwargs,
+        )
+    )
+    _, metrics = loss_fn(
+        _ON_POLICY_CURR,
+        _on_policy_data(filtered_gen_logprob, keep),
+        torch.tensor(1.0),
+        torch.tensor(3.0),
+    )
+    return metrics
+
+
+@pytest.mark.parametrize(
+    "metric",
+    [
+        "token_mult_prob_error",
+        "gen_kl_error",
+        "policy_kl_error",
+        "js_divergence_error",
+        "sampling_importance_ratio",
+    ],
+)
+def test_force_on_policy_ratio_narrows_the_mismatch_diagnostics(metric):
+    """The filtered position must not steer a diagnostic once keep is supplied."""
+    kept_a = _run_on_policy({}, -5.0, _ON_POLICY_KEEP)[metric]
+    kept_b = _run_on_policy({}, -9.0, _ON_POLICY_KEEP)[metric]
+    assert kept_a == pytest.approx(kept_b), (
+        f"{metric} still depends on generation_logprobs at the filtered position"
+    )
+
+    # Without the keep mask the same swing moves the metric, which is the bug.
+    loose_a = _run_on_policy({}, -5.0, None)[metric]
+    loose_b = _run_on_policy({}, -9.0, None)[metric]
+    assert loose_a != pytest.approx(loose_b)
+
+
+def test_force_on_policy_ratio_narrows_the_sequence_importance_weight():
+    """The GSPO weight multiplies every token, so actor_mask cannot undo it.
+
+    ``seq_lp_diff`` sums (prev - generation) over the mask before the reduction,
+    so a single filtered position scales the whole sequence by exp(|log pi_gen|).
+    """
+    seq_cfg = {"sequence_level_importance_ratios": True, "token_level_loss": False}
+
+    kept_a = _run_on_policy(seq_cfg, -5.0, _ON_POLICY_KEEP)["sampling_importance_ratio"]
+    kept_b = _run_on_policy(seq_cfg, -9.0, _ON_POLICY_KEEP)["sampling_importance_ratio"]
+    assert kept_a == pytest.approx(kept_b)
+
+    loose = _run_on_policy(seq_cfg, -5.0, None)["sampling_importance_ratio"]
+    assert loose == pytest.approx(math.exp(5.0), rel=1e-4), (
+        "un-narrowed, the whole sequence is weighted by the fabricated exp(5)"
+    )
+    assert kept_a < loose / 100
