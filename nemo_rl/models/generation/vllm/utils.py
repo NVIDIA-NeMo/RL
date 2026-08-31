@@ -413,6 +413,43 @@ def attach_token_information_to_chat_response_choices(
     return response
 
 
+def attach_sampling_masks_to_chat_response_choices(
+    response: Any,
+    final_request_output: Any,
+) -> Any:
+    """Attach vLLM's per-generated-token sampling supports to chat choices."""
+    outputs_by_index = {
+        output.index: output for output in getattr(final_request_output, "outputs", [])
+    }
+    for choice in getattr(response, "choices", []):
+        generation_output = outputs_by_index.get(choice.index)
+        if generation_output is None:
+            raise RuntimeError(
+                f"vLLM sampling-mask output is missing response choice {choice.index}."
+            )
+        sampling_mask = getattr(generation_output, "sampling_mask", None)
+        raw_token_ids = getattr(sampling_mask, "token_ids", None)
+        if raw_token_ids is None:
+            raise RuntimeError(
+                "vLLM was asked to return sampling masks for the OpenAI-compatible "
+                "chat endpoint but generation output "
+                f"choice_idx={choice.index} did not include one."
+            )
+
+        mask_token_ids = [list(row) for row in raw_token_ids]
+        output_token_ids = getattr(generation_output, "token_ids", None)
+        if output_token_ids is None or len(mask_token_ids) != len(output_token_ids):
+            raise RuntimeError(
+                "vLLM returned a sampling mask that does not align with generated "
+                f"tokens for choice_idx={choice.index}: "
+                f"mask_rows={len(mask_token_ids)}, "
+                f"token_count={None if output_token_ids is None else len(output_token_ids)}."
+            )
+        choice.message.sampling_mask = mask_token_ids
+
+    return response
+
+
 def model_dump_chat_response_with_dynamic_message_fields(
     response: Any,
 ) -> dict[str, Any]:
@@ -424,6 +461,7 @@ def model_dump_chat_response_with_dynamic_message_fields(
         message = getattr(choice, "message", None)
         for field_name in (
             "routed_experts",
+            "sampling_mask",
             "prompt_token_ids",
             "generation_token_ids",
             "generation_log_probs",

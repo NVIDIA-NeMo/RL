@@ -19,6 +19,7 @@ import torch.distributed.nn.functional
 from torch.distributed.tensor import DTensor, distribute_tensor
 
 from nemo_rl.algorithms.logits_sampling_utils import (
+    SamplingMask,
     TrainingSamplingParams,
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
@@ -1076,6 +1077,80 @@ def dtensor_from_parallel_logits_to_logprobs(
     return logprobs[:, :-1]
 
 
+def _sampling_mask_logprobs_from_parallel_logits(
+    vocab_parallel_logits: torch.Tensor,
+    target: torch.Tensor,
+    sampling_mask: SamplingMask,
+    *,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    tp_group: torch.distributed.ProcessGroup,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    chunk_size: Optional[int],
+) -> torch.Tensor:
+    """Compute exact-support next-token logprobs with existing TP/CP gathers."""
+    token_ids = sampling_mask.token_ids
+    sizes = sampling_mask.sizes
+    if token_ids.ndim != target.ndim + 1:
+        raise ValueError(
+            "sampling_mask_token_ids must have one support dimension beyond "
+            f"input_ids; got {tuple(token_ids.shape)} and {tuple(target.shape)}."
+        )
+    if token_ids.shape[:-1] != target.shape or sizes.shape != target.shape:
+        raise ValueError(
+            "Sampling-mask tensors must align with input_ids; got "
+            f"token_ids={tuple(token_ids.shape)}, sizes={tuple(sizes.shape)}, "
+            f"input_ids={tuple(target.shape)}."
+        )
+    support_width = token_ids.shape[-1]
+    if support_width <= 0:
+        raise ValueError("Sampling-mask support width must be positive.")
+
+    # Mask rows are aligned to sampled tokens, while logits at position t predict
+    # the token at t + 1. Shift in canonical sequence order before CP sharding.
+    shifted_target = target.roll(shifts=-1, dims=1)
+    shifted_token_ids = token_ids.roll(shifts=-1, dims=1).to(
+        device=shifted_target.device, dtype=shifted_target.dtype
+    )
+    shifted_sizes = sizes.roll(shifts=-1, dims=1).to(device=shifted_target.device)
+
+    # Gather the target separately from its rollout support. The existing helper
+    # owns TP vocabulary selection, Megatron's load-balanced CP layout, and
+    # sequence chunking; only K + 1 logits are retained after each gather.
+    selected_ids = torch.cat((shifted_target.unsqueeze(-1), shifted_token_ids), dim=-1)
+    selected_logits = gather_logits_at_global_indices(
+        vocab_parallel_logits,
+        selected_ids,
+        tp_group=tp_group,
+        cp_group=cp_group,
+        vocab_start_index=vocab_start_index,
+        vocab_end_index=vocab_end_index,
+        chunk_size=chunk_size,
+    )
+
+    target_logits = selected_logits[..., 0]
+    support_logits = selected_logits[..., 1:]
+    slots = torch.arange(support_width, device=shifted_sizes.device)
+    valid_slots = slots < shifted_sizes.unsqueeze(-1)
+    support_logits = support_logits.masked_fill(~valid_slots, -torch.inf)
+
+    # Prompt and padding rows have empty supports. Treat them as singleton
+    # {target}: the resulting logprob and its gradient are both exactly zero.
+    first_support = torch.where(
+        shifted_sizes == 0,
+        target_logits,
+        support_logits[..., 0],
+    )
+    support_logits = torch.cat(
+        (first_support.unsqueeze(-1), support_logits[..., 1:]), dim=-1
+    )
+    logprobs = target_logits - torch.logsumexp(support_logits, dim=-1)
+
+    # The final row predicts the roll-wrapped first token and is not a real
+    # next-token target.
+    return logprobs[:, :-1]
+
+
 def from_parallel_logits_to_logprobs(
     vocab_parallel_logits: torch.Tensor,
     target: torch.Tensor,
@@ -1086,6 +1161,7 @@ def from_parallel_logits_to_logprobs(
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    sampling_mask: Optional[SamplingMask] = None,
 ) -> torch.Tensor:
     """Get log probabilities from TP+CP sharded vocab logits.
 
@@ -1101,6 +1177,8 @@ def from_parallel_logits_to_logprobs(
         cp_group (torch.distributed.ProcessGroup, optional): Context parallelism process group. Defaults to None.
         chunk_size (int, optional): Sequence dimension chunk size for computing the log probabilities.
         sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
+        sampling_mask: Optional rollout-provided token support. When present,
+            it takes precedence over independently reconstructed top-k/top-p.
 
     Returns:
         torch.Tensor: Log probabilities tensor with shape [batch_size, seq_len-1].
@@ -1108,6 +1186,19 @@ def from_parallel_logits_to_logprobs(
 
     Taken from: https://github.com/NVIDIA/NeMo-Aligner/blob/9faab404f21994a7eb1d6ed5890b76152b941636/nemo_aligner/utils/distributed.py#L354
     """
+    if sampling_mask is not None:
+        with torch.set_grad_enabled(torch.is_grad_enabled() and not inference_only):
+            return _sampling_mask_logprobs_from_parallel_logits(
+                vocab_parallel_logits,
+                target,
+                sampling_mask,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_end_index,
+                tp_group=tp_group,
+                cp_group=cp_group,
+                chunk_size=chunk_size,
+            )
+
     target = target.roll(shifts=-1, dims=-1)
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
     pad_len = 0
@@ -1978,9 +2069,7 @@ def gather_logits_at_global_indices(
         local_vals = local_vals * in_range.to(dtype=local_vals.dtype)
 
         if tp_group is not None:
-            torch.distributed.all_reduce(
-                local_vals, op=torch.distributed.ReduceOp.SUM, group=tp_group
-            )
+            local_vals = group_all_reduce_sum_with_grad(local_vals, tp_group)
         out_chunks.append(local_vals)
 
     gathered_logits = (

@@ -46,6 +46,29 @@ from tests.unit.test_utils import SimpleLossFn
 pytestmark = pytest.mark.mcore
 
 
+def test_kv_calibration_temporarily_disables_sampling_mask_replay():
+    from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = MagicMock()
+    worker.model.named_modules.return_value = []
+    worker.sampling_params = TrainingSamplingParams(replay_sampling_mask=True)
+    replay_flags_seen = []
+    worker.get_logprobs = MagicMock(
+        side_effect=lambda **_: replay_flags_seen.append(
+            worker.sampling_params.replay_sampling_mask
+        )
+    )
+
+    worker.calibrate_qkv_fp8_scales(data=BatchedDataDict())
+
+    assert replay_flags_seen == [False]
+    assert worker.sampling_params.replay_sampling_mask is True
+
+
 def test_model_owned_packing_capability_is_detected():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         _model_self_packs_for_cp,

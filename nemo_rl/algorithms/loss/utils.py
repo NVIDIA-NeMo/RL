@@ -17,8 +17,10 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from nemo_rl.algorithms.logits_sampling_utils import (
+    SamplingMask,
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
+    sampling_mask_from_data,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
@@ -28,6 +30,7 @@ from nemo_rl.algorithms.x_token.loss_utils import (
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     _get_tokens_on_this_cp_rank,
+    from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
     get_cp_sharded_next_token_logprobs,
     get_distillation_topk_logprobs_from_logits,
@@ -38,6 +41,23 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
         ContextParallelSharder,
     )
+
+
+def _get_actor_sampling_mask(
+    data: BatchedDataDict[Any],
+    sampling_params: Optional[TrainingSamplingParams],
+) -> Optional[SamplingMask]:
+    """Load actor-only replay metadata when exact replay is enabled."""
+    if sampling_params is None or not sampling_params.replay_sampling_mask:
+        return None
+
+    sampling_mask = sampling_mask_from_data(data)
+    if sampling_mask is None:
+        raise ValueError(
+            "Sampling-mask replay is enabled, but sampling_mask_token_ids and "
+            "sampling_mask_sizes are missing from the actor batch."
+        )
+    return sampling_mask
 
 
 def prepare_loss_input(
@@ -82,15 +102,38 @@ def prepare_loss_input(
         loss_input = {"logits": logits}
 
     elif loss_fn.input_type == LossInputType.LOGPROB:
+        sampling_mask = _get_actor_sampling_mask(data, sampling_params)
         # Linear CE fusion patch returns precomputed next-token logprobs (2D tensor).
         # Keep normal path unchanged for standard logits (3D tensor).
         if (
             hasattr(loss_fn, "use_fused_linear_logprobs")
             and loss_fn.use_fused_linear_logprobs
         ):
+            if sampling_mask is not None:
+                raise NotImplementedError(
+                    "Sampling-mask replay is incompatible with fused linear logprobs."
+                )
             logprobs = logits
             logprobs = logprobs.to(torch.float32)
             logprobs = logprobs[:, : data["input_ids"].shape[1] - 1]
+        elif sampling_mask is not None:
+            if vocab_parallel_group is None or vocab_parallel_rank is None:
+                raise NotImplementedError(
+                    "Sampling-mask replay currently supports only Megatron "
+                    "vocabulary-parallel policy training."
+                )
+            logprobs = from_parallel_logits_to_logprobs(
+                logits,
+                target=data["input_ids"],
+                vocab_start_index=vocab_parallel_rank * logits.shape[-1],
+                vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+                tp_group=vocab_parallel_group,
+                inference_only=False,
+                cp_group=context_parallel_group,
+                chunk_size=chunk_size,
+                sampling_params=sampling_params,
+                sampling_mask=sampling_mask,
+            )
         else:
             logprobs = get_next_token_logprobs_from_logits(
                 input_ids=data["input_ids"],
@@ -105,29 +148,33 @@ def prepare_loss_input(
             )
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
-        if need_top_k_or_top_p_filtering(sampling_params):
+        reconstructs_sampling_support = (
+            sampling_mask is None and need_top_k_or_top_p_filtering(sampling_params)
+        )
+        if reconstructs_sampling_support:
             # mask out negative infinity logprobs
             # prev_logprobs is already masked out in the previous step
             mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
             logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
 
-            # compute unfiltered logprobs for reference policy KL penalty
-            if (
-                hasattr(loss_fn, "reference_policy_kl_penalty")
-                and loss_fn.reference_policy_kl_penalty != 0
-            ):
-                data["curr_logprobs_unfiltered"] = get_next_token_logprobs_from_logits(
-                    input_ids=data["input_ids"],
-                    next_token_logits=logits,
-                    seq_index=data.get("seq_index", None),
-                    vocab_parallel_rank=vocab_parallel_rank,
-                    vocab_parallel_group=vocab_parallel_group,
-                    context_parallel_group=context_parallel_group,
-                    sampling_params=None,  # no filtering
-                    # Only reachable with top-k/top-p sampling active that has its own kernel path so don't chunk here
-                    chunk_size=None,
-                    cp_sharder=cp_sharder,
-                )
+        # The actor loss uses the rollout support, but reference-policy KL uses
+        # the actor's unfiltered distribution against the unfiltered reference.
+        if (
+            (sampling_mask is not None or reconstructs_sampling_support)
+            and hasattr(loss_fn, "reference_policy_kl_penalty")
+            and loss_fn.reference_policy_kl_penalty != 0
+        ):
+            data["curr_logprobs_unfiltered"] = get_next_token_logprobs_from_logits(
+                input_ids=data["input_ids"],
+                next_token_logits=logits,
+                seq_index=data.get("seq_index", None),
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                sampling_params=None,
+                chunk_size=chunk_size if sampling_mask is not None else None,
+                cp_sharder=cp_sharder,
+            )
 
         loss_input = {"next_token_logprobs": logprobs}
 

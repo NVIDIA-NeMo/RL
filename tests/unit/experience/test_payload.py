@@ -162,6 +162,35 @@ def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
     assert "routed_experts" not in fields
 
 
+def test_record_to_train_batch_backfills_and_packs_sampling_mask_pair() -> None:
+    completion = _completion(route_start=10, reward=1.0, with_routes=False)
+    completion.message_log[1]["sampling_mask_token_ids"] = torch.tensor(
+        [[20, 99], [21, 0]], dtype=torch.int32
+    )
+    completion.message_log[1]["sampling_mask_sizes"] = torch.tensor(
+        [2, 1], dtype=torch.int32
+    )
+
+    train_batch = record_to_train_batch(
+        _record([completion]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+    )
+
+    assert train_batch["sampling_mask_token_ids"].tolist() == [
+        [[0, 0], [0, 0], [20, 99], [21, 0], [0, 0]]
+    ]
+    assert train_batch["sampling_mask_sizes"].tolist() == [[0, 0, 2, 1, 0]]
+
+    _, fields, _ = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+        prompt_idx=17,
+    )
+    assert list(fields["sampling_mask_token_ids"].unbind())[0].shape == (5, 2)
+    assert list(fields["sampling_mask_sizes"].unbind())[0].tolist() == [0, 0, 2, 1, 0]
+
+
 def _failed_completion() -> Completion:
     """A trajectory whose first generation raised: prompt only, no routes."""
     return Completion(

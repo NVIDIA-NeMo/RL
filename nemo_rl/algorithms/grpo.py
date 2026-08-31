@@ -131,6 +131,10 @@ from nemo_rl.models.megatron.router_replay import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.sampling_mask_replay import (
+    configure_vllm_for_sampling_mask_replay,
+    sampling_mask_replay_enabled,
+)
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     Bucket,
@@ -809,6 +813,16 @@ def setup(
     # NeMo Gym is initialized inside setup() (rather than by the caller) so its
     # spinup can overlap with vLLM model loading via deferred model load.
     enable_nemo_gym = should_use_nemo_gym(master_config)
+    enable_sampling_mask_replay = sampling_mask_replay_enabled(policy_config)
+    if enable_sampling_mask_replay:
+        if not enable_nemo_gym or not (master_config.data_plane or {}).get(
+            "enabled", False
+        ):
+            raise ValueError(
+                "sampling_mask_replay.enabled is currently supported only by "
+                "NeMo Gym with the TransferQueue data plane."
+            )
+        configure_vllm_for_sampling_mask_replay(policy_config)
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
@@ -831,6 +845,10 @@ def setup(
             enable_router_replay=enable_router_replay,
             routed_experts_dtype=routed_experts_dtype,
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+            enable_sampling_mask_replay=enable_sampling_mask_replay,
+            sampling_mask_top_k=(
+                generation_config["top_k"] if enable_sampling_mask_replay else None
+            ),
         )
         return actor, time.perf_counter() - t0
 

@@ -16,6 +16,7 @@ import itertools
 import pytest
 import torch
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
@@ -450,6 +451,65 @@ def _create_exact_logits(
                 "Target log probability must be negative or zero for this construction"
             )
     return dummy_logits
+
+
+def test_prepare_loss_input_replays_sampling_mask_and_keeps_unfiltered_kl(
+    monkeypatch,
+):
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "token_mask": torch.ones_like(input_ids),
+            "sample_mask": torch.ones(1),
+            "sampling_mask_token_ids": torch.tensor([[[0, 0], [2, 5], [3, 6], [4, 7]]]),
+            "sampling_mask_sizes": torch.tensor([[0, 2, 2, 2]]),
+        }
+    )
+    replay_calls = []
+    unfiltered_calls = []
+
+    def fake_replayed_logprobs(*args, **kwargs):
+        replay_calls.append(kwargs)
+        return torch.zeros(1, 3)
+
+    def fake_unfiltered_logprobs(**kwargs):
+        unfiltered_calls.append(kwargs)
+        return torch.zeros(1, 3)
+
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.utils.from_parallel_logits_to_logprobs",
+        fake_replayed_logprobs,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.utils.get_next_token_logprobs_from_logits",
+        fake_unfiltered_logprobs,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.utils.mask_out_neg_inf_logprobs",
+        lambda *args, **kwargs: pytest.fail(
+            "exact replay must not run reconstructed-support masking"
+        ),
+    )
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.1))
+
+    prepare_loss_input(
+        torch.randn(1, 4, 8),
+        data,
+        loss_fn,
+        vocab_parallel_rank=0,
+        vocab_parallel_group=object(),
+        sampling_params=TrainingSamplingParams(top_p=0.9, replay_sampling_mask=True),
+        chunk_size=2,
+    )
+
+    assert len(replay_calls) == 1
+    assert len(unfiltered_calls) == 1
+    assert replay_calls[0]["sampling_mask"].token_ids is data["sampling_mask_token_ids"]
+    assert replay_calls[0]["sampling_mask"].sizes is data["sampling_mask_sizes"]
+    assert unfiltered_calls[0]["sampling_params"] is None
+    assert unfiltered_calls[0]["chunk_size"] == 2
+    assert "curr_logprobs_unfiltered" in data
 
 
 # Simplified PPO Clipping Test using original Loss

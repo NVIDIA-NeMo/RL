@@ -30,6 +30,7 @@ from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
     aggregate_spec_decode_counters,
     attach_routed_experts_to_chat_response_choices,
+    attach_sampling_masks_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     compute_spec_decode_metrics,
     format_prompt_for_vllm_generation,
@@ -625,6 +626,50 @@ def test_attach_token_information_to_chat_response_choices():
     ]
     assert response_dict["choices"][1]["message"]["generation_token_ids"] == []
     assert response_dict["choices"][1]["message"]["generation_log_probs"] == []
+
+
+def test_attach_sampling_masks_to_chat_response_choices():
+    final_res = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[201, 202],
+                sampling_mask=SimpleNamespace(token_ids=[[201, 7], [202]]),
+            )
+        ]
+    )
+
+    class Response:
+        choices = [SimpleNamespace(index=0, message=SimpleNamespace())]
+
+        def model_dump(self):
+            return {"choices": [{"message": {"role": "assistant"}}]}
+
+    response = Response()
+    attach_sampling_masks_to_chat_response_choices(response, final_res)
+    dumped = model_dump_chat_response_with_dynamic_message_fields(response)
+    assert dumped["choices"][0]["message"]["sampling_mask"] == [
+        [201, 7],
+        [202],
+    ]
+
+
+def test_attach_sampling_masks_rejects_token_misalignment():
+    final_res = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[201, 202],
+                sampling_mask=SimpleNamespace(token_ids=[[201]]),
+            )
+        ]
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+
+    with pytest.raises(RuntimeError, match="does not align"):
+        attach_sampling_masks_to_chat_response_choices(response, final_res)
 
 
 @pytest.mark.parametrize(

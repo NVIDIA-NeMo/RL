@@ -562,6 +562,14 @@ class RouterReplayConfig(TypedDict):
     enabled: Literal[True]
 
 
+class SamplingMaskReplayConfigDisabled(TypedDict):
+    enabled: Literal[False]
+
+
+class SamplingMaskReplayConfig(TypedDict):
+    enabled: Literal[True]
+
+
 class PolicyConfig(TypedDict):
     model_name: str
     tokenizer: TokenizerConfig
@@ -583,6 +591,9 @@ class PolicyConfig(TypedDict):
     draft: NotRequired[DraftConfig | DraftConfigDisabled]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     router_replay: NotRequired[RouterReplayConfig | RouterReplayConfigDisabled]
+    sampling_mask_replay: NotRequired[
+        SamplingMaskReplayConfig | SamplingMaskReplayConfigDisabled
+    ]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]

@@ -34,6 +34,10 @@ from nemo_rl.data.multimodal_utils import (
     resolve_to_image,
     uses_image_placeholder,
 )
+from nemo_rl.data_plane.schema import (
+    SAMPLING_MASK_SIZES_FIELD,
+    SAMPLING_MASK_TOKEN_IDS_FIELD,
+)
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
@@ -205,6 +209,12 @@ class NemoGymConfig(TypedDict):
     routed_experts_dtype: NotRequired[
         str
     ]  # Carry dtype name for routed_experts tensors ("int8"/"int16"/"int32"), resolved from the model's expert count
+    require_sampling_mask: NotRequired[
+        bool
+    ]  # Require each trainable Gym output item to carry vLLM's sampling mask
+    sampling_mask_top_k: NotRequired[
+        int
+    ]  # Fixed support width used to tensorize variable-length top-p supports
     # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
     # tokenizer consistently with the driver. Defaults to off when absent.
     use_fastokens: NotRequired[bool]
@@ -215,6 +225,51 @@ class NemoGymConfig(TypedDict):
     pad_dynamic_image_shapes: NotRequired[
         bool
     ]  # Normalize heterogeneous image tensors while retaining exact imgs_sizes
+
+
+def _tensorize_sampling_mask(
+    raw_mask: Any,
+    generation_token_ids: list[int],
+    *,
+    support_width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert vLLM's variable-length support rows to the TQ tensor pair."""
+    if (
+        isinstance(support_width, bool)
+        or not isinstance(support_width, int)
+        or support_width <= 0
+    ):
+        raise ValueError(
+            "sampling_mask_top_k must be a positive integer when sampling-mask "
+            "replay is enabled."
+        )
+    if not isinstance(raw_mask, list):
+        raise TypeError("NeMo Gym sampling_mask must be a list of token-id lists.")
+    if len(raw_mask) != len(generation_token_ids):
+        raise ValueError(
+            "NeMo Gym returned a sampling mask that does not align with generated "
+            f"tokens: mask_rows={len(raw_mask)}, "
+            f"token_count={len(generation_token_ids)}."
+        )
+
+    token_ids = torch.zeros(
+        (len(raw_mask), support_width),
+        dtype=torch.int32,
+    )
+    sizes = torch.empty(len(raw_mask), dtype=torch.int32)
+    for position, row in enumerate(raw_mask):
+        if not isinstance(row, list) or not row:
+            raise ValueError(
+                f"NeMo Gym sampling_mask[{position}] must be a non-empty list."
+            )
+        if len(row) > support_width:
+            raise ValueError(
+                f"NeMo Gym sampling_mask[{position}] has {len(row)} entries, "
+                f"exceeding configured top_k={support_width}."
+            )
+        token_ids[position, : len(row)] = torch.tensor(row, dtype=torch.int32)
+        sizes[position] = len(row)
+    return token_ids, sizes
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -850,6 +905,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             generation_token_ids = output_item_dict.pop("generation_token_ids")
             generation_log_probs = output_item_dict.pop("generation_log_probs")
             routed_experts_raw = output_item_dict.pop("routed_experts", None)
+            sampling_mask_raw = output_item_dict.pop("sampling_mask", None)
             new_prompt_token_ids = prompt_token_ids[len(seen_token_ids) :]
 
             routed_experts = None
@@ -881,6 +937,22 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                     "Make sure the Gym repo includes routed_experts propagation "
                     "and the NeMo-RL vLLM OpenAI-compatible server is configured "
                     "with enable_return_routed_experts."
+                )
+
+            sampling_mask_token_ids = None
+            sampling_mask_sizes = None
+            if self.cfg.get("require_sampling_mask", False):
+                if sampling_mask_raw is None:
+                    raise ValueError(
+                        "policy.sampling_mask_replay.enabled=true requires NeMo "
+                        "Gym output items to include sampling_mask, but the field "
+                        "was missing. Make sure Gym preserves the sampling_mask "
+                        "field returned by the NeMo-RL vLLM chat endpoint."
+                    )
+                sampling_mask_token_ids, sampling_mask_sizes = _tensorize_sampling_mask(
+                    sampling_mask_raw,
+                    generation_token_ids,
+                    support_width=self.cfg.get("sampling_mask_top_k", 0),
                 )
 
             # The next prompt prefill supplies the real route for the previous
@@ -945,6 +1017,12 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 assistant_message["routed_experts"] = routed_experts[
                     generation_start:generation_end
                 ]
+            if sampling_mask_token_ids is not None:
+                assert sampling_mask_sizes is not None
+                assistant_message[SAMPLING_MASK_TOKEN_IDS_FIELD] = (
+                    sampling_mask_token_ids
+                )
+                assistant_message[SAMPLING_MASK_SIZES_FIELD] = sampling_mask_sizes
             nemo_rl_message_log.append(assistant_message)
 
             seen_token_ids.extend(new_prompt_token_ids)
@@ -1137,6 +1215,8 @@ def spinup_nemo_gym_actor(
     enable_router_replay: bool,
     routed_experts_dtype: str,
     use_fastokens: bool,
+    enable_sampling_mask_replay: bool = False,
+    sampling_mask_top_k: int | None = None,
 ) -> Any:
     """Spin up the NeMo-Gym actor against the given generation server URLs.
 
@@ -1158,6 +1238,10 @@ def spinup_nemo_gym_actor(
             resolved by the caller from the model's expert count.
         use_fastokens: Forwarded from policy.tokenizer.use_fastokens so the rollout actor
             patches its tokenizer consistently with the driver.
+        enable_sampling_mask_replay: Require vLLM sampling-mask metadata on
+            every trainable Gym output item.
+        sampling_mask_top_k: Fixed mask width; must match generation top-k
+            when sampling-mask replay is enabled.
 
     Returns:
         The spun-up NemoGym Ray actor handle (_spinup already awaited).
@@ -1187,6 +1271,13 @@ def spinup_nemo_gym_actor(
     if uv_venv_dir is not None:
         nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
 
+    sampling_mask_flags: dict[str, Any] = {}
+    if enable_sampling_mask_replay:
+        sampling_mask_flags = {
+            "require_sampling_mask": True,
+            "sampling_mask_top_k": sampling_mask_top_k,
+        }
+
     nemo_gym_cfg = NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
@@ -1197,6 +1288,7 @@ def spinup_nemo_gym_actor(
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
+        **sampling_mask_flags,
         **multimodal_flags,
     )
 

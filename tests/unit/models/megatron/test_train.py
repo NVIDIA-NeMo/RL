@@ -1235,6 +1235,49 @@ class TestLogprobsPostProcessor:
         )[:, :5]
         assert torch.equal(result["logprobs"], expected)
 
+    @patch("nemo_rl.models.megatron.train.mask_out_neg_inf_logprobs")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.from_parallel_logits_to_logprobs")
+    def test_logprobs_post_processor_forwards_sampling_mask(
+        self,
+        mock_from_logits,
+        mock_tp_rank,
+        mock_tp_grp,
+        mock_cp_grp,
+        mock_mask_out,
+    ):
+        from nemo_rl.models.megatron.train import LogprobsPostProcessor
+
+        input_ids = torch.tensor([[1, 2, 3, 4]])
+        mask_token_ids = torch.tensor([[[0, 0], [2, 5], [3, 6], [4, 7]]])
+        mask_sizes = torch.tensor([[0, 2, 2, 2]])
+        data = {
+            "input_ids": input_ids,
+            "sampling_mask_token_ids": mask_token_ids,
+            "sampling_mask_sizes": mask_sizes,
+            "token_mask": torch.ones_like(input_ids),
+            "sample_mask": torch.ones(1),
+        }
+        sampling_params = TrainingSamplingParams(top_p=0.9, replay_sampling_mask=True)
+        processor = LogprobsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}},
+            sampling_params=sampling_params,
+        )
+        mock_from_logits.return_value = torch.randn(1, 3)
+
+        wrapped_fn = processor(data, input_ids, None, original_seq_length=4)
+        wrapped_fn(torch.randn(1, 4, 8))
+
+        call = mock_from_logits.call_args.kwargs
+        assert call["cp_group"] is mock_cp_grp.return_value
+        assert call["sampling_mask"].token_ids is mask_token_ids
+        assert call["sampling_mask"].sizes is mask_sizes
+        mock_mask_out.assert_not_called()
+
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(
         "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0

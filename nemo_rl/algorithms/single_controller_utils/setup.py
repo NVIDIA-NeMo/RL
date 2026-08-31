@@ -79,6 +79,7 @@ from nemo_rl.data_plane import (
 from nemo_rl.data_plane.schema import (
     SC_ROLLOUT_SCHEMA_FIELDS,
     fields_with_optional_routed_experts,
+    fields_with_optional_sampling_mask,
 )
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
@@ -119,6 +120,10 @@ from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
+)
+from nemo_rl.models.policy.sampling_mask_replay import (
+    configure_vllm_for_sampling_mask_replay,
+    sampling_mask_replay_enabled,
 )
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
@@ -662,6 +667,7 @@ def _spinup_gym(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     enable_router_replay = router_replay_enabled(policy_config)
+    enable_sampling_mask_replay = sampling_mask_replay_enabled(policy_config)
     routed_experts_dtype = (
         resolve_routed_experts_dtype_name_for_model(generation_config["model_name"])
         if enable_router_replay
@@ -675,6 +681,10 @@ def _spinup_gym(
         enable_router_replay=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+        enable_sampling_mask_replay=enable_sampling_mask_replay,
+        sampling_mask_top_k=(
+            generation_config["top_k"] if enable_sampling_mask_replay else None
+        ),
     )
     return actor, time.perf_counter() - t0
 
@@ -1013,6 +1023,13 @@ def setup_single_controller(
     # ==========================
     # TODO: add validate dataset wiring.
     use_nemo_gym = should_use_nemo_gym(master_config)
+    enable_sampling_mask_replay = sampling_mask_replay_enabled(policy_config)
+    if enable_sampling_mask_replay and not use_nemo_gym:
+        raise ValueError(
+            "sampling_mask_replay.enabled is currently supported only by "
+            "SingleController with NeMo Gym."
+        )
+    configure_vllm_for_sampling_mask_replay(policy_config)
     if use_nemo_gym and generation_config["backend"] not in ("vllm", "megatron"):
         raise NotImplementedError(
             "SC NeMo-Gym integration currently supports the vllm and megatron backends only; got "
@@ -1359,9 +1376,12 @@ def setup_single_controller(
     # concurrent; TransferQueue otherwise registers field names lazily.
     dp_client.register_partition(
         partition_id=partition_id,
-        fields=fields_with_optional_routed_experts(
-            SC_ROLLOUT_SCHEMA_FIELDS,
-            enabled=router_replay_enabled(policy_config),
+        fields=fields_with_optional_sampling_mask(
+            fields_with_optional_routed_experts(
+                SC_ROLLOUT_SCHEMA_FIELDS,
+                enabled=router_replay_enabled(policy_config),
+            ),
+            enabled=enable_sampling_mask_replay,
         ),
         num_samples=(
             master_config.async_rl.max_buffered_rollouts
@@ -1403,6 +1423,7 @@ def setup_single_controller(
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
         require_routed_experts=router_replay_enabled(policy_config),
+        require_sampling_mask=enable_sampling_mask_replay,
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,

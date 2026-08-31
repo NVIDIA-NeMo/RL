@@ -2433,9 +2433,13 @@ async def run_async_nemo_gym_rollout(
         sampling_params = GenerationSamplingParams.from_generation_config(
             generation_config
         )
-    # Top k is not OpenAI compatible, so NeMo-Gym does not guarantee support over it.
-    assert not sampling_params.top_k, (
-        "Top k is not supported in the sampling params in NeMo-Gym path!"
+    sampling_mask_enabled = bool(
+        policy_generation.cfg.get("vllm_kwargs", {}).get("return_sampling_mask", False)
+    )
+    top_k = sampling_params.top_k
+    assert top_k is None or top_k <= 0 or sampling_mask_enabled, (
+        "top_k in the NeMo-Gym path requires sampling-mask replay so the "
+        "training policy can use the exact rollout action space."
     )
     if num_generations <= 0:
         raise ValueError("num_generations must be greater than zero")

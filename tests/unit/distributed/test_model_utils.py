@@ -18,7 +18,7 @@ import pytest
 import ray
 import torch
 
-from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
+from nemo_rl.algorithms.logits_sampling_utils import SamplingMask, apply_top_k_top_p
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedGatherLogprob,
     ChunkedDistributedLogprob,
@@ -55,21 +55,27 @@ class ModelUtilsTestActor:
         # Initialize worker groups
         torch.distributed.init_process_group(backend="nccl")
 
-        tp_rank = int(os.environ["RANK"]) % self.tp_size
-        cp_rank = int(os.environ["RANK"]) // self.tp_size
-        tp_ranks = self.sharding.get_ranks(tp=tp_rank)
-        if type(tp_ranks) != int:
-            tp_ranks = tp_ranks.layout.tolist()
-        else:
-            tp_ranks = [tp_ranks]
-        cp_ranks = self.sharding.get_ranks(cp=cp_rank)
-        if type(cp_ranks) != int:
-            cp_ranks = cp_ranks.layout.tolist()
-        else:
-            cp_ranks = [cp_ranks]
+        rank = int(os.environ["RANK"])
+        coords = self.sharding.get_worker_coords(rank)
+        tp_rank, cp_rank = coords["tp"], coords["cp"]
 
-        tp_group = torch.distributed.new_group(ranks=cp_ranks)
-        cp_group = torch.distributed.new_group(ranks=tp_ranks)  # this is correct
+        # Every rank creates all groups in the same order, then retains the one
+        # matching its coordinate. This also supports TP and CP simultaneously.
+        tp_group = None
+        for cp_idx in range(self.cp_size):
+            group = torch.distributed.new_group(
+                ranks=self.sharding.get_ranks_by_coord(cp=cp_idx)
+            )
+            if cp_idx == cp_rank:
+                tp_group = group
+        cp_group = None
+        for tp_idx in range(self.tp_size):
+            group = torch.distributed.new_group(
+                ranks=self.sharding.get_ranks_by_coord(tp=tp_idx)
+            )
+            if tp_idx == tp_rank:
+                cp_group = group
+        assert tp_group is not None and cp_group is not None
 
         # Test parameters
         batch_size = 4
@@ -119,6 +125,67 @@ class ModelUtilsTestActor:
         torch.testing.assert_close(
             with_cp_logprobs, expected_logprobs, rtol=1e-5, atol=1e-5
         )
+
+        support_ids = torch.stack(
+            (
+                unpacked_target_ids,
+                (unpacked_target_ids + vocab_size // 2) % vocab_size,
+                (unpacked_target_ids + 3 * vocab_size // 4) % vocab_size,
+            ),
+            dim=-1,
+        )
+        support_sizes = (
+            torch.arange(
+                unpacked_target_ids.numel(), device=unpacked_target_ids.device
+            ).reshape_as(unpacked_target_ids)
+            % 3
+            + 1
+        )
+        support_sizes[:, 0] = 0
+        sampling_mask = SamplingMask(support_ids, support_sizes)
+        for chunk_size in (None, 5):
+            expected_logits = unpacked_logits.detach().clone().requires_grad_(True)
+            expected_replayed = from_parallel_logits_to_logprobs(
+                expected_logits,
+                unpacked_target_ids,
+                vocab_start_index,
+                vocab_end_index,
+                tp_group,
+                chunk_size=chunk_size,
+                sampling_mask=sampling_mask,
+            )
+            cp_logits = (
+                _get_tokens_on_this_cp_rank(
+                    unpacked_logits, cp_rank, self.cp_size, seq_dim=1
+                )
+                .detach()
+                .clone()
+                .requires_grad_(True)
+            )
+            with_cp_replayed = from_parallel_logits_to_logprobs(
+                cp_logits,
+                unpacked_target_ids,
+                vocab_start_index,
+                vocab_end_index,
+                tp_group,
+                cp_group=cp_group,
+                chunk_size=chunk_size,
+                sampling_mask=sampling_mask,
+            )
+            torch.testing.assert_close(
+                with_cp_replayed, expected_replayed, rtol=1e-5, atol=1e-5
+            )
+            expected_replayed.sum().backward()
+            with_cp_replayed.sum().backward()
+            expected_cp_grad = _get_tokens_on_this_cp_rank(
+                expected_logits.grad, cp_rank, self.cp_size, seq_dim=1
+            )
+            torch.testing.assert_close(
+                cp_logits.grad / self.cp_size,
+                expected_cp_grad,
+                rtol=1e-5,
+                atol=1e-5,
+            )
 
         # 2. Prepare inputs for packed function
         # For simplicity, all sequences have the same length
@@ -197,6 +264,7 @@ import numpy as np
     [
         (2, 1),  # TP=2, CP=1
         (1, 2),  # TP=1, CP=2
+        (2, 2),  # Combined TP=2, CP=2
     ],
 )
 def test_from_parallel_logits_to_logprobs_packed_sequences(
@@ -213,7 +281,7 @@ def test_from_parallel_logits_to_logprobs_packed_sequences(
         )
 
     # Create appropriate virtual cluster
-    cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[world_size], use_gpus=True)
 
     try:
         actor_fqn = register_model_utils_test_actor

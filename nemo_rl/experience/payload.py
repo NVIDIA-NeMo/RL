@@ -24,7 +24,12 @@ from tensordict import TensorDict
 from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import (
+    ROUTED_EXPERTS_FIELD,
+    SAMPLING_MASK_FIELDS,
+    SAMPLING_MASK_SIZES_FIELD,
+    SAMPLING_MASK_TOKEN_IDS_FIELD,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
 
@@ -52,6 +57,55 @@ def _violation_counts(
         if message.get("has_malformed_thinking", False):
             counts["num_malformed_thinking"] += 1
     return counts
+
+
+def backfill_missing_sampling_masks(message_logs: list[Any]) -> None:
+    """Zero-fill non-generated turns once, immediately before flattening."""
+    template: torch.Tensor | None = None
+    for message_log in message_logs:
+        for message in message_log:
+            has_ids = SAMPLING_MASK_TOKEN_IDS_FIELD in message
+            has_sizes = SAMPLING_MASK_SIZES_FIELD in message
+            if has_ids != has_sizes:
+                raise RuntimeError("A message contains only one sampling-mask field.")
+            if not has_ids:
+                continue
+            mask_ids = message[SAMPLING_MASK_TOKEN_IDS_FIELD]
+            mask_sizes = message[SAMPLING_MASK_SIZES_FIELD]
+            token_ids = message.get("token_ids")
+            if (
+                not isinstance(mask_ids, torch.Tensor)
+                or not isinstance(mask_sizes, torch.Tensor)
+                or not isinstance(token_ids, torch.Tensor)
+                or mask_ids.ndim != 2
+                or mask_sizes.shape != token_ids.shape[:1]
+                or mask_ids.shape[0] != token_ids.shape[0]
+            ):
+                raise ValueError(
+                    "Sampling-mask tensors must align with their message token_ids."
+                )
+            if template is not None and mask_ids.shape[1] != template.shape[1]:
+                raise ValueError("Sampling-mask support width must be batch-constant.")
+            template = mask_ids
+
+    if template is None:
+        return
+
+    for message_log in message_logs:
+        for message in message_log:
+            if SAMPLING_MASK_TOKEN_IDS_FIELD in message:
+                continue
+            token_ids = message.get("token_ids")
+            if not isinstance(token_ids, torch.Tensor):
+                continue
+            message[SAMPLING_MASK_TOKEN_IDS_FIELD] = torch.zeros(
+                (token_ids.shape[0], template.shape[1]),
+                dtype=template.dtype,
+                device=template.device,
+            )
+            message[SAMPLING_MASK_SIZES_FIELD] = torch.zeros(
+                token_ids.shape[0], dtype=torch.int32, device=template.device
+            )
 
 
 def record_to_train_batch(
@@ -91,6 +145,7 @@ def record_to_train_batch(
     # backfilling here also covers the prompt flatten below. Doing it only inside
     # add_grpo_token_loss_masks_and_generation_logprobs would be too late.
     backfill_missing_routed_experts(message_logs)
+    backfill_missing_sampling_masks(message_logs)
 
     prompt_message_logs = extract_initial_prompt_messages(message_logs, prompt_lengths)
     prompt_flat, _ = batched_message_log_to_flat_message(
@@ -121,6 +176,9 @@ def record_to_train_batch(
     }
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
+    for field in SAMPLING_MASK_FIELDS:
+        if field in flat:
+            train_data[field] = flat[field]
     return BatchedDataDict[Any](train_data)
 
 

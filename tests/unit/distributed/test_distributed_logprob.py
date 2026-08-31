@@ -24,12 +24,14 @@ import functools
 import pytest
 import torch
 
+from nemo_rl.algorithms.logits_sampling_utils import SamplingMask
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
     ChunkedDistributedLogprob,
     DistributedLogprob,
     _compute_distributed_log_softmax,
+    from_parallel_logits_to_logprobs,
     get_next_token_logprobs_from_logits,
 )
 
@@ -137,6 +139,60 @@ def _run_logprob_forward_and_backward(rank, world_size, tp_size, chunk_size):
     torch.testing.assert_close(distributed_grad, baseline_grad, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(
         distributed_log_probs, baseline_log_probs, rtol=1e-4, atol=1e-4
+    )
+
+    # Sampling-mask replay uses the existing sparse-logit gather and must retain
+    # the same TP/chunking forward and backward behavior.
+    support_ids = torch.stack(
+        (target, (target + 1) % full_vocab_size, (target + 2) % full_vocab_size),
+        dim=-1,
+    )
+    support_sizes = (
+        torch.arange(target.numel(), device=target.device).reshape_as(target) % 3 + 1
+    )
+    support_sizes[:, 0] = 0
+    support_sizes[:, -1] = 0
+    sampling_mask = SamplingMask(token_ids=support_ids, sizes=support_sizes)
+
+    baseline_logits = full_logits.detach().clone().requires_grad_(True)
+    target_logits = (
+        baseline_logits[:, :-1].gather(-1, target[:, 1:].unsqueeze(-1)).squeeze(-1)
+    )
+    support_logits = baseline_logits[:, :-1].gather(-1, support_ids[:, 1:])
+    valid_slots = torch.arange(3, device="cuda") < support_sizes[:, 1:].unsqueeze(-1)
+    support_logits = support_logits.masked_fill(~valid_slots, -torch.inf)
+    first_support = torch.where(
+        support_sizes[:, 1:] == 0, target_logits, support_logits[..., 0]
+    )
+    support_logits = torch.cat(
+        (first_support.unsqueeze(-1), support_logits[..., 1:]), dim=-1
+    )
+    expected = target_logits - torch.logsumexp(support_logits, dim=-1)
+    expected.sum().backward()
+
+    replay_logits = (
+        full_logits[:, :, vocab_start_index:vocab_end_index]
+        .detach()
+        .clone()
+        .requires_grad_(True)
+    )
+    actual = from_parallel_logits_to_logprobs(
+        replay_logits,
+        target,
+        vocab_start_index,
+        vocab_end_index,
+        tp_group,
+        chunk_size=chunk_size,
+        sampling_mask=sampling_mask,
+    )
+    actual.sum().backward()
+
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(
+        replay_logits.grad,
+        baseline_logits.grad[:, :, vocab_start_index:vocab_end_index],
+        rtol=1e-4,
+        atol=1e-4,
     )
 
 

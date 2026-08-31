@@ -57,7 +57,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     setup_single_controller,
 )
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
-from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
+from nemo_rl.data_plane.schema import SAMPLING_MASK_FIELDS, SC_ROLLOUT_SCHEMA_FIELDS
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
@@ -1050,8 +1050,63 @@ class TestSetup:
             enable_router_replay=False,
             routed_experts_dtype="int16",
             use_fastokens=False,
+            enable_sampling_mask_replay=False,
+            sampling_mask_top_k=None,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
+
+    def test_sampling_mask_replay_wires_gym_and_data_plane(self, patched_factories):
+        mc = _make_master_config(
+            backend="vllm",
+            megatron_enabled=True,
+            env={"nemo_gym": {}},
+        )
+        generation = mc.policy["generation"]
+        generation.update(
+            {
+                "model_name": "test-model",
+                "temperature": 1.0,
+                "top_k": 50,
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "vllm_kwargs": {},
+                "vllm_cfg": {"env_vars": None},
+            }
+        )
+        mc.policy["sampling_mask_replay"] = {"enabled": True}
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        fake_gym_actor = MagicMock(name="nemo_gym_actor")
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod,
+                "spinup_nemo_gym_actor",
+                return_value=fake_gym_actor,
+            ) as mock_spinup,
+        ):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert generation["vllm_kwargs"]["return_sampling_mask"] is True
+        assert generation["vllm_cfg"]["logprobs_mode"] == "processed_logprobs"
+        assert generation["vllm_cfg"]["env_vars"]["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+        assert mock_spinup.call_args.kwargs["enable_sampling_mask_replay"] is True
+        assert mock_spinup.call_args.kwargs["sampling_mask_top_k"] == 50
+        assert actor_args.tq_buffer._require_sampling_mask is True
+        warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs[
+            "fields"
+        ]
+        assert set(SAMPLING_MASK_FIELDS) <= set(warmup_fields)
+
+    def test_sampling_mask_replay_rejects_non_gym_path(self, patched_factories):
+        mc = _make_master_config(backend="vllm", megatron_enabled=True)
+        mc.policy["sampling_mask_replay"] = {"enabled": True}
+
+        with pytest.raises(ValueError, match="only by SingleController with NeMo Gym"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
 
     def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
         """Non-colocated vLLM records every per-phase field."""
