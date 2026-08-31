@@ -296,7 +296,9 @@ def maybe_prepare_physical_trace_training_batch(
         make_sequence_length_divisible_by=master_config.policy[
             "make_sequence_length_divisible_by"
         ],
-        require_generation_policy_version=True,
+        require_single_generation_policy_version=(
+            not master_config.grpo.async_grpo.enabled
+        ),
     )
     return PhysicalTraceTrainingBatch(
         prepared=prepared,

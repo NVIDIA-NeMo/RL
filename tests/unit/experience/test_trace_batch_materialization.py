@@ -90,6 +90,7 @@ def _prepare(
     mask_truncated: bool = False,
     divisible_by: int = 1,
     expected_rollouts_per_group: int = 1,
+    require_single_generation_policy_version: bool = True,
 ):
     rollout_count = len(bundles)
     physical_logs = logs or [_message_logs(bundle) for bundle in bundles]
@@ -139,7 +140,9 @@ def _prepare(
         pad_token_id=_PAD_TOKEN_ID,
         mask_truncated=mask_truncated,
         make_sequence_length_divisible_by=divisible_by,
-        require_generation_policy_version=True,
+        require_single_generation_policy_version=(
+            require_single_generation_policy_version
+        ),
     )
 
 
@@ -173,6 +176,59 @@ def test_duplicate_prompts_in_distinct_groups_are_allowed():
     )
 
     assert prepared.logical_rollout_count == 2
+
+
+def test_async_batch_allows_distinct_policy_versions_across_complete_groups():
+    older_group = _fixture(compacted=False)
+    newer_group = _fixture(compacted=True)
+    older_group["generation_policy_version"] = "async-policy-weight-00000003"
+    newer_group["generation_policy_version"] = "async-policy-weight-00000004"
+
+    prepared = _prepare(
+        [older_group, newer_group],
+        require_single_generation_policy_version=False,
+    )
+
+    assert prepared.logical_rollout_count == 2
+
+
+def test_sync_batch_rejects_distinct_policy_versions_across_groups():
+    older_group = _fixture(compacted=False)
+    newer_group = _fixture(compacted=True)
+    older_group["generation_policy_version"] = "sync-policy-step-00000003"
+    newer_group["generation_policy_version"] = "sync-policy-step-00000004"
+
+    with pytest.raises(ValueError, match="one generation policy version"):
+        _prepare([older_group, newer_group])
+
+
+def test_one_group_cannot_mix_generation_policy_versions():
+    first = _fixture(compacted=False)
+    second = deepcopy(first)
+    second["rollout_id"] = f"{first['rollout_id']}-replica"
+    for trace in second["physical_traces"]:
+        trace["trace_id"] = f"{trace['trace_id']}-replica"
+    first["generation_policy_version"] = "async-policy-weight-00000003"
+    second["generation_policy_version"] = "async-policy-weight-00000004"
+
+    with pytest.raises(ValueError, match="mixes generation policy versions"):
+        _prepare(
+            [first, second],
+            prompt_ids=torch.tensor([[1, 2, 3], [1, 2, 3]]),
+            expected_rollouts_per_group=2,
+            require_single_generation_policy_version=False,
+        )
+
+
+def test_physical_trace_rows_require_generation_policy_provenance():
+    bundle = _fixture(compacted=True)
+    bundle["generation_policy_version"] = None
+
+    with pytest.raises(ValueError, match="invalid policy provenance"):
+        _prepare(
+            [bundle],
+            require_single_generation_policy_version=False,
+        )
 
 
 def test_one_group_cannot_own_different_prompts():

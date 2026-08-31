@@ -70,6 +70,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.physical_trace_training import (
     PhysicalTraceTrainingBatch,
+    maybe_prepare_physical_trace_training_batch,
     physical_trace_batch_quantum,
     physical_trace_materialization_required,
     validate_physical_trace_training_config,
@@ -691,6 +692,51 @@ def test_physical_trace_training_config_accepts_async_replay():
     config.loss_fn.use_importance_sampling_correction = True
 
     validate_physical_trace_training_config(config)
+
+
+@pytest.mark.parametrize(
+    ("async_enabled", "require_single_version"),
+    [(False, True), (True, False)],
+    ids=["sync", "async"],
+)
+def test_physical_trace_policy_version_scope_matches_training_mode(
+    async_enabled, require_single_version
+):
+    config = _physical_trace_master_config()
+    config.grpo.async_grpo.enabled = async_enabled
+    if async_enabled:
+        config.loss_fn.use_importance_sampling_correction = True
+    prepared = MagicMock()
+
+    with (
+        patch(
+            "nemo_rl.algorithms.physical_trace_training.compute_logical_grpo_advantages",
+            return_value=torch.tensor([[0.0]]),
+        ),
+        patch(
+            "nemo_rl.algorithms.physical_trace_training.prepare_trace_batch",
+            return_value=prepared,
+        ) as prepare_trace_batch,
+    ):
+        result = maybe_prepare_physical_trace_training_batch(
+            {
+                "message_log": [[]],
+                "physical_message_logs": [[[], []]],
+            },
+            advantage_estimator=MagicMock(),
+            prompt_ids=torch.tensor([[1]]),
+            rewards=torch.tensor([1.0]),
+            policy=SimpleNamespace(data_parallel_size=1),
+            master_config=config,
+            pad_token_id=0,
+        )
+
+    assert result is not None
+    assert result.prepared is prepared
+    assert (
+        prepare_trace_batch.call_args.kwargs["require_single_generation_policy_version"]
+        is require_single_version
+    )
 
 
 @pytest.mark.parametrize(

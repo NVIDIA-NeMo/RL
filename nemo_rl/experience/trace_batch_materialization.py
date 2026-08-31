@@ -387,7 +387,7 @@ def prepare_trace_batch(
     pad_token_id: int,
     mask_truncated: bool,
     make_sequence_length_divisible_by: int,
-    require_generation_policy_version: bool,
+    require_single_generation_policy_version: bool,
 ) -> PreparedTraceBatch:
     """Validate logical ownership and materialize exact physical training rows."""
     expected_rollouts_per_group = _require_positive_int(
@@ -454,6 +454,7 @@ def prepare_trace_batch(
     )
     group_prompts: dict[str, torch.Tensor] = {}
     group_counts: dict[str, int] = {}
+    group_policy_versions: dict[str, str] = {}
     rollout_ids: set[str] = set()
     trace_ids: set[str] = set()
     generation_policy_versions: set[str] = set()
@@ -492,12 +493,18 @@ def prepare_trace_batch(
             )
         group_counts[group_id] = group_counts.get(group_id, 0) + 1
 
-        if policy_version is not None:
-            if not isinstance(policy_version, str) or not policy_version:
-                raise ValueError(
-                    f"Trace metadata {rollout_id!r} has invalid policy provenance"
-                )
-            generation_policy_versions.add(policy_version)
+        if not isinstance(policy_version, str) or not policy_version:
+            raise ValueError(
+                f"Trace metadata {rollout_id!r} has invalid policy provenance"
+            )
+        group_policy_version = group_policy_versions.setdefault(
+            group_id, policy_version
+        )
+        if group_policy_version != policy_version:
+            raise ValueError(
+                f"Comparison group {group_id!r} mixes generation policy versions"
+            )
+        generation_policy_versions.add(policy_version)
 
         rollout_reward = float(rewards[parent_index].item())
         advantage = float(logical_advantages[parent_index, 0].item())
@@ -552,7 +559,10 @@ def prepare_trace_batch(
             "Physical-trace comparison groups are incomplete: "
             f"expected={expected_rollouts_per_group}, observed={incomplete_groups!r}"
         )
-    if require_generation_policy_version and len(generation_policy_versions) != 1:
+    if (
+        require_single_generation_policy_version
+        and len(generation_policy_versions) != 1
+    ):
         raise ValueError(
             "One physical optimizer batch requires one generation policy version"
         )
