@@ -19,6 +19,7 @@ import zmq
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import RefitPayloadMode
+from nemo_rl.models.policy.deferred import DeferredTopkWorkerResult
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.telemetry.setup import shutdown_telemetry
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -39,6 +40,31 @@ class AbstractPolicyWorker:
         # Megatron overrides this whenever the distributed optimizer overlaps the
         # parameter all-gather (MXFP8 shared-buffer and plain BF16 alike).
         pass
+
+    def get_topk_logits(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[Any]:
+        """Return top-k logits from the concrete policy worker implementation."""
+        raise NotImplementedError
+
+    def get_topk_logits_deferred(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> DeferredTopkWorkerResult:
+        """Store top-k logits on the worker node and return only their reference."""
+        result = self.get_topk_logits(
+            data=data,
+            k=k,
+            micro_batch_size=micro_batch_size,
+        )
+        return DeferredTopkWorkerResult(payload_ref=ray.put(result))
 
     def init_collective(
         self,
