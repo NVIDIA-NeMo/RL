@@ -260,7 +260,9 @@ fi
 # To re-enable (e.g. if a future blend uses Lean4), explicitly set
 # SANDBOX_CONTAINER to the sandbox image path.
 # -----------------------------------------------------------------------------
-if [[ -z "${SANDBOX_CONTAINER:-}" ]]; then
+# Unset -> historical default; set-but-EMPTY -> sandbox sidecar disabled
+# (the dolphin blend never routes to the sandbox-backed servers, see above).
+if [[ -z "${SANDBOX_CONTAINER+x}" ]]; then
   : "${LUSTRE:?Set LUSTRE or provide SANDBOX_CONTAINER explicitly}"
   export SANDBOX_CONTAINER="${LUSTRE}/enroot-images/nvcr.io/nvidian/nemo-rl:skills-sandbox-latest.squashfs"
 else

@@ -44,7 +44,13 @@ source "${HERE}/swe_nano.secrets.env"
 
 # ---- container / shared read-only assets (proven by the ledger smokes) -------
 CONTAINER=/lustre/fsw/portfolios/llmservice/users/zhiyul/enroot-images/nvcr.io+nvidian+nemo-rl+nightly-gym.2026-08-10.squashfs
-SANDBOX_CONTAINER=/lustre/fsw/portfolios/coreai/users/cye/enroot/nemo-rl:skills-sandbox-latest.squashfs
+# Sandbox sidecar disabled: the shared skills-sandbox squashfs was deleted from
+# its owner's enroot dir on 2026-08-30 (killed jobs 6731069/6731305 at startup),
+# and the dolphin blend never routes to the two sandbox-backed Gym servers
+# (math_formal_lean, ns_tools) — see the "Sandbox process DISABLED" note in
+# nano35_dolphin_launch.sh. ray.sub skips all sandbox plumbing when this is
+# empty. Still overridable for a future blend that needs it.
+SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-}"
 HF_HUB_CACHE=/lustre/fsw/portfolios/llmservice/users/zhiyul/hf_cache/hub
 
 # ---- per-user write paths ----------------------------------------------------
