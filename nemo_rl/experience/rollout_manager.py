@@ -1870,6 +1870,7 @@ class RolloutManager:
                 receipts=receipts,
                 rewards=rewards,
                 fallback_weight_version=start_version,
+                prompt_idx=record.prompt_idx,
             )
             from nemo_rl.experience.finalizer_actor import assert_metadata_only
 
