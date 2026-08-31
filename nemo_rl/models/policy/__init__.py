@@ -376,8 +376,6 @@ class MegatronConfig(TypedDict):
     # Attention backend available values:
     # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/enums.py#L60
     attention_backend: NotRequired[str]
-    # FlashAttention major version (3 or 4). Required when batch_invariant_mode=True.
-    flash_attention_version: NotRequired[int]
     moe_per_layer_logging: bool
     # Set to true to enable DeepEP for expert parallel communication
     # Must set moe_token_dispatcher_type to 'flex'
@@ -488,15 +486,17 @@ class MegatronConfig(TypedDict):
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.
     freeze_config: NotRequired[dict[str, Any]]
-    # Use batch-invariant kernels (cuBLAS workspace shrink, FA num_splits=1, TE GEMM pin)
-    # for deterministic execution regardless of batch size. Required for zero-KL.
+    # Enable Megatron-Core's batch-invariant kernels for bitwise-identical
     batch_invariant_mode: NotRequired[bool]
-    # Master switch for zero train/gen KL with colocated generation.backend='megatron'.
-    # _apply_zero_train_gen_mismatch resolves it into batch_invariant_mode, eager MoE
-    # permute, transformer_engine generation, raw_logprobs, and chunked prefill off,
-    # overriding conflicting YAML with a warning. Seeds attention_backend=flash and
-    # flash_attention_version=4 when absent. enable_prefix_caching, router replay,
-    # moe_grouped_gemm and the CUDA graph knobs must be configured explicitly.
+    # Megatron-Core kernel backend used by batch_invariant_mode. "te_native"
+    # is the performant default; "triton" and "deepgemm" are legacy options.
+    batch_invariant_backend: NotRequired[Literal["deepgemm", "te_native", "triton"]]
+    # Cross-rank EP combine. "ordered" is portable; "multimem" uses NVLS.
+    batch_invariant_collective: NotRequired[Literal["multimem", "ordered"]]
+    # Pin the FlashAttention generation used by both training and inference.
+    # batch_invariant_mode requires version 3 or 4.
+    flash_attention_version: NotRequired[Literal[2, 3, 4] | None]
+    # flag to enable zero train/gen KL with generation.backend='megatron'.
     zero_train_gen_mismatch: NotRequired[bool]
 
 
