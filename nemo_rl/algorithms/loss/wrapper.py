@@ -21,6 +21,7 @@ import torch.distributed
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -30,8 +31,8 @@ class SequencePackingLossWrapper:
         self,
         loss_fn: LossFunction,
         prepare_fn: Callable[Any, Any],
-        cu_seqlens_q: Tensor,
-        cu_seqlens_q_padded: Optional[Tensor] = None,
+        cu_seqlens_q: CpuIntTuple,
+        cu_seqlens_q_padded: Optional[CpuIntTuple] = None,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -55,7 +56,9 @@ class SequencePackingLossWrapper:
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
         self.cu_seqlens_q = cu_seqlens_q
-        self.cu_seqlens_q_padded = cu_seqlens_q_padded
+        self.cu_seqlens_q_padded = (
+            cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
+        )
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
@@ -69,23 +72,19 @@ class SequencePackingLossWrapper:
     ) -> tuple[Tensor, dict[str, Any]]:
         """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid excessive padding."""
         unpadded_cu_seqlens = self.cu_seqlens_q
-        unpadded_seq_lengths = self.cu_seqlens_q[1:] - self.cu_seqlens_q[:-1]
-        if self.cu_seqlens_q_padded is not None:
-            padded_cu_seqlens = self.cu_seqlens_q_padded
-            padded_seq_lengths = (
-                self.cu_seqlens_q_padded[1:] - self.cu_seqlens_q_padded[:-1]
-            )
-        else:
-            padded_cu_seqlens = unpadded_cu_seqlens
-            padded_seq_lengths = unpadded_seq_lengths
+        unpadded_seq_lengths = tuple(
+            end - start
+            for start, end in zip(unpadded_cu_seqlens[:-1], unpadded_cu_seqlens[1:])
+        )
+        padded_cu_seqlens = self.cu_seqlens_q_padded
         seq_starts = padded_cu_seqlens[:-1]
         seq_ends = padded_cu_seqlens[1:]
 
         loss_accum = 0
         metrics_accum = {}
         for seq_idx in range(len(seq_starts)):
-            seq_start = seq_starts[seq_idx].item()
-            seq_end = seq_ends[seq_idx].item()
+            seq_start = seq_starts[seq_idx]
+            seq_end = seq_ends[seq_idx]
 
             # get sequence and unpad all 'data' tensors. The data dict is a BatchedDataDict of unpacked tensors
             seq_data = data.slice(seq_idx, seq_idx + 1)
@@ -111,14 +110,14 @@ class SequencePackingLossWrapper:
                 # Use slicing (clamped end) to avoid narrow() OOB on packed tails.
                 logit_start = seq_start // cp_size
                 logit_end = min(
-                    (seq_start + padded_seq_lengths[seq_idx]) // cp_size,
+                    seq_end // cp_size,
                     next_token_logits.shape[1],
                 )
                 logit_slice_idxs = slice(logit_start, logit_end)
                 next_token_logits_slice = next_token_logits[:, logit_slice_idxs]
             else:
                 logit_start = seq_start // cp_size
-                logit_end = (seq_start + padded_seq_lengths[seq_idx]) // cp_size
+                logit_end = seq_end // cp_size
                 logit_length = logit_end - logit_start
                 next_token_logits_slice = next_token_logits.narrow(
                     1, logit_start, logit_length
@@ -185,8 +184,8 @@ class SequencePackingFusionLossWrapper:
         self,
         loss_fn: LossFunction,
         prepare_fn: Callable[..., Any],
-        cu_seqlens_q: Tensor,
-        cu_seqlens_q_padded: Optional[Tensor] = None,
+        cu_seqlens_q: CpuIntTuple,
+        cu_seqlens_q_padded: Optional[CpuIntTuple] = None,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
