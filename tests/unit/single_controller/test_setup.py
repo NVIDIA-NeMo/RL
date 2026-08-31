@@ -765,6 +765,7 @@ class TestSetup:
         assert actor_args.tq_buffer._dp_client is actor_args.dp_client
         assert actor_args.partition_id == "rollout_data"
         assert actor_args.tq_buffer._partition_id == "rollout_data"
+        assert actor_args.tq_buffer._overlong_filtering is False
         assert actor_args.tq_buffer._require_routed_experts is False
         actor_args.dp_client.register_partition.assert_called_once()
         warmup = actor_args.dp_client.register_partition.call_args.kwargs
@@ -773,6 +774,14 @@ class TestSetup:
         assert "teacher_reference_logprobs" in warmup["fields"]
         assert warmup["num_samples"] == 16
         assert warmup["grpo_group_size"] == 2
+
+    def test_overlong_filtering_reaches_the_tq_payload_builder(self, patched_factories):
+        mc = _make_master_config()
+        mc.grpo.overlong_filtering = True
+
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.tq_buffer._overlong_filtering is True
 
     def test_reserves_topology_constrained_training_before_builds(
         self, patched_factories

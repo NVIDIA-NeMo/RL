@@ -77,6 +77,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
+    _clip_grpo_advantages,
     _write_latest_checkpoint_status,
     compute_and_apply_seq_logprob_error_masking,
 )
@@ -3275,6 +3276,15 @@ class SingleControllerActor:
             self._opd_stat_sum += float(valid.sum())
             self._opd_stat_sumsq += float((valid * valid).sum())
             self._opd_stat_count += int(valid.numel())
+
+        # Keep metrics aligned with the legacy paths: they record the estimated
+        # advantages above, then clamp the tensor consumed by policy training.
+        if not self._is_ppo:
+            assert self._master_config.grpo is not None
+            advantages = _clip_grpo_advantages(
+                advantages,
+                self._master_config.grpo,
+            )
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if seq_logprob_error_threshold is not None:

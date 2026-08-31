@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
@@ -38,6 +39,7 @@ def _completion(
     *,
     env_token_ids: tuple[int, ...] = (30,),
     with_routes: bool = True,
+    truncated: bool = False,
 ) -> Completion:
     message_log = [
         {
@@ -66,7 +68,7 @@ def _completion(
     return Completion(
         message_log=message_log,
         env_extras=None,
-        truncated=False,
+        truncated=truncated,
         reward=reward,
     )
 
@@ -103,6 +105,7 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
+        overlong_filtering=False,
     )
 
     expected_routes = [
@@ -150,6 +153,7 @@ def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
+        overlong_filtering=False,
     )
     assert "routed_experts" not in train_batch
 
@@ -160,6 +164,35 @@ def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
         prompt_idx=17,
     )
     assert "routed_experts" not in fields
+
+
+@pytest.mark.parametrize(
+    ("overlong_filtering", "expected_sample_mask"),
+    [
+        (False, [1.0, 1.0, 1.0]),
+        (True, [1.0, 0.0, 1.0]),
+    ],
+)
+def test_record_to_train_batch_masks_truncated_completions_when_enabled(
+    overlong_filtering: bool,
+    expected_sample_mask: list[float],
+) -> None:
+    record = _record(
+        [
+            _completion(route_start=10, reward=1.0),
+            _completion(route_start=30, reward=2.0, truncated=True),
+            _completion(route_start=50, reward=3.0),
+        ]
+    )
+
+    train_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        overlong_filtering=overlong_filtering,
+    )
+
+    assert train_batch["sample_mask"].dtype == torch.float32
+    assert train_batch["sample_mask"].tolist() == expected_sample_mask
 
 
 def _failed_completion() -> Completion:
@@ -185,6 +218,7 @@ def test_record_to_train_batch_backfills_routes_for_failed_completion() -> None:
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
+        overlong_filtering=False,
     )
 
     assert train_batch["input_lengths"].tolist() == [5, 2]
@@ -220,6 +254,7 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
     train_batch = record_to_train_batch(
         _record(completions),
         pad_value_dict={"token_ids": 0, "input_ids": 0},
+        overlong_filtering=False,
     )
     _, fields, tags = pack_payload(
         train_batch,

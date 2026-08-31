@@ -58,12 +58,14 @@ def record_to_train_batch(
     record: PromptGroupRecord,
     *,
     pad_value_dict: Mapping[str, int],
+    overlong_filtering: bool,
 ) -> BatchedDataDict[Any]:
     """Convert one prompt group's record into a packed BatchedDataDict of N rows.
 
     Args:
         record: Rollout's PromptGroupRecord with N completions to flatten into rows.
         pad_value_dict: Field-name → pad value used by batched_message_log_to_flat_message.
+        overlong_filtering: Whether truncated completions should be excluded from loss.
 
     Returns:
         BatchedDataDict with input_ids, input_lengths, generation_logprobs, token_mask,
@@ -108,6 +110,9 @@ def record_to_train_batch(
         [float(c.reward) for c in completions], dtype=torch.float32
     )
     sample_mask = torch.ones(n, dtype=torch.float32)
+    if overlong_filtering:
+        truncated = torch.tensor([c.truncated for c in completions], dtype=torch.bool)
+        sample_mask[truncated] = 0
 
     train_data: dict[str, Any] = {
         "input_ids": flat["token_ids"],
