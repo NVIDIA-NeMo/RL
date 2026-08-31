@@ -43,6 +43,7 @@ from nemo_rl.algorithms.x_token.loss_utils import LocalizedAlignment
 B, S = 3, 4
 # One live sample out of three. Everything below asserts on 1.0, not 3.
 LIVE_SAMPLE_MASK = torch.tensor([1.0, 0.0, 0.0])
+FRACTIONAL_SAMPLE_MASK = torch.tensor([0.25, 0.0, 0.75])
 ALL_MASKED = torch.zeros(B)
 
 
@@ -119,6 +120,10 @@ class TestMseValueLossFn:
         _, metrics = _value_call(ALL_MASKED)
         assert metrics["num_valid_samples"] == 0.0
 
+    def test_fractional_loss_weights_are_counted_not_summed(self):
+        _, metrics = _value_call(FRACTIONAL_SAMPLE_MASK)
+        assert metrics["num_valid_samples"] == 2.0
+
 
 class TestDistillationLossFn:
     def test_counts_the_mask_not_the_batch(self):
@@ -128,6 +133,10 @@ class TestDistillationLossFn:
     def test_a_fully_masked_microbatch_reports_zero(self):
         _, metrics = _distillation_call(ALL_MASKED)
         assert metrics["num_valid_samples"] == 0.0
+
+    def test_fractional_loss_weights_are_counted_not_summed(self):
+        _, metrics = _distillation_call(FRACTIONAL_SAMPLE_MASK)
+        assert metrics["num_valid_samples"] == 2.0
 
     def test_without_a_mask_every_sample_is_valid(self):
         """The unmasked branch has nothing to count, so the batch dimension is
@@ -152,6 +161,11 @@ class TestCrossTokenizerDistillationLossFn:
         ("sample_mask", "expected"),
         [
             pytest.param(LIVE_SAMPLE_MASK, 1.0, id="one-live-sample"),
+            pytest.param(
+                FRACTIONAL_SAMPLE_MASK,
+                2.0,
+                id="two-fractionally-weighted-samples",
+            ),
             pytest.param(ALL_MASKED, 0.0, id="all-masked"),
         ],
     )
