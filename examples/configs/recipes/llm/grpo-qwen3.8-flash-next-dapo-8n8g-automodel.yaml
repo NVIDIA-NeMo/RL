@@ -1,9 +1,9 @@
 defaults: ../../grpo_math_1B.yaml
 grpo:
-  num_prompts_per_step: 16
+  num_prompts_per_step: 32
   num_generations_per_prompt: 8
-  max_num_epochs: 10
-  max_num_steps: 100
+  max_num_epochs: 1000
+  max_num_steps: 10000
   use_leave_one_out_baseline: false
   val_period: 5
   val_at_start: false
@@ -34,6 +34,8 @@ policy:
   model_name: "path/to/qwen3.8-next-checkpoint"
   tokenizer:
     name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: false
   hf_config_overrides:
     language_model_only: true
     text_config:
@@ -58,8 +60,8 @@ policy:
       master_weights: true
       master_weight_dtype: torch.float32
       store_param_remainders: true
-      exp_avg_dtype: torch.float32
-      exp_avg_sq_dtype: torch.float32
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
     param_group_overrides:
     - pattern: '\.ple\.ple_embedding\.ngram_embedding\.weight$'
       lr_mult: 5.0
