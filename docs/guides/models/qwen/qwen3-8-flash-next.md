@@ -6,9 +6,11 @@ it to set up the environment, choose a starting recipe, and understand the
 settings that are specific to this model.
 
 > [!IMPORTANT]
-> **Early access.** Qwen3.8-Flash-Next 180B runs end-to-end in NeMo RL and short
-> GRPO runs have been numerically validated, but long-run convergence has not
-> been established.
+> **Early access.** Qwen3.8-Flash-Next 180B runs end-to-end in NeMo RL. The
+> documented 4k GRPO configuration has been numerically validated for 182
+> training steps and shows improving validation accuracy and reward. This is
+> limited convergence evidence at 4k context length; longer context lengths
+> have not yet been validated.
 
 ## Support Status
 
@@ -19,7 +21,8 @@ Model support is tracked in two stages:
 | **Functionally Ready** | Runnable end-to-end and numerically validated with an initial training run. |
 | **Long-Run Convergence Validated** | Trains stably over a full-length run with a healthy, reproducible reward curve. |
 
-Qwen3.8-Flash-Next 180B is **Functionally Ready**.
+Qwen3.8-Flash-Next 180B is **Functionally Ready**, with limited convergence
+evidence for the documented 4k configuration.
 
 ## What's Supported
 
@@ -160,10 +163,13 @@ The curves below show 182 training steps from the latest 4k GRPO experiment.
 Validation accuracy improves from 0.381 at step 5 to 0.696 at step 180, while
 training reward increases from -0.234 to 0.838 and mean generated tokens per
 sample decreases from about 2,000 to 1,226. These results extend functional
-validation; long-run convergence has not yet been established.
+validation and provide limited convergence evidence for the documented 4k
+configuration. Longer context lengths have not yet been validated.
 
 ![182-step 4k GRPO training curves for Qwen3.8-Flash-Next: validation accuracy, mean generated tokens per sample, approximate entropy, training loss, generation KL error, and reward](../../../assets/qwen3-8/qwen3.8-flash-next-4k-grpo-training-curves.png)
 
 ## Known Issues
 
-- **Long-run convergence is not validated.** Current evidence covers short runs only.
+- **Convergence validation is limited to the documented 4k configuration.**
+  Current evidence covers 182 training steps; longer context lengths have not
+  yet been validated.
