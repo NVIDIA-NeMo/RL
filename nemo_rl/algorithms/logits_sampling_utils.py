@@ -13,9 +13,14 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 import torch
+
+from nemo_rl.data_plane.schema import (
+    SAMPLING_MASK_SIZES_FIELD as SAMPLING_MASK_SIZES,
+    SAMPLING_MASK_TOKEN_IDS_FIELD as SAMPLING_MASK_TOKEN_IDS,
+)
 
 # Default chunk size for top-k/top-p filtering.
 # The sort operation in top-p filtering is memory intensive because it creates
@@ -24,6 +29,39 @@ import torch
 # this can cause OOM. Chunking along the sequence dimension reduces peak memory.
 # Different chunk sizes have minor performance differences.
 TOP_K_TOP_P_CHUNK_SIZE: int = 256
+
+
+@dataclass
+class SamplingMask:
+    """Compact token-aligned sampling support returned by rollout generation.
+
+    ``token_ids`` has shape ``[B, S, K]`` and ``sizes`` has shape ``[B, S]``.
+    Only the first ``sizes[b, s]`` entries of each support row are valid.
+    Prompt and padding rows use size zero.
+    """
+
+    token_ids: torch.Tensor
+    sizes: torch.Tensor
+
+
+def sampling_mask_from_data(data: Mapping[str, Any]) -> Optional[SamplingMask]:
+    """Read the paired sampling-mask tensors from a batch."""
+    has_token_ids = SAMPLING_MASK_TOKEN_IDS in data
+    has_sizes = SAMPLING_MASK_SIZES in data
+    if not has_token_ids and not has_sizes:
+        return None
+    if has_token_ids != has_sizes:
+        missing = SAMPLING_MASK_SIZES if has_token_ids else SAMPLING_MASK_TOKEN_IDS
+        raise ValueError(
+            "Sampling-mask replay metadata is incomplete: "
+            f"missing required field {missing!r}."
+        )
+
+    token_ids = data[SAMPLING_MASK_TOKEN_IDS]
+    sizes = data[SAMPLING_MASK_SIZES]
+    if not isinstance(token_ids, torch.Tensor) or not isinstance(sizes, torch.Tensor):
+        raise TypeError("Sampling-mask replay fields must both be tensors.")
+    return SamplingMask(token_ids=token_ids, sizes=sizes)
 
 
 @dataclass
@@ -37,11 +75,14 @@ class TrainingSamplingParams:
         top_k: Top-k filtering parameter (None or -1 to disable)
         top_p: Top-p filtering parameter (1.0 to disable)
         temperature: Temperature for scaling logits (default: 1.0)
+        replay_sampling_mask: Whether actor logprobs must use rollout-provided
+            sampling supports instead of reconstructing top-k/top-p supports.
     """
 
     top_k: int | None = None
     top_p: float = 1.0
     temperature: float = 1.0
+    replay_sampling_mask: bool = False
 
 
 def _need_top_k_filtering(top_k: int | None) -> bool:

@@ -45,7 +45,7 @@ import torch
 
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD, SAMPLING_MASK_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
@@ -80,12 +80,14 @@ def _flatten_rollout_message_log_for_tq(
         extract_initial_prompt_messages,
     )
     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+    from nemo_rl.experience.payload import backfill_missing_sampling_masks
     from nemo_rl.experience.rollouts import backfill_missing_routed_experts
 
     pad = {"pad_value_dict": {"token_ids": pad_token_id}}
     # Must precede the prompt extraction: it reuses the same message dicts, so
     # backfilling here also covers the prompt flatten below.
     backfill_missing_routed_experts(message_logs)
+    backfill_missing_sampling_masks(message_logs)
     prompt_message_logs = extract_initial_prompt_messages(
         message_logs,
         prompt_lengths,
@@ -303,6 +305,20 @@ class SyncRolloutActor:
                 "message-log flattening path."
             )
 
+        sampling_mask_replay_enabled = bool(
+            (cfg.policy.get("sampling_mask_replay") or {}).get("enabled", False)
+        )
+        sampling_fields_present = [field in flat for field in SAMPLING_MASK_FIELDS]
+        if any(sampling_fields_present) and not all(sampling_fields_present):
+            raise RuntimeError(
+                "The rollout bulk payload contains only one sampling-mask field."
+            )
+        if sampling_mask_replay_enabled and not all(sampling_fields_present):
+            raise RuntimeError(
+                "policy.sampling_mask_replay.enabled=true requires sampling-mask "
+                "metadata in the rollout bulk payload."
+            )
+
         # TQ bulk payload — DP_TRAIN_FIELDS + multimodal extras.
         bulk_batch = BatchedDataDict[Any](
             {
@@ -315,6 +331,9 @@ class SyncRolloutActor:
         )
         if ROUTED_EXPERTS_FIELD in flat:
             bulk_batch[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
+        for field in SAMPLING_MASK_FIELDS:
+            if field in flat:
+                bulk_batch[field] = flat[field]
         for k, v in flat.get_multimodal_dict(as_tensors=False).items():
             if isinstance(v, torch.Tensor):
                 bulk_batch[k] = v

@@ -835,10 +835,20 @@ class AsyncNemoGymRolloutImpl:
     def _validate_init_params(self) -> None:
         """Validate initialization parameters."""
         # Validate generation config.
-        for key in ["stop_strings", "stop_token_ids", "top_k"]:
+        for key in ["stop_strings", "stop_token_ids"]:
             assert not self._generation_config[key], (  # type: ignore
                 f"{key} is not supported in the generation config in NeMo-Gym path!"
             )
+        sampling_mask_enabled = bool(
+            self._generation_config.get("vllm_kwargs", {}).get(
+                "return_sampling_mask", False
+            )
+        )
+        top_k = self._generation_config["top_k"]
+        assert top_k is None or top_k <= 0 or sampling_mask_enabled, (
+            "top_k in the NeMo-Gym path requires sampling-mask replay so the "
+            "training policy can use the exact rollout action space."
+        )
 
         # Validate max_rollout_turns.
         assert self._max_rollout_turns == 1, (

@@ -35,6 +35,7 @@ from megatron.core.utils import StragglerDetector, get_model_config
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
+    sampling_mask_from_data,
 )
 from nemo_rl.algorithms.loss import (
     DraftLossWrapper,
@@ -634,6 +635,25 @@ class LogprobsPostProcessor:
             Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
         """
         unpacked_input_ids = data_dict["input_ids"]
+        sampling_mask = None
+        if (
+            self.sampling_params is not None
+            and self.sampling_params.replay_sampling_mask
+        ):
+            sampling_mask = sampling_mask_from_data(data_dict)
+            if sampling_mask is None:
+                raise ValueError(
+                    "Sampling-mask replay is enabled, but its fields are missing "
+                    "from the previous-logprob batch."
+                )
+            if (
+                self.use_fused_linear_logprobs
+                or self.cfg["sequence_packing"]["enabled"]
+            ):
+                raise NotImplementedError(
+                    "Sampling-mask replay requires unfused, unpacked Megatron "
+                    "logprob computation."
+                )
 
         def processor_fn_inner(output_tensor):
             if self.use_fused_linear_logprobs:
@@ -667,8 +687,14 @@ class LogprobsPostProcessor:
                     vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
                     tp_group=tp_grp,
                     inference_only=True,
+                    cp_group=(
+                        get_context_parallel_group()
+                        if sampling_mask is not None
+                        else None
+                    ),
                     chunk_size=logprob_chunk_size,
                     sampling_params=self.sampling_params,
+                    sampling_mask=sampling_mask,
                 )
 
             # Prepend 0 logprob for first token to maintain same sequence length as input
@@ -677,7 +703,9 @@ class LogprobsPostProcessor:
             )
 
             # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
-            if need_top_k_or_top_p_filtering(self.sampling_params):
+            if sampling_mask is None and need_top_k_or_top_p_filtering(
+                self.sampling_params
+            ):
                 mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
                 token_logprobs = mask_out_neg_inf_logprobs(
                     token_logprobs, mask, "prev_logprobs"

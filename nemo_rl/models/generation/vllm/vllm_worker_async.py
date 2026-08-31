@@ -45,6 +45,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 )
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
+    attach_sampling_masks_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
@@ -132,6 +133,12 @@ class VllmAsyncGenerationWorkerImpl(
         return bool(
             self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
         )
+
+    def _return_sampling_mask_enabled(self) -> bool:
+        engine_args = getattr(self, "llm_async_engine_args", None)
+        if bool(getattr(engine_args, "return_sampling_mask", False)):
+            return True
+        return bool(self.cfg.get("vllm_kwargs", {}).get("return_sampling_mask", False))
 
     def _reserve_port(self) -> None:
         """Bind and listen on a TCP socket to reserve a free port from the OS.
@@ -651,6 +658,12 @@ class VllmAsyncGenerationWorkerImpl(
                         routed_experts_dtype=worker_self.routed_experts_dtype,
                     )
 
+                if worker_self._return_sampling_mask_enabled():
+                    response = attach_sampling_masks_to_chat_response_choices(
+                        response,
+                        final_res,
+                    )
+
                 return response
 
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
@@ -736,12 +749,18 @@ class VllmAsyncGenerationWorkerImpl(
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
-            # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
-            # Right now we explicitly assert set this to -1.
-            assert request.top_k in (None, -1), (
-                f"Top k sampling parameter must be unset, empty, or -1. Got `{request.top_k}`"
+            # Responses API callers cannot express top-k. Pin it from NeMo-RL's
+            # generation config at this final server-side chokepoint instead.
+            expected_top_k = (
+                generation_config["top_k"]
+                if worker_self._return_sampling_mask_enabled()
+                else -1
             )
-            request.top_k = -1
+            assert request.top_k in (None, -1, expected_top_k), (
+                f"Request top_k={request.top_k} conflicts with NeMo-RL's "
+                f"configured top_k={expected_top_k}."
+            )
+            request.top_k = expected_top_k
 
             # The request sampling params need to exactly match those as are set in NeMo RL.
             # If they do not match, the inference will be off policy and destroy training

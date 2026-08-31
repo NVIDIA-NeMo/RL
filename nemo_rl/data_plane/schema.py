@@ -96,6 +96,12 @@ VALUE_SEED_FIELDS = LP_SEED_FIELDS
 DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS, "multi_modal_inputs")
 
 ROUTED_EXPERTS_FIELD = "routed_experts"
+SAMPLING_MASK_TOKEN_IDS_FIELD = "sampling_mask_token_ids"
+SAMPLING_MASK_SIZES_FIELD = "sampling_mask_sizes"
+SAMPLING_MASK_FIELDS = (
+    SAMPLING_MASK_TOKEN_IDS_FIELD,
+    SAMPLING_MASK_SIZES_FIELD,
+)
 
 # Per-sample 1D scalar fields. The TQ adapter promotes these to ``(N, 1)``
 # on write to work around TQ v0.1.9's KVStorageManager schema/data mismatch on
@@ -126,4 +132,18 @@ def fields_with_optional_routed_experts(
     out = list(fields)
     if enabled and ROUTED_EXPERTS_FIELD not in out:
         out.append(ROUTED_EXPERTS_FIELD)
+    return out
+
+
+def fields_with_optional_sampling_mask(
+    fields: Sequence[str],
+    *,
+    enabled: bool,
+) -> list[str]:
+    """Return ``fields`` plus the sampling-mask pair when replay is enabled."""
+    out = list(fields)
+    if enabled:
+        for field in SAMPLING_MASK_FIELDS:
+            if field not in out:
+                out.append(field)
     return out
