@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, fields
-from typing import Any, Dict, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -53,6 +53,11 @@ from nemo_rl.distributed.model_utils import (
     vocab_parallel_argmax,
 )
 from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.context_parallel import (
+        ContextParallelSharder,
+    )
 
 
 def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
@@ -1008,6 +1013,7 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     projection_matrix_paths: list[Optional[str]],
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
 ) -> tuple[
     torch.Tensor,
     Dict[int, torch.Tensor],
@@ -1032,6 +1038,8 @@ def prepare_xtoken_cross_tokenizer_loss_input(
         projection_matrix_paths: Per-teacher projection paths. Its length is the
             teacher count and drives the ``teacher_{i}_*`` / ``alignment_{i}_*``
             keys read here; a ``None`` entry marks a same-tokenizer teacher.
+        cp_sharder: Automodel's model-owned sequence layout. When provided, it
+            replaces the legacy load-balanced CP relayout for student tensors.
 
     Returns:
         ``(student_logits_contig, teacher_full_logits_by_idx, aligns_by_idx, tp_group, cp_group)``.
@@ -1039,25 +1047,64 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     if isinstance(logits, DTensor):
         mesh = logits.device_mesh
         mesh_names = mesh.mesh_dim_names or ()
-        cp_group = mesh.get_group("cp") if "cp" in mesh_names else None
         tp_group = mesh.get_group("tp") if "tp" in mesh_names else None
+        cp_group = (
+            context_parallel_group
+            if cp_sharder is not None
+            else (mesh.get_group("cp") if "cp" in mesh_names else None)
+        )
     else:
         cp_group = context_parallel_group
         tp_group = vocab_parallel_group
 
     device = torch.cuda.current_device()
 
-    # Student CP-relay computed once and shared by every teacher's KD term and
-    # the next-token-accuracy metric. Relaid from CP load-balanced to this rank's
-    # contiguous window; input_ids / token_mask stay unshifted (the accuracy
-    # metric and the same-vocab KD apply their own CP-aware next-token shift).
-    student_logits_contig = cp_load_balanced_to_contiguous(logits, cp_group=cp_group)
-    student_input_ids = cp_load_balanced_to_contiguous(
-        data["input_ids"], cp_group=cp_group
-    )
-    student_token_mask = cp_load_balanced_to_contiguous(
-        data["token_mask"], cp_group=cp_group
-    )
+    # Student CP relay is computed once and shared by every teacher's KD term.
+    # Automodel restores its own model layout before NeMo RL selects the
+    # contiguous IPC-consumer window. Legacy callers retain the existing
+    # load-balanced-to-contiguous conversion.
+    if cp_sharder is not None:
+        # Keep the student-logit autograd graph intact: to_local_if_dtensor()
+        # runs DTensor.to_local() under torch.no_grad(), which would detach the
+        # X-token KD loss from the student model for TP > 1.
+        local_logits = logits.to_local() if isinstance(logits, DTensor) else logits
+        full_student_logits = cp_sharder.gather_token_tensor(
+            local_logits, seq_dim=1, trim=True
+        )
+        cp_size = (
+            torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+        )
+        full_student_seq_len = full_student_logits.shape[1]
+        if full_student_seq_len % cp_size != 0:
+            raise ValueError(
+                "X-token student sequence length must be divisible by the student "
+                "context parallel size, but got "
+                f"sequence_length={full_student_seq_len}, cp_size={cp_size}. "
+                "Set policy.make_sequence_length_divisible_by to a multiple of "
+                "policy.dtensor_cfg.context_parallel_size."
+            )
+        cp_rank = torch.distributed.get_rank(cp_group) if cp_group is not None else 0
+        student_seq_len = full_student_seq_len // cp_size
+        student_seq_start = cp_rank * student_seq_len
+        student_logits_contig = full_student_logits.narrow(
+            1, student_seq_start, student_seq_len
+        ).contiguous()
+        student_input_ids = to_local_if_dtensor(data["input_ids"])[
+            :, student_seq_start : student_seq_start + student_seq_len
+        ].contiguous()
+        student_token_mask = to_local_if_dtensor(data["token_mask"])[
+            :, student_seq_start : student_seq_start + student_seq_len
+        ].contiguous()
+    else:
+        student_logits_contig = cp_load_balanced_to_contiguous(
+            logits, cp_group=cp_group
+        )
+        student_input_ids = cp_load_balanced_to_contiguous(
+            data["input_ids"], cp_group=cp_group
+        )
+        student_token_mask = cp_load_balanced_to_contiguous(
+            data["token_mask"], cp_group=cp_group
+        )
     sample_mask = to_local_if_dtensor(data["sample_mask"])
 
     teacher_full_logits_by_idx: Dict[int, torch.Tensor] = {}
@@ -1078,20 +1125,51 @@ def prepare_xtoken_cross_tokenizer_loss_input(
                 student_token_mask=student_token_mask,
             )
             continue
-        align = localize_alignment(
-            data,
-            teacher_seq_len=teacher_full_logits.shape[1],
-            alignment_prefix=f"alignment_{i}_",
-            cp_group=cp_group,
-        )
-        align.student_chunk_id = cp_shift_next(
-            cp_load_balanced_to_contiguous(align.student_chunk_id, cp_group=cp_group),
-            cp_group,
-            fill=-1,
-        )
-        align.teacher_chunk_id = cp_shift_next(
-            align.teacher_chunk_id, cp_group, fill=-1
-        )
+        alignment_prefix = f"alignment_{i}_"
+        if cp_sharder is not None:
+            student_chunk_id = to_local_if_dtensor(
+                data[f"{alignment_prefix}student_chunk_id"]
+            ).roll(shifts=-1, dims=1)
+            student_chunk_id[:, -1] = -1
+            student_chunk_id = student_chunk_id[
+                :, student_seq_start : student_seq_start + student_seq_len
+            ].contiguous()
+
+            teacher_chunk_id = to_local_if_dtensor(
+                data[f"{alignment_prefix}teacher_chunk_id"]
+            ).roll(shifts=-1, dims=1)
+            teacher_chunk_id[:, -1] = -1
+            teacher_seq_len = teacher_full_logits.shape[1]
+            teacher_seq_start = cp_rank * teacher_seq_len
+            teacher_chunk_id = teacher_chunk_id[
+                :, teacher_seq_start : teacher_seq_start + teacher_seq_len
+            ].contiguous()
+            align = LocalizedAlignment(
+                sample_mask=sample_mask,
+                student_chunk_id=student_chunk_id,
+                teacher_chunk_id=teacher_chunk_id,
+                pair_valid=to_local_if_dtensor(data[f"{alignment_prefix}pair_valid"]),
+                pair_is_correct=to_local_if_dtensor(
+                    data[f"{alignment_prefix}pair_is_correct"]
+                ),
+            )
+        else:
+            align = localize_alignment(
+                data,
+                teacher_seq_len=teacher_full_logits.shape[1],
+                alignment_prefix=alignment_prefix,
+                cp_group=cp_group,
+            )
+            align.student_chunk_id = cp_shift_next(
+                cp_load_balanced_to_contiguous(
+                    align.student_chunk_id, cp_group=cp_group
+                ),
+                cp_group,
+                fill=-1,
+            )
+            align.teacher_chunk_id = cp_shift_next(
+                align.teacher_chunk_id, cp_group, fill=-1
+            )
         align.student_input_ids = student_input_ids
         align.student_token_mask = student_token_mask
         aligns_by_idx[i] = align
