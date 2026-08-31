@@ -132,6 +132,8 @@ def _make_controller(
     ctrl._gen = SimpleNamespace(
         requires_kv_scale_sync=False,
         invalidate_kv_cache=MagicMock(),
+        pause_generation_for_refit=MagicMock(return_value=True),
+        resume_generation_after_refit=MagicMock(return_value=True),
         worker_group=SimpleNamespace(
             get_dp_leader_worker_idx=lambda shard: shard,
             workers=[
@@ -192,6 +194,15 @@ class TestDeathInsideTheCollective:
         asyncio.run(ctrl._sync_weights())
         assert sync.sync_calls == 2
         assert sync.absent_at_retry == [0]
+
+    def test_generation_stays_paused_across_the_recovery_retry(self):
+        ctrl, _, sync = _make_controller(ABORTED)
+
+        asyncio.run(ctrl._sync_weights())
+
+        assert sync.sync_calls == 2
+        ctrl._gen.pause_generation_for_refit.assert_called_once_with(clear_cache=False)
+        ctrl._gen.resume_generation_after_refit.assert_called_once_with()
 
     def test_survivors_are_pulled_from_service_then_given_back(self):
         """Partial weights must not serve -- and must not be stranded either.

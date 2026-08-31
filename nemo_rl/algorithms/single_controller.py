@@ -2983,17 +2983,20 @@ class SingleControllerActor:
         *,
         calibration_data: Optional[BatchedDataDict[Any]] = None,
     ) -> int:
-        """Pause new rollout dispatches, synchronize weights, resume.
+        """Pause rollout dispatch and generation, synchronize weights, resume.
 
-        SC owns the pause gate; in-flight generations continue through the
-        refit — vLLM V1 async engine supports weight updates during pending
-        requests.
+        SC owns the rollout-dispatch gate and asks every generation backend to
+        pause in-flight work through the common refit lifecycle hooks. Backends
+        without native pause support warn and retain their existing in-flight
+        update behavior. vLLM preserves request state while paused.
 
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
-          2. Optionally calibrate FP8 KV-cache scales.
-          3. weight_synchronizer.sync_weights(kv_scales=...)
-          4. _rollout_permitted.set()   — resume
+          2. Reconcile refit membership and optionally calibrate FP8 KV-cache scales.
+          3. generation.pause_generation_for_refit(clear_cache=...)
+          4. weight_synchronizer.sync_weights(kv_scales=...)
+          5. generation.resume_generation_after_refit()
+          6. _rollout_permitted.set()   — resume dispatch
 
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
@@ -3012,8 +3015,6 @@ class SingleControllerActor:
             if should_use_nemo_gym(self._master_config)
             else await self._abort_stale_inflight()
         )
-
-        # TODO(#2625): Add drain-gate support during refit.
 
         # Reconcile before the refit, not on a death event. The refit group is provably
         # idle here and every rank is synchronized, which is required because the
@@ -3046,6 +3047,24 @@ class SingleControllerActor:
         # set comparison in the common case -- it used to be a full rebuild on every call
         # once a shard was gone, because absent_shards() never empties again.
         await self._reconcile_refit_membership()
+
+        clear_cache = self._async_cfg.recompute_kv_cache_after_weight_updates
+        print("⏸️ Requesting generation pause before refit", flush=True)
+        generation_paused_for_refit = await asyncio.to_thread(
+            self._gen.pause_generation_for_refit,
+            clear_cache=clear_cache,
+        )
+        if generation_paused_for_refit:
+            print(
+                f"   {len(self._inflight_by_group_id)} in-flight rollout group(s) paused",
+                flush=True,
+            )
+        else:
+            print(
+                "   generation backend has no native pause support; "
+                "in-flight requests retain their existing refit behavior",
+                flush=True,
+            )
 
         try:
             await self._sync_weights_within(kv_scales, "first")
@@ -3088,11 +3107,22 @@ class SingleControllerActor:
             # promoted inside its window, and everything below this must still run on
             # both paths.
             self._promote_refit_shards()
-        if self._async_cfg.recompute_kv_cache_after_weight_updates:
+
+        print("▶️ Requesting generation resume after refit", flush=True)
+        generation_resumed_after_refit = await asyncio.to_thread(
+            self._gen.resume_generation_after_refit
+        )
+        if generation_paused_for_refit and not generation_resumed_after_refit:
+            raise RuntimeError(
+                "Failed to resume generation after a successful refit pause"
+            )
+
+        if clear_cache and not generation_paused_for_refit:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would
             # freeze the event loop itself -- taking the watchdog, which is an asyncio
-            # task on that same loop, down with it.
+            # task on that same loop, down with it. A backend that paused natively already
+            # received clear_cache=True at pause time, so invalidating again is redundant.
             await asyncio.to_thread(self._gen.invalidate_kv_cache)
         elapsed = time.monotonic() - t0
 

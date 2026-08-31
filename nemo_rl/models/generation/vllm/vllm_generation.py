@@ -1460,11 +1460,13 @@ class VllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
-        futures = self.worker_group.run_all_workers_single_data(
-            "pause_generation_async",
-            clear_cache=clear_cache,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
+        # Address surviving DP leaders directly. SingleController may have rebuilt the
+        # refit communicator after losing a shard; walking the whole worker group here
+        # would call the dead Ray actor and undo that recovery before the refit starts.
+        futures = [
+            worker.pause_generation_async.remote(clear_cache=clear_cache)
+            for worker in self._refit_leader_workers()
+        ]
         if not all(ray.get(futures)):
             raise RuntimeError("Failed to pause every async vLLM engine")
         return True
@@ -1478,10 +1480,10 @@ class VllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
-        futures = self.worker_group.run_all_workers_single_data(
-            "resume_generation_async",
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
+        futures = [
+            worker.resume_generation_async.remote()
+            for worker in self._refit_leader_workers()
+        ]
         if not all(ray.get(futures)):
             raise RuntimeError("Failed to resume every async vLLM engine")
         return True

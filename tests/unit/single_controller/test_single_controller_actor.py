@@ -432,13 +432,26 @@ class TestLookaheadSchedule:
 
 
 @pytest.mark.parametrize(
-    ("recompute_kv_cache", "expected_invalidation_calls"),
-    [(False, 0), (True, 1)],
+    (
+        "generation_pause_supported",
+        "recompute_kv_cache",
+        "expected_invalidation_calls",
+    ),
+    [
+        (True, False, 0),
+        (True, True, 0),
+        (False, False, 0),
+        (False, True, 1),
+    ],
 )
+@pytest.mark.parametrize("use_nemo_gym", [False, True])
 def test_sync_weights_honors_recompute_kv_cache_config(
+    generation_pause_supported: bool,
     recompute_kv_cache: bool,
     expected_invalidation_calls: int,
+    use_nemo_gym: bool,
 ) -> None:
+    events: list[str] = []
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._async_cfg = AsyncRLConfig(
@@ -449,21 +462,50 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     # No fleet health: _sync_weights reconciles refit membership first, and with no
     # monitor there is nothing to reconcile.
     ctrl._gen_fleet = None
-    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._weight_synchronizer = SimpleNamespace(
+        sync_weights=MagicMock(side_effect=lambda **_: events.append("sync"))
+    )
     ctrl._gen = SimpleNamespace(
-        invalidate_kv_cache=MagicMock(),
+        invalidate_kv_cache=MagicMock(side_effect=lambda: events.append("invalidate")),
+        pause_generation_for_refit=MagicMock(
+            side_effect=lambda **_: (
+                events.append("pause") or generation_pause_supported
+            )
+        ),
         requires_kv_scale_sync=False,
+        resume_generation_after_refit=MagicMock(
+            side_effect=lambda: (events.append("resume") or generation_pause_supported)
+        ),
     )
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
-    # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
-    # abort path (empty registry -> no-op) instead of the gym gate.
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={"should_use_nemo_gym": use_nemo_gym},
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {
+                    "async_engine": True,
+                    "expose_http_server": True,
+                },
+            }
+        },
+    )
 
     asyncio.run(ctrl._sync_weights())
 
     ctrl._weight_synchronizer.sync_weights.assert_called_once_with(kv_scales=None)
+    ctrl._gen.pause_generation_for_refit.assert_called_once_with(
+        clear_cache=recompute_kv_cache
+    )
+    ctrl._gen.resume_generation_after_refit.assert_called_once_with()
     assert ctrl._gen.invalidate_kv_cache.call_count == expected_invalidation_calls
+    assert events == [
+        "pause",
+        "sync",
+        "resume",
+        *(["invalidate"] if expected_invalidation_calls else []),
+    ]
     assert ctrl._rollout_permitted.is_set()
 
 
@@ -479,7 +521,9 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
+        pause_generation_for_refit=MagicMock(return_value=True),
         requires_kv_scale_sync=True,
+        resume_generation_after_refit=MagicMock(return_value=True),
     )
     ctrl._trainer = SimpleNamespace(
         calibrate_qkv_fp8_scales=MagicMock(return_value={"layers": {"layer.0": 0.5}})
@@ -505,6 +549,56 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._weight_synchronizer.sync_weights.assert_called_once_with(
         kv_scales={"layer.0": 0.5}
     )
+
+
+def test_sync_weights_keeps_dispatch_paused_when_generation_resume_fails() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig()
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._gen_fleet = None
+    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._gen = SimpleNamespace(
+        pause_generation_for_refit=MagicMock(return_value=True),
+        requires_kv_scale_sync=False,
+        resume_generation_after_refit=MagicMock(return_value=False),
+    )
+    ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
+    ctrl._master_config = SimpleNamespace(env={})
+
+    with pytest.raises(RuntimeError, match="successful refit pause"):
+        asyncio.run(ctrl._sync_weights())
+
+    ctrl._weight_synchronizer.sync_weights.assert_called_once_with(kv_scales=None)
+    assert not ctrl._rollout_permitted.is_set()
+
+
+def test_sync_weights_does_not_resume_generation_after_failed_refit() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig()
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._gen_fleet = None
+    ctrl._weight_synchronizer = SimpleNamespace(
+        sync_weights=MagicMock(side_effect=RuntimeError("refit failed"))
+    )
+    ctrl._gen = SimpleNamespace(
+        pause_generation_for_refit=MagicMock(return_value=True),
+        requires_kv_scale_sync=False,
+        resume_generation_after_refit=MagicMock(return_value=True),
+    )
+    ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
+    ctrl._master_config = SimpleNamespace(env={})
+
+    with pytest.raises(RuntimeError, match="refit failed"):
+        asyncio.run(ctrl._sync_weights())
+
+    ctrl._gen.resume_generation_after_refit.assert_not_called()
+    assert not ctrl._rollout_permitted.is_set()
 
 
 class _AdvantageDataPlane:

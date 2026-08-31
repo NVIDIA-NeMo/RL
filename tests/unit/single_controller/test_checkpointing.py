@@ -103,6 +103,20 @@ _PARTITION_ID = "rollout_data"
 # ── fakes ────────────────────────────────────────────────────────────────────
 
 
+class _FakeGeneration:
+    """Unsupported generation backend for checkpointing-only actor tests."""
+
+    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
+        del clear_cache
+        return False
+
+    def resume_generation_after_refit(self) -> bool:
+        return False
+
+    def invalidate_kv_cache(self) -> None:
+        pass
+
+
 class _FakeTrainer:
     """TQPolicy stand-in: train methods are no-ops, save_checkpoint records calls."""
 
@@ -541,7 +555,7 @@ def _make_actor_args(
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
-        gen_handle=object(),
+        gen_handle=_FakeGeneration(),
         trainer_handle=trainer if trainer is not None else _FakeTrainer(),
         env_handles={},
         train_cluster=None,  # type: ignore[arg-type]
