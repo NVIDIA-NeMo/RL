@@ -27,15 +27,14 @@ rm -rf "${EXP_DIR}"
 mkdir -p "${LOG_DIR}"
 git config --global --add safe.directory "${PROJECT_ROOT}"
 
-dynamo_venv_dir=${NEMO_RL_DYNAMO_VENV_DIR:-/opt/dynamo_venv}
-dynamo_python=${dynamo_venv_dir}/bin/python
+dynamo_python=/opt/dynamo_venv/bin/python
 "${dynamo_python}" -c \
   'import importlib.metadata as m; assert m.version("ai-dynamo") == "1.3.0.post1"; assert m.version("vllm") == "0.23.0"; assert m.version("nixl") == "1.1.0"; assert m.version("nixl-cu13") == "1.1.0"'
 grep -Fqx \
   'vllm PR #44814 merge commit c9e5bf813530fb9ce06024e075da0f520b0718c8' \
-  "${dynamo_venv_dir}/VLLM_BACKPORTS"
-"${dynamo_venv_dir}/bin/etcd" --version
-"${dynamo_venv_dir}/bin/nats-server" --version
+  /opt/dynamo_venv/VLLM_BACKPORTS
+/opt/dynamo_venv/bin/etcd --version
+/opt/dynamo_venv/bin/nats-server --version
 
 config_path=${DYNAMO_CONFIG_PATH:-${PROJECT_ROOT}/examples/configs/grpo_math_1B_dynamo.yaml}
 
@@ -54,8 +53,10 @@ if [[ "${DYNAMO_EXPECT_DISAGG:-0}" == "1" ]]; then
   grep -F "'--disaggregation-mode', 'decode'" "${RUN_LOG}"
   grep -F "'--disaggregation-mode', 'prefill'" "${RUN_LOG}"
   grep -F "'VLLM_NIXL_SIDE_CHANNEL_PORT':" "${RUN_LOG}"
-  grep -F "frontend ready with managed components {'backend': 1, 'prefill': 1}" \
-    "${RUN_LOG}"
+  component_ready_line=$(grep -F \
+    "frontend ready with managed components" "${RUN_LOG}")
+  grep -Fq "'backend': 1" <<< "${component_ready_line}"
+  grep -Fq "'prefill': 1" <<< "${component_ready_line}"
 fi
 
 grep -F "Performing policy generation refit" "${RUN_LOG}"
@@ -86,7 +87,7 @@ uv run --no-sync tests/check_metrics.py \
   "${metrics_json}" \
   'max(data["train/token_mult_prob_error"]) < 1.05'
 
-if pgrep -f "[d]ynamo.frontend|[d]ynamo.vllm|${dynamo_venv_dir}/bin/[e]tcd|${dynamo_venv_dir}/bin/[n]ats-server"; then
+if pgrep -f '[d]ynamo.frontend|[d]ynamo.vllm|[/]opt/dynamo_venv/bin/etcd|[/]opt/dynamo_venv/bin/nats-server'; then
   echo "Managed Dynamo processes remain after GRPO shutdown" >&2
   exit 1
 fi

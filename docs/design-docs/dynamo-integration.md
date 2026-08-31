@@ -19,11 +19,12 @@ have independent replica counts but share TP, PP, EP, and all other vLLM
 settings. Decode engines are ordered before prefill engines. This order is the
 fixed engine order for placement, membership checks, metrics, and refit ranks.
 
-Every P/D engine uses Dynamo's `NixlConnector`. NeMo RL owns each engine's
-NIXL host and side-channel port. Prefill engines also publish managed KV events
-for the router. Same-node transfer can use CUDA transport. Cross-node transfer
-requires a working NIXL UCX/RDMA path and is not qualified when it falls back
-to TCP.
+Every P/D engine uses vLLM's `NixlConnector`. NeMo RL owns each engine's NIXL
+host and side-channel port. Prefill engines also receive managed KV-event
+configuration for the router. Dynamo disables these events when vLLM prefix
+caching is disabled because there are no cached prefixes to reuse. Same-node
+transfer can use CUDA transport. Cross-node transfer requires a working NIXL
+UCX/RDMA path and is not qualified when it falls back to TCP.
 
 Startup completes only after the frontend sees the same fixed membership at
 the generation and RL endpoints for both the `backend` and `prefill`

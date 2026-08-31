@@ -316,18 +316,28 @@ class DynamoConfig(BaseModel, extra="allow"):
             resources = (
                 colocated.get("resources") if isinstance(colocated, dict) else None
             )
-            if isinstance(resources, dict):
-                gpus_per_node = resources.get("gpus_per_node")
-                num_nodes = resources.get("num_nodes")
-                if gpus_per_node is not None and num_nodes is not None:
-                    configured_gpus = int(gpus_per_node) * int(num_nodes)
-                    expected_gpus = self.managed_inference_world_size
-                    if configured_gpus != expected_gpus:
-                        raise ValueError(
-                            "Dynamo disaggregation requires inference GPUs to equal "
-                            "(prefill_workers + decode_workers) * TP * PP: "
-                            f"configured={configured_gpus}, expected={expected_gpus}"
-                        )
+            if not isinstance(resources, dict):
+                raise ValueError(
+                    "Dynamo disaggregation requires "
+                    "policy.generation.colocated.resources to be set"
+                )
+            gpus_per_node = resources.get("gpus_per_node")
+            if gpus_per_node is None:
+                raise ValueError(
+                    "Dynamo disaggregation requires an explicit "
+                    "policy.generation.colocated.resources.gpus_per_node"
+                )
+            num_nodes = resources.get("num_nodes")
+            configured_gpus = int(gpus_per_node) * int(
+                1 if num_nodes is None else num_nodes
+            )
+            expected_gpus = self.managed_inference_world_size
+            if configured_gpus != expected_gpus:
+                raise ValueError(
+                    "Dynamo disaggregation requires inference GPUs to equal "
+                    "(prefill_workers + decode_workers) * TP * PP: "
+                    f"configured={configured_gpus}, expected={expected_gpus}"
+                )
         if extra.get("refit_transport") is not None:
             raise ValueError(
                 "policy.generation.refit_transport must be null when "

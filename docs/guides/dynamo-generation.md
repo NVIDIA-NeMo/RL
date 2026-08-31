@@ -133,6 +133,8 @@ engines. This gives every engine a stable NCCL refit rank.
 NeMo RL manages `--disaggregation-mode`, the NIXL connector, NIXL side-channel
 ports, and prefill KV-event ports. Do not set these values in
 `worker_args.extra_cli_args`, `vllm_kwargs`, or `vllm_cfg.env_vars`.
+When vLLM prefix caching is disabled, Dynamo does not publish KV events because
+there are no cached prefixes to reuse.
 
 NIXL moves KV-cache data from prefill to decode. NCCL moves model weights from
 training to every prefill and decode engine. Both roles receive each refit and
@@ -220,11 +222,20 @@ printf -v COMMAND '%q ' \
   /opt/nemo_rl_venv/bin/python -u "$PWD/examples/run_grpo.py" \
   --config "$PWD/examples/configs/grpo_math_1B_dynamo_disagg.yaml"
 export COMMAND
+
+sbatch \
+  --nodes=1 \
+  --gres=gpu:3 \
+  --exclusive \
+  --account=<account> \
+  --partition=<partition> \
+  ray.sub
 ```
 
 This assigns one GPU to training, one to a TP1 decode engine, and one to a TP1
 prefill engine. The existing Dynamo L1 job runs both the aggregated and P/D
-smokes.
+smokes. These tests verify function only. They do not measure or claim
+performance.
 
 ## Run SWE1 with W&B
 
