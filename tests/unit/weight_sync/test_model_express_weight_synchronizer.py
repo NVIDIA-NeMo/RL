@@ -97,7 +97,10 @@ def test_retry_after_failed_transfer_uses_fresh_idempotency_key():
     sync.sync_weights()
 
     first, second = control.create_weight_version.call_args_list
-    assert first.kwargs["version_number"] == second.kwargs["version_number"] == 1
+    assert "version_number" not in first.kwargs
+    assert "version_number" not in second.kwargs
+    assert first.kwargs["idempotency_key"].split(":")[1] == "1"
+    assert second.kwargs["idempotency_key"].split(":")[1] == "1"
     assert first.kwargs["idempotency_key"] != second.kwargs["idempotency_key"]
     assert sync.is_stale is False
 

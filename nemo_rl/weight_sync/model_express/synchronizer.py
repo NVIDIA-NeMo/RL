@@ -52,7 +52,7 @@ class ModelExpressWeightSynchronizer(WeightSynchronizer):
         self._server_url = server_url
         self._model_name = generation.cfg["model_name"]
         self._run_id = uuid.uuid4().hex[:8]
-        self._next_version_number = 1
+        self._next_sync_number = 1
         self._next_attempt_number = 1
         self._source_slots: list[str] | None = None
         self._stale = True
@@ -75,12 +75,11 @@ class ModelExpressWeightSynchronizer(WeightSynchronizer):
 
     def _create_weight_version(self) -> Any:
         assert self._source_slots is not None
-        version_number = self._next_version_number
+        sync_number = self._next_sync_number
         version = self._control.create_weight_version(
             model_name=self._model_name,
-            version_number=version_number,
             idempotency_key=(
-                f"{self._run_id}:{version_number}:{self._next_attempt_number}"
+                f"{self._run_id}:{sync_number}:{self._next_attempt_number}"
             ),
             payload_format=self._payload_format,
             expected_source_slots=self._source_slots,
@@ -123,7 +122,7 @@ class ModelExpressWeightSynchronizer(WeightSynchronizer):
                 self._control.delete_weight_version(version.version_id)
                 self._policy.release_model_express_version(version.ref)
 
-        self._next_version_number += 1
+        self._next_sync_number += 1
         self._stale = False
 
     def shutdown(self) -> None:

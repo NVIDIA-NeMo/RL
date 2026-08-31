@@ -483,12 +483,11 @@ class BaseVllmGenerationWorker:
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
         checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
-        if checkpoint_engine_config is not None:
-            from nemo_rl.models.generation.vllm.checkpoint_engine import (
-                configure_nixl_worker,
-            )
+        from nemo_rl.models.generation.vllm.checkpoint_engine import (
+            configure_nixl_worker,
+        )
 
-            configure_nixl_worker(self.cfg, vllm_kwargs)
+        configure_nixl_worker(self.cfg, vllm_kwargs)
 
         # A speculative_config with num_speculative_tokens == 0 is the supported
         # way to disable speculative decoding (e.g. MTP) from a launch script

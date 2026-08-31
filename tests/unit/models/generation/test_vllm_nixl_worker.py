@@ -25,19 +25,10 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 )
 
 
-def _nixl_config() -> dict:
+def _nixl_preinit_config() -> dict:
     return {
-        "backend": "nixl",
-        "update_weights_bucket_memory_ratio": 0.05,
-        "engine_kwargs": {
-            "nixl": {
-                "device": "cuda",
-                "backend_name": "UCX",
-                "backend_init_params": {"foo": "bar"},
-                "release_after_refit": False,
-                "shard_expert_weights": False,
-            }
-        },
+        "backend_name": "UCX",
+        "backend_init_params": {"foo": "bar"},
     }
 
 
@@ -60,13 +51,13 @@ def test_configure_nixl_worker_ignores_other_configs(generation_config):
     assert vllm_kwargs == {"additional_config": {"existing": True}}
 
 
-def test_configure_nixl_worker_uses_vllm_extension_points():
-    checkpoint_config = _nixl_config()
+@pytest.mark.parametrize("transport", ["nixl", "model_express"])
+def test_configure_nixl_worker_uses_vllm_extension_points(transport):
     vllm_kwargs = {"additional_config": {"existing": True}}
 
     configure_nixl_worker(
         {
-            "refit_transport": "nixl",
+            "refit_transport": transport,
             "refit_cfg": {
                 "nixl": {
                     "backend_name": "UCX",
@@ -80,7 +71,7 @@ def test_configure_nixl_worker_uses_vllm_extension_points():
     assert vllm_kwargs["worker_cls"] == NIXL_VLLM_WORKER
     assert vllm_kwargs["additional_config"] == {
         "existing": True,
-        "nemo_rl_checkpoint_engine": checkpoint_config,
+        "nemo_rl_nixl_preinit": _nixl_preinit_config(),
     }
 
 
@@ -103,7 +94,7 @@ def test_preinit_nixl_from_vllm_config_uses_configured_backend(monkeypatch):
         lambda **kwargs: calls.append(kwargs) or agent,
     )
     config = SimpleNamespace(
-        additional_config={"nemo_rl_checkpoint_engine": _nixl_config()}
+        additional_config={"nemo_rl_nixl_preinit": _nixl_preinit_config()}
     )
 
     assert preinit_nixl_from_vllm_config(config) is agent

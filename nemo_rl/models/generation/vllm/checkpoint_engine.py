@@ -18,45 +18,49 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    normalize_vllm_refit_config,
+)
 from nemo_rl.models.generation.vllm.refit_loader import (
     VllmShardedExpertRefitMixin,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-from nemo_rl.weight_sync.checkpoint_engine_config import (
-    checkpoint_engine_refit_config,
-)
 
 if TYPE_CHECKING:
     from nemo_rl.utils.checkpoint_engines.base import CheckpointEngine
 
 
 NIXL_VLLM_WORKER = "nemo_rl.models.generation.vllm.vllm_backend.NixlVllmWorker"
-_NIXL_CONFIG_KEY = "nemo_rl_checkpoint_engine"
+_NIXL_CONFIG_KEY = "nemo_rl_nixl_preinit"
 
 
 def configure_nixl_worker(config: VllmConfig, vllm_kwargs: dict[str, Any]) -> None:
     """Configure vLLM's worker hook for early NIXL initialization."""
-    checkpoint_config = checkpoint_engine_refit_config(config)
-    if checkpoint_config is None or checkpoint_config["backend"] != "nixl":
+    if config.get("refit_transport") not in {"nixl", "model_express"}:
         return
+    refit_config = normalize_vllm_refit_config(config)
+    assert refit_config is not None
 
     worker_cls = vllm_kwargs.setdefault("worker_cls", NIXL_VLLM_WORKER)
     if worker_cls != NIXL_VLLM_WORKER:
         raise ValueError(
-            "NIXL checkpoint-engine refit requires vllm_kwargs.worker_cls to "
+            "NIXL-backed refit requires vllm_kwargs.worker_cls to "
             f"be unset or {NIXL_VLLM_WORKER}."
         )
 
     additional_config = dict(vllm_kwargs.get("additional_config") or {})
-    additional_config[_NIXL_CONFIG_KEY] = checkpoint_config
+    additional_config[_NIXL_CONFIG_KEY] = {
+        "backend_name": refit_config.nixl.backend_name,
+        "backend_init_params": refit_config.nixl.backend_init_params,
+    }
     vllm_kwargs["additional_config"] = additional_config
 
 
 def preinit_nixl_from_vllm_config(vllm_config: Any) -> Any:
     """Create the NIXL preinit agent carried by a vLLM internal worker."""
-    checkpoint_config = vllm_config.additional_config.get(_NIXL_CONFIG_KEY)
-    if checkpoint_config is None:
+    preinit_config = vllm_config.additional_config.get(_NIXL_CONFIG_KEY)
+    if preinit_config is None:
         return None
 
     from nemo_rl.utils.checkpoint_engines.nixl import (
@@ -64,9 +68,7 @@ def preinit_nixl_from_vllm_config(vllm_config: Any) -> Any:
         resolve_nixl_backend_kwargs,
     )
 
-    backend_name, backend_init_params = resolve_nixl_backend_kwargs(
-        checkpoint_config["engine_kwargs"]["nixl"]
-    )
+    backend_name, backend_init_params = resolve_nixl_backend_kwargs(preinit_config)
     return preinit_nixl_agent(
         backend_name=backend_name, backend_init_params=backend_init_params
     )
