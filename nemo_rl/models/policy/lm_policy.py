@@ -817,6 +817,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "check_dim_skip_keys": check_dim_skip_keys,
                 },
             )
+        # ``run_all_workers_sharded_data`` has serialized each replicated DP
+        # shard into Ray and submitted every worker task.  Do not retain the
+        # original Python shards for the duration of the optimizer step: for
+        # long padded batches they form another complete train payload on the
+        # driver in addition to the Ray object-store copies.
+        del sharded_data
         results = self.worker_group.get_all_worker_results(futures)
 
         # Aggregate the results
