@@ -2808,8 +2808,8 @@ class TestBatchInvariantMode:
 
         enable_mcore.assert_not_called()
 
-    def test_supports_matching_tensor_parallelism(self):
-        """Batch-invariant logprobs support TP>1 when generation uses the same TP."""
+    def test_rejects_tensor_parallelism_above_one(self):
+        """TP>1 is out of scope for the current batch-invariant path."""
         from nemo_rl.models.megatron.setup import enable_batch_invariant_mode
 
         config = self._config()
@@ -2817,6 +2817,44 @@ class TestBatchInvariantMode:
         config["generation"]["mcore_generation_config"][
             "tensor_model_parallel_size"
         ] = 2
+
+        with pytest.raises(ValueError, match="tensor_model_parallel_size=1"):
+            enable_batch_invariant_mode(config)
+
+    def test_rejects_mismatched_tensor_parallelism(self):
+        """Generation TP must still match training when both are set."""
+        from nemo_rl.models.megatron.setup import enable_batch_invariant_mode
+
+        config = self._config()
+        config["generation"]["mcore_generation_config"][
+            "tensor_model_parallel_size"
+        ] = 2
+
+        with pytest.raises(ValueError, match="tensor_model_parallel_size"):
+            enable_batch_invariant_mode(config)
+
+    def test_inference_optimized_requires_bfloat16(self):
+        """BF16 is required for inference_optimized BI, not TE-only recipes."""
+        from nemo_rl.models.megatron.setup import enable_batch_invariant_mode
+
+        config = self._config()
+        config["precision"] = "float16"
+        config["generation"]["mcore_generation_config"][
+            "transformer_impl"
+        ] = "inference_optimized"
+
+        with pytest.raises(ValueError, match="inference_optimized"):
+            enable_batch_invariant_mode(config)
+
+    def test_transformer_engine_allows_non_bf16_policy_precision(self):
+        """TE BI does not gate on policy.precision (MCore checks params_dtype)."""
+        from nemo_rl.models.megatron.setup import enable_batch_invariant_mode
+
+        config = self._config()
+        config["precision"] = "float16"
+        config["generation"]["mcore_generation_config"][
+            "transformer_impl"
+        ] = "transformer_engine"
 
         support_check = (
             "megatron.core.transformer.custom_layers.batch_invariant_kernels."
@@ -2860,19 +2898,6 @@ class TestBatchInvariantMode:
             enable_batch_invariant_mode(config)
 
         enable_mcore.assert_called_once_with(backend="te_native", collective="ordered")
-
-    def test_rejects_mismatched_tensor_parallelism(self):
-        """TP degree may be greater than one but must match across both models."""
-        from nemo_rl.models.megatron.setup import enable_batch_invariant_mode
-
-        config = self._config()
-        config["megatron_cfg"]["tensor_model_parallel_size"] = 2
-        config["generation"]["mcore_generation_config"][
-            "tensor_model_parallel_size"
-        ] = 4
-
-        with pytest.raises(ValueError, match="tensor_model_parallel_size"):
-            enable_batch_invariant_mode(config)
 
     @pytest.mark.parametrize(
         ("section", "field", "value", "error"),
@@ -4325,8 +4350,8 @@ def test_zero_train_gen_mismatch_preserves_generation_transformer_impl():
     assert config["megatron_cfg"]["batch_invariant_collective"] == "ordered"
 
 
-def test_zero_train_gen_mismatch_rejects_conflicting_knobs():
-    """Conflicting zero-KL knobs for permute/chunked prefill are rejected."""
+def test_zero_train_gen_mismatch_warns_on_conflicting_knobs():
+    """Conflicting zero-KL knobs are overridden with a warning."""
     from nemo_rl.models.megatron.setup import enable_zero_train_gen_kl
 
     config = _zero_kl_config(
@@ -4335,15 +4360,14 @@ def test_zero_train_gen_mismatch_rejects_conflicting_knobs():
     )
 
     with _stub_zero_kl_patches():
-        with pytest.raises(ValueError, match="moe_permute_fusion"):
+        with pytest.warns(UserWarning, match="moe_permute_fusion|enable_chunked_prefill"):
             enable_zero_train_gen_kl(config)
 
-    config = _zero_kl_config(
-        mcore_generation_config={"enable_chunked_prefill": True},
+    assert config["megatron_cfg"]["moe_permute_fusion"] is False
+    assert (
+        config["generation"]["mcore_generation_config"]["enable_chunked_prefill"]
+        is False
     )
-    with _stub_zero_kl_patches():
-        with pytest.raises(ValueError, match="enable_chunked_prefill"):
-            enable_zero_train_gen_kl(config)
 
 
 def test_zero_train_gen_mismatch_enables_batch_invariant_mode():
@@ -4371,3 +4395,41 @@ def test_zero_train_gen_mismatch_allows_noncolocated_generation():
 
     assert config["generation"]["colocated"]["enabled"] is False
     assert config["megatron_cfg"]["batch_invariant_mode"] is True
+
+
+def test_skip_megatron_moe_bi_fp8_assert_allows_te_path(monkeypatch):
+    """TE MoE+BI+FP8 skips Megatron's bf16-only gate; infopt keeps it."""
+    from types import SimpleNamespace
+
+    from nemo_rl.models.megatron import setup as megatron_setup
+
+    def raise_bf16_only(self):
+        raise AssertionError(
+            "Batch-invariant MoE is bf16-only. Disable fp8/fp4 to use it."
+        )
+
+    megatron_setup._MOE_BI_FP8_ASSERT_SKIPPED = False
+    monkeypatch.setattr(megatron_setup.TransformerConfig, "__post_init__", raise_bf16_only)
+    megatron_setup._skip_megatron_moe_bi_fp8_assert()
+    patched = megatron_setup.TransformerConfig.__post_init__
+
+    te_cfg = SimpleNamespace(
+        transformer_impl="transformer_engine",
+        moe_permute_fusion=False,
+        moe_permute_fusion_into_hybridep=False,
+        moe_pad_expert_input_to_capacity=False,
+        moe_pad_experts_for_cuda_graph_inference=False,
+        sequence_packing_scheduler=None,
+    )
+    patched(te_cfg)  # does not raise
+
+    infopt_cfg = SimpleNamespace(
+        transformer_impl="inference_optimized",
+        moe_permute_fusion=False,
+        moe_permute_fusion_into_hybridep=False,
+        moe_pad_expert_input_to_capacity=False,
+        moe_pad_experts_for_cuda_graph_inference=False,
+        sequence_packing_scheduler=None,
+    )
+    with pytest.raises(AssertionError, match="bf16-only"):
+        patched(infopt_cfg)

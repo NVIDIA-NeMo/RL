@@ -12,6 +12,9 @@ policy:
     zero_train_gen_mismatch: true
     moe_permute_fusion: false
     cuda_graph_impl: none
+    fp8_cfg:
+      enabled: true
+      fp8_recipe: mxfp8
   generation:
     backend: megatron
     colocated:
@@ -19,6 +22,3 @@ policy:
     mcore_generation_config:
       use_cuda_graphs_for_non_decode_steps: false
       enable_chunked_prefill: false
-      fp8_cfg:
-        enabled: true
-        fp8_recipe: mxfp8
