@@ -806,6 +806,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "shaping. Disable them."
         )
 
+    async_config = master_config.async_rl
     generation_config = master_config.policy["generation"]
     if generation_config["colocated"]["enabled"]:
         if generation_config["backend"] != "megatron":
@@ -818,16 +819,13 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "supported only with backend='megatron', which shares the "
                 "training policy's worker group."
             )
-        if master_config.async_rl.max_buffered_rollouts < algo_cfg.num_prompts_per_step:
+        if async_config.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step:
             raise ValueError(
-                f"async_rl.max_buffered_rollouts "
-                f"({master_config.async_rl.max_buffered_rollouts}) must be >= "
-                f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) for "
-                "colocated megatron generation: the buffer must be able to "
-                "hold a full step before the trainer takes the GPUs."
+                "colocated megatron generation requires async_rl.min_groups_for_streaming_train "
+                f"({async_config.min_groups_for_streaming_train}) == "
+                f"num_prompts_per_step ({algo_cfg.num_prompts_per_step})."
             )
 
-    async_config = master_config.async_rl
     # Capacity is sized from the peak window whatever the algorithm, so an inert
     # setting still costs buffer and fails setup naming the wrong cause.
     if (

@@ -349,7 +349,9 @@ def test_train_pump_drives_mcore_training_step(
         )
 
         actor_args = SingleControllerActorArgs(
-            gen_handle=None,
+            # Continuous-serving stub: the pump asks blocks_training() before
+            # every step's trainer GPU work.
+            gen_handle=SimpleNamespace(blocks_training=lambda: False),  # type: ignore[arg-type]
             trainer_handle=trainer,
             env_handles={},
             train_cluster=None,  # type: ignore[arg-type]

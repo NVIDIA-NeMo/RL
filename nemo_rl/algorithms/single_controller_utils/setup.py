@@ -1239,7 +1239,7 @@ def setup_single_controller(
                 reserved_http_server_port,
                 megatron_port_holder,
             ) = MegatronGeneration.reserve_http_server_address(
-                train_cluster if colocated else inference_cluster,
+                inference_cluster,
                 master_config.policy,
             )
             gen_reserve_time = time.perf_counter() - t0

@@ -757,7 +757,11 @@ class TestSetup:
             ("megatron_dtensor_trainer", ValueError, "megatron_cfg.enabled"),
             ("megatron_recompute_mismatch", ValueError, "kv_cache_management_mode"),
             ("megatron_fleet_health", NotImplementedError, "generation_fleet_health"),
-            ("megatron_colocated_small_buffer", ValueError, "max_buffered_rollouts"),
+            (
+                "megatron_colocated_min_groups",
+                ValueError,
+                "min_groups_for_streaming_train",
+            ),
             ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
         ],
     )
@@ -793,11 +797,15 @@ class TestSetup:
                 colocated=False, backend="megatron", megatron_enabled=True
             )
             mc.async_rl.generation_fleet_health.enabled = True
-        elif invalid_case == "megatron_colocated_small_buffer":
+        elif invalid_case == "megatron_colocated_min_groups":
+            # The colocated engine stands down once per step, so streaming
+            # below a whole batch is rejected at setup.
             mc = _make_master_config(
                 colocated=True, backend="megatron", megatron_enabled=True
             )
-            mc.async_rl.max_buffered_rollouts = mc.grpo.num_prompts_per_step - 1
+            mc.async_rl.min_groups_for_streaming_train = (
+                mc.grpo.num_prompts_per_step - 1
+            )
         elif invalid_case == "gym_on_sglang":
             mc = _make_master_config(colocated=False, backend="sglang")
         else:  # pragma: no cover
@@ -1314,7 +1322,7 @@ class TestSetup:
         no port holder is created, the cross-check is skipped, and the initial
         refit is left to the actor.
         colocated: rank 0 lives with the trainer — the reservation targets the
-        train cluster, the reserved port rides the trainer build, and the
+        shared cluster, the reserved port rides the trainer build, and the
         engine wraps the trainer's policy instead of a dedicated cluster.
         """
         gym = scenario != "native"
@@ -1392,14 +1400,16 @@ class TestSetup:
                 with pytest.raises(RuntimeError, match=error_match):
                     setup_single_controller(mc, tokenizer)
 
-        train_cluster = patched_factories["_build_clusters"].return_value[0]
         inference_cluster = patched_factories["_build_clusters"].return_value[1]
         assert mc.policy["generation"]["model_name"] == "test-model"
         # Reservation + holder lifecycle exist on the gym legs only; every gym
         # leg — success or either failure — reaps the holder exactly once.
         if gym:
+            # Always the inference cluster: when colocated, _build_clusters
+            # returns the train cluster twice, so the two are the same object
+            # in production (the mocked distinction here is not).
             mock_megatron.reserve_http_server_address.assert_called_once_with(
-                train_cluster if colocated else inference_cluster,
+                inference_cluster,
                 mc.policy,
             )
             mock_ray.kill.assert_called_once_with(port_holder)

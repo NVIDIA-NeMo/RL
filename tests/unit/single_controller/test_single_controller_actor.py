@@ -973,23 +973,27 @@ class _FullStepSampler(_OneThenEmptySampler):
 
 
 class _ChunkedSampler(_EmptySampler):
-    """Assembles one step out of several single-group chunks, then goes empty.
+    """Assembles one step out of ``chunks`` selects, then goes empty.
 
-    This is the shape the streaming path actually produces and the reason
-    ``keep_train_buffers`` exists: every chunk after the first runs against an
-    already-open train step.
+    Single-group chunks are the shape the streaming path actually produces and
+    the reason ``keep_train_buffers`` exists: every chunk after the first runs
+    against an already-open train step. ``groups_per_chunk`` covers the blocking
+    (colocated) shape, where the whole step arrives as one multi-group chunk.
     """
 
-    def __init__(self, meta: KVBatchMeta, chunks: int) -> None:
+    def __init__(
+        self, meta: KVBatchMeta, chunks: int, groups_per_chunk: int = 1
+    ) -> None:
         self._meta = meta
         self._remaining = chunks
+        self._groups_per_chunk = groups_per_chunk
 
     async def select(self, **kwargs):
         del kwargs
         if self._remaining == 0:
             return None, 0
         self._remaining -= 1
-        return self._meta, 1
+        return self._meta, self._groups_per_chunk
 
 
 class _SequenceSampler(_EmptySampler):
@@ -1482,9 +1486,7 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    ctrl._sync_weights.assert_awaited_once_with(
-        calibration_data=None, defer_engine_wake=False
-    )
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert train_metrics["evicted_stale_prompt_groups"] == 2
     assert train_metrics["aborted_stale_inflight_groups"] == 1
@@ -1496,21 +1498,20 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
 def test_train_pump_chunked_step_by_engine_regime(
     monkeypatch, engine_blocks_training
 ) -> None:
-    """One two-chunk step, observed under both engine regimes.
+    """One step, observed under both engine regimes.
 
-    Both regimes: the logprob detour between chunks must not offload the
-    trainer's grad buffers — mcore's offload frees the gradients earlier
-    chunks accumulated rather than copying them out. First chunk: no step
-    open, the offload is worth taking; later chunks: buffers stay resident.
+    Streaming: the step arrives as two single-group chunks. The engine is
+    never stood down, the rollout gate stays open, and the configured
+    streaming minimum reaches the sampler. The logprob detour between chunks
+    must not offload the trainer's grad buffers — mcore's offload frees the
+    gradients earlier chunks accumulated rather than copying them out. First
+    chunk: no step open, the offload is worth taking; later chunks: buffers
+    stay resident.
 
-    Streaming: the engine is never stood down, the rollout gate stays open,
-    and the configured streaming minimum reaches the sampler.
-
-    Blocking (colocated Megatron): the pump closes the gate and sleeps the
-    engine exactly once per step, before any trainer GPU work, and demands
-    whole steps from the sampler (min == max). The chunked delivery here is
-    a fake-permitted shape — real samplers honor the min — proving
-    release-once is robust to partial deliveries.
+    Blocking (colocated Megatron): setup pins min_groups_for_streaming_train
+    == num_prompts_per_step, so the pump demands the whole step from the
+    sampler (min == max) and it arrives as one chunk; the gate is closed and
+    the engine slept exactly once, before any trainer GPU work.
     """
     meta = KVBatchMeta(
         partition_id="rollout_data",
@@ -1529,9 +1530,17 @@ def test_train_pump_chunked_step_by_engine_regime(
             )
             return await super().select(**kwargs)
 
-    # num_prompts_per_step is 2 in the harness, so two single-group chunks
-    # close the step.
-    ctrl = _train_pump_controller(sampler=_BoundsRecordingSampler(meta, chunks=2))
+    # num_prompts_per_step is 2 in the harness: two single-group chunks close
+    # the streaming step, one two-group chunk the blocking one.
+    sampler = (
+        _BoundsRecordingSampler(meta, chunks=1, groups_per_chunk=2)
+        if engine_blocks_training
+        else _BoundsRecordingSampler(meta, chunks=2)
+    )
+    ctrl = _train_pump_controller(sampler=sampler)
+    if engine_blocks_training:
+        # Mirror the colocated setup invariant the config validator enforces.
+        ctrl._async_cfg.min_groups_for_streaming_train = 2
     ctrl._policy_logprobs_required = True
     calls: list[object] = []
 
@@ -1566,22 +1575,21 @@ def test_train_pump_chunked_step_by_engine_regime(
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert ctrl._train_steps == 1
-    assert trainer.keep_train_buffers_calls == [False, True]
     chunk = ["lp_inference_prep", "prepare_for_training", "train"]
     if engine_blocks_training:
-        # Released exactly once, with the gate already closed, before the
-        # trainer touched the GPUs; both chunks then ran without a second
-        # release. The (mocked) post-step _sync_weights reopens the gate.
-        assert calls == [("finish_generation", False)] + chunk * 2
+        # Stood down exactly once, with the gate already closed, before the
+        # trainer touched the GPUs; the whole step then ran as one chunk. The
+        # (mocked) post-step _sync_weights reopens the gate.
+        assert calls == [("finish_generation", False)] + chunk
+        assert trainer.keep_train_buffers_calls == [False]
         assert not ctrl._rollout_permitted.is_set()
-        assert select_bounds and all(lo == hi for lo, hi in select_bounds)
+        assert select_bounds == [(2, 2)]
     else:
         assert calls == chunk * 2
+        assert trainer.keep_train_buffers_calls == [False, True]
         assert ctrl._rollout_permitted.is_set()
         assert select_bounds[0] == (1, 2)
-    ctrl._sync_weights.assert_awaited_once_with(
-        calibration_data=None, defer_engine_wake=False
-    )
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
 
 
 def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> None:
@@ -1855,9 +1863,7 @@ def test_train_pump_trains_the_policy_once_warmup_is_over(monkeypatch, capsys) -
 
     trainer.begin_train_step.assert_called_once()
     trainer.finish_train_step.assert_called_once_with()
-    ctrl._sync_weights.assert_awaited_once_with(
-        calibration_data=None, defer_engine_wake=False
-    )
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
     # Announced exactly once, on the step that crosses the boundary.
     assert capsys.readouterr().out.count("Critic warmup complete") == 1
 
@@ -1900,9 +1906,7 @@ def test_train_pump_groups_ppo_epochs_by_model(monkeypatch) -> None:
         "policy.finish_train_step",
     ]
     # Still one RL step, so one refit and one version bump.
-    ctrl._sync_weights.assert_awaited_once_with(
-        calibration_data=None, defer_engine_wake=False
-    )
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
     assert ctrl._trainer_version == 1
 
 

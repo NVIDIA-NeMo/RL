@@ -1720,7 +1720,6 @@ class SingleControllerActor:
             evicted_stale_prompt_groups = 0
             min_sample_version = None
             step_open = False
-            generation_released = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
             # One chunk per step on the PPO path, so these are the step's own
@@ -1767,13 +1766,11 @@ class SingleControllerActor:
                         max_prompt_groups = target_groups - groups_dispatched
                         if max_prompt_groups <= 0:
                             break
+                        # For a colocated engine this is max_prompt_groups, pinned inside setup.
                         min_prompt_groups = min(
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
-                        if self._gen.blocks_training():
-                            # Always assemble a whole batch in colocated mode.
-                            min_prompt_groups = max_prompt_groups
                         train_meta, num_groups = await self._sampler.select(
                             current_train_weight=self._trainer_version,
                             min_prompt_groups=min_prompt_groups,
@@ -1809,16 +1806,13 @@ class SingleControllerActor:
                         for _ in range(num_groups):
                             self._buffer_capacity.release()
 
-                    # A generation engine that blocks training must stand down;
-                    # sleep the engine to allow for the trainer to perform GPU work.
-                    # Safe because the select above assembles whole steps for blocking engines.
+                    # Whole steps are assembled for colocated engines so the loop closes after this.
                     # In-flight requests freeze, then continue on fresh weights.
                     # The post-step `_sync_weights` wake reopens the gate,
                     # except on save-bound steps, where the wake is deferred until after the save.
-                    if not generation_released and self._gen.blocks_training():
+                    if self._gen.blocks_training():
                         self._rollout_permitted.clear()
                         await asyncio.to_thread(self._gen.finish_generation)
-                        generation_released = True
 
                     # ---- 2. Prepare the batch ----
                     # Compute prev_logprobs / ref_logprobs
@@ -2101,43 +2095,50 @@ class SingleControllerActor:
                 )
 
                 # ---- 6. Refit the model ----
-                with self._timer.time("weight_sync"):
-                    calibration_data = (
-                        BatchedDataDict.from_batches(calibration_batches)
-                        if calibration_batches
-                        else None
-                    )
-                    # Critic warmup doesn't need refit, and the version still advances.
-                    aborted_stale_inflight_groups = 0
-                    if is_policy_training_step:
-                        aborted_stale_inflight_groups = await self._sync_weights(
-                            calibration_data=calibration_data,
-                            defer_engine_wake=defer_wake_for_save,
-                        )
-                    self._retune_lookahead_versions()
-                    self._rollout_manager.set_weight_version(self._trainer_version)
-                    step_metrics.update(
-                        {
-                            "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
-                            "aborted_stale_inflight_groups": aborted_stale_inflight_groups,
-                            # Non-zero means this step trained on a smaller batch than
-                            # num_prompts_per_step, which any comparison of step metrics
-                            # across steps has to account for.
-                            "dropped_prompt_groups": dropped_prompt_groups,
-                            # Groups filled by a spare prompt this step waited on --
-                            # either one it lost itself, or one it lent to an earlier
-                            # step and was repaid for. Non-zero here with zero above is
-                            # the healthy shape of on_dropped_prompt="replace": the
-                            # batch stayed whole, and the cost was the wall-clock spent
-                            # waiting on the spare.
-                            "replaced_prompt_groups": replaced_prompt_groups,
-                            # Groups this step lost and filled by borrowing finished work
-                            # from a later step. The better shape of the same thing: the
-                            # batch stayed whole and nothing waited for it, with the
-                            # repayment showing up as a replacement on the lender.
-                            "promoted_prompt_groups": promoted_prompt_groups,
-                        }
-                    )
+                # Critic warmup doesn't need refit, and the version still advances.
+                aborted_stale_inflight_groups = 0
+                if is_policy_training_step:
+                    if defer_wake_for_save:
+                        # Wake-deferral (colocated): the engine is about to be saved,
+                        # so leave it asleep. Record `weight_sync` for consistency in reports.
+                        with self._timer.time("weight_sync"):
+                            pass
+                        with self._timer.time("offload_before_refit"):
+                            await asyncio.to_thread(self._trainer.offload_before_refit)
+                    else:
+                        with self._timer.time("weight_sync"):
+                            calibration_data = (
+                                BatchedDataDict.from_batches(calibration_batches)
+                                if calibration_batches
+                                else None
+                            )
+                            aborted_stale_inflight_groups = await self._sync_weights(
+                                calibration_data=calibration_data,
+                            )
+                self._retune_lookahead_versions()
+                self._rollout_manager.set_weight_version(self._trainer_version)
+                step_metrics.update(
+                    {
+                        "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
+                        "aborted_stale_inflight_groups": aborted_stale_inflight_groups,
+                        # Non-zero means this step trained on a smaller batch than
+                        # num_prompts_per_step, which any comparison of step metrics
+                        # across steps has to account for.
+                        "dropped_prompt_groups": dropped_prompt_groups,
+                        # Groups filled by a spare prompt this step waited on --
+                        # either one it lost itself, or one it lent to an earlier
+                        # step and was repaid for. Non-zero here with zero above is
+                        # the healthy shape of on_dropped_prompt="replace": the
+                        # batch stayed whole, and the cost was the wall-clock spent
+                        # waiting on the spare.
+                        "replaced_prompt_groups": replaced_prompt_groups,
+                        # Groups this step lost and filled by borrowing finished work
+                        # from a later step. The better shape of the same thing: the
+                        # batch stayed whole and nothing waited for it, with the
+                        # repayment showing up as a replacement on the lender.
+                        "promoted_prompt_groups": promoted_prompt_groups,
+                    }
+                )
 
                 # Checkpointing (mirrors async_grpo_train's save block).
                 if will_save_checkpoint:
@@ -3047,7 +3048,6 @@ class SingleControllerActor:
         self,
         *,
         calibration_data: Optional[BatchedDataDict[Any]] = None,
-        defer_engine_wake: bool = False,
     ) -> int:
         """Pause new rollout dispatches, synchronize weights, resume.
 
@@ -3060,13 +3060,9 @@ class SingleControllerActor:
           3. weight_synchronizer.sync_weights(kv_scales=...)
           4. _rollout_permitted.set()   — resume
 
-        `defer_engine_wake` is used to skip refit and wake on save-bound steps for colocated cases.
-
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
                 scales before synchronizing weights.
-            defer_engine_wake: Keep the engine asleep: offload the trainer's
-                refit buffers, stamp the version, leave the gate closed.
 
         Returns:
             The number of stale in-flight rollout groups aborted before the
@@ -3107,59 +3103,56 @@ class SingleControllerActor:
             )
             kv_scales = calibration_result["layers"]
 
-        if defer_engine_wake:
-            await asyncio.to_thread(self._trainer.offload_before_refit)
-        else:
-            # Reconcile once more, immediately before the collective.
-            #
-            # The reconcile above runs before calibration and two to_thread hops; a death
-            # recorded in that gap would otherwise be ignored until the NEXT step, by which
-            # time this broadcast is already hanging on the missing rank. Idempotent, and a
-            # set comparison in the common case -- it used to be a full rebuild on every call
-            # once a shard was gone, because absent_shards() never empties again.
-            await self._reconcile_refit_membership()
+        # Reconcile once more, immediately before the collective.
+        #
+        # The reconcile above runs before calibration and two to_thread hops; a death
+        # recorded in that gap would otherwise be ignored until the NEXT step, by which
+        # time this broadcast is already hanging on the missing rank. Idempotent, and a
+        # set comparison in the common case -- it used to be a full rebuild on every call
+        # once a shard was gone, because absent_shards() never empties again.
+        await self._reconcile_refit_membership()
 
-            try:
-                await self._sync_weights_within(kv_scales, "first")
-            except (RefitAborted, RayActorError) as failure:
-                # DETECT AND FAIL FAST, because this one cannot be recovered from.
-                #
-                # sync_stream_within gives up on kernels already enqueued on THIS trainer's
-                # stream, and aborting a communicator does not retire them. Its CUDA context is
-                # unusable afterwards: ncclCommAbort never returns and no rebuild on that device
-                # can bootstrap, so entering the recovery here does not fail -- it wedges, for
-                # the full harness deadline, with no attribution. Jobs 6521181, 6523731, 6582457
-                # and 6584636 each eliminated one candidate explanation and left this one.
-                #
-                # Narrow by construction: the token is applied only by sync_stream_within, which
-                # is reachable only from _nccl_reshard_refit. The packed-broadcast transport
-                # takes the same fault, fires the same deadline, aborts and recovers, and so
-                # does reshard when the fault lands at a step boundary. Recovering this last
-                # case is deliberately left to a future change; see the design doc, 8.5.7.
-                if is_refit_context_lost(failure):
-                    print(
-                        "  _sync_weights: the refit aborted mid-transfer on the nccl_reshard "
-                        "bulk path, which orphans GPU work on the trainers and leaves their "
-                        "CUDA contexts unusable. Recovery is not possible from here, so the "
-                        "run ends now rather than wedging in a rebuild that cannot complete.",
-                        flush=True,
-                    )
-                    raise
-                with self._recovery_window():
-                    await self._recover_from_failed_refit(failure)
-                    # Once only: a second failure is a real fault, not a membership problem,
-                    # and retrying forever would recreate the wedge this exists to remove.
-                    await self._sync_weights_within(kv_scales, "retry")
-                    # Inside the window: this is what refills the serving set, so releasing
-                    # the flag before it runs would reopen the gap it exists to close.
-                    self._promote_refit_shards()
-            else:
-                # A completed refit is what makes an engine's weights current, so this is
-                # where a shard pulled out of service for holding partial ones earns its way
-                # back. else, not a trailing statement: the recovery path above already
-                # promoted inside its window, and everything below this must still run on
-                # both paths.
+        try:
+            await self._sync_weights_within(kv_scales, "first")
+        except (RefitAborted, RayActorError) as failure:
+            # DETECT AND FAIL FAST, because this one cannot be recovered from.
+            #
+            # sync_stream_within gives up on kernels already enqueued on THIS trainer's
+            # stream, and aborting a communicator does not retire them. Its CUDA context is
+            # unusable afterwards: ncclCommAbort never returns and no rebuild on that device
+            # can bootstrap, so entering the recovery here does not fail -- it wedges, for
+            # the full harness deadline, with no attribution. Jobs 6521181, 6523731, 6582457
+            # and 6584636 each eliminated one candidate explanation and left this one.
+            #
+            # Narrow by construction: the token is applied only by sync_stream_within, which
+            # is reachable only from _nccl_reshard_refit. The packed-broadcast transport
+            # takes the same fault, fires the same deadline, aborts and recovers, and so
+            # does reshard when the fault lands at a step boundary. Recovering this last
+            # case is deliberately left to a future change; see the design doc, 8.5.7.
+            if is_refit_context_lost(failure):
+                print(
+                    "  _sync_weights: the refit aborted mid-transfer on the nccl_reshard "
+                    "bulk path, which orphans GPU work on the trainers and leaves their "
+                    "CUDA contexts unusable. Recovery is not possible from here, so the "
+                    "run ends now rather than wedging in a rebuild that cannot complete.",
+                    flush=True,
+                )
+                raise
+            with self._recovery_window():
+                await self._recover_from_failed_refit(failure)
+                # Once only: a second failure is a real fault, not a membership problem,
+                # and retrying forever would recreate the wedge this exists to remove.
+                await self._sync_weights_within(kv_scales, "retry")
+                # Inside the window: this is what refills the serving set, so releasing
+                # the flag before it runs would reopen the gap it exists to close.
                 self._promote_refit_shards()
+        else:
+            # A completed refit is what makes an engine's weights current, so this is
+            # where a shard pulled out of service for holding partial ones earns its way
+            # back. else, not a trailing statement: the recovery path above already
+            # promoted inside its window, and everything below this must still run on
+            # both paths.
+            self._promote_refit_shards()
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would
@@ -3169,8 +3162,7 @@ class SingleControllerActor:
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
-        if not defer_engine_wake:
-            self._rollout_permitted.set()
+        self._rollout_permitted.set()
         return aborted_stale_inflight_groups
 
     async def _value_stage(self, meta: KVBatchMeta) -> KVBatchMeta:

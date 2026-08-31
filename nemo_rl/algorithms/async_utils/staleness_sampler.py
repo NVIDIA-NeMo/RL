@@ -672,8 +672,8 @@ SamplerConfig = Annotated[
 def required_buffer_capacity_for_config(
     cfg: SamplerConfig,
     groups_per_step: int,
-) -> Optional[int]:
-    """Return a built-in sampler's required capacity without constructing it."""
+) -> int:
+    """Return a sampler config's required capacity without constructing it."""
     if isinstance(cfg, ReadyFirstSamplerConfig):
         return _gated_required_buffer_capacity(
             groups_per_step,
@@ -689,7 +689,7 @@ def required_buffer_capacity_for_config(
             groups_per_step,
             gate_window=cfg.peak_lookahead_versions,
         )
-    return None
+    return groups_per_step
 
 
 def _custom_sampler_class(cfg: CustomSamplerConfig) -> type:

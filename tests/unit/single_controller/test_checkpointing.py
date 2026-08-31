@@ -399,7 +399,7 @@ class _EventRecordingSynchronizer(_FakeWeightSynchronizer):
 
 
 class _RefitRecordingTrainer(_FakeTrainer):
-    """Records the offload calls the deferred-wake sync path makes."""
+    """Records the offload calls the deferred-wake save path makes."""
 
     def __init__(self, events: list[str]) -> None:
         super().__init__()
