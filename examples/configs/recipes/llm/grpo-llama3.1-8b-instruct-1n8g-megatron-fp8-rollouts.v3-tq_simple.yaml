@@ -1,3 +1,5 @@
 defaults: grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts.v3.yaml
 data_plane:
   enabled: true
+  observability:
+    verify_tensor_hash: true

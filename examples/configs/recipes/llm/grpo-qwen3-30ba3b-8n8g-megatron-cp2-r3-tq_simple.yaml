@@ -3,6 +3,8 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3-tq_simple
 data_plane:
   enabled: true
+  observability:
+    verify_tensor_hash: true
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3-tq_simple
   wandb:

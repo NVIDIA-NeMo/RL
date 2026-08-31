@@ -1,3 +1,5 @@
 defaults: grpo-moonlight-16ba3b-4n8g-megatron.yaml
 data_plane:
   enabled: true
+  observability:
+    verify_tensor_hash: true

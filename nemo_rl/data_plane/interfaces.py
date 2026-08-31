@@ -175,11 +175,22 @@ class ObservabilityConfig(TypedDict):
     injected programmatically (callables don't round-trip through
     YAML) — set ``cfg["observability"]["callback"] = my_fn`` before
     :func:`build_data_plane_client` to plug into wandb / file / log.
-    Default callback prints one line per op for debug.
+    There is no default callback: per-step metrics reach the logger via
+    ``get_step_metrics``, so a per-op sink is opt-in.
+
+    ``verify_tensor_hash`` is a correctness check, not a metric: each put
+    records a per-row ``torch.hash_tensor`` fold of the row's values, mixed
+    with the row's dtype and shape, and each get re-checks it, so a value
+    that changes between wire-in and wire-out is reported
+    (``hash/mismatches``) instead of silently training on it. It reads every
+    tensor element a second time on both sides — roughly 8 ms for a 107 MB
+    batch — so leave it off outside of debugging. It does not detect a
+    permutation *within* a row; see ``data_plane/README.md``.
     """
 
     enabled: bool
     callback: NotRequired[Callable[[dict[str, Any]], None]]
+    verify_tensor_hash: NotRequired[bool]
 
 
 @dataclass

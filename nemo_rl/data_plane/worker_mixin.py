@@ -28,7 +28,7 @@ TP=CP=PP=1) and inherit ``train`` / ``get_logprobs`` /
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 
 import torch
 
@@ -182,6 +182,25 @@ class TQWorkerMixin:
     def _forward_pad_seqlen(self, meta: "KVBatchMeta") -> int:
         """Cross-DP forward pad target, minted by :meth:`TQPolicy._stamp_pad_seqlen`."""
         return int((meta.extra_info or {}).get(GLOBAL_FORWARD_PAD_SEQLEN, 0))
+
+    def get_data_plane_snapshot(self) -> "dict[str, Any] | None":
+        """This rank's data-plane counters, for cluster-wide aggregation.
+
+        Returns ``None`` when observability is off or no client exists, so
+        the driver can filter rather than special-case. The payload is
+        counters only (about 1 kB), not tensors.
+
+        Closes this rank's step window (``step_max_ms``) as it reads, since
+        the driver calls this once per step. A maximum cannot be differenced
+        out of a cumulative counter, so without the reset the cluster's
+        per-step max would latch at the worst call ever seen.
+        """
+        client = getattr(self, "_dp_client", None)
+        snapshot = getattr(client, "snapshot", None)
+        if not callable(snapshot):
+            return None
+        # cast: ``snapshot`` came off getattr, so it is untyped here.
+        return cast("dict[str, Any] | None", snapshot(reset_step_window=True))
 
     def _fetch(
         self,

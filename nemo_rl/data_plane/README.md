@@ -409,43 +409,325 @@ global_forward_pad_seqlen = round_up(1320, 64) = 1344
 ## Configuration
 
 The data plane is configured via a `data_plane:` block in the master
-YAML (`examples/configs/...`). The canonical exemplar is
+YAML (`examples/configs/...`). **YAML is the single source of truth
+for defaults** — the adapter has no hidden `cfg.get(key, default)`
+fallbacks. The canonical exemplar is
 `examples/configs/grpo_math_1B.yaml`.
 
-`enabled`, `impl`, `backend` and `claim_meta_poll_interval_s` are
-**required** when `enabled=true`. Backend sizing lives in a block named
-for the backend that reads it; only the block named by `backend` is
-consulted. An absent `mooncake_cpu:` block means that backend's
-defaults, declared on `MooncakeCpuConfig` in
-`nemo_rl/data_plane/interfaces.py`. `simple:` is **not** optional —
-`num_storage_units` has no static default, since no single value is
-right across cluster sizes, so a `simple` run without the block fails
-validation. Recipes under `examples/configs/recipes/**/*.yaml` inherit
-all of it via `defaults:`.
+All eight keys below are **required** when `enabled=true`. Recipes
+under `examples/configs/recipes/**/*.yaml` inherit them via
+`defaults:` from the exemplar.
 
 ```yaml
 data_plane:
   enabled: false                       # flip to true to engage grpo_train_sync
   impl: transfer_queue                 # only one impl today
   backend: "simple"                    # "simple" or "mooncake_cpu"
+  storage_capacity: 1000000            # max samples retained per partition
+  num_storage_units: 2                 # storage shards
   claim_meta_poll_interval_s: 0.5      # blocking-claim poll cadence
-  simple:
-    storage_capacity: 1000000          # max samples retained per partition
-    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
-  mooncake_cpu:
-    global_segment_size: 68719476736   # 64 GiB/process
-    local_buffer_size:    4294967296   # 4 GiB/process
-    reuse_registered_buffers: true     # reuse RDMA-registered buffers
-    staging_buffer_size:   268435456   # 256 MiB/pool slot; bigger transfers bypass the pool
-  # observability:                     # NotRequired
-  #   enabled: false
+  global_segment_size: 549755813888    # 512 GiB — used when backend == "mooncake_cpu"
+  local_buffer_size:   68719476736     # 64 GiB  — used when backend == "mooncake_cpu"
+  observability:                       # NotRequired
+    enabled: true                      # per-op timing / latency percentiles / volume
+    verify_tensor_hash: false          # debug: wire-in vs wire-out tensor check
 ```
 
-These keys used to sit directly under `data_plane:`. That spelling is not
-rejected — it is simply never read. A config still using it silently gets
-this backend's defaults instead of its own values: an inherited config
-supplies the nested block, so a surviving flat key always loses the merge,
-with no warning either way.
+### Observability
+
+`enabled: true` wraps the adapter in `MetricsDataPlaneClient`, which records
+per-op wall time, latency percentiles (fixed-bucket histogram, so per-rank
+counts sum into one cluster-wide distribution) and byte volume. `snapshot()`
+returns the cumulative view; `get_step_metrics(step_time_s)` returns the
+per-step delta already flattened for the logger.
+
+**Scope: one process, not the cluster.** Every process builds its own
+client with its own counters — the driver, each policy worker, the rollout
+actor. `grpo_train_sync` logs the *driver's*, under `data_plane/driver/`.
+The driver issues about one op of each kind per step, so `calls` is small
+by construction; the bulk traffic is the rollout actor's `kv_first_write`
+and the workers' per-DP-rank `get_samples`, and neither appears in these
+series. Do not read `comm_volume_mb` as cluster-wide volume.
+
+`OpStats` is additive on purpose, and `merge_snapshots()` uses it: the
+histogram buckets and the regression sufficient statistics from every rank
+*sum* into one cluster-wide view. Everything derived — percentiles, the
+throughput — is recomputed from the merged totals, never
+averaged across ranks (averaging per-rank percentiles does not give a
+cluster percentile).
+
+**What gets charted is the bottleneck, not the detail.** Four ops times
+eight fields is 32 series saying one thing, and a dashboard of 32 lines
+does not answer "where is my time going". So the emitted series are the
+totals and `percent_of_dataplane`, with the per-op detail in a table beside them:
+
+| series | what it answers |
+|---|---|
+| `step/frac_of_step` | is the data plane worth optimising at all? |
+| `step/percent_of_dataplane/by_op/{put,get,clear,register}` | which call is expensive? |
+| `step/wall_s`, `step/comm_volume_mb` | how much time and traffic |
+| `step/volume_mb/by_op/{get,put}` | which direction that traffic went |
+| `step/codec/{pack_s,unpack_s}` | jagged pad/unpad cost, which `by_op` cannot see |
+| `now/bytes_outstanding_mb`, `now/n_processes` | occupancy, fan-out width |
+| `step/self/{overhead_ms,frac}` | what measuring cost |
+| `step/hash/*` | only with `verify_tensor_hash` on |
+
+Per-op detail is published under `step/by_op/<op>/<field>` and feeds the
+breakdown table rather than a chart.
+
+**`percent_of_dataplane` is a percentage of data-plane time, not of the step.** The
+denominator is `sum(wall_ms)` over the ops that ran, so
+`by_op/put = 43` reads "43% of the time spent inside the data plane went to
+put". Whether that time mattered against compute is the *other* metric:
+`frac_of_step` divides by the step's own wall clock. Read them together —
+a workload can be 43% put and still not be worth touching.
+
+Reading a real TransferQueue step:
+
+```
+step/frac_of_step                                  0.074   the data plane is 7% of the step
+step/percent_of_dataplane/by_op/put                 42.1   within it, put is the largest op
+```
+
+`by_op` sums to 100 by construction.
+
+`volume_mb` counts *transfers*, not data size, and two things follow from
+that. A byte written and later read is counted on both sides. And every
+reporting process is summed, so four ranks each fetching their own shard
+count four times. Both are correct for "what crossed the wire" -- on a real
+step get moved 20.8 MB against put's 2.7 MB, because every DP rank fetches
+its shard once for the logprob pass and again for the train pass. Neither
+is correct for "how big was the batch", which these series cannot answer.
+
+**The rollout actor is not in the fan-out**, so `kv_first_write` -- the
+write of the entire rollout batch, and the largest write in the step -- is
+absent from `volume_mb/by_op/put` and from `comm_volume_mb`. That is why
+put reads small next to get. Read the write side as "what the driver and
+policy workers wrote", not as the step's write traffic.
+
+On the cluster path `wall_ms` is summed over processes that ran
+concurrently, so these are percentages of aggregate **process-time**, not of
+elapsed time. That is the right denominator for "what should I optimise"
+and the wrong one for "what blocked the step".
+
+**A per-op breakdown table** carries the detail, under
+`data_plane/{cluster,driver}/breakdown` — one row per op, ordered by
+`percent_of_dataplane` so the bottleneck is the first line read:
+
+| op | percent_of_dataplane | calls | wall_ms | mean_ms | max_ms | p50_ms | p90_ms | mb |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| put | 43.0 | 2 | 53.9 | 26.9 | 29.4 | — | — | 1.32 |
+| get | 30.9 | 2 | 38.7 | 19.4 | 21.5 | — | — | 1.03 |
+| register | 17.1 | 1 | 21.4 | 21.4 | 21.4 | — | — | 0 |
+| clear | 8.93 | 1 | 11.2 | 11.2 | 11.2 | — | — | 0 |
+
+Everything in ms on that row is **per call** except `wall_ms`: that `put`
+row reads "each call cost 26.9 ms". `calls`, `wall_ms` and `mb` are the
+only extensive columns.
+
+**Per-call figures describe the wire; sums describe the run.** `wall_ms` on the cluster
+path is summed over processes that ran concurrently, so it is process-time
+and scales with DP degree — 200 gets of 11 ms across 8 ranks reads 2232
+while the wall clock was 279. Dividing by the process count only trades one
+arbitrary denominator for another. Per call is invariant to both DP degree
+and batch size: the same workload at 8 and at 32 ranks reports 11.16 and
+11.06 ms while `wall_ms` quadruples. Use `mean_ms` to compare runs and
+cluster sizes, `percent_of_dataplane` to attribute cost across ops within one step.
+
+A stack of line charts answers "how did put's wall time trend"; this
+answers "where did the step go", which is a table. Cells are empty rather
+than zero where a series was withheld (a percentile below the sample gate,
+a fit that is not trustworthy) — a zero would read as a measurement. It is
+built from the same metrics dict that is logged, so the table and the
+series cannot disagree. Only wandb renders it; other backends skip it.
+
+**Every series says what kind of number it is.** A per-step delta and an
+instantaneous level shared the `_mb` suffix and a chart, with nothing to
+tell them apart:
+
+| namespace | meaning | example |
+|---|---|---|
+| `step/` | what happened during this step; resets | `step/comm_volume_mb` |
+| `now/` | what is true at this instant; persists | `now/bytes_outstanding_mb` |
+
+A rising `now/bytes_outstanding_mb` is not an accumulation bug — it is the
+leak signal the metric exists for: bytes put and never cleared.
+
+Two more read differently in the cluster view and are named to say so:
+
+- **`step/frac_of_step` is per process.** `wall_ms` sums processes that ran
+  concurrently, so dividing it by one step's wall clock exceeded 1 whenever
+  they overlapped (measured 1.054 across ten processes) and read as "105%
+  of the step". Divided per process it is the mean share of the step a
+  process spent in the data plane, which is what the name claims.
+- **`step/{op}/max_ms` is scoped to the step by being reset**, not by being
+  differenced. A maximum cannot be recovered from two cumulative readings
+  the way `calls` and `wall_ms` can, so the reader that consumes it zeroes
+  it — `snapshot(reset_step_window=True)`, which the once-per-step
+  collector passes and an inspection snapshot does not. Without that the
+  cluster path reported the lifetime max: after one 50 ms call every later
+  step still read 50 ms.
+
+`grpo_train_sync` fans out to the driver and every policy worker, and logs
+the combined result under `data_plane/cluster/` instead of the driver's
+own. **It does not reach the rollout actor**, which builds its own client
+and is not on the worker group — so `kv_first_write`, the write of the
+whole rollout, is not in these totals. It falls back to `data_plane/driver/` when the fan-out finds only one
+process. Measured: **~2.4 ms and ~1 kB per process per step** for 10
+processes, against a 6x wider view of the traffic. The fan-out is
+best-effort — a rank that cannot answer is dropped rather than failing the
+step.
+
+`step/self/overhead_ms` reports what the measurement itself cost — the
+whole bill, both halves:
+
+- every process's wrapper time (its wall time minus the time its inner
+  client was working), and
+- the fan-out that gathered and merged the snapshots.
+
+The second is the larger. In the cross-process e2e the wrapper cost 0.13 ms
+and the fan-out 2.31 ms, so a figure covering only the first understated by
+19x. Measured whole: **~2.4 ms, about 0.9% of data-plane time** for 10
+processes.
+
+It is deliberately not clamped to 100%. Against a fast backend the ratio
+can exceed 1, meaning measuring cost more than the operation measured — a
+signal worth seeing rather than hiding.
+
+**Units:** charted *durations* are seconds — `step/wall_s`,
+`step/codec/{pack_s,unpack_s}` — so they sit beside
+`timing/train/total_step_time`. The one charted duration that is not is
+`step/self/overhead_ms`: it is a cost-of-measurement figure, read against the
+breakdown table rather than against the step clock. The table itself is ms
+throughout (`wall_ms`, `mean_ms`, `max_ms`, `p50_ms`, `p90_ms`), where
+sub-second per-call figures stay legible. Volumes are always `_mb`. What is not
+allowed is mixing units *within one chart*: `step/wall_s` on the same axis as
+`p90_ms` puts a 0.008 next to a 24.85 and reads as a data-plane bug rather than
+an axis one.
+
+**Per step you get, per op tag:** `calls`, `wall_ms`, `max_ms`. Percentiles come off the *step's* histogram delta, not the
+cumulative one -- a per-step p50 off a histogram that is never reset goes
+flat -- and each is emitted only when the step holds enough calls to
+resolve it: **p50 at 20, p90 at 40**, roughly four observations above the
+rank (`n >= 4 / (1 - q)`). Below that the key is absent.
+
+The tail quantile is **p90, not p99**, because a step holds tens of calls,
+not thousands. A p99 needs ~100 samples before any observation lies above
+its rank at all; below that it collapses onto the largest one. Over a
+lognormal-with-tail draw at 58 calls -- what a DP-8 run actually puts per
+step -- the p99 equalled the maximum **80% of the time**, which is
+`max_ms` under a more precise-sounding name. The p90 off the same 58 never
+did on a smooth tail and 12% of the time on a bimodal one. A coarser
+quantile that is resolved beats a finer one that is not.
+
+`max_ms` stays alongside, exact and scoped to the step: it answers "did
+anything go wrong this step", where p90 answers "what does the tail look
+like". If the two diverge sharply, the op is bimodal -- a straggler rank
+or a cold buffer -- and the max is the number to chase.
+
+Measured against a no-op inner client on the payload the wire actually
+carries — 256 ragged rows, 12 MB, jagged per-token fields as
+`pack_jagged_fields` leaves them: **~37 µs per put, ~15 µs per get**, under
+0.1% of a 59 ms operation. What is left is dominated by the per-key
+attribution `clear_samples` needs to undo.
+
+This is **on in the exemplar config**, which is where a v1 `TypedDict`
+default lives — so recipes inheriting `grpo_math_1B.yaml` get it, and a
+config with no `observability:` block still falls back to `False` at the
+factory. It only engages when `data_plane.enabled` is true either way, so
+it costs nothing for runs that don't use the data plane. There is
+no default per-op sink: `get_step_metrics()` is the surface, and
+`grpo_train_sync` logs it once a step under the `data_plane/` prefix — so
+the series reach whatever backends the run has enabled (wandb, TensorBoard,
+MLflow). Roughly 5-8 series per distinct op tag. Set
+`observability.callback` if you additionally want a hook on every transfer;
+`log_event` is exported for that.
+
+`verify_tensor_hash: true` additionally records a fingerprint of every row
+on every put and re-checks it on every get, so a tensor that changes between
+wire-in and wire-out is reported (`hash/mismatches`) instead of being trained
+on silently.
+
+One granularity: every row carries its own digest, formed from two parts.
+
+```
+  the row's values ──► torch.hash_tensor  (XOR fold, on device) ──► fold
+                                                                      ⊕ ──► digest
+  "<dtype>|<row shape>" ──► crc32  (host, one short string)    ──► seed
+```
+
+| what it covers | so a divergence in | is caught |
+|---|---|---|
+| the values fold | any element's value | yes |
+| the seed's dtype | precision (bf16 vs fp32 at equal width) | yes |
+| the seed's shape | length (a zero pad or a truncation) and trailing-dim layout | yes |
+| — | a permutation *within* one row | **no** — see below |
+
+The shape never travels and is never compared: only one integer per row is
+stored. A shape change makes the seed differ, which makes the digest differ,
+which surfaces as an ordinary mismatch.
+
+The seed's shape is the *row's*, not the leaf's, and both layouts must agree
+on it — a dense `(N, L, D)` and the jagged form whose values are `(total, D)`
+both report a row of `(L, D)`. That is what lets a field packed jagged and
+read back densified (`_from_wire` stacks uniform nested rows) reconcile
+instead of reporting a mismatch on every round trip. Deriving the dense row's
+length from its offsets instead would say `(1, L, D)` and break exactly that.
+
+Because the digest covers one row and nothing else, it reconciles against any
+later grouping of the same rows: a shard read is *checked*, not abstained on,
+and a delta write that touches one field leaves the others' fingerprints
+alone. This is also why there is no longer a second, coarser granularity for
+ragged leaves. `hash_tensor` has no ragged kernel, so a ragged leaf folds one
+row at a time — but the fold is an XOR, which is associative and elementwise,
+so `hash_tensor(row)` equals `hash_tensor(rect, dim=1)[i]`. The vectorized and
+per-row paths produce identical values, and the `_WriteScheme` bookkeeping
+that used to record which granularity a put had used, so a get could replay
+it, is gone with them.
+
+**The accepted limit: a within-row permutation is not detected.** XOR cannot
+see its own operands reordered, and no seed fixes it — the seed covers dtype
+and shape, which a reordering leaves alone. This was taken deliberately, for
+cost. Measured on a 107 MB batch of 1536 rows × 4 fields:
+
+| digest | cost | pad / reshape / dtype | permutation |
+|---|---|---|---|
+| **`hash_tensor` + shape seed** | **8 ms** | caught | **blind** |
+| `crc32` over the row's bytes | 64 ms | caught | caught |
+| `blake2b` over the row's bytes | 146 ms | caught | caught |
+| bare `hash_tensor` (what this replaced) | 94 ms | blind | blind |
+
+The two sequential hashes cost ~7-18x because they read every byte on the
+host, one row at a time; the fold reduces a whole rectangular leaf in one
+on-device call. If a reordering bug is ever suspected — the jagged
+pack/unpack offsets are where one would live — swapping `_leaf_digests` for
+the `crc32` form is a one-function change.
+
+Verified by injecting corruption into the round trip. Caught: a
+single-element change in every dtype, a truncated row, a zeroed row, a
+bf16→fp32 precision change, a zero pad, a trailing-dim reshape, and a row
+served from the wrong sample — with **zero false alarms** over a 500-row
+randomized soak, every shard grouping from 1 to 256, reversed id order,
+field subsets and delta writes. Not caught, by the deliberate choice above:
+a reordering of elements *within* one row. Note the row-swap and the
+within-row cases differ — two rows exchanged between wire-in and wire-out
+land against the wrong sample ids and are caught, because each row carries
+its own digest. Known limits, measured rather than assumed:
+
+- It compares digests, so it detects divergence, not its cause. A mismatch
+  names the sample, the field, the row index and the row length; what
+  changed between the two reads is still yours to find.
+- **A mismatch count at or above `rows_checked` is reported as suspect.**
+  Every row of every field wrong, identically, every step is not what a
+  broken wire looks like; it is what a broken guard looks like. Both false
+  alarms this check has produced had exactly that shape, and both were its
+  own bookkeeping. Per-sample lines carry the row index and the row length
+  so the next one is adjudicable from a single log line.
+- Only rows this process wrote can be checked. A consumer-side client
+  reports them under `hash/rows_unverified` rather than counting them
+  clean, and `hash/fields_skipped` reports any leaf it could not compare
+  — watch that one, since a guard that quietly stops covering a field still
+  reports zero mismatches.
 
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests

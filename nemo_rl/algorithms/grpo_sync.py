@@ -32,7 +32,9 @@ against both entrypoints and diffing the wandb runs.
 from __future__ import annotations
 
 import gc
+import logging
 import os
+import time
 import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -74,6 +76,13 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.observability import (
+    MetricsDataPlaneClient,
+    breakdown_table,
+    cluster_step_metrics,
+    headline_series,
+    merge_snapshots,
+)
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -375,6 +384,89 @@ def _compute_seq_logprob_error_metrics(
             seq_logprob_error_metrics.pop("num_masked_seqs")
         )
     return masking_data["sample_mask"], seq_logprob_error_metrics
+
+
+def _log_breakdown(
+    logger: Logger, metrics: dict[str, float], step: int, name: str
+) -> None:
+    """Log the per-op breakdown as a table beside the series.
+
+    A backend without a table type has no rows to log. Failures propagate to
+    the caller, which already guarantees the logging path cannot fail a step.
+    """
+    columns, rows = breakdown_table(metrics)
+    if rows:
+        logger.log_table(columns, rows, step, name)
+
+
+def _log_data_plane_metrics(
+    policy: Any, logger: Logger, step: int, total_step_time: float
+) -> None:
+    """Log this step's data-plane cost. Never raises.
+
+    On by default, so this runs every step of every recipe.
+    """
+    try:
+        _log_data_plane_metrics_impl(policy, logger, step, total_step_time)
+    except Exception as exc:  # noqa: BLE001 - a panel must never fail a step
+        logging.getLogger(__name__).warning(
+            "data-plane metrics failed at step %d (%s: %s); training continues",
+            step,
+            type(exc).__name__,
+            exc,
+        )
+
+
+def _log_data_plane_metrics_impl(
+    policy: Any, logger: Logger, step: int, total_step_time: float
+) -> None:
+    """Log this step's data-plane cost. No-op unless observability is enabled.
+
+    Prefers the cluster view -- the driver's counters plus every policy
+    worker's, summed -- and falls back to the driver's alone when the
+    fan-out reaches only one process. Reported one way or the other, never
+    both, so there is a single answer to "what did the data plane cost"
+    rather than two that disagree by roughly the DP degree.
+
+    The prefix names the scope because the two differ by a lot: the driver
+    issues about one op of each kind per step while the bulk traffic is the
+    workers' per-DP-rank ``get_samples``. Note that even the cluster view
+    omits the rollout actor, which builds its own client and is not on the
+    worker group -- so ``kv_first_write`` is not in these totals.
+
+    The previous reading lives on the policy, alongside the client whose
+    counters it differences, rather than in module state: two trainers in
+    one process would otherwise interleave one ``prev`` and produce
+    negative deltas.
+    """
+    client = getattr(policy, "dp_client", None)
+    if not isinstance(client, MetricsDataPlaneClient):
+        return  # observability disabled -> plain adapter
+
+    collect = getattr(policy, "collect_data_plane_snapshots", None)
+    collect_started = time.perf_counter()
+    snapshots = collect() if callable(collect) else []
+    if len(snapshots) > 1:
+        merged = merge_snapshots(snapshots)
+        # The fan-out is part of what observability costs, and the larger
+        # part: omitting it reported a twentieth of the real bill.
+        collect_ms = (time.perf_counter() - collect_started) * 1e3
+        prev = getattr(policy, "_prev_cluster_snapshot", {})
+        metrics = cluster_step_metrics(
+            merged, prev, total_step_time, collect_ms=collect_ms
+        )
+        policy._prev_cluster_snapshot = merged
+        logger.log_metrics(headline_series(metrics), step, prefix="data_plane/cluster")
+        _log_breakdown(logger, metrics, step, "data_plane/cluster/breakdown")
+    else:
+        # Single process, or the fan-out could not reach the workers.
+        metrics = client.get_step_metrics(total_step_time)
+        logger.log_metrics(headline_series(metrics), step, prefix="data_plane/driver")
+        _log_breakdown(logger, metrics, step, "data_plane/driver/breakdown")
+    print(
+        f"  • data plane: {metrics['step/wall_s']:.2f}s, "
+        f"{metrics['step/comm_volume_mb']:.1f} MB moved"
+    )
 
 
 def grpo_train_sync(
@@ -1338,6 +1430,10 @@ def grpo_train_sync(
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
+            # Before the step_finished=True log below, which commits the step:
+            # anything logged against a committed step is dropped by wandb, so
+            # these series were computed, printed, and silently discarded.
+            _log_data_plane_metrics(policy, logger, total_steps + 1, total_time)
             logger.log_metrics(
                 timing_metrics,
                 total_steps + 1,

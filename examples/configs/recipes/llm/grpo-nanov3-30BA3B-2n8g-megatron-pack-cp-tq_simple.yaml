@@ -1,3 +1,5 @@
 defaults: grpo-nanov3-30BA3B-2n8g-megatron-pack-cp.yaml
 data_plane:
   enabled: true
+  observability:
+    verify_tensor_hash: true
