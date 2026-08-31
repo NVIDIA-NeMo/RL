@@ -594,3 +594,53 @@ class TestStragglersAreWaitedForBeforeARebuild:
         sync = _collective()
         sync._refit_timeout_s = None
         assert 0 < sync._settle_budget_s() < 600
+
+
+class TestBackendsWithoutAWorkerGroup:
+    """CollectiveWeightSynchronizer holds a GenerationInterface, not a VllmGeneration.
+
+    Only some implementations own a Ray worker group with DP shards -- vLLM and TRT-LLM do;
+    Dynamo, Megatron and SGLang do not, and the interface declares nothing either way. Of
+    those, Dynamo reaches this synchronizer through the ordinary non-colocated branch of
+    the factory, so reading self._generation.worker_group broke it on the plain grpo.py
+    path:
+
+        grpo.py:1747  policy_generation.weight_synchronizer.init_communicator()
+        AttributeError: 'DynamoGeneration' object has no attribute 'worker_group'
+
+    Membership tracking is only meaningful where shards exist, so a backend without one
+    records None and every reconcile falls through to "nothing to do" -- which is exactly
+    how this method behaved before membership tracking was added.
+    """
+
+    @staticmethod
+    def _synchronizer(*, has_worker_group: bool):
+        from nemo_rl.weight_sync.collective_weight_synchronizer import (
+            CollectiveWeightSynchronizer,
+        )
+
+        sync = CollectiveWeightSynchronizer.__new__(CollectiveWeightSynchronizer)
+        generation = SimpleNamespace()
+        if has_worker_group:
+            generation.worker_group = SimpleNamespace(
+                dp_size=2, workers=[object(), object()]
+            )
+        sync._generation = generation
+        sync._train_cluster = SimpleNamespace(world_size=lambda: 2)
+        sync._built_membership = None
+        return sync
+
+    def test_a_backend_without_shards_records_no_membership(self):
+        sync = self._synchronizer(has_worker_group=False)
+        assert sync._desired_membership([], 2) is None
+
+    def test_and_its_reconcile_is_inert_rather_than_raising(self):
+        sync = self._synchronizer(has_worker_group=False)
+        assert sync.reconcile_communicator([], force=False) is False
+        assert sync.reconcile_communicator([0], force=True) is False
+
+    def test_a_sharded_backend_still_records_membership(self):
+        sync = self._synchronizer(has_worker_group=True)
+        membership = sync._desired_membership([], 2)
+        assert membership is not None
+        assert membership.train_world_size == 2

@@ -167,6 +167,41 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
     def is_stale(self) -> bool:
         return self._stale
 
+    def _desired_membership(
+        self, absent_shards: Sequence[int], train_world_size: int
+    ) -> Optional[RefitMembership]:
+        """The membership to track, or None for a backend that owns no DP worker group.
+
+        NOT every GenerationInterface has one. vLLM and TRT-LLM do; Dynamo, Megatron and
+        SGLang do not, and the interface declares nothing either way -- so reading
+        ``self._generation.worker_group`` assumes a vLLM shape that this synchronizer is
+        not entitled to assume. It holds a GenerationInterface, and Dynamo reaches it
+        through the ordinary non-colocated branch of the factory.
+
+        That assumption broke L1_Functional_Tests_Dynamo on the plain grpo.py path:
+
+            grpo.py:1747  policy_generation.weight_synchronizer.init_communicator()
+            AttributeError: 'DynamoGeneration' object has no attribute 'worker_group'
+
+        None means "this backend has no shards to track", which is the same thing an
+        unrecorded membership already meant: every reconcile falls through to "nothing to
+        do", exactly as it behaved before membership tracking existed. Re-admission is only
+        meaningful where shards exist.
+
+        Deliberately NOT mirrored on the reshard synchronizer. nccl_reshard is a vLLM-only
+        transport that REQUIRES a worker group, so a missing one there is a
+        misconfiguration that should fail loudly rather than silently degrade.
+        """
+        worker_group = getattr(self._generation, "worker_group", None)
+        if worker_group is None:
+            return None
+        return desired_membership(
+            absent_shards=absent_shards,
+            dp_size=worker_group.dp_size,
+            total_gen_workers=len(worker_group.workers),
+            train_world_size=train_world_size,
+        )
+
     def init_communicator(self) -> None:
         # prepare_refit_info is called before init_collective. This matches
         # distillation.py ordering. Neither call depends on the other today,
@@ -194,12 +229,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         )
         ray.get(futures_train + futures_inference)
         # Recorded so the first reconcile can tell "unchanged" from "never built".
-        self._built_membership = desired_membership(
-            absent_shards=[],
-            dp_size=self._generation.worker_group.dp_size,
-            total_gen_workers=len(self._generation.worker_group.workers),
-            train_world_size=train_world_size,
-        )
+        self._built_membership = self._desired_membership([], train_world_size)
 
     def _settle_budget_s(self) -> float:
         """How long to let stragglers unwind: their own deadline, plus a little.
@@ -236,12 +266,15 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         reload, and one path shared with ``init_communicator`` is exercised by every
         normal run instead of only after a failure.
         """
-        membership = desired_membership(
-            absent_shards=absent_shards,
-            dp_size=self._generation.worker_group.dp_size,
-            total_gen_workers=len(self._generation.worker_group.workers),
-            train_world_size=self._train_cluster.world_size(),
+        membership = self._desired_membership(
+            absent_shards, self._train_cluster.world_size()
         )
+        # A backend with no DP worker group has no membership to reconcile, and never had
+        # one to lose: nothing can be absent, so there is nothing to rebuild over. Returning
+        # False here is what this method did for every backend before membership tracking
+        # existed. See _desired_membership.
+        if membership is None:
+            return False
         # Compared against what was built, not against "is anything absent". Keyed off
         # the absent set alone this would return False the moment a restarted shard came
         # back, leaving it permanently excluded from a communicator it should rejoin.
@@ -250,11 +283,8 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         # everything, so "not recorded" is not "unknown", and treating it as a difference
         # would rebuild pointlessly on the very first refit of every run.
         if self._built_membership is None:
-            self._built_membership = desired_membership(
-                absent_shards=[],
-                dp_size=self._generation.worker_group.dp_size,
-                total_gen_workers=len(self._generation.worker_group.workers),
-                train_world_size=membership.train_world_size,
+            self._built_membership = self._desired_membership(
+                [], membership.train_world_size
             )
         # `force` is how the recovery path says the communicator is GONE rather than
         # merely unchanged: after an abort the membership is identical and the
