@@ -1208,7 +1208,7 @@ class DistillationLossFn(LossFunction):
             # reported loss with its zero. Falls back to the batch dimension
             # when there is no mask, where every sample is valid by definition.
             "num_valid_samples": (
-                data["sample_mask"].sum().item()
+                torch.count_nonzero(data["sample_mask"]).item()
                 if "sample_mask" in data
                 else data["input_ids"].shape[0]
             ),
@@ -1347,7 +1347,7 @@ class MseValueLossFn(LossFunction):
             "returns_sq_mean": returns_sq_mean,
             "residual_sq_mean": residual_sq_mean,
             # See DistillationLossFn: the critic's workers gate on this too.
-            "num_valid_samples": sample_mask.sum().item(),
+            "num_valid_samples": torch.count_nonzero(sample_mask).item(),
         }
 
         return loss, metrics
@@ -1731,7 +1731,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             "kl_loss_scale": kl_scale.item(),
             "accuracy": accuracy.item(),
             # See DistillationLossFn.
-            "num_valid_samples": data["sample_mask"].sum().item(),
+            "num_valid_samples": torch.count_nonzero(data["sample_mask"]).item(),
         }
         metrics.update(per_teacher_metrics)
         return loss, metrics
