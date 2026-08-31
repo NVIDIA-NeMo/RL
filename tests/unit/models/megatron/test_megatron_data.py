@@ -37,6 +37,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 from tests.unit.models.megatron.megatron_data_actors import (
     GetPackSequenceParametersTestActor,
     PackSequencesTestActor,
@@ -558,7 +559,7 @@ class TestProcessMicrobatch:
             cu_seqlens_padded,
         ) = _pack_sequences_for_megatron(
             input_ids,
-            seq_lengths,
+            to_cpu_int_tuple(seq_lengths),
             pad_individual_seqs_to_multiple_of=4,
             cp_size=1,
         )
@@ -1748,7 +1749,7 @@ def test_shard_routed_experts_for_cp_matches_input_ids_zigzag(cp_size):
         cu_seqlens_padded,
     ) = _pack_sequences_for_megatron(
         input_ids,
-        seq_lengths,
+        to_cpu_int_tuple(seq_lengths),
         pad_individual_seqs_to_multiple_of=pad_to_multiple,
         cp_rank=0,
         cp_size=cp_size,
