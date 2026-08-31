@@ -1264,6 +1264,30 @@ class TQReplayBuffer:
         Raises:
             ValueError: group_id has no live slot (removed or never reserved).
         """
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the controller data-plane "
+                "checkpoint barrier before committing finalized groups"
+            )
+        async with self._data_plane_checkpoint_barrier.mutation():
+            return self._commit_finalized_unlocked(
+                group_id,
+                meta,
+                group_min_wv,
+                group_max_wv,
+                staging_keys=staging_keys,
+            )
+
+    def _commit_finalized_unlocked(
+        self,
+        group_id: str,
+        meta: KVBatchMeta,
+        group_min_wv: int,
+        group_max_wv: int,
+        *,
+        staging_keys: Optional[list[str]] = None,
+    ) -> KVBatchMeta:
+        """Fill the slot while the caller holds a barrier mutation slot."""
         try:
             idx = self._group_ids.index(group_id)
         except ValueError:
