@@ -94,8 +94,6 @@ def test_the_error_names_the_backend_that_was_configured():
 
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])
 def test_no_transport_gets_past_the_guard(backend):
-    """The supported pairing. Setup fails later on the mocks, which is what
-    keeps this from passing vacuously if the guard were made unconditional."""
-    with pytest.raises(Exception) as excinfo:
+    """The supported pairing reaches the next validation on the mock config."""
+    with pytest.raises(KeyError, match="megatron_cfg"):
         _run(backend, None)
-    assert "refit_transport" not in str(excinfo.value)
