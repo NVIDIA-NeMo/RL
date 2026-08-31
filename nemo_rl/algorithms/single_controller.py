@@ -1143,36 +1143,39 @@ class SingleControllerActor:
     ) -> None:
         """Clear known request ownership after a pre-publication/known outcome."""
         errors: list[BaseException] = []
-        try:
-            await self._call_dp(
-                "clear_samples",
-                sample_ids=list(request.rollout_ids),
-                partition_id=self._partition_id,
-            )
-        except Exception as error:
-            errors.append(
-                RuntimeError(
-                    "pre-publication canonical cleanup failed for "
-                    f"group={request.group_id!r}, ids={request.rollout_ids!r}"
-                )
-            )
-            errors[-1].__cause__ = error
-        staging_keys = self._request_staging_keys(request)
-        if staging_keys:
+        # One shared mutation slot for both clears: they run outside the train
+        # pump task, so a live data-plane checkpoint must not interleave them.
+        async with self._data_plane_checkpoint_barrier.mutation():
             try:
                 await self._call_dp(
                     "clear_samples",
-                    sample_ids=staging_keys,
-                    partition_id=self._master_config.token_capture.staging_partition,
+                    sample_ids=list(request.rollout_ids),
+                    partition_id=self._partition_id,
                 )
             except Exception as error:
                 errors.append(
                     RuntimeError(
-                        "pre-publication staging cleanup failed for "
-                        f"group={request.group_id!r}, keys={staging_keys!r}"
+                        "pre-publication canonical cleanup failed for "
+                        f"group={request.group_id!r}, ids={request.rollout_ids!r}"
                     )
                 )
                 errors[-1].__cause__ = error
+            staging_keys = self._request_staging_keys(request)
+            if staging_keys:
+                try:
+                    await self._call_dp(
+                        "clear_samples",
+                        sample_ids=staging_keys,
+                        partition_id=self._master_config.token_capture.staging_partition,
+                    )
+                except Exception as error:
+                    errors.append(
+                        RuntimeError(
+                            "pre-publication staging cleanup failed for "
+                            f"group={request.group_id!r}, keys={staging_keys!r}"
+                        )
+                    )
+                    errors[-1].__cause__ = error
         if errors:
             raise BaseExceptionGroup(
                 f"known-outcome cleanup failed for group {request.group_id}",
