@@ -41,7 +41,9 @@ assert_grep() {
 cd "$PROJECT_ROOT"
 uv run coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PROJECT_ROOT/nemo_rl" \
     "$PROJECT_ROOT/examples/run_grpo.py" \
-    --config "$PROJECT_ROOT/examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation.yaml" \
+    --config "$PROJECT_ROOT/examples/configs/grpo_math_1B.yaml" \
+    policy.model_name=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16 \
+    policy.tokenizer.name=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
     grpo.max_num_steps=2 \
@@ -52,10 +54,15 @@ uv run coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PR
     policy.logprob_batch_size=1 \
     policy.max_total_sequence_length=512 \
     policy.make_sequence_length_divisible_by=32 \
+    policy.dtensor_cfg.enabled=false \
+    policy.sequence_packing.enabled=false \
+    policy.megatron_cfg.enabled=true \
+    policy.megatron_cfg.bias_activation_fusion=false \
     ++policy.megatron_cfg.train_iters=2 \
     policy.megatron_cfg.tensor_model_parallel_size=1 \
     policy.megatron_cfg.expert_model_parallel_size=2 \
     policy.megatron_cfg.sequence_parallel=false \
+    policy.megatron_cfg.moe_router_dtype=fp32 \
     policy.megatron_cfg.activation_checkpointing=true \
     policy.megatron_cfg.fp8_cfg.enabled=false \
     policy.megatron_cfg.optimizer.optimizer_cpu_offload=true \
@@ -65,11 +72,11 @@ uv run coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PR
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.gpus_per_node=2 \
     policy.generation.colocated.resources.num_nodes=1 \
-    policy.generation.mcore_generation_config.transformer_impl=inference_optimized \
-    policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
-    policy.generation.mcore_generation_config.expert_model_parallel_size=2 \
-    policy.generation.mcore_generation_config.sequence_parallel=false \
-    policy.generation.mcore_generation_config.inference_grouped_gemm_backend=torch \
+    ++policy.generation.mcore_generation_config.transformer_impl=inference_optimized \
+    ++policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
+    ++policy.generation.mcore_generation_config.expert_model_parallel_size=2 \
+    ++policy.generation.mcore_generation_config.sequence_parallel=false \
+    ++policy.generation.mcore_generation_config.inference_grouped_gemm_backend=torch \
     ++policy.generation.mcore_generation_config.inference_moe_token_dispatcher_type=nvls \
     policy.generation.mcore_generation_config.cuda_graph_impl=local \
     policy.generation.mcore_generation_config.inference_cuda_graph_scope=block \
