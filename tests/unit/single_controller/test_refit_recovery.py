@@ -483,21 +483,6 @@ class TestTheControllerStopsWaitingForASilentRank:
         never.set()
         assert elapsed < 10.0, "it must give up, not wait on a rank that never answers"
 
-    def test_a_generation_lifecycle_call_uses_the_same_bound(self):
-        never = threading.Event()
-        ctrl = self._ctrl(0.1, lambda **_: None)
-        ctrl._REFIT_UNWIND_GRACE_S = 0.1
-
-        with pytest.raises(RefitAborted, match="generation pause before refit"):
-            asyncio.run(
-                ctrl._run_refit_call_within(
-                    never.wait,
-                    what="generation pause before refit",
-                )
-            )
-
-        never.set()
-
     def test_giving_up_is_recognised_as_an_abort(self):
         """So it lands in the existing `except (RefitAborted, RayActorError)` recovery."""
         never = threading.Event()

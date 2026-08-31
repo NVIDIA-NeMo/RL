@@ -2910,27 +2910,25 @@ class SingleControllerActor:
     _REFIT_UNWIND_GRACE_S = 60.0
 
     def _refit_await_budget_s(self) -> Optional[float]:
-        """How long to wait for a refit lifecycle call, or None to wait forever."""
+        """How long to wait for the refit before giving up, or None to wait forever."""
         deadline = self._async_cfg.generation_fleet_health.refit_timeout_s
         return None if deadline is None else deadline + self._REFIT_UNWIND_GRACE_S
 
-    async def _run_refit_call_within(
-        self, call: Callable[[], Any], *, what: str
-    ) -> Any:
-        """Run a blocking refit lifecycle call off-loop with the refit deadline.
+    async def _sync_weights_within(self, kv_scales, what: str) -> None:
+        """Run the refit off-loop, and stop waiting if it outlives the deadline.
 
-        WHY THIS IS NEEDED ON TOP OF EVERY WORKER-SIDE BOUND. A frozen-but-alive rank is
-        a Ray actor that never answers, and Ray puts no timeout on an actor call. Pause,
-        weight sync, resume, and fallback cache invalidation all cross that boundary, so
-        every one must use this wrapper. Job 6508251 measured the old end state: the
-        deadline fired, the workers aborted, the trainers returned, every actor was idle
-        -- and the run still sat for 1800s because the controller await had no bound.
+        WHY THIS IS NEEDED ON TOP OF EVERY WORKER-SIDE BOUND. A frozen-but-alive rank is a
+        Ray actor that never answers, and Ray puts no timeout on an actor call. So the
+        controller's await never resolves however well the workers behave. Job 6508251
+        measured that end state: the deadline fired, the workers aborted, the trainers
+        returned, every actor was idle -- and the run still sat for 1800s because this
+        await had no bound. It is the last unbounded wait on the refit path, and unlike the
+        others it is not in NCCL or CUDA.
 
-        Timing out raises RefitAborted. The weight-sync caller routes that through its
-        existing recovery path; pause/resume deliberately remain fail-stop because a
-        partial multi-engine lifecycle call leaves the controller unable to prove which
-        preserved requests are paused or cache-cleared. In every case the dispatch gate
-        stays closed rather than allowing requests into uncertain engine state.
+        Timing out raises RefitAborted so this joins the existing recovery path rather than
+        inventing a second one: the caller reconciles membership and retries once. By then
+        the fleet probe has usually condemned the silent shard, so the rebuild can exclude
+        it and the retry may genuinely succeed.
 
         A DEDICATED DAEMON THREAD, not asyncio.to_thread. to_thread runs on the default
         ThreadPoolExecutor, whose workers are non-daemon and are joined at interpreter
@@ -2938,14 +2936,18 @@ class SingleControllerActor:
         a wedge in the refit for a wedge on the way out. asyncio.wait_for cannot cancel a
         running thread either way; this only controls whether the orphan can block exit.
 
-        The orphan is a real consequence, not a free win. A timed-out call can leave a
-        thread parked on the old Ray future. The thread is therefore a daemon: bounded
-        failure is preferable to trading a runtime wedge for an interpreter-shutdown
-        wedge.
+        The orphan is a real consequence, not a free win. If the retry succeeds the run
+        continues with a thread still parked inside the old sync_weights, and if that rank
+        were ever resumed it would wake up holding a communicator that has since been
+        replaced. Acceptable against a guaranteed 30-minute stall, and it is why this path
+        is bounded-failure-first rather than resume-and-forget.
         """
         budget_s = self._refit_await_budget_s()
         if budget_s is None:
-            return await asyncio.to_thread(call)
+            await asyncio.to_thread(
+                self._weight_synchronizer.sync_weights, kv_scales=kv_scales
+            )
+            return
 
         loop = asyncio.get_running_loop()
         settled: asyncio.Future = loop.create_future()
@@ -2958,33 +2960,23 @@ class SingleControllerActor:
 
         def _run() -> None:
             try:
-                result = call()
+                self._weight_synchronizer.sync_weights(kv_scales=kv_scales)
             except BaseException as exc:  # noqa: BLE001 - re-raised on the loop below
                 loop.call_soon_threadsafe(_settle, settled.set_exception, exc)
             else:
-                loop.call_soon_threadsafe(_settle, settled.set_result, result)
+                loop.call_soon_threadsafe(_settle, settled.set_result, None)
 
-        thread_label = what.replace(" ", "-")
-        threading.Thread(
-            target=_run, name=f"sc-refit-{thread_label}", daemon=True
-        ).start()
+        threading.Thread(target=_run, name=f"sc-refit-{what}", daemon=True).start()
 
         try:
-            return await asyncio.wait_for(settled, budget_s)
+            await asyncio.wait_for(settled, budget_s)
         except asyncio.TimeoutError:
             raise RefitAborted(
-                f"{what} did not return within {budget_s}s. A generation rank is most "
-                "likely alive but not answering -- a Ray actor call has no timeout of "
-                "its own, so waiting here is unbounded. Giving up with rollout dispatch "
-                "still paused."
+                f"the {what} refit did not return within {budget_s}s. Every worker-side "
+                "bound has passed, so a generation rank is most likely alive but not "
+                "answering -- a Ray actor call has no timeout of its own, so waiting here "
+                "is unbounded. Giving up so the fleet can be reconciled and retried."
             ) from None
-
-    async def _sync_weights_within(self, kv_scales, what: str) -> None:
-        """Run one weight sync through the bounded refit lifecycle wrapper."""
-        await self._run_refit_call_within(
-            partial(self._weight_synchronizer.sync_weights, kv_scales=kv_scales),
-            what=f"the {what} refit",
-        )
 
     async def _sync_weights(
         self,
@@ -3058,12 +3050,9 @@ class SingleControllerActor:
 
         clear_cache = self._async_cfg.recompute_kv_cache_after_weight_updates
         print("⏸️ Requesting generation pause before refit", flush=True)
-        generation_paused_for_refit = await self._run_refit_call_within(
-            partial(
-                self._gen.pause_generation_for_refit,
-                clear_cache=clear_cache,
-            ),
-            what="generation pause before refit",
+        generation_paused_for_refit = await asyncio.to_thread(
+            self._gen.pause_generation_for_refit,
+            clear_cache=clear_cache,
         )
         if generation_paused_for_refit:
             print(
@@ -3120,9 +3109,8 @@ class SingleControllerActor:
             self._promote_refit_shards()
 
         print("▶️ Requesting generation resume after refit", flush=True)
-        generation_resumed_after_refit = await self._run_refit_call_within(
-            self._gen.resume_generation_after_refit,
-            what="generation resume after refit",
+        generation_resumed_after_refit = await asyncio.to_thread(
+            self._gen.resume_generation_after_refit
         )
         if generation_paused_for_refit and not generation_resumed_after_refit:
             raise RuntimeError(
@@ -3134,10 +3122,7 @@ class SingleControllerActor:
             # time. Other backends must explicitly confirm equivalent engine-side cache
             # handling; merely clearing reusable prefix entries does not invalidate KV
             # blocks still owned by running requests.
-            invalidated = await self._run_refit_call_within(
-                self._gen.invalidate_kv_cache,
-                what="generation KV-cache invalidation after refit",
-            )
+            invalidated = await asyncio.to_thread(self._gen.invalidate_kv_cache)
             if not invalidated:
                 raise NotImplementedError(
                     "recompute_kv_cache_after_weight_updates=True requires the "
