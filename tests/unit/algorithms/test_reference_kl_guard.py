@@ -26,7 +26,7 @@ and a MemoryTracker, so mock arguments reach it.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -116,10 +116,11 @@ def test_a_nonzero_kl_penalty_with_skipped_reference_logprobs_raises(call, block
     ids=["sync-ppo", "sync-grpo"],
 )
 def test_the_supported_pairing_gets_past_the_guard(call, block):
-    """kl_penalty=0 is the combination the guard exists to allow. It must not
-    raise ValueError here -- these mocks fail later, which is fine and is what
-    keeps the test from passing vacuously if the guard were made
-    unconditional."""
-    with pytest.raises(Exception) as excinfo:
-        call(_master_config(block, kl_penalty=0.0))
-    assert "reference_policy_kl_penalty=0" not in str(excinfo.value)
+    """kl_penalty=0 reaches the first supported-path side effect."""
+
+    class ReachedSupportedPath(Exception):
+        pass
+
+    with patch("builtins.print", side_effect=ReachedSupportedPath):
+        with pytest.raises(ReachedSupportedPath):
+            call(_master_config(block, kl_penalty=0.0))
