@@ -58,11 +58,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # KV cache lifecycle across suspend/resume:
     # - "persist": cache stays allocated; CUDA graphs remain valid (default)
     # - "offload": cache is moved off-GPU between iterations
-    #
-    # The third mcore value, "recompute" (drop + rebuild on resume), must be set via
-    # `grpo.async_grpo.recompute_kv_cache_after_weight_updates=true`.
-    # TODO: Unify `kv_cache_management_mode` and `recompute_kv_cache_after_weight_updates`.
-    kv_cache_management_mode: Literal["persist", "offload"]
+    # - "recompute": cache is dropped and rebuilt on resume
+    kv_cache_management_mode: Literal["persist", "offload", "recompute"]
 
     logging_step_interval: NotRequired[int]
     # Whether MCore returns selected-token log-probs before or after sampling
@@ -84,10 +81,18 @@ class MCoreGenerationConfig(GenerationConfig):
 def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]:
     """The `megatron_cfg` a dedicated inference model runs with."""
     generation_config = cast(MCoreGenerationConfig, policy_config["generation"])
+    overrides = dict(generation_config.get("mcore_generation_config") or {})
+    explicit_cp = overrides.pop("context_parallel_size", None)
+    if explicit_cp is not None and explicit_cp != 1:
+        raise ValueError(
+            "Megatron generation does not support context parallelism: remove "
+            "policy.generation.mcore_generation_config.context_parallel_size or set it to 1."
+        )
     merged: dict[str, Any] = {
         **cast(dict[str, Any], policy_config["megatron_cfg"]),
-        **(generation_config.get("mcore_generation_config") or {}),
+        **overrides,
         "activation_checkpointing": False,
+        "context_parallel_size": 1,
     }
     # inference_optimized layers hard-require SP with TP>1. Raise with the
     # config key: the colocated build bypasses validate_and_set_config, so this
@@ -114,13 +119,12 @@ def dedicated_inference_megatron_cfg(
     Colocated Megatron generation shares the training model unless the resolved
     inference layout or `transformer_impl` differs from training; then the worker
     builds a second model and reshards into it on every wake. Inference never
-    uses CP, so CP is pinned to 1 (CP>1 training therefore always differs).
+    uses CP, and CP is already pinned to 1 (CP>1 training therefore always differs).
 
     Returns None when the resolved config matches training (reshardless:
     generate directly on the shared training model).
     """
     inference_mcfg = merged_inference_megatron_cfg(policy_config)
-    inference_mcfg["context_parallel_size"] = 1
 
     train_mcfg = cast(dict[str, Any], policy_config["megatron_cfg"])
     layout_keys = (

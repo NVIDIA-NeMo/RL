@@ -128,6 +128,9 @@ checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-single-controller
   metric_name: null
+  # Include native TQ state and the metadata-only replay index. A save failure
+  # aborts checkpoint finalization.
+  save_data_plane: true
 
 policy:
   dtensor_cfg:

@@ -14,18 +14,33 @@
 
 import asyncio
 import gc
+import hashlib
+import json
+import math
 import statistics
 import threading as _threading
 import uuid
 from collections import Counter
-from collections.abc import Mapping
-from typing import Any, Awaitable, Callable, Iterable, Optional
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
+from numbers import Integral, Real
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Iterable,
+    Literal,
+    NotRequired,
+    Optional,
+    TypedDict,
+)
 
 import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
@@ -35,6 +50,207 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 from nemo_rl.utils.r3_trace import trace_rollout_payload
+
+DATA_PLANE_CHECKPOINT_DIR = "data_plane"
+REPLAY_BUFFER_METADATA_FILENAME = "replay_buffer_metadata.pt"
+LEGACY_REPLAY_BUFFER_FILENAME = "replay_buffer.pt"
+REPLACEMENT_RESERVE_FILENAME = "replacement_reserve.pt"
+REPLAY_BUFFER_METADATA_SCHEMA_VERSION = 1
+REPLAY_BUFFER_METADATA_STORAGE: Literal["tq_checkpoint"] = "tq_checkpoint"
+
+# These TypedDicts describe the versioned, plain-mapping checkpoint wire
+# format. They are intentionally not dataclass instances: persisting a
+# dataclass would couple recovery to its Python import path and class layout.
+# Runtime objects such as KVBatchMeta remain explicitly represented as fields
+# inside this schema.
+
+
+class TQReplayGroupMetadata(TypedDict):
+    """Controller-local index for one training-ready group stored in TQ."""
+
+    meta: KVBatchMeta
+    start_weight: int
+    end_weight: int
+    target_step: Optional[int]
+    group_id: str
+
+
+class TQReplayMetadataState(TypedDict):
+    """Versioned metadata-only replay index paired with a TQ snapshot."""
+
+    schema_version: int
+    storage: Literal["tq_checkpoint"]
+    partition_id: str
+    saved_capacity: int
+    manifest_digest: str
+    groups: list[TQReplayGroupMetadata]
+
+
+class DataPlaneCheckpointMetadata(TypedDict):
+    """SC metadata envelope stored with a native data-plane checkpoint.
+
+    The replay fields are present together in ``authoritative`` mode and
+    absent in ``shadow`` mode.
+    """
+
+    data_plane_checkpoint_schema_version: int
+    single_controller_train_steps: int
+    single_controller_trainer_version: int
+    single_controller_epoch: int
+    partition_id: str
+    sampler_name: str
+    mode: Literal["authoritative", "shadow"]
+    replay_metadata_schema_version: NotRequired[int]
+    replay_manifest_digest: NotRequired[str]
+    replay_group_count: NotRequired[int]
+    rollout_recovery_schema_version: NotRequired[int]
+    rollout_recovery_payload_sha256: NotRequired[str]
+    rollout_recovery_group_count: NotRequired[int]
+
+
+def _canonical_manifest_value(value: Any, *, path: str) -> Any:
+    """Return a deterministic JSON value or reject unsupported metadata."""
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, Real):
+        float_value = float(value)
+        if not math.isfinite(float_value):
+            raise TypeError(f"Replay metadata at {path} must be finite")
+        return float_value
+    if isinstance(value, Mapping):
+        canonical: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"Replay metadata at {path} has non-string key {key!r}")
+            canonical[key] = _canonical_manifest_value(
+                item,
+                path=f"{path}.{key}",
+            )
+        return canonical
+    if isinstance(value, (list, tuple)):
+        return [
+            _canonical_manifest_value(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    raise TypeError(
+        f"Replay metadata at {path} has unsupported type "
+        f"{type(value).__name__}; expected JSON-compatible primitive values"
+    )
+
+
+def replay_manifest_digest(groups: list[TQReplayGroupMetadata]) -> str:
+    """Return a stable digest binding replay metadata to a TQ checkpoint."""
+    digest_input = [
+        {
+            "group_id": group["group_id"],
+            "start_weight": group["start_weight"],
+            "end_weight": group["end_weight"],
+            "target_step": group["target_step"],
+            "meta": {
+                "partition_id": group["meta"].partition_id,
+                "task_name": group["meta"].task_name,
+                "sample_ids": list(group["meta"].sample_ids),
+                "fields": (
+                    list(group["meta"].fields)
+                    if group["meta"].fields is not None
+                    else None
+                ),
+                "sequence_lengths": (
+                    list(group["meta"].sequence_lengths)
+                    if group["meta"].sequence_lengths is not None
+                    else None
+                ),
+                "tags": _canonical_manifest_value(
+                    group["meta"].tags,
+                    path=f"groups[{group_index}].meta.tags",
+                ),
+                "extra_info": _canonical_manifest_value(
+                    group["meta"].extra_info,
+                    path=f"groups[{group_index}].meta.extra_info",
+                ),
+            },
+        }
+        for group_index, group in enumerate(groups)
+    ]
+    encoded = json.dumps(
+        digest_input,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class DataPlaneMutationCut:
+    """Live capability proving code runs inside a data-plane barrier cut."""
+
+    __slots__ = ("_barrier", "_live")
+
+    def __init__(self, barrier: "DataPlaneCheckpointBarrier") -> None:
+        self._barrier = barrier
+        self._live = True
+
+    def require_live(self) -> None:
+        """Fail when a mutation tries to reuse an absent or expired cut."""
+        if not self._live:
+            raise RuntimeError("data-plane mutation cut is no longer active")
+
+    def _invalidate(self) -> None:
+        self._live = False
+
+
+class DataPlaneCheckpointBarrier:
+    """Allow concurrent mutations while giving live checkpoints exclusivity.
+
+    At most one checkpoint holder is active. New mutations queue behind it,
+    and a checkpoint waits for all active mutations before yielding. Every
+    live canonical TQ commit/clear and native save must use this barrier so the
+    snapshot and controller replay index describe the same rows.
+    """
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._checkpoint_active = False
+        self._active_mutations = 0
+
+    @asynccontextmanager
+    async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
+        """Yield a live mutation capability after any active checkpoint exits."""
+        async with self._condition:
+            await self._condition.wait_for(lambda: not self._checkpoint_active)
+            self._active_mutations += 1
+        cut = DataPlaneMutationCut(self)
+        try:
+            yield cut
+        finally:
+            cut._invalidate()
+            async with self._condition:
+                self._active_mutations -= 1
+                if self._active_mutations == 0:
+                    self._condition.notify_all()
+
+    @asynccontextmanager
+    async def checkpoint(self) -> AsyncIterator[DataPlaneMutationCut]:
+        """Yield a live capability after blocking and draining all mutations."""
+        async with self._condition:
+            await self._condition.wait_for(lambda: not self._checkpoint_active)
+            self._checkpoint_active = True
+            try:
+                await self._condition.wait_for(lambda: self._active_mutations == 0)
+            except BaseException:
+                self._checkpoint_active = False
+                self._condition.notify_all()
+                raise
+        cut = DataPlaneMutationCut(self)
+        try:
+            yield cut
+        finally:
+            cut._invalidate()
+            async with self._condition:
+                self._checkpoint_active = False
+                self._condition.notify_all()
 
 
 class PostWriteEnrichmentError(RuntimeError):
@@ -778,9 +994,30 @@ class TQReplayBuffer:
         self.target_step_list: list[Optional[int]] = []
         self.ready_list: list[bool] = []
         self._group_ids: list[str] = []
+        self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         self._post_write_enricher: Optional[
             Callable[[KVBatchMeta, PromptGroupRecord], Awaitable[KVBatchMeta]]
         ] = None
+
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        """Bind the controller's shared checkpoint/mutation barrier once.
+
+        A private fallback barrier would not coordinate with controller-owned
+        saves and clears, so destructive operations fail loudly until the SC
+        actor supplies its barrier.
+        """
+        if self._data_plane_checkpoint_barrier is not None:
+            raise RuntimeError("data-plane checkpoint barrier is already configured")
+        self._data_plane_checkpoint_barrier = barrier
+
+    @property
+    def data_plane_checkpoint_barrier(self) -> DataPlaneCheckpointBarrier:
+        """Return the shared barrier used by controller and post-commit ownership."""
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError("data-plane checkpoint barrier is not configured")
+        return self._data_plane_checkpoint_barrier
 
     def set_post_write_enricher(
         self,
@@ -801,7 +1038,9 @@ class TQReplayBuffer:
         Args:
             weight_version: Weight version stamped on the slot.
             target_step: Training step this slot targets; only consulted by StalenessSampler.force_in_order.
-            group_id: Per-group sample_id prefix; defaults to a fresh uuid4.
+            group_id: Pre-minted logical group ID and sample-ID prefix. The
+                checkpoint-enabled lineage path always supplies this. ``None``
+                creates a fresh UUID only for untracked callers.
 
         Returns:
             group_id used by the matching commit.
@@ -846,9 +1085,17 @@ class TQReplayBuffer:
                 f"commit called with unknown group_id={group_id!r}; "
                 f"reserve() must precede commit() (or the slot was already removed)"
             )
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the controller data-plane "
+                "checkpoint barrier before committing samples"
+            )
         train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
         sample_ids, fields, tags = pack_payload(
-            train_batch, weight_version=start_weight_version, group_id=group_id
+            train_batch,
+            weight_version=start_weight_version,
+            group_id=group_id,
+            prompt_idx=record.prompt_idx,
         )
         if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
             raise RuntimeError(
@@ -858,56 +1105,56 @@ class TQReplayBuffer:
                 "the async message-log flattening path."
             )
         trace_rollout_payload(keys=sample_ids, data=train_batch)
-        try:
-            await self._call_dp(
-                "put_samples",
-                sample_ids=sample_ids,
-                partition_id=self._partition_id,
-                fields=fields,
-                tags=tags,
-            )
-
-            # mirrors kv_first_write
-            lengths = train_batch["input_lengths"]
-            meta = KVBatchMeta(
-                partition_id=self._partition_id,
-                task_name="train",
-                sample_ids=list(sample_ids),
-                fields=list(fields.keys()),
-                sequence_lengths=[int(s) for s in lengths.tolist()],
-                tags=[dict(t) for t in tags],
-            )
-
-            if self._post_write_enricher is not None:
-                try:
-                    meta = await self._post_write_enricher(meta, record)
-                except Exception as error:
-                    raise PostWriteEnrichmentError(
-                        f"post-write enrichment failed for group_id={group_id!r}"
-                    ) from error
-
-            idx = self._group_ids.index(group_id)
-            self.meta_list[idx] = meta
-            self.end_weight_list[idx] = end_weight_version
-            self.ready_list[idx] = True
-            return meta
-        except BaseException as commit_error:
-            # put_samples may have written rows before raising. Roll back by the
-            # deterministic IDs known here; the caller removes the reserved slot.
+        async with self._data_plane_checkpoint_barrier.mutation():
             try:
-                await self._call_dp(
-                    "clear_samples",
-                    sample_ids=list(sample_ids),
+                await call_data_plane(
+                    self._dp_client,
+                    "put_samples",
+                    sample_ids=sample_ids,
                     partition_id=self._partition_id,
+                    fields=fields,
+                    tags=tags,
                 )
-            except BaseException as rollback_error:
-                if isinstance(commit_error, asyncio.CancelledError):
-                    raise commit_error from rollback_error
-                raise BaseExceptionGroup(
-                    f"commit and rollback both failed for group_id={group_id!r}",
-                    [commit_error, rollback_error],
+
+                # mirrors kv_first_write
+                lengths = train_batch["input_lengths"]
+                meta = KVBatchMeta(
+                    partition_id=self._partition_id,
+                    task_name="train",
+                    sample_ids=list(sample_ids),
+                    fields=list(fields.keys()),
+                    sequence_lengths=[int(s) for s in lengths.tolist()],
+                    tags=[dict(t) for t in tags],
                 )
-            raise
+
+                if self._post_write_enricher is not None:
+                    try:
+                        meta = await self._post_write_enricher(meta, record)
+                    except Exception as error:
+                        raise PostWriteEnrichmentError(
+                            f"post-write enrichment failed for group_id={group_id!r}"
+                        ) from error
+
+                idx = self._group_ids.index(group_id)
+                self.meta_list[idx] = meta
+                self.end_weight_list[idx] = end_weight_version
+                self.ready_list[idx] = True
+                return meta
+            except BaseException as commit_error:
+                # put_samples may have written rows before raising. Roll back by the
+                # deterministic IDs while retaining the barrier mutation slot.
+                try:
+                    await self._clear_samples_unlocked(
+                        sample_ids=list(sample_ids),
+                    )
+                except BaseException as rollback_error:
+                    if isinstance(commit_error, asyncio.CancelledError):
+                        raise commit_error from rollback_error
+                    raise BaseExceptionGroup(
+                        f"commit and rollback both failed for group_id={group_id!r}",
+                        [commit_error, rollback_error],
+                    )
+                raise
 
     async def remove_group(self, group_id: str, *, remove_in_dp: bool = False) -> int:
         """Remove the live slot identified by ``group_id``.
@@ -922,11 +1169,17 @@ class TQReplayBuffer:
         Raises:
             ValueError: ``group_id`` has no live slot.
         """
-        try:
-            idx = self._group_ids.index(group_id)
-        except ValueError as error:
-            raise ValueError(f"unknown group_id={group_id!r}") from error
-        return await self.remove([idx], remove_in_dp=remove_in_dp)
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the controller data-plane "
+                "checkpoint barrier before removing a group"
+            )
+        async with self._data_plane_checkpoint_barrier.mutation():
+            try:
+                idx = self._group_ids.index(group_id)
+            except ValueError as error:
+                raise ValueError(f"unknown group_id={group_id!r}") from error
+            return await self._remove_unlocked([idx], clear_data_plane=remove_in_dp)
 
     async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
         """Drop entries at the given indices and optionally clear them from DataPlane.
@@ -940,14 +1193,24 @@ class TQReplayBuffer:
         """
         if len(idxs) == 0:
             return 0
-
-        drop_idxs = sorted(idxs, reverse=True)
-        if drop_idxs[0] >= len(self.meta_list):
-            raise IndexError(
-                f"TQReplayBuffer.remove: indices out of range: {drop_idxs[0]}; "
-                f"size={len(self.meta_list)}"
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the controller data-plane "
+                "checkpoint barrier before removing groups"
             )
+        async with self._data_plane_checkpoint_barrier.mutation():
+            drop_idxs = sorted(idxs, reverse=True)
+            if drop_idxs[0] >= len(self.meta_list):
+                raise IndexError(
+                    f"TQReplayBuffer.remove: indices out of range: {drop_idxs[0]}; "
+                    f"size={len(self.meta_list)}"
+                )
+            return await self._remove_unlocked(drop_idxs, clear_data_plane=remove_in_dp)
 
+    async def _remove_unlocked(
+        self, drop_idxs: list[int], *, clear_data_plane: bool
+    ) -> int:
+        """Remove validated indices while the caller owns any required lock."""
         dropped_sample_ids: list[str] = []
         for i in drop_idxs:
             meta = self.meta_list[i]
@@ -960,72 +1223,52 @@ class TQReplayBuffer:
             del self.ready_list[i]
             del self._group_ids[i]
 
-        if remove_in_dp:
-            await self._call_dp(
-                "clear_samples",
+        if clear_data_plane:
+            await self._clear_samples_unlocked(
                 sample_ids=dropped_sample_ids,
-                partition_id=self._partition_id,
             )
 
         return len(drop_idxs)
 
-    async def state_dict(self, *, saved_capacity: int) -> dict[str, Any]:
-        """Serialize ready groups (meta + DataPlane payloads) for checkpointing.
+    def metadata_state_dict(self, *, saved_capacity: int) -> TQReplayMetadataState:
+        """Capture the controller index for ready groups without tensor payloads.
 
-        Snapshots the ready slots synchronously on the event loop first, then
-        fetches each group's rows from the DataPlane. Unready reservations are
-        in-flight rollouts and are dropped, matching legacy semantics. The
-        snapshot stays consistent during the async fetch: concurrent commits
-        only append/flip *other* slots, and the train pump — the only
-        remover — is the caller itself; groups committed mid-save land in the
-        next checkpoint.
-
-        Args:
-            saved_capacity: max_buffered_rollouts at save time, recorded so
-                load_state_dict can report capacity changes across restarts.
-
-        Returns:
-            Envelope: ``{"partition_id": ..., "saved_capacity": ...,
-            "groups": [{"meta", "start_weight", "end_weight", "target_step",
-            "group_id", "fields_data"}, ...]}``.
+        The caller must hold the exclusive side of the shared data-plane
+        checkpoint barrier through this capture and the matching TQ save.
+        Commits and destructive clears use shared mutation slots, so the replay
+        index and native snapshot describe one exact set of training-ready groups.
+        Every operation that mutates the canonical rollout partition or its
+        controller-local replay membership must either participate in that
+        barrier across the complete publish/index or clear/remove transition,
+        or run in the same asyncio task as the checkpoint save. The advantage
+        stage relies on the latter: it and ``_save_checkpoint`` both live in
+        ``_train_pump``, so they cannot interleave. Any new writer outside
+        ``_train_pump`` -- including future finalizer paths -- must take a
+        mutation slot; canonical writes are not required to originate
+        specifically from :meth:`commit`.
+        In-flight reservations are intentionally omitted.
         """
-        snapshot: list[tuple[KVBatchMeta, int, int, Optional[int], str]] = []
+        groups: list[TQReplayGroupMetadata] = []
         for i, ready in enumerate(self.ready_list):
             if not ready:
                 continue
             meta = self.meta_list[i]
             assert meta is not None  # commit sets meta before ready=True
-            snapshot.append(
-                (
-                    meta,
-                    self.start_weight_list[i],
-                    self.end_weight_list[i],
-                    self.target_step_list[i],
-                    self._group_ids[i],
-                )
-            )
-
-        groups: list[dict[str, Any]] = []
-        for meta, start_weight, end_weight, target_step, group_id in snapshot:
-            fields_data = await self._call_dp(
-                "get_samples",
-                sample_ids=meta.sample_ids,
-                partition_id=self._partition_id,
-                select_fields=meta.fields,
-            )
             groups.append(
                 {
                     "meta": meta,
-                    "start_weight": start_weight,
-                    "end_weight": end_weight,
-                    "target_step": target_step,
-                    "group_id": group_id,
-                    "fields_data": fields_data,
+                    "start_weight": self.start_weight_list[i],
+                    "end_weight": self.end_weight_list[i],
+                    "target_step": self.target_step_list[i],
+                    "group_id": self._group_ids[i],
                 }
             )
         return {
+            "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+            "storage": REPLAY_BUFFER_METADATA_STORAGE,
             "partition_id": self._partition_id,
             "saved_capacity": saved_capacity,
+            "manifest_digest": replay_manifest_digest(groups),
             "groups": groups,
         }
 
@@ -1036,16 +1279,14 @@ class TQReplayBuffer:
         max_groups: int,
         expected_partition_id: str,
         expected_group_size: int,
+        expected_manifest_digest: str,
     ) -> int:
-        """Validate and re-put checkpointed groups into the buffer.
+        """Restore the local replay index for an already-restored TQ snapshot.
 
-        The preflight runs entirely before any DataPlane write (legacy
-        precedent: validate, then truncate):
-          1. Validate the envelope and raise ValueError on malformed state.
-          2. Truncate to ``max_groups``, keeping the freshest groups, so the
-             restored count can never exceed the buffer's capacity. Groups
-             carrying a ``target_step`` are never truncated — an over-capacity
-             in-order checkpoint raises instead (see Raises).
+        The replay index never contains tensor payloads and this method never
+        writes to the DataPlane. TQ must be restored first; the caller binds the
+        two artifacts by passing the manifest digest returned by TQ checkpoint
+        loading.
 
         Staleness is intentionally NOT handled here — load only loads. The
         train pump's first ``sampler.evict`` drops any restored group that is
@@ -1053,7 +1294,7 @@ class TQReplayBuffer:
         eviction in one place.
 
         Args:
-            state: Envelope produced by ``state_dict``.
+            state: Envelope produced by ``metadata_state_dict``.
             max_groups: Current max_buffered_rollouts; the restored count
                 never exceeds it.
             expected_partition_id: Partition this buffer writes to; must
@@ -1061,6 +1302,8 @@ class TQReplayBuffer:
             expected_group_size: num_generations_per_prompt; every group must
                 hold exactly this many rows (a changed group size silently
                 breaks the group-relative baseline).
+            expected_manifest_digest: Digest returned by the matching native
+                TQ checkpoint load. It must match the replay metadata file.
 
         Returns:
             Number of groups restored into the buffer.
@@ -1068,13 +1311,34 @@ class TQReplayBuffer:
         Raises:
             ValueError: If the envelope is malformed (missing keys, partition
                 mismatch, misaligned or wrongly sized groups, duplicate
-                sample_ids), or if target-stamped groups exceed ``max_groups``.
+                sample_ids), disagrees with the native TQ snapshot, or exceeds
+                ``max_groups``.
         """
-        required_keys = {"partition_id", "saved_capacity", "groups"}
+        if self.meta_list or self._group_ids:
+            raise RuntimeError(
+                "Replay-buffer checkpoint loading requires an empty local buffer"
+            )
+        required_keys = {
+            "schema_version",
+            "storage",
+            "partition_id",
+            "saved_capacity",
+            "manifest_digest",
+            "groups",
+        }
         missing_keys = required_keys - set(state)
         if missing_keys:
             raise ValueError(
                 f"Replay buffer checkpoint missing required keys: {missing_keys}"
+            )
+        if state["schema_version"] != REPLAY_BUFFER_METADATA_SCHEMA_VERSION:
+            raise ValueError(
+                "Unsupported replay-buffer metadata schema version: "
+                f"{state['schema_version']!r}"
+            )
+        if state["storage"] != REPLAY_BUFFER_METADATA_STORAGE:
+            raise ValueError(
+                f"Replay-buffer metadata has unsupported storage: {state['storage']!r}"
             )
         if state["partition_id"] != expected_partition_id:
             raise ValueError(
@@ -1090,16 +1354,25 @@ class TQReplayBuffer:
             "end_weight",
             "target_step",
             "group_id",
-            "fields_data",
         }
         seen_sample_ids: set[str] = set()
         for group in groups:
+            if "fields_data" in group:
+                raise ValueError(
+                    "Metadata-only replay checkpoint must not contain fields_data"
+                )
             missing_group_keys = group_keys - set(group)
             if missing_group_keys:
                 raise ValueError(
                     f"Replay buffer checkpoint group missing keys: {missing_group_keys}"
                 )
             meta = group["meta"]
+            if meta.partition_id != expected_partition_id:
+                raise ValueError(
+                    "Replay buffer checkpoint group partition_id mismatch: "
+                    f"checkpoint={meta.partition_id!r}, "
+                    f"expected={expected_partition_id!r}"
+                )
             num_tags = len(meta.tags) if meta.tags is not None else -1
             num_lengths = (
                 len(meta.sequence_lengths) if meta.sequence_lengths is not None else -1
@@ -1120,43 +1393,36 @@ class TQReplayBuffer:
                     )
                 seen_sample_ids.add(sid)
 
+        actual_digest = replay_manifest_digest(groups)
+        if state["manifest_digest"] != actual_digest:
+            raise ValueError(
+                "Replay-buffer metadata digest does not match its contents"
+            )
+        if expected_manifest_digest != actual_digest:
+            raise ValueError(
+                "Replay-buffer metadata does not match the loaded TQ checkpoint"
+            )
+
         if state["saved_capacity"] != max_groups:
             print(
                 "TQReplayBuffer capacity changed: "
                 f"checkpoint={state['saved_capacity']}, current={max_groups}. "
                 "Using current config value."
             )
-        num_truncated = 0
         if len(groups) > max_groups:
-            if any(group["target_step"] is not None for group in groups):
-                raise ValueError(
-                    f"Replay buffer checkpoint holds {len(groups)} group(s) "
-                    f"but async_rl.max_buffered_rollouts is {max_groups}. "
-                    "These groups carry target_step stamps (in-order "
-                    "sampling) and are selected as whole per-step batches, so "
-                    "dropping any of them would deadlock the resumed run. "
-                    "Resume with async_rl.max_buffered_rollouts >= "
-                    f"{len(groups)}, or delete replay_buffer.pt from the "
-                    "checkpoint to resume with an empty buffer."
-                )
-            num_truncated = len(groups) - max_groups
-            # Keep the freshest max_groups groups, preserving original order.
-            prioritized = sorted(
-                range(len(groups)),
-                key=lambda i: (groups[i]["start_weight"], i),
+            raise ValueError(
+                "Native TQ checkpoint contains more replay groups than the current "
+                f"buffer capacity: checkpoint={len(groups)}, current={max_groups}. "
+                f"Resume with async_rl.max_buffered_rollouts >= {len(groups)} to "
+                f"keep them. Deleting {REPLAY_BUFFER_METADATA_FILENAME} from the "
+                "checkpoint directory also allows startup, but skips loading the "
+                "matching TQ checkpoint and discards these groups and the prompts "
+                "that produced them because the dataloader has already moved past "
+                "them."
             )
-            indices_to_keep = sorted(prioritized[num_truncated:])
-            groups = [groups[i] for i in indices_to_keep]
 
         for group in groups:
             meta = group["meta"]
-            await self._call_dp(
-                "put_samples",
-                sample_ids=list(meta.sample_ids),
-                partition_id=self._partition_id,
-                fields=group["fields_data"],
-                tags=[dict(t) for t in meta.tags],
-            )
             self.meta_list.append(meta)
             self.start_weight_list.append(group["start_weight"])
             self.end_weight_list.append(group["end_weight"])
@@ -1164,10 +1430,10 @@ class TQReplayBuffer:
             self.ready_list.append(True)
             self._group_ids.append(group["group_id"])
 
-        summary = f"📦 Restored {len(groups)} replay group(s) from checkpoint"
-        if num_truncated:
-            summary += f"; truncated {num_truncated} group(s) over capacity"
-        print(summary, flush=True)
+        print(
+            f"📦 Restored {len(groups)} replay group(s) from checkpoint",
+            flush=True,
+        )
         return len(groups)
 
     def count_for_target_step(self, target_step: int) -> int:
@@ -1226,13 +1492,12 @@ class TQReplayBuffer:
     def __len__(self) -> int:
         return len(self.meta_list)
 
-    async def _call_dp(self, method_name: str, **kwargs: Any) -> Any:
-        """Call a DataPlaneClient method, awaiting Ray remotes if needed."""
-        method = getattr(self._dp_client, method_name)
-        remote = getattr(method, "remote", None)
-        if remote is not None:
-            return await remote(**kwargs)
-        result = method(**kwargs)
-        if asyncio.iscoroutine(result):
-            return await result
-        return result
+    async def _clear_samples_unlocked(self, *, sample_ids: list[str]) -> None:
+        """Clear rows while the caller holds a barrier mutation slot."""
+        await call_data_plane(
+            self._dp_client,
+            "clear_samples",
+            offload_sync=True,
+            sample_ids=sample_ids,
+            partition_id=self._partition_id,
+        )
