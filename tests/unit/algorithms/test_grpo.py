@@ -50,6 +50,7 @@ from nemo_rl.algorithms.grpo import (
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
+    _startup_pipeline_ready,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
@@ -1120,6 +1121,21 @@ class StubAsyncTrajectoryCollector:
         return self._remote_method("resume_after_refit")
 
     @property
+    def get_status(self):
+        """Return a healthy collector status with no reserved targets."""
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            return_value={
+                "running": True,
+                "data_exhausted": False,
+                "errored": False,
+                "inflight_workers": 0,
+                "generating_targets": [],
+            }
+        )
+        return mock
+
+    @property
     def stop(self):
         """Stop collection - returns a remote-callable mock"""
         mock = MagicMock()
@@ -1440,6 +1456,168 @@ def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components)
 
     mock_grpo_components["checkpointer"].shutdown.assert_called_once()
     mock_grpo_components["policy"].shutdown.assert_called_once()
+
+
+def test_async_grpo_startup_aborts_when_lookahead_never_claimed(
+    mock_grpo_components, tmp_path
+):
+    """Startup raises instead of spinning when the lookahead can never be claimed.
+
+    The pre-fix startup loop skipped the exhausted/errored check whenever the
+    lookahead was missing, leaving the driver waiting on a target no producer
+    would ever claim.
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 2
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.checkpoint_dir = tmp_path
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+
+    # Restored buffer: step 0 is complete, step 1 is absent.
+    complete_batch = MagicMock()
+    complete_batch.remote = MagicMock(
+        side_effect=lambda target_step, *_args, **_kwargs: target_step == 0
+    )
+
+    # First poll: collector alive but has not claimed step 1 -> keep waiting.
+    # Second poll: collector stopped with the dataset exhausted -> must raise.
+    statuses = [
+        {
+            "running": True,
+            "data_exhausted": False,
+            "errored": False,
+            "error": None,
+            "inflight_workers": 1,
+            "generating_targets": [],
+        },
+        {
+            "running": False,
+            "data_exhausted": True,
+            "errored": False,
+            "error": None,
+            "inflight_workers": 0,
+            "generating_targets": [],
+        },
+    ]
+    status = MagicMock()
+    status.remote = MagicMock(side_effect=statuses)
+
+    with (
+        patch.object(
+            StubReplayBuffer,
+            "has_complete_batch",
+            property(lambda self: complete_batch),
+        ),
+        patch.object(
+            StubAsyncTrajectoryCollector,
+            "get_status",
+            property(lambda self: status),
+        ),
+        patch("nemo_rl.algorithms.grpo.time.sleep", return_value=None),
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        pytest.raises(
+            RuntimeError,
+            match=r"dataloader exhausted.*lookahead claim at target=1",
+        ),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    # Two polls prove the barrier waited once before detecting terminal state.
+    assert status.remote.call_count == 2
+
+
+def test_async_grpo_starvation_reports_collector_error(mock_grpo_components):
+    """Main-loop starvation reports a collector failure, not data exhaustion."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.get_latest_checkpoint_path.return_value = None
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+
+    empty_sample = MagicMock()
+    empty_sample.remote = MagicMock(return_value=None)
+    statuses = [
+        {
+            "running": True,
+            "data_exhausted": False,
+            "errored": False,
+            "error": None,
+            "inflight_workers": 0,
+            "generating_targets": [],
+        },
+        {
+            "running": False,
+            "data_exhausted": False,
+            "errored": True,
+            "error": "tokenizer failed",
+            "inflight_workers": 0,
+            "generating_targets": [],
+        },
+    ]
+    status = MagicMock()
+    status.remote = MagicMock(side_effect=statuses)
+
+    with (
+        patch.object(
+            StubReplayBuffer,
+            "sample",
+            property(lambda self: empty_sample),
+        ),
+        patch.object(
+            StubAsyncTrajectoryCollector,
+            "get_status",
+            property(lambda self: status),
+        ),
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        pytest.raises(
+            RuntimeError,
+            match=r"collector errored.*Inspect the preceding trajectory collector error",
+        ),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert status.remote.call_count == 2
 
 
 @pytest.mark.parametrize("frontier_aligned", [True, False])
@@ -1824,6 +2002,54 @@ def test_should_use_nemo_gym_requires_dynamo_token_wrapper() -> None:
 
     master_config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
     assert should_use_nemo_gym(master_config) is True
+
+
+@pytest.mark.parametrize(
+    (
+        "lookahead_complete",
+        "generating_targets",
+        "current_step_ready",
+        "step",
+        "max_num_steps",
+        "expected",
+        "expected_queries",
+    ),
+    [
+        pytest.param(True, [], True, 3, 10, True, 1, id="complete"),
+        pytest.param(False, [4], True, 3, 10, True, 1, id="reserved-only"),
+        pytest.param(False, [], True, 3, 10, False, 1, id="neither"),
+        pytest.param(False, [5, 6], True, 3, 10, False, 1, id="other-target-reserved"),
+        pytest.param(False, [], True, 9, 10, True, 0, id="last-step"),
+        pytest.param(False, [], False, 3, 10, False, 0, id="current-not-ready"),
+    ],
+)
+def test_startup_pipeline_ready(
+    lookahead_complete,
+    generating_targets,
+    current_step_ready,
+    step,
+    max_num_steps,
+    expected,
+    expected_queries,
+):
+    """Startup needs a complete or claimed lookahead except at the last step."""
+    replay_buffer = MagicMock()
+    replay_buffer.has_complete_batch.remote.return_value = lookahead_complete
+    collector_status = {"generating_targets": generating_targets}
+
+    with patch("nemo_rl.algorithms.grpo.ray.get", side_effect=lambda value: value):
+        result = _startup_pipeline_ready(
+            replay_buffer,
+            collector_status,
+            current_step_ready=current_step_ready,
+            step=step,
+            num_prompts_per_step=8,
+            max_trajectory_age_steps=1,
+            max_num_steps=max_num_steps,
+        )
+
+    assert result is expected
+    assert replay_buffer.has_complete_batch.remote.call_count == expected_queries
 
 
 @contextmanager

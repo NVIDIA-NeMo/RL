@@ -35,7 +35,12 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     SamplerConfig,
     required_buffer_capacity_for_config,
 )
-from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
+from nemo_rl.algorithms.grpo import (
+    _REWARD_PENALTY_FLAGS,
+    GRPOConfig,
+    GRPOLoggerConfig,
+    RewardPenaltyConfig,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
@@ -586,6 +591,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
@@ -932,6 +938,15 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+
+    reward_penalties_enabled = any(
+        getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
+    )
+    if reward_penalties_enabled and not master_config.env.get("should_use_nemo_gym"):
+        raise ValueError(
+            "reward_penalties require the NeMo-Gym rollout path "
+            "(env.should_use_nemo_gym=true) on SingleController"
+        )
 
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
         raise ValueError(

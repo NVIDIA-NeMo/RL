@@ -45,6 +45,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     GRPOSaveState,
+    RewardPenaltyConfig,
     _initial_grpo_save_state,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -429,6 +430,61 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract():
 
 class TestSetup:
     """setup arg validation + actor_args assembly."""
+
+    def test_reward_penalties_are_typed(self):
+        assert isinstance(_make_master_config().reward_penalties, RewardPenaltyConfig)
+
+    def test_reward_penalties_require_gym_before_setup_factories(
+        self, patched_factories
+    ):
+        mc = _make_master_config()
+        mc.reward_penalties = RewardPenaltyConfig(penalize_empty_final_answer=True)
+
+        with pytest.raises(ValueError, match="reward_penalties require the NeMo-Gym"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_invalid_reward_penalty_config_fails_before_setup_factories(
+        self, patched_factories
+    ):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.reward_penalties = RewardPenaltyConfig.model_construct(
+            penalize_unwanted_tokens=True
+        )
+
+        with pytest.raises(ValueError, match="reward_penalties.token_ids.unwanted"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_resolves_and_passes_reward_penalties(self, patched_factories):
+        mc = _make_master_config()
+        tokenizer = MagicMock(pad_token_id=0)
+        thinking_tags = ["<reason>", "</reason>"]
+        resolved = {"penalize_malformed_think_tag": True}
+
+        with (
+            patch.object(
+                sc_setup_mod, "get_nemo_gym_thinking_tags", return_value=thinking_tags
+            ) as get_tags,
+            patch.object(
+                sc_setup_mod, "resolve_reward_penalty_config", return_value=resolved
+            ) as resolve_config,
+            patch.object(sc_setup_mod, "RolloutManager") as rollout_manager,
+        ):
+            actor_args, _ = setup_single_controller(mc, tokenizer)
+
+        get_tags.assert_called_once_with(mc.env)
+        resolve_config.assert_called_once_with(
+            mc.reward_penalties,
+            tokenizer,
+            thinking_tags=thinking_tags,
+        )
+        assert rollout_manager.call_args.kwargs["reward_penalty_config"] is resolved
+        assert actor_args.rollout_manager is rollout_manager.return_value
 
     def test_raises_when_data_plane_disabled(self):
         mc = _make_master_config(dp_enabled=False)
