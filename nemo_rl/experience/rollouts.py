@@ -233,8 +233,14 @@ def attach_static_multimodal_payload(
         )
     for source, target in zip(source_users, target_users):
         for key, value in source.items():
-            if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
-                target[key] = value
+            if not (isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS):
+                continue
+            if key in target:
+                # The Gym actor attached rollout-matched media for this turn
+                # (e.g. after vetoing dedup omission on a budget-bound row);
+                # never overwrite it with the statically-budgeted prompt copy.
+                continue
+            target[key] = value
 
 
 def _add_r3_fallback_metrics(
