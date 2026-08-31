@@ -231,7 +231,14 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
 
 
 def should_log_nemo_gym_training_samples(env_config: Mapping[str, Any]) -> bool:
-    """Read ``env.nemo_gym.log_training_samples``; absent means disabled."""
+    """Read ``env.log_training_samples``; absent means disabled.
+
+    The earlier nested ``env.nemo_gym.log_training_samples`` spelling remains
+    accepted for compatibility. An explicit top-level value takes precedence.
+    """
+    if "log_training_samples" in env_config:
+        return bool(env_config["log_training_samples"])
+
     nemo_gym_config = env_config.get("nemo_gym")
     return bool(
         isinstance(nemo_gym_config, Mapping)

@@ -569,13 +569,14 @@ def setup(
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
+    enable_nemo_gym = should_use_nemo_gym(master_config)
     validate_router_replay_transport_path(
         policy_config,
         data_plane_enabled=bool((master_config.data_plane or {}).get("enabled", False)),
         async_grpo_enabled=bool(
             grpo_config.async_grpo and grpo_config.async_grpo.enabled
         ),
-        nemo_gym_enabled=should_use_nemo_gym(master_config),
+        nemo_gym_enabled=enable_nemo_gym,
     )
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
@@ -619,6 +620,10 @@ def setup(
     #         Logger
     # ==========================
     logger = Logger(logger_config)
+    if enable_nemo_gym:
+        env_configs.setdefault("nemo_gym", {})["nemo_gym_log_dir"] = os.path.join(
+            logger.base_log_dir, "nemo_gym"
+        )
     logger.log_hyperparams(master_config.model_dump())
 
     # ==========================
@@ -807,7 +812,6 @@ def setup(
 
     # NeMo Gym is initialized inside setup() (rather than by the caller) so its
     # spinup can overlap with vLLM model loading via deferred model load.
-    enable_nemo_gym = should_use_nemo_gym(master_config)
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
@@ -2258,14 +2262,18 @@ def _take_nemo_gym_training_samples_for_log(
         if has_samples:
             raise RuntimeError(
                 "NeMo Gym training samples reached the trainer while "
-                "env.nemo_gym.log_training_samples is disabled"
+                "env.log_training_samples is disabled"
             )
         return None
     if not has_samples:
-        raise RuntimeError(
-            "env.nemo_gym.log_training_samples=true, but the sampled replay "
-            "batch contains no retained NeMo Gym responses"
+        warnings.warn(
+            "env.log_training_samples=true, but the sampled replay "
+            "batch contains no retained NeMo Gym responses; skipping sample "
+            "logging for this step",
+            RuntimeWarning,
+            stacklevel=2,
         )
+        return None
 
     raw_samples = repeated_batch[NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY]
     del repeated_batch[NEMO_GYM_TRAINING_SAMPLE_BATCH_KEY]
@@ -4283,7 +4291,7 @@ def async_grpo_train(
         "should_use_nemo_gym", False
     ):
         raise ValueError(
-            "env.nemo_gym.log_training_samples requires env.should_use_nemo_gym=true"
+            "env.log_training_samples requires env.should_use_nemo_gym=true"
         )
 
     if router_replay_enabled(master_config.policy) and (
