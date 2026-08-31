@@ -4270,6 +4270,9 @@ def async_grpo_train(
     log_nemo_gym_training_samples = should_log_nemo_gym_training_samples(
         master_config.env
     )
+    log_local_train_data_artifacts = not _should_log_nemo_gym_responses(
+        master_config
+    )
     if log_nemo_gym_training_samples and not master_config.env.get(
         "should_use_nemo_gym", False
     ):
@@ -4911,6 +4914,14 @@ def async_grpo_train(
                     print(
                         f"❌ Unexpected training batch size: got {repeated_batch.size}, expected {expected_batch_size}. Skipping step and waiting for correct buffer content."
                     )
+                    del (
+                        per_prompt_batches,
+                        repeated_batch,
+                        sample_result,
+                        trajectories,
+                        trajectory_teacher_logprobs,
+                    )
+                    gc.collect()
                     time.sleep(0.5)
                     continue
 
@@ -4934,6 +4945,13 @@ def async_grpo_train(
                             samples=nemo_gym_training_samples,
                         )
                         del nemo_gym_training_samples
+
+                # ``repeated_batch`` now owns the selected combined batch and
+                # the optional sample writer owns its detached snapshots.  The
+                # replay-buffer result and per-prompt source batches are not
+                # used below; retaining them would keep a second object graph
+                # of message logs and Gym responses alive through training.
+                del per_prompt_batches, sample_result, trajectories
 
                 # Baseline spec-decode counters; the delta read at metrics time gives
                 # MTP acceptance over this step's generation window (async generation
@@ -5009,6 +5027,17 @@ def async_grpo_train(
                         )
                     )
                     train_data.to("cpu")
+
+                    # Everything needed by policy inference/training now lives
+                    # in train_data.  Keep non-tensor content only when the
+                    # local train-data artifact writer will consume it.
+                    flat_token_mask = train_data["token_mask"]
+                    flat_messages_content = (
+                        flat_messages.get("content", [])
+                        if log_local_train_data_artifacts
+                        else []
+                    )
+                    del flat_messages
 
                 generation_logger_metrics = None
                 if policy_generation.blocks_training():
@@ -5135,6 +5164,13 @@ def async_grpo_train(
                     train_data["advantages"] = _clip_grpo_advantages(
                         train_data["advantages"], master_config.grpo
                     )
+
+                # The message log is only needed through advantage penalties.
+                # Drop the large Python object graph before Policy.train builds
+                # and serializes its DP shards.
+                with timer.time("driver_memory_cleanup"):
+                    del repeated_batch["message_log"]
+                    gc.collect()
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -5316,10 +5352,6 @@ def async_grpo_train(
                             trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
-                flat_token_mask = flat_messages["token_loss_mask"]
-                # Save content for logging before deleting flat_messages
-                flat_messages_content = flat_messages.get("content", [])
-                del flat_messages
 
                 # Filter advantages using token mask (only valid response tokens)
                 response_advantages = torch.masked_select(
@@ -5543,7 +5575,7 @@ def async_grpo_train(
             # NeMo Gym responses can be very large and expensive to log; when
             # env.should_log_nemo_gym_responses is true, skip these artifacts (see
             # _should_log_nemo_gym_responses).
-            if not _should_log_nemo_gym_responses(master_config):
+            if log_local_train_data_artifacts:
                 non_tensor_log_data: dict[str, Any] = {}
                 if "agent_ref" in repeated_batch:
                     non_tensor_log_data["agent_ref"] = repeated_batch["agent_ref"]
@@ -5697,6 +5729,26 @@ def async_grpo_train(
                     tensor_log_data,
                     num_log_samples,
                 )
+
+            # Release the completed step before assembling the next globally
+            # padded batch.  Several of these locals are aliases into tensors
+            # formerly owned by ``train_data``; deleting that container alone
+            # leaves the token mask, combined mask, and advantages reachable.
+            # The CPU allocator may retain their pages, but dropping all live
+            # references lets the next sharding pass reuse those allocations.
+            del (
+                advantages,
+                flat_advantages,
+                flat_token_mask,
+                mask,
+                repeated_batch,
+                response_advantages,
+                rewards,
+                sample_mask,
+                token_mask,
+                trajectory_teacher_logprobs,
+            )
+            gc.collect()
 
             timer.reset()
             step += 1
