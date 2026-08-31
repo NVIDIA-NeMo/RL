@@ -49,6 +49,8 @@ class FinalizationRequest:
     receipts: tuple[Optional[dict[str, Any]], ...]
     rewards: tuple[float, ...]
     fallback_weight_version: int
+    # Stable dataset prompt index; pack_payload stamps it on every row's tag.
+    prompt_idx: int
 
 
 @dataclass(frozen=True)
@@ -134,6 +136,7 @@ class FinalizerActor:  # pragma: no cover
             list(request.receipts),
             list(request.rewards),
             fallback_weight_version=request.fallback_weight_version,
+            prompt_idx=request.prompt_idx,
         )
         assert_metadata_only(result)
         return result

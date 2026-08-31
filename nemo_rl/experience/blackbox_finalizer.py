@@ -507,6 +507,7 @@ class BlackboxFinalizer:
         rewards: list[float],
         *,
         fallback_weight_version: int,
+        prompt_idx: int,
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
 
@@ -690,7 +691,10 @@ class BlackboxFinalizer:
                 rows, max_len=max_len, metrics=metrics
             )
         sample_ids, fields, tags = pack_payload(
-            train_batch, weight_version=group_min_wv, group_id=group_id
+            train_batch,
+            weight_version=group_min_wv,
+            group_id=group_id,
+            prompt_idx=prompt_idx,
         )
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0

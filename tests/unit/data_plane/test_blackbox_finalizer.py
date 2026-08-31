@@ -213,6 +213,7 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         [receipt, None],  # second rollout lost its receipt -> placeholder
         [1.0, 0.0],
         fallback_weight_version=9,
+        prompt_idx=0,
     )
     assert not finalized.dropped
     assert finalized.meta is not None
@@ -257,6 +258,7 @@ def test_finalize_group_min_valid_fraction_drops(tq_client, partitions):
         [None, None],
         [0.0, 0.0],
         fallback_weight_version=3,
+        prompt_idx=0,
     )
     assert finalized.dropped
     assert finalized.meta is None
@@ -408,6 +410,7 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
         [receipt, None],  # second rollout -> placeholder
         [1.0, 0.0],
         fallback_weight_version=9,
+        prompt_idx=0,
     )
     assert not finalized.dropped
     assert "routed_experts" in finalized.meta.fields
@@ -467,6 +470,7 @@ def test_finalize_group_router_replay_without_routes_fails_loudly(
             [receipt.model_dump()],
             [1.0],
             fallback_weight_version=9,
+            prompt_idx=0,
         )
 
 
@@ -558,6 +562,7 @@ def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
         [receipt, None],
         [1.0, 0.0],
         fallback_weight_version=9,
+        prompt_idx=0,
     )
 
     assert finalized.meta is not None

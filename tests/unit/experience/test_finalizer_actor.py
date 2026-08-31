@@ -43,6 +43,7 @@ def _request() -> FinalizationRequest:
             },
         ),
         rewards=(1.0,),
+        prompt_idx=0,
         fallback_weight_version=4,
     )
 
