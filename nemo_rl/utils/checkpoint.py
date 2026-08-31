@@ -456,6 +456,9 @@ class CheckpointManager:
         Applied to all checkpoints regardless of save_period alignment.
         Purely recency-based — metrics are not considered.
 
+        Keep markers: if ``step_N/.keep`` exists, that step is always retained
+        regardless of retention settings.
+
         Args:
             exclude_latest (bool): Whether to protect the most recent checkpoint
                 from deletion.
@@ -502,6 +505,11 @@ class CheckpointManager:
         if self.ft_keep_latest_k is not None:
             by_step = sorted(checkpoint_history, key=lambda x: x[0], reverse=True)
             protected_steps.update(s for s, _, _ in by_step[: self.ft_keep_latest_k])
+
+        # Manual retention override: if step_N/.keep exists, never prune step_N.
+        for step, path, _ in checkpoint_history:
+            if (Path(path) / ".keep").exists():
+                protected_steps.add(step)
 
         for step, path, _ in checkpoint_history:
             if step not in protected_steps:
