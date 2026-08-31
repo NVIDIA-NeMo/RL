@@ -187,6 +187,7 @@ def test_runtime_builds_stable_disaggregated_roles_and_rejects_wrong_gpu_count()
     None
 ):
     config = _config(tp=2)
+    config["colocated"]["resources"] = {"gpus_per_node": 4, "num_nodes": 1}
     config["dynamo_cfg"]["disaggregation"] = {
         "prefill_workers": 1,
         "decode_workers": 1,
@@ -197,6 +198,7 @@ def test_runtime_builds_stable_disaggregated_roles_and_rejects_wrong_gpu_count()
 
     config["vllm_cfg"]["tensor_parallel_size"] = 1
     config["vllm_cfg"]["expert_parallel_size"] = 1
+    config["colocated"]["resources"]["gpus_per_node"] = 2
     with pytest.raises(ValueError, match="allocated=4, expected=2"):
         ManagedDynamoRuntime(cluster=_Cluster(), config=config)
 
@@ -929,10 +931,11 @@ def test_frontend_logs_resolved_tokenizer_environment(monkeypatch, capsys) -> No
     assert "<redacted>" not in output
 
 
-def test_frontend_requires_matching_prefill_and_decode_rl_membership(
+def test_frontend_accepts_a_fully_registered_disaggregated_fleet(
     monkeypatch,
 ) -> None:
     config = _config(tp=2)
+    config["colocated"]["resources"] = {"gpus_per_node": 4, "num_nodes": 1}
     config["dynamo_cfg"]["disaggregation"] = {
         "prefill_workers": 1,
         "decode_workers": 1,
@@ -964,3 +967,71 @@ def test_frontend_requires_matching_prefill_and_decode_rl_membership(
     )
 
     runtime._wait_for_frontend(expected_components={"backend": 1, "prefill": 1})
+
+
+@pytest.mark.parametrize(
+    "instances",
+    [
+        [
+            {
+                "namespace": "nemo-rl-test",
+                "component": "backend",
+                "endpoint": endpoint,
+                "instance_id": "decode-0",
+            }
+            for endpoint in ("generate", "rl")
+        ],
+        [
+            {
+                "namespace": "nemo-rl-test",
+                "component": component,
+                "endpoint": endpoint,
+                "instance_id": instance_id,
+            }
+            for component, endpoint, instance_id in (
+                ("backend", "generate", "decode-0"),
+                ("backend", "rl", "decode-0"),
+                ("prefill", "generate", "prefill-0"),
+                ("prefill", "rl", "prefill-1"),
+            )
+        ],
+    ],
+    ids=["missing-prefill", "mismatched-prefill-instance-ids"],
+)
+def test_frontend_rejects_incomplete_disaggregated_registration(
+    monkeypatch, instances
+) -> None:
+    config = _config(tp=2)
+    config["colocated"]["resources"] = {"gpus_per_node": 4, "num_nodes": 1}
+    config["dynamo_cfg"]["disaggregation"] = {
+        "prefill_workers": 1,
+        "decode_workers": 1,
+    }
+    runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=config)
+    runtime._frontend_port = 3000
+    runtime._frontend_process = _FakeProcess()
+    runtime._pool = SimpleNamespace(is_alive=lambda: True)
+    runtime._namespace = "nemo-rl-test"
+    urls = []
+
+    def fake_urlopen(url, timeout):
+        urls.append(url)
+        return _FakeHttpResponse({"instances": instances})
+
+    monotonic = iter([0.0, 1.0, 100.0])
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.urllib.request.urlopen",
+        fake_urlopen,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.time.monotonic",
+        lambda: next(monotonic),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.time.sleep", lambda _: None
+    )
+
+    with pytest.raises(RuntimeError, match="did not observe the fixed worker fleet"):
+        runtime._wait_for_frontend(expected_components={"backend": 1, "prefill": 1})
+
+    assert urls == ["http://127.0.0.1:3000/health"]

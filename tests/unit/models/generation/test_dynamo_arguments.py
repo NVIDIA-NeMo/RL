@@ -118,8 +118,31 @@ def test_disaggregation_config_derives_and_validates_exact_resource_count() -> N
     assert validated.managed_worker_count == 3
     assert validated.managed_inference_world_size == 6
 
+    config["colocated"]["resources"]["num_nodes"] = None
+    DynamoConfig.model_validate(config)
+
     config["colocated"]["resources"]["gpus_per_node"] = 4
     with pytest.raises(ValidationError, match="configured=4, expected=6"):
+        DynamoConfig.model_validate(config)
+
+
+@pytest.mark.parametrize(
+    ("resources", "match"),
+    [
+        (None, "colocated.resources to be set"),
+        ({"gpus_per_node": None, "num_nodes": 1}, "explicit.*gpus_per_node"),
+    ],
+)
+def test_disaggregation_config_requires_inference_resources(resources, match) -> None:
+    config = _config()
+    config["dynamo_cfg"]["disaggregation"] = {
+        "prefill_workers": 1,
+        "decode_workers": 1,
+    }
+    if resources is not None:
+        config["colocated"]["resources"] = resources
+
+    with pytest.raises(ValidationError, match=match):
         DynamoConfig.model_validate(config)
 
 
