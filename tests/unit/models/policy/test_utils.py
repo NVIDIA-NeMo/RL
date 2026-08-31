@@ -30,6 +30,7 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
+    import_bridge_plugins,
     rebuild_cuda_tensor_from_ipc,
     stream_weights_via_ipc_zmq_impl,
 )
@@ -623,3 +624,27 @@ class TestEnsureTeacherIpcBuffer:
         assert s2 is s and h2 is h
         s3, _ = ensure_teacher_ipc_buffer(s, h, 3, 1, 4, 8, torch.float32, dev)
         assert s3 is not s and s3.shape == (3, 1, 4, 8)
+
+
+class TestImportBridgePlugins:
+    """Test cases for the import_bridge_plugins function."""
+
+    def test_imports_listed_modules(self, tmp_path, monkeypatch):
+        mod = tmp_path / "fake_bridge_plugin.py"
+        mod.write_text("import sys\nsys._fake_bridge_plugin_loaded = True\n")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        try:
+            import_bridge_plugins(["fake_bridge_plugin"])
+            assert getattr(sys, "_fake_bridge_plugin_loaded", False)
+        finally:
+            sys.modules.pop("fake_bridge_plugin", None)
+            if hasattr(sys, "_fake_bridge_plugin_loaded"):
+                delattr(sys, "_fake_bridge_plugin_loaded")
+
+    @pytest.mark.parametrize("module_names", [None, []])
+    def test_absent_and_empty_are_noops(self, module_names):
+        import_bridge_plugins(module_names)
+
+    def test_missing_module_raises(self):
+        with pytest.raises(ModuleNotFoundError):
+            import_bridge_plugins(["nemo_rl_no_such_bridge_plugin"])

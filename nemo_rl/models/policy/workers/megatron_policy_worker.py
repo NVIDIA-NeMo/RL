@@ -108,6 +108,7 @@ from nemo_rl.models.policy.utils import (
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
     get_runtime_env_for_policy_worker,
+    import_bridge_plugins,
     send_hf_buckets_via_ipc_actor_impl,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -493,6 +494,9 @@ class MegatronPolicyWorkerImpl(
             f"device drift after setup_distributed: current_device="
             f"{torch.cuda.current_device()}, LOCAL_RANK={local_rank}."
         )
+
+        # Import side effects register out-of-tree bridges before AutoBridge runs.
+        import_bridge_plugins(config["megatron_cfg"].get("bridge_plugins"))
 
         # Step 2: Validate and setup model paths
         hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(

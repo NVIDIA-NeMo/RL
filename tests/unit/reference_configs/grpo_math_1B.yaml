@@ -183,6 +183,7 @@ policy:
   megatron_cfg:
     enabled: false
     model_overrides: {}
+    bridge_plugins: null
     checkpoint:
       async_save: true
       ckpt_assume_constant_structure: true

@@ -182,6 +182,8 @@ policy:
     # Arbitrary overrides applied recursively to the Megatron Bridge model
     # provider before model instantiation. Do not duplicate first-class fields.
     model_overrides: {}
+    # Modules imported in the worker to register out-of-tree Megatron-Bridge bridges.
+    bridge_plugins: null
     checkpoint:
       async_save: true
       ckpt_assume_constant_structure: true

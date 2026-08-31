@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import importlib
 import os
 import traceback
 import warnings
@@ -127,6 +128,19 @@ def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     if config.get("quant_cfg") is None:
         return default_cls
     return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
+
+
+def import_bridge_plugins(module_names: list[str] | None) -> None:
+    """Import modules whose side effects register out-of-tree Megatron-Bridge bridges.
+
+    Megatron-Bridge dispatches on architecture names collected at import time and
+    has no plugin auto-discovery, so a bridge defined outside the package must be
+    imported before ``AutoBridge`` resolves the model. Modules are listed in
+    ``megatron_cfg.bridge_plugins`` — the Megatron analog of
+    ``vllm_cfg.reasoning_parser_plugin``.
+    """
+    for module_name in module_names or []:
+        importlib.import_module(module_name)
 
 
 def resolve_model_class(model_name: str) -> Any:

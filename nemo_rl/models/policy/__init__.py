@@ -327,6 +327,9 @@ class MegatronCheckpointConfig(TypedDict, total=False):
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
+    # Modules imported in the worker before model import, so out-of-tree
+    # Megatron-Bridge bridges can register (import side effect).
+    bridge_plugins: NotRequired[list[str] | None]
     # Arbitrary model-provider attributes applied recursively to the Megatron
     # Bridge model config before model instantiation. Keys must match configurable
     # provider fields and must not duplicate first-class megatron_cfg fields.
