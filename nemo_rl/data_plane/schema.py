@@ -30,6 +30,10 @@ INPUT_LENGTHS = "input_lengths"
 SAMPLE_MASK = "sample_mask"
 META_IDX = "meta_idx"
 
+# Token-aligned message-violation fields consumed by SingleController advantages.
+INVALID_TOOL_CALL_MASK = "invalid_tool_call_mask"
+MALFORMED_THINKING_MASK = "malformed_thinking_mask"
+
 # Tensor fields in the train partition. Rollout writes the input
 # subset on first put; later stages add prev_logprobs /
 # reference_policy_logprobs (workers) and advantages (driver).
@@ -56,6 +60,8 @@ SC_ROLLOUT_SCHEMA_FIELDS = (
     "values",
     "returns",
     "teacher_reference_logprobs",
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
 )
 
 # Subset fetched by logprob / ref-logprob workers.

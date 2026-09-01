@@ -15,6 +15,10 @@ ppo:
     enabled: false
   reward_scaling:
     enabled: false
+  # Optional NeMo-Gym message-level penalties. Values overwrite computed
+  # advantages on tokens belonging to the corresponding assistant message.
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:
@@ -145,8 +149,8 @@ checkpointing:
 
 policy:
   tokenizer:
-    # Opt-in Rust-backed BPE tokenizer (~10x faster encode); requires the
-    # fastokens-b10 wheel. NRL_USE_FASTOKENS overrides at runtime.
+    # Opt-in Rust-backed BPE tokenizer (~10x faster encode); requires the fastokens wheel.
+    # NRL_USE_FASTOKENS overrides at runtime.
     use_fastokens: false
   # The only thing on the SC path that takes the policy optimizer off the GPU.
   # Without it the critic's forward and train stages run on top of it.

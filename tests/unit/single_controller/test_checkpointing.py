@@ -126,7 +126,9 @@ class _FakeTrainer:
     def begin_train_step(self, loss_fn: Any) -> None:
         pass
 
-    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
         pass
 
     def finish_train_step(self) -> dict[str, Any]:
