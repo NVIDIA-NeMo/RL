@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import types
-from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 
 import torch
@@ -24,9 +23,7 @@ from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuanti
 from nemo_rl.modelopt.utils import MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS
 from nemo_rl.models.generation.vllm.checkpoint_engine import VllmCheckpointEngineMixin
 from nemo_rl.models.generation.vllm.vllm_backend import (
-    IPCWeightManifestError,
     VllmInternalWorkerExtension,
-    WeightUpdateFinalizer,
     WeightUpdateTransport,
 )
 
@@ -52,51 +49,10 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         quantization = self.model_runner.vllm_config.model_config.quantization
         return bool(quantization and str(quantization).startswith("modelopt"))
 
-    @contextmanager
-    def _weight_update_lifecycle(
-        self, transport: WeightUpdateTransport
-    ) -> Iterator[WeightUpdateFinalizer]:
-        """Use vLLM's native layerwise reload for canonical real-quant tensors."""
-        if not self._is_real_quant_model():
-            with super()._weight_update_lifecycle(transport) as finalize:
-                yield finalize
-            return
-
-        from vllm.config import set_current_vllm_config
-        from vllm.model_executor.model_loader.reload import (
-            finalize_layerwise_reload,
-            initialize_layerwise_reload,
-        )
-
-        model = self.model_runner.model
-
-        def finalize() -> None:
-            try:
-                with torch.device(self.device):
-                    finalize_layerwise_reload(model, self.model_config)
-                torch.accelerator.synchronize()
-            except Exception as error:
-                if transport == "ipc":
-                    raise RuntimeError(
-                        f"ModelOpt real-quant refit post-processing failed: {error}"
-                    ) from error
-                raise
-
-        try:
-            with set_current_vllm_config(self.model_runner.vllm_config):
-                with torch.device(self.device):
-                    initialize_layerwise_reload(model)
-                yield finalize
-        except IPCWeightManifestError as error:
-            raise RuntimeError(
-                f"ModelOpt real-quant refit rejected: {error}"
-            ) from error
-        except Exception as error:
-            if transport == "collective":
-                raise RuntimeError(
-                    "ModelOpt real-quant collective refit failed"
-                ) from error
-            raise
+    def _uses_native_layerwise_refit(self, transport: WeightUpdateTransport) -> bool:
+        if self._is_real_quant_model():
+            return transport in ("ipc", "collective")
+        return super()._uses_native_layerwise_refit(transport)
 
     def _weight_update_errors_are_fatal(self) -> bool:
         return self._is_real_quant_model()
@@ -158,13 +114,8 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
 
     def _load_weights(self, weights):
         if self._is_real_quant_model():
-
-            def owned_weights():
-                for name, tensor in weights:
-                    yield name, tensor.detach().clone()
-
             with torch.device(self.device):
-                self._load_full_hf_weights(owned_weights())
+                self._load_full_hf_weights(list(weights))
             return
 
         remapped_weights = []

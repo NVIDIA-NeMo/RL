@@ -28,10 +28,10 @@ from nemo_rl.modelopt.utils import resolve_quant_cfg
 
 @pytest.fixture(autouse=True)
 def _install_optional_modelopt_config_api(monkeypatch):
-    """Provide ModelOpt's config APIs when the optional dependency is absent."""
+    """Provide the ModelOpt recipe APIs when the optional dependency is absent."""
     try:
-        import modelopt.torch.export.convert_hf_config  # noqa: F401
-        import modelopt.torch.quantization.config  # noqa: F401
+        import modelopt.recipe  # noqa: F401
+        import modelopt.torch.quantization  # noqa: F401
 
         return
     except ImportError:
@@ -41,7 +41,6 @@ def _install_optional_modelopt_config_api(monkeypatch):
         "modelopt",
         "modelopt.recipe",
         "modelopt.torch",
-        "modelopt.torch.export",
         "modelopt.torch.quantization",
     )
     for module_name in module_names:
@@ -53,61 +52,6 @@ def _install_optional_modelopt_config_api(monkeypatch):
         raise FileNotFoundError(config_name)
 
     sys.modules["modelopt.recipe"].load_config = missing_recipe
-
-    convert_module = types.ModuleType("modelopt.torch.export.convert_hf_config")
-
-    def convert_hf_quant_config_format(config):
-        quantization = config["quantization"]
-        algo = quantization["quant_algo"]
-        group = {
-            "weights": {
-                "dynamic": False,
-                "num_bits": 4,
-                "type": "float",
-                "group_size": quantization["group_size"],
-            },
-            "targets": ["Linear"],
-        }
-        if algo == "NVFP4":
-            group["input_activations"] = dict(group["weights"])
-        return {
-            "config_groups": {"group_0": group},
-            "ignore": quantization["exclude_modules"],
-            "quant_algo": algo,
-            "producer": config["producer"],
-            "quant_method": "modelopt",
-        }
-
-    convert_module.convert_hf_quant_config_format = convert_hf_quant_config_format
-    monkeypatch.setitem(
-        sys.modules,
-        "modelopt.torch.export.convert_hf_config",
-        convert_module,
-    )
-
-    config_module = types.ModuleType("modelopt.torch.quantization.config")
-
-    class QuantizerCfgEntry:
-        def __init__(self, entry):
-            self.entry = {"enable": True, **entry}
-
-        def model_dump(self, **kwargs):
-            del kwargs
-            return {
-                key: value for key, value in self.entry.items() if value is not None
-            }
-
-    class QuantizeConfig:
-        def __init__(self, quant_cfg, **kwargs):
-            del kwargs
-            self.quant_cfg = [QuantizerCfgEntry(entry) for entry in quant_cfg]
-
-    config_module.QuantizeConfig = QuantizeConfig
-    monkeypatch.setitem(
-        sys.modules,
-        "modelopt.torch.quantization.config",
-        config_module,
-    )
 
 
 def _install_fake_vllm_worker(monkeypatch):
@@ -225,6 +169,13 @@ def _install_fake_vllm_reload(monkeypatch):
         "vllm.model_executor.model_loader.reload.layerwise",
         layerwise_module,
     )
+    hpc_module = types.ModuleType("vllm.model_executor.layers.hpc")
+
+    class HpcModule(torch.nn.Module):
+        pass
+
+    hpc_module.HpcModule = HpcModule
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.hpc", hpc_module)
     return reload_module
 
 
@@ -592,10 +543,6 @@ async def test_async_quant_generation_worker_collective_rpc_accessors():
     ]
 
 
-def test_vllm_quant_backend_imports_without_gpt_oss_helper(monkeypatch):
-    _import_vllm_quant_backend(monkeypatch)
-
-
 def test_real_quant_backend_uses_modelopt_refit_timeout(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
     events = []
@@ -642,7 +589,14 @@ def test_real_quant_backend_uses_modelopt_refit_timeout(monkeypatch):
 
 @pytest.mark.parametrize(
     ("quantization", "expected"),
-    [("modelopt", True), ("modelopt_nvfp4", True), ("fp8", False), (None, False)],
+    [
+        ("modelopt", True),
+        ("modelopt_fp4", True),
+        ("modelopt_mxfp8", True),
+        ("modelopt_mixed", True),
+        ("fp8", False),
+        (None, False),
+    ],
 )
 def test_real_quant_model_detection_uses_native_vllm_method(
     monkeypatch, quantization, expected
@@ -658,7 +612,7 @@ def test_real_quant_model_detection_uses_native_vllm_method(
     assert extension._is_real_quant_model() is expected
 
 
-def test_real_quant_load_owns_transport_tensors(monkeypatch):
+def test_real_quant_load_uses_canonical_hf_loader(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.device = torch.device("cpu")
@@ -681,7 +635,7 @@ def test_real_quant_load_owns_transport_tensors(monkeypatch):
     assert [name for name, _ in loaded] == ["model.weight"]
     torch.testing.assert_close(loaded[0][1], source)
     assert (
-        loaded[0][1].untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+        loaded[0][1].untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
     )
 
 
@@ -772,61 +726,20 @@ def test_fake_quant_eager_input_amax_loader_supports_direct_vllm_load(monkeypatc
     assert not hasattr(model.input_quantizer._amax, "weight_loader")
 
 
-def test_real_quant_reload_keeps_vllm_config_active_during_layerwise_processing(
-    monkeypatch,
-):
+@pytest.mark.parametrize(
+    ("transport", "expected"),
+    [("ipc", True), ("collective", True), ("nccl_reshard", False)],
+)
+def test_real_quant_selects_native_layerwise_refit(monkeypatch, transport, expected):
     backend = _import_vllm_quant_backend(monkeypatch)
-    config_mod = sys.modules["vllm.config"]
-    reload_mod = sys.modules["vllm.model_executor.model_loader.reload"]
-
-    model = torch.nn.Linear(1, 1)
-    vllm_config = object()
-    model_config = object()
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
-    extension.model_runner = types.SimpleNamespace(
-        model=model,
-        vllm_config=vllm_config,
-    )
-    extension.model_config = model_config
-    extension.device = torch.device("cpu")
-    calls = []
-
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
         "_is_real_quant_model",
-        lambda self: True,
-    )
-    monkeypatch.setattr(
-        reload_mod,
-        "initialize_layerwise_reload",
-        lambda root: calls.append(("initialize", root)),
+        lambda _self: True,
     )
 
-    def finalize(root, config):
-        assert config_mod.get_current_vllm_config() is vllm_config
-        calls.append(("finalize", root, config))
-
-    monkeypatch.setattr(reload_mod, "finalize_layerwise_reload", finalize)
-    monkeypatch.setattr(
-        backend.torch.accelerator,
-        "synchronize",
-        lambda: calls.append("sync"),
-    )
-
-    with extension._weight_update_lifecycle("collective") as finish:
-        # FlashInferExperts performs this lookup when online layer processing
-        # reconstructs its kernel during the yielded weight-load phase.
-        assert config_mod.get_current_vllm_config() is vllm_config
-        calls.append("load")
-        finish()
-
-    assert config_mod.current is None
-    assert calls == [
-        ("initialize", model),
-        "load",
-        ("finalize", model, model_config),
-        "sync",
-    ]
+    assert extension._uses_native_layerwise_refit(transport) is expected
 
 
 def test_real_quant_collective_reload_uses_vllm_layerwise_lifecycle(monkeypatch):
@@ -868,7 +781,7 @@ def test_real_quant_collective_reload_uses_vllm_layerwise_lifecycle(monkeypatch)
         lambda model_arg, config_arg: calls.append(("finalize", model_arg, config_arg)),
     )
     monkeypatch.setattr(
-        backend.torch.accelerator,
+        base_backend.torch.cuda,
         "synchronize",
         lambda: calls.append("sync"),
     )
@@ -922,9 +835,10 @@ def test_real_quant_collective_reload_raises_on_failure(monkeypatch):
         ),
     )
 
-    with pytest.raises(RuntimeError, match="collective refit failed"):
+    with pytest.raises(ValueError, match="broadcast boom"):
         extension.update_weights_from_collective()
     assert calls == [("initialize", model)]
+    assert isinstance(extension._nrl_layerwise_reload_failure, ValueError)
 
 
 def test_non_real_quant_collective_reload_delegates(monkeypatch):
@@ -993,7 +907,7 @@ def test_real_quant_ipc_complete_finalizes_vllm_layerwise_reload_and_acks(
         lambda model_arg, config_arg: calls.append(("finalize", model_arg, config_arg)),
     )
     monkeypatch.setattr(
-        backend.torch.accelerator,
+        _base_vllm_backend().torch.cuda,
         "synchronize",
         lambda: calls.append("sync"),
     )
@@ -1046,11 +960,10 @@ def test_real_quant_ipc_finalize_failure_acks_complete(monkeypatch):
         fail_finalize,
     )
 
-    with pytest.raises(
-        RuntimeError, match="ModelOpt real-quant refit post-processing failed"
-    ):
+    with pytest.raises(RuntimeError, match="bad scales"):
         extension.update_weights_via_ipc_zmq()
     assert socket.sent == [IPCProtocol.ACK.value.encode()]
+    assert isinstance(extension._nrl_layerwise_reload_failure, RuntimeError)
 
 
 @pytest.mark.parametrize(
@@ -1146,7 +1059,7 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     assert extension.zmq_socket.sent == [IPCProtocol.ACK.value.encode()] * len(payloads)
 
 
-def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
+def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
     base_backend = _base_vllm_backend()
     reload_mod = sys.modules["vllm.model_executor.model_loader.reload"]
@@ -1185,9 +1098,7 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(
         model=model,
-        vllm_config=types.SimpleNamespace(
-            model_config=types.SimpleNamespace(architectures=["GptOssForCausalLM"])
-        ),
+        vllm_config=object(),
     )
     extension.model_config = model_config
     extension.device = torch.device("cuda:0")
@@ -1232,6 +1143,11 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
     )
     monkeypatch.setattr(
         backend.torch.accelerator,
+        "synchronize",
+        lambda: calls.append("sync"),
+    )
+    monkeypatch.setattr(
+        base_backend.torch.cuda,
         "synchronize",
         lambda: calls.append("sync"),
     )

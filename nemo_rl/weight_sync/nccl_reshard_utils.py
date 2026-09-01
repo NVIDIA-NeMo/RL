@@ -616,9 +616,9 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             "dynamic expert load balancing can change ownership afterwards)."
         )
 
-    # ModelOpt real-quant rollout holds NVFP4-packed vLLM params and refits
-    # through vLLM's layerwise-reload weight loaders; the bulk xferdtensor
-    # path writes directly into param storage, bypassing both.
+    # ModelOpt real-quant rollout holds packed vLLM parameters and refits through
+    # vLLM's layerwise-reload weight loaders; the bulk xferdtensor path writes
+    # directly into parameter storage, bypassing both.
     if generation.get("real_quant"):
         violations.append(
             "policy.generation.real_quant must be False "
