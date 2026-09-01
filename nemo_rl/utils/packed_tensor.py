@@ -36,7 +36,15 @@ def get_num_buffers():
     return int(os.getenv("NRL_REFIT_NUM_BUFFERS", "2"))
 
 
-def packed_broadcast_producer(iterator, group, src, post_iter_func):
+def packed_broadcast_producer(
+    iterator,
+    group,
+    src,
+    post_iter_func,
+    *,
+    buffer_size_bytes: int | None = None,
+    num_buffers: int | None = None,
+):
     """Broadcast a list of tensors in a packed manner.
 
     Args:
@@ -44,14 +52,20 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
         group: process group (vllm PyNcclCommunicator)
         src: source rank (0 in current implementation)
         post_iter_func: function to apply to each tensor before packing, should return a tensor
+        buffer_size_bytes: packed-buffer target. Uses the NeMo-RL default when unset.
+        num_buffers: number of alternating CUDA buffers. Uses the default when unset.
 
     Returns:
         None
 
     """
-    target_packed_tensor_size = get_target_packed_tensor_size()
+    target_packed_tensor_size = (
+        get_target_packed_tensor_size()
+        if buffer_size_bytes is None
+        else buffer_size_bytes
+    )
 
-    num_buffers = get_num_buffers()
+    num_buffers = get_num_buffers() if num_buffers is None else num_buffers
     streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
 
@@ -77,12 +91,15 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                     # Apply backend specific post processing and then convert to linearized uint8 tensor.
                     # contiguous() is required because the upstream iterator may
                     # yield non-contiguous tensors that view(...) cannot handle.
-                    tensor = (
-                        post_iter_func(next(iterator))
-                        .contiguous()
-                        .reshape(-1)
-                        .view(torch.uint8)
-                    )
+                    tensor = post_iter_func(next(iterator))
+                    if tensor.device.type != "cuda":
+                        # Everything here is concatenated into one buffer and
+                        # broadcast over a CUDA collective, so a single host
+                        # tensor anywhere in the stream fails the cat. The
+                        # producer owns its buffer's device rather than
+                        # trusting every upstream exporter to agree.
+                        tensor = tensor.to(torch.cuda.current_device())
+                    tensor = tensor.contiguous().reshape(-1).view(torch.uint8)
                     packing_tensor_list[buffer_idx].append(tensor)
                     packing_tensor_sizes[buffer_idx] += tensor.numel()
                     if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
@@ -109,7 +126,9 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
         s.synchronize()
 
 
-def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
+def packed_broadcast_consumer(
+    iterator, group, src, post_unpack_func, *, num_buffers: int | None = None
+):
     """Consume a packed tensor and unpack it into a list of tensors.
 
     Args:
@@ -117,6 +136,10 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
         group: process group (vllm PyNcclCommunicator)
         src: source rank (0 in current implementation)
         post_unpack_func: function to apply to each tensor after unpacking
+        num_buffers: number of alternating CUDA buffers/streams. Uses the
+            NRL_REFIT_NUM_BUFFERS default when unset. Chunk boundaries only
+            depend on the packed-buffer target size, so the producer and
+            consumer may use different buffer counts.
 
     Returns:
         None
@@ -167,7 +190,8 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
 
     target_packed_tensor_size = get_target_packed_tensor_size()
 
-    num_buffers = get_num_buffers()
+    if num_buffers is None:
+        num_buffers = get_num_buffers()
     streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
 

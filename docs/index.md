@@ -79,6 +79,13 @@ Learn how to evaluate your models using built-in evaluation datasets and custom 
 Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
 :::
 
+:::{grid-item-card} {octicon}`workflow` Managed Dynamo Generation
+:link: guides/dynamo-generation
+:link-type: doc
+
+Run a fixed Dynamo vLLM fleet with NCCL refit and W&B telemetry inside a Slurm Ray allocation.
+:::
+
 ::::
 
 ## Guides and Examples
@@ -101,7 +108,7 @@ Step-by-step guide for supervised fine-tuning on the OpenMathInstruct2 dataset.
 :::
 
 :::{grid-item-card} {octicon}`rocket` Nemotron 3 Ultra
-:link: guides/nemotron-3-ultra
+:link: guides/models/nemotron/nemotron-3-ultra
 :link-type: doc
 
 Post-train Nemotron 3 Ultra with RLVR, teacher training, and MOPD stages on GB200 NVL72 hardware.
@@ -184,11 +191,11 @@ Choose among colocated IPC, NCCL, sparse delta, and NIXL refit transports.
 Use NIXL checkpoint-engine refit to update non-colocated vLLM generation workers from policy workers.
 :::
 
-:::{grid-item-card} {octicon}`workflow` Single-Controller (Async GRPO)
+:::{grid-item-card} {octicon}`workflow` Single-Controller (Async GRPO and PPO)
 :link: guides/single-controller
 :link-type: doc
 
-Run async GRPO via the SingleController path: TransferQueue data plane, pluggable staleness samplers, and streaming trainer.
+Run async GRPO or PPO via the SingleController path: TransferQueue data plane, pluggable staleness samplers, and streaming trainer.
 :::
 
 ::::
@@ -210,6 +217,13 @@ Deep dive into NeMo RL's architecture, APIs, and design decisions for scalable R
 :link-type: doc
 
 Tools and techniques for debugging distributed Ray applications and RL training runs.
+:::
+
+:::{grid-item-card} {octicon}`graph` Observability
+:link: observability/index
+:link-type: doc
+
+OpenTelemetry traces and `rl.*` metrics via nemo-lens: span groups, configuration, vLLM tracing, and an OTLP export stack.
 :::
 
 :::{grid-item-card} {octicon}`zap` FP8 Quantization
@@ -289,11 +303,6 @@ guides/sft-openmathinstruct2.md
 ```{toctree}
 :caption: Guides
 
-guides/nemotron-3-nano.md
-guides/nemotron-3-nano-omni.md
-guides/nemotron-3.5-lightning.md
-guides/nemotron-3-super.md
-guides/nemotron-3-ultra.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
@@ -313,8 +322,6 @@ guides/environments.md
 guides/eval.md
 guides/deepseek.md
 guides/models/index.md
-guides/models/qwen/index.md
-guides/models/qwen/qwen3-5.md
 model-quirks.md
 guides/async-grpo.md
 guides/single-controller.md
@@ -324,6 +331,7 @@ guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
 guides/refit.md
 guides/checkpoint-engine-refit.md
+guides/dynamo-generation.md
 guides/router-replay.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
@@ -349,6 +357,12 @@ guides/use-custom-vllm.md
 ```
 
 ```{toctree}
+:caption: Observability
+
+observability/index.md
+```
+
+```{toctree}
 :caption: Design Docs
 
 design-docs/design-and-philosophy.md
@@ -358,6 +372,7 @@ design-docs/uv.md
 design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
+design-docs/dynamo-integration.md
 design-docs/sparse-delta-refit.md
 design-docs/checkpoint-engines.md
 design-docs/checkpointing.md
@@ -369,6 +384,8 @@ design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md
 design-docs/nccl-reshard-refit.md
+design-docs/media-token-validity-mask.md
+design-docs/automodel-context-parallel.md
 ```
 
 ```{toctree}

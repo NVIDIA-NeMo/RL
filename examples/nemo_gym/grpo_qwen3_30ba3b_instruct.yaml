@@ -64,7 +64,6 @@ policy:
         # Enable the appropriate reasoning parser here. Since this model is an instruct model, we comment it out.
         # reasoning_parser: deepseek_r1
     mcore_generation_config:
-      async_engine: false
       max_model_len: ${policy.max_total_sequence_length}
       cuda_graph_impl: "local"
       inference_cuda_graph_scope: "block"
@@ -78,7 +77,8 @@ policy:
       kv_cache_management_mode: "persist"
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
-      refit_backend: "nvshmem"
+      logprobs_mode: processed_logprobs
+      refit_backend: "nccl"
       parsers: []
       expose_http_server: false
 
@@ -144,6 +144,7 @@ policy:
       # optimizer cpu offload
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}

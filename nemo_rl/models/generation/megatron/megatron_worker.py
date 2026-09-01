@@ -25,12 +25,32 @@ import torch
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
+    MambaInferenceStateConfig,
     PrefixCachingCoordinatorPolicy,
 )
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import set_decode_expert_padding
+from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
+from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
+from megatron.core.resharding.refit import (
+    prepare_swap_model_weights,
+    swap_model_weights,
+)
+from megatron.core.transformer import MegatronModule
+from megatron.core.transformer.cuda_graph_config import (
+    normalize_inference_cuda_graph_scope,
+)
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    _CudagraphGlobalRecord,
+)
 from megatron.core.transformer.enums import InferenceCudaGraphScope
-from megatron.core.transformer.utils import toggle_cuda_graphs
+from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.utils import (
+    set_model_config_attribute,
+    toggle_cuda_graphs,
+)
 from megatron.core.utils import unwrap_model
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -42,6 +62,11 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.megatron.utils import (
     log_gpu_memory,
     resolve_torch_dtype,
+)
+from nemo_rl.models.megatron.memory_saver import (
+    HAVE_TORCH_MEMORY_SAVER,
+    pause_inference_weights,
+    resume_inference_weights,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
@@ -57,7 +82,21 @@ class MegatronGenerationMixin:
      - tokenizer: HF tokenizer.
      - megatron_tokenizer: tokenizer for inference.
      - is_generation_colocated: Whether colocated or distributed.
+     - _reserved_http_server_socket: driver-reserved server socket, or None.
     """
+
+    # Colocated-reshard hosts assign the dedicated inference-layout model here
+    # (see MegatronPolicyWorkerImpl._build_colocated_inference_model).
+    inference_model = None
+    _colocated_reshard_plan = None
+
+    def _gen_model(self) -> MegatronModule:
+        """The model the inference engine wraps.
+
+        Returns the dedicated inference-layout model when one exists (colocated
+        reshard), otherwise the shared training model.
+        """
+        return self.inference_model if self.inference_model is not None else self.model
 
     def _init_inference_engine_state(self) -> None:
         """Reset all inference-engine attributes to their uninitialized state."""
@@ -73,13 +112,103 @@ class MegatronGenerationMixin:
         self._inference_loop = None
         self._inference_thread = None
 
+    def _setup_colocated_cuda_graph_managers(self) -> None:
+        """Create inference CUDA-graph managers for shared-model colocated generation.
+
+        Colocated policies build the shared training model without CUDA graphs.
+        But CUDA graphs configs MUST be in-place at initialization.
+
+        Must run at worker init: colocated reshard is detected via the pending reshard plan
+        (its dedicated inference model is built later, with graphs enabled);
+        the plan is consumed on the first generation cycle.
+        """
+        generation_cfg = self.cfg.get("generation")
+        if (
+            generation_cfg is None
+            or generation_cfg.get("backend") != "megatron"
+            or not self.is_generation_colocated
+            or self._colocated_reshard_plan is not None
+        ):
+            return
+        mcore_generation_config = generation_cfg["mcore_generation_config"]
+        cuda_graph_impl = mcore_generation_config["cuda_graph_impl"]
+        if cuda_graph_impl == "none":
+            return
+        if cuda_graph_impl != "local":
+            raise ValueError(
+                "Colocated Megatron generation supports only cuda_graph_impl "
+                f"'none' or 'local' for inference CUDA graphs, got '{cuda_graph_impl}'. "
+                "'transformer_engine' and 'full_iteration' are training-only capture modes."
+            )
+
+        lang_module = unwrap_model(self.model)
+        # A model built with graphs enabled already owns managers.
+        if not any(
+            hasattr(module, "cudagraph_manager") for module in lang_module.modules()
+        ):
+            scope = normalize_inference_cuda_graph_scope(
+                mcore_generation_config.get("inference_cuda_graph_scope"),
+                cuda_graph_impl,
+            )
+            # Need the correct configs.
+            set_model_config_attribute(lang_module, "cuda_graph_impl", cuda_graph_impl)
+            set_model_config_attribute(lang_module, "inference_cuda_graph_scope", scope)
+            set_model_config_attribute(lang_module, "cuda_graph_modules", [])
+
+            # Need to recurse the configs' effects down into modules.
+            # Megatron-LM has no API for attaching inference CUDA-graph managers to
+            # an already-built model (reported upstream), so this mirrors its
+            # construction-time setup.
+            # TODO: switch to the upstream API once it exists.
+            for module in lang_module.modules():
+                if not isinstance(module, GraphableMegatronModule):
+                    continue
+                if hasattr(module, "create_mcore_cudagraph_manager"):
+                    module.create_mcore_cudagraph_manager(module.config)
+                else:
+                    module.cudagraph_manager = CudaGraphManager(module.config)
+
+            # Handle MTP as well.
+            # TODO: this path only becomes testable once #3331 merges.
+            if getattr(lang_module, "mtp_process", False):
+                if hasattr(lang_module, "_setup_mtp_cuda_graphs") and not hasattr(
+                    lang_module, "_mtp_cudagraph_manager"
+                ):
+                    lang_module._setup_mtp_cuda_graphs()
+                assert hasattr(lang_module, "_mtp_cudagraph_manager"), (
+                    f"cuda_graph_impl='{cuda_graph_impl}', but no MTP graph manager was created."
+                )
+
+            assert any(
+                hasattr(module, "cudagraph_manager") for module in lang_module.modules()
+            ), (
+                f"cuda_graph_impl='{cuda_graph_impl}' is set for colocated Megatron "
+                "generation, but no CUDA-graph manager could be created for this model."
+            )
+
+            # When the model-level manager owns block-scope graphs,
+            # construction deletes the decoder's fallback manager.
+            decoder = getattr(lang_module, "decoder", None)
+            if (
+                hasattr(lang_module, "cudagraph_manager")
+                and decoder is not None
+                and hasattr(decoder, "cudagraph_manager")
+            ):
+                del decoder.cudagraph_manager
+
+        # Detach for training; this caches the managers built above.
+        toggle_cuda_graphs(lang_module, set_to="none")
+
+    def get_inference_cuda_graph_capture_count(self) -> int:
+        """Inference CUDA graphs captured in this worker process (0 = eager decode)."""
+        return len(_CudagraphGlobalRecord.cudagraph_inference_record)
+
     def _initialize_inference_engine(self, mcore_generation_config: dict) -> None:
         """Initialize the persistent inference engine and client."""
         # TODO: Switch to standardized Megatron API.
         if self._inference_engine_initialized:
             return
 
-        from megatron.core.inference.config import MambaInferenceStateConfig
         from megatron.core.inference.contexts.dynamic_context import (
             DynamicInferenceContext,
         )
@@ -94,7 +223,8 @@ class MegatronGenerationMixin:
         )
         from megatron.core.utils import get_attr_wrapped_model
 
-        pg_collection = get_attr_wrapped_model(self.model, "pg_collection")
+        gen_model = self._gen_model()
+        pg_collection = get_attr_wrapped_model(gen_model, "pg_collection")
 
         buffer_size_gb = mcore_generation_config["buffer_size_gb"]
         num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
@@ -115,7 +245,7 @@ class MegatronGenerationMixin:
         num_speculative_tokens = mcore_generation_config["num_speculative_tokens"]
         max_requests = mcore_generation_config.get("max_requests")
 
-        mamba_inference_state_config = MambaInferenceStateConfig.from_model(self.model)
+        mamba_inference_state_config = MambaInferenceStateConfig.from_model(gen_model)
         is_hybrid_model = mamba_inference_state_config is not None
         if is_hybrid_model:
             if (
@@ -140,7 +270,7 @@ class MegatronGenerationMixin:
             logging_step_interval = 0
 
         # flashinfer's fused-RoPE kernel only dispatches fp16/bf16 q/k.
-        use_flashinfer_fused_rope = self.model.config.params_dtype in (
+        use_flashinfer_fused_rope = gen_model.config.params_dtype in (
             torch.float16,
             torch.bfloat16,
         )
@@ -171,20 +301,20 @@ class MegatronGenerationMixin:
             ),
             logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
-            logprobs_mode="processed_logprobs",
+            logprobs_mode=mcore_generation_config["logprobs_mode"],
             max_requests=max_requests,
         )
 
         if "inference_cuda_graph_scope" in mcore_generation_config:
-            self.model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
+            gen_model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
                 mcore_generation_config["inference_cuda_graph_scope"]
             ]
 
         self.inference_context = DynamicInferenceContext(
-            self.model.config, inference_config
+            gen_model.config, inference_config
         )
         self.inference_wrapped_model = GPTInferenceWrapper(
-            self.model, self.inference_context
+            gen_model, self.inference_context
         )
         text_generation_controller = TextGenerationController(
             inference_wrapped_model=self.inference_wrapped_model,
@@ -288,18 +418,23 @@ class MegatronGenerationMixin:
         )
 
         ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
+        reserved_socket = self._reserved_http_server_socket
+        if reserved_socket is not None:
+            server_port = reserved_socket.getsockname()[1]
+        else:
+            server_port = _get_free_port_local()
 
         start_text_gen_server(
             coordinator_addr=self.coordinator_addr,
             tokenizer=self.megatron_tokenizer,
             rank=torch.distributed.get_rank(),
-            server_port=free_port,
+            server_port=server_port,
             parsers=self.cfg["generation"]["mcore_generation_config"]["parsers"],
             verbose=False,
+            sock=reserved_socket,
         )
 
-        base_url = f"http://{ip}:{free_port}/v1"
+        base_url = f"http://{ip}:{server_port}/v1"
         max_wait_time = 300
         start_time = time.time()
         with requests.Session() as session:
@@ -342,12 +477,25 @@ class MegatronGenerationMixin:
             print(f"[Rank {torch.distributed.get_rank()}] HTTP Server not started")
             self.base_url = None
 
-    def finish_generation(self) -> None:
-        """Wind down a generation cycle."""
+    def finish_generation(self, *, release_gpu: bool = True) -> None:
+        """Wind down a generation cycle.
+
+        Args:
+            release_gpu: the caller needs the GPUs for itself (a training
+                step or a checkpoint save), so even a colocated engine must
+                fully stand down. Pass False between generation phases (e.g.
+                after validation) to let a colocated engine keep serving;
+                tearing it down there would discard KV/prefix caches and CUDA
+                graphs for no reason.
+                For non-colocated engines this body reduces to a rotary-cache clear
+                (their engine pause happens in suspend_for_refit).
+        """
+        if self.is_generation_colocated and not release_gpu:
+            return
         print(f"[Rank {self.rank}] finishing generation", flush=True)
         log_gpu_memory("finish_generation START")
 
-        lang_module = unwrap_model(self.model)
+        lang_module = unwrap_model(self._gen_model())
 
         if self.is_generation_colocated:
             if self._inference_engine_initialized and not self._inference_engine_asleep:
@@ -357,6 +505,9 @@ class MegatronGenerationMixin:
             ]
             if cuda_graph_impl != "none":
                 toggle_cuda_graphs(lang_module, set_to="none")
+                # Need to turn off padding before training.
+                # Gains nightly MoE coverage once #2884 and #3570 merge.
+                set_decode_expert_padding(lang_module, set_to=False)
 
         rotary_module = getattr(lang_module, "rotary_pos_emb", None)
         if rotary_module is not None and hasattr(
@@ -365,6 +516,9 @@ class MegatronGenerationMixin:
             rotary_module.forward.cache_clear()
 
         if self.is_generation_colocated:
+            # Offload the inference weights to CPU.
+            if self.inference_model is not None:
+                self._offload_inference_model()
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -373,27 +527,54 @@ class MegatronGenerationMixin:
     def prepare_for_generation(self, tags=None, **kwargs) -> None:
         """Enter inference mode and start (or wake) the inference engine.
 
+        Idempotent wake: a plain call (no tags) on an already-serving engine returns immediately.
+        Refit-protocol calls (tags) are never skipped.
+
         Called in both colocated and non-colocated setups.
         Even in non-colocated mode, Megatron's engine has to be intentionally paused before a refit
         (and its weights are not detachable), so we have to switch modes around every refit.
         """
+        if (
+            tags is None
+            and self._inference_engine_initialized
+            and not self._inference_engine_asleep
+        ):
+            print(
+                f"[Rank {self.rank}] prepare_for_generation: engine already "
+                "serving, skipping",
+                flush=True,
+            )
+            return
         log_gpu_memory("prepare_for_generation START")
         mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
 
-        self.model.config.flash_decode = False
-        if self.is_generation_colocated and self.should_disable_forward_pre_hook:
-            # Bring offloaded params back to CUDA before colocated generation.
+        # Colocated reshard: build the dedicated inference-layout model on the first cycle.
+        if self._colocated_reshard_plan is not None:
+            self._build_colocated_inference_model(self.cfg)
+
+        gen_model = self._gen_model()
+        # `flash_decode` selects Megatron Inference's deprecated static-batching decode path,
+        # which would cause an assertion error if taken.
+        gen_model.config.flash_decode = False
+        if self.is_generation_colocated and self.inference_model is None:
             self.model = self.move_model(
                 self.model, "cuda", move_params=True, move_grads=False
             )
-            # DP inference schedules requests independently, so a forward pre-hook
-            # cannot safely launch a parameter all-gather from only the rank that
-            # received work. Gather once across every worker, then keep the hooks
-            # disabled until the next training step completes.
-            if self._forward_pre_hook_enabled():
+            # Because DP inference requests are asynchronously scheduled per rank, pre-forward hooks that trigger DP collectives (such as an overlapped param gather after optimizer steps) will stall or hang.
+            # Instead, synchronously gather all model compute weights from the sharded model state here, and deactivate all pre-forward hooks.
+            # Incompatible with FSDP2 or Megatron-FSDP for inference.
+            if (
+                self.should_disable_forward_pre_hook
+                and self._forward_pre_hook_enabled()
+            ):
                 self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
+            gen_model = self.model
 
-        lang_module = unwrap_model(self.model)
+        # Colocated reshard (hosts without a dedicated inference model skip it).
+        if self.inference_model is not None:
+            self._reshard_into_inference_model()
+
+        lang_module = unwrap_model(gen_model)
         lang_module.eval()
 
         rotary_module = getattr(lang_module, "rotary_pos_emb", None)
@@ -684,8 +865,16 @@ class MegatronGenerationRefitMixin:
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             rank_offset: Offset for this side's ranks (`train_world_size` for inference).
-            refit_backend: Copy-service backend ("gloo", "nccl", or "nvshmem").
+            refit_backend: Copy-service backend ("gloo" or "nccl";
+                "nvshmem" is currently broken, see the issue below).
         """
+        if refit_backend == "nvshmem":
+            warnings.warn(
+                'refit_backend="nvshmem" is currently broken; prefer "nccl" or '
+                '"gloo". See https://github.com/NVIDIA-NeMo/RL/issues/3646',
+                stacklevel=2,
+            )
+
         from torch.distributed.distributed_c10d import (
             PrefixStore,
             ProcessGroup,
@@ -739,6 +928,10 @@ class MegatronGenerationRefitMixin:
                 nccl_store, global_rank, world_size, nccl_options
             )
             nccl_backend._set_sequence_number_for_group()
+            # Create the group-wide NCCL communicator now, on every rank.
+            nccl_backend.eager_connect_single_device(
+                torch.device("cuda", torch.cuda.current_device())
+            )
             pg._register_backend(
                 torch.device("cuda"),
                 ProcessGroup.BackendType.NCCL,
@@ -756,25 +949,16 @@ class MegatronGenerationRefitMixin:
         _world.pg_names[pg] = group_name
 
         if refit_backend == "nvshmem":
+            # Deferred: importing NVSHMEMCopyService loads the optional nvshmem bindings.
             from megatron.core.resharding.copy_services.nvshmem_copy_service import (
                 NVSHMEMCopyService,
             )
 
             self.refit_copy_service = NVSHMEMCopyService(group=self.refit_pg)
         elif refit_backend == "nccl":
-            from megatron.core.resharding.copy_services.nccl_copy_service import (
-                NCCLCopyService,
-            )
-
             self.refit_copy_service = NCCLCopyService(group=self.refit_pg)
         else:
-            from megatron.core.resharding.copy_services.gloo_copy_service import (
-                GlooCopyService,
-            )
-
             self.refit_copy_service = GlooCopyService(group=self.refit_pg)
-
-        from megatron.core.resharding.refit import prepare_swap_model_weights
 
         is_source = rank_offset == 0
         # Cache for later refit calls (swap_weights_via_reshard).
@@ -796,8 +980,8 @@ class MegatronGenerationRefitMixin:
         """Initialize NVShmem collectively before any weight transfer.
 
         Must be called on ALL participating ranks (training + inference) simultaneously,
-        after `prepare_for_generation()` has completed and the CG has been recorded.
-        The `NVSHMEMCopyService` lazy init can corrupt CUDA graph state.
+        outside CUDA graph capture. Lazy initialization during graph recording or replay
+        can corrupt CUDA graph state.
         """
         if not hasattr(self, "refit_copy_service"):
             return
@@ -814,8 +998,6 @@ class MegatronGenerationRefitMixin:
         Returns:
             True on success.
         """
-        from megatron.core.resharding.refit import swap_model_weights
-
         src_model = self.model if is_source else None
         dst_model = None if is_source else self.model
 
@@ -830,12 +1012,76 @@ class MegatronGenerationRefitMixin:
 
         return True
 
+    def _onload_inference_model(self) -> None:
+        """Restore the colocated inference weights to GPU before resharding / generation."""
+        if not self._inference_model_offloaded:
+            return
+        resume_inference_weights()
+        self._inference_model_offloaded = False
+
+    def _offload_inference_model(self) -> None:
+        """Offload the colocated inference weights to CPU while training runs."""
+        if (
+            self.inference_model is None
+            or self._inference_model_offloaded
+            or not HAVE_TORCH_MEMORY_SAVER
+        ):
+            return
+        pause_inference_weights()
+        self._inference_model_offloaded = True
+
+    def _reshard_into_inference_model(self) -> None:
+        """Reshard current training weights into the colocated inference-layout model."""
+        inference_model = self.inference_model
+        if inference_model is None:
+            return
+
+        # Bring the inference weights back to GPU.
+        self._onload_inference_model()
+        self.model = self.move_model(
+            self.model, "cuda", move_params=True, move_grads=False
+        )
+        # TODO: Optimize away the full synchronization.
+        torch.cuda.synchronize()
+
+        # The swap reads the training params as its source;
+        # under overlap_param_gather they stay stale after the optimizer step until gathered.
+        if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
+            self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
+
+        # Build + cache the same-rank reshard plan once, before the first CUDA-graph capture.
+        if not self._swap_weights_plan_prepared:
+            prepare_swap_model_weights(
+                src_model=self.model,
+                target_model=inference_model,
+                group=None,
+                src_rank_offset=0,
+                dst_rank_offset=0,
+            )
+            self._swap_weights_plan_prepared = True
+
+        swap_model_weights(
+            self.model,
+            inference_model,
+            refit_method=self.cfg["generation"]["mcore_generation_config"][
+                "refit_backend"
+            ],
+            group=None,
+            src_rank_offset=0,
+            dst_rank_offset=0,
+        )
+        # Offload training model.
+        self.model = self.move_model(
+            self.model, "cpu", move_params=True, move_grads=False
+        )
+        # TODO: Optimize away the full synchronization.
+        torch.cuda.synchronize()
+
     def suspend_for_refit(self) -> None:
         """Pause+suspend the inference engine before a weight refit."""
         if not self._inference_engine_initialized:
             return
         self._sleep()
-        torch.cuda.synchronize()
 
     def resume_after_refit(self) -> None:
         """Resume+unpause the inference engine after a weight refit."""

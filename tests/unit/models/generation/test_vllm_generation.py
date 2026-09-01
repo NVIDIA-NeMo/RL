@@ -19,7 +19,7 @@ import sys
 import types
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
@@ -168,6 +168,71 @@ def test_context_capped_max_new_tokens():
         )
 
 
+@pytest.mark.asyncio
+async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = MagicMock(
+        pause_generation=AsyncMock(),
+        resume_generation=AsyncMock(),
+    )
+
+    assert await worker.pause_generation_async(clear_cache=False)
+    assert await worker.resume_generation_async()
+
+    worker.llm.pause_generation.assert_awaited_once_with(mode="keep", clear_cache=False)
+    worker.llm.resume_generation.assert_awaited_once_with()
+
+
+def test_vllm_generation_broadcasts_native_refit_pause_and_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": True}}
+    generation.worker_group = MagicMock()
+    generation.worker_group.workers = [object(), object()]
+    futures = [object(), object()]
+    generation.worker_group.run_all_workers_single_data.return_value = futures
+    ray_get = MagicMock(side_effect=[[True, True], [True, True]])
+    monkeypatch.setattr(ray, "get", ray_get)
+
+    assert generation.pause_generation_for_refit(clear_cache=True)
+    assert generation.resume_generation_after_refit()
+
+    generation.worker_group.run_all_workers_single_data.assert_any_call(
+        "pause_generation_async",
+        clear_cache=True,
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+    generation.worker_group.run_all_workers_single_data.assert_any_call(
+        "resume_generation_async",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+
+
+def test_vllm_generation_rejects_partial_refit_pause_and_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": True}}
+    generation.worker_group = MagicMock()
+    generation.worker_group.workers = [object(), object()]
+    generation.worker_group.run_all_workers_single_data.return_value = [
+        object(),
+        object(),
+    ]
+    monkeypatch.setattr(
+        ray,
+        "get",
+        MagicMock(side_effect=[[True, False], [False, True]]),
+    )
+
+    with pytest.raises(RuntimeError, match="pause every async vLLM engine"):
+        generation.pause_generation_for_refit(clear_cache=False)
+    with pytest.raises(RuntimeError, match="resume every async vLLM engine"):
+        generation.resume_generation_after_refit()
+
+
 def test_sampling_params_preserve_bad_words():
     worker = object.__new__(VllmGenerationWorkerImpl)
     worker.cfg = {
@@ -297,6 +362,12 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     class ReasoningParserManager:
         import_reasoning_parser = MagicMock()
 
+    # The server resolves the chat template through vLLM's own loader, so the
+    # stub tree needs this leaf even though the test does not assert on it.
+    make_module(
+        "vllm.entrypoints.chat_utils",
+        load_chat_template=MagicMock(return_value=None),
+    )
     make_module(
         "vllm.entrypoints.openai.chat_completion.protocol",
         ChatCompletionRequest=type("ChatCompletionRequest", (), {}),
@@ -691,6 +762,7 @@ def get_basic_megatron_test_config(
         "sequence_packing": {
             "enabled": False,
         },
+        "make_sequence_length_divisible_by": 1,
         "megatron_cfg": {
             "enabled": True,
             "empty_unused_memory_level": empty_unused_memory_level,
@@ -734,6 +806,7 @@ def get_basic_megatron_test_config(
                 "clip_grad": 1.0,
                 "optimizer_cpu_offload": False,
                 "optimizer_offload_fraction": 0.0,
+                "overlap_cpu_optimizer_d2h_h2d": False,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
@@ -937,6 +1010,38 @@ def test_vllm_policy_generation(policy, test_input_data, tokenizer):
     assert all(len(text) > 0 for text in generated_texts), (
         "Some generated texts are empty"
     )
+
+
+@pytest.mark.vllm
+def test_vllm_policy_generation_with_fastokens_enabled(
+    monkeypatch, cluster, test_input_data, tokenizer
+):
+    """Test real vLLM generation when vLLM's fastokens patch is enabled."""
+    # Keep this on the VLLM-only flag path; NeMo-RL mirrors NRL_USE_FASTOKENS.
+    monkeypatch.delenv("NRL_USE_FASTOKENS", raising=False)
+    monkeypatch.setenv("VLLM_USE_FASTOKENS", "1")
+
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config = configure_generation_config(vllm_config, tokenizer)
+    vllm_policy = VllmGeneration(cluster, vllm_config)
+
+    try:
+        outputs = vllm_policy.generate(test_input_data)
+
+        assert "output_ids" in outputs, "output_ids not found in generation output"
+        assert outputs["output_ids"].shape[0] == len(test_input_data["input_ids"]), (
+            "Wrong batch size in output"
+        )
+
+        generated_texts = tokenizer.batch_decode(
+            outputs["output_ids"], skip_special_tokens=True
+        )
+        print(f"Generated texts with fastokens enabled: {generated_texts}")
+        assert all(len(text) > 0 for text in generated_texts), (
+            "Some generated texts are empty"
+        )
+    finally:
+        vllm_policy.shutdown()
 
 
 async def _generate_async(vllm_policy, tokenizer, test_input_data, greedy=False):

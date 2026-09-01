@@ -47,6 +47,34 @@ def test_nixl_example_is_an_enabled_non_colocated_overlay():
     assert config.cluster["num_nodes"] == 2
 
 
+def test_reset_encoder_cache_flag_rejected_on_unsupported_refit_transports():
+    """The encoder-cache reset is honored only on collective/IPC and nccl_reshard."""
+    import pytest
+
+    from nemo_rl.models.generation.vllm.config import (
+        VllmConfig,
+        normalize_vllm_refit_config,
+    )
+
+    def _config(transport):
+        return cast(
+            VllmConfig,
+            {
+                "vllm_cfg": {"reset_encoder_cache_after_weight_update": True},
+                "refit_transport": transport,
+            },
+        )
+
+    # Supported transports pass through unchanged.
+    assert normalize_vllm_refit_config(_config(None)) is None
+    assert normalize_vllm_refit_config(_config("nccl_reshard")) is None
+
+    # Transports whose refit path never resets the encoder cache fail loudly.
+    for transport in ("nixl", "vllm_s3_sparse", "vllm_zmq_sparse"):
+        with pytest.raises(ValueError, match="reset_encoder_cache_after_weight_update"):
+            normalize_vllm_refit_config(_config(transport))
+
+
 def test_refit_policy_generation_uses_attached_checkpoint_engine_synchronizer():
     from nemo_rl.algorithms import grpo as grpo_mod
     from nemo_rl.models.generation.vllm import VllmGeneration
@@ -73,28 +101,31 @@ def test_refit_policy_generation_uses_attached_checkpoint_engine_synchronizer():
     assert result == {"transfer_s": 1.0}
 
 
-def test_refit_policy_generation_sglang_uses_standard_refit(monkeypatch):
+def test_refit_policy_generation_sglang_uses_attached_synchronizer(monkeypatch):
+    """SGLang always refits through its synchronizer, never the inline branches."""
     from nemo_rl.algorithms import grpo as grpo_mod
     from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 
     policy = MagicMock()
-    policy.stream_weights_via_http.return_value = [object()]
-
     generation = MagicMock(spec=SGLangGeneration)
-    generation.get_rollout_engine_urls.return_value = ["http://rollout"]
+    generation.weight_synchronizer = MagicMock()
+    generation.weight_synchronizer.sync_weights.return_value = None
     ray_get = MagicMock()
     monkeypatch.setattr(grpo_mod.ray, "get", ray_get)
 
-    grpo_mod.refit_policy_generation(
+    result = grpo_mod.refit_policy_generation(
         policy=policy,
         policy_generation=generation,
         colocated_inference=True,
         _refit_buffer_size_gb=2,
     )
 
-    policy.stream_weights_via_http.assert_called_once_with(
-        rollout_engine_urls=["http://rollout"],
-        buffer_size_bytes=2 * 1024**3,
+    generation.weight_synchronizer.sync_weights.assert_called_once_with(
+        timer=None, kv_scales=None
     )
-    ray_get.assert_called_once_with(policy.stream_weights_via_http.return_value)
-    assert generation.prepare_for_generation.call_count == 2
+    assert result == {}
+    # The synchronizer owns every phase transition; grpo must not drive them.
+    policy.offload_before_refit.assert_not_called()
+    policy.offload_after_refit.assert_not_called()
+    generation.prepare_for_generation.assert_not_called()
+    ray_get.assert_not_called()

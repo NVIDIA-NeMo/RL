@@ -1,4 +1,10 @@
+---
+orphan: true
+---
+
 # Nemotron 3 Nano Omni
+
+> **Note:** This document has moved and will be deprecated here. See the new location: https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/models/nemotron/nemotron-3-nano-omni.md
 
 This guide explains how to post-train the Nemotron 3 Nano Omni vision-language model with GRPO using NeMo RL. Both the AutoModel and Megatron backends are supported for image-and-text training.
 

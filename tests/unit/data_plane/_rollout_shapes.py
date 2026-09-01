@@ -242,3 +242,22 @@ def mooncake_available() -> bool:
             raise
         return False
     return True
+
+
+def rdma_available() -> bool:
+    """Return True if a usable mlx5 RDMA device is present.
+
+    Set ``NEMO_RL_REQUIRE_MOONCAKE=1`` to promote a missing device into a
+    loud ``RuntimeError`` instead of returning False — same promotion rule
+    as :func:`mooncake_available`, for the "RDMA device absent" precondition.
+    """
+    from nemo_rl.data_plane.adapters.transfer_queue import rdma_devices
+
+    if rdma_devices():
+        return True
+    if os.environ.get("NEMO_RL_REQUIRE_MOONCAKE") == "1":
+        raise RuntimeError(
+            "no usable mlx5 RDMA device — mooncake_cpu requires RDMA "
+            "(set MC_MOONCAKE_DEVICE=<dev> to override)"
+        )
+    return False

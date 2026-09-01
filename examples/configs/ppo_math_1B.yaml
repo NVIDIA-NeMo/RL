@@ -10,6 +10,10 @@ ppo:
   max_num_steps: 100000
   ppo_epochs: 4
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
+  # step_<n> dir of a critic-pretrain run whose value/ seeds the critic.
+  # Only a fresh run reads it; a resume ignores it and restores the critic from
+  # its own checkpoint, so it can stay set.
+  warm_start_value_checkpoint: null
   val_period: 20
   val_at_start: true
   val_at_end: false
@@ -21,6 +25,17 @@ ppo:
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
   skip_reference_policy_logprobs_calculation: true  # No KL, so skip ref logprobs
+
+  # Async PPO requires non-colocated vLLM generation and importance correction.
+  async_ppo:
+    enabled: false
+    max_trajectory_age_steps: 1
+    # Requires policy_training_start_step > 0. null uses max_trajectory_age_steps.
+    warmup_generation_lead_steps: null
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+    # true discards partial restored rows and fills from subsequent prompts.
+    drop_incomplete_targets_on_restore: false
 
   reward_shaping:
     enabled: true
@@ -128,6 +143,15 @@ policy:
     enabled: false
     empty_unused_memory_level: 1
     activation_checkpointing: false
+    # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
+    # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+    fine_grained_activation_offloading: false
+    # Modules to offload when enabled; null disables module selection. Common
+    # examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"]. Supported
+    # names depend on the pinned Megatron-LM version and are validated by MCore.
+    # "attn_proj" requires "core_attn". See the latest upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: null
     converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
@@ -171,6 +195,7 @@ policy:
       clip_grad: ${policy.max_grad_norm}
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -251,6 +276,7 @@ policy:
       enable_chunked_prefill: true
       unified_memory_level: 0
       max_tokens: 16384
+      logprobs_mode: processed_logprobs
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
@@ -317,6 +343,15 @@ value:
     enabled: false
     empty_unused_memory_level: 1
     activation_checkpointing: false
+    # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
+    # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+    fine_grained_activation_offloading: false
+    # Modules to offload when enabled; null disables module selection. Common
+    # examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"]. Supported
+    # names depend on the pinned Megatron-LM version and are validated by MCore.
+    # "attn_proj" requires "core_attn". See the latest upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: null
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
@@ -359,6 +394,7 @@ value:
       clip_grad: 1.0
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: 0.1
@@ -423,6 +459,7 @@ data:
   max_input_seq_length: 2048
   shuffle: true
   num_workers: 1
+  use_multiple_dataloader: false
   train:
     dataset_name: DAPOMath17K
   validation:

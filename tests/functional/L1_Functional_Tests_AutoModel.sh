@@ -36,6 +36,7 @@ run_test() {
 
 run_test      uv run --no-sync bash ./tests/functional/dpo_automodel_lora.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_ref_anchor_resume.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora_async.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora_non_colocated.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_automodel_lora.sh
