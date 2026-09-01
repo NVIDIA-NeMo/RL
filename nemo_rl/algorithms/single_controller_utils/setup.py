@@ -69,6 +69,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.multimodal_utils import (
+    UNDECLARED_MULTIMODAL_MODEL_INPUTS,
+    get_multimodal_keys_from_processor,
+)
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -1375,7 +1379,10 @@ def setup_single_controller(
         partition_fields.extend(
             field
             for field in packed_tensor_wire_fields(
-                getattr(processor, "model_input_names", ())
+                [
+                    *get_multimodal_keys_from_processor(processor),
+                    *UNDECLARED_MULTIMODAL_MODEL_INPUTS,
+                ]
             )
             if field not in partition_fields
         )

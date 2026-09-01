@@ -32,7 +32,11 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import (
+    DP_TRAIN_FIELDS,
+    PACKED_TENSOR_META_PREFIX,
+    ROUTED_EXPERTS_FIELD,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.models.policy.tq_policy import TQPolicy
 
@@ -180,6 +184,53 @@ class TestTQPolicySplitFanout:
 
         train_meta = mock_shard.call_args.args[0]
         assert train_meta.fields == [*DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD]
+
+    def test_policy_dispatches_request_the_same_multimodal_columns(self):
+        """Prev/ref logprob and both train APIs must fetch one identical media set."""
+        p, wg = _make_tq_policy()
+        media_fields = [
+            "token_type_ids",
+            "pixel_values",
+            f"{PACKED_TENSOR_META_PREFIX}pixel_values",
+            "imgs_sizes",
+            f"{PACKED_TENSOR_META_PREFIX}imgs_sizes",
+        ]
+        meta = KVBatchMeta(
+            partition_id="train",
+            task_name="train",
+            sample_ids=["s0", "s1"],
+            fields=[*DP_TRAIN_FIELDS, *media_fields],
+        )
+
+        dispatched_media: list[list[str]] = []
+        calls = [
+            lambda: p.get_logprobs_from_meta(meta),
+            lambda: p.get_reference_policy_logprobs_from_meta(meta),
+            lambda: p.train_from_meta(meta, loss_fn="LF"),
+            lambda: p.train_microbatches_from_meta(meta),
+        ]
+        for call in calls:
+            with (
+                patch.object(TQPolicy, "_stamp_pad_seqlen"),
+                patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+                patch(
+                    "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                    return_value=([meta, meta], None),
+                ) as mock_shard,
+                patch(
+                    "nemo_rl.models.policy.tq_policy._aggregate_train_results",
+                    return_value={},
+                ),
+            ):
+                wg.get_all_worker_results.reset_mock()
+                call()
+
+            dispatch_meta = mock_shard.call_args.args[0]
+            dispatched_media.append(
+                [field for field in dispatch_meta.fields if field in media_fields]
+            )
+
+        assert dispatched_media == [media_fields] * len(calls)
 
     def test_finish_dedupes_replica_twins(self):
         """TP/CP twins return identical metric copies; aggregating without

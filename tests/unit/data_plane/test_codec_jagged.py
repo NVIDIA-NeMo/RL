@@ -24,12 +24,14 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.codec import (
     materialize,
     pack_jagged_fields,
     response_from_nested,
     to_nested_by_length,
 )
+from nemo_rl.data_plane.schema import PACKED_TENSOR_META_PREFIX
 
 from ._rollout_shapes import make_rollout_batch
 
@@ -133,6 +135,20 @@ def test_materialize_jagged_layout_passes_nested_through() -> None:
     td = TensorDict({"x": nested}, batch_size=[2])
     bdd = materialize(td, layout="jagged")
     assert bdd["x"].is_nested
+
+
+def test_materialize_jagged_layout_ignores_forward_pad_target() -> None:
+    """A token-length target must not be applied to raw nested leaves."""
+    padded, lens = _padded([[1, 2], [3, 4, 5]], pad=0)
+    nested = to_nested_by_length(padded, lens)
+    td = TensorDict({"x": nested}, batch_size=[2])
+
+    bdd = materialize(td, layout="jagged", pad_to_seqlen=8)
+
+    assert bdd["x"].is_nested
+    rows = list(bdd["x"].unbind())
+    assert torch.equal(rows[0], torch.tensor([1, 2]))
+    assert torch.equal(rows[1], torch.tensor([3, 4, 5]))
 
 
 def test_materialize_default_pad_value_is_zero() -> None:
@@ -257,3 +273,140 @@ def test_pack_jagged_fields_forced_per_token_field_drops_extra_padding() -> None
     assert torch.equal(out["advantages"][1], advantages[1, :5])
     assert torch.equal(out["advantages"][0, 3:], torch.zeros(2))
     assert torch.equal(out["extra_2d"], extra)
+
+
+# ── PackedTensor wire invariants ──────────────────────────────────────
+
+
+def test_packed_tensor_wire_round_trip_preserves_arbitrary_pack_dim() -> None:
+    """Field names are dynamic; metadata preserves rows, dtype, and packing dim."""
+    rows = [
+        torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        None,
+        torch.arange(4, dtype=torch.float32).reshape(2, 2) + 10,
+    ]
+    packed = PackedTensor(rows, dim_to_pack=1)
+
+    wire = pack_jagged_fields(
+        {"pixel_values_flat": packed},
+        lengths=torch.tensor([4, 2, 3]),
+    )
+
+    metadata_key = f"{PACKED_TENSOR_META_PREFIX}pixel_values_flat"
+    assert wire["pixel_values_flat"].is_nested
+    assert torch.equal(
+        wire[metadata_key],
+        torch.tensor([[3, 1, 0], [0, 1, 0], [2, 1, 0]]),
+    )
+
+    restored = materialize(wire)["pixel_values_flat"]
+    assert isinstance(restored, PackedTensor)
+    assert restored.dim_to_pack == 1
+    assert restored.pad_to_max_shape is False
+    assert restored.as_tensor().dtype == torch.float32
+    for row_idx, expected in enumerate(rows):
+        actual = restored.slice([row_idx]).as_tensor()
+        if expected is None:
+            assert actual is None
+        else:
+            assert torch.equal(actual, expected)
+
+
+def test_packed_tensor_wire_round_trip_preserves_mixed_media_fields() -> None:
+    """Independent media fields keep their own dtype and reconstruction metadata."""
+    pixels = PackedTensor(
+        [
+            torch.arange(24, dtype=torch.float32).reshape(2, 3, 4),
+            torch.arange(8, dtype=torch.float32).reshape(1, 2, 4),
+        ],
+        dim_to_pack=0,
+        pad_to_max_shape=True,
+    )
+    image_sizes = PackedTensor(
+        [torch.tensor([[12, 16]]), torch.tensor([[8, 8]])],
+        dim_to_pack=0,
+    )
+    num_frames = PackedTensor(
+        [torch.tensor([1], dtype=torch.int32), torch.tensor([2], dtype=torch.int32)],
+        dim_to_pack=0,
+    )
+
+    wire = pack_jagged_fields(
+        {
+            "pixel_values": pixels,
+            "imgs_sizes": image_sizes,
+            "num_frames": num_frames,
+        },
+        lengths=torch.tensor([4, 3]),
+    )
+    restored = materialize(wire)
+
+    restored_pixels = restored["pixel_values"]
+    assert isinstance(restored_pixels, PackedTensor)
+    assert restored_pixels.pad_to_max_shape is True
+    assert restored_pixels.as_tensor().dtype == torch.float32
+    assert restored_pixels.slice([0]).as_tensor().shape == (2, 3, 4)
+    assert restored_pixels.slice([1]).as_tensor().shape == (1, 3, 4)
+    assert torch.equal(
+        restored_pixels.slice([1]).as_tensor()[:, :2],
+        pixels.slice([1]).as_tensor(),
+    )
+    assert torch.count_nonzero(restored_pixels.slice([1]).as_tensor()[:, 2:]) == 0
+
+    assert restored["imgs_sizes"].as_tensor().dtype == torch.int64
+    assert torch.equal(restored["imgs_sizes"].as_tensor(), image_sizes.as_tensor())
+    assert restored["num_frames"].as_tensor().dtype == torch.int32
+    assert torch.equal(restored["num_frames"].as_tensor(), num_frames.as_tensor())
+
+
+def test_materialize_rejects_orphan_packed_tensor_metadata() -> None:
+    metadata_key = f"{PACKED_TENSOR_META_PREFIX}pixel_values"
+    td = TensorDict(
+        {metadata_key: torch.tensor([[1, 0, 0], [1, 0, 0]])},
+        batch_size=[2],
+    )
+
+    with pytest.raises(ValueError, match="has no payload field"):
+        materialize(td)
+
+
+def test_materialize_rejects_malformed_packed_tensor_metadata() -> None:
+    packed = PackedTensor(
+        [torch.ones(1, 2), torch.ones(2, 2)],
+        dim_to_pack=0,
+    )
+    wire = pack_jagged_fields({"pixel_values": packed}, lengths=torch.tensor([2, 3]))
+    metadata_key = f"{PACKED_TENSOR_META_PREFIX}pixel_values"
+    malformed = TensorDict(
+        {
+            "pixel_values": wire["pixel_values"],
+            metadata_key: torch.ones((2, 2), dtype=torch.long),
+        },
+        batch_size=[2],
+    )
+
+    with pytest.raises(ValueError, match=r"shape \[batch, 3\]"):
+        materialize(malformed)
+
+
+def test_materialized_media_survives_token_microbatch_truncation() -> None:
+    """Media is reconstructed before token truncation and is not sequence-padded."""
+    packed = PackedTensor(
+        [torch.arange(6, dtype=torch.float32).reshape(2, 3)],
+        dim_to_pack=0,
+    )
+    wire = pack_jagged_fields(
+        {
+            "input_ids": torch.tensor([[1, 2, 3, 0]]),
+            "pixel_values": packed,
+        },
+        lengths=torch.tensor([3]),
+        token_aligned_fields=frozenset({"input_ids"}),
+    )
+
+    restored = materialize(wire, layout="padded", pad_to_seqlen=8)
+    restored.truncate_tensors(dim=1, truncated_len=3)
+
+    assert restored["input_ids"].shape == (1, 3)
+    assert isinstance(restored["pixel_values"], PackedTensor)
+    assert torch.equal(restored["pixel_values"].as_tensor(), packed.as_tensor())

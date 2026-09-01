@@ -170,14 +170,8 @@ def test_multimodal_packed_tensor_round_trips_through_tq_payload() -> None:
         _completion(route_start=10, reward=1.0, with_routes=False),
         _completion(route_start=30, reward=2.0, with_routes=False),
     ]
-    media_rows = [
-        torch.arange(8, dtype=torch.float32).reshape(2, 4),
-        torch.arange(4, dtype=torch.float32).reshape(1, 4) + 20,
-    ]
-    for completion, media in zip(completions, media_rows, strict=True):
-        completion.message_log[0]["pixel_values"] = PackedTensor(
-            media, dim_to_pack=0
-        )
+    media = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    completions[0].message_log[0]["pixel_values"] = PackedTensor(media, dim_to_pack=0)
 
     train_batch = record_to_train_batch(
         _record(completions),
@@ -198,8 +192,8 @@ def test_multimodal_packed_tensor_round_trips_through_tq_payload() -> None:
     restored_media = restored["pixel_values"]
     assert isinstance(restored_media, PackedTensor)
     assert len(restored_media) == 2
-    assert restored_media.logical_segment_counts_by_row() == [1, 1]
-    assert torch.equal(restored_media.as_tensor(), torch.cat(media_rows))
+    assert restored_media.logical_segment_counts_by_row() == [1, 0]
+    assert torch.equal(restored_media.as_tensor(), media)
 
 
 def _failed_completion() -> Completion:

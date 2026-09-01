@@ -20,6 +20,7 @@
 import argparse
 import builtins
 import json
+import math
 import statistics
 import sys
 
@@ -36,6 +37,12 @@ def min(value):
 def max(value):
     """Return the maximum value in a dictionary."""
     return builtins.max(float(v) for v in value.values())
+
+
+def all_finite(value):
+    """Return whether a metric is present and every recorded value is finite."""
+    vals = [float(v) for v in value.values()]
+    return bool(vals) and builtins.all(math.isfinite(v) for v in vals)
 
 
 def ratio_above(value, threshold):
@@ -148,6 +155,7 @@ def evaluate_check(data: dict, check: str) -> tuple[bool, str, object]:
         "max": max,
         "mean": mean,
         "median": median,
+        "all_finite": all_finite,
         "ratio_above": ratio_above,
     }
 

@@ -110,6 +110,8 @@ class TQValue(TQDriverMixin, Value):
             timer: Optional timer for nested get_values measurements.
         """
         spa, dba = self._packing_args("logprob_mb_tokens")
+        # The critic is text-only (built with is_vlm=False), so media columns
+        # are deliberately not fetched here.
         value_meta = self._isolated_meta(
             meta,
             fields=list(VALUE_SEED_FIELDS),
@@ -161,6 +163,8 @@ class TQValue(TQDriverMixin, Value):
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
 
         spa, dba = self._packing_args("train_mb_tokens")
+        # The critic is text-only (built with is_vlm=False), so media columns
+        # are deliberately not fetched here.
         train_meta = self._isolated_meta(
             meta,
             fields=list(DP_VALUE_TRAIN_FIELDS),

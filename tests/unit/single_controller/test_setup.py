@@ -942,6 +942,14 @@ class TestSetup:
         warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs["fields"]
         assert "pixel_values" in warmup_fields
         assert "__nrl_packed_tensor_meta__pixel_values" in warmup_fields
+        for field in (
+            "imgs_sizes",
+            "num_frames",
+            "pixel_values_flat",
+            "image_num_patches",
+        ):
+            assert field in warmup_fields
+            assert f"__nrl_packed_tensor_meta__{field}" in warmup_fields
 
     def test_weight_sync_factory_args(self, patched_factories):
         """create_weight_synchronizer receives policy / generation / topology."""

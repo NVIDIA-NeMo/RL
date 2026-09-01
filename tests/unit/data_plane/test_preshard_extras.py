@@ -29,11 +29,12 @@ from __future__ import annotations
 
 import torch
 
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, packed_tensor_wire_fields
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 from ._rollout_shapes import (
@@ -92,6 +93,51 @@ def test_kv_first_write_carries_multimodal_extras():
         select_fields=["pixel_values"],
     )
     assert fetched["pixel_values"].shape == (4, 3, 4, 4)
+
+
+def test_kv_first_write_round_trips_mixed_packed_tensor_rows():
+    """Packed media crosses the client boundary with text-only rows intact."""
+    client = NoOpDataPlaneClient()
+    client.register_partition(
+        partition_id="train",
+        fields=[
+            "input_ids",
+            "input_lengths",
+            "token_mask",
+            "sample_mask",
+            "generation_logprobs",
+            *packed_tensor_wire_fields(["pixel_values"]),
+        ],
+        num_samples=3,
+        consumer_tasks=["train"],
+    )
+    fb = _final_batch(3)
+    fb["pixel_values"] = PackedTensor(
+        [
+            torch.arange(8, dtype=torch.float32).reshape(2, 4),
+            None,
+            torch.arange(4, dtype=torch.float32).reshape(1, 4) + 20,
+        ],
+        dim_to_pack=0,
+    )
+
+    meta = kv_first_write(
+        fb,
+        sample_ids=["u0", "u1", "u2"],
+        dp_client=client,
+        partition_id="train",
+    )
+    out = read_columns(
+        client,
+        meta,
+        select_fields=packed_tensor_wire_fields(["pixel_values"]),
+    )
+
+    restored = out["pixel_values"]
+    assert isinstance(restored, PackedTensor)
+    assert restored.logical_segment_counts_by_row() == [1, 0, 1]
+    assert restored.as_tensor().dtype == torch.float32
+    assert torch.equal(restored.as_tensor(), fb["pixel_values"].as_tensor())
 
 
 def test_kv_first_write_keys_match_uids_x_ngen():

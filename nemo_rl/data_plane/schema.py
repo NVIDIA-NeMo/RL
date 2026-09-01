@@ -136,10 +136,18 @@ def fields_with_optional_routed_experts(
 
 def fields_with_packed_tensor_payload(
     fields: Sequence[str],
-    available_fields: Sequence[str],
+    available_fields: Sequence[str] | None,
 ) -> list[str]:
-    """Include PackedTensor payload/metadata columns present in a TQ record."""
+    """Include PackedTensor payload/metadata columns present in a TQ record.
+
+    Use this when narrowing an existing record for a consumer that can use
+    media, such as the policy path. For partition schema registration, use
+    :func:`packed_tensor_wire_fields` instead. Text-only consumers should not
+    request media columns.
+    """
     out = list(fields)
+    if not available_fields:
+        return out
     available = set(available_fields)
     for field in MULTIMODAL_AUXILIARY_FIELDS:
         if field in available and field not in out:

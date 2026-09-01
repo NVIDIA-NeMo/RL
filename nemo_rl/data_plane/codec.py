@@ -427,6 +427,15 @@ def materialize(
     pads = pad_value_dict or {}
     out: dict[str, Any] = {}
     available_keys = set(td.keys(include_nested=False))
+    for key in available_keys:
+        if not key.startswith(PACKED_TENSOR_META_PREFIX):
+            continue
+        payload_key = key.removeprefix(PACKED_TENSOR_META_PREFIX)
+        if payload_key not in available_keys:
+            raise ValueError(
+                f"PackedTensor metadata field {key!r} has no payload field "
+                f"{payload_key!r}"
+            )
     # pyrefly: inference cycle on tensordict.items() loop var.
     for key, val in td.items(include_nested=False):  # type: ignore[bad-assignment]
         if key.startswith(PACKED_TENSOR_META_PREFIX):
@@ -478,6 +487,7 @@ def materialize(
         if (
             pad_to_seqlen > 0
             and isinstance(padded, torch.Tensor)
+            and not padded.is_nested
             and padded.dim() >= 2
             and padded.shape[1] < pad_to_seqlen
         ):
