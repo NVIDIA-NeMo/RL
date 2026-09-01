@@ -290,6 +290,23 @@ class TrtllmAsyncGenerationWorkerImpl:
                 transceiver_kwargs["max_tokens_in_buffer"] = disagg_cfg[
                     "max_tokens_in_buffer"
                 ]
+            # Only forward when set, so TRT-LLM keeps its own "auto" default
+            # otherwise. Worth forwarding at all because "auto" resolves to the
+            # C++ transceiver whenever it cannot confirm the model's preference,
+            # and a hybrid Mamba model under disaggregation needs the Python
+            # (v2) transceiver to hand its recurrent state over.
+            if disagg_cfg.get("cache_transceiver_runtime") is not None:
+                transceiver_kwargs["transceiver_runtime"] = disagg_cfg[
+                    "cache_transceiver_runtime"
+                ]
+            if disagg_cfg.get("kv_cache_bounce_size_mb") is not None:
+                transceiver_kwargs["kv_cache_bounce_size_mb"] = disagg_cfg[
+                    "kv_cache_bounce_size_mb"
+                ]
+            if disagg_cfg.get("kv_transfer_timeout_ms") is not None:
+                transceiver_kwargs["kv_transfer_timeout_ms"] = disagg_cfg[
+                    "kv_transfer_timeout_ms"
+                ]
             llm_kwargs["cache_transceiver_config"] = CacheTransceiverConfig(
                 **transceiver_kwargs
             )
