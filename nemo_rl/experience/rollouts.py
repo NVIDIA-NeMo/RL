@@ -21,7 +21,7 @@ import json
 import statistics
 import warnings
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -54,7 +54,10 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
-from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
+from nemo_rl.environments.nemo_gym import (
+    DEFAULT_THINKING_TAGS,
+    get_pad_dynamic_image_shapes,
+)
 from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
@@ -73,10 +76,28 @@ from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
 
+_REWARD_PENALTY_METRICS = {
+    "duplicated_reasoning": (
+        "penalize_duplicated_reasoning",
+        "reasoning_equal_to_final_answer_rate",
+    ),
+    "empty_final_answer": (
+        "penalize_empty_final_answer",
+        "empty_final_answer_rate",
+    ),
+    "unwanted_token": ("penalize_unwanted_tokens", "unwanted_token_rate"),
+    "malformed_think_tag": (
+        "penalize_malformed_think_tag",
+        "malformed_think_tag_rate",
+    ),
+}
+
 
 def attach_initial_nemo_gym_image_payloads(
     batch: BatchedDataDict[DatumSpec],
     processor: Any,
+    *,
+    env_config: Mapping[str, Any],
 ) -> None:
     """Attach initial Gym image tensors once, before prompt repeat.
 
@@ -85,7 +106,17 @@ def attach_initial_nemo_gym_image_payloads(
     prompt batch, allowing ``repeat_interleave(..., share_immutable_media=True)``
     to retain one physical processor output per prompt. Flag-off runs never call
     this helper.
+
+    Takes ``master_config.env`` and resolves ``pad_dynamic_image_shapes``
+    itself, mirroring the per-turn attach inside the NeMo-Gym actor. Resolving
+    here rather than at each call site means a caller cannot supply the wrong
+    value -- the divergence between the two attach paths that this helper
+    previously had. The flag only matters for a turn carrying more than one
+    image at differing resolutions, where the processor returns a ragged CHW
+    list; without it the processor is asked to stack those and raises before
+    the shapes are read.
     """
+    pad_dynamic_image_shapes = get_pad_dynamic_image_shapes(env_config)
     for message_log, extra_env_info in zip(
         batch["message_log"], batch["extra_env_info"]
     ):
@@ -114,6 +145,7 @@ def attach_initial_nemo_gym_image_payloads(
             user_message,
             images=images,
             processor=processor,
+            pad_dynamic_image_shapes=pad_dynamic_image_shapes,
         )
 
 
@@ -183,20 +215,41 @@ def _reattach_original_multimodal_payloads(
     for result, original_log in zip(results, original_message_logs):
         if not result.pop("_initial_multimodal_data_omitted", False):
             continue
-        original_user_messages = [
-            message for message in original_log if message.get("role") == "user"
-        ]
-        for log_key in ("input_message_log", "message_log"):
-            target_log = result.get(log_key)
-            if not target_log:
-                continue
-            target_user_messages = [
-                message for message in target_log if message.get("role") == "user"
-            ]
-            for original, target in zip(original_user_messages, target_user_messages):
-                for key, value in original.items():
-                    if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
-                        target[key] = value
+        _reattach_static_multimodal_payloads_to_result(result, original_log)
+
+
+def _reattach_static_multimodal_payloads_to_result(
+    result: dict[str, Any],
+    source_message_log: list[dict[str, Any]],
+) -> None:
+    """Restore static media to each Gym-authored message-log representation."""
+    for log_key in ("input_message_log", "message_log"):
+        target_log = result.get(log_key)
+        if not target_log:
+            continue
+        attach_static_multimodal_payload(target_log, source_message_log)
+
+
+def attach_static_multimodal_payload(
+    target_message_log: list[dict[str, Any]],
+    source_message_log: list[dict[str, Any]],
+) -> None:
+    """Copy policy-ready media from static source turns to Gym-authored turns."""
+    source_users = [
+        message for message in source_message_log if message.get("role") == "user"
+    ]
+    target_users = [
+        message for message in target_message_log if message.get("role") == "user"
+    ]
+    if len(target_users) < len(source_users):
+        raise ValueError(
+            "Cannot attach static multimodal payload: Gym returned fewer user "
+            "turns than the source prompt."
+        )
+    for source, target in zip(source_users, target_users):
+        for key, value in source.items():
+            if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
+                target[key] = value
 
 
 def _add_r3_fallback_metrics(
@@ -429,6 +482,38 @@ def _apply_effort_shaping(
     )
 
 
+def _effort_shaping_metrics(shaping: _EffortShapingMetrics) -> dict[str, float]:
+    """Build the rollout-metric entries for one group's effort-shaping lists.
+
+    Shared by the batched v1 path and the SingleController rollout manager so the
+    two cannot drift apart.
+
+    Args:
+        shaping: Per-sample tracking lists returned by ``_apply_effort_shaping``.
+
+    Returns:
+        Metric name to value. Empty only when shaping was disabled; callers
+        ``update`` an existing dict, so an absent key leaves the metric unreported
+        rather than reporting a zero.
+    """
+    metrics: dict[str, float] = {}
+    if shaping.length_rewards_low:
+        metrics["mean_length_reward_low"] = sum(shaping.length_rewards_low) / len(
+            shaping.length_rewards_low
+        )
+    if shaping.rewards_low:
+        metrics["mean_reward_low"] = sum(shaping.rewards_low) / len(shaping.rewards_low)
+    if shaping.low_lengths:
+        metrics["mean_length_low"] = sum(shaping.low_lengths) / len(shaping.low_lengths)
+        metrics["median_length_low"] = float(statistics.median(shaping.low_lengths))
+    if shaping.high_lengths:
+        metrics["mean_length_high"] = sum(shaping.high_lengths) / len(
+            shaping.high_lengths
+        )
+        metrics["median_length_high"] = float(statistics.median(shaping.high_lengths))
+    return metrics
+
+
 def generate_responses(
     policy_generation: GenerationInterface,
     generation_input_data: BatchedDataDict[GenerationDatumSpec],
@@ -535,6 +620,7 @@ async def generate_responses_async(
     # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``;
     # vLLM exposes ``cfg`` and gates on ``vllm_cfg.async_engine``;
     # TRT-LLM requires its flag; the Megatron backend is always async.
+    # Managed Dynamo always exposes its rollout frontend asynchronously.
     vllm_cfg = getattr(policy_generation, "cfg", None)
     sglang_cfg = getattr(policy_generation, "sglang_cfg", None)
     generation_config = vllm_cfg or sglang_cfg or {}
@@ -546,6 +632,8 @@ async def generate_responses_async(
         use_async_generation = bool(
             generation_config.get("vllm_cfg", {}).get("async_engine", False)
         )
+    elif backend == "dynamo":
+        use_async_generation = True
     elif backend == "trtllm":
         assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
             "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
@@ -1803,6 +1891,22 @@ def _get_reward_penalty_config_value(
     return getattr(reward_penalty_config, key, None)
 
 
+def compute_reward_penalty_metrics(
+    penalty_counts: dict[str, int],
+    num_results: int,
+    reward_penalty_config: dict[str, Any] | BaseModel | None,
+) -> dict[str, float]:
+    """Return enabled penalty rates using the legacy NeMo-Gym metric names."""
+    if reward_penalty_config is None or not num_results:
+        return {}
+
+    return {
+        metric_name: penalty_counts[count_key] / num_results
+        for count_key, (flag, metric_name) in _REWARD_PENALTY_METRICS.items()
+        if _get_reward_penalty_config_value(reward_penalty_config, flag)
+    }
+
+
 def _get_reward_penalty_token_id(
     reward_penalty_config: dict[str, Any] | BaseModel,
     key: str,
@@ -2249,7 +2353,8 @@ async def run_async_nemo_gym_rollout(
         policy_generation: Generation interface whose configuration supplies the
             model's maximum sequence length.
         input_batch: Batch whose ``extra_env_info`` field contains NeMo-Gym rows.
-        tokenizer: Tokenizer used by the NeMo-Gym actor and local postprocessing.
+        tokenizer: Tokenizer for local postprocessing. The actor holds its own,
+            installed once at spinup -- see NemoGym.set_tokenizer.
         task_to_env: Environment mapping containing the ``"nemo_gym"`` actor.
         generation_config: Sampling parameters forwarded to every NeMo-Gym row.
         num_generations: Number of contiguous rows belonging to each prompt group.
@@ -2344,6 +2449,14 @@ async def run_async_nemo_gym_rollout(
         raise ValueError(
             "returns_entire_batch requires num_generations to equal the batch size"
         )
+    # Media is restored by row index: result[0] uses message_log[0], result[1]
+    # uses message_log[1], and so on. Reject mismatches instead of attaching a
+    # video's tensors to the wrong prompt.
+    original_message_logs = input_batch.get("message_log")
+    if original_message_logs is not None and len(original_message_logs) != len(
+        nemo_gym_rows
+    ):
+        raise ValueError("NeMo-Gym message-log count must match the rollout-row count")
 
     timer = Timer()
     timer_prefix = "timing/rollout"
@@ -2363,7 +2476,6 @@ async def run_async_nemo_gym_rollout(
         with timer.time(run_rollouts_timer_label):
             ray_arguments = (
                 nemo_gym_rows,
-                tokenizer,
                 timer_prefix,
                 deduplicate_multimodal_data,
             )
@@ -2408,16 +2520,16 @@ async def run_async_nemo_gym_rollout(
 
                 _tensorize_nemo_gym_result(result)
                 completed_group = accumulator.add(rowidx, result)
+                if original_message_logs is not None:
+                    _reattach_static_multimodal_payloads_to_result(
+                        result, original_message_logs[rowidx]
+                    )
+                    result.pop("_initial_multimodal_data_omitted", None)
                 if completed_group is not None:
                     group_input_batch = input_batch.slice(
                         completed_group.group_index * num_generations,
                         (completed_group.group_index + 1) * num_generations,
                     )
-                    if deduplicate_multimodal_data:
-                        _reattach_original_multimodal_payloads(
-                            completed_group.results,
-                            group_input_batch["message_log"],
-                        )
                     rollout_result = _postprocess_single_nemo_gym_group(
                         nemo_gym_rows=completed_group.rows,
                         results=completed_group.results,
@@ -2482,7 +2594,8 @@ def run_nemo_gym_rollout_sync(
         policy_generation: Generation interface whose configuration supplies the
             model's maximum sequence length.
         input_batch: Batch whose ``extra_env_info`` field contains NeMo-Gym rows.
-        tokenizer: Tokenizer used by the NeMo-Gym actor and local postprocessing.
+        tokenizer: Tokenizer for local postprocessing. The actor holds its own,
+            installed once at spinup -- see NemoGym.set_tokenizer.
         task_to_env: Environment mapping containing the ``"nemo_gym"`` actor.
         generation_config: Sampling parameters forwarded to every NeMo-Gym row.
         log_full_result_tables: Whether to include complete per-agent result
@@ -2561,10 +2674,6 @@ def _postprocess_single_nemo_gym_group(
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
-    length_rewards_low = shaping.length_rewards_low
-    rewards_low = shaping.rewards_low
-    low_lengths = shaping.low_lengths
-    high_lengths = shaping.high_lengths
 
     resolved_reward_penalty_config = resolve_reward_penalty_config(
         reward_penalty_config, tokenizer, thinking_tags=thinking_tags
@@ -2744,39 +2853,15 @@ def _postprocess_single_nemo_gym_group(
     if mask_env_flagged_samples:
         final_batch["mask_sample"] = _extract_mask_sample_flags(results)
 
-    if length_rewards_low:
-        rollout_metrics["mean_length_reward_low"] = sum(length_rewards_low) / len(
-            length_rewards_low
-        )
-    if rewards_low:
-        rollout_metrics["mean_reward_low"] = sum(rewards_low) / len(rewards_low)
-    if low_lengths:
-        rollout_metrics["mean_length_low"] = sum(low_lengths) / len(low_lengths)
-        rollout_metrics["median_length_low"] = float(statistics.median(low_lengths))
-    if high_lengths:
-        rollout_metrics["mean_length_high"] = sum(high_lengths) / len(high_lengths)
-        rollout_metrics["median_length_high"] = float(statistics.median(high_lengths))
+    rollout_metrics.update(_effort_shaping_metrics(shaping))
 
-    # Penalty metrics — map count keys to (config flag, metric name)
-    _PENALTY_METRICS = {
-        "duplicated_reasoning": (
-            "penalize_duplicated_reasoning",
-            "reasoning_equal_to_final_answer_rate",
-        ),
-        "empty_final_answer": (
-            "penalize_empty_final_answer",
-            "empty_final_answer_rate",
-        ),
-        "unwanted_token": ("penalize_unwanted_tokens", "unwanted_token_rate"),
-        "malformed_think_tag": (
-            "penalize_malformed_think_tag",
-            "malformed_think_tag_rate",
-        ),
-    }
-    if resolved_reward_penalty_config and results:
-        for key, (flag, metric_name) in _PENALTY_METRICS.items():
-            if _get_reward_penalty_config_value(resolved_reward_penalty_config, flag):
-                rollout_metrics[metric_name] = penalty_counts[key] / len(results)
+    rollout_metrics.update(
+        compute_reward_penalty_metrics(
+            penalty_counts,
+            len(results),
+            resolved_reward_penalty_config,
+        )
+    )
 
     # Expose per-component rewards as `reward/<name>` batch keys for multi-reward NeMo
     # Gym environments so GDPO can compute per-component advantages; single-reward envs

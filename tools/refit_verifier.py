@@ -81,6 +81,7 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, init_ray
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.constants import SGLANG_BACKEND
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.lm_policy import Policy
@@ -89,6 +90,7 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
+from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
 
 def parse_args():
@@ -255,6 +257,7 @@ def setup_configs(args, tokenizer):
                 # Optimizer CPU offload settings
                 "optimizer_cpu_offload": False,
                 "optimizer_offload_fraction": 0.0,
+                "overlap_cpu_optimizer_d2h_h2d": False,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
@@ -610,10 +613,10 @@ def init_sglang(inference_cluster, generation_config):
 def initialize_generation_with_policy(
     init_generation_fn: Callable,
     init_policy_fn: Callable,
-    init_time_key: str,
     colocated_inference: bool,
     worker_init_timing_metrics: dict,
     policy: Policy | None = None,
+    refit_buffer_size_gb: float | None = None,
 ):
     """Initialize SGLang generation + policy, then run the weight-equality check.
 
@@ -625,7 +628,6 @@ def initialize_generation_with_policy(
     Args:
         init_generation_fn: Callable returning (engine, init_time_s).
         init_policy_fn: Callable returning (policy, init_time_s).
-        init_time_key: Metrics key for generation init time.
         colocated_inference: Whether inference is colocated with training.
         worker_init_timing_metrics: Dict populated with init/parallel timing.
         policy: Optional pre-initialized policy; if set, init_policy_fn is skipped.
@@ -648,7 +650,7 @@ def initialize_generation_with_policy(
             policy, policy_time = policy_future.result()
         parallel_wall_time = time.perf_counter() - parallel_start_time
 
-        worker_init_timing_metrics[init_time_key] = generation_time
+        worker_init_timing_metrics["generation_init_time_s"] = generation_time
         worker_init_timing_metrics["policy_init_time_s"] = policy_time
         worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
         worker_init_timing_metrics["parallel_init_enabled"] = 1.0
@@ -658,15 +660,23 @@ def initialize_generation_with_policy(
             flush=True,
         )
         policy_generation, generation_time = init_generation_fn()
-        worker_init_timing_metrics[init_time_key] = generation_time
+        worker_init_timing_metrics["generation_init_time_s"] = generation_time
 
         if policy is None:
             policy, policy_time = init_policy_fn()
             worker_init_timing_metrics["policy_init_time_s"] = policy_time
         worker_init_timing_metrics["parallel_init_enabled"] = 0.0
 
-    state_dict_info = policy.prepare_refit_info()
-    policy_generation.prepare_refit_info(state_dict_info)
+    # SGLang refits run through the synchronizer, which owns the phase
+    # transitions; init_communicator() exchanges the refit metadata.
+    policy_generation.weight_synchronizer = create_weight_synchronizer(
+        policy=policy,
+        generation=policy_generation,
+        generation_backend=SGLANG_BACKEND,
+        colocated=colocated_inference,
+        refit_buffer_size_gb=refit_buffer_size_gb,
+    )
+    policy_generation.weight_synchronizer.init_communicator()
 
     refit_policy_generation(
         policy=policy,
@@ -765,9 +775,9 @@ def main_sglang():
     policy_generation, _ = initialize_generation_with_policy(
         init_generation_fn=lambda: init_sglang(cluster, generation_config),
         init_policy_fn=init_policy_fn,
-        init_time_key="sglang_init_time_s",
         colocated_inference=True,
         worker_init_timing_metrics=worker_init_timing_metrics,
+        refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
     )
 
     print("\n--- SGLang weight-check timing ---")

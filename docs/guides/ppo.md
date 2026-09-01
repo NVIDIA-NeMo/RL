@@ -57,6 +57,18 @@ policy:
 
 When only one node remains for policy and generation after other resources are reserved, `gpus_per_node` reserves that many GPUs for generation and `num_nodes` must be `null` or `1`. When more than one node remains for training and generation, generation uses complete nodes: set `num_nodes` to the number of inference nodes and `gpus_per_node` equal to `cluster.gpus_per_node`. Non-colocated SGLang generation is not currently supported by PPO.
 
+### Asynchronous PPO
+
+Set `ppo.async_ppo.enabled: true` to overlap rollout generation with training. A background collector fills a replay buffer on the non-colocated vLLM GPUs while the policy and value model train on their shared cluster. Values and policy/reference log probabilities are recomputed when a trajectory is sampled, then PPO runs GAE, all `critic_ppo_epochs` critic updates, and all `ppo_epochs` policy updates before publishing one new policy version to vLLM.
+
+Async PPO reuses the trajectory collector, replay buffer, and weight-versioning infrastructure described in the [Async GRPO guide](async-grpo.md); this section focuses on PPO-specific behavior and constraints.
+
+Async PPO requires non-colocated vLLM generation with `vllm_cfg.async_engine: true`, `loss_fn.use_importance_sampling_correction: true`, and `loss_fn.force_on_policy_ratio: false`. Dynamic sampling, reward scaling, reward shaping, multiple dataloaders, NeMo Gym, colocated generation, and FP8 KV-scale synchronization are not supported yet.
+
+`max_trajectory_age_steps` is the normal policy-training age limit. The recommended value is `1`; larger values improve overlap but increase off-policy bias in GAE. When `policy_training_start_step > 0`, set `warmup_generation_lead_steps` to a larger value to bank additional rollout batches while the policy is frozen for critic warmup. The collector caps frozen-policy targets at `policy_training_start_step + max_trajectory_age_steps`, so their actual policy-update age remains within the normal limit. The buffer keeps these batches valid through that frontier and then restores the normal age limit. `null` uses `max_trajectory_age_steps` as the generation lead throughout.
+
+Async training stops at `max_num_steps`; the collector cycles the training dataloader as needed. `max_num_epochs` is not supported yet and must be set to `-1`; use `max_num_steps` to control training length. This is a v1-only convention — the SingleController path rejects any non-positive `max_num_epochs`, so set a positive value there (see [single-controller.md](single-controller.md#migrating-a-legacy-async-config)). Async checkpoints save the collector dataloader and replay-buffer state together with policy and value state. By default, incomplete restored targets are retained and gap-filled. Setting `drop_incomplete_targets_on_restore: true` discards their restored rows and fills the target from subsequent dataloader prompts; it does not regenerate the original prompts.
+
 ### Value Model Configuration
 
 ```yaml
@@ -163,10 +175,10 @@ The PPO training loop, [ppo_train](../../nemo_rl/algorithms/ppo.py), follows thi
 3. **Value inference**: the value model predicts per-token state values
 4. **Logprob computation**: the policy computes log probabilities for advantage estimation
 5. **Advantage estimation**: GAE computes advantages using value predictions and rewards
-6. **Value training**: the critic is updated first (critic-before-actor, following [veRL](https://arxiv.org/abs/2412.09613))
-7. **Policy training**: the actor is updated with the clipped surrogate objective
+6. **Value training**: the critic completes all of its updates first
+7. **Policy training**: the actor completes all of its updates with the clipped surrogate objective
 
-Steps 6–7 repeat `ppo_epochs` times per rollout before generating new responses.
+The critic stays resident for all `critic_ppo_epochs` updates, then the policy stays resident for all `ppo_epochs` updates. This avoids moving the colocated models between CPU and GPU after every epoch.
 
 ### Multiple Training Steps per Rollout
 
@@ -174,10 +186,14 @@ Unlike GRPO, which performs one training update per rollout, PPO can perform mul
 
 ```yaml
 ppo:
-  ppo_epochs: 4   # Train 4 times on each rollout batch
+  ppo_epochs: 4          # actor passes over each rollout batch
+  critic_ppo_epochs: ${ppo.ppo_epochs}  # critic passes; follows actor by default
 ```
 
-Each step trains both the critic and the actor on the same advantage estimates computed from the initial rollout.
+Each pass uses the same returns and advantage estimates computed from the initial
+rollout. Both epoch counts must be at least 1 and can be configured independently;
+the exemplar uses interpolation so the critic follows the actor unless explicitly
+overridden.
 
 ### Critic Warmup
 
@@ -189,6 +205,39 @@ ppo:
 ```
 
 During warmup, generation and environment scoring still run normally — only policy weight updates are skipped.
+
+### Warm-Starting the Critic
+
+Warmup can be paid once, offline, instead of inside every PPO run: pretrain the value model separately and point a fresh PPO run at that checkpoint.
+
+```yaml
+ppo:
+  warm_start_value_checkpoint: /path/to/critic_pretrain_run/step_370
+  policy_training_start_step: 0  # the critic is already warm
+```
+
+`policy_training_start_step: 0` is the natural pairing, but keeping a short online warmup is equally valid: it calibrates the seeded critic on this run's own rollout distribution before the policy starts moving. A nonzero value is also what `async_ppo.warmup_generation_lead_steps` requires (`async_rl.sampler.warmup_lookahead_versions` on the SingleController path) — both must be null when it is 0.
+
+The path is a `step_<n>` directory holding a `value/` subtree — the layout a PPO or critic-pretraining run checkpoints. The critic restores its weights from it, plus optimizer moments and LR-scheduler state whenever the seed carries them; a seed written with `save_optimizer: false` restores weights only and warns. Setup rejects a path with no `value/weights` subtree rather than letting the critic start cold behind the message above. Nothing else is read: the policy starts from the base model, the dataloader from the beginning, and the step counter at 0.
+
+**The seed and this run must agree on the value scheduler.** The seed is restored through the ordinary resume path, so Megatron compares nine scheduler fields against the ones this run builds and raises on the first mismatch — `use_checkpoint_opt_param_scheduler` is off, so `OptimizerParamScheduler._check_and_set` asserts equality. Match all of these across the two runs:
+
+- `value.megatron_cfg.optimizer.lr` and `.min_lr` — they feed `max_lr`/`min_lr` and are the *first* two fields checked. They live in the optimizer block, not the scheduler block.
+- `value.megatron_cfg.scheduler`.
+- `value.train_global_batch_size` — it multiplies `lr_decay_steps`, `wd_incr_steps` and `lr_warmup_steps`.
+- the tick budget `train_iters`. A synchronous run sets it to `min(max_num_steps, max_num_epochs × len(dataloader)) × critic_ppo_epochs`; an async run sets it to `max_num_steps × critic_ppo_epochs`, since async requires `max_num_epochs: -1`. `len(dataloader)` is prompt batches per epoch, so on a synchronous run the dataset size and `num_prompts_per_step` are part of the budget whenever the epoch term is the smaller one — as it is for the shipped recipes that set `max_num_epochs: 15`. Matching `max_num_steps` and `critic_ppo_epochs` alone is not enough there.
+
+A mismatch fails during critic init. Which field is named depends on which input differs: a batch-size difference reports `warmup iterations`, a learning-rate difference reports `learning rate`.
+
+```
+AssertionError: OptimizerParamScheduler: class input value <X> and checkpointvalue <Y> for total number of weight decay iterations do not match
+```
+
+(`checkpointvalue` runs together in the upstream message; search for it as written.)
+
+Carrying the seed's schedule over is deliberate — it is what lets the post-warmup LR continue instead of restarting. Set `value.megatron_cfg.scheduler.override_opt_param_scheduler: true` if you would rather this run's settings win; the seed's step position is still restored, so the critic resumes at the seed's tick count rather than at step 0. All of this is Megatron-only — a DTensor critic (the default in `ppo_math_1B.yaml`) loads the seed's scheduler state with no comparison and has no override knob.
+
+The warm start applies to a fresh run only: once the run has written a checkpoint of its own, that checkpoint wins. That is what lets the setting stay in the config across resumes — a resubmitted run restores its own critic instead of re-seeding from the pretrained one, with no config edit in between.
 
 ## Loss
 
@@ -225,7 +274,9 @@ ppo:
   max_num_epochs: 100000
   max_num_steps: 100000
   ppo_epochs: 4
+  critic_ppo_epochs: ${ppo.ppo_epochs}
   policy_training_start_step: 0
+  warm_start_value_checkpoint: null
   val_period: 20
   val_at_start: true
   val_at_end: false
@@ -234,6 +285,14 @@ ppo:
   overlong_filtering: false
   # null logs mismatch metrics without masking; set a threshold to mask sequences.
   seq_logprob_error_threshold: null
+
+  async_ppo:
+    enabled: false
+    max_trajectory_age_steps: 1
+    warmup_generation_lead_steps: null
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+    drop_incomplete_targets_on_restore: false
 
   adv_estimator:
     name: "gae"
@@ -272,9 +331,12 @@ value_loss_fn:
 ```
 
 **PPO-specific parameters:**
-- **`ppo.ppo_epochs`**: Number of training updates per rollout batch
+- **`ppo.ppo_epochs`**: Number of actor training updates per rollout batch
+- **`ppo.critic_ppo_epochs`**: Number of critic training updates per rollout batch. It can differ from `ppo_epochs`; the exemplar defaults it to `${ppo.ppo_epochs}`.
 - **`ppo.policy_training_start_step`**: Number of critic-only warmup steps before policy training begins
+- **`ppo.warm_start_value_checkpoint`**: Checkpoint step directory whose `value/` seeds the critic on a fresh run. See [Warm-Starting the Critic](#warm-starting-the-critic)
 - **`ppo.seq_logprob_error_threshold`**: Nullable sequence-level multiplicative probability-error threshold. PPO always logs sequence-level train/generation mismatch metrics; when this is set, sequences above the threshold are excluded from advantage and loss computation.
+- **`ppo.async_ppo`**: Enables replay-buffer-based asynchronous PPO. See [Asynchronous PPO](#asynchronous-ppo) for requirements and staleness controls.
 - **`ppo.adv_estimator.name`**: Set to `"gae"` for GAE advantage estimation (PPO default)
 - **`ppo.adv_estimator.gae_lambda`**: GAE $\lambda$ parameter (bias-variance tradeoff, typically 0.95)
 - **`ppo.adv_estimator.gae_gamma`**: Discount factor $\gamma$ (typically 1.0 for outcome-supervised tasks)
@@ -282,7 +344,7 @@ value_loss_fn:
 - **`value_loss_fn.cliprange`**: Clip range for value function predictions
 - **`loss_fn.positive_example_nll_weight`**: VAPO NLL auxiliary loss weight on correct samples (0 = disabled)
 
-All other parameters (clipping, KL, importance sampling, dynamic sampling, reward shaping, reward scaling) work identically to GRPO. See the [GRPO Guide](grpo.md) for details.
+For synchronous PPO, the remaining clipping, KL, sampling, and reward options work as documented in the [GRPO Guide](grpo.md). Async PPO has the limitations listed above.
 
 ## Metrics
 

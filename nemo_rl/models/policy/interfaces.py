@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -166,7 +166,13 @@ class PolicyInterface(ABC):
 class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
     def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+        nccl_peer: str = "nemo",
     ) -> list[ray.ObjectRef]:
         pass
 
@@ -193,34 +199,61 @@ class ColocatablePolicyInterface(PolicyInterface):
     ) -> list[ray.ObjectRef]:
         pass
 
-    def stream_weights_via_http(
+    def connect_sglang_rollout_engines(
         self,
-        rollout_engine_urls: list[str],
-        buffer_size_bytes: int,
-    ) -> list[ray.ObjectRef]:
-        """Stream model weights to colocated SGLang engines via CUDA IPC over HTTP.
-
-        Args:
-            rollout_engine_urls: ``http://host:port`` base URLs of each
-                engine's ``node_rank=0`` SGLang HTTP server.
-            buffer_size_bytes: Max bucket size in bytes before flushing.
-
-        The rollout TP size (``num_gpus_per_engine``) is captured once via
-        ``set_rollout_num_gpus_per_engine`` and reused on every refit.
-        """
+        *,
+        engine_gpu_counts: list[int],
+        engine_gpu_offsets: Optional[list[int]] = None,
+    ) -> None:
         raise NotImplementedError(
-            "stream_weights_via_http is not implemented for this policy worker"
+            "connect_sglang_rollout_engines is not implemented for this policy"
         )
 
-    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
-        """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
         raise NotImplementedError(
-            "set_rollout_num_gpus_per_engine is not implemented for this policy worker"
+            "update_weights_to_sglang_colocated is not implemented for this policy"
+        )
+
+    def connect_sglang_rollout_engines_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        engine_gpu_counts: list[int],
+        group_name: Optional[str] = None,
+    ) -> None:
+        raise NotImplementedError(
+            "connect_sglang_rollout_engines_distributed is not implemented "
+            "for this policy"
+        )
+
+    def update_weights_to_sglang_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        rollout_engine_lock: ray.actor.ActorHandle,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        raise NotImplementedError(
+            "update_weights_to_sglang_distributed is not implemented for this policy"
         )
 
     @abstractmethod
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
     ) -> list[ray.ObjectRef]:
         pass
 
@@ -235,11 +268,20 @@ class ColocatablePolicyInterface(PolicyInterface):
         raise NotImplementedError
 
     def nccl_reshard_refit(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
     ) -> list[ray.ObjectRef]:
         """Sync weights to generation workers via the NCCL-reshard path."""
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_for_lp_inference(self) -> None:
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        """Put the policy in eval mode for logprob inference.
+
+        Args:
+            keep_train_buffers: Leave grad buffers and optimizer state on CUDA
+                because a train step is already open and its accumulated
+                gradients must survive this call.
+        """
         pass

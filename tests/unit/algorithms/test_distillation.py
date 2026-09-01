@@ -14,7 +14,7 @@
 
 import copy
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -643,10 +643,10 @@ def test_validate_logs_data_when_logger_provided(mock_components):
             return_value=(mock_batch, mock_rollout_metrics),
         ),
         patch(
-            "nemo_rl.algorithms.distillation._should_use_nemo_gym", return_value=False
+            "nemo_rl.algorithms.distillation.should_use_nemo_gym", return_value=False
         ),
         patch(
-            "nemo_rl.algorithms.distillation._should_use_async_rollouts",
+            "nemo_rl.algorithms.distillation.should_use_async_rollouts",
             return_value=False,
         ),
         patch("nemo_rl.algorithms.distillation.print_message_log_samples"),
@@ -699,10 +699,10 @@ def test_validate_works_without_logger(mock_components):
             return_value=(mock_batch, mock_rollout_metrics),
         ),
         patch(
-            "nemo_rl.algorithms.distillation._should_use_nemo_gym", return_value=False
+            "nemo_rl.algorithms.distillation.should_use_nemo_gym", return_value=False
         ),
         patch(
-            "nemo_rl.algorithms.distillation._should_use_async_rollouts",
+            "nemo_rl.algorithms.distillation.should_use_async_rollouts",
             return_value=False,
         ),
         patch("nemo_rl.algorithms.distillation.print_message_log_samples"),
@@ -1281,7 +1281,13 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
     }
     assert master_config.env["nemo_gym"] == nemo_gym_env_before
     nemo_gym_actor._spinup.remote.assert_called_once_with()
-    mock_ray.get.assert_called_once_with("spinup-ref")
+    # Two waits, in order: the spinup, then the tokenizer install. Distillation
+    # builds its actor inline rather than through spinup_nemo_gym_actor, so it
+    # is the one call site that has to set the tokenizer itself -- passing it
+    # per rollout is what made the actor deserialize it once per prompt.
+    assert mock_ray.get.call_args_list[0] == call("spinup-ref")
+    assert mock_ray.get.call_count == 2
+    nemo_gym_actor.set_tokenizer.remote.assert_called_once_with(tokenizer)
 
 
 def test_nemo_gym_distillation_runner_uses_setup_actor():
@@ -1332,7 +1338,7 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
             side_effect=lambda cfg, _: cfg,
         ),
         patch.object(runner, "setup_nemo_gym_config"),
-        patch.object(runner, "_should_use_nemo_gym", return_value=True),
+        patch.object(runner, "should_use_nemo_gym", return_value=True),
         patch.object(runner, "setup_response_data", return_value=(MagicMock(), None)),
         patch.object(runner, "init_ray"),
         patch.object(runner, "setup") as mock_setup,
