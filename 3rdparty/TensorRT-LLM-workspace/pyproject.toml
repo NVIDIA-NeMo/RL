@@ -149,4 +149,4 @@ backend-path = ["."]
 # never committed, and the cache key uses this raw string, not the expanded one).
 # The ref is user/zongfeij/rl @ 1.3.0rc23: 
 url = "https://oauth2:${GITLAB_CLONE_ACCESS_TOKEN}@gitlab-master.nvidia.com/ftp/tekit.git"
-ref = "7035705878c31d3ed64d224e46c6e1fddff9aefc"   # pragma: allowlist secret
+ref = "97b62625d76e9c5d71358fc3e4ba1670cafb920c"   # pragma: allowlist secret
