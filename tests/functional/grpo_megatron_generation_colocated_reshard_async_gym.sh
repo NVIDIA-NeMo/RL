@@ -100,3 +100,10 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 uv run tests/check_metrics.py $JSON_METRICS \
     'median(data["train/gen_kl_error"]) < 1.3' \
     'data["validation/accuracy"]["10"] > 0.1'
+
+# The save-bound step must defer the engine wake past the checkpoint save
+# (save_period=5 with 10 steps gives save-bound steps 5 and 10).
+if ! grep -q "Keeping colocated engine asleep for checkpointing" $RUN_LOG; then
+    echo "FAIL: deferred-wake log line not found (colocated checkpoint path not exercised)"
+    exit 1
+fi

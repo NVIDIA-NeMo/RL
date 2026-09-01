@@ -56,7 +56,7 @@ if megatron_generation_supported; then
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated_gym.sh
     run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_topp_topk.sh
     run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated_async_gym.sh
-    run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_async_gym.sh
+    run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_reshard_async_gym.sh
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_multiturn.sh
 fi
 
