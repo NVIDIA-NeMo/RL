@@ -369,9 +369,28 @@ if [[ $EXIT_CODE -eq 0 ]]; then
 fi
 
 # The failure must name the rollout path, not surface as a bare Ray traceback.
-if grep -qE "RolloutRedispatchExhausted|GenerationUnavailable|RolloutStall|RolloutTimeout|GenerationFleetExhausted" "$RUN_LOG"; then
+#
+# NoSurvivingShards belongs here alongside GenerationFleetExhausted because losing the
+# only shard can surface as EITHER, and which one wins is a matter of timing rather
+# than of what went wrong:
+#
+#   GenerationFleetExhausted  too few shards SERVING, raised by the watchdog tick
+#   NoSurvivingShards         no shard can take part in the REFIT, raised by the
+#                             reconcile that runs before every weight sync
+#
+# The refit runs every step and the watchdog every watchdog.interval_s, so once
+# detection got faster (probe_interval_s, 30s -> 5s) the reconcile started winning and
+# this test failed -- while the run was doing exactly what it should: dying fast, with
+# the cause named. Job 5931102.
+#
+# Deliberately NOT unified by having the reconcile call raise_if_exhausted() first.
+# That looks tidier and is a trap: an aborted refit marks every surviving shard STALE
+# via mark_weights_partial, so the serving set is legitimately empty for the moment
+# between the abort and the retry -- and raise_if_exhausted() there would kill the run
+# in the middle of the recovery that was about to succeed.
+if grep -qE "RolloutRedispatchExhausted|GenerationUnavailable|RolloutStall|RolloutTimeout|GenerationFleetExhausted|NoSurvivingShards" "$RUN_LOG"; then
     echo "[chaos] PASS: bounded, attributable failure ${ELAPSED}s after the kill"
-    grep -oE "RolloutRedispatchExhausted|GenerationUnavailable|RolloutStall|RolloutTimeout|GenerationFleetExhausted" "$RUN_LOG" | sort | uniq -c
+    grep -oE "RolloutRedispatchExhausted|GenerationUnavailable|RolloutStall|RolloutTimeout|GenerationFleetExhausted|NoSurvivingShards" "$RUN_LOG" | sort | uniq -c
     exit 0
 fi
 

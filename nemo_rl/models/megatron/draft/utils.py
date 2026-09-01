@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 import torch
 import torch.distributed as dist
@@ -987,6 +988,32 @@ def get_attached_draft_model(model: list[MegatronModule]) -> MegatronModule | No
         if draft_model is not None:
             return draft_model
     return None
+
+
+@contextmanager
+def draft_model_detached(model: list[MegatronModule]) -> Iterator[None]:
+    """Temporarily detach the nested draft model from its owner chunk.
+
+    Megatron-Bridge conversion only covers the base model's HF architecture;
+    draft weights are refit through `export_eagle_weights_to_hf` instead.
+    """
+    owner_chunk: MegatronModule | None = None
+    draft_model: MegatronModule | None = None
+    for model_chunk in reversed(model):
+        unwrapped_chunk = unwrap_model(model_chunk)
+        chunk_draft = getattr(unwrapped_chunk, "draft_model", None)
+        if chunk_draft is not None:
+            owner_chunk = unwrapped_chunk
+            draft_model = chunk_draft
+            break
+    if owner_chunk is None:
+        yield
+        return
+    delattr(owner_chunk, "draft_model")
+    try:
+        yield
+    finally:
+        owner_chunk.draft_model = draft_model
 
 
 def _export_layer_weights_to_hf(

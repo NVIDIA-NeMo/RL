@@ -148,6 +148,10 @@ def _make_worker(loss_type):
     # The step summary in finish_train_step reads it eagerly to decide whether
     # this rank prints.
     w.rank = 0
+    # Also set in __init__: the finish path reads them to put the DDP forward
+    # pre-hook back after the first optimizer step.
+    w._first_train_step_forward_pre_hook_disabled = False
+    w._first_train_step_param_sync_func = None
     # Pure telemetry, and it resets the CUDA peak counters — keep it out of the
     # way so these tests stay hermetic on GPU shards.
     w._log_gpu_mem = MagicMock()
@@ -534,6 +538,33 @@ class TestFinish:
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
         w.finish_train_step()
         assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
+
+    @pytest.mark.parametrize("update_successful", [True, False])
+    def test_reenables_forward_pre_hook_after_a_successful_step(
+        self, mock_module_symbols, update_successful
+    ):
+        """__init__ disables the pre-hook for the first step; finish has to put
+        it back once the optimizer stepped, or every later forward sees only its
+        own param shard."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
+        w._first_train_step_forward_pre_hook_disabled = True
+        w._first_train_step_param_sync_func = "ORIGINAL_PARAM_SYNC_FUNC"
+        w.enable_forward_pre_hook = MagicMock()
+        w.optimizer.step.return_value = (update_successful, 0.5, 0)
+
+        with patch(f"{WORKER_MOD}.get_model_config", return_value=w.model.config):
+            w.finish_train_step()
+
+        if update_successful:
+            w.enable_forward_pre_hook.assert_called_once_with()
+            assert w.model.config.param_sync_func == "ORIGINAL_PARAM_SYNC_FUNC"
+            assert w._first_train_step_forward_pre_hook_disabled is False
+            assert w._first_train_step_param_sync_func is None
+        else:
+            w.enable_forward_pre_hook.assert_not_called()
+            assert w._first_train_step_forward_pre_hook_disabled is True
 
     def test_clears_train_step_state(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
