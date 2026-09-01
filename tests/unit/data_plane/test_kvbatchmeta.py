@@ -261,7 +261,7 @@ def test_concat_unions_payload_fields_in_first_seen_order():
         fields=[
             "input_ids",
             "pixel_values",
-            "__nrl_packed_tensor_meta__pixel_values",
+            "image_grid_thw",
         ],
     )
 
@@ -271,7 +271,7 @@ def test_concat_unions_payload_fields_in_first_seen_order():
         "input_ids",
         "input_lengths",
         "pixel_values",
-        "__nrl_packed_tensor_meta__pixel_values",
+        "image_grid_thw",
     ]
 
 
