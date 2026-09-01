@@ -62,6 +62,9 @@ class TrtllmEngineKnobs(TypedDict, total=False):
     gpu_memory_utilization: float
     max_batch_size: int
     max_num_tokens: int
+    # "auto" | "dummy", mirroring vllm_cfg.load_format. Set by
+    # configure_generation_config, not by the recipe.
+    load_format: NotRequired[str]
     # TRT-LLM splits the TP dimension on MoE layers, so moe_tp * moe_ep must
     # equal *this engine's* tensor_parallel_size. Partitioning only: the worker
     # count stays TP x PP x DP.
