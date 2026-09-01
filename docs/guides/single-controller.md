@@ -199,8 +199,6 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 4. **Train pump loop**: `sampler.evict` drops out-of-window groups and `sampler.select` picks the next batch. On PPO, `_value_stage` runs the critic forward, `_advantage_stage` computes advantages, and `_value_train_epochs` runs `ppo.critic_ppo_epochs` critic updates. The TQPolicy split API then runs one optimizer step per RL step on GRPO, or `ppo.ppo_epochs` policy updates on PPO.
 5. **Weight sync**: after each optimizer step the pump bumps the trainer version, clears rollout permission, asks the generation backend to pause in-flight work, calls the weight synchronizer, resumes generation, and re-opens the rollout pump for the next version. vLLM's native pause preserves active request state; backends without pause support warn and retain their existing refit behavior.
 
-Freezing a vLLM request does not stop its existing end-to-end generation timeout. Size `NRL_VLLM_ASYNC_TIMEOUT_SECONDS` and any generation-router `backend_timeout_s` to cover the longest expected generation plus time spent paused for refit.
-
 ## Relation to Legacy Async GRPO
 
 The [legacy async GRPO](./async-grpo.md) (`grpo.async_grpo.enabled: true` under `run_grpo.py`) and the SC path both target the same async training problem but partition responsibilities differently:
