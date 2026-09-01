@@ -556,6 +556,9 @@ class RouterReplayConfig(TypedDict):
     # ``inline`` carries the dense tensor through Gym and the RL driver.
     # ``ray`` carries small tags and resolves the tensor in policy workers.
     transport: NotRequired[Literal["inline", "ray"]]
+    # With Ray transport, share one CPU assembly across all TP/CP/PP ranks in
+    # each DP shard. Defaults to true; false restores per-worker assembly.
+    materialize_once_per_dp: NotRequired[bool]
     # Internal run-unique store identifier populated during setup.
     _store_run_instance_id: NotRequired[str]
 

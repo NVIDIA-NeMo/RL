@@ -21,9 +21,13 @@ policy worker resolves the references in its already-selected microbatch.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import threading
 import uuid
+import warnings
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence, cast
 
@@ -44,6 +48,11 @@ _MISSING_ROUTE_SENTINEL = -1
 
 _REGISTRY_ACTOR_PREFIX = "nrl_routed_experts_registry_"
 _STORE_ACTOR_PREFIX = "nrl_routed_experts_store_"
+_MATERIALIZER_ACTOR_PREFIX = "nrl_routed_experts_materializer_"
+# This cache only bridges the skew between TP/CP/PP siblings requesting the
+# same DP-local microbatch. Target-weight-version retirement is the primary
+# lifetime boundary; the entry limit is a backstop against unbounded growth.
+_MATERIALIZER_CACHE_MAX_ENTRIES = 8
 
 
 def _validate_identifier(value: Any, *, field: str) -> str:
@@ -57,6 +66,13 @@ def _validate_identifier(value: Any, *, field: str) -> str:
 def registry_actor_name(run_instance_id: str) -> str:
     run_instance_id = _validate_identifier(run_instance_id, field="run_instance_id")
     return f"{_REGISTRY_ACTOR_PREFIX}{run_instance_id}"
+
+
+def materializer_actor_name(run_instance_id: str, dp_rank: int) -> str:
+    run_instance_id = _validate_identifier(run_instance_id, field="run_instance_id")
+    if isinstance(dp_rank, bool) or not isinstance(dp_rank, int) or dp_rank < 0:
+        raise ValueError(f"dp_rank must be a non-negative integer, got {dp_rank!r}")
+    return f"{_MATERIALIZER_ACTOR_PREFIX}{run_instance_id}_dp_{dp_rank}"
 
 
 def is_routed_experts_ref(value: Any) -> bool:
@@ -142,6 +158,162 @@ def slice_routed_experts_ref(
     sliced["offset"] = int(offset)
     sliced["length"] = int(length)
     return validate_routed_experts_ref(sliced)
+
+
+MaterializationKey = str
+
+
+@dataclass
+class _NormalizedRoutedExpertsBatch:
+    refs_by_sample: list[list[dict[str, Any]]]
+    input_lengths: tuple[int, ...]
+    batch_size: int
+    padded_length: int
+    layer_topk: tuple[int, int]
+    target_weight_versions: tuple[int, ...]
+    cache_key: MaterializationKey
+
+
+def _normalize_input_lengths(
+    input_lengths: torch.Tensor | Sequence[int], *, batch_size: int
+) -> tuple[int, ...]:
+    if isinstance(input_lengths, torch.Tensor):
+        if input_lengths.ndim != 1:
+            raise ValueError(
+                "input_lengths must be one-dimensional, got "
+                f"shape={list(input_lengths.shape)}"
+            )
+        raw_lengths = input_lengths.detach().to(device="cpu").tolist()
+    else:
+        raw_lengths = list(input_lengths)
+    if len(raw_lengths) != batch_size:
+        raise ValueError(
+            "input_lengths batch size does not match routed-experts references: "
+            f"lengths={len(raw_lengths)}, batch={batch_size}"
+        )
+    lengths: list[int] = []
+    for value in raw_lengths:
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise TypeError(f"input_lengths values must be integers, got {value!r}")
+        normalized = int(value)
+        if normalized < 0:
+            raise ValueError(
+                f"input_lengths values must be non-negative, got {value!r}"
+            )
+        lengths.append(normalized)
+    return tuple(lengths)
+
+
+def _normalize_routed_experts_batch(
+    refs_by_sample: Any,
+    *,
+    batch_size: int,
+    padded_length: int,
+    input_lengths: torch.Tensor | Sequence[int],
+) -> _NormalizedRoutedExpertsBatch:
+    if not isinstance(refs_by_sample, list):
+        raise TypeError(
+            "Ray-reference routed_experts must be a list with one entry per sample"
+        )
+    if len(refs_by_sample) != batch_size:
+        raise ValueError(
+            "routed-experts reference batch size does not match input_ids: "
+            f"refs={len(refs_by_sample)}, batch={batch_size}"
+        )
+    if padded_length < 0:
+        raise ValueError(f"padded_length must be non-negative, got {padded_length}")
+
+    lengths = _normalize_input_lengths(input_lengths, batch_size=batch_size)
+    normalized: list[list[dict[str, Any]]] = []
+    layer_topk: tuple[int, int] | None = None
+    target_weight_versions: set[int] = set()
+    sample_keys: list[tuple[Any, ...]] = []
+    for sample_index, raw_segments in enumerate(refs_by_sample):
+        if is_routed_experts_ref(raw_segments):
+            raw_segments = [raw_segments]
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raise ValueError(
+                f"Sample {sample_index} has no routed-experts reference segments"
+            )
+        segments = [validate_routed_experts_ref(segment) for segment in raw_segments]
+        segment_length = sum(int(segment["length"]) for segment in segments)
+        expected_length = lengths[sample_index]
+        if segment_length != expected_length:
+            raise ValueError(
+                "Routed-experts reference segments do not cover the sample's token "
+                f"length: sample={sample_index}, segments={segment_length}, "
+                f"input_length={expected_length}"
+            )
+        if expected_length > padded_length:
+            raise ValueError(
+                "Routed-experts sample length exceeds the padded output length: "
+                f"sample={sample_index}, input_length={expected_length}, "
+                f"padded_length={padded_length}"
+            )
+
+        segment_keys: list[tuple[Any, ...]] = []
+        for segment in segments:
+            this_layer_topk = (int(segment["shape"][1]), int(segment["shape"][2]))
+            if layer_topk is None:
+                layer_topk = this_layer_topk
+            elif layer_topk != this_layer_topk:
+                raise ValueError(
+                    "Routed-experts references disagree on layer/top-k shape: "
+                    f"expected={layer_topk}, got={this_layer_topk}"
+                )
+            lookup_key = routed_experts_ref_lookup_key(segment)
+            target_weight_versions.add(lookup_key[0])
+            segment_keys.append(
+                (
+                    str(segment["store"]),
+                    str(segment["store_instance_id"]),
+                    lookup_key,
+                    int(segment["offset"]),
+                    int(segment["length"]),
+                    tuple(int(dim) for dim in segment["shape"]),
+                    str(segment["dtype"]),
+                )
+            )
+        normalized.append(segments)
+        sample_keys.append(tuple(segment_keys))
+
+    if layer_topk is None:
+        raise ValueError("Cannot materialize an empty routed-experts reference batch")
+    key_payload = (
+        ROUTED_EXPERTS_REF_SCHEMA,
+        batch_size,
+        padded_length,
+        lengths,
+        tuple(sample_keys),
+    )
+    cache_key = hashlib.sha256(
+        json.dumps(key_payload, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return _NormalizedRoutedExpertsBatch(
+        refs_by_sample=normalized,
+        input_lengths=lengths,
+        batch_size=batch_size,
+        padded_length=padded_length,
+        layer_topk=layer_topk,
+        target_weight_versions=tuple(sorted(target_weight_versions)),
+        cache_key=cache_key,
+    )
+
+
+def routed_experts_materialization_key(
+    refs_by_sample: Any,
+    *,
+    batch_size: int,
+    padded_length: int,
+    input_lengths: torch.Tensor | Sequence[int],
+) -> MaterializationKey:
+    """Build the exact DP-local composite identity without resolving payloads."""
+    return _normalize_routed_experts_batch(
+        refs_by_sample,
+        batch_size=batch_size,
+        padded_length=padded_length,
+        input_lengths=input_lengths,
+    ).cache_key
 
 
 @dataclass
@@ -235,6 +407,171 @@ class RoutedExpertsStoreState:
         }
 
 
+@dataclass
+class _MaterializedRouteRef:
+    object_ref: Any
+    nbytes: int
+    shape: tuple[int, int, int, int]
+    dtype: str
+    target_weight_versions: tuple[int, ...]
+
+
+class RoutedExpertsMaterializerState:
+    """Bounded LRU metadata/cache state for one DP materializer actor."""
+
+    def __init__(self, max_entries: int = _MATERIALIZER_CACHE_MAX_ENTRIES):
+        if isinstance(max_entries, bool) or not isinstance(max_entries, int):
+            raise TypeError(f"max_entries must be an integer, got {max_entries!r}")
+        if max_entries <= 0:
+            raise ValueError(f"max_entries must be positive, got {max_entries}")
+        self.max_entries = max_entries
+        self._retired_through = -1
+        self._entries: OrderedDict[MaterializationKey, _MaterializedRouteRef] = (
+            OrderedDict()
+        )
+        self._requests = 0
+        self._hits = 0
+        self._misses = 0
+        self._materializations = 0
+        self._materialized_bytes = 0
+        self._evictions = 0
+
+    def get(self, key: MaterializationKey) -> _MaterializedRouteRef | None:
+        self._requests += 1
+        entry = self._entries.get(key)
+        if entry is None:
+            self._misses += 1
+            return None
+        self._hits += 1
+        self._entries.move_to_end(key)
+        return entry
+
+    def put(
+        self,
+        *,
+        key: MaterializationKey,
+        object_ref: Any,
+        nbytes: int,
+        shape: Sequence[int],
+        dtype: str,
+        target_weight_versions: Sequence[int],
+    ) -> _MaterializedRouteRef:
+        if key in self._entries:
+            raise RuntimeError("Duplicate routed-experts materialization cache key")
+        normalized_shape = tuple(int(dim) for dim in shape)
+        if len(normalized_shape) != 4:
+            raise ValueError(
+                f"Expected a four-dimensional materialized shape, got {shape!r}"
+            )
+        if dtype != ROUTED_EXPERTS_REF_DTYPE:
+            raise ValueError(f"Expected int16 routed experts, got {dtype!r}")
+        versions = tuple(sorted({int(version) for version in target_weight_versions}))
+        if not versions:
+            raise ValueError(
+                "A routed-experts materialization must have a target version"
+            )
+        retired_versions = [
+            version for version in versions if version <= self._retired_through
+        ]
+        if retired_versions:
+            raise RuntimeError(
+                "Cannot cache routed experts containing retired target-weight versions: "
+                f"versions={retired_versions}, retired_through={self._retired_through}"
+            )
+        entry = _MaterializedRouteRef(
+            object_ref=object_ref,
+            nbytes=int(nbytes),
+            shape=cast(tuple[int, int, int, int], normalized_shape),
+            dtype=dtype,
+            target_weight_versions=versions,
+        )
+        self._entries[key] = entry
+        self._materializations += 1
+        self._materialized_bytes += entry.nbytes
+        while len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)
+            self._evictions += 1
+        return entry
+
+    def retire_through(self, target_weight_version: int) -> dict[str, int]:
+        target_weight_version = int(target_weight_version)
+        self._retired_through = max(self._retired_through, target_weight_version)
+        retired_materializations = 0
+        retired_materialized_bytes = 0
+        for key, entry in list(self._entries.items()):
+            if max(entry.target_weight_versions) > self._retired_through:
+                continue
+            del self._entries[key]
+            retired_materializations += 1
+            retired_materialized_bytes += entry.nbytes
+        return self.stats() | {
+            "retired_through": self._retired_through,
+            "retired_materializations": retired_materializations,
+            "retired_materialized_bytes": retired_materialized_bytes,
+        }
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "remaining_materializations": len(self._entries),
+            "materialization_cache_requests": self._requests,
+            "materialization_cache_hits": self._hits,
+            "materialization_cache_misses": self._misses,
+            "materializations": self._materializations,
+            "materialized_bytes": self._materialized_bytes,
+            "materialization_cache_evictions": self._evictions,
+        }
+
+
+def _materialize_normalized_routed_experts(
+    batch: _NormalizedRoutedExpertsBatch,
+    *,
+    resolver: Callable[[dict[str, Any]], Any],
+) -> np.ndarray:
+    dense = np.full(
+        (
+            batch.batch_size,
+            batch.padded_length,
+            batch.layer_topk[0],
+            batch.layer_topk[1],
+        ),
+        _MISSING_ROUTE_SENTINEL,
+        dtype=np.int16,
+    )
+    resolved: dict[tuple[str, str, tuple[int, int, int, str]], np.ndarray] = {}
+    for sample_index, segments in enumerate(batch.refs_by_sample):
+        destination_offset = 0
+        for segment in segments:
+            length = int(segment["length"])
+            if length == 0:
+                continue
+            source_key = (
+                str(segment["store"]),
+                str(segment["store_instance_id"]),
+                routed_experts_ref_lookup_key(segment),
+            )
+            source = resolved.get(source_key)
+            if source is None:
+                value = resolver(segment)
+                if isinstance(value, torch.Tensor):
+                    source = value.detach().to(device="cpu").numpy()
+                else:
+                    source = np.asarray(value)
+                resolved[source_key] = source
+            if source.dtype != np.int16 or list(source.shape) != segment["shape"]:
+                raise RuntimeError(
+                    "Resolved routed-experts object does not match its tag: "
+                    f"actual_shape={list(source.shape)}, expected_shape={segment['shape']}, "
+                    f"actual_dtype={source.dtype}, expected_dtype=int16"
+                )
+            source_offset = int(segment["offset"])
+            dense[
+                sample_index,
+                destination_offset : destination_offset + length,
+            ] = source[source_offset : source_offset + length]
+            destination_offset += length
+    return dense
+
+
 @ray.remote(num_cpus=0)  # pragma: no cover - exercised in distributed jobs
 class RoutedExpertsObjectStore:
     """Ownership/index actor; payload bytes remain in Ray's object store."""
@@ -285,12 +622,85 @@ class RoutedExpertsObjectStore:
 
 
 @ray.remote(num_cpus=0)  # pragma: no cover - exercised in distributed jobs
+class RoutedExpertsMaterializer:
+    """Single-flight CPU assembler shared by all policy ranks in one DP shard."""
+
+    def __init__(
+        self,
+        run_instance_id: str,
+        dp_rank: int,
+        max_entries: int = _MATERIALIZER_CACHE_MAX_ENTRIES,
+    ):
+        self.run_instance_id = _validate_identifier(
+            run_instance_id, field="run_instance_id"
+        )
+        if isinstance(dp_rank, bool) or not isinstance(dp_rank, int) or dp_rank < 0:
+            raise ValueError(f"dp_rank must be a non-negative integer, got {dp_rank!r}")
+        self.dp_rank = dp_rank
+        self._state = RoutedExpertsMaterializerState(max_entries=max_entries)
+
+    def materialize(
+        self,
+        cache_key: MaterializationKey,
+        refs_by_sample: Any,
+        input_lengths: Sequence[int],
+        batch_size: int,
+        padded_length: int,
+    ) -> dict[str, Any]:
+        entry = self._state.get(cache_key)
+        cache_hit = entry is not None
+        if entry is None:
+            batch = _normalize_routed_experts_batch(
+                refs_by_sample,
+                batch_size=int(batch_size),
+                padded_length=int(padded_length),
+                input_lengths=input_lengths,
+            )
+            if batch.cache_key != cache_key:
+                raise RuntimeError(
+                    "Policy worker and materializer computed different routed-experts "
+                    "cache keys"
+                )
+            dense = _materialize_normalized_routed_experts(
+                batch,
+                resolver=_resolve_routed_experts_ref_with_ray,
+            )
+            # Keep the immutable composite alive in this actor's LRU. Returning
+            # the ObjectRef nested in metadata lets every policy process ray.get
+            # the same plasma object instead of serializing a fresh actor result.
+            object_ref = ray.put(dense)
+            entry = self._state.put(
+                key=batch.cache_key,
+                object_ref=object_ref,
+                nbytes=int(dense.nbytes),
+                shape=dense.shape,
+                dtype=str(dense.dtype),
+                target_weight_versions=batch.target_weight_versions,
+            )
+        return {
+            "object_ref": entry.object_ref,
+            "shape": list(entry.shape),
+            "dtype": entry.dtype,
+            "nbytes": entry.nbytes,
+            "target_weight_versions": list(entry.target_weight_versions),
+            "cache_hit": cache_hit,
+        }
+
+    def retire_through(self, target_weight_version: int) -> dict[str, int]:
+        return self._state.retire_through(target_weight_version)
+
+    def get_stats(self) -> dict[str, int]:
+        return self._state.stats()
+
+
+@ray.remote(num_cpus=0)  # pragma: no cover - exercised in distributed jobs
 class RoutedExpertsStoreRegistry:
     def __init__(self, run_instance_id: str):
         self.run_instance_id = _validate_identifier(
             run_instance_id, field="run_instance_id"
         )
         self._stores: dict[str, Any] = {}
+        self._materializers: dict[str, Any] = {}
 
     def register_store(self, store_instance_id: str, store: Any) -> None:
         store_instance_id = _validate_identifier(
@@ -303,18 +713,71 @@ class RoutedExpertsStoreRegistry:
             )
         self._stores[store_instance_id] = store
 
+    def register_materializer(self, actor_name: str, materializer: Any) -> None:
+        actor_name = _validate_identifier(actor_name, field="actor_name")
+        expected_prefix = f"{_MATERIALIZER_ACTOR_PREFIX}{self.run_instance_id}_dp_"
+        if not actor_name.startswith(expected_prefix):
+            raise ValueError(
+                "Routed-experts materializer belongs to a different run: "
+                f"actor={actor_name!r}, run_instance_id={self.run_instance_id!r}"
+            )
+        # The deterministic actor name plus get_if_exists makes registration
+        # idempotent across all TP/CP/PP siblings. Keep the first equivalent
+        # handle rather than depending on private Ray ActorHandle identity APIs.
+        self._materializers.setdefault(actor_name, materializer)
+
     def retire_through(self, target_weight_version: int) -> dict[str, int]:
-        futures = [
+        store_futures = [
             store.retire_through.remote(target_weight_version)
             for store in self._stores.values()
         ]
-        results = ray.get(futures)
+        materializer_futures = [
+            materializer.retire_through.remote(target_weight_version)
+            for materializer in self._materializers.values()
+        ]
+        store_results = ray.get(store_futures)
+        materializer_results = ray.get(materializer_futures)
         return {
             "retired_through": int(target_weight_version),
-            "stores": len(results),
-            "retired_objects": sum(result["retired_objects"] for result in results),
-            "retired_bytes": sum(result["retired_bytes"] for result in results),
-            "remaining_objects": sum(result["remaining_objects"] for result in results),
+            "stores": len(store_results),
+            "retired_objects": sum(
+                result["retired_objects"] for result in store_results
+            ),
+            "retired_bytes": sum(result["retired_bytes"] for result in store_results),
+            "remaining_objects": sum(
+                result["remaining_objects"] for result in store_results
+            ),
+            "materializers": len(materializer_results),
+            "retired_materializations": sum(
+                result["retired_materializations"] for result in materializer_results
+            ),
+            "retired_materialized_bytes": sum(
+                result["retired_materialized_bytes"] for result in materializer_results
+            ),
+            "remaining_materializations": sum(
+                result["remaining_materializations"] for result in materializer_results
+            ),
+            "materialization_cache_requests": sum(
+                result["materialization_cache_requests"]
+                for result in materializer_results
+            ),
+            "materialization_cache_hits": sum(
+                result["materialization_cache_hits"] for result in materializer_results
+            ),
+            "materialization_cache_misses": sum(
+                result["materialization_cache_misses"]
+                for result in materializer_results
+            ),
+            "materializations": sum(
+                result["materializations"] for result in materializer_results
+            ),
+            "materialized_bytes": sum(
+                result["materialized_bytes"] for result in materializer_results
+            ),
+            "materialization_cache_evictions": sum(
+                result["materialization_cache_evictions"]
+                for result in materializer_results
+            ),
         }
 
 
@@ -386,6 +849,7 @@ class RoutedExpertsStoreWriter:
 
 
 _STORE_HANDLE_CACHE: dict[str, Any] = {}
+_MATERIALIZER_HANDLE_CACHE: dict[tuple[str, int], Any] = {}
 
 
 def _resolve_routed_experts_ref_with_ray(ref: dict[str, Any]) -> np.ndarray:
@@ -419,90 +883,99 @@ def materialize_routed_experts_refs(
     resolver: Callable[[dict[str, Any]], Any] = _resolve_routed_experts_ref_with_ray,
 ) -> torch.Tensor:
     """Resolve one selected policy microbatch into a dense CPU tensor."""
-    if not isinstance(refs_by_sample, list):
-        raise TypeError(
-            "Ray-reference routed_experts must be a list with one entry per sample"
-        )
     batch_size, padded_length = input_ids.shape[:2]
-    if len(refs_by_sample) != batch_size:
-        raise ValueError(
-            "routed-experts reference batch size does not match input_ids: "
-            f"refs={len(refs_by_sample)}, batch={batch_size}"
-        )
-
-    normalized: list[list[dict[str, Any]]] = []
-    layer_topk: tuple[int, int] | None = None
-    for sample_index, raw_segments in enumerate(refs_by_sample):
-        if is_routed_experts_ref(raw_segments):
-            raw_segments = [raw_segments]
-        if not isinstance(raw_segments, list) or not raw_segments:
-            raise ValueError(
-                f"Sample {sample_index} has no routed-experts reference segments"
-            )
-        segments = [validate_routed_experts_ref(segment) for segment in raw_segments]
-        segment_length = sum(int(segment["length"]) for segment in segments)
-        expected_length = int(input_lengths[sample_index].item())
-        if segment_length != expected_length:
-            raise ValueError(
-                "Routed-experts reference segments do not cover the sample's token "
-                f"length: sample={sample_index}, segments={segment_length}, "
-                f"input_length={expected_length}"
-            )
-        for segment in segments:
-            this_layer_topk = (int(segment["shape"][1]), int(segment["shape"][2]))
-            if layer_topk is None:
-                layer_topk = this_layer_topk
-            elif layer_topk != this_layer_topk:
-                raise ValueError(
-                    "Routed-experts references disagree on layer/top-k shape: "
-                    f"expected={layer_topk}, got={this_layer_topk}"
-                )
-        normalized.append(segments)
-
-    if layer_topk is None:
-        raise ValueError("Cannot materialize an empty routed-experts reference batch")
-    dense = torch.full(
-        (batch_size, padded_length, layer_topk[0], layer_topk[1]),
-        _MISSING_ROUTE_SENTINEL,
-        dtype=torch.int16,
-        device="cpu",
+    batch = _normalize_routed_experts_batch(
+        refs_by_sample,
+        batch_size=batch_size,
+        padded_length=padded_length,
+        input_lengths=input_lengths,
     )
-    resolved: dict[tuple[str, str, tuple[int, int, int, str]], torch.Tensor] = {}
-    for sample_index, segments in enumerate(normalized):
-        destination_offset = 0
-        for segment in segments:
-            length = int(segment["length"])
-            if length == 0:
-                continue
-            cache_key = (
-                str(segment["store"]),
-                str(segment["store_instance_id"]),
-                routed_experts_ref_lookup_key(segment),
-            )
-            source = resolved.get(cache_key)
-            if source is None:
-                value = resolver(segment)
-                if isinstance(value, torch.Tensor):
-                    source = value.detach().to(device="cpu")
-                else:
-                    source = torch.from_numpy(np.asarray(value))
-                if (
-                    source.dtype != torch.int16
-                    or list(source.shape) != segment["shape"]
-                ):
-                    raise RuntimeError(
-                        "Resolved routed-experts object does not match its tag: "
-                        f"actual_shape={list(source.shape)}, expected_shape={segment['shape']}, "
-                        f"actual_dtype={source.dtype}, expected_dtype=torch.int16"
-                    )
-                resolved[cache_key] = source
-            source_offset = int(segment["offset"])
-            dense[
-                sample_index,
-                destination_offset : destination_offset + length,
-            ].copy_(source[source_offset : source_offset + length])
-            destination_offset += length
-    return dense
+    return torch.from_numpy(
+        _materialize_normalized_routed_experts(batch, resolver=resolver)
+    )
+
+
+def _get_or_create_routed_experts_materializer(
+    run_instance_id: str, dp_rank: int
+) -> Any:
+    run_instance_id = _validate_identifier(run_instance_id, field="run_instance_id")
+    actor_name = materializer_actor_name(run_instance_id, dp_rank)
+    cache_key = (run_instance_id, dp_rank)
+    materializer = _MATERIALIZER_HANDLE_CACHE.get(cache_key)
+    if materializer is not None:
+        return materializer
+
+    node_id = ray.get_runtime_context().get_node_id()
+    materializer = RoutedExpertsMaterializer.options(
+        name=actor_name,
+        namespace=ROUTED_EXPERTS_RAY_NAMESPACE,
+        get_if_exists=True,
+        scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
+    ).remote(run_instance_id, dp_rank)
+    registry = RoutedExpertsStoreRegistry.options(
+        name=registry_actor_name(run_instance_id),
+        namespace=ROUTED_EXPERTS_RAY_NAMESPACE,
+        get_if_exists=True,
+    ).remote(run_instance_id)
+    ray.get(registry.register_materializer.remote(actor_name, materializer))
+    _MATERIALIZER_HANDLE_CACHE[cache_key] = materializer
+    return materializer
+
+
+def materialize_routed_experts_refs_once_per_dp(
+    refs_by_sample: Any,
+    *,
+    input_ids: torch.Tensor,
+    input_lengths: torch.Tensor,
+    run_instance_id: str,
+    dp_rank: int,
+) -> torch.Tensor:
+    """Resolve and assemble once, then share the immutable CPU result per DP."""
+    batch_size, padded_length = input_ids.shape[:2]
+    batch = _normalize_routed_experts_batch(
+        refs_by_sample,
+        batch_size=batch_size,
+        padded_length=padded_length,
+        input_lengths=input_lengths,
+    )
+    materializer = _get_or_create_routed_experts_materializer(run_instance_id, dp_rank)
+    metadata = ray.get(
+        materializer.materialize.remote(
+            batch.cache_key,
+            refs_by_sample,
+            batch.input_lengths,
+            batch_size,
+            padded_length,
+        )
+    )
+    object_or_ref = metadata["object_ref"]
+    value = (
+        ray.get(object_or_ref)
+        if isinstance(object_or_ref, ray.ObjectRef)
+        else object_or_ref
+    )
+    array = np.asarray(value)
+    if (
+        list(array.shape) != metadata["shape"]
+        or str(array.dtype) != metadata["dtype"]
+        or int(array.nbytes) != metadata["nbytes"]
+    ):
+        raise RuntimeError(
+            "Shared routed-experts materialization does not match its metadata: "
+            f"actual_shape={list(array.shape)}, expected_shape={metadata['shape']}, "
+            f"actual_dtype={array.dtype}, expected_dtype={metadata['dtype']}, "
+            f"actual_nbytes={array.nbytes}, expected_nbytes={metadata['nbytes']}"
+        )
+    # Ray plasma NumPy views are intentionally immutable. PyTorch warns when a
+    # read-only view is wrapped even though this tensor is only read before the
+    # existing H2D copy. Suppress that narrowly without making a CPU copy.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="The given NumPy array is not writable",
+            category=UserWarning,
+        )
+        return torch.from_numpy(array)
 
 
 def retire_routed_experts_through(
