@@ -16,71 +16,7 @@
 
 from typing import ClassVar, Final
 
-try:
-    from nemo.lens.groups import SpanGroup
-except ImportError:  # pragma: no cover — exercised only in lens-free envs
-    # Structural stand-in for ``nemo.lens.groups.SpanGroup`` so this module
-    # (and everything importing ``RLSpanGroup``) stays importable in a venv
-    # without nemo-lens. Constants and ``resolve`` mirror the lens class;
-    # telemetry itself cannot be enabled without lens, so nothing consumes the
-    # resolved sets in that environment.
-    class SpanGroup:  # type: ignore[no-redef]
-        """Fallback span-group base when nemo-lens is not installed."""
-
-        JOB = "job"
-        CHECKPOINT = "checkpoint"
-        EVALUATE = "evaluate"
-        MODEL_INIT = "model_init"
-        LOAD_CHECKPOINT = "load_checkpoint"
-        STEP = "step"
-        FORWARD_BACKWARD = "forward_backward"
-        OPTIMIZER = "optimizer"
-
-        ALL_GROUPS: Final[frozenset] = frozenset(
-            [
-                JOB,
-                CHECKPOINT,
-                EVALUATE,
-                MODEL_INIT,
-                LOAD_CHECKPOINT,
-                STEP,
-                FORWARD_BACKWARD,
-                OPTIMIZER,
-            ]
-        )
-
-        _PRESETS: ClassVar[dict] = {
-            "default": frozenset([JOB, CHECKPOINT, EVALUATE]),
-            "per_step": frozenset(
-                [
-                    JOB,
-                    CHECKPOINT,
-                    EVALUATE,
-                    MODEL_INIT,
-                    LOAD_CHECKPOINT,
-                    STEP,
-                    FORWARD_BACKWARD,
-                    OPTIMIZER,
-                ]
-            ),
-            "all": ALL_GROUPS,
-        }
-
-        @classmethod
-        def resolve(cls, spec: str) -> frozenset:
-            """Resolve a span-group spec string to a frozenset of group names."""
-            result: set = set()
-            for part in (p.strip().lower() for p in spec.split(",") if p.strip()):
-                if part in cls._PRESETS:
-                    result |= cls._PRESETS[part]
-                elif part in cls.ALL_GROUPS:
-                    result.add(part)
-                else:
-                    valid = sorted(cls.ALL_GROUPS | set(cls._PRESETS))
-                    raise ValueError(
-                        f"Unknown span group or preset: {part!r}. Valid options: {valid}"
-                    )
-            return frozenset(result)
+from nemo.lens.groups import SpanGroup
 
 
 class RLSpanGroup(SpanGroup):
