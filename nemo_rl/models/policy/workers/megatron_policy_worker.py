@@ -13,7 +13,6 @@
 # limitations under the License.
 import copy
 import gc
-import itertools
 import logging
 import math
 import os
@@ -246,19 +245,6 @@ def _estimate_refit_tensor_size_in_bytes(
 def _is_mtp_megatron_param(param_name: str) -> bool:
     """Return whether a Megatron parameter belongs to a co-trained MTP module."""
     return param_name.startswith("mtp.") or ".mtp." in param_name
-
-
-def _grouped_expert_member_views(weight: torch.Tensor) -> list[torch.Tensor]:
-    """Return cached TE grouped members without invoking unsupported indexing."""
-    storage = weight.data if isinstance(weight, torch.nn.Parameter) else weight
-    splitter = getattr(storage, "split_into_quantized_tensors", None)
-    if callable(splitter):
-        members = getattr(storage, "quantized_tensors", None)
-        if members is None:
-            members = splitter()
-            storage.quantized_tensors = members
-        return list(members)
-    return list(storage.unbind(0))
 
 
 def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
@@ -2350,270 +2336,19 @@ class MegatronPolicyWorkerImpl(
             and vllm_cfg.get("is_mx") is True
         )
 
-    def _build_native_grouped_mxfp8_tasks(
-        self,
-        *,
-        bridge: Any,
-        registry: Any,
-        global_names: list[str],
-        pp_rank: int,
-    ) -> list[Any]:
-        """Build deterministic source tasks for singular grouped expert weights."""
-        if not self._is_native_mxfp8_export() or not getattr(
-            self.model.config, "moe_single_grouped_weight", False
-        ):
-            return []
-
-        from megatron.bridge.models.conversion.model_bridge import (
-            WeightConversionTask,
-            _megatron_local_name_to_global,
-        )
-        from megatron.core.fp8_utils import is_grouped_mxfp8tensor
-
-        models = [self.model]
-        grouped_suffixes = (
-            ".mlp.experts.linear_fc1.weight",
-            ".mlp.experts.linear_fc2.weight",
-        )
-        local_tasks: dict[str, tuple[str, torch.Tensor, Any]] = {}
-        local_storage: dict[str, bool] = {}
-        for local_name, param in self.model.named_parameters():
-            local_name = bridge._unwrap_name(local_name)
-            if not local_name.endswith(grouped_suffixes):
-                continue
-            global_name = _megatron_local_name_to_global(
-                models, self.model.config, local_name, 0
-            )
-            if _is_mtp_megatron_param(global_name):
-                continue
-            mapping = registry.megatron_to_hf_lookup(f"{global_name}0")
-            if mapping is None:
-                raise ValueError(
-                    "Missing Megatron-Bridge mapping for grouped MXFP8 source "
-                    f"{global_name!r} role 'weight'"
-                )
-            uses_native_storage = bool(is_grouped_mxfp8tensor(param))
-            local_storage[global_name] = uses_native_storage
-            # A per-module TE recipe can keep first/last or other selected
-            # grouped experts in BF16. Those tasks remain in the ordinary
-            # Bridge stream and are sent through the misc path.
-            if not uses_native_storage:
-                continue
-            local_tasks[global_name] = (local_name, param, mapping)
-
-        tasks: list[Any] = []
-        for global_name in global_names:
-            if not global_name.endswith(grouped_suffixes):
-                continue
-            if _is_mtp_megatron_param(global_name):
-                continue
-            local = local_tasks.get(global_name)
-            if local is None:
-                param_name = global_name
-                param_weight = None
-                mapping = registry.megatron_to_hf_lookup(f"{global_name}0")
-            else:
-                param_name, param_weight, mapping = local
-            if mapping is None:
-                raise ValueError(
-                    "Missing Megatron-Bridge mapping for grouped MXFP8 source "
-                    f"{global_name!r} role 'weight'"
-                )
-            local_uses_native = local_storage.get(global_name)
-            broadcaster = getattr(mapping, "broadcast_obj_from_pp_rank", None)
-            uses_native = (
-                bool(
-                    broadcaster(
-                        local_uses_native,
-                        cache_key=f"native-grouped-storage:{global_name}",
-                    )
-                )
-                if callable(broadcaster)
-                else bool(local_uses_native)
-            )
-            if not uses_native:
-                continue
-            tasks.append(
-                WeightConversionTask(
-                    param_name=param_name,
-                    global_param_name=global_name,
-                    mapping=mapping,
-                    param_weight=param_weight,
-                    pp_rank=pp_rank,
-                    vp_stage=0 if param_weight is not None else None,
-                )
-            )
-        return tasks
-
     def _build_native_mxfp8_conversion_tasks(self) -> list[Any]:
-        """Build strict ordinary tasks around singular grouped MXFP8 sources."""
-        from megatron.bridge.models.conversion.model_bridge import (
-            WeightConversionTask,
-            _get_pg_collection_from_model,
-            _get_pp_rank,
-            _megatron_local_name_to_global,
+        """Delegate MXFP8 task construction and classify singular grouped tasks."""
+        tasks = self.megatron_bridge._model_bridge.build_export_mxfp8_tasks(
+            self.megatron_bridge.hf_pretrained, [self.model]
         )
-        from megatron.bridge.models.conversion.utils import (
-            get_module_and_param_from_name,
-            persistent_buffers,
-        )
-
-        models = [self.model]
-        bridge = self.megatron_bridge._model_bridge
-        hf_pretrained = self.megatron_bridge.hf_pretrained
-        bridge.hf_pretrained = hf_pretrained
-        bridge.hf_config = (
-            hf_pretrained.config if hasattr(hf_pretrained, "config") else hf_pretrained
-        )
-        registry = bridge.mapping_registry()
-        set_process_groups = getattr(
-            registry, "set_process_groups_from_pg_collection", None
-        )
-        if callable(set_process_groups):
-            set_process_groups(_get_pg_collection_from_model(models))
-
-        global_names = bridge._megatron_global_param_names_all_pp_ranks(models)
-        shares_embeddings = getattr(
-            bridge, "_share_embeddings_and_output_weights", None
-        )
-        if callable(shares_embeddings) and shares_embeddings(self.model.config):
-            global_names = [name for name in global_names if "output_layer" not in name]
-        pp_rank = _get_pp_rank(models)
-        grouped_tasks = self._build_native_grouped_mxfp8_tasks(
-            bridge=bridge,
-            registry=registry,
-            global_names=global_names,
-            pp_rank=pp_rank,
-        )
-        self._native_grouped_mxfp8_tasks = grouped_tasks
-        grouped_names = {task.global_param_name for task in grouped_tasks}
         grouped_suffixes = (
             ".mlp.experts.linear_fc1.weight",
             ".mlp.experts.linear_fc2.weight",
         )
-        num_experts = int(getattr(self.model.config, "num_moe_experts", 0) or 0)
-        ep_size = int(getattr(self.model.config, "expert_model_parallel_size", 1) or 1)
-        if num_experts and num_experts % ep_size:
-            raise ValueError(
-                f"num_moe_experts={num_experts} must be divisible by "
-                f"expert_model_parallel_size={ep_size}"
-            )
-        local_expert_count = num_experts // ep_size if num_experts else 0
-        grouped_misc_names: dict[str, list[str]] = {}
-        expanded_global_names: list[str] = []
-        for global_name in global_names:
-            if (
-                global_name.endswith(grouped_suffixes)
-                and global_name not in grouped_names
-            ):
-                if _is_mtp_megatron_param(global_name):
-                    raise ValueError(
-                        "native MXFP8 refit does not yet support co-trained MTP "
-                        "grouped experts"
-                    )
-                if local_expert_count <= 0:
-                    raise ValueError(
-                        f"Cannot expand grouped expert parameter {global_name!r} "
-                        "without num_moe_experts"
-                    )
-                expanded = [
-                    f"{global_name}{expert_id}"
-                    for expert_id in range(local_expert_count)
-                ]
-                grouped_misc_names[global_name] = expanded
-                expanded_global_names.extend(expanded)
-            else:
-                expanded_global_names.append(global_name)
-        global_names = expanded_global_names
-        remaining_names = [name for name in global_names if name not in grouped_names]
-        if not remaining_names:
-            return grouped_tasks
-
-        has_hf_state = hasattr(hf_pretrained, "state") and hasattr(
-            hf_pretrained.state, "source"
-        )
-        hf_keys = hf_pretrained.state.source.get_all_keys() if has_hf_state else None
-
-        mappings = bridge._validate_conversion_mappings(
-            registry,
-            remaining_names,
-            hf_keys,
-        )
-        remaining_set = set(remaining_names)
-        local_tasks: dict[str, Any] = {}
-        for local_name, _ in itertools.chain(
-            self.model.named_parameters(), persistent_buffers(self.model)
-        ):
-            if "_extra_state" in local_name or bridge._is_adapter_param_name(
-                local_name
-            ):
-                continue
-            local_name = bridge._unwrap_name(local_name)
-            global_name = _megatron_local_name_to_global(
-                models, self.model.config, local_name, 0
-            )
-            expanded_names = grouped_misc_names.get(global_name)
-            if expanded_names is not None:
-                local_module, local_weight = get_module_and_param_from_name(
-                    models, local_name, 0
-                )
-                members = (
-                    []
-                    if local_weight is None
-                    else _grouped_expert_member_views(local_weight)
-                )
-                if len(members) != len(expanded_names):
-                    raise ValueError(
-                        f"Grouped expert parameter {global_name!r} has local shape "
-                        f"{getattr(local_weight, 'shape', None)}, expected "
-                        f"{len(expanded_names)} local experts"
-                    )
-                if local_module is not None and not hasattr(local_module, "config"):
-                    setattr(local_module, "config", self.model.config)
-                for expert_id, expanded_name in enumerate(expanded_names):
-                    local_tasks[expanded_name] = WeightConversionTask(
-                        pp_rank=pp_rank,
-                        vp_stage=0,
-                        param_name=f"{local_name}{expert_id}",
-                        global_param_name=expanded_name,
-                        megatron_module=local_module,
-                        param_weight=members[expert_id],
-                        mapping=mappings[expanded_name],
-                    )
-                continue
-            if global_name not in remaining_set:
-                continue
-            local_module, local_weight = get_module_and_param_from_name(
-                models, local_name, 0
-            )
-            if local_module is not None and not hasattr(local_module, "config"):
-                setattr(local_module, "config", self.model.config)
-            local_tasks[global_name] = WeightConversionTask(
-                pp_rank=pp_rank,
-                vp_stage=0,
-                param_name=local_name,
-                global_param_name=global_name,
-                megatron_module=local_module,
-                param_weight=local_weight,
-                mapping=mappings[global_name],
-            )
-
-        task_by_name = {task.global_param_name: task for task in grouped_tasks}
-        for global_name in remaining_names:
-            local_task = local_tasks.get(global_name)
-            if local_task is not None:
-                task_by_name[global_name] = local_task
-            else:
-                task_by_name[global_name] = WeightConversionTask(
-                    pp_rank=pp_rank,
-                    vp_stage=None,
-                    param_name=global_name,
-                    global_param_name=global_name,
-                    megatron_module=None,
-                    param_weight=None,
-                    mapping=mappings[global_name],
-                )
-        return [task_by_name[name] for name in global_names]
+        self._native_grouped_mxfp8_tasks = [
+            task for task in tasks if task.global_param_name.endswith(grouped_suffixes)
+        ]
+        return tasks
 
     def _build_refit_conversion_tasks(self) -> list:
         """Build the conversion-task list driving refit (BF16 or FP8 export).

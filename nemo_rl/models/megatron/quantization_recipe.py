@@ -47,9 +47,11 @@ def _find_bf16_config_key(recipe: Any) -> str:
     candidates = []
     for config_key, config in recipe.configs.items():
         training_recipe = config.get("training_recipe", {})
-        if (
-            training_recipe.get("fp8_quantization_recipe") is None
-            and training_recipe.get("fp4_quantization_recipe") is None
+        evaluation_recipe = config.get("evaluation_recipe", training_recipe)
+        if all(
+            phase_recipe.get("fp8_quantization_recipe") is None
+            and phase_recipe.get("fp4_quantization_recipe") is None
+            for phase_recipe in (training_recipe, evaluation_recipe)
         ):
             candidates.append(str(config_key))
     if "bf16" in candidates:
@@ -58,12 +60,12 @@ def _find_bf16_config_key(recipe: Any) -> str:
         return candidates[0]
     if len(candidates) > 1:
         raise ValueError(
-            "A first/last BF16 override found multiple non-quantized training "
+            "A first/last BF16 override found multiple fully non-quantized "
             f"configs without a 'bf16' key: {candidates!r}"
         )
     raise ValueError(
-        "A first/last BF16 override requires a non-quantized training config "
-        "in the TE precision recipe"
+        "A first/last BF16 override requires a config that is non-quantized "
+        "during both training and evaluation"
     )
 
 

@@ -551,6 +551,12 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
             "sample_mask": torch.ones(batch_size),
             "prev_logprobs": torch.zeros(batch_size, sequence_length),
             "generation_logprobs": generation_logprobs,
+            # The filtered row is also flagged. Its penalty must not overwrite
+            # the sequence-error mask and leak back into streaming training.
+            "invalid_tool_call_mask": torch.tensor(
+                [[False] * sequence_length] * 2 + [[True] * sequence_length] * 2
+            ),
+            "malformed_thinking_mask": torch.zeros(batch_size, sequence_length),
         },
         batch_size=[batch_size],
     )
@@ -567,9 +573,14 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
+        grpo=SimpleNamespace(
+            seq_logprob_error_threshold=2.0,
+            invalid_tool_call_advantage=-5.0,
+            malformed_thinking_advantage=None,
+        )
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = True
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -589,8 +600,17 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     assert has_valid_training_tokens
     assert data_plane.selected_fields is not None
     assert "prev_logprobs" in data_plane.selected_fields
+    assert "invalid_tool_call_mask" in data_plane.selected_fields
     assert "generation_logprobs" in data_plane.selected_fields
     assert data_plane.written_fields is not None
+    # The estimator's value remains, but the penalty did not overwrite it with
+    # -5; sample_mask below is what excludes this row from streaming training.
+    torch.testing.assert_close(
+        data_plane.written_fields["advantages"][2], torch.ones(5)
+    )
+    torch.testing.assert_close(
+        data_plane.written_fields["advantages"][3], torch.full((5,), -5.0)
+    )
     assert torch.equal(
         data_plane.written_fields["sample_mask"],
         torch.tensor([1.0, 1.0, 0.0, 1.0]),
@@ -639,6 +659,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
         grpo=SimpleNamespace(seq_logprob_error_threshold=None)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -702,6 +723,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
         grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -758,6 +780,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
         grpo=SimpleNamespace(seq_logprob_error_threshold=None)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -834,6 +857,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         grpo=SimpleNamespace(seq_logprob_error_threshold=None)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -1058,6 +1082,7 @@ def _train_pump_controller(*, sampler) -> object:
         checkpointing={"enabled": False, "save_period": 10},
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
     ctrl._async_cfg = SimpleNamespace(
         min_groups_for_streaming_train=1,
         rollout_failure=SimpleNamespace(min_step_batch_fraction=0.9),
@@ -1474,6 +1499,7 @@ def _ppo_train_pump_controller(
         seq_logprob_error_threshold=None,
     )
     ctrl._algo_cfg = ctrl._master_config.ppo
+    ctrl._message_level_advantage_penalties_enabled = False
     ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
     return ctrl, value
@@ -1743,6 +1769,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
         ppo=SimpleNamespace(seq_logprob_error_threshold=None)
     )
     ctrl._algo_cfg = ctrl._master_config.ppo
+    ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],

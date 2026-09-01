@@ -1204,6 +1204,7 @@ def test_rollout_pump_writes_expected_tq_data(
         dp_adapter,
         partition_id=_PARTITION_ID,
         pad_value_dict={"token_ids": int(tokenizer.pad_token_id or 0)},
+        include_message_violation_fields=False,
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
