@@ -41,9 +41,12 @@ _N_GENS = 2
 
 
 def _stub_record_to_train_batch(
-    record: PromptGroupRecord, *, pad_value_dict: Any
+    record: PromptGroupRecord,
+    *,
+    pad_value_dict: Any,
+    include_message_violation_fields: bool,
 ) -> BatchedDataDict[Any]:
-    del record, pad_value_dict
+    del record, pad_value_dict, include_message_violation_fields
     return BatchedDataDict[Any](
         {
             "input_ids": torch.ones((_N_GENS, 3), dtype=torch.long),
@@ -183,6 +186,7 @@ def _make_buffer(
         dp,
         partition_id="rollout_data",
         pad_value_dict={"token_ids": 0},
+        include_message_violation_fields=False,
         require_routed_experts=require_routed_experts,
     )
     buffer.set_data_plane_checkpoint_barrier(
@@ -568,6 +572,7 @@ class TestTQReplayBufferRemove:
             dp,
             partition_id="rollout_data",
             pad_value_dict={"token_ids": 0},
+            include_message_violation_fields=False,
         )
 
         with pytest.raises(RuntimeError, match="must be bound"):
