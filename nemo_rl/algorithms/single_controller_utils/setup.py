@@ -93,7 +93,11 @@ from nemo_rl.experience.rollout_manager import (
     RolloutRetryPolicy,
     RolloutTimeouts,
 )
-from nemo_rl.experience.rollouts import should_mask_flagged_samples
+from nemo_rl.experience.rollouts import (
+    get_nemo_gym_thinking_tags,
+    resolve_reward_penalty_config,
+    should_mask_flagged_samples,
+)
 from nemo_rl.models.generation import resolve_generation_class
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
@@ -881,6 +885,11 @@ def setup_single_controller(
         logged by the SC actor).
     """
     validate_single_controller_config(master_config)
+    resolved_reward_penalty_config = resolve_reward_penalty_config(
+        master_config.reward_penalties,
+        tokenizer,
+        thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+    )
 
     # short names for config sections
     algo_cfg = algo_config(master_config)
@@ -1393,6 +1402,10 @@ def setup_single_controller(
         dp_client,
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
+        include_message_violation_fields=(
+            algo_cfg.invalid_tool_call_advantage is not None
+            or algo_cfg.malformed_thinking_advantage is not None
+        ),
         require_routed_experts=router_replay_enabled(policy_config),
     )
     rollout_manager = RolloutManager(
@@ -1405,6 +1418,7 @@ def setup_single_controller(
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
+        reward_penalty_config=resolved_reward_penalty_config,
         tq_buffer=tq_buffer,
         timeouts=RolloutTimeouts(
             rollout_s=master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s,
