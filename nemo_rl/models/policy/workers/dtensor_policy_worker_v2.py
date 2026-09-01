@@ -303,6 +303,7 @@ class DTensorPolicyWorkerV2Impl(
                     "dequantize_base_checkpoint", False
                 ),
                 "is_peft": self.lora_enabled,
+                # The algorithm finalizes policy writes before checkpoint rename.
                 "is_async": True,
             }
         )
@@ -1354,7 +1355,6 @@ class DTensorPolicyWorkerV2Impl(
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
-        checkpointing_cfg: Optional[CheckpointingConfig] = None,
         *,
         is_final_checkpoint: bool,
     ) -> None:
@@ -1370,9 +1370,7 @@ class DTensorPolicyWorkerV2Impl(
             scheduler=self.scheduler,
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
-            checkpointing_cfg=checkpointing_cfg,
             is_final_checkpoint=is_final_checkpoint,
-            lora_enabled=self.lora_enabled,
             peft_config=self.peft_config,
         )
 

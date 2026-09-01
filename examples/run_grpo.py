@@ -150,7 +150,10 @@ def main() -> None:
             from nemo_rl.models.policy.tq_policy import TQPolicy
 
             def _make_policy(**kwargs):
-                return TQPolicy(**kwargs, dp_cfg=_dp_cfg)
+                return TQPolicy(
+                    **kwargs,
+                    dp_cfg=_dp_cfg,
+                )
 
             _policy_factory = _make_policy
         else:

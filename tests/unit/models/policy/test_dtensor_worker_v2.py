@@ -453,6 +453,7 @@ def test_dtensor_v2_checkpoint_save_and_load(
             init_reference_model=False,
             cluster=two_gpu_virtual_cluster,
             name_prefix="lm_policy_checkpoint",
+            checkpointing_cfg=checkpointing_config,
         )
 
         try:
@@ -465,7 +466,6 @@ def test_dtensor_v2_checkpoint_save_and_load(
             policy.save_checkpoint(
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
-                checkpointing_cfg=checkpointing_config,
                 is_final_checkpoint=False,
             )
             policy.finalize_async_save()
@@ -502,6 +502,7 @@ def test_dtensor_v2_checkpoint_save_and_load(
                 name_prefix="lm_policy_checkpoint_loaded",
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
+                checkpointing_cfg=checkpointing_config,
             )
 
             # Verify policy was loaded successfully

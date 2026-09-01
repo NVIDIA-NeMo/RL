@@ -126,7 +126,7 @@ def tokenizer():
 
 
 @pytest.fixture(scope="function")
-def policy(cluster, tokenizer, request):
+def policy(cluster, tokenizer, request, tmp_path):
     """Initialize the policy with dtensor v1/v2."""
     use_v2 = bool(getattr(request, "param", False))
     config = {
@@ -142,6 +142,15 @@ def policy(cluster, tokenizer, request):
         config=config,
         init_optimizer=True,
         init_reference_model=False,
+        checkpointing_cfg=(
+            {
+                "enabled": True,
+                "checkpoint_dir": str(tmp_path),
+                "model_save_format": "torch_save",
+            }
+            if use_v2
+            else None
+        ),
     )
     yield policy
     policy.worker_group.shutdown()
@@ -385,10 +394,6 @@ def test_convert_dcp_to_hf(policy, num_gpus, request):
     with TemporaryDirectory() as tmp_dir:
         policy.save_checkpoint(
             os.path.join(tmp_dir, "test_hf_and_dcp"),
-            checkpointing_cfg={
-                "enabled": True,
-                "model_save_format": "torch_save" if policy_version_is_v2 else None,
-            },
             is_final_checkpoint=False,
         )
         policy.finalize_async_save()

@@ -1241,9 +1241,8 @@ def setup(
             "(reference model is not loaded)."
         )
 
-    # Caller-supplied factory lets the sync trainer swap in a TQ-mediated
-    # Policy subclass without this shared setup needing to know the data
-    # plane exists. Default is the plain Policy class — legacy behavior.
+    # Caller-supplied factories receive the same construction-time checkpoint
+    # configuration as Policy, so worker resources are fully defined at setup.
     _make_policy = policy_factory if policy_factory is not None else Policy
 
     def init_policy(reserved_http_server_port: Optional[int] = None):
@@ -1253,8 +1252,6 @@ def setup(
         if reserved_http_server_port is not None:
             # Colocated Megatron generation serves HTTP from the training workers.
             extra_policy_kwargs["reserved_http_server_port"] = reserved_http_server_port
-        if policy_factory is None:
-            extra_policy_kwargs["checkpointing_cfg"] = checkpointing_config
         p = _make_policy(
             cluster=train_cluster,
             config=policy_config,
@@ -1264,9 +1261,9 @@ def setup(
             optimizer_path=optimizer_path,
             init_optimizer=True,
             init_reference_model=init_reference_model,
+            checkpointing_cfg=checkpointing_config,
             **extra_policy_kwargs,
         )
-        # Keep custom policy_factory call signatures backward compatible.
         p.debug_payload_metrics = grpo_config.debug_payload_metrics
         if remote_transport is not None:
             assert remote_synchronizer_cls is not None
@@ -3857,7 +3854,6 @@ def grpo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
                             is_final_checkpoint=should_save_as_final_checkpoint(
                                 is_last_step=is_last_step,
                                 early_stop_requested=early_stop_message is not None,
@@ -5720,7 +5716,6 @@ def async_grpo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
                             is_final_checkpoint=should_save_as_final_checkpoint(
                                 is_last_step=is_last_step,
                                 early_stop_requested=early_stop_message is not None,

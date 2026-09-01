@@ -192,7 +192,7 @@ def test_value_worker_init_rejects_cp_scoring_before_setup(monkeypatch):
 
 
 def _make_checkpointing_cfg(checkpoint_dir) -> dict:
-    """Build a minimal `CheckpointingConfig` for DTensor V2 ``save_checkpoint``."""
+    """Build a minimal `CheckpointingConfig` for DTensor V2 worker setup."""
     return {
         "enabled": True,
         "checkpoint_dir": str(checkpoint_dir),
@@ -203,6 +203,16 @@ def _make_checkpointing_cfg(checkpoint_dir) -> dict:
         "checkpoint_must_save_by": None,
         "save_optimizer": True,
     }
+
+
+def test_value_rejects_user_configured_checkpoint_async_mode():
+    with pytest.raises(ValueError, match="checkpointing.is_async is managed"):
+        Value(
+            cluster=None,
+            config={},
+            tokenizer=None,
+            checkpointing_cfg={"is_async": True},
+        )
 
 
 def _load_dcp_state(checkpoint_dir: Path, output_path: Path) -> dict[str, Any]:
@@ -263,7 +273,7 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
 
 
 @pytest.fixture
-def value_setup(request, tiny_qwen2_model_path):
+def value_setup(request, tiny_qwen2_model_path, tmp_path):
     """Spin up a `Value` wrapper around a tiny Qwen2 backbone for DTensor V2 testing.
 
     Parameter format: ``(num_gpus, tp, cp, config_updates)``.
@@ -298,7 +308,12 @@ def value_setup(request, tiny_qwen2_model_path):
         _apply_config_updates(config, config_updates)
         tokenizer = get_tokenizer(config["tokenizer"])
 
-        value = Value(cluster=cluster, config=config, tokenizer=tokenizer)
+        value = Value(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            checkpointing_cfg=_make_checkpointing_cfg(tmp_path / "value_ckpt_root"),
+        )
 
         torch.manual_seed(42)
         batch, seq_len = 8, 64
@@ -485,7 +500,12 @@ def test_value_worker_parallelism_equivalence(
         # Reference worker: feature OFF.
         ref_config = _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
         tokenizer = get_tokenizer(ref_config["tokenizer"])
-        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer)
+        ref = Value(
+            cluster=cluster,
+            config=ref_config,
+            tokenizer=tokenizer,
+            checkpointing_cfg=_make_checkpointing_cfg(tmp_path),
+        )
         values_ref = ref.get_values(data)["values"].detach().cpu()
 
         # Save weights, then reload into a feature-ON worker (same weights).
@@ -493,7 +513,6 @@ def test_value_worker_parallelism_equivalence(
         ref.prepare_for_inference()
         ref.save_checkpoint(
             weights_path=weights_path,
-            checkpointing_cfg=_make_checkpointing_cfg(tmp_path),
             is_final_checkpoint=False,
         )
         ref.shutdown()
@@ -584,7 +603,6 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
     value.save_checkpoint(
         weights_path=weights_path,
         optimizer_path=optimizer_path,
-        checkpointing_cfg=_make_checkpointing_cfg(tmp_path / "value_ckpt_root"),
         is_final_checkpoint=False,
     )
 
@@ -615,6 +633,7 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
         weights_path=resume_weights_path,
         optimizer_path=resume_optimizer_path,
         name_prefix="lm_value_resumed",
+        checkpointing_cfg=_make_checkpointing_cfg(tmp_path / "value_ckpt_resaved"),
     )
     try:
         workers_alive = ray.get(
@@ -651,7 +670,6 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
         resumed.save_checkpoint(
             weights_path=resaved_weights_path,
             optimizer_path=resaved_optimizer_path,
-            checkpointing_cfg=_make_checkpointing_cfg(resaved_root),
             is_final_checkpoint=False,
         )
 

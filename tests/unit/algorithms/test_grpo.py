@@ -3103,7 +3103,7 @@ def test_noncolocated_opd_teacher_must_fit_on_one_cluster_node(
     "initial_skip_flag",
     [None, False],
 )
-def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
+def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
     monkeypatch, mock_grpo_components, initial_skip_flag
 ):
     from nemo_rl.algorithms import grpo as grpo_mod
@@ -3155,7 +3155,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         def prepare_refit_info(self):
             return {}
 
-    def legacy_policy_factory(
+    def policy_factory(
         *,
         cluster,
         config,
@@ -3165,7 +3165,9 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         optimizer_path,
         init_optimizer,
         init_reference_model,
+        checkpointing_cfg,
     ):
+        assert checkpointing_cfg is master_config.checkpointing
         del (
             cluster,
             config,
@@ -3249,7 +3251,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         tokenizer,
         dataset,
         None,
-        policy_factory=legacy_policy_factory,
+        policy_factory=policy_factory,
     )
 
     assert master_config.grpo.skip_reference_policy_logprobs_calculation is True

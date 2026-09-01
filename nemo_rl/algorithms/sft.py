@@ -649,7 +649,6 @@ def sft_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
                             is_final_checkpoint=should_save_as_final_checkpoint(
                                 is_last_step=is_last_step
                             ),

@@ -120,6 +120,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
         draft_enabled = bool(config.get("draft", {}).get("enabled", False))
+        if checkpointing_cfg is not None and "is_async" in checkpointing_cfg:
+            raise ValueError(
+                "checkpointing.is_async is managed by the training backend and "
+                "must not be set. Configure Megatron async saves with "
+                "policy.megatron_cfg.checkpoint.async_save; Automodel policy "
+                "saves are always asynchronous."
+            )
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
@@ -204,6 +211,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
+
+        if (
+            dtensor_enable
+            and not use_v2
+            and checkpointing_cfg is not None
+            and checkpointing_cfg.get("model_save_format", None) is not None
+        ):
+            raise ValueError(
+                "model_save_format must be None or omitted if using "
+                "DTensorPolicyWorker (_v2=False)."
+            )
 
         # If a worker extension class is provided, use it instead of the default worker builder class
         if worker_extension_cls_fqn is not None:
@@ -1261,7 +1279,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
-        checkpointing_cfg: Optional[CheckpointingConfig] = None,
         *,
         is_final_checkpoint: bool,
     ) -> None:
@@ -1269,9 +1286,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         With Megatron async_save=True, this returns after D2H staging. The caller
         must call finalize_async_save() before renaming the checkpoint directory.
+
+        DTensor v2 checkpoint resources are configured when the Policy is
+        constructed. ``weights_path`` selects the destination for each save.
         """
-        # Only pass checkpointing_cfg for DTensor v2
-        use_v2 = self.cfg.get("dtensor_cfg", {}).get("_v2", False)
+        dtensor_cfg = self.cfg.get("dtensor_cfg", {})
+        use_v2 = bool(dtensor_cfg.get("enabled", False)) and bool(
+            dtensor_cfg.get("_v2", False)
+        )
 
         if use_v2:
             futures = self.worker_group.run_all_workers_single_data(
@@ -1279,17 +1301,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
                 tokenizer_path=tokenizer_path,
-                checkpointing_cfg=checkpointing_cfg,
                 is_final_checkpoint=is_final_checkpoint,
             )
         else:
-            if (
-                checkpointing_cfg is not None
-                and checkpointing_cfg.get("model_save_format", None) is not None
-            ):
-                raise ValueError(
-                    "model_save_format must be None or omitted if using DTensorPolicyWorker (_v2=False)."
-                )
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,

@@ -192,6 +192,8 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
                 ),
                 "is_peft": self.lora_enabled,
                 "skip_task_head_prefixes_for_base_model": ["score."],
+                # Callers rename after Value.save_checkpoint returns.
+                "is_async": False,
             }
         )
         self._init_checkpoint_manager(
@@ -585,7 +587,6 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
-        checkpointing_cfg: Optional[CheckpointingConfig] = None,
         *,
         is_final_checkpoint: bool,
     ) -> None:
@@ -598,9 +599,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
             scheduler=self.scheduler,
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
-            checkpointing_cfg=checkpointing_cfg,
             is_final_checkpoint=is_final_checkpoint,
-            lora_enabled=self.lora_enabled,
             peft_config=self.peft_config,
         )
 

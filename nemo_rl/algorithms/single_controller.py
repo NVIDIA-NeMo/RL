@@ -2850,7 +2850,6 @@ class SingleControllerActor:
                 if self._checkpointer.save_optimizer
                 else None,
                 tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
-                checkpointing_cfg=self._master_config.checkpointing,
                 is_final_checkpoint=is_final_checkpoint,
             )
             await asyncio.to_thread(self._value.finish_training)
@@ -2872,7 +2871,6 @@ class SingleControllerActor:
             if self._checkpointer.save_optimizer and is_policy_training_step
             else None,
             tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
-            checkpointing_cfg=self._master_config.checkpointing,
             is_final_checkpoint=is_final_checkpoint,
         )
 

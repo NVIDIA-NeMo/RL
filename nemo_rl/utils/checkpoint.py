@@ -146,12 +146,6 @@ class CheckpointingConfig(TypedDict):
     single_rank_consolidation (bool): Whether only rank 0 consolidates the checkpoint.
     consolidation_timeout_minutes (int): Timeout for the dedicated distributed
         consolidation process group.
-    cpu_offload (bool): Whether Automodel moves checkpoint state tensors to CPU
-        before saving.
-    staging_dir (str | None): Optional local staging directory used while
-        consolidating checkpoint shards.
-    v4_compatible (bool): Whether consolidated checkpoints use the original
-        Transformers v4-compatible model configuration.
     model_cache_dir (str): Directory for model cache (for safetensors format).
     model_repo_id (str): Repository ID for the model (for safetensors format).
     is_peft (bool): Whether the model uses PEFT.
@@ -186,14 +180,12 @@ class CheckpointingConfig(TypedDict):
     ]  # Automodel default: "final"
     single_rank_consolidation: NotRequired[bool]  # Default: False
     consolidation_timeout_minutes: NotRequired[int]  # Default: 30
-    cpu_offload: NotRequired[bool]  # Default: False
-    staging_dir: NotRequired[str | None]  # Default: None
-    v4_compatible: NotRequired[bool]  # Default: False
     model_cache_dir: NotRequired[str]  # Default: ""
     model_repo_id: NotRequired[str]  # Default: ""
     is_peft: NotRequired[bool]  # Default: False
     peft_config: NotRequired[Any]  # Default: None
-    is_async: NotRequired[bool]  # Default: False
+    # Reserved for backend-owned Automodel setup; user values are rejected.
+    is_async: NotRequired[bool]
     # Keep known upstream-only keys through Pydantic parsing so the Automodel
     # wrapper can reject them explicitly instead of silently dropping them.
     wait_for_staging: NotRequired[bool]

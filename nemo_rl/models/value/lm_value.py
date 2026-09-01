@@ -79,6 +79,13 @@ class Value(ValueInterface):
         # Value models use the same backend configuration as policy models
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
+        if checkpointing_cfg is not None and "is_async" in checkpointing_cfg:
+            raise ValueError(
+                "checkpointing.is_async is managed by the training backend and "
+                "must not be set. Configure Megatron async saves with "
+                "value.megatron_cfg.checkpoint.async_save; Automodel value saves "
+                "are always synchronous."
+            )
 
         if megatron_enable and dtensor_enable:
             raise ValueError(
@@ -434,11 +441,14 @@ class Value(ValueInterface):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
-        checkpointing_cfg: Optional[CheckpointingConfig] = None,
         *,
         is_final_checkpoint: bool,
     ) -> None:
-        """Save a checkpoint of the value model."""
+        """Save a checkpoint of the value model.
+
+        DTensor v2 checkpoint resources are configured when the Value is
+        constructed. ``weights_path`` selects the destination for each save.
+        """
         megatron_enable = bool(self.cfg.get("megatron_cfg", {}).get("enabled", False))
 
         if megatron_enable:
@@ -457,7 +467,6 @@ class Value(ValueInterface):
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
                 tokenizer_path=tokenizer_path,
-                checkpointing_cfg=checkpointing_cfg,
                 is_final_checkpoint=is_final_checkpoint,
             )
         ray.get(futures)

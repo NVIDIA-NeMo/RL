@@ -138,7 +138,6 @@ class _FakeTrainer:
         weights_path: str,
         optimizer_path: Optional[str],
         tokenizer_path: str,
-        checkpointing_cfg: dict[str, Any],
         is_final_checkpoint: bool,
     ) -> None:
         self.save_calls.append(
@@ -146,7 +145,6 @@ class _FakeTrainer:
                 "weights_path": weights_path,
                 "optimizer_path": optimizer_path,
                 "tokenizer_path": tokenizer_path,
-                "checkpointing_cfg": checkpointing_cfg,
                 "is_final_checkpoint": is_final_checkpoint,
             }
         )
@@ -851,7 +849,6 @@ class TestSaveTrigger:
         assert first["tokenizer_path"] == str(
             ckpt_dir / "tmp_step_2" / "policy" / "tokenizer"
         )
-        assert first["checkpointing_cfg"] is mc.checkpointing
         assert trainer.save_calls[1]["weights_path"] == str(
             ckpt_dir / "tmp_step_4" / "policy" / "weights"
         )

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 
@@ -68,12 +70,11 @@ def test_policy_forwards_final_checkpoint_marker_to_dtensor_v2(monkeypatch):
         "nemo_rl.models.policy.lm_policy.ray.get", lambda futures: futures
     )
     policy = Policy.__new__(Policy)
-    policy.cfg = {"dtensor_cfg": {"_v2": True}}
+    policy.cfg = {"dtensor_cfg": {"enabled": True, "_v2": True}}
     policy.worker_group = WorkerGroup()
 
     policy.save_checkpoint(
         weights_path="checkpoint/weights",
-        checkpointing_cfg={"enabled": True},
         is_final_checkpoint=True,
     )
 
@@ -84,8 +85,54 @@ def test_policy_forwards_final_checkpoint_marker_to_dtensor_v2(monkeypatch):
                 "weights_path": "checkpoint/weights",
                 "optimizer_path": None,
                 "tokenizer_path": None,
-                "checkpointing_cfg": {"enabled": True},
                 "is_final_checkpoint": True,
+            },
+        )
+    ]
+
+
+def test_policy_rejects_user_configured_checkpoint_async_mode():
+    with pytest.raises(ValueError, match="checkpointing.is_async is managed"):
+        Policy(
+            cluster=None,
+            config={},
+            tokenizer=None,
+            checkpointing_cfg={"is_async": True},
+        )
+
+
+def test_policy_uses_megatron_save_path_when_dtensor_is_disabled(monkeypatch):
+    calls = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return ["future"]
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.lm_policy.ray.get", lambda futures: futures
+    )
+    policy = Policy.__new__(Policy)
+    policy.cfg = {
+        # Disabled DTensor settings must not select the Automodel save path,
+        # even if their dormant _v2 value is true.
+        "dtensor_cfg": {"enabled": False, "_v2": True},
+        "megatron_cfg": {"enabled": True},
+    }
+    policy.worker_group = WorkerGroup()
+
+    policy.save_checkpoint(
+        weights_path="checkpoint/weights",
+        is_final_checkpoint=False,
+    )
+
+    assert calls == [
+        (
+            "save_checkpoint",
+            {
+                "weights_path": "checkpoint/weights",
+                "optimizer_path": None,
+                "tokenizer_path": None,
             },
         )
     ]

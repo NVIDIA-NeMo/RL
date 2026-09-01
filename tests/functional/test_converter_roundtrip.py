@@ -233,6 +233,7 @@ def create_dcp_checkpoint(
         config=config["policy"],
         tokenizer=tokenizer,
         init_reference_model=False,
+        checkpointing_cfg=config["checkpointing"],
     )
 
     # Save checkpoint without any training
@@ -242,7 +243,6 @@ def create_dcp_checkpoint(
     )
     policy.save_checkpoint(
         dcp_checkpoint_path,
-        checkpointing_cfg=config["checkpointing"],
         is_final_checkpoint=False,
     )
     policy.finalize_async_save()

@@ -98,11 +98,15 @@ model = model_class.from_pretrained(
   intentionally exposes only canonical strings: use quoted `"false"` instead of the
   YAML boolean `false`, and use `"every"` instead of `true`. Timeout-triggered saves
   remain resumable recovery checkpoints and are not marked as terminal saves.
-  NeMo RL also forwards Automodel's checkpoint CPU offload, consolidation staging,
-  and Transformers v4 compatibility settings. NeMo RL retains
-  ownership of async-save finalization, metric selection, and checkpoint retention, so
-  overlapping or otherwise unsupported upstream settings are rejected instead of
-  silently ignored.
+  NeMo RL retains ownership of async-save finalization, metric selection, and
+  checkpoint retention, so overlapping or otherwise unsupported upstream settings
+  are rejected instead of silently ignored. Automodel policy saves are asynchronous
+  and finalized before checkpoint promotion; value saves are synchronous because
+  their callers promote the checkpoint immediately after `Value.save_checkpoint()`
+  returns. Automodel's checkpoint CPU offload, consolidation staging, and
+  Transformers v4 compatibility settings are not exposed yet. As with the Megatron
+  backend, checkpoint resource settings are fixed when workers start; an individual
+  save supplies only its destination and whether it is the final checkpoint.
 
 The upgrade removes three compatibility workarounds:
 

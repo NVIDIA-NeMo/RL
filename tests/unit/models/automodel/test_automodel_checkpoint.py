@@ -14,15 +14,12 @@
 """Unit tests for automodel checkpoint utilities."""
 
 import os
-import socket
 from dataclasses import fields
-from datetime import timedelta
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-import torch.multiprocessing as mp
 
 # Skip entire module if nemo_automodel is not available
 try:
@@ -41,19 +38,16 @@ from nemo_automodel.components.checkpoint.config import SaveConsolidatedMode
 
 from nemo_rl.models.automodel.checkpoint import (
     _AUTOMODEL_CONFIG_FIELDS,
-    _IN_PLACE_MUTABLE_FIELDS,
     _UNSUPPORTED_AUTOMODEL_CONFIG_FIELDS,
     AutomodelCheckpointManager,
     _extract_automodel_config_updates,
-    _infer_checkpoint_root,
-    detect_checkpoint_format,
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 @pytest.mark.automodel
 def test_automodel_checkpoint_fields_are_explicitly_classified():
-    """An upstream config addition must be supported, rejected, or internal."""
+    """An upstream field must be supported, rejected, internal, or unexposed."""
     internal_fields = frozenset(
         {
             "checkpoint_dir",
@@ -62,25 +56,33 @@ def test_automodel_checkpoint_fields_are_explicitly_classified():
             "original_model_root_dir",
         }
     )
+    # Upstream options intentionally not exposed by NeMo-RL yet.
+    unexposed_fields = frozenset({"cpu_offload", "staging_dir", "v4_compatible"})
     field_groups = (
         _AUTOMODEL_CONFIG_FIELDS,
         _UNSUPPORTED_AUTOMODEL_CONFIG_FIELDS,
         internal_fields,
+        unexposed_fields,
     )
     classified_fields = set().union(*field_groups)
     assert sum(map(len, field_groups)) == len(classified_fields)
     upstream_fields = {field.name for field in fields(AutomodelCheckpointingConfig)}
     assert classified_fields == upstream_fields
-    assert _IN_PLACE_MUTABLE_FIELDS <= upstream_fields
 
-    caller_supplied_fields = classified_fields - {
-        "checkpoint_dir",
-        "enabled",
-        "model_state_dict_keys",
-        "original_model_root_dir",
-        "dequantize_base_checkpoint",
-        "skip_task_head_prefixes_for_base_model",
-    }
+    # These fields are populated by the worker/runtime rather than user YAML.
+    caller_supplied_fields = (
+        classified_fields
+        - unexposed_fields
+        - {
+            "checkpoint_dir",
+            "enabled",
+            "model_state_dict_keys",
+            "original_model_root_dir",
+            "dequantize_base_checkpoint",
+            "skip_task_head_prefixes_for_base_model",
+            "is_async",
+        }
+    )
     assert caller_supplied_fields <= CheckpointingConfig.__annotations__.keys()
 
 
@@ -245,220 +247,6 @@ def check_dict_equality(dict1, dict2):
             assert dict1[k] == dict2[k]
 
 
-class _WorldProcessMesh:
-    """Minimal mesh interface backed by the default process group."""
-
-    @staticmethod
-    def get_group():
-        return torch.distributed.group.WORLD
-
-
-def _run_consolidated_group_rebuild(rank: int, world_size: int, port: int) -> None:
-    """Verify every rank rebuilds with a dedicated consolidation group."""
-    torch.distributed.init_process_group(
-        backend="gloo",
-        init_method=f"tcp://127.0.0.1:{port}",
-        rank=rank,
-        world_size=world_size,
-        timeout=timedelta(seconds=90),
-    )
-    manager = AutomodelCheckpointManager(
-        dp_mesh=_WorldProcessMesh(),
-        tp_mesh=_WorldProcessMesh(),
-    )
-    try:
-        manager.init_checkpointer(config_updates={"save_consolidated": "false"})
-        original_checkpointer = manager.checkpointer
-
-        manager.update_checkpointer_config(
-            config_updates={
-                "save_consolidated": "every",
-                "consolidation_timeout_minutes": 1,
-            }
-        )
-
-        assert manager.checkpointer is not original_checkpointer
-        assert manager.checkpointer is not None
-        consolidation_group = manager.checkpointer._consolidation_process_group
-        assert consolidation_group is not None
-        gathered_ranks = [None] * world_size
-        torch.distributed.all_gather_object(
-            gathered_ranks,
-            rank,
-            group=consolidation_group,
-        )
-        assert gathered_ranks == list(range(world_size))
-    finally:
-        if manager.checkpointer is not None:
-            manager.checkpointer.close()
-        torch.distributed.destroy_process_group()
-
-
-@pytest.mark.automodel
-class TestDetectCheckpointFormat:
-    """Tests for detect_checkpoint_format function."""
-
-    def test_detect_safetensors_format(self, tmp_path):
-        """Test detection of safetensors format."""
-        # Create a checkpoint directory with safetensors files
-        model_dir = tmp_path / "weights" / "model"
-        model_dir.mkdir(parents=True)
-        (model_dir / "model.safetensors").touch()
-
-        model_save_format, is_peft = detect_checkpoint_format(str(tmp_path / "weights"))
-
-        assert model_save_format == "safetensors"
-        assert is_peft is False
-
-    def test_detect_torch_save_format_distcp(self, tmp_path):
-        """Test detection of torch_save format with .distcp files."""
-        # Create a checkpoint directory with .distcp files
-        model_dir = tmp_path / "weights" / "model"
-        model_dir.mkdir(parents=True)
-        (model_dir / "checkpoint.distcp").touch()
-
-        model_save_format, is_peft = detect_checkpoint_format(str(tmp_path / "weights"))
-
-        assert model_save_format == "torch_save"
-        assert is_peft is False
-
-    def test_detect_torch_save_format_bin(self, tmp_path):
-        """Test detection of torch_save format with .bin files."""
-        # Create a checkpoint directory with .bin files
-        model_dir = tmp_path / "weights" / "model"
-        model_dir.mkdir(parents=True)
-        (model_dir / "pytorch_model.bin").touch()
-
-        model_save_format, is_peft = detect_checkpoint_format(str(tmp_path / "weights"))
-
-        assert model_save_format == "torch_save"
-        assert is_peft is False
-
-    def test_detect_torch_save_format_pt(self, tmp_path):
-        """Test detection of torch_save format with .pt files."""
-        # Create a checkpoint directory with .pt files
-        model_dir = tmp_path / "weights" / "model"
-        model_dir.mkdir(parents=True)
-        (model_dir / "model.pt").touch()
-
-        model_save_format, is_peft = detect_checkpoint_format(str(tmp_path / "weights"))
-
-        assert model_save_format == "torch_save"
-        assert is_peft is False
-
-    def test_detect_peft_adapter(self, tmp_path):
-        """Test detection of PEFT adapter files."""
-        # Create a checkpoint directory with adapter files
-        model_dir = tmp_path / "weights" / "model"
-        model_dir.mkdir(parents=True)
-        (model_dir / "adapter_model.safetensors").touch()
-
-        model_save_format, is_peft = detect_checkpoint_format(str(tmp_path / "weights"))
-
-        assert model_save_format == "safetensors"
-        assert is_peft is True
-
-    def test_detect_peft_adapter_config(self, tmp_path):
-        """Test detection of PEFT adapter config files."""
-        # Create a checkpoint directory with adapter config
-        model_dir = tmp_path / "weights" / "model"
-        model_dir.mkdir(parents=True)
-        (model_dir / "adapter_config.json").touch()
-        (model_dir / "model.safetensors").touch()
-
-        model_save_format, is_peft = detect_checkpoint_format(str(tmp_path / "weights"))
-
-        assert model_save_format == "safetensors"
-        assert is_peft is True
-
-    def test_detect_empty_directory(self, tmp_path):
-        """Test detection with empty directory."""
-        # Create an empty checkpoint directory
-        model_dir = tmp_path / "weights"
-        model_dir.mkdir(parents=True)
-
-        model_save_format, is_peft = detect_checkpoint_format(str(model_dir))
-
-        # Default to safetensors when no files found
-        assert model_save_format == "safetensors"
-        assert is_peft is False
-
-    def test_detect_nonexistent_directory(self, tmp_path):
-        """A missing checkpoint must fail instead of guessing a format."""
-        nonexistent_path = str(tmp_path / "nonexistent")
-
-        with pytest.raises(FileNotFoundError, match="Checkpoint path does not exist"):
-            detect_checkpoint_format(nonexistent_path)
-
-    def test_detect_nested_safetensors(self, tmp_path):
-        """Test detection of safetensors in nested directories."""
-        # Create nested structure
-        nested_dir = tmp_path / "weights" / "model" / "rank_0"
-        nested_dir.mkdir(parents=True)
-        (nested_dir / "model-00001-of-00002.safetensors").touch()
-
-        model_save_format, is_peft = detect_checkpoint_format(str(tmp_path / "weights"))
-
-        assert model_save_format == "safetensors"
-        assert is_peft is False
-
-
-@pytest.mark.automodel
-class TestInferCheckpointRoot:
-    """Tests for _infer_checkpoint_root function."""
-
-    def test_infer_root_from_weights_model_path(self):
-        """Test inferring root from path ending with weights/model."""
-        weights_path = "/path/to/checkpoint/weights/model"
-
-        result = _infer_checkpoint_root(weights_path)
-
-        assert result == "/path/to/checkpoint"
-
-    def test_infer_root_from_weights_path(self):
-        """Test inferring root from path ending with weights."""
-        weights_path = "/path/to/checkpoint/weights"
-
-        result = _infer_checkpoint_root(weights_path)
-
-        assert result == "/path/to/checkpoint"
-
-    def test_infer_root_from_other_path(self):
-        """Test inferring root from path not ending with weights."""
-        weights_path = "/path/to/checkpoint/custom_dir"
-
-        result = _infer_checkpoint_root(weights_path)
-
-        # Should return parent directory
-        assert result == "/path/to/checkpoint"
-
-    def test_infer_root_with_trailing_slash(self):
-        """Test inferring root with trailing slash in path."""
-        weights_path = "/path/to/checkpoint/weights/"
-
-        result = _infer_checkpoint_root(weights_path)
-
-        # dirname of "/path/to/checkpoint/weights/" is "/path/to/checkpoint/weights"
-        # which ends with "weights", so parent is returned
-        assert result == "/path/to/checkpoint"
-
-    def test_infer_root_relative_path(self):
-        """Test inferring root from relative path."""
-        weights_path = "checkpoint/weights/model"
-
-        result = _infer_checkpoint_root(weights_path)
-
-        assert result == "checkpoint"
-
-    def test_infer_root_single_level(self):
-        """Test inferring root from single level path."""
-        weights_path = "weights/model"
-
-        result = _infer_checkpoint_root(weights_path)
-
-        assert result == ""
-
-
 @pytest.mark.automodel
 class TestAutomodelCheckpointManager:
     """Tests for AutomodelCheckpointManager class.
@@ -492,7 +280,6 @@ class TestAutomodelCheckpointManager:
         )
 
         assert manager.checkpointer is None
-        assert manager.checkpoint_config is None
         assert manager.dp_mesh is mock_dp_mesh
         assert manager.tp_mesh is mock_tp_mesh
 
@@ -585,33 +372,6 @@ class TestAutomodelCheckpointManager:
             manager.save_checkpoint(
                 model=mock_model,
                 weights_path="/path/to/weights",
-                checkpointing_cfg={"enabled": True},
-                is_final_checkpoint=False,
-            )
-
-    @patch("torch.distributed.get_rank")
-    def test_save_checkpoint_without_config_raises(self, mock_get_rank, mock_meshes):
-        """Test that save_checkpoint raises error without checkpointing config."""
-        from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
-
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-
-        # Set up a mock checkpointer so we get past the first assertion
-        manager.checkpointer = MagicMock()
-
-        mock_model = MagicMock()
-
-        with pytest.raises(ValueError, match="checkpointing_cfg must be provided"):
-            manager.save_checkpoint(
-                model=mock_model,
-                weights_path="/path/to/weights",
-                checkpointing_cfg=None,
                 is_final_checkpoint=False,
             )
 
@@ -638,77 +398,25 @@ class TestAutomodelCheckpointManager:
                 weights_path="/path/to/weights",
             )
 
-    def test_load_uses_rank_zero_checkpoint_detection(self, mock_meshes):
-        """Every rank consumes the same rank-0 filesystem detection result."""
+    def test_load_delegates_checkpoint_format_detection_to_automodel(self, mock_meshes):
+        """Resume loading does not scan files or mutate the save configuration."""
         mock_dp_mesh, mock_tp_mesh = mock_meshes
         manager = AutomodelCheckpointManager(
             dp_mesh=mock_dp_mesh,
             tp_mesh=mock_tp_mesh,
         )
         manager.checkpointer = MagicMock()
-        manager.update_checkpointer_config = MagicMock()
+        model = MagicMock()
 
-        def broadcast_rank_zero_result(payload, *, src):
-            assert src == 0
-            payload[0] = ("torch_save", True, None)
-
-        with (
-            patch("torch.distributed.is_initialized", return_value=True),
-            patch("torch.distributed.get_world_size", return_value=2),
-            patch("torch.distributed.get_rank", return_value=1),
-            patch(
-                "torch.distributed.broadcast_object_list",
-                side_effect=broadcast_rank_zero_result,
-            ) as mock_broadcast,
-            patch(
-                "nemo_rl.models.automodel.checkpoint.detect_checkpoint_format"
-            ) as mock_detect,
-        ):
-            manager.load_checkpoint(
-                model=MagicMock(),
-                weights_path="/checkpoint/weights",
-            )
-
-        mock_detect.assert_not_called()
-        mock_broadcast.assert_called_once()
-        manager.update_checkpointer_config.assert_called_once_with(
-            config_updates={
-                "model_save_format": "torch_save",
-                "is_peft": True,
-                "dequantize_base_checkpoint": False,
-            },
-            checkpoint_root="/checkpoint",
+        manager.load_checkpoint(
+            model=model,
+            weights_path="/checkpoint/weights",
         )
 
-    def test_load_broadcasts_rank_zero_detection_error(self, mock_meshes):
-        """A rank-0 filesystem error makes every rank fail before rebuilding."""
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
+        manager.checkpointer.load_model.assert_called_once_with(
+            model=model,
+            model_path="/checkpoint/weights/model",
         )
-        manager.checkpointer = MagicMock()
-        manager.update_checkpointer_config = MagicMock()
-
-        with (
-            patch("torch.distributed.is_initialized", return_value=True),
-            patch("torch.distributed.get_world_size", return_value=2),
-            patch("torch.distributed.get_rank", return_value=0),
-            patch("torch.distributed.broadcast_object_list") as mock_broadcast,
-            patch(
-                "nemo_rl.models.automodel.checkpoint.detect_checkpoint_format",
-                side_effect=PermissionError("metadata not visible"),
-            ),
-            pytest.raises(RuntimeError, match="Rank 0 failed to detect"),
-        ):
-            manager.load_checkpoint(
-                model=MagicMock(),
-                weights_path="/checkpoint/weights",
-            )
-
-        mock_broadcast.assert_called_once()
-        manager.update_checkpointer_config.assert_not_called()
-        manager.checkpointer.load_model.assert_not_called()
 
     @patch("torch.distributed.get_rank")
     def test_init_checkpointer_creates_checkpointer(self, mock_get_rank, mock_meshes):
@@ -733,12 +441,7 @@ class TestAutomodelCheckpointManager:
             mock_checkpointer_cls.return_value = mock_checkpointer
 
             manager.init_checkpointer(
-                config_updates={
-                    "cpu_offload": True,
-                    "model_repo_id": "test-model",
-                    "staging_dir": "/local/checkpoint-staging",
-                    "v4_compatible": True,
-                },
+                config_updates={"model_repo_id": "test-model"},
                 checkpoint_root="/path/to/checkpoints",
             )
 
@@ -746,9 +449,6 @@ class TestAutomodelCheckpointManager:
             mock_checkpointer_cls.assert_called_once()
             automodel_config = mock_checkpointer_cls.call_args.kwargs["config"]
             assert automodel_config.save_consolidated == SaveConsolidatedMode.FINAL
-            assert automodel_config.cpu_offload is True
-            assert automodel_config.staging_dir == "/local/checkpoint-staging"
-            assert automodel_config.v4_compatible is True
 
     @patch("torch.distributed.get_rank")
     def test_init_checkpointer_does_nothing_if_exists(self, mock_get_rank, mock_meshes):
@@ -778,328 +478,6 @@ class TestAutomodelCheckpointManager:
             # Should not have created a new checkpointer
             mock_checkpointer_cls.assert_not_called()
             assert manager.checkpointer is existing_checkpointer
-
-    @patch("torch.distributed.get_rank")
-    @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
-    def test_update_checkpointer_config_updates_mutable_config_in_place(
-        self, mock_checkpointer_cls, mock_get_rank, mock_meshes
-    ):
-        """Mutable settings preserve the Checkpointer and its config references."""
-        from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
-
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-
-        mock_checkpointer = MagicMock()
-
-        def build_checkpointer(*, config, **_kwargs):
-            mock_checkpointer.config = config
-            mock_checkpointer.lifecycle.config = config
-            return mock_checkpointer
-
-        mock_checkpointer_cls.side_effect = build_checkpointer
-        manager.init_checkpointer()
-        original_config = mock_checkpointer.config
-
-        manager.update_checkpointer_config(
-            config_updates={"model_repo_id": "updated-model"},
-            checkpoint_root="/new/path",
-        )
-
-        assert manager.checkpointer is mock_checkpointer
-        assert mock_checkpointer.config is original_config
-        assert mock_checkpointer.lifecycle.config is original_config
-        assert mock_checkpointer.config.checkpoint_dir == "/new/path"
-        assert mock_checkpointer.lifecycle.config.checkpoint_dir == "/new/path"
-        assert mock_checkpointer.config.model_repo_id == "updated-model"
-        mock_checkpointer.close.assert_not_called()
-        mock_checkpointer_cls.assert_called_once()
-
-    @patch("torch.distributed.get_rank")
-    @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
-    def test_checkpoint_dir_only_update_skips_config_revalidation(
-        self, mock_checkpointer_cls, mock_get_rank, mock_meshes
-    ):
-        """Per-step path updates do not rerun Automodel ``__post_init__``."""
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-        checkpointer = MagicMock()
-
-        def build_checkpointer(*, config, **_kwargs):
-            checkpointer.config = config
-            checkpointer.lifecycle.config = config
-            return checkpointer
-
-        mock_checkpointer_cls.side_effect = build_checkpointer
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-        manager.init_checkpointer(
-            config_updates={"save_consolidated": "final"},
-            checkpoint_root="/old/path",
-        )
-
-        with patch("nemo_rl.models.automodel.checkpoint.replace") as mock_replace:
-            manager.update_checkpointer_config(
-                config_updates={
-                    "model_save_format": "safetensors",
-                    "save_consolidated": "final",
-                },
-                checkpoint_root="/new/path",
-            )
-
-        mock_replace.assert_not_called()
-        assert checkpointer.config.checkpoint_dir == "/new/path"
-        assert checkpointer.lifecycle.config.checkpoint_dir == "/new/path"
-        checkpointer.close.assert_not_called()
-
-    @patch("torch.distributed.get_rank")
-    @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
-    def test_update_rebuilds_checkpointer_for_consolidation_resources(
-        self, mock_checkpointer_cls, mock_get_rank, mock_meshes
-    ):
-        """Construction-time consolidation settings require a new Checkpointer."""
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-        built_checkpointers = []
-
-        def build_checkpointer(*, config, **_kwargs):
-            checkpointer = MagicMock()
-            checkpointer.config = config
-            built_checkpointers.append(checkpointer)
-            return checkpointer
-
-        mock_checkpointer_cls.side_effect = build_checkpointer
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-        manager.init_checkpointer(
-            config_updates={"is_async": True, "save_consolidated": "false"}
-        )
-        original_checkpointer = manager.checkpointer
-
-        manager.update_checkpointer_config(
-            config_updates={
-                "save_consolidated": "every",
-                "consolidation_timeout_minutes": 5,
-            }
-        )
-
-        assert len(built_checkpointers) == 2
-        assert original_checkpointer is not None
-        original_checkpointer.close.assert_called_once_with()
-        assert manager.checkpointer is built_checkpointers[1]
-        assert (
-            manager.checkpointer.config.save_consolidated == SaveConsolidatedMode.EVERY
-        )
-        assert manager.checkpointer.config.is_async is True
-        assert manager.checkpointer.config.consolidation_timeout_minutes == 5
-
-    @patch("torch.distributed.get_rank")
-    @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
-    def test_final_mode_rebuilds_checkpointer(
-        self, mock_checkpointer_cls, mock_get_rank, mock_meshes
-    ):
-        """The canonical final mode reaches the Automodel Checkpointer."""
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-        built_checkpointers = []
-
-        def build_checkpointer(*, config, **_kwargs):
-            checkpointer = MagicMock()
-            checkpointer.config = config
-            built_checkpointers.append(checkpointer)
-            return checkpointer
-
-        mock_checkpointer_cls.side_effect = build_checkpointer
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-        manager.init_checkpointer(config_updates={"save_consolidated": "false"})
-
-        manager.update_checkpointer_config(
-            config_updates={"save_consolidated": "final"}
-        )
-
-        assert len(built_checkpointers) == 2
-        assert (
-            manager.checkpointer.config.save_consolidated == SaveConsolidatedMode.FINAL
-        )
-
-    @patch("torch.distributed.get_rank")
-    @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
-    def test_final_to_every_rebuilds_conservatively(
-        self, mock_checkpointer_cls, mock_get_rank, mock_meshes
-    ):
-        """Non-whitelisted changes rebuild even when current upstream is safe."""
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-        built_checkpointers = []
-
-        def build_checkpointer(*, config, **_kwargs):
-            checkpointer = MagicMock()
-            checkpointer.config = config
-            checkpointer.lifecycle.config = config
-            built_checkpointers.append(checkpointer)
-            return checkpointer
-
-        mock_checkpointer_cls.side_effect = build_checkpointer
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-        manager.init_checkpointer(config_updates={"save_consolidated": "final"})
-
-        manager.update_checkpointer_config(
-            config_updates={"save_consolidated": "every"}
-        )
-
-        assert len(built_checkpointers) == 2
-        built_checkpointers[0].close.assert_called_once_with()
-        assert manager.checkpointer is built_checkpointers[1]
-        assert (
-            manager.checkpointer.config.save_consolidated == SaveConsolidatedMode.EVERY
-        )
-
-    @patch("torch.distributed.get_rank")
-    @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
-    def test_rebuild_failure_preserves_existing_checkpointer(
-        self, mock_checkpointer_cls, mock_get_rank, mock_meshes
-    ):
-        """A replacement construction failure leaves the old instance usable."""
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-        original_checkpointer = MagicMock()
-        mock_checkpointer_cls.side_effect = [
-            original_checkpointer,
-            RuntimeError("replacement construction failed"),
-        ]
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-        manager.init_checkpointer(config_updates={"save_consolidated": "false"})
-
-        with pytest.raises(RuntimeError, match="replacement construction failed"):
-            manager.update_checkpointer_config(
-                config_updates={"save_consolidated": "every"}
-            )
-
-        assert manager.checkpointer is original_checkpointer
-        original_checkpointer.close.assert_not_called()
-
-    @patch("torch.distributed.get_rank")
-    @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
-    def test_close_failure_keeps_replacement_checkpointer(
-        self, mock_checkpointer_cls, mock_get_rank, mock_meshes, caplog
-    ):
-        """A cleanup error never closes or discards the new process groups."""
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-        built_checkpointers = []
-
-        def build_checkpointer(*, config, **_kwargs):
-            checkpointer = MagicMock()
-            checkpointer.config = config
-            built_checkpointers.append(checkpointer)
-            return checkpointer
-
-        mock_checkpointer_cls.side_effect = build_checkpointer
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-        manager.init_checkpointer(config_updates={"save_consolidated": "false"})
-        built_checkpointers[0].close.side_effect = RuntimeError("close failed")
-
-        with caplog.at_level("ERROR"):
-            manager.update_checkpointer_config(
-                config_updates={"save_consolidated": "every"}
-            )
-
-        assert manager.checkpointer is built_checkpointers[1]
-        assert manager.checkpoint_config is built_checkpointers[1].config
-        built_checkpointers[1].close.assert_not_called()
-        assert "Failed to close the replaced Automodel Checkpointer" in caplog.text
-
-    @patch("torch.distributed.get_rank")
-    @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
-    def test_invalid_resource_update_preserves_existing_checkpointer(
-        self, mock_checkpointer_cls, mock_get_rank, mock_meshes
-    ):
-        """Validate replacement config before closing the working Checkpointer."""
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-        original_checkpointer = MagicMock()
-
-        def build_checkpointer(*, config, **_kwargs):
-            original_checkpointer.config = config
-            return original_checkpointer
-
-        mock_checkpointer_cls.side_effect = build_checkpointer
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-        manager.init_checkpointer()
-
-        with pytest.raises(
-            ValueError,
-            match="consolidation_timeout_minutes must be greater than 0",
-        ):
-            manager.update_checkpointer_config(
-                config_updates={"consolidation_timeout_minutes": 0}
-            )
-
-        assert manager.checkpointer is original_checkpointer
-        original_checkpointer.close.assert_not_called()
-
-    @patch("torch.distributed.get_rank")
-    def test_update_checkpointer_config_does_nothing_if_no_checkpointer(
-        self, mock_get_rank, mock_meshes
-    ):
-        """Test that update_checkpointer_config does nothing without checkpointer."""
-        from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
-
-        mock_get_rank.return_value = 0
-        mock_dp_mesh, mock_tp_mesh = mock_meshes
-
-        manager = AutomodelCheckpointManager(
-            dp_mesh=mock_dp_mesh,
-            tp_mesh=mock_tp_mesh,
-        )
-
-        # Should not raise any error
-        manager.update_checkpointer_config(
-            config_updates={"is_peft": True},
-            checkpoint_root="/new/path",
-        )
-
-        assert manager.checkpointer is None
-
-
-@pytest.mark.automodel
-def test_save_consolidated_rebuilds_group_on_every_rank():
-    """Late consolidated-save enablement creates a usable Gloo group on all ranks."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-
-    with patch.dict(os.environ, {"GLOO_SOCKET_IFNAME": "lo"}):
-        mp.spawn(
-            _run_consolidated_group_rebuild,
-            args=(2, port),
-            nprocs=2,
-            join=True,
-        )
 
 
 @pytest.mark.automodel
@@ -1134,17 +512,15 @@ class TestSaveCheckpointFunctional:
             dp_mesh=mock_dp_mesh,
             tp_mesh=mock_tp_mesh,
         )
-        manager.init_checkpointer()
+        manager.init_checkpointer(config_updates={"is_peft": True})
+        mock_checkpointer.config = mock_checkpointer_cls.call_args.kwargs["config"]
 
         with TemporaryDirectory() as tmp_dir:
             weights_path = os.path.join(tmp_dir, "weights")
             manager.save_checkpoint(
                 model=mock_model,
                 weights_path=weights_path,
-                checkpointing_cfg={
-                    "enabled": True,
-                    "peft_config": peft_config,
-                },
+                peft_config=peft_config,
                 is_final_checkpoint=True,
             )
 
@@ -1173,6 +549,7 @@ class TestSaveCheckpointFunctional:
             tp_mesh=mock_tp_mesh,
         )
         manager.init_checkpointer()
+        mock_checkpointer.config = mock_checkpointer_cls.call_args.kwargs["config"]
 
         with TemporaryDirectory() as tmp_dir:
             weights_path = os.path.join(tmp_dir, "weights")
@@ -1181,11 +558,6 @@ class TestSaveCheckpointFunctional:
             manager.save_checkpoint(
                 model=mock_model,
                 weights_path=weights_path,
-                checkpointing_cfg={
-                    "enabled": True,
-                    "model_save_format": "safetensors",
-                    "is_peft": False,
-                },
                 is_final_checkpoint=False,
             )
 
@@ -1197,10 +569,10 @@ class TestSaveCheckpointFunctional:
 
     @patch("torch.distributed.get_rank")
     @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
-    def test_save_forwards_consolidation_resource_config(
-        self, mock_checkpointer_cls, mock_get_rank, mock_meshes, mock_model
+    def test_init_configures_consolidation_resources(
+        self, mock_checkpointer_cls, mock_get_rank, mock_meshes
     ):
-        """Save-time Automodel resource settings reach the rebuilt Checkpointer."""
+        """Construction-time resource settings reach the Automodel Checkpointer."""
         mock_get_rank.return_value = 0
         mock_dp_mesh, mock_tp_mesh = mock_meshes
         built_configs = []
@@ -1217,33 +589,26 @@ class TestSaveCheckpointFunctional:
             tp_mesh=mock_tp_mesh,
         )
         manager.init_checkpointer(
-            config_updates={"is_async": True, "save_consolidated": "false"}
+            config_updates={
+                "is_async": True,
+                "save_consolidated": "every",
+                "single_rank_consolidation": True,
+                "consolidation_timeout_minutes": 7,
+            }
         )
 
-        with TemporaryDirectory() as tmp_dir:
-            manager.save_checkpoint(
-                model=mock_model,
-                weights_path=os.path.join(tmp_dir, "weights"),
-                checkpointing_cfg={
-                    "enabled": True,
-                    "save_consolidated": "every",
-                    "single_rank_consolidation": True,
-                    "consolidation_timeout_minutes": 7,
-                },
-                is_final_checkpoint=False,
-            )
-
-        assert len(built_configs) == 2
-        assert built_configs[-1].save_consolidated == SaveConsolidatedMode.EVERY
-        assert built_configs[-1].single_rank_consolidation is True
-        assert built_configs[-1].consolidation_timeout_minutes == 7
+        assert len(built_configs) == 1
+        assert built_configs[0].is_async is True
+        assert built_configs[0].save_consolidated == SaveConsolidatedMode.EVERY
+        assert built_configs[0].single_rank_consolidation is True
+        assert built_configs[0].consolidation_timeout_minutes == 7
 
     @patch("torch.distributed.get_rank")
     @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
     def test_save_reuses_checkpointer_configured_at_setup(
         self, mock_checkpointer_cls, mock_get_rank, mock_meshes, mock_model
     ):
-        """Normal saves only update the checkpoint path after setup configures resources."""
+        """A save does not rebuild or mutate the setup-time configuration."""
         mock_get_rank.return_value = 0
         mock_dp_mesh, mock_tp_mesh = mock_meshes
         built_checkpointers = []
@@ -1274,16 +639,55 @@ class TestSaveCheckpointFunctional:
         original_checkpointer = manager.checkpointer
 
         with TemporaryDirectory() as tmp_dir:
+            weights_path = os.path.join(tmp_dir, "weights")
             manager.save_checkpoint(
                 model=mock_model,
-                weights_path=os.path.join(tmp_dir, "weights"),
-                checkpointing_cfg=checkpointing_cfg,
+                weights_path=weights_path,
                 is_final_checkpoint=False,
             )
 
         assert manager.checkpointer is original_checkpointer
         assert len(built_checkpointers) == 1
+        assert original_checkpointer.config.checkpoint_dir == "/initial/checkpoint/root"
+        assert (
+            original_checkpointer.lifecycle.config.checkpoint_dir
+            == "/initial/checkpoint/root"
+        )
         original_checkpointer.close.assert_not_called()
+
+    @patch("torch.distributed.get_rank")
+    @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
+    def test_save_rejects_local_cloud_storage_transition(
+        self, mock_checkpointer_cls, mock_get_rank, mock_meshes, mock_model
+    ):
+        """A Checkpointer cannot change storage implementations after setup."""
+        mock_get_rank.return_value = 0
+        mock_dp_mesh, mock_tp_mesh = mock_meshes
+        mock_checkpointer = MagicMock()
+
+        def build_checkpointer(*, config, **_kwargs):
+            mock_checkpointer.config = config
+            mock_checkpointer.lifecycle.config = config
+            return mock_checkpointer
+
+        mock_checkpointer_cls.side_effect = build_checkpointer
+        manager = AutomodelCheckpointManager(
+            dp_mesh=mock_dp_mesh,
+            tp_mesh=mock_tp_mesh,
+        )
+        manager.init_checkpointer(checkpoint_root="/local/checkpoints")
+
+        with pytest.raises(
+            ValueError,
+            match="cannot change between local and cloud paths",
+        ):
+            manager.save_checkpoint(
+                model=mock_model,
+                weights_path="msc://bucket/run/weights",
+                is_final_checkpoint=False,
+            )
+
+        mock_checkpointer.save_model.assert_not_called()
 
     @patch("torch.distributed.get_rank")
     @patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
@@ -1307,6 +711,7 @@ class TestSaveCheckpointFunctional:
             tp_mesh=mock_tp_mesh,
         )
         manager.init_checkpointer()
+        mock_checkpointer.config = mock_checkpointer_cls.call_args.kwargs["config"]
 
         with TemporaryDirectory() as tmp_dir:
             weights_path = os.path.join(tmp_dir, "model", "weights")
@@ -1318,11 +723,6 @@ class TestSaveCheckpointFunctional:
                 weights_path=weights_path,
                 optimizer=mock_optimizer,
                 optimizer_path=optimizer_path,
-                checkpointing_cfg={
-                    "enabled": True,
-                    "model_save_format": "safetensors",
-                    "is_peft": True,
-                },
                 is_final_checkpoint=False,
             )
 
@@ -1347,6 +747,7 @@ class TestSaveCheckpointFunctional:
             tp_mesh=mock_tp_mesh,
         )
         manager.init_checkpointer()
+        mock_checkpointer.config = mock_checkpointer_cls.call_args.kwargs["config"]
 
         with TemporaryDirectory() as tmp_dir:
             weights_path = os.path.join(tmp_dir, "model", "weights")
@@ -1362,7 +763,6 @@ class TestSaveCheckpointFunctional:
                 weights_path=weights_path,
                 tokenizer=mock_tokenizer,
                 tokenizer_path=tokenizer_path,
-                checkpointing_cfg={"enabled": True},
                 is_final_checkpoint=False,
             )
 
@@ -1401,6 +801,7 @@ class TestSaveCheckpointFunctional:
             tp_mesh=mock_tp_mesh,
         )
         manager.init_checkpointer()
+        mock_checkpointer.config = mock_checkpointer_cls.call_args.kwargs["config"]
 
         with TemporaryDirectory() as tmp_dir:
             weights_path = os.path.join(tmp_dir, "model", "weights")
@@ -1414,7 +815,6 @@ class TestSaveCheckpointFunctional:
                 weights_path=weights_path,
                 tokenizer=mock_tokenizer,
                 tokenizer_path=tokenizer_path,
-                checkpointing_cfg={"enabled": True},
                 is_final_checkpoint=False,
             )
 
@@ -1456,10 +856,6 @@ class TestSaveLoadIntegration:
             checkpoint_manager.save_checkpoint(
                 model=test_model,
                 weights_path=weights_path,
-                checkpointing_cfg={
-                    "enabled": True,
-                    "model_save_format": "safetensors",
-                },
                 is_final_checkpoint=False,
             )
 
@@ -1492,16 +888,6 @@ class TestSaveLoadIntegration:
             mesh = torch.distributed.device_mesh.init_device_mesh(
                 "cpu", (1,), mesh_dim_names=("dp",)
             )
-            checkpoint_manager = AutomodelCheckpointManager(
-                dp_mesh=mesh,
-                tp_mesh=mesh,
-            )
-            checkpoint_manager.init_checkpointer(
-                config_updates={
-                    "model_save_format": "safetensors",
-                    "save_consolidated": "final",
-                }
-            )
             cases = [
                 ("false", False, False),
                 ("false", True, False),
@@ -1514,15 +900,20 @@ class TestSaveLoadIntegration:
             for index, (mode, is_final_checkpoint, should_consolidate) in enumerate(
                 cases
             ):
+                checkpoint_manager = AutomodelCheckpointManager(
+                    dp_mesh=mesh,
+                    tp_mesh=mesh,
+                )
+                checkpoint_manager.init_checkpointer(
+                    config_updates={
+                        "model_save_format": "safetensors",
+                        "save_consolidated": mode,
+                    }
+                )
                 weights_path = os.path.join(tmp_dir, f"case_{index}")
                 checkpoint_manager.save_checkpoint(
                     model=test_model,
                     weights_path=weights_path,
-                    checkpointing_cfg={
-                        "enabled": True,
-                        "model_save_format": "safetensors",
-                        "save_consolidated": mode,
-                    },
                     is_final_checkpoint=is_final_checkpoint,
                 )
                 consolidated_path = os.path.join(weights_path, "model", "consolidated")
@@ -1559,10 +950,6 @@ class TestSaveLoadIntegration:
             checkpoint_manager.save_checkpoint(
                 model=test_model,
                 weights_path=weights_path,
-                checkpointing_cfg={
-                    "enabled": True,
-                    "model_save_format": "torch_save",
-                },
                 is_final_checkpoint=False,
             )
 
@@ -1630,7 +1017,6 @@ class TestSaveLoadIntegration:
                 optimizer=optimizer,
                 scheduler=scheduler,
                 optimizer_path=optimizer_path,
-                checkpointing_cfg={"enabled": True},
                 is_final_checkpoint=False,
             )
 
@@ -1724,13 +1110,7 @@ class TestSaveLoadIntegration:
             checkpoint_manager.save_checkpoint(
                 model=test_model,
                 weights_path=weights_path,
-                checkpointing_cfg={
-                    "enabled": True,
-                    "model_save_format": "safetensors",
-                    "is_peft": True,
-                },
                 is_final_checkpoint=False,
-                lora_enabled=True,
                 peft_config=lora_config,
             )
 
