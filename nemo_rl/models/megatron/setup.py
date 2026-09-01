@@ -2355,6 +2355,113 @@ def setup_reference_model_state(
     return reference_state_dict
 
 
+def load_teacher_output_layer_weight(
+    *,
+    teacher_pretrained_path: str,
+    local_vocab_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Load this rank's shard of a teacher checkpoint's LM-head weight.
+
+    Full-vocabulary MOPD ships the teacher's hidden states and projects them on
+    the student side, which needs the teacher's ``output_layer.weight``. Only
+    that one tensor is read: instantiating a second Megatron model just to reach
+    it is far more fragile, since provider and config objects accumulate
+    runtime-only distributed state during live training.
+
+    The request is built at the **student's** tensor-parallel rank and size with
+    ``allow_shape_mismatch=True``, which is what lets a teacher sharded over a
+    different tensor-parallel width be re-sharded onto the student's layout.
+
+    Args:
+        teacher_pretrained_path: Megatron checkpoint root of the teacher.
+        local_vocab_size: This rank's vocabulary shard width.
+        dtype: Dtype to materialize the shard in.
+
+    Returns:
+        The ``[local_vocab_size, hidden_size]`` weight shard on CPU.
+
+    Raises:
+        FileNotFoundError: If the checkpoint root holds no readable iteration.
+        KeyError: If neither an output-layer nor a tied-embedding weight exists.
+        ValueError: If the checkpoint tensor is not a rank-2 matrix.
+    """
+    from megatron.core import dist_checkpointing
+    from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+    from megatron.bridge.training.utils.checkpoint_utils import (
+        get_checkpoint_name,
+        get_checkpoint_train_state_filename,
+        read_train_state,
+    )
+
+    if not checkpoint_exists(teacher_pretrained_path):
+        raise FileNotFoundError(
+            "opd_full needs the teacher LM head, but no Megatron checkpoint is "
+            f"readable at {teacher_pretrained_path!r}."
+        )
+    # validate_model_paths returns a checkpoint root on the HF-cache path but an
+    # already-resolved iteration directory for an explicit pretrained_checkpoint,
+    # and checkpoint_exists accepts both. Detect which one this is instead of
+    # assuming a root and failing on a missing tracker file.
+    if os.path.exists(os.path.join(teacher_pretrained_path, "metadata.json")):
+        checkpoint_dir = teacher_pretrained_path
+    else:
+        train_state_filename = get_checkpoint_train_state_filename(
+            teacher_pretrained_path, prefix="latest"
+        )
+        train_state = read_train_state(train_state_filename)
+        checkpoint_dir = get_checkpoint_name(
+            teacher_pretrained_path, train_state.step, release=False
+        )
+
+    tensor_metadata = dist_checkpointing.load_tensors_metadata(checkpoint_dir)
+    if "output_layer.weight" in tensor_metadata:
+        checkpoint_key = "output_layer.weight"
+    elif "embedding.word_embeddings.weight" in tensor_metadata:
+        # Tied embedding/output checkpoints store the LM head under the
+        # embedding tensor's checkpoint key.
+        checkpoint_key = "embedding.word_embeddings.weight"
+    else:
+        available_keys = sorted(tensor_metadata)
+        raise KeyError(
+            "Could not find a teacher LM-head tensor in "
+            f"{checkpoint_dir!r}. Expected 'output_layer.weight' or "
+            "'embedding.word_embeddings.weight'; got "
+            f"{len(available_keys)} keys, first few: {available_keys[:8]}."
+        )
+
+    global_shape = tuple(tensor_metadata[checkpoint_key].global_shape)
+    if len(global_shape) != 2:
+        raise ValueError(
+            f"Teacher LM-head tensor {checkpoint_key!r} must be rank 2, got "
+            f"global shape {global_shape}."
+        )
+    teacher_hidden_size = int(global_shape[1])
+
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    weight_template = torch.empty(
+        (int(local_vocab_size), teacher_hidden_size), dtype=dtype, device="cpu"
+    )
+    sharded_template = make_tp_sharded_tensor_for_checkpoint(
+        weight_template,
+        key=checkpoint_key,
+        allow_shape_mismatch=True,
+        tp_group=pg_collection.tp,
+        dp_cp_group=pg_collection.dp_cp,
+    )
+    loaded = dist_checkpointing.load(
+        {checkpoint_key: sharded_template},
+        checkpoint_dir,
+        validate_access_integrity=False,
+    )[checkpoint_key]
+    if not isinstance(loaded, torch.Tensor):
+        raise TypeError(
+            f"Expected a Tensor for {checkpoint_key!r} from {checkpoint_dir!r}, "
+            f"got {type(loaded).__name__}."
+        )
+    return loaded.detach().to(device="cpu", dtype=dtype, copy=True)
+
+
 def finalize_megatron_setup(
     config: PolicyConfig,
     megatron_cfg: ConfigContainer,

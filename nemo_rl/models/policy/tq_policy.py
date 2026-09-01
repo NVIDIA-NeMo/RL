@@ -44,6 +44,7 @@ from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     LP_SEED_FIELDS,
+    fields_with_optional_opd_full,
     fields_with_optional_routed_experts,
 )
 from nemo_rl.models.policy.lm_policy import Policy
@@ -121,6 +122,12 @@ class TQPolicy(TQDriverMixin, Policy):
         self._router_replay_enabled = bool(
             (self.cfg.get("router_replay") or {}).get("enabled", False)
         )
+        # Full-vocabulary MOPD adds a per-token teacher payload column that the
+        # loss reads. Resolved by the driver in setup; absent means the feature
+        # is off and the column must stay out of every fetch.
+        self._opd_full_field: Optional[str] = (
+            self.cfg.get("on_policy_distillation_full") or {}
+        ).get("payload_field")
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -164,8 +171,11 @@ class TQPolicy(TQDriverMixin, Policy):
         """
         self.dp_client.register_partition(
             partition_id=self.tq_partition_id,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            fields=fields_with_optional_opd_full(
+                fields_with_optional_routed_experts(
+                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                ),
+                field=self._opd_full_field,
             ),
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
@@ -183,8 +193,11 @@ class TQPolicy(TQDriverMixin, Policy):
         """
         self.dp_client.register_partition(
             partition_id=partition_id,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            fields=fields_with_optional_opd_full(
+                fields_with_optional_routed_experts(
+                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                ),
+                field=self._opd_full_field,
             ),
             num_samples=num_samples,
             consumer_tasks=[partition_id],
@@ -335,8 +348,11 @@ class TQPolicy(TQDriverMixin, Policy):
         # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
         train_meta = self._isolated_meta(
             meta,
-            fields=fields_with_optional_routed_experts(
-                train_fields, enabled=self._router_replay_enabled
+            fields=fields_with_optional_opd_full(
+                fields_with_optional_routed_experts(
+                    train_fields, enabled=self._router_replay_enabled
+                ),
+                field=self._opd_full_field,
             ),
             task_name="train",
         )
@@ -464,8 +480,11 @@ class TQPolicy(TQDriverMixin, Policy):
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._isolated_meta(
             meta,
-            fields=fields_with_optional_routed_experts(
-                train_fields, enabled=self._router_replay_enabled
+            fields=fields_with_optional_opd_full(
+                fields_with_optional_routed_experts(
+                    train_fields, enabled=self._router_replay_enabled
+                ),
+                field=self._opd_full_field,
             ),
             task_name="train",
         )

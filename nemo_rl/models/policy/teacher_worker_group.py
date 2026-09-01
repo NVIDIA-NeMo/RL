@@ -236,6 +236,19 @@ class TeacherWorkerGroup:
         self.cfg = cfg
         self._micro_batch_size = teacher_cfg.micro_batch_size
 
+        # Resolved by the driver in setup and carried on the deep-copied policy
+        # config; absent means full-vocabulary MOPD is off for this run.
+        opd_full_cfg = cfg.get("on_policy_distillation_full")
+        self._opd_full_payload: Optional[str] = (
+            opd_full_cfg["teacher_payload"] if opd_full_cfg else None
+        )
+        self._opd_full_payload_dtype: str = (
+            opd_full_cfg["payload_dtype"] if opd_full_cfg else "bfloat16"
+        )
+        self._opd_full_payload_field: Optional[str] = (
+            opd_full_cfg["payload_field"] if opd_full_cfg else None
+        )
+
         # Set up sequence packing / dynamic batching (mirrors lm_policy.py)
         self.use_sequence_packing = cfg["sequence_packing"]["enabled"]
         self.use_dynamic_batches = cfg["dynamic_batching"]["enabled"]
@@ -332,7 +345,12 @@ class TeacherWorkerGroup:
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
-            common_kwargs={"micro_batch_size": self._micro_batch_size},
+            common_kwargs={
+                "micro_batch_size": self._micro_batch_size,
+                "opd_full_payload": self._opd_full_payload,
+                "opd_full_payload_dtype": self._opd_full_payload_dtype,
+                "opd_full_payload_field": self._opd_full_payload_field,
+            },
         )
         self.worker_group.get_all_worker_results(futures)
 

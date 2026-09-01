@@ -46,7 +46,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_model_config, unwrap_model
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
@@ -81,6 +81,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 )
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.megatron.setup import (
+    load_teacher_output_layer_weight,
     build_inference_model,
     finalize_megatron_setup,
     handle_model_import,
@@ -93,6 +94,7 @@ from nemo_rl.models.megatron.setup import (
 from nemo_rl.models.megatron.train import (
     LogprobsPostProcessor,
     LossPostProcessor,
+    TeacherFullPayloadPostProcessor,
     TopkLogitsPostProcessor,
     aggregate_training_statistics,
     megatron_forward_backward,
@@ -102,6 +104,7 @@ from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
+    TeacherFullPayloadOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
     broadcast_hf_buckets_via_distributed_impl,
@@ -693,6 +696,18 @@ class MegatronPolicyWorkerImpl(
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
 
+        # Full-vocabulary MOPD: this rank's teacher LM-head shard, loaded on
+        # demand from the teacher checkpoint (see load_opd_full_teacher_lm_head).
+        # It is a plain tensor rather than a module, so it stays invisible to
+        # checkpoint saving and to HF/vLLM refit conversion.
+        opd_full_cfg = self.cfg.get("on_policy_distillation_full") or {}
+        self._opd_full_enabled = bool(opd_full_cfg)
+        self._opd_full_lm_head_lifecycle: str = opd_full_cfg.get(
+            "teacher_lm_head_lifecycle", "offload"
+        )
+        self._opd_full_teacher_lm_head: Optional[torch.Tensor] = None
+        self._opd_full_teacher_checkpoint_path: Optional[str] = None
+
         self._init_inference_engine_state()
         self._setup_colocated_cuda_graph_managers()
 
@@ -896,6 +911,7 @@ class MegatronPolicyWorkerImpl(
                     num_microbatches=num_microbatches,
                     sampling_params=self.sampling_params,
                     draft_model=self.draft_model,
+                    teacher_output_layer_weight=self._opd_full_teacher_lm_head,
                 )
 
                 rerun_state_machine = get_rerun_state_machine()
@@ -1555,6 +1571,7 @@ class MegatronPolicyWorkerImpl(
             num_microbatches=num_microbatches,
             sampling_params=self.sampling_params,
             draft_model=self.draft_model,
+            teacher_output_layer_weight=self._opd_full_teacher_lm_head,
         )
 
         # Placeholder N=1: loss returns un-normalized sums. ``backward``
@@ -2045,6 +2062,204 @@ class MegatronPolicyWorkerImpl(
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
         return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
+
+    def _resolve_output_layer_owner(self) -> Any:
+        """Return the unwrapped module that owns ``output_layer`` on this rank.
+
+        Raises:
+            AttributeError: If this rank has no output layer. Megatron only builds
+                one on the last pipeline stage, so this is the expected failure
+                when opd_full runs with student pipeline parallelism.
+        """
+        model = unwrap_model(self.model)
+        if hasattr(model, "output_layer"):
+            return model
+        language_model = getattr(model, "language_model", None)
+        if language_model is not None and hasattr(language_model, "output_layer"):
+            return language_model
+        pipeline_size = (
+            parallel_state.get_pipeline_model_parallel_world_size()
+            if torch.distributed.is_initialized()
+            else 1
+        )
+        raise AttributeError(
+            "opd_full requires an output_layer on this rank, but none was found "
+            f"after unwrapping {type(model).__qualname__}. Megatron builds "
+            "output_layer only on the last pipeline stage "
+            f"(pipeline_model_parallel_size={pipeline_size}); the teacher LM head "
+            "cannot be loaded per-stage because the load is a whole-world "
+            "collective. Use pipeline_model_parallel_size=1 or "
+            "on_policy_distillation.full.teacher_payload='logits'."
+        )
+
+    def load_opd_full_teacher_lm_head(self, teacher_pretrained_path: str) -> None:
+        """Load this rank's shard of the teacher LM head for full-vocabulary MOPD.
+
+        Called after the teacher worker groups exist, because the teacher's
+        Megatron checkpoint is only materialized by their HF conversion.
+
+        Args:
+            teacher_pretrained_path: Megatron checkpoint root of the teacher.
+        """
+        owner = self._resolve_output_layer_owner()
+        output_layer = owner.output_layer
+        output_weight = output_layer.weight
+        if output_weight is None:
+            output_weight = owner.shared_embedding_or_output_weight()
+
+        self._opd_full_teacher_checkpoint_path = teacher_pretrained_path
+        teacher_lm_head = load_teacher_output_layer_weight(
+            teacher_pretrained_path=teacher_pretrained_path,
+            local_vocab_size=output_layer.output_size_per_partition,
+            dtype=output_weight.dtype,
+        )
+        self._opd_full_teacher_lm_head = teacher_lm_head
+        if self._opd_full_lm_head_lifecycle == "none":
+            self._move_opd_full_teacher_lm_head("cuda")
+
+    @torch.no_grad()
+    def _move_opd_full_teacher_lm_head(self, device: str) -> None:
+        """Move the cached teacher LM-head shard between CPU and GPU."""
+        if self._opd_full_teacher_lm_head is None:
+            return
+        target_device = torch.device(device)
+        if self._opd_full_teacher_lm_head.device == target_device:
+            return
+        self._opd_full_teacher_lm_head = self._opd_full_teacher_lm_head.to(
+            device=target_device, non_blocking=True
+        )
+
+    def _release_opd_full_teacher_lm_head(self) -> None:
+        """Apply the configured lifecycle policy after a training phase."""
+        if self._opd_full_teacher_lm_head is None:
+            return
+        if self._opd_full_lm_head_lifecycle == "offload":
+            self._move_opd_full_teacher_lm_head("cpu")
+        elif self._opd_full_lm_head_lifecycle == "evict":
+            self._opd_full_teacher_lm_head = None
+
+    def _stage_opd_full_teacher_lm_head_for_training(self) -> None:
+        """Make the teacher LM-head shard resident on GPU for a train step."""
+        if not self._opd_full_enabled:
+            return
+        if (
+            self._opd_full_teacher_lm_head is None
+            and self._opd_full_lm_head_lifecycle == "evict"
+            and self._opd_full_teacher_checkpoint_path is not None
+        ):
+            self.load_opd_full_teacher_lm_head(self._opd_full_teacher_checkpoint_path)
+        self._move_opd_full_teacher_lm_head("cuda")
+
+    @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs_with_full_payload")
+    def get_logprobs_with_full_payload(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        payload: str,
+        payload_dtype: str,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[TeacherFullPayloadOutputSpec]:
+        """Run a teacher forward returning sampled-token logprobs and the full payload.
+
+        Full-vocabulary MOPD needs the teacher's whole next-token distribution.
+        Both outputs come from a single forward: adding a second entrypoint would
+        double the teacher's cost for the same tokens.
+
+        Unlike ``get_logprobs``, the payload is deliberately **not** broadcast off
+        the last pipeline stage -- it is orders of magnitude larger than the
+        scalar logprob column, and the caller writes it back from the stage that
+        already owns it.
+
+        Args:
+            data: Right-padded batch to score.
+            payload: ``"hidden_states"`` or ``"logits"``.
+            payload_dtype: Torch dtype name for the transported payload.
+            micro_batch_size: Overrides the configured logprob batch size.
+
+        Returns:
+            A BatchedDataDict with ``logprobs`` ``[B, S]`` on every rank and
+            ``teacher_full_payload`` ``[B, S, D]`` on the last pipeline stage
+            (``None`` elsewhere).
+        """
+        self.timer.start("get_logprobs_with_full_payload")
+        no_grad = torch.no_grad()
+        no_grad.__enter__()
+        logprob_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+
+        self.model.eval()
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
+
+        (
+            mb_iterator,
+            num_microbatches,
+            micro_batch_size,
+            seq_length,
+            padded_seq_length,
+        ) = get_microbatch_iterator(
+            data,
+            self.cfg,
+            logprob_batch_size,
+            straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+        )
+
+        list_of_outputs = megatron_forward_backward(
+            model=self.model,
+            data_iterator=mb_iterator,
+            seq_length=padded_seq_length,
+            mbs=micro_batch_size,
+            num_microbatches=num_microbatches,
+            post_processing_fn=TeacherFullPayloadPostProcessor(
+                cfg=self.cfg,
+                payload=payload,
+                payload_dtype=getattr(torch, payload_dtype),
+                sampling_params=self.sampling_params,
+            ),
+            forward_only=True,
+            defer_fp32_logits=self.defer_fp32_logits,
+            sampling_params=self.sampling_params,
+            straggler_timer=self.mcore_state.straggler_timer,
+            enable_opd_full_capture=(payload == "hidden_states"),
+        )
+
+        teacher_full_payload = None
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            padded_logprobs = []
+            padded_payloads = []
+            for microbatch_output in list_of_outputs:
+                logprobs_mb = microbatch_output["logprobs"]
+                payload_mb = microbatch_output["teacher_full_payload"]
+                padding_needed = seq_length - logprobs_mb.shape[1]
+                if padding_needed > 0:
+                    logprobs_mb = torch.nn.functional.pad(
+                        logprobs_mb, (0, padding_needed), mode="constant", value=0.0
+                    )
+                    payload_mb = torch.nn.functional.pad(
+                        payload_mb,
+                        (0, 0, 0, padding_needed),
+                        mode="constant",
+                        value=0.0,
+                    )
+                padded_logprobs.append(logprobs_mb)
+                padded_payloads.append(payload_mb)
+            tensors = {"logprobs": torch.cat(padded_logprobs, dim=0)}
+            teacher_full_payload = torch.cat(padded_payloads, dim=0).to("cpu")
+        else:
+            tensors = {"logprobs": None}
+        logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
+
+        no_grad.__exit__(None, None, None)
+        self.timer.stop("get_logprobs_with_full_payload")
+        return BatchedDataDict[TeacherFullPayloadOutputSpec](
+            logprobs=logprobs.to("cpu"),
+            teacher_full_payload=teacher_full_payload,
+        )
 
     def _apply_state_dict_to_model(
         self,
@@ -3403,6 +3618,10 @@ class MegatronPolicyWorkerImpl(
         ):
             self.move_optimizer("cpu")
 
+        # No teacher projection happens during logprob inference, so the head can
+        # follow the configured offload policy here too.
+        self._release_opd_full_teacher_lm_head()
+
         gc.collect()
         torch.cuda.empty_cache()
         self._log_gpu_mem("lp_prep_exit")
@@ -3436,6 +3655,10 @@ class MegatronPolicyWorkerImpl(
             self.model, "cuda", move_grads=True, move_params=True
         )
         self.model.train()
+
+        # The opd_full teacher LM head follows the model: the loss projects the
+        # teacher payload with it on every microbatch.
+        self._stage_opd_full_teacher_lm_head_for_training()
 
         # Training expects optimizer state on CUDA. Keep this unconditional rather
         # than trying to mirror every path that may have offloaded it to CPU.
@@ -3493,6 +3716,7 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
         """Offload the optimizer and buffers to the CPU."""
+        self._release_opd_full_teacher_lm_head()
         # An in-flight async checkpoint keeps references to the CUDA tensors in
         # its sharded state dict until the write is finalized. Offloading swaps
         # those tensors for CPU storage, so the checkpoint references would keep

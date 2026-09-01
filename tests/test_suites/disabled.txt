@@ -62,3 +62,16 @@ tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-a
 tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym-quick.sh
 tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-async-gym-quick.sh
 tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-colocated-reshard-async-gym-quick.sh
+
+# Full-vocabulary MOPD (on_policy_distillation.full): the exact reverse KL over
+# the whole vocabulary instead of the top-k sampled-token gap. Same Qwen3-1.7B
+# self-distillation as its two nightly siblings, so the divergence must sit at
+# ~0, and it additionally asserts the reverse KL matches its entropy /
+# cross-entropy decomposition -- the check that catches a bad teacher
+# hidden-state gather or a mis-sharded teacher LM head. Disabled on landing for
+# the same two reasons as the circle_click recipe above: it has not been run end
+# to end yet, so its thresholds are unvalidated smoke bounds; and nightly.txt is
+# at 4192 of its 4197 GPU-hour cap, which leaves no room for this run's ~10
+# GPU-hours. Move to nightly.txt once a real run confirms the thresholds and the
+# budget has room.
+tests/test_suites/llm/mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller-fullvocab.sh
