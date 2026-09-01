@@ -1061,8 +1061,10 @@ class _LpRecordingTrainer(_NoOpTrainer):
     def prepare_for_training(self) -> None:
         self.calls.append("prepare_for_training")
 
-    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
-        del meta
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
+        del meta, train_fields
         self.calls.append("train")
 
     def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
