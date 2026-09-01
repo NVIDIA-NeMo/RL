@@ -227,6 +227,11 @@ class TrtllmAsyncGenerationWorkerImpl:
             backend="pytorch",
             tensor_parallel_size=tp_size,
             dtype=engine_cfg["precision"],
+            # "dummy" during training: the initial refit lands before the
+            # first request, so loading the checkpoint here is wasted startup
+            # time. configure_generation_config decides; "auto" is TRT-LLM's
+            # own default and the value evaluation gets.
+            load_format=engine_cfg.get("load_format", "auto"),
             max_seq_len=engine_cfg["max_model_len"],
             max_batch_size=engine_cfg["max_batch_size"],
             max_num_tokens=engine_cfg["max_num_tokens"],
