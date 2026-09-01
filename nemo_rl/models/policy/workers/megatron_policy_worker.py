@@ -2215,7 +2215,13 @@ class MegatronPolicyWorkerImpl(
 
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
-        return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
+        cpu_logprobs = torch.empty_like(
+            logprobs,
+            device="cpu",
+            pin_memory=True,
+        )
+        cpu_logprobs.copy_(logprobs, non_blocking=False)
+        return BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
 
     def _resolve_output_layer_owner(self) -> Any:
         """Return the unwrapped module that owns ``output_layer`` on this rank.
