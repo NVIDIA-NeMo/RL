@@ -16,7 +16,6 @@ import asyncio
 import copy
 import gc
 import logging
-import os
 import threading
 import time
 import uuid
@@ -1199,13 +1198,6 @@ class VllmAsyncGenerationWorkerImpl(
 
         base_url = f"http://{node_ip}:{free_port}/v1"
         print(f"Starting server on {base_url}")
-
-        byte_dir = os.environ.get("NRL_HTTP_BYTES_DIR")
-        if byte_dir:
-            # Perf-measurement tooling only (see nemo_rl/utils/http_byte_counter.py).
-            from nemo_rl.utils.http_byte_counter import HttpByteCounterMiddleware
-
-            app = HttpByteCounterMiddleware(app, "vllm_worker", byte_dir)  # type: ignore[assignment]
 
         config = uvicorn.Config(
             app,

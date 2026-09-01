@@ -51,7 +51,6 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
     encoded_route_plan_size_bytes,
 )
-from nemo_rl.experience.row_dump import maybe_dump_train_rows
 
 # Keep the finalizer importable in its CPU-only actor without importing the
 # generation package (which eagerly loads backend dependencies). This value is
@@ -722,13 +721,6 @@ class BlackboxFinalizer:
                 metrics["finalize/routed_experts_row_coverage"] = (
                     valid_route_rows / len(valid_rows)
                 )
-        maybe_dump_train_rows(
-            source="finalizer",
-            group_id=group_id,
-            sample_ids=list(sample_ids),
-            train_batch=train_batch,
-            weight_version=group_min_wv,
-        )
         assert sample_ids == rollout_ids, (
             "canonical sample ids must equal the ledger-registered rollout ids: "
             f"{sample_ids} != {rollout_ids}"

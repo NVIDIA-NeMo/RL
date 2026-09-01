@@ -53,7 +53,6 @@ from nemo_rl.experience.interfaces import (
     PromptGroupRecord,
 )
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
-from nemo_rl.experience.row_dump import maybe_dump_train_rows
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 DATA_PLANE_CHECKPOINT_DIR = "data_plane"
@@ -1143,13 +1142,6 @@ class TQReplayBuffer:
                 "not produce that field. Check vLLM routed-expert capture and "
                 "the async message-log flattening path."
             )
-        maybe_dump_train_rows(
-            source="legacy_commit",
-            group_id=group_id,
-            sample_ids=list(sample_ids),
-            train_batch=train_batch,
-            weight_version=start_weight_version,
-        )
         trace_rollout_payload(keys=sample_ids, data=train_batch)
         async with self._data_plane_checkpoint_barrier.mutation():
             try:
