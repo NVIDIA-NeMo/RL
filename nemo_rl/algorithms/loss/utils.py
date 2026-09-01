@@ -33,7 +33,7 @@ from nemo_rl.distributed.model_utils import (
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
 )
-from nemo_rl.utils.sequence_lengths import CpuIntTuple
+from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
@@ -119,7 +119,9 @@ def pack_rolled_draft_token_mask(
     per-segment left shift.
     """
     packed = _pack_input_ids(
-        token_mask * sample_mask.unsqueeze(-1), cu_seqlens, cu_seqlens_padded
+        token_mask * sample_mask.unsqueeze(-1),
+        to_cpu_int_tuple(cu_seqlens),
+        to_cpu_int_tuple(cu_seqlens_padded),
     )
     return roll_packed_seq_dim(packed, cu_seqlens_padded, seq_dim=1)
 
