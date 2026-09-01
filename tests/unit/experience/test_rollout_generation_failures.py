@@ -741,12 +741,30 @@ class TestPartialGymRedispatch:
         method = _PartialGymMethod(fail_after_rows=99, failures_before_success=0)
         impl = _make_gym_impl(method, num_generations=2, row_attempts=2)
 
-        with pytest.raises(ValueError, match="must be stamped with their own position"):
+        with pytest.raises(ValueError, match="carries invalid _rowidx"):
             asyncio.run(
                 impl._run_rollouts(
                     [{"agent_ref": {"name": "a"}}], Timer(), "timing/rollout"
                 )
             )
+
+    def test_row_indices_must_fit_within_the_prompt_group(self):
+        method = _PartialGymMethod(fail_after_rows=99, failures_before_success=0)
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=2)
+        rows = _gym_rows(2)
+        rows[1]["_rowidx"] = 2
+
+        with pytest.raises(ValueError, match="carries invalid _rowidx=2"):
+            asyncio.run(impl._run_rollouts(rows, Timer(), "timing/rollout"))
+
+    def test_row_indices_must_be_unique(self):
+        method = _PartialGymMethod(fail_after_rows=99, failures_before_success=0)
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=2)
+        rows = _gym_rows(2)
+        rows[1]["_rowidx"] = 0
+
+        with pytest.raises(ValueError, match="duplicate _rowidx values"):
+            asyncio.run(impl._run_rollouts(rows, Timer(), "timing/rollout"))
 
     def test_the_group_deadline_spans_re_dispatches(self):
         """The budget belongs to the prompt group, not to each attempt.

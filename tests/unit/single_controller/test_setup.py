@@ -58,6 +58,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
+from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.utils.config import (
     load_config,
@@ -431,7 +432,9 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract():
     )
 
 
-def test_sibling_recovery_functional_config_resolves_to_runtime_contract():
+def test_sibling_recovery_functional_config_resolves_to_runtime_contract(
+    tmp_path: Path,
+) -> None:
     """The two-phase Gym recovery fixture must pass SC config validation."""
     register_omegaconf_resolvers()
     repo_root = Path(__file__).resolve().parents[3]
@@ -466,7 +469,7 @@ def test_sibling_recovery_functional_config_resolves_to_runtime_contract():
         "grpo.skip_reference_policy_logprobs_calculation=false",
         "loss_fn.use_importance_sampling_correction=true",
         "checkpointing.enabled=true",
-        "checkpointing.checkpoint_dir=/tmp/sibling-recovery-checkpoints",
+        f"checkpointing.checkpoint_dir={tmp_path / 'sibling-recovery-checkpoints'}",
         "checkpointing.metric_name=null",
         "checkpointing.save_period=1",
         "+checkpointing.save_data_plane=true",
@@ -499,6 +502,11 @@ def test_sibling_recovery_functional_config_resolves_to_runtime_contract():
     validate_single_controller_config(master_config)
     assert master_config.checkpointing["metric_name"] is None
     assert master_config.checkpointing["save_data_plane"] is True
+    assert master_config.token_capture.enabled is True
+    assert (
+        master_config.rollout_recovery.default_granularity
+        is RecoveryGranularity.SIBLING
+    )
     assert master_config.async_rl.rollout_failure.native.generation_timeout_s is None
     assert master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s == 120
 
@@ -715,6 +723,14 @@ class TestSetup:
                 "deferred_routes_without_capture",
                 "defer_routed_experts_to_policy requires",
             ),
+            (
+                "prompt_group_recovery_without_capture",
+                "non-default rollout_recovery policies require",
+            ),
+            (
+                "recovery_override_without_capture",
+                "non-default rollout_recovery policies require",
+            ),
         ],
     )
     def test_invalid_config_fails_before_setup_factories(
@@ -732,6 +748,12 @@ class TestSetup:
             mc.async_rl.max_buffered_rollouts = 7
         elif invalid_case == "deferred_routes_without_capture":
             mc.token_capture.defer_routed_experts_to_policy = True
+        elif invalid_case == "prompt_group_recovery_without_capture":
+            mc.rollout_recovery.default_granularity = RecoveryGranularity.PROMPT_GROUP
+        elif invalid_case == "recovery_override_without_capture":
+            mc.rollout_recovery.task_granularity_overrides = {
+                "genrm": RecoveryGranularity.PROMPT_GROUP
+            }
         else:  # pragma: no cover
             raise AssertionError(f"unknown test case {invalid_case}")
 

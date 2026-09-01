@@ -63,6 +63,7 @@ from nemo_rl.experience.rollouts import (
     _attach_routed_experts_to_message_log_prefix,
     _dummy_routed_experts_for_tokens,
     _effort_shaping_metrics,
+    _EffortShapingMetrics,
     _find_routed_experts_template,
     _tensorize_by_key,
     attach_static_multimodal_payload,
@@ -964,6 +965,7 @@ class AsyncNemoGymRolloutImpl:
         nemo_gym_env: Any,
         pending: list[dict],
         results: list[Optional[dict]],
+        shaping_by_rowidx: list[Optional[_EffortShapingMetrics]],
         total_rows: int,
         timer_prefix: str,
         on_completion: Optional[RolloutCompletionCallback] = None,
@@ -974,6 +976,8 @@ class AsyncNemoGymRolloutImpl:
             nemo_gym_env: The NeMo-Gym environment actor handle.
             pending: Rows still awaiting a result; each carries its original ``_rowidx``.
             results: Full-length result list, mutated in place.
+            shaping_by_rowidx: Per-row shaping metrics, populated before a
+                completion can be published to the recovery ledger.
             total_rows: Size of the original prompt group, used to validate row indices.
             timer_prefix: Timer namespace forwarded to the environment.
 
@@ -981,6 +985,7 @@ class AsyncNemoGymRolloutImpl:
             The environment's timing metrics, or None if the stream ended without them.
         """
         dispatched = {row["_rowidx"] for row in pending}
+        inputs_by_rowidx = {row["_rowidx"]: row for row in pending}
         received: set[int] = set()
         env_timing_metrics: Optional[dict[str, Any]] = None
 
@@ -1003,6 +1008,16 @@ class AsyncNemoGymRolloutImpl:
             if rowidx in received:
                 raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
             received.add(rowidx)
+            # A streamed completion may become durable recovery ownership before
+            # the rest of its prompt group finishes. Shape its reward first so a
+            # checkpoint never preserves a raw reward that finalization will later
+            # train on. The shaping rule is row-local; aggregation below is metrics
+            # only.
+            shaping_by_rowidx[rowidx] = _apply_effort_shaping(
+                [result],
+                [inputs_by_rowidx[rowidx]],
+                self._effort_config,
+            )
             results[rowidx] = result
             if on_completion is not None:
                 await on_completion(rowidx, self._result_to_completion(result))
@@ -1047,6 +1062,9 @@ class AsyncNemoGymRolloutImpl:
         # Run generation and restore input order as results stream back.
         with timer.time(f"{timer_prefix}/run_rollouts"):
             results: list[dict | None] = [None for _ in range(total_rows)]
+            shaping_by_rowidx: list[Optional[_EffortShapingMetrics]] = [
+                None for _ in range(total_rows)
+            ]
             env_timing_metrics: dict[str, Any] = {}
             # One deadline for the whole prompt group, re-dispatches included -- it is
             # the group that has a budget, not each attempt. It also spans the stream
@@ -1088,6 +1106,7 @@ class AsyncNemoGymRolloutImpl:
                             nemo_gym_env,
                             pending,
                             results,
+                            shaping_by_rowidx,
                             total_rows,
                             timer_prefix,
                             on_completion=on_completion,
@@ -1119,9 +1138,30 @@ class AsyncNemoGymRolloutImpl:
                 raise failure from last_error
 
             completed_results = [result for result in results if result is not None]
-            # Shape rewards for low-effort prompts before completions are built.
-            shaping = _apply_effort_shaping(
-                completed_results, inputs, self._effort_config
+            completed_shaping = [
+                metrics for metrics in shaping_by_rowidx if metrics is not None
+            ]
+            shaping = _EffortShapingMetrics(
+                length_rewards_low=[
+                    value
+                    for metrics in completed_shaping
+                    for value in metrics.length_rewards_low
+                ],
+                rewards_low=[
+                    value
+                    for metrics in completed_shaping
+                    for value in metrics.rewards_low
+                ],
+                low_lengths=[
+                    value
+                    for metrics in completed_shaping
+                    for value in metrics.low_lengths
+                ],
+                high_lengths=[
+                    value
+                    for metrics in completed_shaping
+                    for value in metrics.high_lengths
+                ],
             )
             # All N rollouts share the same input prompt; tensorize one copy.
             prompt_message_log = completed_results[0]["input_message_log"]
@@ -1853,9 +1893,7 @@ class RolloutManager:
                     "token-capture completion must contain environment extras"
                 )
             if "ng_receipt" not in env_extras:
-                raise ValueError(
-                    "token-capture completion must contain ng_receipt"
-                )
+                raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
             gate_rollout_id = env_extras.get("ng_rollout_id")
             if receipt is not None and not isinstance(receipt, dict):
@@ -1885,10 +1923,7 @@ class RolloutManager:
                     f"expected={gate_rollout_id!r}"
                 )
 
-            if (
-                recovery_group.recovery_granularity
-                is RecoveryGranularity.PROMPT_GROUP
-            ):
+            if recovery_group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                 result = SiblingSealResult(
                     gate_rollout_id=gate_rollout_id,
                     receipt=receipt,
@@ -1973,7 +2008,11 @@ class RolloutManager:
             # terminal rows keep any later read fail-closed.
             self._tq_buffer.abort(group_id)
             async with self._recovery_mutation() as cut:
-                self._recovery_ledger.abandon_unsealed(cut, group_id)
+                # Intentional staleness aborts discard the ledger owner before
+                # cancelling this task. Preserve the original cancellation rather
+                # than replacing it with "unknown group" during cleanup.
+                if group_id in self._recovery_ledger:
+                    self._recovery_ledger.abandon_unsealed(cut, group_id)
             # The capture ledger has no per-rollout fail endpoint. Rows from
             # abandoned attempts are unreferenced and are swept with the
             # staging partition at run teardown.
