@@ -195,6 +195,8 @@ ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/z3/lib:/opt/
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
+# Prefetch worker-venv manifest to avoid the need for symlinks.
+COPY --from=nemo-rl docker/venv_prefetch_manifest.tsv ./docker/venv_prefetch_manifest.tsv
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
 COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
@@ -234,7 +236,7 @@ fi
 # to warm the uv cache, then at the end just sync the default dependencies.
 # Do everything in one layer to prevent large layers.
 
-# The venv is symlinked to avoid bloating the layer size
+# Everything is hardlinked against the uv cache; this layer holds exactly one real copy of every wheel.
 UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
     UV_LINK_MODE=hardlink uv sync --frozen --extra vllm --no-install-project
@@ -242,10 +244,41 @@ fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
     UV_LINK_MODE=hardlink uv sync --frozen --extra sglang --no-install-project
 fi
-uv sync --link-mode symlink --frozen --extra mcore --no-install-project
-uv sync --link-mode symlink --frozen --extra automodel --no-install-project
-uv sync --link-mode symlink --frozen --extra modelopt --no-install-project
-uv sync --link-mode symlink --frozen --all-groups --no-install-project
+UV_LINK_MODE=hardlink uv sync --frozen --extra mcore --no-install-project
+UV_LINK_MODE=hardlink uv sync --frozen --extra automodel --no-install-project
+UV_LINK_MODE=hardlink uv sync --frozen --extra modelopt --no-install-project
+UV_LINK_MODE=hardlink uv sync --frozen --all-groups --no-install-project
+
+# Worker-venv prefetch, phase 1:
+# Materialize each registry venv's third-party packages in THIS layer, hardlinked against the above cache,
+# so the N worker venvs cost directory entries instead of N wheel copies
+PREFETCH_NEGATIVE_FILTERS=""
+if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
+    PREFETCH_NEGATIVE_FILTERS="$PREFETCH_NEGATIVE_FILTERS vllm"
+fi
+if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
+    PREFETCH_NEGATIVE_FILTERS="$PREFETCH_NEGATIVE_FILTERS sglang"
+fi
+while IFS=$'\t' read -r venv_name stage extras; do
+    if [[ -z "$venv_name" || "$venv_name" == \#* ]]; then
+        continue
+    fi
+    skip=""
+    for f in $PREFETCH_NEGATIVE_FILTERS; do
+        if [[ "$venv_name" == *"$f"* ]]; then
+            skip=1
+        fi
+    done
+    if [[ -n "$skip" ]]; then
+        continue
+    fi
+    if [[ "$stage" == "trtllm" ]]; then
+        extras=""
+    fi
+    venv_path="${NEMO_RL_VENV_DIR}/${venv_name}"
+    uv venv --allow-existing "$venv_path"
+    UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --frozen $extras --no-install-project
+done < docker/venv_prefetch_manifest.tsv
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
@@ -298,9 +331,14 @@ du -sh /root/.cache/uv /root/.cache/trtllm-wheels
 
 TRTLLM_SYNC_LOG=$(mktemp /tmp/trtllm-sync.XXXXXX.log)
 set +e
+# Build TRT-LLM into a throwaway venv instead of the main one:
+# the main venv is fully hardlinked from the dependency layer,
+# and churning it here would copy files up into this layer.
+# The throwaway venv is created and deleted within this RUN, so it leaves no bytes in the layer.
 UV_CACHE_DIR=/root/.cache/uv \
     TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
-    uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project \
+    UV_PROJECT_ENVIRONMENT=/tmp/trtllm-build-venv \
+    uv sync --verbose --link-mode hardlink --locked --extra trtllm --no-install-project \
     2>&1 | tee "$TRTLLM_SYNC_LOG" \
     | awk '/\[TRTLLM_CCACHE\]|Ninja progress:/ { print; fflush() }'
 TRTLLM_SYNC_STATUS=$?
@@ -317,11 +355,25 @@ rm -f "$TRTLLM_SYNC_LOG"
 echo "TRT-LLM cache state after build:"
 du -sh /root/.cache/uv /root/.cache/trtllm-wheels
 
-# Restore the intended default environment in the same layer so the transient
-# TRT-LLM installation does not add a large intermediate venv layer.
-uv sync --link-mode symlink --locked --all-groups --no-install-project
+# Worker-venv prefetch, phase 1 for the "trtllm"-stage manifest entries:
+# the dependency layer gave them a base-only warm; now that the tensorrt_llm wheel exists,
+# top off the venv with the full extra set so that the added files hardlink in-layer.
+while IFS=$'\t' read -r venv_name stage extras; do
+    if [[ -z "$venv_name" || "$venv_name" == \#* || "$stage" != "trtllm" ]]; then
+        continue
+    fi
+    venv_path="${NEMO_RL_VENV_DIR}/${venv_name}"
+    uv venv --allow-existing "$venv_path"
+    UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink \
+        TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
+        uv sync --frozen $extras --no-install-project
+done < docker/venv_prefetch_manifest.tsv
 
-# The final sync can repopulate the shared uv cache, so repeat the security
+# The main venv was never touched (the build ran in the throwaway venv), so
+# the previous "restore the default environment" sync is no longer needed.
+rm -rf /tmp/trtllm-build-venv
+
+# The syncs above can repopulate the shared uv cache, so repeat the security
 # cleanup performed in the preceding dependency layer.
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 EOF
@@ -417,16 +469,20 @@ fi
 export TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels
 export TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels
 export TRTLLM_REQUIRE_CACHED_WHEEL=1
+# Worker-venv prefetch, phase 2:
+# all venvs have by now been materialized in hardlink-mode;
+# add the editable project install per venv.
 if [[ -n "$NEGATIVE_FILTERS" ]]; then
-    UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
+    UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
 else
-    UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+    UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py
 fi
 EOF
 
 # Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)
 # into the image. Gated on NEMO_GYM_PREFETCH_CONFIGS (no-op by default). Runs after the
 # source COPY above so examples/nemo_gym/prefetch_venvs.py is present.
+# Gym server venvs use symlinks, not the hardlink scheme used for worker venvs.
 # Gym pins vllm==0.24.0; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
 # RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
 ARG NEMO_GYM_CUDA=cu130
