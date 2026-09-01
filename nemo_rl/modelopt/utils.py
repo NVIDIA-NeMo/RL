@@ -24,6 +24,17 @@ MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS = 600_000
 
 def prepare_real_quant_generation_config(policy: Any, generation_config: dict) -> None:
     """Inject the policy-produced canonical ModelOpt config into vLLM config."""
+    policy_config = policy.cfg
+    if not policy_config.get("megatron_cfg", {}).get("enabled", False):
+        raise ValueError(
+            "policy.generation.real_quant=true requires "
+            "policy.megatron_cfg.enabled=true; DTensor real-quant export is unsupported"
+        )
+    if not policy_config.get("quant_cfg"):
+        raise ValueError(
+            "policy.quant_cfg must be set when policy.generation.real_quant=true"
+        )
+
     quantization_config = policy.get_real_quantization_config()
     hf_overrides = generation_config.setdefault("vllm_kwargs", {}).setdefault(
         "hf_overrides", {}

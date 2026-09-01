@@ -387,6 +387,7 @@ uv run --extra mcore --extra modelopt \
 - **Generation**: Currently only vLLM is supported for generation.
 - **DTensor backend**: Quantization support for the DTensor policy worker is not yet implemented.
 - **Real-quant rollout**: The native-loader path has end-to-end functional coverage for dense W4A16. W4A4, fused-MoE, and hybrid MoE/Mamba paths require architecture-specific revalidation; fused MoE currently requires all experts local to each vLLM rank. The policy recipe must leave unsupported or sensitive paths in BF16.
+- **Real-quant refit transport**: NIXL, custom checkpoint engines, and remote sparse-delta transports are not supported because they bypass vLLM's native layerwise reload lifecycle.
 - **Router Replay (R3)**: R3 is supported on the Megatron policy path.
 - **Input quantization**: W4A4 real rollout supports ModelOpt's block-16 E2M1 input format with a global scale per projection; other activation formats remain fake-quant only.
 - **Model support**: Dense Transformer, MoE (Mixture of Experts), and hybrid MoE/Mamba models are supported on the Megatron policy + vLLM generation path when Megatron-Bridge and ModelOpt support the model architecture and quantization recipe.

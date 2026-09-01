@@ -382,6 +382,36 @@ def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        {
+            "quant_cfg": None,
+            "real_quant": True,
+            "refit_transport": "nixl",
+            "refit_cfg": {"nixl": {}},
+        },
+        {
+            "quant_cfg": None,
+            "real_quant": True,
+            "refit_transport": "vllm_zmq_sparse",
+        },
+    ],
+)
+def test_configure_real_quant_rejects_transport_without_reload_lifecycle(cfg):
+    worker_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_worker"
+    )
+    llm_kwargs = {
+        "hf_overrides": {
+            "quantization_config": {"quant_method": "modelopt", "quant_algo": "FP8"}
+        }
+    }
+
+    with pytest.raises(ValueError, match="native layerwise reload lifecycle"):
+        worker_mod._configure_quant_engine_kwargs(cfg, llm_kwargs)
+
+
 def test_configure_real_quant_requires_policy_config():
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
@@ -397,7 +427,8 @@ def test_configure_real_quant_requires_policy_config():
 def test_prepare_real_quant_generation_config_copies_policy_config():
     quantization_config = {"quant_method": "modelopt", "quant_algo": "FP8"}
     policy = types.SimpleNamespace(
-        get_real_quantization_config=lambda: quantization_config
+        cfg={"quant_cfg": "FP8_DEFAULT_CFG", "megatron_cfg": {"enabled": True}},
+        get_real_quantization_config=lambda: quantization_config,
     )
     generation_config = {"vllm_kwargs": {"hf_overrides": {"trust_remote_code": True}}}
 
@@ -412,10 +443,11 @@ def test_prepare_real_quant_generation_config_copies_policy_config():
 
 def test_prepare_real_quant_generation_config_rejects_conflict():
     policy = types.SimpleNamespace(
+        cfg={"quant_cfg": "FP8_DEFAULT_CFG", "megatron_cfg": {"enabled": True}},
         get_real_quantization_config=lambda: {
             "quant_method": "modelopt",
             "quant_algo": "FP8",
-        }
+        },
     )
     generation_config = {
         "vllm_kwargs": {
@@ -430,6 +462,26 @@ def test_prepare_real_quant_generation_config_rejects_conflict():
 
     with pytest.raises(ValueError, match="conflicts"):
         modelopt_utils.prepare_real_quant_generation_config(policy, generation_config)
+
+
+@pytest.mark.parametrize(
+    ("policy_config", "error"),
+    [
+        (
+            {"quant_cfg": "FP8_DEFAULT_CFG", "megatron_cfg": {"enabled": False}},
+            "megatron_cfg",
+        ),
+        ({"quant_cfg": None, "megatron_cfg": {"enabled": True}}, "policy.quant_cfg"),
+    ],
+)
+def test_prepare_real_quant_generation_config_validates_policy(policy_config, error):
+    policy = types.SimpleNamespace(
+        cfg=policy_config,
+        get_real_quantization_config=lambda: pytest.fail("unexpected worker RPC"),
+    )
+
+    with pytest.raises(ValueError, match=error):
+        modelopt_utils.prepare_real_quant_generation_config(policy, {})
 
 
 def test_configure_quant_engine_kwargs_for_fake_quant_without_quant_cfg(monkeypatch):

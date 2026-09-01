@@ -1139,6 +1139,7 @@ def test_real_quant_distillation_setup_builds_vllm_from_student_config(monkeypat
     class DummyPolicy:
         def __init__(self, *, name_prefix, **_kwargs):
             self.name_prefix = name_prefix
+            self.cfg = _kwargs["config"]
             events.append(name_prefix)
 
         def get_real_quantization_config(self):

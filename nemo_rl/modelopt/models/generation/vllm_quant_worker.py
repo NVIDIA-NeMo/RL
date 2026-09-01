@@ -19,7 +19,10 @@ from typing import Any
 import ray
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_SPARSE_REFIT_TRANSPORTS,
+    VllmConfig,
+)
 from nemo_rl.models.generation.vllm.vllm_worker import (
     VllmGenerationWorkerImpl,
 )
@@ -47,13 +50,25 @@ def _configure_quant_engine_kwargs(
     cfg: VllmConfig,
     llm_kwargs: dict[str, Any],
 ) -> None:
+    real_quant = bool(cfg.get("real_quant"))
+    checkpoint_engine_config = checkpoint_engine_refit_config(cfg)
+    refit_transport = cfg.get("refit_transport")
+    if real_quant and (
+        checkpoint_engine_config is not None
+        or refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS
+    ):
+        raise ValueError(
+            f"ModelOpt real quantization does not support refit_transport="
+            f"{refit_transport!r} because it bypasses vLLM's native layerwise "
+            "reload lifecycle"
+        )
+
     extension_name = "VllmQuantInternalWorkerExtension"
-    if checkpoint_engine_refit_config(cfg) is not None:
+    if checkpoint_engine_config is not None:
         extension_name += "WithCheckpointEngine"
     llm_kwargs["worker_extension_cls"] = (
         "nemo_rl.modelopt.models.generation.vllm_quant_backend." + extension_name
     )
-    real_quant = bool(cfg.get("real_quant"))
     if real_quant:
         os.environ.pop("VLLM_QUANT_CFG", None)
         quantization_config = llm_kwargs.get("hf_overrides", {}).get(

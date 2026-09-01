@@ -3059,6 +3059,7 @@ def test_real_quant_setup_builds_vllm_from_policy_config(
 
     class DummyPolicy:
         def __init__(self, **_kwargs):
+            self.cfg = _kwargs["config"]
             events.append("policy")
 
         def get_real_quantization_config(self):
