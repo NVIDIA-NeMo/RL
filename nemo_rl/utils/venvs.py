@@ -93,8 +93,13 @@ def create_local_venv(
     # Command doesn't matter, since `uv` syncs the environment no matter the command.
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
-    # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
+    # Run uv sync first to ensure build requirements are set (for --no-build-isolation packages).
+    # --inexact: this base-set sync must not prune extras out of a venv that was
+    # pre-materialized in the image; pruning and re-adding hardlinked packages would copy
+    # them up into the image's final layer.
+    subprocess.run(
+        ["uv", "sync", "--inexact", "--directory", git_root], env=env, check=True
+    )
     subprocess.run(exec_cmd, env=env, check=True)
 
     # Return the path to the python executable in the virtual environment
