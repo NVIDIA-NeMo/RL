@@ -16,9 +16,11 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
+import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -35,6 +37,65 @@ from tools.external_gym_vllm.vllm_pool_lb import (
 )
 
 REPO_ROOT = Path(__file__).parents[3]
+
+
+def test_serve_wrapper_applies_only_external_vllm_patches(monkeypatch):
+    from tools.external_gym_vllm import serve_vllm_on_ray
+
+    calls = []
+    monkeypatch.setattr(
+        serve_vllm_on_ray,
+        "_load_apply_external_vllm_patches",
+        lambda: lambda: calls.append("patches"),
+    )
+    monkeypatch.setattr(
+        serve_vllm_on_ray.ray,
+        "init",
+        lambda **_kwargs: calls.append("ray"),
+    )
+
+    vllm_module = types.ModuleType("vllm")
+    vllm_module.__path__ = []
+    entrypoints_module = types.ModuleType("vllm.entrypoints")
+    entrypoints_module.__path__ = []
+    cli_module = types.ModuleType("vllm.entrypoints.cli")
+    cli_module.__path__ = []
+    cli_main_module = types.ModuleType("vllm.entrypoints.cli.main")
+    cli_main_module.main = lambda: calls.append("vllm")
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints", entrypoints_module)
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints.cli", cli_module)
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints.cli.main", cli_main_module)
+
+    serve_vllm_on_ray.main()
+
+    assert calls == ["patches", "ray", "vllm"]
+
+
+def test_serve_wrapper_loads_patches_without_importing_nemo_rl_package():
+    script = REPO_ROOT / "tools/external_gym_vllm/serve_vllm_on_ray.py"
+    program = textwrap.dedent(
+        f"""
+        import runpy
+        import sys
+        import types
+
+        sys.modules["ray"] = types.ModuleType("ray")
+        namespace = runpy.run_path({str(script)!r})
+        apply_external_vllm_patches = namespace["_load_apply_external_vllm_patches"]()
+        assert callable(apply_external_vllm_patches)
+        assert "nemo_rl.models.generation" not in sys.modules
+        assert "nemo_rl.models.policy" not in sys.modules
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_shutdown_timeout_bounds_watchdog_restart_outage():
@@ -591,6 +652,13 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert (
         'COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"' in source
     )
+    assert "++env.nemo_gym.external_service_readiness" in source
+    assert "expected_backends:${replicas[${pool}]}" in source
+    assert "external_service_readiness_json" not in source
+    assert source.index('bash "${RAY_SUB}" &') < source.index(
+        "deadline=$((SECONDS + max_startup_timeout))"
+    )
+    assert source.count("check_startup_steps") == 3
     assert "genrm" not in source.lower()
     assert "nl2bash" not in source.lower()
     assert "safety" not in source.lower()

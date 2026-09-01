@@ -17,18 +17,38 @@
 
 from __future__ import annotations
 
+import runpy
 import sys
+from collections.abc import Callable
+from pathlib import Path
+from typing import cast
 
 import ray
 
-from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
+
+def _load_apply_external_vllm_patches() -> Callable[[], None]:
+    """Load external-server patches without importing NeMo RL dependencies."""
+    repo_root = Path(__file__).resolve().parents[2]
+    patches_path = repo_root / "nemo_rl/models/generation/vllm/patches.py"
+    if patches_path.is_file():
+        namespace = runpy.run_path(str(patches_path))
+        apply_external_vllm_patches = namespace.get("_apply_external_vllm_patches")
+        if not callable(apply_external_vllm_patches):
+            raise RuntimeError(
+                f"_apply_external_vllm_patches is missing from {patches_path}"
+            )
+        return cast(Callable[[], None], apply_external_vllm_patches)
+
+    # Support installations that copy this tool without the source checkout.
+    from nemo_rl.models.generation.vllm.patches import _apply_external_vllm_patches
+
+    return _apply_external_vllm_patches
 
 
 def main() -> None:
     """Connect to the private cluster and start the requested vLLM command."""
-    worker_python = sys.executable
-    _apply_vllm_patches(worker_python)
-    ray.init(address="auto", runtime_env={"py_executable": worker_python})
+    _load_apply_external_vllm_patches()()
+    ray.init(address="auto", runtime_env={"py_executable": sys.executable})
 
     # vLLM is available only in the generation worker environment and must be
     # imported after NeMo RL applies its runtime patches.

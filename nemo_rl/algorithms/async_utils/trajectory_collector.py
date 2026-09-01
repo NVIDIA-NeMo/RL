@@ -30,6 +30,7 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
+    _get_effort_config,
 )
 from nemo_rl.algorithms.grpo import (
     MasterConfig as GRPOMasterConfig,
@@ -415,18 +416,21 @@ class AsyncTrajectoryCollector:
         return self.data_exhausted
 
     def get_status(self) -> dict:
-        """Return a snapshot of the collector's internal state for driver-side diagnostics."""
+        """Return collector progress used for driver coordination and diagnostics."""
         with self._threads_lock:
             inflight_workers = len(self._inflight_threads)
         with self._failure_lock:
             collection_failed = self.collection_failed
             collection_error = self.collection_error
+        with self._generation_check_lock:
+            generating_targets = sorted(self._generating_targets)
         return {
             "running": self.running,
             "data_exhausted": self.data_exhausted,
             "errored": collection_failed,
             "error": collection_error,
             "inflight_workers": inflight_workers,
+            "generating_targets": generating_targets,
         }
 
     def _mark_collection_failed(self, error: Exception) -> None:
@@ -1287,7 +1291,13 @@ class AsyncTrajectoryCollector:
                 ),
                 max_rollout_turns=None,
                 greedy=False,
+                effort_config=(
+                    _get_effort_config(self.master_config)
+                    if isinstance(self.master_config, GRPOMasterConfig)
+                    else None
+                ),
                 reward_penalty_config=self.master_config.reward_penalties,
+                length_penalty_config=self.master_config.grpo.model_dump(),
                 thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
                 mask_env_flagged_samples=should_mask_flagged_samples(
                     self.master_config.env

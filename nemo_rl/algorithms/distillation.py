@@ -52,6 +52,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    extract_external_service_readiness,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
     should_use_nemo_gym,
@@ -531,6 +532,9 @@ def setup(
                     "invalid_tool_call_patterns", None
                 )
                 thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+                external_service_readiness = extract_external_service_readiness(
+                    nemo_gym_dict
+                )
                 # Pass prebuilt cache + venv dirs through the global config so the
                 # gym reuses image-baked venvs instead of rebuilding them.
                 uv_cache_dir = get_nemo_gym_uv_cache_dir()
@@ -545,6 +549,7 @@ def setup(
                     invalid_tool_call_patterns=invalid_tool_call_patterns,
                     thinking_tags=thinking_tags,
                     use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+                    external_service_readiness=external_service_readiness,
                     initial_global_config_dict=nemo_gym_dict,
                 )
                 nemo_gym_opts = {

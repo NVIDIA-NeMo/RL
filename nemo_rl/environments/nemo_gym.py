@@ -11,19 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import math
 import os
 import subprocess
 import sys
+import time
+import urllib.parse
+import urllib.request
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, Protocol, Self, TypedDict
 
 import ray
 import torch
 from PIL import Image
+from pydantic import BaseModel, Field, field_validator, model_validator
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transformers import PreTrainedTokenizerBase
 
@@ -78,6 +83,40 @@ class NemoGymCompatibleConfig(Protocol):
 
     @property
     def policy(self) -> PolicyConfig: ...
+
+
+class ExternalServiceReadinessTargetConfig(BaseModel, extra="allow"):
+    """Health endpoint and required backend count for one external service."""
+
+    name: str = Field(min_length=1)
+    url: str
+    expected_backends: int = Field(gt=0)
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, url: str) -> str:
+        """Require an absolute HTTP(S) health endpoint."""
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("url must be an absolute HTTP(S) URL")
+        return url
+
+
+class ExternalServiceReadinessConfig(BaseModel, extra="allow"):
+    """Startup gate for external services used by NeMo Gym rollouts."""
+
+    services: list[ExternalServiceReadinessTargetConfig] = Field(min_length=1)
+    timeout_seconds: float = Field(gt=0)
+    poll_interval_seconds: float = Field(gt=0)
+    request_timeout_seconds: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_unique_service_names(self) -> Self:
+        """Reject ambiguous duplicate service labels in diagnostics."""
+        names = [service.name for service in self.services]
+        if len(names) != len(set(names)):
+            raise ValueError("external readiness service names must be unique")
+        return self
 
 
 def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
@@ -208,6 +247,10 @@ class NemoGymConfig(TypedDict):
     # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
     # tokenizer consistently with the driver. Defaults to off when absent.
     use_fastokens: NotRequired[bool]
+    # Optional startup gate for externally served Gym dependencies. The actor
+    # starts local Gym services first, then waits for every target before it
+    # exposes its rollout collection helper to the training driver.
+    external_service_readiness: NotRequired[ExternalServiceReadinessConfig | None]
     # Multimodal fields (populated by `setup_nemo_gym_config` when VLM is enabled).
     tokenizer_config: NotRequired[
         Optional[TokenizerConfig]
@@ -215,6 +258,117 @@ class NemoGymConfig(TypedDict):
     pad_dynamic_image_shapes: NotRequired[
         bool
     ]  # Normalize heterogeneous image tensors while retaining exact imgs_sizes
+
+
+def extract_external_service_readiness(
+    nemo_gym_dict: dict[str, Any],
+) -> ExternalServiceReadinessConfig | None:
+    """Remove and validate NeMo-RL's external readiness block from Gym config."""
+    readiness_dict = nemo_gym_dict.pop("external_service_readiness", None)
+    if readiness_dict is None:
+        return None
+    return ExternalServiceReadinessConfig.model_validate(readiness_dict)
+
+
+def _probe_external_service(
+    service: ExternalServiceReadinessTargetConfig,
+    *,
+    request_timeout_seconds: float,
+) -> str | None:
+    """Return a readiness problem for one service, or None when it is ready."""
+    try:
+        with urllib.request.urlopen(
+            service.url, timeout=request_timeout_seconds
+        ) as response:
+            status_code = response.status
+            response_body = response.read()
+    except OSError as error:
+        return f"request failed: {error}"
+
+    if status_code != 200:
+        return f"HTTP {status_code}"
+
+    try:
+        payload = json.loads(response_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return f"invalid JSON response: {error}"
+    if not isinstance(payload, dict):
+        return f"expected a JSON object, got {type(payload).__name__}"
+
+    status = payload.get("status")
+    healthy_backends = payload.get("healthy_backends")
+    total_backends = payload.get("total_backends")
+    if (
+        not isinstance(healthy_backends, int)
+        or isinstance(healthy_backends, bool)
+        or not isinstance(total_backends, int)
+        or isinstance(total_backends, bool)
+    ):
+        return (
+            "health response must contain integer healthy_backends and total_backends"
+        )
+    if (
+        status != "ok"
+        or healthy_backends < service.expected_backends
+        or total_backends < service.expected_backends
+    ):
+        return (
+            f"status={status!r}, healthy_backends={healthy_backends}, "
+            f"total_backends={total_backends}, "
+            f"expected_backends={service.expected_backends}"
+        )
+    return None
+
+
+def _wait_for_external_services(
+    config: ExternalServiceReadinessConfig | None,
+) -> None:
+    """Wait for all external Gym dependencies under one shared deadline."""
+    if config is None:
+        return
+
+    deadline = time.monotonic() + config.timeout_seconds
+    previous_problems: dict[str, str] = {}
+    while True:
+        problems: dict[str, str] = {}
+        for service in config.services:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                problems[service.name] = "startup deadline expired before probe"
+                continue
+            problem = _probe_external_service(
+                service,
+                request_timeout_seconds=min(
+                    config.request_timeout_seconds, remaining_seconds
+                ),
+            )
+            if problem is not None:
+                problems[service.name] = problem
+
+        if not problems:
+            print(
+                "All external NeMo-Gym services are ready: "
+                + ", ".join(service.name for service in config.services)
+            )
+            return
+
+        if problems != previous_problems:
+            print(
+                "Waiting for external NeMo-Gym services: "
+                + "; ".join(f"{name}: {problem}" for name, problem in problems.items())
+            )
+            previous_problems = problems
+
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            details = "; ".join(
+                f"{name}: {problem}" for name, problem in problems.items()
+            )
+            raise TimeoutError(
+                "Timed out waiting for external NeMo-Gym services after "
+                f"{config.timeout_seconds:g}s. Last observations: {details}"
+            )
+        time.sleep(min(config.poll_interval_seconds, remaining_seconds))
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -620,6 +774,15 @@ Depending on your data shape, you may want to change these values."""
                 skip_load_from_cli=True,
             )
         )
+
+        try:
+            _wait_for_external_services(self.cfg.get("external_service_readiness"))
+        except TimeoutError:
+            # RunHelper.start() has already spawned local Gym services. Do not
+            # leave them behind when an external dependency misses its deadline.
+            self.rh.shutdown()
+            self.rh = None
+            raise
 
         # Setup for rollout collection
         self.head_server_config = BaseServerConfig(
@@ -1169,6 +1332,7 @@ def spinup_nemo_gym_actor(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     # Same treatment for the multimodal knobs: NemoGymConfig declares them as
     # top-level fields, so populate them here instead of leaving the actor to
     # read them back out of Gym's global config dict.
@@ -1196,6 +1360,7 @@ def spinup_nemo_gym_actor(
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         **multimodal_flags,
     )

@@ -16,10 +16,19 @@ vLLM arguments. The wrapper then:
 1. validates every pool and splits hetgroup 1 into disjoint node slices;
 2. starts every replica in its own private Ray cluster;
 3. starts one OpenAI-compatible load balancer per pool;
-4. waits for every backend and load balancer to become healthy;
-5. replaces each pool's URL placeholder in `COMMAND`;
-6. starts `ray.sub` on hetgroup 0 only; and
+4. replaces each pool's URL placeholder and injects an explicit backend-count
+   readiness contract into the NeMo Gym config;
+5. starts `ray.sub` on hetgroup 0 while the external models are still loading;
+6. lets the NeMo Gym actor start its local servers, then waits for every
+   external load balancer to report the required healthy backend count; and
 7. stops training if any required external service exits.
+
+This overlaps Ray, policy/trainer, and local Gym initialization with external
+model loading without letting rollout setup complete early. The load
+balancer's `/health` response must report `status: ok` and both
+`healthy_backends` and `total_backends` at or above the registered replica
+count. The Gym actor applies one shared, bounded deadline across all pools and
+shuts down its local servers if that deadline expires.
 
 Recipe launchers keep their concrete model and serving settings outside these
 helpers. A launcher can add another service without adding another server body
@@ -70,7 +79,7 @@ The generated fields are:
 |---|---:|---|---|
 | `POOL_MODEL` | yes | — | Checkpoint path under `EXTERNAL_VLLM_SHARED_ROOT` or Hugging Face model ID. |
 | `POOL_CONTAINER` | yes | — | Container used by this pool's replicas. |
-| `POOL_VLLM_PYTHON` | yes | — | Python executable containing vLLM, Ray, and NeMo RL's compatibility patch. |
+| `POOL_VLLM_PYTHON` | yes | — | Python executable containing vLLM and Ray. |
 | `POOL_REPLICAS` | yes | — | Number of independent DP=1 servers. |
 | `POOL_TENSOR_PARALLEL_SIZE` | yes | — | Tensor parallel size per server. |
 | `POOL_LB_PORT` | yes | — | Unique load-balancer port on the Ray head node. |
@@ -122,6 +131,8 @@ Optional globals:
 | `EXTERNAL_VLLM_LB_PYTHON` | `/opt/nemo_rl_venv/bin/python` | Python with `aiohttp` in `CONTAINER`. |
 | `RAY_SUB` | `$SLURM_SUBMIT_DIR/ray.sub` | Normal NeMo RL Slurm entrypoint. |
 | `EXTERNAL_VLLM_SHARED_ROOT` | `/lustre` | Shared host path mounted at the same path in every external-service container. |
+| `EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS` | `5` | How often the NeMo Gym actor rechecks external load-balancer health. |
+| `EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS` | `10` | Per-request timeout for the NeMo Gym external-health probes. |
 | `DEDICATED_RAY_HEAD` | unset | Passed through to `ray.sub`. With `1`, include one extra node in hetgroup 0 while keeping `cluster.num_nodes` equal to the GPU worker-node count; the head node's GPUs remain allocated but idle. |
 
 The number of nodes in hetgroup 1 must equal:
@@ -165,12 +176,20 @@ also accepted.
 Each pool container must provide:
 
 - its configured `POOL_VLLM_PYTHON`;
-- importable `nemo_rl`, `ray`, and `vllm` packages in that environment; and
+- importable `ray` and `vllm` packages in that environment;
+- access to the matching NeMo RL source checkout, or an importable `nemo_rl`
+  package as a fallback; and
 - the `ray` command on `PATH`.
 
-`serve_vllm_on_ray.py` applies NeMo RL's vLLM compatibility patches before it
-imports the vLLM API server. `CONTAINER` must provide
-`EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
+`serve_vllm_on_ray.py` loads NeMo RL's vLLM compatibility patch module directly
+from the matching source checkout before importing the vLLM API server. This
+avoids importing NeMo RL's policy modules and training dependency stack into a
+purpose-built serving container. If the source checkout is unavailable, the
+wrapper falls back to the installed `nemo_rl` package. The wrapper applies an
+explicit allowlist: OpenAI `NamespaceTool` compatibility plus the RayExecutorV2
+TCPStore and MessageQueue port-race fixes. It does not apply model-, worker-, or
+policy-refit-specific patches because these servers are inference-only.
+`CONTAINER` must provide `EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
 
 ## Slurm submission
 
@@ -197,7 +216,7 @@ sbatch \
 ```
 
 Slurm gang-schedules the two components. Replica `srun` steps explicitly use
-hetgroup 1 and load-balancer steps explicitly use hetgroup 0. Before starting
+hetgroup 1 and load-balancer steps explicitly use hetgroup 0. When starting
 `ray.sub`, the wrapper scopes its unsuffixed Slurm nodelist and node-count
 variables to component 0; Slurm then uses component 0 by default for its steps.
 External nodes therefore cannot accidentally join the training Ray cluster.

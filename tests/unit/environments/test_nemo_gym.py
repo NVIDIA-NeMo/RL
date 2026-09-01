@@ -17,6 +17,7 @@ import time
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -38,9 +39,12 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.environments.nemo_gym import (
+    ExternalServiceReadinessConfig,
     NemoGym,
     NemoGymConfig,
+    _wait_for_external_services,
     build_reward_component_columns,
+    extract_external_service_readiness,
     extract_reward_components,
     setup_nemo_gym_config,
     validate_reward_components_match_scalar,
@@ -84,6 +88,109 @@ def test_multimodal_content_types_cover_responses_media_aliases():
         "audio",
         "audio_url",
     } <= MULTIMODAL_CONTENT_TYPES
+
+
+def _external_health_response(
+    *, status: str, healthy_backends: int, total_backends: int
+) -> MagicMock:
+    response = MagicMock()
+    response.status = 200
+    response.read.return_value = json.dumps(
+        {
+            "status": status,
+            "healthy_backends": healthy_backends,
+            "total_backends": total_backends,
+        }
+    ).encode()
+    response.__enter__.return_value = response
+    return response
+
+
+def test_external_service_readiness_waits_for_every_expected_backend():
+    config = ExternalServiceReadinessConfig(
+        services=[
+            {
+                "name": "GENRM",
+                "url": "http://10.0.0.1:9213/health",
+                "expected_backends": 2,
+            }
+        ],
+        timeout_seconds=10,
+        poll_interval_seconds=1,
+        request_timeout_seconds=2,
+    )
+
+    with (
+        patch(
+            "nemo_rl.environments.nemo_gym.urllib.request.urlopen",
+            side_effect=[
+                _external_health_response(
+                    status="ok", healthy_backends=1, total_backends=2
+                ),
+                _external_health_response(
+                    status="ok", healthy_backends=2, total_backends=2
+                ),
+            ],
+        ) as urlopen,
+        patch("nemo_rl.environments.nemo_gym.time.sleep") as sleep,
+    ):
+        _wait_for_external_services(config)
+
+    assert urlopen.call_count == 2
+    sleep.assert_called_once_with(1)
+
+
+def test_external_service_readiness_times_out_with_last_observation():
+    config = ExternalServiceReadinessConfig(
+        services=[
+            {
+                "name": "GENRM",
+                "url": "http://10.0.0.1:9213/health",
+                "expected_backends": 2,
+            }
+        ],
+        timeout_seconds=1,
+        poll_interval_seconds=1,
+        request_timeout_seconds=1,
+    )
+
+    with (
+        patch(
+            "nemo_rl.environments.nemo_gym.urllib.request.urlopen",
+            side_effect=OSError("connection refused"),
+        ),
+        patch(
+            "nemo_rl.environments.nemo_gym.time.monotonic",
+            side_effect=[0, 0, 2],
+        ),
+    ):
+        with pytest.raises(TimeoutError, match="GENRM: request failed"):
+            _wait_for_external_services(config)
+
+
+def test_external_service_readiness_is_not_forwarded_to_gym():
+    nemo_gym_dict = {
+        "external_service_readiness": {
+            "services": [
+                {
+                    "name": "GENRM",
+                    "url": "http://10.0.0.1:9213/health",
+                    "expected_backends": 2,
+                }
+            ],
+            "timeout_seconds": 10,
+            "poll_interval_seconds": 1,
+            "request_timeout_seconds": 2,
+        },
+        "skip_venv_if_present": True,
+    }
+
+    readiness = extract_external_service_readiness(nemo_gym_dict)
+
+    assert readiness is not None
+    assert readiness.services[0].name == "GENRM"
+    assert "external_service_readiness" not in nemo_gym_dict
+    assert nemo_gym_dict == {"skip_venv_if_present": True}
 
 
 def test_extract_static_video_message_resolves_local_file(tmp_path):
