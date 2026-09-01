@@ -15,6 +15,10 @@ ppo:
     enabled: false
   reward_scaling:
     enabled: false
+  # Optional NeMo-Gym message-level penalties. Values overwrite computed
+  # advantages on tokens belonging to the corresponding assistant message.
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:
