@@ -40,6 +40,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import build_nccl_reshard_refit_info
 from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
     NcclReshardWeightSynchronizer,
 )
+from nemo_rl.weight_sync.refit_components import component_plan_digest
 from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
     SGLangDisaggregatedWeightSynchronizer,
@@ -629,6 +630,85 @@ class TestCollectiveWeightSynchronizer:
 
 class TestNcclReshardWeightSynchronizer:
     @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
+    def test_init_validates_refit_plan_before_collectives(self, mock_ray):
+        """Both synchronous metadata phases must finish before NCCL setup starts."""
+        events: list[str] = []
+        mock_ray.get.return_value = [True]
+        refit_info = build_nccl_reshard_refit_info(
+            {
+                "model.layers.0.mlp.gate_proj.weight": {
+                    "shape": [64, 32],
+                    "dtype": "torch.bfloat16",
+                }
+            },
+            train_parallelism={"tp_size": 2, "ep_size": 1, "pp_size": 1},
+            gen_parallelism={"tp_size": 4, "ep_size": 1, "pp_size": 1},
+            train_world_size=2,
+            gen_world_size=4,
+        )
+        policy = _mock_policy(
+            cfg={
+                "megatron_cfg": {
+                    "tensor_model_parallel_size": 2,
+                    "expert_model_parallel_size": 1,
+                    "pipeline_model_parallel_size": 1,
+                },
+                "generation": {"vllm_cfg": {"tensor_parallel_size": 4}},
+            },
+        )
+        generation = _mock_generation()
+
+        def record(event: str, result):
+            def call(*args, **kwargs):
+                events.append(event)
+                return result
+
+            return call
+
+        policy.prepare_nccl_reshard_refit_info.side_effect = record(
+            "policy.prepare_refit_info", refit_info
+        )
+        generation.prepare_nccl_reshard_refit_info.side_effect = record(
+            "generation.prepare_refit_info", None
+        )
+        policy.init_collective.side_effect = record(
+            "policy.init_collective", [MagicMock()]
+        )
+        generation.rebuild_collective.side_effect = record(
+            "generation.init_collective", [MagicMock()]
+        )
+        policy.init_nccl_reshard_comm_group.side_effect = record(
+            "policy.init_reshard", [MagicMock()]
+        )
+        generation.rebuild_nccl_reshard_comm_group.side_effect = record(
+            "generation.init_reshard", [MagicMock()]
+        )
+        train_cluster = _mock_cluster(world_size=2)
+        train_cluster.num_gpus_per_node = 8
+        train_cluster.get_available_address_and_port.return_value = (
+            "10.0.0.1",
+            12345,
+        )
+
+        sync = NcclReshardWeightSynchronizer(
+            policy, generation, train_cluster, _mock_cluster(world_size=4)
+        )
+
+        sync.init_communicator()
+
+        last_metadata_event = max(
+            events.index("policy.prepare_refit_info"),
+            events.index("generation.prepare_refit_info"),
+        )
+        first_collective_event = min(
+            events.index("policy.init_collective"),
+            events.index("generation.init_collective"),
+            events.index("policy.init_reshard"),
+            events.index("generation.init_reshard"),
+        )
+        assert last_metadata_event < first_collective_event
+
+    @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
     def test_init_communicator_ships_wire_safe_refit_info(self, mock_ray):
         # The train-side refit info carries MeshInfo rank tensors; the copy
         # handed to the generation side must be the wire-safe (plain-dict)
@@ -679,6 +759,7 @@ class TestNcclReshardWeightSynchronizer:
         policy.prepare_nccl_reshard_refit_info.assert_called_once()
         gen.prepare_nccl_reshard_refit_info.assert_called_once()
         (shipped,), _ = gen.prepare_nccl_reshard_refit_info.call_args
+        assert shipped["plan_digest"] == component_plan_digest(shipped)
         for params in shipped["per_layer_params"].values():
             for p in params:
                 assert isinstance(p["src_mesh_info"], dict)
