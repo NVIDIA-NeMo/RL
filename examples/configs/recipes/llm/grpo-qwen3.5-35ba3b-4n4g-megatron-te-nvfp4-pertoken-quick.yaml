@@ -7,7 +7,6 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3.5-35ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
 policy:
   train_global_batch_size: 16
-  logprob_batch_size: 1
   router_replay:
     enabled: true
   generation:
