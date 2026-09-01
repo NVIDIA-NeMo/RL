@@ -438,14 +438,17 @@ class TrtllmAsyncGenerationWorkerImpl:
         )
         tokenizer_backend = _tokenizer_backend_name(tokenizer)
         print(f"[TrtllmAsyncWorker] HTTP tokenizer backend: {tokenizer_backend}")
-        if (
-            os.environ.get("NRL_USE_FASTOKENS") == "1"
-            and tokenizer_backend != "fastokens._compat._TokenizerShim"
-        ):
+        # Assert the patch landed, not which private class implements it:
+        # fastokens renamed the shim (0.2.x `_compat._TokenizerShim` ->
+        # 0.3.x `_ConfiguredTokenizerShim`), and pinning the exact name makes
+        # this fail on every release that touches internals.
+        if os.environ.get(
+            "NRL_USE_FASTOKENS"
+        ) == "1" and not tokenizer_backend.startswith("fastokens."):
             raise RuntimeError(
                 "NRL_USE_FASTOKENS=1, but the TRT-LLM HTTP tokenizer backend "
-                f"is {tokenizer_backend!r}; expected "
-                "'fastokens._compat._TokenizerShim'"
+                f"is {tokenizer_backend!r}; expected a fastokens shim "
+                "(fastokens.patch_transformers() did not take effect)"
             )
         self._http_thread, self._http_base_url, self._http_server = start_server(
             llm=self.llm,
