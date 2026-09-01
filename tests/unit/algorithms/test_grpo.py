@@ -5588,6 +5588,15 @@ class TestAggregateRolloutMetrics:
         assert result["mean_gen_tokens_per_sample"] == pytest.approx(200.0)
         assert result["reward/mean"] == pytest.approx(0.7)
 
+    def test_group_std_metrics_are_summarized(self):
+        result = aggregate_rollout_metrics(
+            {"reward_score_raw/std_in_group": [0.1, 0.2, 0.3]}
+        )
+
+        assert result["reward_score_raw/std_in_group/mean"] == pytest.approx(0.2)
+        assert result["reward_score_raw/std_in_group/p05"] == pytest.approx(0.11)
+        assert result["reward_score_raw/std_in_group/p95"] == pytest.approx(0.29)
+
     def test_non_numeric_passed_through(self):
         metrics = {"some_list_metric": [["a", "b"], ["c", "d"]]}
         result = aggregate_rollout_metrics(metrics)

@@ -2057,6 +2057,64 @@ def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group():
         accumulator.add(1, {"row": 1})
 
 
+def test_group_reward_diagnostics_reports_ties_and_skips_incomplete_scores():
+    results = [
+        {
+            "full_result": {
+                "reward": reward,
+                "reward_score_raw": raw_score,
+                "reward_overall_raw": reward if index < 2 else None,
+            }
+        }
+        for index, (reward, raw_score) in enumerate(
+            ((1.0, 2.0), (1.0, 2.0), (2.0, 4.0))
+        )
+    ]
+
+    metrics = rollouts_mod._group_reward_diagnostics(results)
+
+    assert metrics["zero_advantage_group_pct"] == 0.0
+    assert metrics["total_reward/std_in_group"] == pytest.approx(1 / 3**0.5)
+    assert metrics["reward_score_raw/all_equal_in_group_pct"] == 0.0
+    assert metrics["reward_score_raw/pairwise_tie_pct"] == pytest.approx(100 / 3)
+    assert metrics["reward_score_raw/std_in_group"] == pytest.approx(2 / 3**0.5)
+    assert not any(key.startswith("reward_overall_raw/") for key in metrics)
+
+    equal_metrics = rollouts_mod._group_reward_diagnostics(
+        [
+            {"full_result": {"reward": 1.0, "reward_score_raw": 2.0}},
+            {"full_result": {"reward": 1.0, "reward_score_raw": 2.0}},
+        ]
+    )
+    assert equal_metrics["zero_advantage_group_pct"] == 100.0
+    assert equal_metrics["total_reward/std_in_group"] == 0.0
+    assert equal_metrics["reward_score_raw/all_equal_in_group_pct"] == 100.0
+    assert equal_metrics["reward_score_raw/pairwise_tie_pct"] == 100.0
+
+
+def test_sync_group_reward_diagnostics_preserve_prompt_boundaries():
+    results = [
+        {
+            "full_result": {
+                "reward": reward,
+                "reward_score_raw": reward,
+                "reward_overall_raw": reward,
+            }
+        }
+        for reward in (1.0, 1.0, 2.0, 2.0)
+    ]
+
+    metrics = rollouts_mod._group_reward_diagnostics(results, group_size=2)
+
+    assert metrics["zero_advantage_group_pct"] == 100.0
+    assert metrics["total_reward/std_in_group/mean"] == 0.0
+    assert metrics["total_reward/std_in_group/p05"] == 0.0
+    assert metrics["total_reward/std_in_group/p95"] == 0.0
+    assert metrics["reward_score_raw/all_equal_in_group_pct"] == 100.0
+    assert metrics["reward_score_raw/pairwise_tie_pct"] == 100.0
+    assert metrics["reward_score_raw/std_in_group/mean"] == 0.0
+
+
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
 def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     rows = [
@@ -2117,6 +2175,17 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     assert rollout_result.task_index == 42
     assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
     assert rollout_result.rollout_metrics["reward_score_raw/mean"] == 1.5
+    assert rollout_result.rollout_metrics["zero_advantage_group_pct"] == 0.0
+    assert (
+        rollout_result.rollout_metrics[
+            "reward_score_raw/all_equal_in_group_pct"
+        ]
+        == 0.0
+    )
+    assert rollout_result.rollout_metrics["reward_score_raw/pairwise_tie_pct"] == 0.0
+    assert rollout_result.rollout_metrics["reward_score_raw/std_in_group"] == pytest.approx(
+        2**-0.5
+    )
     assert rollout_result.rollout_metrics["reasoning_tokens_per_sample/mean"] == 0.5
     assert rollout_result.rollout_metrics["reasoning_tokens_per_sample/p05"] == 0.0
     assert rollout_result.rollout_metrics["reasoning_tokens_per_sample/p95"] == 1.0
@@ -2129,6 +2198,13 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     )
     assert rollout_result.rollout_metrics["reward_rubric_mean_clean/mean"] == 1.0
     assert rollout_result.rollout_metrics["reward_overall_raw/mean"] == 1.5
+    assert (
+        rollout_result.rollout_metrics[
+            "reward_overall_raw/all_equal_in_group_pct"
+        ]
+        == 0.0
+    )
+    assert rollout_result.rollout_metrics["reward_overall_raw/pairwise_tie_pct"] == 0.0
     assert rollout_result.rollout_metrics["reward_overall_len_adjusted/mean"] == pytest.approx(1.6)
     assert rollout_result.rollout_metrics["reward_length_adjustment/mean"] == 0.1
     assert (
@@ -2151,6 +2227,7 @@ def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
 
     async def fake_stream(**kwargs):
         assert kwargs["num_generations"] == input_batch.size
+        assert kwargs["reward_group_size"] == 1
         assert kwargs["returns_entire_batch"] is True
         assert kwargs["log_full_result_tables"] is False
         assert kwargs["deduplicate_multimodal_data"] is True
@@ -2166,6 +2243,7 @@ def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
         task_to_env={},
         generation_config={},
         log_full_result_tables=False,
+        num_generations_per_prompt=1,
         deduplicate_multimodal_data=True,
         debug_payload_metrics=True,
     )
@@ -2368,6 +2446,7 @@ def test_run_async_nemo_gym_rollout(
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         generation_config=nemo_gym_vllm_generation.cfg,
         log_full_result_tables=True,
+        num_generations_per_prompt=1,
         max_rollout_turns=None,
         debug_payload_metrics=True,
     )
