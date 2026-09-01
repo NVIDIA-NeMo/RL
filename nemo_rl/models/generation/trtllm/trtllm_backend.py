@@ -261,7 +261,7 @@ class NcclExtension(WorkerExtension):
                 self._finalize_weight_update()
                 torch.cuda.current_stream().synchronize()
 
-                self.engine.reset_prefix_cache()
+                self.engine.recompute_active_requests()
             except Exception as e:
                 self._abort_weight_update_after_failure(
                     model, model_engine.model_loader, e
