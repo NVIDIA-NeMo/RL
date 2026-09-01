@@ -593,48 +593,80 @@ class TrtllmGeneration(GenerationInterface):
             DisaggServerActor,
         )
 
+        n_fe = int(disagg.get("num_frontend_workers") or 1)
+        assert self.num_replicas * n_fe <= 256, (
+            "replicas * num_frontend_workers must fit the snowflake node_id "
+            f"space (8 bits): {self.num_replicas} * {n_fe} > 256"
+        )
+        # Deterministic ports: a restarted frontend re-binds the same port on
+        # its pinned node, so the URL Gym holds stays valid across crashes.
+        # Keep the base outside virtual_cluster's random master-port window
+        # (1400-1999); frontends on one node get base+frontend_idx.
+        base_port = int(disagg.get("frontend_base_port") or 17300)
+
         self._disagg_actors = []
         futures = []
         for replica_idx in range(self.num_replicas):
             base = replica_idx * per_replica
-            # Its own CPU-only actor rather than an engine worker's process:
-            # this is the request hot path for the whole replica, and sharing a
-            # process with an engine would couple the replica's routing latency
-            # to that one engine's load. Soft-pinned to the node holding its
-            # first context engine so routing hops stay local when they can.
-            actor = DisaggServerActor.options(
-                scheduling_strategy=NodeAffinitySchedulingStrategy(
-                    node_id=addrs[base]["node_id"], soft=True
+            serve_args = dict(
+                ctx_addrs=[
+                    (a["host"], a["port"]) for a in addrs[base : base + num_ctx]
+                ],
+                gen_addrs=[
+                    (a["host"], a["port"])
+                    for a in addrs[base + num_ctx : base + per_replica]
+                ],
+                ctx_router=disagg["ctx_router"],
+                gen_router=disagg["gen_router"],
+                gen_tokids_ctxbytes=bool(disagg.get("gen_tokids_ctxbytes", False)),
+                gen_strip_message_history=bool(
+                    disagg.get("gen_strip_message_history", False)
                 ),
-                name=f"trtllm_disagg_server_{replica_idx}",
-                # The server imports tensorrt_llm (OpenAIDisaggServer,
-                # disagg_utils), which only exists in the engine workers' venv.
-                # Without this the actor starts in the driver's environment and
-                # dies with ModuleNotFoundError: No module named 'tensorrt_llm'.
-                # The venv already exists on every node -- the worker group
-                # created it before these actors are spawned.
-                runtime_env={"py_executable": self.worker_group.py_executable},
-            ).remote(replica_idx)
-            self._disagg_actors.append(actor)
-
-            futures.append(
-                actor.start.remote(
-                    ctx_addrs=[
-                        (a["host"], a["port"]) for a in addrs[base : base + num_ctx]
-                    ],
-                    gen_addrs=[
-                        (a["host"], a["port"])
-                        for a in addrs[base + num_ctx : base + per_replica]
-                    ],
-                    ctx_router=disagg["ctx_router"],
-                    gen_router=disagg["gen_router"],
-                )
+                frontend_tokenize=bool(disagg.get("frontend_tokenize", False)),
+                model_name=self.cfg["model_name"],
+                default_chat_template_kwargs=self.cfg["trtllm_cfg"].get(
+                    "default_chat_template_kwargs"
+                ),
             )
+            for fe_idx in range(n_fe):
+                # Its own CPU-only actor rather than an engine worker's
+                # process: this is the request hot path for the whole replica,
+                # and sharing a process with an engine would couple the
+                # replica's routing latency to that one engine's load.
+                # Frontends spread round-robin across the replica's engine
+                # nodes; the pin is HARD and restarts are unlimited so a
+                # crashed frontend re-serves the same host:port (the
+                # constructor starts the server -- Ray never replays method
+                # calls on restart).
+                pin_node = addrs[base + (fe_idx % per_replica)]["node_id"]
+                actor = DisaggServerActor.options(
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        node_id=pin_node, soft=False
+                    ),
+                    name=f"trtllm_disagg_server_{replica_idx}_{fe_idx}",
+                    max_restarts=-1,
+                    # The server imports tensorrt_llm (OpenAIDisaggServer,
+                    # disagg_utils), which only exists in the engine workers'
+                    # venv. Without this the actor starts in the driver's
+                    # environment and dies with ModuleNotFoundError.
+                    runtime_env={"py_executable": self.worker_group.py_executable},
+                ).remote(
+                    replica_idx,
+                    frontend_idx=fe_idx,
+                    num_frontends=n_fe,
+                    port=base_port + fe_idx,
+                    serve_args=serve_args,
+                )
+                self._disagg_actors.append(actor)
+                # start() waits for readiness and returns the URL; the server
+                # itself was already brought up by the constructor.
+                futures.append(actor.start.remote())
 
         self._disagg_server_urls = ray.get(futures)
         print(
             f"  ✓ PD disaggregation: {self.num_replicas} replica(s) x "
-            f"({num_ctx} context + {num_gen} generation) engines; "
+            f"({num_ctx} context + {num_gen} generation) engines, "
+            f"{n_fe} frontend worker(s) each; "
             f"disagg servers: {self._disagg_server_urls}",
             flush=True,
         )
@@ -683,7 +715,7 @@ class TrtllmGeneration(GenerationInterface):
         return ray.get(futures)
 
     def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
-        """One OpenAI-compatible base URL per DP shard, in shard order.
+        """One or more OpenAI-compatible base URLs per DP shard, in shard order.
 
         A shard's entry point is not always an engine: under disaggregation the
         caller must talk to the replica's disagg server, which routes prefill and

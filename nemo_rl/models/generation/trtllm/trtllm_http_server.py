@@ -26,7 +26,10 @@ Under PD disaggregation this endpoint is *leg-aware*. A replica's
   rebuilding them, so the sequence matches the KV that was transferred.
 """
 
+import asyncio
 import logging
+import os
+import random
 import threading
 import time
 import uuid
@@ -40,6 +43,78 @@ from nemo_rl.models.generation.openai_server_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _tokenizer_backend_name(tokenizer: Any) -> str:
+    """Return the concrete backend that performs encode/decode operations."""
+    backend = getattr(tokenizer, "_tokenizer", None)
+    implementation = backend if backend is not None else tokenizer
+    implementation_type = type(implementation)
+    return f"{implementation_type.__module__}.{implementation_type.__name__}"
+
+
+async def build_spliced_prompt_ids(
+    messages: list[dict],
+    tools: "list[dict] | None",
+    tokenizer: Any,
+    model_config: Any,
+    template_kwargs: dict[str, Any],
+) -> list[int]:
+    """Render the chat template and splice in the on-policy prefix.
+
+    The single source of truth for turning a conversation into engine prompt
+    ids -- shared by the engine adapter's route and the disagg frontend's
+    tokenizer (phase-2 ``frontend_tokenize``) so both produce IDENTICAL ids;
+    a divergence between them would silently train on off-policy tokens.
+
+    Raises ``ValueError`` for unparseable or multimodal messages. The
+    tokenizer-heavy part runs in a thread: the HF fast tokenizer releases the
+    GIL, so a 30k-token render stops serializing the caller's event loop.
+    """
+    from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
+
+    conversation, mm_coroutine, *_ = parse_chat_messages_coroutines(
+        messages, model_config
+    )
+    mm_data, mm_embeddings = await mm_coroutine
+    if mm_data is not None or mm_embeddings is not None:
+        raise ValueError(
+            "NeMo-RL's TRT-LLM HTTP adapter does not support multimodal chat inputs"
+        )
+
+    def _sync() -> list[int]:
+        # Full retokenization avoids accumulating generation token IDs twice.
+        prompt_token_ids = _build_prompt_token_ids(
+            conversation,
+            tokenizer,
+            tools=tools,
+            default_template_kwargs=template_kwargs,
+        )
+        # Empty required_prefix_ids on turn one returns the template unchanged.
+        required_prefix_ids, template_prefix_ids = _compute_splice_inputs(
+            messages,
+            conversation,
+            tokenizer,
+            tools,
+            template_kwargs,
+        )
+        return replace_prefix_tokens(
+            tokenizer=tokenizer,
+            model_prefix_token_ids=required_prefix_ids,
+            template_prefix_token_ids=template_prefix_ids,
+            template_token_ids=prompt_token_ids,
+        )
+
+    return await asyncio.to_thread(_sync)
+
+
+# Sampling rate for shadow-validating frontend-supplied prompt ids on the
+# context leg: the ctx adapter recomputes the ids from the messages it also
+# received and logs a mismatch. Cheap insurance while frontend_tokenize is
+# young; 0 disables.
+_TOKENIZE_SHADOW_RATE = float(
+    os.environ.get("NRL_TRTLLM_TOKENIZE_SHADOW_RATE", "0") or 0
+)
 
 
 def _context_leg_response(
@@ -180,8 +255,6 @@ def create_app(
     _tool_parser_instance = _build_tool_parser(_tool_parser_name)
     _parse_tool_calls = _make_parse_tool_calls(_tool_parser_instance)
 
-    from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
-
     model_config = getattr(llm, "_hf_model_config", None)
     if model_config is None:
         raise RuntimeError(
@@ -263,52 +336,15 @@ def create_app(
             else None
         )
 
-        try:
-            conversation, mm_coroutine, _ = parse_chat_messages_coroutines(
-                messages, model_config
-            )
-            mm_data, mm_embeddings = await mm_coroutine
-        except ValueError as e:
-            return JSONResponse(status_code=400, content={"error": str(e)})
-
-        # This token-only adapter does not support multimodal inputs.
-        if mm_data is not None or mm_embeddings is not None:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "NeMo-RL's TRT-LLM HTTP adapter does not support "
-                    "multimodal chat inputs"
-                },
-            )
-
-        # Full retokenization avoids accumulating generation token IDs twice.
-        prompt_token_ids = _build_prompt_token_ids(
-            conversation,
-            tokenizer,
-            tools=tools,
-            default_template_kwargs=effective_template_kwargs,
-        )
-
-        # Empty required_prefix_ids on turn one returns the template unchanged.
-        required_prefix_ids, template_prefix_ids = _compute_splice_inputs(
-            messages,
-            conversation,
-            tokenizer,
-            tools,
-            effective_template_kwargs,
-        )
-
-        adj_prompt = replace_prefix_tokens(
-            tokenizer=tokenizer,
-            model_prefix_token_ids=required_prefix_ids,
-            template_prefix_token_ids=template_prefix_ids,
-            template_token_ids=prompt_token_ids,
-        )
-
         # On the generation leg the disagg server hands over the exact token ids
         # the context engine built KV for (openai_disagg_service._get_gen_request).
         # Rebuilding them from `messages` could yield a different sequence, which
-        # would decode against mismatched KV -- and silently. Prefer what it sent.
+        # would decode against mismatched KV -- and silently. Prefer what it sent,
+        # and skip the chat-template work entirely: nothing downstream of this
+        # block reads `conversation`, and under gen_strip_message_history the
+        # messages are not even complete. (Before this short-circuit the
+        # generation leg rendered two full 30k-token templates per request and
+        # then discarded them.)
         supplied = body.get("prompt_token_ids")
         if supplied is None and body.get("prompt_token_ids_b64"):
             # Same int32 buffer encoding openai_server.py uses on this hop.
@@ -319,8 +355,65 @@ def create_app(
             supplied = np.frombuffer(
                 base64.b64decode(body["prompt_token_ids_b64"]), dtype=np.int32
             ).tolist()
+
         if supplied:
             adj_prompt = list(supplied)
+            # Shadow validation for frontend-tokenized ids (context leg only:
+            # the generation leg's ids legitimately extend past the messages).
+            if (
+                is_context_leg
+                and messages
+                and _TOKENIZE_SHADOW_RATE > 0
+                and random.random() < _TOKENIZE_SHADOW_RATE
+            ):
+                try:
+                    recomputed = await build_spliced_prompt_ids(
+                        messages,
+                        tools,
+                        tokenizer,
+                        model_config,
+                        effective_template_kwargs,
+                    )
+                    if recomputed != adj_prompt:
+                        diff = next(
+                            (
+                                i
+                                for i, (a, b) in enumerate(zip(adj_prompt, recomputed))
+                                if a != b
+                            ),
+                            min(len(adj_prompt), len(recomputed)),
+                        )
+                        lo, hi = max(0, diff - 8), diff + 8
+                        logger.error(
+                            "frontend-tokenize SHADOW MISMATCH: supplied %d ids, "
+                            "recomputed %d, first divergence at %d; "
+                            "supplied[%d:%d]=%s (%r) vs recomputed=%s (%r); "
+                            "template_kwargs=%r first_msg_role=%r",
+                            len(adj_prompt),
+                            len(recomputed),
+                            diff,
+                            lo,
+                            hi,
+                            adj_prompt[lo:hi],
+                            tokenizer.decode(adj_prompt[lo:hi]),
+                            recomputed[lo:hi],
+                            tokenizer.decode(recomputed[lo:hi]),
+                            effective_template_kwargs,
+                            (messages[0] or {}).get("role") if messages else None,
+                        )
+                except Exception as e:  # noqa: BLE001 - shadow must never fail serving
+                    logger.error("frontend-tokenize shadow recompute failed: %s", e)
+        else:
+            try:
+                adj_prompt = await build_spliced_prompt_ids(
+                    messages,
+                    tools,
+                    tokenizer,
+                    model_config,
+                    effective_template_kwargs,
+                )
+            except ValueError as e:
+                return JSONResponse(status_code=400, content={"error": str(e)})
 
         max_tokens_requested = (
             body.get("max_tokens") or body.get("max_completion_tokens") or max_seq_len
@@ -480,7 +573,15 @@ def create_app(
             # this declared string field is how the ids survive the disagg
             # server's strict re-validation. Same encoding vLLM uses, which is
             # what NeMo-Gym already parses.
-            as_ids = bool(body.get("return_tokens_as_token_ids"))
+            # Under disaggregation the flag never survives the frontend's
+            # gym-field strip, yet ids are exactly what rides this channel
+            # (the disagg adaptor parses token_id:N back out) -- and decoding
+            # each generated token individually is per-token tokenizer work
+            # nobody reads. Force the id encoding on any disagg request.
+            as_ids = (
+                bool(body.get("return_tokens_as_token_ids"))
+                or disagg_params is not None
+            )
             response["choices"][0]["logprobs"] = {
                 "content": [
                     {
