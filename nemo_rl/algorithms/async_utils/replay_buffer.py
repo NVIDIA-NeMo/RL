@@ -982,12 +982,14 @@ class TQReplayBuffer:
         *,
         pad_value_dict: Mapping[str, int],
         overlong_filtering: bool,
+        include_message_violation_fields: bool,
         require_routed_experts: bool = False,
     ):
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
         self._overlong_filtering = overlong_filtering
+        self._include_message_violation_fields = include_message_violation_fields
         self._require_routed_experts = require_routed_experts
         self.meta_list: list[Optional[KVBatchMeta]] = []
         self.start_weight_list: list[int] = []
@@ -1096,6 +1098,7 @@ class TQReplayBuffer:
             record,
             pad_value_dict=self._pad_value_dict,
             overlong_filtering=self._overlong_filtering,
+            include_message_violation_fields=self._include_message_violation_fields,
         )
         sample_ids, fields, tags = pack_payload(
             train_batch,

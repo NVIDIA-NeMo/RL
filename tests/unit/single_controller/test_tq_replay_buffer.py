@@ -45,8 +45,9 @@ def _stub_record_to_train_batch(
     *,
     pad_value_dict: Any,
     overlong_filtering: bool,
+    include_message_violation_fields: bool,
 ) -> BatchedDataDict[Any]:
-    del record, pad_value_dict, overlong_filtering
+    del record, pad_value_dict, overlong_filtering, include_message_violation_fields
     return BatchedDataDict[Any](
         {
             "input_ids": torch.ones((_N_GENS, 3), dtype=torch.long),
@@ -188,6 +189,7 @@ def _make_buffer(
         partition_id="rollout_data",
         pad_value_dict={"token_ids": 0},
         overlong_filtering=overlong_filtering,
+        include_message_violation_fields=False,
         require_routed_experts=require_routed_experts,
     )
     buffer.set_data_plane_checkpoint_barrier(
@@ -323,12 +325,15 @@ class TestTQReplayBufferReserveCommit:
             *,
             pad_value_dict: Any,
             overlong_filtering: bool,
+            include_message_violation_fields: bool,
         ) -> BatchedDataDict[Any]:
+            del include_message_violation_fields
             received.append(overlong_filtering)
             return _stub_record_to_train_batch(
                 record,
                 pad_value_dict=pad_value_dict,
                 overlong_filtering=overlong_filtering,
+                include_message_violation_fields=False,
             )
 
         monkeypatch.setattr(
@@ -601,6 +606,7 @@ class TestTQReplayBufferRemove:
             partition_id="rollout_data",
             pad_value_dict={"token_ids": 0},
             overlong_filtering=False,
+            include_message_violation_fields=False,
         )
 
         with pytest.raises(RuntimeError, match="must be bound"):
