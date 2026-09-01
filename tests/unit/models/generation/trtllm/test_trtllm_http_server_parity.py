@@ -272,7 +272,7 @@ def _run_trtllm_server_process(
             tokenizer_revision=MODEL_REVISION,
             tensor_parallel_size=1,
             max_num_tokens=2048,
-            kv_cache_config=KvCacheConfig(avg_seq_len=64),
+            kv_cache_config=KvCacheConfig(),
         )
         server_thread, base_url, server = start_server(
             llm=llm,
