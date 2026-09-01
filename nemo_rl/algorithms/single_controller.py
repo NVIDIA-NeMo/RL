@@ -1316,6 +1316,10 @@ class SingleControllerActor:
             # The actor publishes canonical rows before returning metadata. Keep
             # the remote write, local replay-index update, and lineage hand-off in
             # one mutation cut so a TQ snapshot sees all of them or none of them.
+            # This deliberately makes checkpoint acquisition wait for the tail of
+            # every in-flight finalizer RPC. Releasing the cut across the await
+            # would let a snapshot preserve canonical rows without the matching
+            # replay index and lineage transition, which is not recoverable.
             async with self._data_plane_checkpoint_barrier.mutation() as cut:
                 ledger = self._rollout_recovery_ledger
                 ledger.mark_finalization_started(cut, request.group_id)

@@ -1341,6 +1341,7 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         await ctrl._rollout_pump()
 
         assert manager.recovery_ledger.groups() == []
+        assert manager.stats.committed == int(committed)
         # A committed group transfers its permit to the train pump; a dropped
         # group returns it immediately because no canonical replay row owns it.
         assert ctrl._buffer_capacity._value == (0 if committed else 1)

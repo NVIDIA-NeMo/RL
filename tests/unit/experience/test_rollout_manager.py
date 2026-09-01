@@ -1659,6 +1659,35 @@ class TestGenerateForFinalizationFlow:
             _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
         assert len(buf.abort_calls) == 1
 
+    def test_cancel_after_controller_discard_preserves_cancelled_error(self):
+        """A stale abort may delete lineage before rollout cleanup runs."""
+
+        async def _scenario() -> None:
+            started = asyncio.Event()
+
+            async def _block(_sample: object) -> None:
+                started.set()
+                await asyncio.Event().wait()
+
+            buf = _FakeCaptureBuffer()
+            mgr = _make_capture_manager(buf, on_run=_block)
+            task = asyncio.create_task(
+                mgr.generate_for_finalization({"prompt": "p", "idx": 0})
+            )
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            (group_id,) = buf._slots
+            async with buf.data_plane_checkpoint_barrier.mutation() as cut:
+                mgr.discard_prompt_group(cut, group_id)
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert group_id not in mgr.recovery_ledger
+            assert buf.abort_calls == [group_id]
+
+        asyncio.run(_scenario())
+
     def test_retries_infrastructure_failure_with_stable_logical_ids(self):
         buf = _FakeCaptureBuffer()
         attempts = 0
