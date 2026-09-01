@@ -54,7 +54,30 @@ class TrtllmDisaggArgs(TypedDict):
     # Mapped onto TRT-LLM's CacheTransceiverConfig.
     # DEFAULT | UCX | NIXL | MOONCAKE | MPI
     cache_transceiver_backend: str
+
+    # "CPP" | "PYTHON" | "auto". TRT-LLM defaults to "auto", which only adopts
+    # the model's preferred runtime when the effective backend supports it and
+    # silently falls back to the C++ transceiver otherwise -- and that fallback
+    # is not what a hybrid Mamba model wants: the recurrent-state handoff needs
+    # the Python (v2) transceiver. Left unset here so TRT-LLM keeps its own
+    # default; set it explicitly to force one.
+    cache_transceiver_runtime: NotRequired[str]
+
+    # MiB of bounce buffer, or 0 to keep the per-block path. Bounce coalesces a
+    # request's scattered per-block KV into one contiguous fabric-VMM buffer and
+    # issues a single multi-rail NIXL write, which sidesteps registering every
+    # VMM-split block descriptor individually -- the step that fails here with
+    # "registerMem: registration failed for the specified or all potential
+    # backends". Only the Python (v2) transceiver reads it.
+    kv_cache_bounce_size_mb: NotRequired[int]
     max_tokens_in_buffer: NotRequired[int]
+
+    # Milliseconds before an unfinished KV transfer is cancelled on either
+    # side. TRT-LLM's default (60 s) is tuned for short prompts at low
+    # concurrency; at high rollout concurrency the ctx-side timeout can fire
+    # in bulk and the resulting cancel/retry churn stresses the transceiver,
+    # so large multi-turn workloads want a much larger value.
+    kv_transfer_timeout_ms: NotRequired[int]
 
     # Per-role overrides merged over trtllm_cfg. Any trtllm_cfg key goes here --
     # tensor_parallel_size and the MoE split are the ones that usually differ,
