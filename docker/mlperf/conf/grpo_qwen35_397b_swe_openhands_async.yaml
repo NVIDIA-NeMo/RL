@@ -405,7 +405,8 @@ env:
           agent_max_turns: 30
           # Qualified train/validation protocol for the 48-node rollout pool.
           swebench_agent_timeout: 1800
-          swebench_tests_timeout: 300
+          swebench_tests_timeout: 60
+          command_exec_timeout: 60
           concurrency: 256
           base_results_dir: /logs/nemo_gym/swe_agents_train
           dataset_path: ${data.train.data_path}
@@ -421,7 +422,8 @@ env:
           agent_framework_commit: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.agent_framework_commit}
           agent_max_turns: 30
           swebench_agent_timeout: 1800
-          swebench_tests_timeout: 180
+          swebench_tests_timeout: 60
+          command_exec_timeout: 60
           concurrency: 256
           base_results_dir: /logs/nemo_gym/swe_agents_val
           dataset_path: ${data.validation.data_path}
