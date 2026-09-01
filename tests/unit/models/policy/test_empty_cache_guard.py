@@ -56,3 +56,27 @@ def test_empty_cache_guard_swallows_variant_runtime_error(monkeypatch):
         assert torch.cuda.empty_cache is wrapped
     finally:
         torch.cuda.empty_cache = original
+
+
+def test_empty_cache_guard_reraises_unrelated_runtime_errors(monkeypatch):
+    """Only the known expandable-segments allocator error is swallowed;
+    any other RuntimeError must propagate."""
+    import pytest
+
+    from nemo_rl.models.policy.utils import (
+        make_empty_cache_best_effort_under_expandable_segments,
+    )
+
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    original = torch.cuda.empty_cache
+
+    def _raises_other():
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    try:
+        torch.cuda.empty_cache = _raises_other
+        make_empty_cache_best_effort_under_expandable_segments()
+        with pytest.raises(RuntimeError, match="illegal memory access"):
+            torch.cuda.empty_cache()
+    finally:
+        torch.cuda.empty_cache = original
