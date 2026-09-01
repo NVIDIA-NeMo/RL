@@ -509,6 +509,40 @@ def shutdown_environments(
                     print(f"Error stopping environment {task_name}: {kill_error}")
 
 
+def _clamp_max_num_steps_to_epochs(
+    grpo_config: GRPOConfig,
+    train_sample_count: int,
+    *,
+    use_multiple_dataloader: bool,
+) -> None:
+    """Lower max_num_steps to the steps max_num_epochs is worth.
+
+    async_grpo_train has no epoch loop -- it consumes the trajectory collector's
+    buffer rather than iterating the dataloader -- so max_num_epochs can only
+    bound it through the step count. Without this the run passes its last epoch
+    and the collector raises on an exhausted dataloader.
+
+    single_controller_utils.setup._clamp_max_num_steps does the same for the
+    single-controller path, which has no epoch loop either. It is not reused
+    here: it imports from this module, it takes the dataloader rather than a
+    step count (multiple dataloaders have no single one to measure), and it has
+    no exemption for them.
+
+    Args:
+        grpo_config: Mutated in place; only max_num_steps changes.
+        train_sample_count: Steps in one epoch, i.e. len(dataloader).
+        use_multiple_dataloader: When set, MultipleDataloaderWrapper is an
+            infinite iterator, so an epoch has no length to derive a bound from
+            and max_num_steps is left alone.
+    """
+    if use_multiple_dataloader or grpo_config.max_num_epochs <= 0:
+        return
+    grpo_config.max_num_steps = min(
+        grpo_config.max_num_steps,
+        grpo_config.max_num_epochs * train_sample_count,
+    )
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -1193,13 +1227,15 @@ def setup(
 
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
 
+    _clamp_max_num_steps_to_epochs(
+        grpo_config,
+        train_sample_count,
+        use_multiple_dataloader=master_config["data"]["use_multiple_dataloader"],
+    )
+
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(
-            grpo_config.max_num_steps,
-            grpo_config.max_num_epochs * train_sample_count,
-        )
-        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+        policy_config["megatron_cfg"]["train_iters"] = grpo_config.max_num_steps
 
     # Megatron generation expresses recompute-after-refit engine-side via
     # `kv_cache_management_mode="recompute"`; the loop-level flag must agree.
