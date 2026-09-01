@@ -28,6 +28,9 @@ async_rl:
   diagnostics: true
 
 policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 2
   generation:
     backend: megatron
     colocated:
@@ -37,6 +40,8 @@ policy:
         gpus_per_node: 2
     mcore_generation_config:
       transformer_impl: inference_optimized
+      tensor_model_parallel_size: 2
+      expert_model_parallel_size: 2
       moe_router_dtype: fp32
       moe_pad_experts_for_cuda_graph_inference: false
       cuda_graph_impl: local
@@ -44,6 +49,7 @@ policy:
       num_cuda_graphs: -1
       use_cuda_graphs_for_non_decode_steps: false
       enable_chunked_prefill: true
+      enable_prefix_caching: false
       async_sched_mode: async
       kv_cache_management_mode: persist
       refit_backend: nccl

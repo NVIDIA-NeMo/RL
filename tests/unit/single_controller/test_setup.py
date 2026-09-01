@@ -1045,8 +1045,14 @@ class TestSetup:
         }
         assert call_kwargs["is_vlm"] is True
         warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs["fields"]
-        assert "pixel_values" in warmup_fields
-        assert "__nrl_packed_tensor_meta__pixel_values" in warmup_fields
+        for field in (
+            "pixel_values",
+            "image_grid_thw",
+            "imgs_sizes",
+            "num_frames",
+            "mm_token_type_ids",
+        ):
+            assert field in warmup_fields
 
     def test_weight_sync_factory_args(self, patched_factories):
         """create_weight_synchronizer receives policy / generation / topology."""

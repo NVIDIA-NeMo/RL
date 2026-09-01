@@ -1,7 +1,9 @@
 # NeMo-RL v2 SingleController overlay for one-node, non-colocated Omni CLEVR.
-defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-1n4g-megatron_generation.v1.yaml
+defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron_generation.v1.yaml
 
 grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 8
   async_grpo: null
   val_period: 0
   val_at_start: false
@@ -26,8 +28,13 @@ async_rl:
   diagnostics: true
 
 policy:
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 2
   generation:
     backend: megatron
+    max_new_tokens: 512
     colocated:
       enabled: false
       resources:
@@ -35,6 +42,8 @@ policy:
         gpus_per_node: 2
     mcore_generation_config:
       transformer_impl: inference_optimized
+      tensor_model_parallel_size: 2
+      expert_model_parallel_size: 2
       moe_router_dtype: fp32
       moe_pad_experts_for_cuda_graph_inference: false
       cuda_graph_impl: local
@@ -45,6 +54,9 @@ policy:
       async_sched_mode: async
       kv_cache_management_mode: persist
       refit_backend: nccl
+
+data:
+  num_workers: 0
 
 cluster:
   num_nodes: 1
