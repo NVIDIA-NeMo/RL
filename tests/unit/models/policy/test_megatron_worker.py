@@ -60,6 +60,7 @@ def test_get_topk_logits_can_return_normalized_logprobs():
     worker.model_slices_context_parallel_inputs = False
     worker.defer_fp32_logits = False
     worker.sampling_params = MagicMock()
+    worker.media_placeholder_token_id = None
     data = BatchedDataDict({"input_ids": torch.zeros(2, 3, dtype=torch.long)})
     first_indices = torch.tensor([[[1, 2], [3, 4]]])
     second_indices = torch.tensor([[[5, 6], [7, 8]]])
