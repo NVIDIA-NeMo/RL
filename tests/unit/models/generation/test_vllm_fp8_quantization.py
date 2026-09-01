@@ -918,6 +918,110 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
 
+@pytest.mark.parametrize(
+    "use_ray_v2", ["1", "0"], ids=["ray_executor_v2", "ray_executor_v1"]
+)
+def test_multi_gpu_fp8_patches_before_model_load(fp8_module, monkeypatch, use_ray_v2):
+    """Both Ray executors must receive the FP8 patches before worker/model init."""
+    from vllm import envs
+    from vllm.v1.executor.abstract import Executor
+    from vllm.v1.executor.ray_executor import RayDistributedExecutor
+    from vllm.v1.executor.ray_executor_v2 import RayExecutorV2, RayWorkerProc
+
+    fp8 = fp8_module
+    events = []
+    fp8_config = fp8.FP8Config(model_parallel_size=2)
+    vllm_config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(distributed_executor_backend="ray")
+    )
+
+    # vLLM memoizes env lookups once an engine has been built in-process, which
+    # would make setenv below a silent no-op and quietly test one branch twice.
+    envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", use_ray_v2)
+    uses_v2 = use_ray_v2 == "1"
+    assert envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND is uses_v2
+    assert Executor.get_class(vllm_config) is (
+        RayExecutorV2 if uses_v2 else RayDistributedExecutor
+    )
+
+    def fake_apply_fp8_patches(_worker, config):
+        events.append(("apply_fp8_patches", config))
+        fp8.fp8_patches_applied = True
+
+    def fake_initialize_worker(_worker, *args, **kwargs):
+        events.append(("initialize_worker", args))
+        assert fp8.fp8_patches_applied, (
+            "RayExecutorV2 started worker/model initialization before NeMo-RL "
+            "installed its FP8 patches"
+        )
+
+    def fake_collective_rpc(_executor, *_args, **_kwargs):
+        events.append(("collective_rpc", None))
+        assert fp8.fp8_patches_applied, (
+            "RayDistributedExecutor started worker/model initialization before "
+            "NeMo-RL installed its FP8 patches"
+        )
+
+    monkeypatch.setattr(fp8, "apply_fp8_patches", fake_apply_fp8_patches)
+    # monkey_patch_vllm_ray_executor() rebinds these by raw class assignment with
+    # no cleanup of its own, so register both with monkeypatch to undo the rebind
+    # even when this regression test fails.
+    monkeypatch.setattr(RayWorkerProc, "initialize_worker", fake_initialize_worker)
+    monkeypatch.setattr(RayDistributedExecutor, "collective_rpc", fake_collective_rpc)
+
+    fp8.monkey_patch_vllm_ray_executor(fp8_config)
+
+    if uses_v2:
+        assert RayDistributedExecutor.collective_rpc is fake_collective_rpc, (
+            "the V1 executor must be left unpatched when the V2 backend is active"
+        )
+        patched_initialize_worker = RayWorkerProc.initialize_worker
+        # cloudpickle reconstructs nested functions with a distinct globals dict.
+        worker_initialize_worker = types.FunctionType(
+            patched_initialize_worker.__code__,
+            patched_initialize_worker.__globals__.copy(),
+            closure=patched_initialize_worker.__closure__,
+        )
+        worker_initialize_worker(object(), 0, {})
+        worker_initialize_worker(object(), 0, {})
+
+        assert events == [
+            ("apply_fp8_patches", fp8_config),
+            ("initialize_worker", (0, {})),
+            ("initialize_worker", (0, {})),
+        ]
+    else:
+        assert RayWorkerProc.initialize_worker is fake_initialize_worker, (
+            "the V2 worker hook must be left unpatched when the V1 backend is active"
+        )
+
+        # execute_method(fn, cfg) ends up calling fn(worker, cfg) upstream, so pass
+        # the worker through rather than None to mirror apply_fp8_patches(self, cfg).
+        def make_worker():
+            worker = types.SimpleNamespace()
+
+            def fake_execute_method_remote(fn, config):
+                fn(worker, config)
+                return object()
+
+            worker.execute_method = types.SimpleNamespace(
+                remote=fake_execute_method_remote
+            )
+            return worker
+
+        monkeypatch.setattr(fp8, "ray", types.SimpleNamespace(get=lambda _future: None))
+        executor = types.SimpleNamespace(workers=[make_worker()])
+        RayDistributedExecutor.collective_rpc(executor, "init_device")
+        RayDistributedExecutor.collective_rpc(executor, "init_device")
+
+        assert events == [
+            ("apply_fp8_patches", fp8_config),
+            ("collective_rpc", None),
+            ("collective_rpc", None),
+        ]
+
+
 def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     """Refit runs this every step; rebinding .data each time fragments memory.
 
