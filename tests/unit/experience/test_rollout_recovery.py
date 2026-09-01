@@ -28,7 +28,6 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     PromptGroupPhase,
@@ -93,29 +92,6 @@ def _shuffled_prompt_loader(seed: int = 123) -> StatefulDataLoader:
     )
 
 
-def _group_state(
-    idx: int = 7,
-    *,
-    target_step: int | None = 7,
-    phase: str = "admitted",
-) -> dict:
-    return {
-        "group_id": f"g{idx}",
-        "admission_id": "batch-7",
-        "prompt_id": str(idx),
-        "prompt_ref": {
-            "sample_id": str(idx),
-            "task_name": None,
-        },
-        "agent_name": None,
-        "recovery_granularity": "sibling",
-        "expected_generations": 2,
-        "target_step": target_step,
-        "start_weight_version": 7,
-        "phase": phase,
-    }
-
-
 def test_ledger_round_trip_preserves_group_ownership() -> None:
     ledger = RolloutRecoveryLedger()
     _reserve(
@@ -133,6 +109,13 @@ def test_ledger_round_trip_preserves_group_ownership() -> None:
     )
 
     state = ledger.state_dict()
+    assert "open_train_step" not in state
+    assert {
+        "canonical_meta",
+        "group_min_weight_version",
+        "group_max_weight_version",
+        "claimed_train_step",
+    }.isdisjoint(state["groups"][0])
     restored = RolloutRecoveryLedger()
     _load(restored, state)
 
@@ -615,7 +598,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     assert rewards == [0.0, 1.0]
 
     state["schema_version"] = 3
-    with pytest.raises(ValueError, match="before schema v4"):
+    with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):
         RolloutRecoveryLedger.from_state_dict(state)
 
 
@@ -680,9 +663,7 @@ def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
             gate_rollout_id=gate_id,
             receipt={
                 "rollout_id": gate_id,
-                "manifest": [
-                    {"staging_key": f"g7/sibling-{generation_index}/call-0"}
-                ],
+                "manifest": [{"staging_key": f"g7/sibling-{generation_index}/call-0"}],
             },
             reward=1.0,
         )
@@ -776,58 +757,6 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
         ledger.state_dict()
 
 
-def test_checkpoint_rejects_an_open_optimizer_step() -> None:
-    ledger = RolloutRecoveryLedger()
-    group = _reserve(
-        ledger,
-        group_id="g7",
-        admission_id="batch-7",
-        prompt_id="7",
-        prompt_payload=_prompt(),
-        expected_generations=1,
-        target_step=7,
-        start_weight_version=6,
-        agent_name=None,
-        recovery_granularity=RecoveryGranularity.SIBLING,
-        admitted=True,
-    )
-    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
-    gate_id = group.gate_rollout_id(0)
-    _mutate(
-        lambda cut: ledger.mark_sibling_sealed(
-            cut,
-            "g7",
-            generation_index=0,
-            gate_rollout_id=gate_id,
-            receipt={
-                "rollout_id": gate_id,
-                "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
-            },
-            reward=1.0,
-        )
-    )
-    _mutate(lambda cut: ledger.mark_finalization_started(cut, "g7"))
-    ledger.mark_group_finalized(
-        "g7",
-        meta=KVBatchMeta(
-            partition_id="rollout_data",
-            task_name="train",
-            sample_ids=["g7_g0"],
-        ),
-        group_min_weight_version=6,
-        group_max_weight_version=6,
-    )
-    ledger.claim_groups_for_training(
-        ["g7"],
-        train_step=7,
-        trainer_version=7,
-        expected_group_count=1,
-    )
-
-    with pytest.raises(RuntimeError, match="open optimizer step"):
-        ledger.state_dict()
-
-
 @pytest.mark.parametrize(
     ("field", "value", "error_fragment"),
     [
@@ -864,27 +793,63 @@ def test_restore_rejects_malformed_recovery_policy_fields(
         _load(RolloutRecoveryLedger(), state)
 
 
-@pytest.mark.parametrize(
-    "state",
-    [
-        {"schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION + 1, "groups": []},
-        {"schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION, "groups": {}},
-        {
-            "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-            "groups": [_group_state(phase="unknown")],
-        },
-        {
-            "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-            "groups": [
-                _group_state(idx, target_step=target_step, phase=phase)
-                for idx, target_step, phase in (
-                    (7, None, "reserved"),
-                    (8, 7, "admitted"),
-                )
-            ],
-        },
-    ],
-)
-def test_restore_rejects_incompatible_or_malformed_state(state: dict) -> None:
-    with pytest.raises((TypeError, ValueError)):
+def test_restore_rejects_unsupported_schema_version() -> None:
+    state = {
+        "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION + 1,
+        "groups": [],
+    }
+
+    with pytest.raises(ValueError, match="Unsupported rollout-recovery schema"):
         _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
+
+
+def test_restore_rejects_non_list_groups() -> None:
+    state = {
+        "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+        "groups": {},
+    }
+
+    with pytest.raises(ValueError, match="must contain a groups list"):
+        _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
+
+
+def test_restore_rejects_invalid_prompt_group_phase() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+    state = ledger.state_dict()
+    state["groups"][0]["phase"] = "unknown"
+
+    with pytest.raises(ValueError, match="invalid prompt group phase"):
+        _load(RolloutRecoveryLedger(), state)
+
+
+def test_restore_rejects_inconsistent_shared_admission_state() -> None:
+    ledger = RolloutRecoveryLedger()
+    for idx in (7, 8):
+        _reserve(
+            ledger,
+            group_id=f"g{idx}",
+            admission_id="batch-7",
+            prompt_id=str(idx),
+            prompt_payload=_prompt(idx),
+            expected_generations=1,
+            target_step=7,
+            start_weight_version=6,
+            admitted=True,
+        )
+    state = ledger.state_dict()
+    state["groups"][0]["target_step"] = None
+    state["groups"][0]["phase"] = "reserved"
+
+    with pytest.raises(ValueError, match="disagree on phase or target_step"):
+        _load(RolloutRecoveryLedger(), state)
