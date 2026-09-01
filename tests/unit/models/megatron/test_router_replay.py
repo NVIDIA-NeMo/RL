@@ -1216,6 +1216,142 @@ def test_router_replay_missing_route_sentinel_uses_megatron_topk():
 
 
 @pytest.mark.mcore
+def test_router_replay_setup_uses_no_missing_fast_path():
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        clear_router_replay,
+        set_router_replay_forward,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, replay, layer_number):
+            super().__init__()
+            self.router_replay = replay
+            self.layer_number = layer_number
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(num_layers=1, moe_layer_freq=[1])
+            self.router = DummyRouter(RouterReplay(), layer_number=1)
+
+    try:
+        model = DummyModel()
+        replay = model.router.router_replay
+        target = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
+        scores = torch.tensor(
+            [
+                [0.1, 0.9, 0.2, 0.3, 0.4],
+                [0.4, 0.2, 0.8, 0.7, 0.1],
+            ],
+            dtype=torch.float32,
+        )
+
+        set_router_replay_forward(model, target)
+
+        assert hasattr(replay, "_nrl_missing_route_fallback_mask")
+        assert replay._nrl_missing_route_fallback_mask is None
+
+        def unexpected_default_topk(*args, **kwargs):
+            raise AssertionError("no-missing replay must not compute native top-k")
+
+        probs, indices = replay.get_replay_topk(
+            scores,
+            2,
+            default_compute_topk=unexpected_default_topk,
+        )
+
+        expected_indices = target[:, 0].long()
+        assert torch.equal(indices, expected_indices)
+        assert torch.equal(probs, scores.gather(1, expected_indices))
+
+        clear_router_replay(model)
+        assert not hasattr(replay, "_nrl_missing_route_fallback_mask")
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_router_replay_setup_precomputes_missing_mask_for_forward_only():
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        clear_router_replay,
+        set_router_replay_backward,
+        set_router_replay_forward,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, replay, layer_number):
+            super().__init__()
+            self.router_replay = replay
+            self.layer_number = layer_number
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(num_layers=1, moe_layer_freq=[1])
+            self.router = DummyRouter(RouterReplay(), layer_number=1)
+
+    default_topk_calls = 0
+
+    def default_compute_topk(scores, topk, num_groups=None, group_topk=None):
+        nonlocal default_topk_calls
+        default_topk_calls += 1
+        return torch.topk(scores, k=topk, dim=1)
+
+    try:
+        model = DummyModel()
+        replay = model.router.router_replay
+        target = torch.tensor([[[1, 2]], [[-1, -1]]], dtype=torch.int32)
+        scores = torch.tensor(
+            [
+                [0.1, 0.9, 0.2],
+                [0.4, 0.2, 0.8],
+            ],
+            dtype=torch.float32,
+        )
+        expected_default = torch.topk(scores, k=2, dim=1).indices
+        expected_mixed = torch.stack([target[0, 0].long(), expected_default[1]])
+
+        set_router_replay_forward(model, target)
+
+        assert torch.equal(
+            replay._nrl_missing_route_fallback_mask,
+            torch.tensor([False, True]),
+        )
+        _, forward_indices = replay.get_replay_topk(
+            scores,
+            2,
+            default_compute_topk=default_compute_topk,
+        )
+
+        assert default_topk_calls == 1
+        assert torch.equal(forward_indices, expected_mixed)
+        assert torch.equal(replay.replay_backward_list[0], expected_mixed)
+
+        set_router_replay_backward(model)
+        _, backward_indices = replay.get_replay_topk(
+            scores,
+            2,
+            default_compute_topk=default_compute_topk,
+        )
+
+        assert default_topk_calls == 1
+        assert torch.equal(backward_indices, expected_mixed)
+        assert replay.replay_backward_list == []
+
+        clear_router_replay(model)
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
 def test_router_replay_backward_queue_is_fifo_across_replayed_microbatches():
     from megatron.core.transformer.moe.router_replay import (
         RouterReplay,
