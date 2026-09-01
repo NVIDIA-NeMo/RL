@@ -870,6 +870,7 @@ def test_main_worker_accepts_nvfp4_pertoken_over_framework_defaults():
     assert llm_kwargs["quantization"] == NVFP4_PER_TOKEN_METHOD
     assert get_quantization_config(NVFP4_PER_TOKEN_METHOD) is NvFp4PerTokenConfig
     assert llm_kwargs["load_format"] == "dummy"
+    assert llm_kwargs["kernel_config"]["enable_flashinfer_autotune"] is False
     assert llm_kwargs["worker_extension_cls"].endswith(".NvFp4PerTokenWorkerExtension")
     assert llm_kwargs["hf_overrides"]["quantization_config"] == (
         build_nvfp4_pertoken_hf_quant_config(DEFAULT_NVFP4_IGNORE)
@@ -899,6 +900,7 @@ def test_main_worker_rejects_explicit_quantization_for_nvfp4_pertoken():
         {"quantization": "fp8"},
         {"load_format": "auto"},
         {"hf_overrides": {"quantization_config": {}}},
+        {"kernel_config": {"enable_flashinfer_autotune": True}},
     ],
 )
 @pytest.mark.vllm

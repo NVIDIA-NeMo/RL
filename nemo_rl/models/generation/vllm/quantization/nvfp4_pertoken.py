@@ -685,6 +685,11 @@ def _reject_conflicting_engine_kwargs(llm_kwargs: dict[str, Any]) -> None:
     hf_overrides = llm_kwargs.get("hf_overrides")
     if isinstance(hf_overrides, dict) and "quantization_config" in hf_overrides:
         conflicts.append("hf_overrides.quantization_config")
+    kernel_config = llm_kwargs.get("kernel_config")
+    if isinstance(kernel_config, dict) and kernel_config.get(
+        "enable_flashinfer_autotune"
+    ) not in (None, False):
+        conflicts.append("kernel_config.enable_flashinfer_autotune")
     if conflicts:
         raise ValueError(
             "nvfp4_pertoken cannot overwrite explicit vLLM settings: "
@@ -709,6 +714,8 @@ def configure_nvfp4_pertoken_engine_kwargs(
     - dummy initial load: params are NVFP4-shaped and the BF16 checkpoint on
       disk cannot fill them; the first refit (which always precedes the first
       generation) provides every weight
+    - disables FlashInfer autotuning because its full-model warmup otherwise
+      executes the dummy NVFP4 weights before that first refit
     - installs the refit worker extension
     """
     conflict_source = (
@@ -718,6 +725,10 @@ def configure_nvfp4_pertoken_engine_kwargs(
     register_nvfp4_pertoken()
     llm_kwargs["quantization"] = NVFP4_PER_TOKEN_METHOD
     llm_kwargs["load_format"] = "dummy"
+    kernel_config = llm_kwargs.setdefault("kernel_config", {})
+    if not isinstance(kernel_config, dict):
+        raise ValueError("nvfp4_pertoken requires kernel_config to be a mapping")
+    kernel_config["enable_flashinfer_autotune"] = False
     hf_overrides = llm_kwargs.setdefault("hf_overrides", {})
     hf_overrides["quantization_config"] = build_nvfp4_pertoken_hf_quant_config(ignore)
     llm_kwargs["worker_extension_cls"] = (
