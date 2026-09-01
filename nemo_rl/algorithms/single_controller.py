@@ -27,7 +27,8 @@ Data flow:
                  → _advantage_stage(meta) → dp_client.get_samples(...)
                                         → adv_estimator.compute_advantage(...)
                                         → dp_client.put_samples(...)
-                 → _value_train(meta) (PPO only) → value.train_from_meta(...)
+                 → _value_train_epochs(meta) (PPO only)
+                     → value.train_from_meta(...)
                      Value → dp_client.get_samples(...)     (via its own client)
                  → trainer.begin/train_microbatches/finish_train_step (split API,
                      driver-side TQPolicy via asyncio.to_thread)
@@ -102,7 +103,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
-from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
+from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
@@ -148,6 +149,20 @@ def _pooled_opd_metrics(
         "on_policy_distillation/adv_mean": mean,
         "on_policy_distillation/adv_std": math.sqrt(max(variance, 0.0)),
     }
+
+
+def _train_fields_for_step(
+    *,
+    policy_logprobs_required: bool,
+    reference_logprobs_required: bool,
+) -> tuple[str, ...]:
+    """Return only the data-plane columns produced for this train step."""
+    return tuple(
+        field
+        for field in DP_TRAIN_FIELDS
+        if (policy_logprobs_required or field != "prev_logprobs")
+        and (reference_logprobs_required or field != "reference_policy_logprobs")
+    )
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -202,6 +217,9 @@ class SingleControllerActor:
         self._is_ppo: bool = is_ppo_run(master_config)
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
+        self._critic_ppo_epochs: int = (
+            self._algo_cfg.critic_ppo_epochs if self._is_ppo else 1
+        )
         self._message_level_advantage_penalties_enabled = (
             self._algo_cfg.invalid_tool_call_advantage is not None
             or self._algo_cfg.malformed_thinking_advantage is not None
@@ -211,11 +229,17 @@ class SingleControllerActor:
             master_config.loss_fn.force_on_policy_ratio
             and self._algo_cfg.seq_logprob_error_threshold is None
         )
+        # _build_trainer initializes the reference model only for a positive KL
+        # penalty, so the controller must use the same gate before requesting it.
         self._reference_logprobs_required = bool(
             master_config.loss_fn.reference_policy_kl_penalty > 0
             and not self._algo_cfg.skip_reference_policy_logprobs_calculation
         )
         self._teacher_logprobs_required = opd_module.is_opd_enabled(master_config)
+        self._train_fields = _train_fields_for_step(
+            policy_logprobs_required=self._policy_logprobs_required,
+            reference_logprobs_required=self._reference_logprobs_required,
+        )
         self._dp_client = actor_args.dp_client
         self._gen: Generation = actor_args.gen_handle
         self._trainer: TQPolicy = actor_args.trainer_handle
@@ -1670,9 +1694,11 @@ class SingleControllerActor:
                     chunk -- the value workers have no split train API yet (#2625).
                 b. Policy model: train_microbatches_from_meta, which only
                     accumulates gradients.
-                c. PPO only: 3a-3b repeat ppo.ppo_epochs times, and the policy's
-                    optimizer step closes here rather than in 5 -- a PPO step is
-                    one chunk, so there is nothing to accumulate across chunks.
+                c. PPO only: all critic updates run before all policy updates.
+                    Their counts are ppo.critic_ppo_epochs and ppo.ppo_epochs,
+                    respectively. Each policy optimizer step closes here rather
+                    than in 5 -- a PPO step is one chunk, so there is nothing to
+                    accumulate across chunks.
             4. Clear the batch. dp_client.clear_samples on the consumed sample_ids.
             5. Train the policy model (GRPO) -- finish_train_step all_reduces the
                 accumulated gradients, rescales, and runs optimizer.step.
@@ -1840,35 +1866,37 @@ class SingleControllerActor:
                     # optimizer step with the next chunk.
 
                     # GRPO runs one iteration: F/B only, its optimizer step is in 5.
-                    # For PPO, each epoch is a full optimizer step for both models.
+                    # For PPO, each actor epoch and critic epoch is a full optimizer
+                    # step. Group each model's epochs under one residency cycle so
+                    # the colocated models do not move between CPU and GPU per epoch.
                     # TODO(#2625): value_result, policy_result only record the last epoch's metrics.
                     # That matches ppo.py for the losses; total_flops is additive and undercounted.
-                    for epoch in range(self._ppo_epochs):
-                        # Value model first, then policy, as in the legacy PPO epoch loop.
-                        if self._is_ppo:
-                            with self._timer.time("value_training"):
-                                value_result = await self._value_train(train_meta)
+                    if self._is_ppo:
+                        with self._timer.time("value_training"):
+                            value_result = await self._value_train_epochs(
+                                train_meta,
+                                num_epochs=self._critic_ppo_epochs,
+                            )
 
-                        if is_policy_training_step:
-                            if (
-                                self._is_ppo
-                                and self._train_steps == policy_training_start_step
-                                and policy_training_start_step > 0
-                                and epoch == 0
-                            ):
-                                print(
-                                    f"  ✓ Critic warmup complete ({policy_training_start_step} "
-                                    "steps). Starting policy training.",
-                                    flush=True,
-                                )
-                            # Always restore training mode because log-prob inference may have
-                            # switched the model to inference mode.
-                            with self._timer.time("training_prep"):
-                                await asyncio.to_thread(
-                                    self._trainer.prepare_for_training
-                                )
+                    if is_policy_training_step:
+                        if (
+                            self._is_ppo
+                            and self._train_steps == policy_training_start_step
+                            and policy_training_start_step > 0
+                        ):
+                            print(
+                                f"  ✓ Critic warmup complete ({policy_training_start_step} "
+                                "steps). Starting policy training.",
+                                flush=True,
+                            )
+                        # Always restore training mode because log-prob inference may have
+                        # switched the model to inference mode. Keep it resident
+                        # across every PPO actor epoch.
+                        with self._timer.time("training_prep"):
+                            await asyncio.to_thread(self._trainer.prepare_for_training)
 
-                            if has_valid_training_tokens:
+                        if has_valid_training_tokens:
+                            for _ in range(self._ppo_epochs):
                                 with self._timer.time("policy_training"):
                                     if not step_open:
                                         await asyncio.to_thread(
@@ -1879,6 +1907,7 @@ class SingleControllerActor:
                                     await asyncio.to_thread(
                                         self._trainer.train_microbatches_from_meta,
                                         train_meta,
+                                        train_fields=self._train_fields,
                                     )
                                     # A PPO step is one chunk: nothing to
                                     # accumulate, so close every epoch here.
@@ -1887,12 +1916,6 @@ class SingleControllerActor:
                                             self._trainer.finish_train_step
                                         )
                                         step_open = False
-                                        if epoch < self._ppo_epochs - 1:
-                                            # The next epoch's critic train must not
-                                            # share the training GPUs with the policy.
-                                            await asyncio.to_thread(
-                                                self._trainer.offload_to_cpu
-                                            )
 
                     if train_meta.sequence_lengths:
                         self._step_log_dict["sequence_lengths"].extend(
@@ -3122,19 +3145,25 @@ class SingleControllerActor:
         await asyncio.to_thread(self._value.finish_inference)
         return meta.with_fields([self._advantage_cfg.values_field])
 
-    async def _value_train(self, meta: KVBatchMeta) -> dict[str, Any]:
-        """Run one value model optimizer step against this chunk's GAE returns.
+    async def _value_train_epochs(
+        self, meta: KVBatchMeta, *, num_epochs: int
+    ) -> dict[str, Any]:
+        """Run consecutive critic epochs under one model onload/offload cycle.
 
         Returns:
-            The aggregated value model train result, shaped like Value.train's.
+            The final epoch's ``train_from_meta`` output; earlier epochs'
+            results are discarded.
         """
         await asyncio.to_thread(self._value.prepare_for_training)
-        result = await asyncio.to_thread(
-            self._value.train_from_meta,
-            meta,
-            self._value_loss_fn,  # pyrefly: ignore
-        )
+        result: dict[str, Any] | None = None
+        for _ in range(num_epochs):
+            result = await asyncio.to_thread(
+                self._value.train_from_meta,
+                meta,
+                self._value_loss_fn,  # pyrefly: ignore
+            )
         await asyncio.to_thread(self._value.finish_training)
+        assert result is not None
         return result
 
     async def _advantage_stage(self, meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
