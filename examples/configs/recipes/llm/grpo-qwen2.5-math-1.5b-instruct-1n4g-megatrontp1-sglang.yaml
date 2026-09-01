@@ -1,0 +1,20 @@
+defaults: ./grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n4g-megatrontp1-sglang
+
+policy:
+  generation:
+    sglang_cfg:
+      tp_size: 1
+      sglang_server_config:
+        num_gpus: 4
+
+logger:
+  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-1n4g-megatrontp1-sglang
+  wandb:
+    name: grpo-qwen2.5-math-1.5b-instruct-1n4g-megatrontp1-sglang
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1

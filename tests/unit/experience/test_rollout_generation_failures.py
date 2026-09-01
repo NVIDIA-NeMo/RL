@@ -177,6 +177,7 @@ def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
     )
     manager._stats = RolloutStats()
     manager._skipped_prompts = 0
+    manager._consecutive_infra_drops = 0
     return manager
 
 
@@ -460,8 +461,8 @@ class _PartialGymMethod:
         del kwargs
         return self
 
-    def remote(self, inputs, tokenizer, timer_prefix):
-        del tokenizer, timer_prefix
+    def remote(self, inputs, timer_prefix):
+        del timer_prefix
         self.dispatched.append([row["_rowidx"] for row in inputs])
         attempt = self.attempts
         self.attempts += 1
@@ -500,8 +501,8 @@ class _FakeGymMethod:
         del kwargs
         return self
 
-    def remote(self, inputs, tokenizer, timer_prefix):
-        del tokenizer, timer_prefix
+    def remote(self, inputs, timer_prefix):
+        del timer_prefix
         return self._stream(len(inputs))
 
     async def _stream(self, num_inputs):
@@ -536,6 +537,10 @@ def _make_gym_impl(
     impl._stats = stats if stats is not None else RolloutStats()
     # Upstream default; this fixture is about re-dispatch, not sample masking.
     impl._mask_env_flagged_samples = True
+    # Reward penalties are off; direct construction must still satisfy the impl contract.
+    impl._reward_penalty_config = None
+    # Effort-level reward shaping is off unless env.nemo_gym.effort_levels is set.
+    impl._effort_config = None
     return impl
 
 

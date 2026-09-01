@@ -14,6 +14,7 @@
 import importlib
 import math
 import os
+import sys
 import time
 from copy import deepcopy
 from dataclasses import dataclass
@@ -506,10 +507,11 @@ class RayWorkerGroup:
             for key in ("HF_HOME", "HF_MODULES_CACHE", "PYTHONPATH")
             if key in env_vars
         }
-        initializer_runtime_env = {
-            "py_executable": py_executable,
-            "env_vars": initializer_env_vars,
-        }
+        initializer_runtime_env = {}
+        if py_executable != sys.executable:
+            initializer_runtime_env["py_executable"] = py_executable
+        if initializer_env_vars:
+            initializer_runtime_env["env_vars"] = initializer_env_vars
         self._initializer_pool: dict[int, ray.actor.ActorHandle] = {}
         for pg_idx in unique_pg_indices:
             # num_cpus=0 so the initializer doesn't consume a CPU slot — it
@@ -548,6 +550,10 @@ class RayWorkerGroup:
                         "NODE_RANK": str(pg_idx),
                         "AVAILABLE_ADDR_LIST": str(available_addresses),
                         "AVAILABLE_PORT_LIST": str(available_ports),
+                        # RANK is group-local, so it alone cannot tell a policy
+                        # worker from a generation worker. Observability consumers
+                        # need the group to disambiguate them.
+                        "NRL_WORKER_GROUP": self.name_prefix,
                     }
                 )
                 # Remove Ray-specific environment variables, let the worker itself set them.

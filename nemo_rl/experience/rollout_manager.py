@@ -24,7 +24,11 @@ import torch
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneMutationCut,
+    PostWriteEnrichmentError,
+    TQReplayBuffer,
+)
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -40,12 +44,22 @@ from nemo_rl.experience.failures import (
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.rollout_recovery import (
+    PromptGroupPhase,
+    RolloutRecoveryLedger,
+)
 from nemo_rl.experience.rollouts import (
+    EffortLevelsConfig,
+    _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
     _dummy_routed_experts_for_tokens,
+    _effort_shaping_metrics,
     _find_routed_experts_template,
     _tensorize_by_key,
+    apply_reward_penalties,
+    attach_static_multimodal_payload,
     calculate_rewards,
+    compute_reward_penalty_metrics,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -57,13 +71,27 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 
 
+def _contains_post_write_enrichment_error(error: BaseException) -> bool:
+    """Whether an error, including a rollback ExceptionGroup, is post-write."""
+    if isinstance(error, PostWriteEnrichmentError):
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        return any(
+            _contains_post_write_enrichment_error(child) for child in error.exceptions
+        )
+    return False
+
+
 class RolloutOutcome(str, enum.Enum):
     """How :meth:`RolloutManager.generate_and_push` finished for one prompt."""
 
     # The prompt group reached the replay buffer.
     COMMITTED = "committed"
-    # The prompt exhausted its data-failure budget within max_skipped_prompts.
-    # No group was committed, so the caller owns releasing its backpressure permit.
+    # The prompt was given up on within a budget: its data-failure budget within
+    # max_skipped_prompts, or its infrastructure budget within
+    # max_consecutive_dropped_prompts. No group was committed, so the caller owns
+    # releasing its backpressure permit and atomically replacing the ledger owner or
+    # crediting the step's shortfall.
     SKIPPED = "skipped"
 
 
@@ -92,6 +120,10 @@ class RolloutRetryPolicy:
     # enforced across every generate_and_push call. 0 means none may be: the first
     # exhaustion propagates the original failure.
     max_skipped_prompts: int = 0
+    # Cap on CONSECUTIVE prompts that may exhaust their infra budget and be dropped;
+    # any commit resets the run of failures. 0 means none may be, so the first
+    # exhaustion raises RolloutRedispatchExhausted as it did before this budget existed.
+    max_consecutive_dropped_prompts: int = 0
 
     @classmethod
     def single_attempt(cls, **overrides: Any) -> "RolloutRetryPolicy":
@@ -148,6 +180,15 @@ class RolloutStats:
     data_retries_by_reason: dict[str, int] = field(default_factory=dict)
     # Prompts that ran out of data budget entirely.
     data_failures_by_reason: dict[str, int] = field(default_factory=dict)
+    # Prompts that ran out of INFRA budget and were dropped rather than failing the run.
+    # Distinct from redispatches_by_reason, which counts attempts that were retried: a
+    # fleet that recovers shows redispatches with this flat, and the two diverging is
+    # what says the outage outlasted the per-prompt budget.
+    infra_drops_by_reason: dict[str, int] = field(default_factory=dict)
+    # Longest run of consecutive infra drops seen so far. The live counter resets on
+    # every commit, so without this high-water mark a run that came within one prompt of
+    # aborting is indistinguishable from one that never dropped anything.
+    max_consecutive_infra_drops: int = 0
     # NeMo-Gym row-level re-dispatches. These recover a partial prompt group without
     # redoing the whole thing, so they never reached the counters above and gym could
     # retry rows all run with redispatch_total sitting flat.
@@ -166,6 +207,14 @@ class RolloutStats:
     def record_data_failure(self, reason: str) -> None:
         self.data_failures_by_reason[reason] = (
             self.data_failures_by_reason.get(reason, 0) + 1
+        )
+
+    def record_infra_drop(self, reason: str, consecutive: int) -> None:
+        self.infra_drops_by_reason[reason] = (
+            self.infra_drops_by_reason.get(reason, 0) + 1
+        )
+        self.max_consecutive_infra_drops = max(
+            self.max_consecutive_infra_drops, consecutive
         )
 
     def record_gym_row_redispatch(self, rows: int = 1) -> None:
@@ -188,6 +237,12 @@ class RolloutStats:
                 sum(self.data_failures_by_reason.values())
             ),
             "rollout/gym_row_redispatch_total": float(self.gym_row_redispatches),
+            "rollout/infra_drops_total": float(
+                sum(self.infra_drops_by_reason.values())
+            ),
+            "rollout/max_consecutive_infra_drops": float(
+                self.max_consecutive_infra_drops
+            ),
         }
         for reason, count in self.redispatches_by_reason.items():
             metrics[f"rollout/redispatch_total/{reason}"] = float(count)
@@ -195,6 +250,8 @@ class RolloutStats:
             metrics[f"rollout/data_retry_total/{reason}"] = float(count)
         for reason, count in self.data_failures_by_reason.items():
             metrics[f"rollout/data_failures_total/{reason}"] = float(count)
+        for reason, count in self.infra_drops_by_reason.items():
+            metrics[f"rollout/infra_drops_total/{reason}"] = float(count)
         return metrics
 
 
@@ -710,6 +767,7 @@ class AsyncNemoGymRolloutImpl:
         max_rollout_turns: int,
         generation_config: GenerationConfig,
         mask_env_flagged_samples: bool = True,
+        reward_penalty_config: Optional[dict[str, Any]] = None,
         # Optional so direct construction does not have to carry the resiliency wiring;
         # RolloutManager always passes both explicitly.
         timeouts: Optional[RolloutTimeouts] = None,
@@ -717,6 +775,8 @@ class AsyncNemoGymRolloutImpl:
         # Shared with the owning RolloutManager so row-level re-dispatches are visible
         # in the same counters as everything else. None when constructed directly.
         stats: Optional[RolloutStats] = None,
+        # Length-based reward shaping for low-effort prompts; None disables it.
+        effort_config: Optional[EffortLevelsConfig] = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -726,6 +786,7 @@ class AsyncNemoGymRolloutImpl:
         self._max_rollout_turns = max_rollout_turns
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
+        self._reward_penalty_config = reward_penalty_config
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._max_gym_row_attempts = (
             retry_policy
@@ -733,6 +794,7 @@ class AsyncNemoGymRolloutImpl:
             else RolloutRetryPolicy.single_attempt()
         ).max_gym_row_attempts
         self._stats = stats
+        self._effort_config = effort_config
 
         self._validate_init_params()
 
@@ -753,6 +815,10 @@ class AsyncNemoGymRolloutImpl:
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
             rollout_inputs, timer, timer_prefix
         )
+        source_message_log = input_sample["message_log"]
+        attach_static_multimodal_payload(prompt_message_log, source_message_log)
+        for completion in completions:
+            attach_static_multimodal_payload(completion.message_log, source_message_log)
 
         timer.stop(f"{timer_prefix}/total")
         rollout_metrics.update(timer.get_timing_metrics("sum"))
@@ -834,7 +900,7 @@ class AsyncNemoGymRolloutImpl:
 
         async for result_ref in nemo_gym_env.run_rollouts.options(
             num_returns="streaming"
-        ).remote(pending, self._tokenizer, timer_prefix):
+        ).remote(pending, timer_prefix):
             rowidx, result, timing_metrics = await result_ref
             # Validated against the original group, not the pending subset: on a
             # re-dispatch the row keeps its original index so results stay ordered.
@@ -858,7 +924,10 @@ class AsyncNemoGymRolloutImpl:
         return env_timing_metrics
 
     async def _run_rollouts(
-        self, inputs: list[dict], timer: Timer, timer_prefix: str
+        self,
+        inputs: list[dict],
+        timer: Timer,
+        timer_prefix: str,
     ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
         """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics.
 
@@ -946,50 +1015,79 @@ class AsyncNemoGymRolloutImpl:
                 raise failure from last_error
 
             completed_results = [result for result in results if result is not None]
+            # Shape rewards for low-effort prompts before completions are built.
+            shaping = _apply_effort_shaping(
+                completed_results, inputs, self._effort_config
+            )
             # All N rollouts share the same input prompt; tensorize one copy.
             prompt_message_log = completed_results[0]["input_message_log"]
             _tensorize_by_key(prompt_message_log, "token_ids")
-            # Convert results to completions.
-            completions = [
-                self._result_to_completion(result) for result in completed_results
-            ]
+            # Apply penalties before Completion captures each result's reward, while
+            # preserving the batch-level counts used by legacy Gym metrics.
+            completions, penalty_counts = self._results_to_completions(
+                completed_results
+            )
 
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):
             rollout_metrics = self._compute_rollout_metrics(
                 completions, inputs[0]["agent_ref"]["name"]
             )
+            # Same helper the batched path uses, so the two cannot drift apart.
+            rollout_metrics.update(_effort_shaping_metrics(shaping))
+            rollout_metrics.update(
+                self._compute_reward_penalty_metrics(
+                    penalty_counts, len(completed_results)
+                )
+            )
 
         rollout_metrics.update(env_timing_metrics)
 
         return completions, prompt_message_log, rollout_metrics
 
-    def _result_to_completion(self, result: dict) -> Completion:
-        """Convert one run_rollouts result dict into a Completion."""
-        # Tensorize token fields.
-        _tensorize_by_key(result["message_log"], "token_ids")
-        _tensorize_by_key(
-            [m for m in result["message_log"] if m["role"] == "assistant"],
-            "generation_logprobs",
-        )
-
-        # Calculate truncation.
-        truncated = (
-            sum(len(m["token_ids"]) for m in result["message_log"]) == self._max_seq_len
-        )
-
-        # Same gate as the batched path: when masking is off, drop the env
-        # mask flag so later batch building never sees it.
-        if not self._mask_env_flagged_samples:
-            (result["full_result"].get("instance_config") or {}).pop(
-                "mask_sample", None
+    def _results_to_completions(
+        self, results: list[dict]
+    ) -> tuple[list[Completion], dict[str, int]]:
+        """Apply configured penalties and convert a Gym result batch."""
+        for result in results:
+            _tensorize_by_key(result["message_log"], "token_ids")
+            _tensorize_by_key(
+                [m for m in result["message_log"] if m["role"] == "assistant"],
+                "generation_logprobs",
             )
 
-        return Completion(
-            message_log=result["message_log"],
-            env_extras=result["full_result"],
-            truncated=truncated,
-            reward=float(result["full_result"]["reward"]),
+            # Same gate as the batched path: when masking is off, drop the env
+            # mask flag so later batch building never sees it.
+            if not self._mask_env_flagged_samples:
+                (result["full_result"].get("instance_config") or {}).pop(
+                    "mask_sample", None
+                )
+
+        penalty_counts = apply_reward_penalties(results, self._reward_penalty_config)
+        completions = []
+        for result in results:
+            truncated = (
+                sum(len(m["token_ids"]) for m in result["message_log"])
+                == self._max_seq_len
+            )
+            completions.append(
+                Completion(
+                    message_log=result["message_log"],
+                    env_extras=result["full_result"],
+                    truncated=truncated,
+                    reward=float(result["full_result"]["reward"]),
+                )
+            )
+        return completions, penalty_counts
+
+    def _compute_reward_penalty_metrics(
+        self, penalty_counts: dict[str, int], num_results: int
+    ) -> dict[str, float]:
+        """Return enabled penalty rates using the legacy Gym metric names."""
+        return compute_reward_penalty_metrics(
+            penalty_counts,
+            num_results,
+            self._reward_penalty_config,
         )
 
     def _compute_rollout_metrics(
@@ -1084,9 +1182,11 @@ class RolloutManager:
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
         mask_env_flagged_samples: bool = True,
+        reward_penalty_config: Optional[dict[str, Any]] = None,
         tq_buffer: Optional[TQReplayBuffer] = None,
         timeouts: Optional[RolloutTimeouts] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
+        effort_config: Optional[EffortLevelsConfig] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1122,25 +1222,88 @@ class RolloutManager:
             generation_config=generation_config,
             # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores it.
             mask_env_flagged_samples=mask_env_flagged_samples,
+            reward_penalty_config=reward_penalty_config,
             # None means "no deadlines", which is what async_rl's own defaults resolve
             # to; callers that have a config pass the resolved values in.
             timeouts=timeouts if timeouts is not None else RolloutTimeouts(),
             # Only the NeMo-Gym impl reads these; the native impl absorbs them via kwargs.
             retry_policy=self._retry_policy,
             stats=self._stats,
+            effort_config=effort_config,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
+        self._recovery_ledger = RolloutRecoveryLedger()
         self._weight_version: int = 0
         # Run-wide, shared across concurrent generate_and_push calls. Safe as a plain
         # int: every caller runs on the SingleController's single event loop.
         self._skipped_prompts: int = 0
+        # Infra drops since the last commit. Shared for the same reason, and shared
+        # deliberately: the question it answers -- "is the fleet still answering
+        # anyone?" -- is about the fleet, not about one prompt's history.
+        self._consecutive_infra_drops: int = 0
 
     @property
     def stats(self) -> RolloutStats:
         """Counters describing retry/skip activity so far."""
         return self._stats
+
+    @property
+    def recovery_ledger(self) -> RolloutRecoveryLedger:
+        """Return the prompt-group ownership ledger shared with the controller."""
+        return self._recovery_ledger
+
+    def reserve_prompt_group(
+        self,
+        cut: DataPlaneMutationCut,
+        input_sample: DatumSpec,
+        *,
+        target_step: Optional[int],
+        admitted: bool = True,
+        admission_id: Optional[str] = None,
+    ) -> str:
+        """Own a prompt before controller dispatch can yield or checkpoint."""
+        prompt_idx = input_sample.get("idx")
+        if isinstance(prompt_idx, bool) or not isinstance(prompt_idx, int):
+            raise ValueError(
+                "rollout recovery requires every dataloader sample to contain "
+                f"a stable integer idx, got {prompt_idx!r}"
+            )
+        record = self._recovery_ledger.reserve_group(
+            cut,
+            prompt_id=str(prompt_idx),
+            prompt_payload=input_sample,
+            expected_generations=self._num_generations_per_prompt,
+            target_step=target_step,
+            start_weight_version=self._weight_version,
+            admitted=admitted,
+            admission_id=admission_id,
+        )
+        return record.group_id
+
+    def mark_prompt_group_admitted(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+        *,
+        target_step: Optional[int],
+    ) -> None:
+        """Attach sampler admission state to a pre-admission reservation."""
+        self._recovery_ledger.mark_group_admitted(
+            cut,
+            group_id,
+            target_step=target_step,
+            start_weight_version=self._weight_version,
+        )
+
+    def discard_prompt_group(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+    ) -> None:
+        """Release a reservation that will intentionally never be dispatched."""
+        self._recovery_ledger.discard_group(cut, group_id)
 
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
@@ -1159,6 +1322,7 @@ class RolloutManager:
         *,
         target_step: Optional[int] = None,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
+        lineage_group_id: Optional[str] = None,
     ) -> RolloutOutcome:
         """Roll out one prompt and commit it, re-dispatching on infrastructure failure.
 
@@ -1179,18 +1343,41 @@ class RolloutManager:
             target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
             inflight_registry: Optional controller-owned mapping from group ID to
                 its dispatch task and start weight version.
+            lineage_group_id: Stable group minted by the rollout ledger before
+                dataloader dispatch. TQ records this same ID rather than minting one.
+                ``None`` preserves the ordinary non-checkpointed fresh-ID retry path.
 
         Returns:
-            ``COMMITTED`` when the group reached the buffer, ``SKIPPED`` when the prompt
-            exhausted its data budget within ``max_skipped_prompts``.
+            ``COMMITTED`` when the group reached the buffer, or ``SKIPPED`` when the
+            prompt was given up on within a budget: its data budget within
+            ``max_skipped_prompts``, or its infra budget within
+            ``max_consecutive_dropped_prompts``. A ``SKIPPED`` prompt committed nothing,
+            so the caller owns both its backpressure permit and the checkpoint-atomic
+            transition from its retained ledger record to either a replacement prompt
+            or the shortfall for the training step it was stamped for.
 
         Raises:
-            RolloutRedispatchExhausted: The infra budget ran out.
-            RolloutDataFailure: The data budget ran out under ``fail_fast``.
+            RolloutRedispatchExhausted: The infra budget ran out and the fleet has not
+                committed anything since ``max_consecutive_dropped_prompts`` drops ago.
+            RolloutDataFailure: The data budget ran out beyond ``max_skipped_prompts``.
         """
         assert self._tq_buffer is not None, (
             "generate_and_push requires tq_buffer to be set at __init__"
         )
+        if lineage_group_id is not None:
+            lineage_group = self._recovery_ledger.get_group(lineage_group_id)
+            if lineage_group.phase is not PromptGroupPhase.ADMITTED:
+                raise RuntimeError(
+                    f"lineage group {lineage_group_id!r} must be admitted "
+                    "before dispatch"
+                )
+            if lineage_group.expected_generations != self._num_generations_per_prompt:
+                raise ValueError(
+                    f"lineage group {lineage_group_id!r} expects "
+                    f"{lineage_group.expected_generations} generation(s), but "
+                    "the resumed configuration requests "
+                    f"{self._num_generations_per_prompt}"
+                )
         policy = self._retry_policy
         infra_attempts = 0
         data_attempts = 0
@@ -1202,15 +1389,17 @@ class RolloutManager:
         # about the prompt rather than about the fleet.
         while infra_attempts < policy.max_infra_attempts:
             start_version = self._weight_version
-            # Reserved inside the loop so each attempt owns a fresh group_id: rows a
-            # failed attempt may have written cannot then collide with the retry's.
+            # A lineage-tracked prompt reuses its durable logical ID only after the
+            # prior attempt's buffer slot was removed successfully. Ordinary callers
+            # retain the existing fresh-ID-per-attempt behavior.
             group_id = self._tq_buffer.reserve(
-                weight_version=start_version, target_step=target_step
+                weight_version=start_version,
+                target_step=target_step,
+                group_id=lineage_group_id,
             )
             try:
-                # Registered per ATTEMPT, not per prompt: each retry reserves a fresh
-                # group_id, so the controller's registry must follow the attempt that
-                # actually owns the slot it might abort.
+                # Registered per active attempt so cancellation follows the slot that
+                # currently owns the stable recovery group ID.
                 if inflight_registry is not None:
                     current_task = asyncio.current_task()
                     assert current_task is not None
@@ -1232,13 +1421,30 @@ class RolloutManager:
                 # A failed rollout must not leave an unready slot that can block an
                 # in-order sampler. commit() rolls back any DataPlane rows it wrote.
                 # Cleanup failure must not mask the error that caused it.
+                cleanup_failed = False
                 try:
                     await self._tq_buffer.remove_group(group_id)
                 except Exception as cleanup_exc:
+                    cleanup_failed = True
                     print(
                         f"  warn: remove_group({group_id}) cleanup failed: {cleanup_exc!r}",
                         flush=True,
                     )
+                if cleanup_failed:
+                    # Fail fast for every caller, not only lineage-tracked ones:
+                    # the failed remove leaves an unready slot the retry cannot
+                    # reclaim (capacity accounting drifts), and a post-write
+                    # failure may have left TQ rows that no owner records -- the
+                    # next data-plane checkpoint's inventory check would reject
+                    # those later with a less useful error. A lineage-tracked
+                    # retry additionally must not reuse its stable ID while the
+                    # previous slot may still exist. Re-raise the rollout error.
+                    raise
+                # The rollout itself succeeded. Re-running generation cannot repair
+                # a required downstream stage (for example MOPD teacher inference),
+                # and would spend the rollout retry budget on the wrong subsystem.
+                if _contains_post_write_enrichment_error(error):
+                    raise
                 reason = type(error).__name__
 
                 if classify_rollout_failure(error) is FailureClass.INFRA:
@@ -1294,19 +1500,51 @@ class RolloutManager:
                 raise
 
             self._stats.committed += 1
+            # A commit proves the fleet is answering, which is exactly the claim the
+            # consecutive budget is testing, so it clears the run of drops. Placed on
+            # the success path rather than in the infra handler so that a prompt which
+            # succeeded on a retry also counts -- the fleet recovered either way.
+            self._consecutive_infra_drops = 0
+            if lineage_group_id is not None:
+                async with (
+                    self._tq_buffer.data_plane_checkpoint_barrier.mutation()
+                ) as cut:
+                    self._recovery_ledger.discard_group(cut, lineage_group_id)
             return RolloutOutcome.COMMITTED
 
         # The infrastructure budget ran out. The same failure followed the prompt across
         # repeated shard selections, which says the fleet is broken rather than the
-        # prompt, so this is reported rather than absorbed.
+        # prompt.
         #
         # The budget is >= 1 (enforced in RolloutRetryPolicy), so the loop ran at least
         # once and can only have exited through the infra branch's break.
         assert last_infra_error is not None
-        raise RolloutRedispatchExhausted(
-            f"prompt idx={input_sample['idx']} exhausted its infrastructure retry "
-            f"budget after {infra_attempts} attempt(s) "
-            f"(max_infra_attempts_per_prompt="
-            f"{policy.max_infra_attempts}); last failure was "
-            f"{type(last_infra_error).__name__}: {last_infra_error}"
-        ) from last_infra_error
+        reason = type(last_infra_error).__name__
+        self._consecutive_infra_drops += 1
+        if self._consecutive_infra_drops > policy.max_consecutive_dropped_prompts:
+            raise RolloutRedispatchExhausted(
+                f"prompt idx={input_sample['idx']} exhausted its infrastructure retry "
+                f"budget after {infra_attempts} attempt(s) "
+                f"(max_infra_attempts_per_prompt="
+                f"{policy.max_infra_attempts}), and this was drop "
+                f"{self._consecutive_infra_drops} with no rollout committed in between, "
+                f"exceeding max_consecutive_dropped_prompts="
+                f"{policy.max_consecutive_dropped_prompts}; the generation fleet is not "
+                f"recovering. Last failure was {reason}: {last_infra_error}"
+            ) from last_infra_error
+
+        # Under the budget: give up on this prompt and let the run continue. The caller
+        # owns the backpressure permit for a SKIPPED outcome, and -- because the prompt
+        # may have been stamped for a specific training step that will now never fill --
+        # owns atomically replacing its retained ledger entry or crediting the shortfall
+        # so the train pump can close that step short.
+        self._stats.record_infra_drop(reason, self._consecutive_infra_drops)
+        print(
+            f"dropping prompt idx={input_sample['idx']} after {infra_attempts} "
+            f"infrastructure failure(s) ({reason}: {last_infra_error}) "
+            f"[consecutive drop {self._consecutive_infra_drops}/"
+            f"{policy.max_consecutive_dropped_prompts}]",
+            flush=True,
+        )
+        self._stats.skipped += 1
+        return RolloutOutcome.SKIPPED
