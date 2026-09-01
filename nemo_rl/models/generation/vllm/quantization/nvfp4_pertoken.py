@@ -15,35 +15,42 @@
 
 Routed-expert weights are quantized here, at refit weight-load time, from the
 plain BF16 stream the Megatron training worker exports — a sibling of the
-fp8/mxfp8 "real quant" rollout path (``quantization/fp8.py``). The training
-worker stays entirely unaware of NVFP4; the refit transport always carries
-BF16.
+fp8/mxfp8 "real quant" rollout path (``quantization/fp8.py``). Megatron may
+use TE NVFP4 for policy computation, but its master/export weights and the
+refit transport remain BF16.
 """
 
-import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Optional
+from types import MappingProxyType
+from typing import Any, Literal, Optional, cast
 
 import torch
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     make_nvfp4_moe_kernel,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
 )
 from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
-from nemo_rl.models.generation.vllm.quantization.fp8 import get_module_from_param_name
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     DEFAULT_NVFP4_IGNORE,
     NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS,
     NvFp4PerTokenRolloutConfig,
+)
+from nemo_rl.models.generation.vllm.quantization.utils import (
+    resolve_module_from_param_name,
 )
 from nemo_rl.models.generation.vllm.vllm_backend import (
     VllmInternalWorkerExtension,
@@ -56,10 +63,6 @@ __all__ = ["DEFAULT_NVFP4_IGNORE", "NvFp4PerTokenRolloutConfig"]
 
 NVFP4_PER_TOKEN_METHOD = "nvfp4_pertoken"
 
-_EXPERT_WEIGHT_RE = re.compile(
-    r"^(?P<prefix>.*\.experts)\.(?P<eid>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
-)
-
 _FP4_MAX = 6.0
 _FP8_E4M3_MAX = 448.0
 _AMAX_DENOMINATOR = _FP4_MAX * _FP8_E4M3_MAX
@@ -67,69 +70,204 @@ _AMAX_DENOMINATOR = _FP4_MAX * _FP8_E4M3_MAX
 _registered = False
 _pertoken_marker_printed = False
 
+ProjectionRole = Literal["w1", "w2", "w3"]
+
 
 @dataclass
 class PendingHalf:
-    """One half of a gate/up pair awaiting its partner.
+    """One half of a logical W1/W3 pair awaiting its partner.
 
     The tensor is cloned off the refit IPC buffer, which the sender recycles
     as soon as the batch is acknowledged (see ``policy/utils.py``'s
     ping-pong double buffering).
     """
 
-    layer_prefix: str
-    expert_id: int
-    proj: str  # "gate_proj" | "up_proj"
+    source_prefix: str
+    role: Literal["w1", "w3"]
     tensor: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ExpertWeightSpec:
+    """One checkpoint projection classified by a vLLM expert mapping."""
+
+    checkpoint_suffix: str
+    logical_key: str
+    role: ProjectionRole
+
+
+@dataclass(frozen=True)
+class RoutedExpertTarget:
+    """Immutable refit inventory for one selected RoutedExperts container."""
+
+    module: RoutedExperts
+    module_name: str
+    specs: tuple[ExpertWeightSpec, ...]
+    specs_by_suffix: Mapping[str, ExpertWeightSpec]
+    expected_roles: frozenset[tuple[str, ProjectionRole]]
+
+
+def _build_expert_target(module_name: str, module: RoutedExperts) -> RoutedExpertTarget:
+    """Build and validate the checkpoint W1/W2/W3 map exposed by vLLM."""
+    projection_names = {
+        "w1": module.ckpt_gate_proj_name,
+        "w2": module.ckpt_down_proj_name,
+        "w3": module.ckpt_up_proj_name,
+    }
+    specs_by_suffix: dict[str, ExpertWeightSpec] = {}
+    for _param_name, weight_name, _expert_id, shard_id in module.get_expert_mapping():
+        if shard_id not in projection_names:
+            raise RuntimeError(
+                f"[nvfp4_pertoken] {module_name} returned unsupported expert "
+                f"shard {shard_id!r} for {weight_name!r}."
+            )
+        role = cast(ProjectionRole, shard_id)
+        projection_name = projection_names[role]
+        parts = weight_name.removesuffix(".").split(".")
+        projection_positions = [
+            index for index, part in enumerate(parts) if part == projection_name
+        ]
+        if len(projection_positions) != 1:
+            raise RuntimeError(
+                f"[nvfp4_pertoken] {module_name} cannot identify projection "
+                f"{projection_name!r} in vLLM mapping name {weight_name!r}."
+            )
+        parts[projection_positions[0]] = "<projection>"
+        logical_key = ".".join(parts)
+        checkpoint_suffix = f"{weight_name.removesuffix('.')}.weight"
+        spec = ExpertWeightSpec(
+            checkpoint_suffix=checkpoint_suffix,
+            logical_key=logical_key,
+            role=role,
+        )
+        previous = specs_by_suffix.setdefault(checkpoint_suffix, spec)
+        if previous != spec:
+            raise RuntimeError(
+                f"[nvfp4_pertoken] ambiguous vLLM expert mapping for "
+                f"{module_name}: {checkpoint_suffix!r}."
+            )
+
+    roles_by_key: dict[str, set[str]] = {}
+    for spec in specs_by_suffix.values():
+        roles_by_key.setdefault(spec.logical_key, set()).add(spec.role)
+    incomplete = {
+        key: sorted({"w1", "w2", "w3"} - roles)
+        for key, roles in roles_by_key.items()
+        if roles != {"w1", "w2", "w3"}
+    }
+    if not specs_by_suffix or incomplete:
+        raise RuntimeError(
+            f"[nvfp4_pertoken] incomplete vLLM expert mapping for {module_name}: "
+            f"missing roles {incomplete or 'all W1/W2/W3 entries'}."
+        )
+
+    specs = tuple(
+        sorted(
+            specs_by_suffix.values(),
+            key=lambda spec: (spec.logical_key, spec.role, spec.checkpoint_suffix),
+        )
+    )
+    return RoutedExpertTarget(
+        module=module,
+        module_name=module_name,
+        specs=specs,
+        specs_by_suffix=MappingProxyType(dict(specs_by_suffix)),
+        expected_roles=frozenset((spec.logical_key, spec.role) for spec in specs),
+    )
 
 
 class NvFp4PerTokenQuantizer:
     """Quantizes routed-expert weights to NVFP4 during vLLM-side weight refit.
 
-    Stateful only over a single gate/up pair per (layer, expert) — never a
-    whole layer — so memory stays bounded regardless of expert count. Gate
-    and up projections share one global scale (vLLM's
+    Stateful only over a single W1/W3 pair per logical expert — never a whole
+    layer — so memory stays bounded regardless of expert count. W1 and W3
+    share one global scale (vLLM's
     ``ModelOptNvFp4FusedMoE.process_weights_after_loading`` collapses
     ``w13_weight_scale_2`` to column 0, so independently-scaled halves would
-    decode the up projection with the gate's scale), so quantization of a
-    pair is deferred until both halves have arrived. ``additional_ignore``
-    expert layers are detected by probing the owning module's quant method
-    rather than re-deriving the ignore-pattern match, since a config-level
-    check cannot see how ``configure_nvfp4_pertoken_engine_kwargs`` resolved
-    that layer's ``quant_method`` at engine build time.
+    decode W3 with W1's scale), so quantization is deferred until both halves
+    arrive. Projection names and expert identities come exclusively from each
+    destination ``RoutedExperts.get_expert_mapping()``; no model-family naming
+    convention is assumed.
     """
 
     def __init__(self, model: torch.nn.Module) -> None:
         self._model = model
-        self._pending: dict[tuple[str, int], PendingHalf] = {}
-        self._quantized_layer: dict[str, bool] = {}
+        self._targets: dict[int, RoutedExpertTarget] = {}
+        self._all_target_suffixes: set[str] = set()
+        self._pending: dict[tuple[int, str], PendingHalf] = {}
+        self._seen_roles: dict[int, set[tuple[str, str]]] = {}
         self._quantized_events = 0
+        self._build_inventory()
+
+    def _build_inventory(self) -> None:
+        for module_name, module in self._model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if isinstance(module, RoutedExperts):
+                num_fused_shared_experts = int(
+                    getattr(module.expert_map_manager, "num_fused_shared_experts", 0)
+                )
+                if num_fused_shared_experts:
+                    raise RuntimeError(
+                        f"[nvfp4_pertoken] {module_name} fuses "
+                        f"{num_fused_shared_experts} shared experts into RoutedExperts; "
+                        "shared-expert NVFP4 is not supported."
+                    )
+                if isinstance(quant_method, ModelOptNvFp4PerTokenFusedMoE):
+                    target = _build_expert_target(module_name, module)
+                    self._targets[id(module)] = target
+                    self._all_target_suffixes.update(
+                        spec.checkpoint_suffix for spec in target.specs
+                    )
+                elif not isinstance(quant_method, UnquantizedFusedMoEMethod):
+                    raise RuntimeError(
+                        f"[nvfp4_pertoken] {module_name} has unexpected routed "
+                        f"expert quant method {type(quant_method).__name__}."
+                    )
+            elif isinstance(module, (LinearBase, ParallelLMHead)) and not isinstance(
+                quant_method, UnquantizedLinearMethod
+            ):
+                raise RuntimeError(
+                    f"[nvfp4_pertoken] ordinary linear {module_name} was assigned "
+                    f"{type(quant_method).__name__}, expected UnquantizedLinearMethod."
+                )
+
+        print(
+            f"[nvfp4_pertoken] inventory: selected {len(self._targets)} "
+            "RoutedExperts containers; ordinary linears remain BF16",
+            flush=True,
+        )
+
+    def _resolve_module(self, name: str) -> torch.nn.Module | None:
+        resolution = resolve_module_from_param_name(self._model, name)
+        return resolution.module if resolution is not None else None
 
     def reset(self) -> None:
-        """Clear pending gate/up state and this refit's liveness counter."""
+        """Clear pending pairs, coverage, and this refit's liveness counter."""
         self._pending = {}
+        self._seen_roles = {}
         self._quantized_events = 0
 
-    def _is_quantized_layer(self, layer_prefix: str) -> bool:
-        cached = self._quantized_layer.get(layer_prefix)
-        if cached is not None:
-            return cached
-        module = get_module_from_param_name(
-            self._model, f"{layer_prefix}.0.gate_proj.weight"
-        )
-        is_quantized = isinstance(
-            getattr(module, "quant_method", None), ModelOptNvFp4PerTokenFusedMoE
-        )
-        self._quantized_layer[layer_prefix] = is_quantized
-        return is_quantized
+    @staticmethod
+    def _classify(target: RoutedExpertTarget, name: str) -> ExpertWeightSpec | None:
+        # Mapping keys are checkpoint-relative (for example
+        # ``experts.17.w1.weight``), while the stream includes the model/layer
+        # prefix. Probe the bounded set of dot-boundary suffixes instead of
+        # scanning every expert mapping entry for every refit tensor.
+        parts = name.split(".")
+        for index in range(len(parts)):
+            spec = target.specs_by_suffix.get(".".join(parts[index:]))
+            if spec is not None:
+                return spec
+        return None
 
     def process(
         self, weights: list[tuple[str, torch.Tensor]]
     ) -> list[tuple[str, torch.Tensor]]:
         """Quantize matching expert weights in one refit batch.
 
-        Non-expert names and expert layers outside the quantized scope
-        (``additional_ignore``) pass through, cloned off the IPC buffer.
+        Non-target names and BF16 routed-expert layers pass through, cloned off
+        the IPC buffer. A weight resolved to a selected target but absent from
+        that target's vLLM mapping is fatal.
 
         The clone matters: vLLM's layerwise reload buffers every
         ``weight_loader`` call's arguments (including the tensor) and replays
@@ -140,38 +278,62 @@ class NvFp4PerTokenQuantizer:
         """
         out: list[tuple[str, torch.Tensor]] = []
         for name, tensor in weights:
-            match = _EXPERT_WEIGHT_RE.match(name)
-            if match is None or not self._is_quantized_layer(match.group("prefix")):
+            owner = self._resolve_module(name)
+            if owner is None:
+                if any(name.endswith(suffix) for suffix in self._all_target_suffixes):
+                    raise RuntimeError(
+                        f"[nvfp4_pertoken] could not resolve target-owned "
+                        f"checkpoint weight {name!r}."
+                    )
+                out.append((name, tensor.clone()))
+                continue
+            target = self._targets.get(id(owner))
+            if target is None:
                 out.append((name, tensor.clone()))
                 continue
 
-            prefix = match.group("prefix")
-            expert_id = int(match.group("eid"))
-            proj = match.group("proj")
-
-            if proj == "down_proj":
-                out.extend(
-                    self._quantize(f"{prefix}.{expert_id}.down_proj", weight=tensor)
+            spec = self._classify(target, name)
+            if spec is None:
+                if name.endswith(".weight"):
+                    raise RuntimeError(
+                        f"[nvfp4_pertoken] target-owned weight {name!r} is not "
+                        f"classified by {target.module_name}'s vLLM expert mapping."
+                    )
+                out.append((name, tensor.clone()))
+                continue
+            seen_roles = self._seen_roles.setdefault(id(target.module), set())
+            role_key = (spec.logical_key, spec.role)
+            if role_key in seen_roles:
+                raise RuntimeError(
+                    f"[nvfp4_pertoken] duplicate {spec.role} checkpoint weight "
+                    f"for {target.module_name}:{spec.logical_key}."
                 )
+            seen_roles.add(role_key)
+            source_prefix = name.removesuffix(".weight")
+            if spec.role == "w2":
+                out.extend(self._quantize(source_prefix, weight=tensor))
                 continue
 
-            key = (prefix, expert_id)
+            key = (id(target.module), spec.logical_key)
             partner = self._pending.pop(key, None)
             if partner is None:
                 self._pending[key] = PendingHalf(
-                    layer_prefix=prefix,
-                    expert_id=expert_id,
-                    proj=proj,
+                    source_prefix=source_prefix,
+                    role=spec.role,
                     tensor=tensor.clone(),
                 )
                 continue
-
-            gate, up = (
-                (tensor, partner.tensor)
-                if proj == "gate_proj"
-                else (partner.tensor, tensor)
+            if partner.role == spec.role:
+                raise RuntimeError(
+                    f"[nvfp4_pertoken] duplicate {spec.role} checkpoint weight "
+                    f"for {target.module_name}:{spec.logical_key}."
+                )
+            first, second = (
+                ((source_prefix, tensor), (partner.source_prefix, partner.tensor))
+                if spec.role == "w1"
+                else ((partner.source_prefix, partner.tensor), (source_prefix, tensor))
             )
-            out.extend(self._quantize_pair(prefix, expert_id, gate=gate, up=up))
+            out.extend(self._quantize_pair(w1=first, w3=second))
         return out
 
     def _quantize(
@@ -184,18 +346,17 @@ class NvFp4PerTokenQuantizer:
         return self._emit(name_prefix, packed, scale, weight_scale_2)
 
     def _quantize_pair(
-        self, prefix: str, expert_id: int, *, gate: torch.Tensor, up: torch.Tensor
+        self,
+        *,
+        w1: tuple[str, torch.Tensor],
+        w3: tuple[str, torch.Tensor],
     ) -> list[tuple[str, torch.Tensor]]:
-        """Quantize a gate/up pair under one shared global scale."""
-        weight_scale_2 = self._global_scale(gate, up)
+        """Quantize a logical W1/W3 pair under one shared global scale."""
+        weight_scale_2 = self._global_scale(w1[1], w3[1])
         out: list[tuple[str, torch.Tensor]] = []
-        for proj_name, w in (("gate_proj", gate), ("up_proj", up)):
-            packed, scale = self._scaled_fp4_quant(w, weight_scale_2)
-            out.extend(
-                self._emit(
-                    f"{prefix}.{expert_id}.{proj_name}", packed, scale, weight_scale_2
-                )
-            )
+        for source_prefix, weight in (w1, w3):
+            packed, scale = self._scaled_fp4_quant(weight, weight_scale_2)
+            out.extend(self._emit(source_prefix, packed, scale, weight_scale_2))
         self._quantized_events += 1
         return out
 
@@ -213,6 +374,12 @@ class NvFp4PerTokenQuantizer:
     def _scaled_fp4_quant(
         weight: torch.Tensor, weight_scale_2: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if weight.ndim != 2 or weight.shape[1] % 16 != 0:
+            raise RuntimeError(
+                "[nvfp4_pertoken] expert checkpoint weights must be "
+                "two-dimensional with an input dimension divisible by the "
+                f"NVFP4 block size 16, got shape {tuple(weight.shape)}."
+            )
         global_scale = weight_scale_2.reciprocal().reshape(1)
         packed, scale = ops.scaled_fp4_quant(
             weight, global_scale, is_sf_swizzled_layout=False, backend="none"
@@ -250,26 +417,50 @@ class NvFp4PerTokenQuantizer:
         than let that pass unnoticed (mirrors
         ``_IPCWeightManifest.require_complete``).
 
-        Also prints a per-refit liveness line and raises if nothing was
-        quantized — a config/name mismatch would otherwise silently degrade to
-        an all-BF16 refit. Use print because Ray workers default to
+        Every selected local target must receive its complete W1/W2/W3
+        inventory. A PP worker owning only BF16 boundary layers may have no
+        selected local target; the driver preflight separately rejects a
+        globally dense-only model. Use print because Ray workers default to
         WARNING-level logging.
         """
         if self._pending:
+            unpaired = [
+                {
+                    "module": self._targets[target_id].module_name,
+                    "logical_expert": logical_key,
+                    "received": pending.role,
+                }
+                for (target_id, logical_key), pending in sorted(
+                    self._pending.items(), key=lambda item: item[0][1]
+                )
+            ]
             raise RuntimeError(
                 "[nvfp4_pertoken] refit ended with unpaired expert projections: "
-                f"{sorted(self._pending)}"
+                f"{unpaired}"
             )
-        print(
-            f"[nvfp4_pertoken] refit: quantized {self._quantized_events} expert "
-            "weight groups",
-            flush=True,
-        )
-        if self._quantized_events == 0:
+        missing: dict[str, list[tuple[str, str]]] = {}
+        for target_id, target in self._targets.items():
+            target_missing = sorted(
+                target.expected_roles - self._seen_roles.get(target_id, set())
+            )
+            if target_missing:
+                missing[target.module_name] = target_missing
+        if missing:
+            preview = {module_name: roles[:8] for module_name, roles in missing.items()}
+            raise RuntimeError(
+                "[nvfp4_pertoken] refit did not cover every selected W1/W2/W3 "
+                f"target (first missing entries): {preview}"
+            )
+        if self._targets and self._quantized_events == 0:
             raise RuntimeError(
                 "[nvfp4_pertoken] refit quantized 0 params — export naming and "
                 "the model's quant_method assignment are out of sync."
             )
+        print(
+            f"[nvfp4_pertoken] refit: quantized {self._quantized_events} expert "
+            f"weight groups across {len(self._targets)} RoutedExperts containers",
+            flush=True,
+        )
 
 
 class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
@@ -306,6 +497,14 @@ class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
             )
 
     def process_weights_after_loading(self, layer) -> None:
+        """Finalize reload-format weights for dynamic per-token activation FP4.
+
+        This intentionally replaces the stock ModelOpt implementation in full.
+        Stock processing reconstructs a kernel using checkpoint/static input
+        scales; this method installs neutral activation scales, preserves dense
+        reload storage, and rebuilds the FlashInfer TRT-LLM kernel with
+        ``per_token_activation=True`` after every cold or warm refit.
+        """
         # Neutral (1.0) global activation scales: the kernel derives per-token
         # scales at runtime, so the output scalars reduce to the weight scales.
         num_experts = layer.w13_input_scale.data.shape[0]
@@ -378,12 +577,40 @@ class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
 
 
 class NvFp4PerTokenConfig(ModelOptNvFp4Config):
-    """Stock ModelOpt NVFP4 config with per-token FusedMoE activations."""
+    """Routed-expert-only ModelOpt NVFP4 with per-token activations.
+
+    W4A4 and block size 16 are intentionally fixed for this rollout contract;
+    they are properties of the selected vLLM kernel and refit tensor format,
+    not user-tunable recipe fields.
+    """
 
     FusedMoEMethodCls = ModelOptNvFp4PerTokenFusedMoE
 
     def get_name(self):
         return NVFP4_PER_TOKEN_METHOD
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        """Quantize selected RoutedExperts and keep all ordinary linears BF16."""
+        if isinstance(layer, RoutedExperts):
+            if self.is_layer_excluded(prefix):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+            num_fused_shared_experts = int(
+                getattr(layer.expert_map_manager, "num_fused_shared_experts", 0)
+            )
+            if num_fused_shared_experts:
+                raise ValueError(
+                    f"{NVFP4_PER_TOKEN_METHOD} does not support RoutedExperts "
+                    f"with {num_fused_shared_experts} fused shared experts "
+                    f"({prefix})."
+                )
+            return self.FusedMoEMethodCls(
+                quant_config=self, moe_config=layer.moe_config
+            )
+        if isinstance(layer, (LinearBase, ParallelLMHead)):
+            return UnquantizedLinearMethod()
+        # Preserve ModelOpt's attention/KV-cache handling; all remaining module
+        # types are unquantized by the base implementation.
+        return super().get_quant_method(layer, prefix)
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
@@ -424,6 +651,10 @@ class NvFp4PerTokenWorkerExtension(VllmInternalWorkerExtension):
 
     def _get_reload_weight_preparer(self) -> _ReloadWeightPreparer:
         return self._get_quantizer()
+
+    def report_nvfp4_pertoken_target_count(self) -> int:
+        """Report this TP/PP worker's selected routed-expert containers."""
+        return len(self._get_quantizer()._targets)
 
     def maybe_init_zmq(self) -> None:
         """Use a longer ZMQ timeout.
