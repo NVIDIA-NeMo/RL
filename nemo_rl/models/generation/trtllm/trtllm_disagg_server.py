@@ -215,8 +215,41 @@ def _build_adaptor_class() -> type:
     import aiohttp
     from fastapi import HTTPException, Request, Response
     from fastapi.responses import JSONResponse
-    from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+    from tensorrt_llm.serve.openai_disagg_server import (
+        OpenAIDisaggServer,
+        RawRequestResponseHooks,
+    )
     from tensorrt_llm.serve.openai_protocol import UCompletionRequest
+
+    class _CtxStampRelayHooks(RawRequestResponseHooks):
+        """Stash the ctx adapter's timing stamps on the raw request.
+
+        ``on_ctx_resp`` is the only place the context-leg response is visible
+        outside the disagg service, and the generation response is all the
+        caller ever sees. Parking the stamps on ``raw_req.state`` lets
+        ``_attach_rollout_fields`` -- which already rewrites the final payload
+        and holds the same ``raw_req`` -- move them onto the response without
+        touching the service itself.
+        """
+
+        _CTX_STAMPS = (
+            "nemo_ctx_arrival_ts_us",
+            "nemo_ctx_queued_ts_us",
+            "nemo_ctx_first_scheduled_ts_us",
+            "nemo_ctx_done_ts_us",
+        )
+
+        def on_ctx_resp(self, ctx_server: str, response: Any) -> None:
+            super().on_ctx_resp(ctx_server, response)
+            # The ctx adapter only emits these when timeline emission is on
+            # (NRL_TRTLLM_EMIT_TIMELINE_FIELDS); they ride as pydantic extras.
+            stamps = {}
+            for field in self._CTX_STAMPS:
+                value = getattr(response, field, None)
+                if isinstance(value, int):
+                    stamps[field] = value
+            if stamps:
+                self.raw_req.state.nemo_ctx_stamps = stamps
 
     class OpenAIDisaggServerAdaptor(OpenAIDisaggServer):
         """``OpenAIDisaggServer`` speaking NeMo-Gym's dialect at both edges.
@@ -236,6 +269,8 @@ def _build_adaptor_class() -> type:
         emitted that ``ChatCompletionResponse`` does not declare; those have to
         travel in a declared field (see ``_generation_token_ids``).
         """
+
+        response_hooks_cls = _CtxStampRelayHooks
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             self._tokenize_fn = kwargs.pop("tokenize_fn", None)
@@ -350,8 +385,8 @@ def _build_adaptor_class() -> type:
             payload = json.loads(response.body)
 
             # Frontend timing stamps recorded by the ASGI middleware; with the
-            # ctx stamps the disagg service relays and the gen adapter's own
-            # nemo_vllm_* set, the per-call timeline becomes a complete
+            # ctx stamps captured by _CtxStampRelayHooks and the gen adapter's
+            # own nemo_vllm_* set, the per-call timeline becomes a complete
             # end-to-end path decomposition.
             if raw_req is not None:
                 for header, field in (
@@ -361,6 +396,9 @@ def _build_adaptor_class() -> type:
                     value = raw_req.headers.get(header)
                     if value and value.isdigit():
                         payload[field] = int(value)
+                ctx_stamps = getattr(raw_req.state, "nemo_ctx_stamps", None)
+                if ctx_stamps:
+                    payload.update(ctx_stamps)
 
             choices = payload.get("choices") or []
             if not choices:
