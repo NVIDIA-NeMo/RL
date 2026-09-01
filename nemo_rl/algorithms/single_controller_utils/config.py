@@ -771,8 +771,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
     Both directions on the critic: one the PPO path needs and does not have, and
-    one a GRPO run carries and would never build. Plus the reward-shaping knobs
-    SC reads on neither path.
+    one a GRPO run carries and would never build. Plus the reward-shaping and
+    sampling knobs SC reads on neither path.
     """
     algo_cfg = algo_config(master_config)
 
