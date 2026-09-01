@@ -15,7 +15,7 @@ loss_fn:
   use_importance_sampling_correction: true  # required for off-policy replay data
 checkpointing:
   enabled: false
-  checkpoint_dir: results/grpo-nanov3-30BA3B-4n4g-megatron_async_colocated-mxfp8
+  checkpoint_dir: results/grpo-nanov3-30BA3B-4n4g-megatron_async_colocated-mxfp8  # pragma: allowlist secret
   save_period: 100
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
