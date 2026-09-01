@@ -96,15 +96,16 @@ def _patch_sglang_transformers_compat_bootstrap() -> None:
     if sentinel in content:
         return
 
-    anchor = "    _applied = True\n"
+    anchor = "\n    _applied = True\n"
     if anchor not in content:
         raise RuntimeError(
             f"Transformers patch bootstrap anchor '{anchor.strip()}' not found in "
             f"{file_to_patch}."
         )
 
-    content = content.replace(anchor, f"{anchor}\n{sentinel}", 1)
-    _write_and_verify(file_to_patch, content, sentinel)
+    patched_content = content.replace(anchor, f"{anchor}\n{sentinel}", 1)
+    compile(patched_content, file_to_patch, "exec")
+    _write_and_verify(file_to_patch, patched_content, sentinel)
     logger.info("Patched Transformers compatibility bootstrap in %s.", file_to_patch)
 
 
