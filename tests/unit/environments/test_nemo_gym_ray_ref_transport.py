@@ -105,3 +105,68 @@ def test_nemo_gym_postprocess_keeps_two_views_of_one_ray_object():
     generation_ref = result["message_log"][1]["routed_experts"]
     assert prompt_ref == full_ref | {"offset": 0, "length": 2}
     assert generation_ref == full_ref | {"offset": 2, "length": 1}
+
+
+def test_nemo_gym_postprocess_splices_ray_routes_across_multiple_turns():
+    first_ref = _full_ref() | {
+        "request_id": "request-a",
+        "length": 4,
+        "shape": [4, 2, 2],
+    }
+    second_ref = first_ref | {
+        "request_id": "request-b",
+        "length": 7,
+        "shape": [7, 2, 2],
+    }
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3, 4],
+                    "generation_log_probs": [-0.1, -0.2],
+                    "routed_experts": first_ref,
+                },
+                {
+                    "prompt_token_ids": [1, 2, 3, 4, 5],
+                    "generation_token_ids": [6, 7],
+                    "generation_log_probs": [-0.3, -0.4],
+                    "routed_experts": second_ref,
+                },
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+    class _Tokenizer:
+        def batch_decode(self, batch):
+            return ["decoded"] * len(batch)
+
+    class _MockSelf:
+        cfg = {"require_routed_experts": True}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    message_log = result["message_log"]
+    assert message_log[0]["routed_experts"] == first_ref | {
+        "offset": 0,
+        "length": 2,
+    }
+    # Token 4's padded decode route is replaced by its real route from the
+    # second request's prefill without resolving either Ray object.
+    assert message_log[1]["routed_experts"] == [
+        first_ref | {"offset": 2, "length": 1},
+        second_ref | {"offset": 3, "length": 1},
+    ]
+    assert message_log[2]["routed_experts"] == second_ref | {
+        "offset": 4,
+        "length": 1,
+    }
+    assert message_log[3]["routed_experts"] == second_ref | {
+        "offset": 5,
+        "length": 2,
+    }
