@@ -90,6 +90,14 @@ class NcclExtension(WorkerExtension):
     #  Collective initialisation (called once during setup)
     # ------------------------------------------------------------------ #
 
+    # Park the executor loop at a step boundary for the duration. Building the
+    # refit group is a blocking ncclCommInitRank across train+inference ranks,
+    # and the loop's own per-iteration object collectives are NCCL-backed since
+    # tekit 97b62625. Running both on the same device deadlocks: the loop's
+    # broadcast waits on peers whose main thread is inside ncclCommInitRank,
+    # which in turn waits on every rank. Observed as PG5 stalling at work 85
+    # after 84 clean iterations, then killed by the 600 s watchdog.
+    @control_action_decorator
     def init_collective(
         self,
         rank_prefix: int,
