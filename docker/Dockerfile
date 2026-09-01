@@ -145,8 +145,10 @@ ARG NVTE_BUILD_THREADS_PER_JOB=2
 ARG NVTE_CUDA_ARCHS=90;100
 ARG NVTE_FRAMEWORK=pytorch
 # TE 2.18 enables its experimental NCCL-EP backend by default on Hopper and
-# newer GPUs. NeMo RL uses Megatron Core's EP path, so retain the existing
-# capability set and avoid requiring matching system NCCL-EP headers.
+# newer GPUs. Current recipes use Megatron Core's standard token dispatcher,
+# so retain the existing capability set and avoid requiring matching system
+# NCCL-EP headers. Custom NCCL-EP experiments can opt in explicitly with
+# ``--build-arg NVTE_WITH_NCCL_EP=1``.
 ARG NVTE_WITH_NCCL_EP=0
 # Only use for custom vllm installs. Learn more at https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
 ARG BUILD_CUSTOM_VLLM

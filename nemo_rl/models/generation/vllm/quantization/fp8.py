@@ -25,7 +25,6 @@ from transformers import AutoConfig, AutoModel
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
@@ -33,6 +32,9 @@ from vllm.v1.engine.utils import CoreEngineProcManager
 
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
+)
+from nemo_rl.models.generation.vllm.quantization.utils import (
+    resolve_module_from_param_name,
 )
 
 logger = init_logger(__name__)
@@ -443,67 +445,11 @@ def get_module_from_param_name(model, name: str):
     stopping early at a ``RoutedExperts`` (or its owning ``MoERunner``) since
     per-expert path components below that point do not exist as submodules.
     """
-    # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
-    # The module path is all but the last part (the parameter's own name)
-    path_parts = name.split(".")
-    module_path = path_parts[:-1]
-    # Replace with the fused model name
-    packed_modules_mapping = model.packed_modules_mapping
-    reversed_mapping = {
-        original_name: fused_name
-        for fused_name, original_names_list in packed_modules_mapping.items()
-        for original_name in original_names_list
-    }
-    if module_path[-1] in reversed_mapping.keys():
-        module_path[-1] = reversed_mapping[module_path[-1]]
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_prefix"
-    ):
-        if module_path[0] in model.hf_to_vllm_mapper.orig_to_new_prefix:
-            module_path[0] = model.hf_to_vllm_mapper.orig_to_new_prefix[module_path[0]]
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_substr"
-    ):
-        for i in range(len(module_path)):
-            if module_path[i] in model.hf_to_vllm_mapper.orig_to_new_substr:
-                module_path[i] = model.hf_to_vllm_mapper.orig_to_new_substr[
-                    module_path[i]
-                ]
-
-    current_module = model
-    try:
-        # Traverse the model hierarchy
-        for part in module_path:
-            # vLLM 0.25 split the old FusedMoE module into a MoERunner that
-            # delegates to a RoutedExperts submodule owning the expert weights
-            # (w13_weight/w2_weight), so stop at either and return the
-            # weight-owning module.
-            if isinstance(current_module, MoERunner):
-                return current_module.routed_experts
-            if isinstance(current_module, RoutedExperts):
-                return current_module
-            if part == "model" and not hasattr(current_module, part):
-                # Some HF/vLLM model classes expose the decoder directly (for
-                # example ``language_model``) while parameter names still carry
-                # vLLM's synthetic ``model.`` prefix.
-                continue
-            if part == "layers" and not hasattr(current_module, part):
-                # Qwen3.5-MoE VL exposes ``language_model`` as a CausalLM
-                # wrapper; its decoder stack lives under ``language_model.model``.
-                wrapped_model = getattr(current_module, "model", None)
-                if wrapped_model is not None and hasattr(wrapped_model, part):
-                    current_module = wrapped_model
-            if isinstance(current_module, torch.nn.ModuleList):
-                current_module = current_module[int(part)]
-            else:
-                current_module = getattr(current_module, part)
-    except (AttributeError, IndexError, ValueError) as e:
-        print(f"Warning: Could not find module for parameter '{name}'. Error: {e}")
-    # Fused param names (e.g. "...experts.w13_weight") end the traversal on the
-    # MoERunner itself; normalize to the weight-owning RoutedExperts submodule.
-    if isinstance(current_module, MoERunner):
-        return current_module.routed_experts
-    return current_module
+    resolution = resolve_module_from_param_name(model, name)
+    if resolution is None:
+        print(f"Warning: Could not find module for parameter '{name}'.")
+        return None
+    return resolution.module
 
 
 def _is_fp8_weight(name, model):

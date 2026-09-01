@@ -1743,6 +1743,8 @@ class TestApplyPerformanceConfig:
             {"megatron_cfg": {"fp4_cfg": {"enabled": False}}},
             {"megatron_cfg": {"fp4_cfg": {"fp4_recipe": "other"}}},
             {"megatron_cfg": {"fp4_cfg": {"fp4_param": True}}},
+            {"megatron_cfg": {"env_vars": {"NVTE_BACKWARD_OVERRIDE": "dequantized"}}},
+            {"megatron_cfg": {"te_precision_config_file": None}},
         ],
     )
     def test_nvfp4_pertoken_requires_validated_training_contract(self, policy_update):
@@ -1758,7 +1760,14 @@ class TestApplyPerformanceConfig:
                 "fp4_cfg": {
                     "enabled": True,
                     "fp4": "e2m1",
-                }
+                },
+                "env_vars": {
+                    "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+                    "NVTE_BACKWARD_OVERRIDE": "dequantized",
+                },
+                "te_precision_config_file": (
+                    "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+                ),
             },
         }
         if "precision" in policy_update:
@@ -1766,12 +1775,50 @@ class TestApplyPerformanceConfig:
         if "quant_cfg" in policy_update:
             config["quant_cfg"] = policy_update["quant_cfg"]
         if "megatron_cfg" in policy_update:
-            config["megatron_cfg"]["fp4_cfg"].update(
-                policy_update["megatron_cfg"]["fp4_cfg"]
-            )
+            for key, value in policy_update["megatron_cfg"].items():
+                if key == "fp4_cfg":
+                    config["megatron_cfg"]["fp4_cfg"].update(value)
+                else:
+                    config["megatron_cfg"][key] = value
 
         with pytest.raises(ValueError, match="requires policy.precision"):
-            apply_te_precision_config(SimpleNamespace(), config)
+            apply_te_precision_config(SimpleNamespace(num_layers=48), config)
+
+    def test_nvfp4_pertoken_accepts_complete_training_contract(self):
+        from nemo_rl.models.megatron.setup import apply_te_precision_config
+
+        model_cfg = SimpleNamespace(num_layers=48)
+        config = {
+            "precision": "bfloat16",
+            "generation": {
+                "backend": "vllm",
+                "nvfp4_pertoken_rollout": {"enabled": True},
+            },
+            "megatron_cfg": {
+                "fp4_cfg": {"enabled": True, "fp4": "e2m1"},
+                "first_last_layers_bf16": True,
+                "num_layers_at_start_in_bf16": 2,
+                "num_layers_at_end_in_bf16": 4,
+                "te_precision_config_file": (
+                    "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+                ),
+                "env_vars": {
+                    "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+                    "NVTE_BACKWARD_OVERRIDE": "dequantized",
+                },
+            },
+        }
+
+        apply_te_precision_config(model_cfg, config)
+
+        assert config["generation"]["nvfp4_pertoken_rollout"]["additional_ignore"] == [
+            "*.layers.0.mlp.experts*",
+            "*.layers.1.mlp.experts*",
+            "*.layers.44.mlp.experts*",
+            "*.layers.45.mlp.experts*",
+            "*.layers.46.mlp.experts*",
+            "*.layers.47.mlp.experts*",
+        ]
 
     def test_first_and_last_bf16_layers_are_forwarded(self):
         from nemo_rl.models.megatron.setup import apply_te_precision_config
@@ -1816,8 +1863,10 @@ class TestApplyPerformanceConfig:
 
         assert match("decoder.layers.0.self_attention.linear_qkv") == "bf16"
         assert match("decoder.layers.0.self_attention.linear_proj") == "bf16"
-        assert match("decoder.layers.0.mlp.linear_fc1") == "nvfp4"
-        assert match("decoder.layers.0.mlp.linear_fc2") == "nvfp4"
+        assert match("decoder.layers.0.mlp.experts.linear_fc1") == "nvfp4"
+        assert match("decoder.layers.0.mlp.experts.linear_fc2") == "nvfp4"
+        assert match("decoder.layers.0.mlp.linear_fc1") is None
+        assert match("decoder.layers.0.mlp.shared_experts.linear_fc1") is None
         assert match("decoder.layers.0.input_layernorm") is None
 
     def test_recompute_granularity_full_explicit(self):

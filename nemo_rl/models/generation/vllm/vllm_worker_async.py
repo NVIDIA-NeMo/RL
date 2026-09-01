@@ -43,6 +43,10 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
+from nemo_rl.models.generation.vllm.collective_rpc import (
+    resolve_collective_rpc_result,
+)
+from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
@@ -331,6 +335,17 @@ class VllmAsyncGenerationWorkerImpl(
     async def post_init_async(self):
         if self.llm is not None:
             await self.llm.collective_rpc("bind_numa", args=tuple())
+            if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
+                target_counts = await resolve_collective_rpc_result(
+                    self.llm.collective_rpc(
+                        "report_nvfp4_pertoken_target_count", args=tuple()
+                    )
+                )
+                if not target_counts or sum(target_counts) == 0:
+                    raise RuntimeError(
+                        "generation.nvfp4_pertoken_rollout selected no "
+                        "RoutedExperts targets across the vLLM model"
+                    )
         self.vllm_device_ids = await self.report_device_id_async()
         if self._mtp_load_from_disk:
             await self.llm.collective_rpc(

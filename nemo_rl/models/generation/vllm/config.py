@@ -23,9 +23,15 @@ from pydantic import (
     PositiveInt,
 )
 
-from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
+    get_num_routed_experts,
+)
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+    MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
+    MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
     NvFp4PerTokenRolloutConfig,
+    resolve_boundary_ignore_patterns,
 )
 
 VllmRefitTransportName = Literal["s3", "zmq"]
@@ -277,6 +283,72 @@ def parse_nvfp4_pertoken_rollout(
     return parsed if parsed.enabled else None
 
 
+def normalize_nvfp4_pertoken_policy_config(policy_config: dict[str, Any]) -> None:
+    """Derive rollout BF16 exclusions from the policy's Megatron boundary.
+
+    This runs on the driver before generation workers are created so trainer
+    and rollout actors receive one normalized precision contract.
+    """
+    generation_config = policy_config.get("generation") or {}
+    if generation_config.get("backend") != "vllm":
+        return
+    rollout = parse_nvfp4_pertoken_rollout(cast(VllmConfig, generation_config))
+    if rollout is None:
+        return
+
+    from transformers import AutoConfig
+
+    model_name = policy_config.get("model_name")
+    if not model_name:
+        raise ValueError(
+            "NVFP4 per-token boundary resolution requires policy.model_name"
+        )
+    overrides = policy_config.get("hf_config_overrides") or {}
+    hf_config = AutoConfig.from_pretrained(
+        model_name, trust_remote_code=True, **overrides
+    )
+    text_config = getattr(hf_config, "text_config", None)
+    num_hidden_layers = overrides.get("num_hidden_layers")
+    if num_hidden_layers is None:
+        num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+    if num_hidden_layers is None and text_config is not None:
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+
+    megatron_cfg = policy_config.get("megatron_cfg") or {}
+    first_last_layers_bf16 = bool(megatron_cfg.get("first_last_layers_bf16", False))
+    num_start = int(
+        megatron_cfg.get(
+            "num_layers_at_start_in_bf16",
+            MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
+        )
+        or 0
+    )
+    num_end = int(
+        megatron_cfg.get(
+            "num_layers_at_end_in_bf16",
+            MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
+        )
+        or 0
+    )
+    raw_rollout = generation_config.setdefault("nvfp4_pertoken_rollout", {})
+    legacy_ignore = (
+        rollout.additional_ignore if "additional_ignore" in raw_rollout else None
+    )
+    resolved = resolve_boundary_ignore_patterns(
+        num_hidden_layers=num_hidden_layers,
+        first_last_layers_bf16=first_last_layers_bf16,
+        num_layers_at_start_in_bf16=num_start,
+        num_layers_at_end_in_bf16=num_end,
+        legacy_additional_ignore=legacy_ignore,
+    )
+    raw_rollout["additional_ignore"] = resolved
+    print(
+        "[nvfp4_pertoken] derived rollout BF16 decoder layers from Megatron: "
+        f"{resolved}",
+        flush=True,
+    )
+
+
 def validate_nvfp4_pertoken_generation(
     config: VllmConfig, *, is_eval: bool
 ) -> NvFp4PerTokenRolloutConfig | None:
@@ -328,19 +400,12 @@ def validate_nvfp4_pertoken_generation(
 
 
 def validate_nvfp4_pertoken_model(hf_config: Any) -> None:
-    """Limit the feature to the Qwen3 all-MoE layout validated end to end."""
-    architectures = getattr(hf_config, "architectures", []) or []
-    decoder_sparse_step = getattr(hf_config, "decoder_sparse_step", None)
-    mlp_only_layers = getattr(hf_config, "mlp_only_layers", None) or []
-    if (
-        "Qwen3MoeForCausalLM" not in architectures
-        or decoder_sparse_step != 1
-        or mlp_only_layers
-    ):
+    """Preflight the model before vLLM performs constructed-model validation."""
+    if get_num_routed_experts(hf_config) is None:
+        architectures = getattr(hf_config, "architectures", []) or []
         raise ValueError(
-            "generation.nvfp4_pertoken_rollout currently supports only the "
-            "validated Qwen3 all-MoE layout (Qwen3MoeForCausalLM, "
-            "decoder_sparse_step=1, no mlp_only_layers)."
+            "generation.nvfp4_pertoken_rollout requires a model with routed "
+            f"experts; no routed-expert count was found for {architectures or 'the HF config'}."
         )
 
 

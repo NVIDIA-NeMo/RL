@@ -711,41 +711,96 @@ def test_nvfp4_pertoken_validation_accepts_vllm_model_parallelism(vllm_cfg):
     )
 
 
-@pytest.mark.parametrize(
-    ("architectures", "decoder_sparse_step", "mlp_only_layers"),
-    [
-        (["LlamaForCausalLM"], 1, []),
-        (["Qwen3MoeForCausalLM"], 2, []),
-        (["Qwen3MoeForCausalLM"], 1, [0]),
-    ],
-)
-def test_nvfp4_pertoken_rejects_unverified_model_layouts(
-    architectures, decoder_sparse_step, mlp_only_layers
-):
+@pytest.mark.parametrize("architecture", ["LlamaForCausalLM", "Qwen3_8ForCausalLM"])
+def test_nvfp4_pertoken_rejects_dense_models(architecture):
     from nemo_rl.models.generation.vllm.config import (
         validate_nvfp4_pertoken_model,
     )
 
-    hf_config = types.SimpleNamespace(
-        architectures=architectures,
-        decoder_sparse_step=decoder_sparse_step,
-        mlp_only_layers=mlp_only_layers,
-    )
-    with pytest.raises(ValueError, match="Qwen3 all-MoE"):
+    hf_config = types.SimpleNamespace(architectures=[architecture])
+    with pytest.raises(ValueError, match="requires a model with routed experts"):
         validate_nvfp4_pertoken_model(hf_config)
 
 
-def test_nvfp4_pertoken_accepts_qwen3_all_moe_layout():
+@pytest.mark.parametrize(
+    ("architecture", "expert_field"),
+    [
+        ("Qwen3MoeForCausalLM", {"num_experts": 128}),
+        ("Qwen3_5MoeForConditionalGeneration", {"num_experts": 256}),
+        ("DeepseekV2ForCausalLM", {"n_routed_experts": 64}),
+    ],
+)
+def test_nvfp4_pertoken_accepts_generic_moe_layouts(architecture, expert_field):
     from nemo_rl.models.generation.vllm.config import (
         validate_nvfp4_pertoken_model,
     )
 
-    hf_config = types.SimpleNamespace(
-        architectures=["Qwen3MoeForCausalLM"],
-        decoder_sparse_step=1,
-        mlp_only_layers=[],
-    )
+    hf_config = types.SimpleNamespace(architectures=[architecture], **expert_field)
     validate_nvfp4_pertoken_model(hf_config)
+
+
+def test_nvfp4_policy_boundary_normalization_uses_megatron_as_source(
+    monkeypatch,
+):
+    from nemo_rl.models.generation.vllm import config as vllm_config
+
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=48),
+    )
+    policy_config = {
+        "model_name": "dummy-moe",
+        "generation": {
+            "backend": "vllm",
+            "nvfp4_pertoken_rollout": {"enabled": True},
+        },
+        "megatron_cfg": {
+            "first_last_layers_bf16": True,
+            "num_layers_at_start_in_bf16": 2,
+            "num_layers_at_end_in_bf16": 4,
+        },
+    }
+
+    vllm_config.normalize_nvfp4_pertoken_policy_config(policy_config)
+
+    assert policy_config["generation"]["nvfp4_pertoken_rollout"][
+        "additional_ignore"
+    ] == [
+        "*.layers.0.mlp.experts*",
+        "*.layers.1.mlp.experts*",
+        "*.layers.44.mlp.experts*",
+        "*.layers.45.mlp.experts*",
+        "*.layers.46.mlp.experts*",
+        "*.layers.47.mlp.experts*",
+    ]
+
+
+def test_nvfp4_policy_boundary_normalization_uses_mcore_count_defaults(
+    monkeypatch,
+):
+    from nemo_rl.models.generation.vllm import config as vllm_config
+
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=48),
+    )
+    policy_config = {
+        "model_name": "dummy-moe",
+        "generation": {
+            "backend": "vllm",
+            "nvfp4_pertoken_rollout": {"enabled": True},
+        },
+        "megatron_cfg": {"first_last_layers_bf16": True},
+    }
+
+    vllm_config.normalize_nvfp4_pertoken_policy_config(policy_config)
+
+    assert policy_config["generation"]["nvfp4_pertoken_rollout"][
+        "additional_ignore"
+    ] == [
+        "*.layers.0.mlp.experts*",
+        "*.layers.47.mlp.experts*",
+    ]
 
 
 def test_main_worker_configures_nvfp4_pertoken_engine_kwargs(monkeypatch):

@@ -975,6 +975,15 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
     def post_init(self):
         if self.llm is not None:
             self.llm.collective_rpc("bind_numa", args=tuple())
+            if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
+                target_counts = self.llm.collective_rpc(
+                    "report_nvfp4_pertoken_target_count", args=tuple()
+                )
+                if not target_counts or sum(target_counts) == 0:
+                    raise RuntimeError(
+                        "generation.nvfp4_pertoken_rollout selected no "
+                        "RoutedExperts targets across the vLLM model"
+                    )
         self.vllm_device_ids = self.report_device_id()
         if self._mtp_load_from_disk:
             self.llm.collective_rpc(

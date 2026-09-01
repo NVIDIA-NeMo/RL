@@ -1,10 +1,10 @@
-defaults: performance/grpo-qwen3-30ba3b-4n4g.yaml
+defaults: grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml
 grpo:
   max_num_steps: 20
   num_prompts_per_step: 8
   num_generations_per_prompt: 2
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
+  checkpoint_dir: results/grpo-qwen3.5-35ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
 policy:
   train_global_batch_size: 16
   logprob_batch_size: 1
@@ -33,6 +33,9 @@ policy:
       NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING: '1'
       NVTE_BACKWARD_OVERRIDE: dequantized
 logger:
-  log_dir: logs/grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
+  log_dir: logs/grpo-qwen3.5-35ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
   wandb:
-    name: grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
+    name: grpo-qwen3.5-35ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
