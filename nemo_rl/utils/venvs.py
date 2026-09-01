@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import fcntl
 import logging
 import os
 import shlex
@@ -114,37 +113,8 @@ def create_local_venv(
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    #
-    # Serialized per node: two builders (NemoGym + vLLM worker venvs) run
-    # concurrently on every node and race on the uv cache. The loser reads
-    # a half-written nemo-rl metadata entry and fails with spurious
-    # "extra `vllm` is not defined" / stale-lock errors (jobs
-    # 6581921/6583062/6584210 — a different node each run, while the same
-    # command passes 3/3 serially on a probe node). The flock makes the
-    # two builds on a node sequential.
-    #
-    # Do NOT `uv cache clean` here on failure: with UV_CACHE_DIR on a
-    # shared filesystem the clean takes an exclusive lock on the whole
-    # cache (1800s stalls cluster-wide in job 6586163) and deletes entries
-    # other nodes are concurrently reading, re-poisoning the cache every
-    # retry. The cache must instead be warmed serially (single probe node)
-    # before a multi-node run whenever uv.lock changes.
-    node_build_lock = os.path.join(NEMO_RL_VENV_DIR, ".uv_node_build.lock")
-    with open(node_build_lock, "a") as lock_handle:
-        fcntl.flock(lock_handle, fcntl.LOCK_EX)
-        for attempt in range(3):
-            try:
-                subprocess.run(
-                    ["uv", "sync", "--frozen", "--directory", git_root],
-                    env=env,
-                    check=True,
-                )
-                subprocess.run(exec_cmd, env=env, check=True)
-                break
-            except subprocess.CalledProcessError:
-                if attempt == 2:
-                    raise
-                time.sleep(15 * (attempt + 1))
+    subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
+    subprocess.run(exec_cmd, env=env, check=True)
 
     # Return the path to the python executable in the virtual environment
     python_path = os.path.join(venv_path, "bin", "python")
@@ -221,15 +191,6 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     ray.get(pg.ready())
 
     force_rebuild = os.environ.get("NRL_FORCE_REBUILD_VENVS", "false").lower() == "true"
-    # NRL_FORCE_REBUILD_VENVS_LIST: comma-separated venv names to rebuild even
-    # when the global flag is off — for containers whose baked venvs are only
-    # partially compatible with the checked-out branch.
-    rebuild_list = {
-        name
-        for name in os.environ.get("NRL_FORCE_REBUILD_VENVS_LIST", "").split(",")
-        if name
-    }
-    force_rebuild = force_rebuild or venv_name in rebuild_list
     # Launch one actor per node
     actors = [
         _env_builder.options(placement_group=pg).remote(
