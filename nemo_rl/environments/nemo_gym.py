@@ -81,6 +81,56 @@ DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 NEMO_GYM_POPPED_VALUE_SENTINEL_KEY = "__nemo_rl_popped__"
 
 
+def _replace_last_routed_experts_ref(
+    previous_routes: Any,
+    replacement: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Replace the final logical route in a reference-backed message.
+
+    vLLM cannot report the route used to predict the final generated token in
+    the same decode response.  The following turn's prefill does contain that
+    route.  Dense router replay patches the final row in place; reference-backed
+    replay represents the same operation by trimming the prior slice and
+    appending a one-token slice from the next request.
+    """
+    if is_routed_experts_ref(previous_routes):
+        segments = [validate_routed_experts_ref(previous_routes)]
+    elif isinstance(previous_routes, list) and previous_routes:
+        segments = [validate_routed_experts_ref(segment) for segment in previous_routes]
+    else:
+        raise TypeError(
+            "Cannot patch a reference-backed routed-experts turn whose previous "
+            f"routes have type {type(previous_routes).__name__}."
+        )
+
+    last_nonempty = next(
+        (
+            index
+            for index in range(len(segments) - 1, -1, -1)
+            if int(segments[index]["length"]) > 0
+        ),
+        None,
+    )
+    if last_nonempty is None:
+        raise ValueError(
+            "Cannot replace the final route of an empty routed-experts turn"
+        )
+
+    last = segments[last_nonempty]
+    updated = segments[:last_nonempty]
+    if int(last["length"]) > 1:
+        updated.append(
+            slice_routed_experts_ref(
+                last,
+                offset=int(last["offset"]),
+                length=int(last["length"]) - 1,
+            )
+        )
+    updated.append(validate_routed_experts_ref(dict(replacement)))
+    updated.extend(segments[last_nonempty + 1 :])
+    return updated
+
+
 def _popped_training_value_sentinel(
     *, field: str, dtype: str, shape: Optional[Sequence[int]]
 ) -> dict[str, Any]:
@@ -1082,7 +1132,6 @@ Depending on your data shape, you may want to change these values."""
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         batch_decode_items = []
-        routed_experts_ref_items = 0
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -1135,14 +1184,6 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 expected_tokens = len(prompt_token_ids) + len(generation_token_ids)
                 if is_routed_experts_ref(routed_experts_raw):
                     routed_experts_ref = validate_routed_experts_ref(routed_experts_raw)
-                    routed_experts_ref_items += 1
-                    if routed_experts_ref_items > 1 or seen_token_ids:
-                        raise NotImplementedError(
-                            "router_replay.transport=ray currently supports "
-                            "one routed-experts-bearing model output per sample. "
-                            "Multi-turn prompt/generation reference splitting is "
-                            "deferred."
-                        )
                     if (
                         routed_experts_ref["offset"] != 0
                         or routed_experts_ref["length"]
@@ -1212,6 +1253,18 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 previous_routes = nemo_rl_message_log[-1].get("routed_experts")
                 if isinstance(previous_routes, torch.Tensor):
                     previous_routes[-1] = routed_experts[len(seen_token_ids) - 1]
+            elif routed_experts_ref is not None and seen_token_ids:
+                previous_routes = nemo_rl_message_log[-1].get("routed_experts")
+                nemo_rl_message_log[-1]["routed_experts"] = (
+                    _replace_last_routed_experts_ref(
+                        previous_routes,
+                        slice_routed_experts_ref(
+                            routed_experts_ref,
+                            offset=len(seen_token_ids) - 1,
+                            length=1,
+                        ),
+                    )
+                )
 
             prompt_start = len(seen_token_ids)
             prompt_end = len(prompt_token_ids)
