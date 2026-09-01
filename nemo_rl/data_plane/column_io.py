@@ -37,7 +37,12 @@ import torch
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data_plane.codec import materialize, pack_jagged_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
-from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN, Layout
+from nemo_rl.data_plane.schema import (
+    GLOBAL_FORWARD_PAD_SEQLEN,
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
+    Layout,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 TOKEN_ALIGNED_FIELDS = frozenset(
@@ -53,6 +58,8 @@ TOKEN_ALIGNED_FIELDS = frozenset(
         "token_mask",
         "sample_mask",
         "routed_experts",
+        INVALID_TOOL_CALL_MASK,
+        MALFORMED_THINKING_MASK,
     }
 )
 

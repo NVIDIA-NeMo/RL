@@ -16,6 +16,10 @@ from __future__ import annotations
 
 import torch
 
+from nemo_rl.data_plane.schema import (
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
+)
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 
@@ -103,6 +107,7 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
     )
 
     expected_routes = [
@@ -124,6 +129,7 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
         train_batch,
         weight_version=3,
         group_id="group",
+        prompt_idx=17,
     )
     assert sample_ids == ["group_g0", "group_g1"]
     assert "routed_experts" in fields
@@ -132,22 +138,99 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
     packed_rows = list(packed_routes.unbind())
     assert torch.equal(packed_rows[0], expected_routes[0])
     assert torch.equal(packed_rows[1], expected_routes[1])
-    assert tags == [{"weight_version": 3}, {"weight_version": 3}]
+    no_violations = {
+        "num_invalid_tool_calls": 0,
+        "num_malformed_thinking": 0,
+        "num_assistant_messages": 1,
+    }
+    assert tags == [
+        {"weight_version": 3, "prompt_idx": 17, **no_violations},
+        {"weight_version": 3, "prompt_idx": 17, **no_violations},
+    ]
+
+
+def test_record_to_train_batch_preserves_message_violation_masks() -> None:
+    invalid = _completion(route_start=10, reward=1.0)
+    invalid.message_log[1]["is_invalid_tool_call"] = True
+
+    malformed = _completion(
+        route_start=30,
+        reward=2.0,
+        env_token_ids=(30, 31),
+    )
+    malformed.message_log[1]["has_malformed_thinking"] = True
+
+    train_batch = record_to_train_batch(
+        _record([invalid, malformed]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=True,
+    )
+
+    assert train_batch[INVALID_TOOL_CALL_MASK].dtype == torch.bool
+    assert train_batch[MALFORMED_THINKING_MASK].dtype == torch.bool
+    assert train_batch[INVALID_TOOL_CALL_MASK][0, :5].tolist() == [
+        False,
+        False,
+        True,
+        True,
+        False,
+    ]
+    assert not train_batch[MALFORMED_THINKING_MASK][0, :5].any()
+    assert not train_batch[INVALID_TOOL_CALL_MASK][1, :6].any()
+    assert train_batch[MALFORMED_THINKING_MASK][1, :6].tolist() == [
+        False,
+        False,
+        True,
+        True,
+        False,
+        False,
+    ]
+
+    _, fields, tags = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+        prompt_idx=17,
+    )
+    invalid_rows = list(fields[INVALID_TOOL_CALL_MASK].unbind())
+    malformed_rows = list(fields[MALFORMED_THINKING_MASK].unbind())
+    assert invalid_rows[0].tolist() == [False, False, True, True, False]
+    assert malformed_rows[1].tolist() == [False, False, True, True, False, False]
+    assert tags[0]["num_invalid_tool_calls"] == 1
+    assert tags[1]["num_malformed_thinking"] == 1
+
+
+def test_record_to_train_batch_preserves_clean_masks_when_enabled() -> None:
+    train_batch = record_to_train_batch(
+        _record([_completion(route_start=10, reward=1.0)]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=True,
+    )
+
+    assert not train_batch[INVALID_TOOL_CALL_MASK].any()
+    assert not train_batch[MALFORMED_THINKING_MASK].any()
 
 
 def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
-    record = _record([_completion(route_start=10, reward=1.0, with_routes=False)])
+    completion = _completion(route_start=10, reward=1.0, with_routes=False)
+    completion.message_log[1]["is_invalid_tool_call"] = True
+    completion.message_log[1]["has_malformed_thinking"] = True
+    record = _record([completion])
 
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
     )
     assert "routed_experts" not in train_batch
+    assert INVALID_TOOL_CALL_MASK not in train_batch
+    assert MALFORMED_THINKING_MASK not in train_batch
 
     _, fields, _ = pack_payload(
         train_batch,
         weight_version=3,
         group_id="group",
+        prompt_idx=17,
     )
     assert "routed_experts" not in fields
 
@@ -175,6 +258,7 @@ def test_record_to_train_batch_backfills_routes_for_failed_completion() -> None:
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
     )
 
     assert train_batch["input_lengths"].tolist() == [5, 2]
@@ -187,6 +271,59 @@ def test_record_to_train_batch_backfills_routes_for_failed_completion() -> None:
     # It is fully loss-masked either way.
     assert train_batch["token_mask"][1, :2].tolist() == [0, 0]
 
-    _, fields, _ = pack_payload(train_batch, weight_version=3, group_id="group")
+    _, fields, _ = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+        prompt_idx=17,
+    )
     assert "routed_experts" in fields
     assert list(fields["routed_experts"].unbind())[1].shape == (2, 2, 2)
+
+
+def test_pack_payload_stamps_violation_counts_on_tags() -> None:
+    """Each flag lands in its own counter; a row that never generated counts zero."""
+    completions = [
+        _completion(route_start=10, reward=1.0),
+        _completion(route_start=30, reward=1.0),
+        _failed_completion(),
+    ]
+    completions[0].message_log[1]["is_invalid_tool_call"] = True
+    completions[1].message_log[1]["has_malformed_thinking"] = True
+
+    train_batch = record_to_train_batch(
+        _record(completions),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+    )
+    _, fields, tags = pack_payload(
+        train_batch,
+        weight_version=7,
+        group_id="g",
+        prompt_idx=17,
+    )
+
+    assert "violation_counts" not in fields
+    assert tags == [
+        {
+            "weight_version": 7,
+            "prompt_idx": 17,
+            "num_invalid_tool_calls": 1,
+            "num_malformed_thinking": 0,
+            "num_assistant_messages": 1,
+        },
+        {
+            "weight_version": 7,
+            "prompt_idx": 17,
+            "num_invalid_tool_calls": 0,
+            "num_malformed_thinking": 1,
+            "num_assistant_messages": 1,
+        },
+        {
+            "weight_version": 7,
+            "prompt_idx": 17,
+            "num_invalid_tool_calls": 0,
+            "num_malformed_thinking": 0,
+            "num_assistant_messages": 0,
+        },
+    ]
