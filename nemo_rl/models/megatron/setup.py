@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import enum
 import hashlib
 import json
 import os
@@ -454,6 +455,20 @@ def enable_zero_train_gen_kl(
 _MOE_BI_FP8_ASSERT_SKIPPED = False
 
 
+def _coerce_mcore_config_enums_to_strings(config: Any) -> None:
+    """Reset MCore enum config fields to strings before __post_init__ reruns.
+
+    Bridge ``finalize()`` and ``ConfigContainer.validate()`` both call MCore
+    ``TransformerConfig.__post_init__``. Some inference_optimized checks compare
+    against string literals (e.g. ``"vllm"``) before converting to enums, so a
+    second pass fails with ``InferenceGroupedGemmBackend.VLLM`` even when the
+    YAML value is correct.
+    """
+    backend = getattr(config, "inference_grouped_gemm_backend", None)
+    if isinstance(backend, enum.Enum):
+        config.inference_grouped_gemm_backend = backend.value
+
+
 def _skip_megatron_moe_bi_fp8_assert() -> None:
     """Allow TE MoE + batch_invariant_mode + FP8 past Megatron's bf16-only gate.
 
@@ -468,6 +483,7 @@ def _skip_megatron_moe_bi_fp8_assert() -> None:
     orig_post_init = TransformerConfig.__post_init__
 
     def _post_init_allow_te_moe_bi_fp8(self: Any) -> None:
+        _coerce_mcore_config_enums_to_strings(self)
         try:
             orig_post_init(self)
         except AssertionError as e:
@@ -979,14 +995,6 @@ def setup_model_config(
     # Validate chunking configuration
     _validate_chunking_config(config)
 
-    # Reconstructed providers must be finalized so derived fields reflect the
-    # merged config. Without overrides, preserve the existing checkpoint-load
-    # behavior: only HF-derived providers need finalization here.
-    if derive_provider_from_hf or model_overrides:
-        model_cfg.finalize()
-
-    model_cfg.__post_init__()
-
     # Derive fp8_param_enabled once from the config dict so that load_main_params_from_ckpt
     # and _create_megatron_config both use the same canonical check (fp8 enabled AND fp8_param).
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -1018,6 +1026,11 @@ def setup_model_config(
 
     # Validate training configuration
     _validate_training_config(config, model_cfg)
+
+    # Finalize once after NeMo-RL fields are applied. Bridge configs defer MCore
+    # __post_init__ to finalize(); megatron_cfg.validate() may call it again.
+    if derive_provider_from_hf or model_overrides:
+        model_cfg.finalize()
 
     # Create final megatron config
     megatron_cfg = _create_megatron_config(
