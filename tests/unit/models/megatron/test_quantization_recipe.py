@@ -12,11 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 
 from nemo_rl.models.megatron.quantization_recipe import (
+    _find_bf16_config_key,
     first_last_bf16_local_layers,
 )
+
+
+@pytest.mark.parametrize(
+    ("quantization_key", "quantization_recipe"),
+    [
+        ("fp8_quantization_recipe", "mxfp8"),
+        ("fp4_quantization_recipe", "nvfp4"),
+    ],
+)
+def test_find_bf16_config_key_rejects_quantized_evaluation(
+    quantization_key: str, quantization_recipe: str
+) -> None:
+    recipe = SimpleNamespace(
+        configs={
+            "bf16": {
+                "training_recipe": {},
+                "evaluation_recipe": {quantization_key: quantization_recipe},
+            },
+            "full_precision": {
+                "training_recipe": {},
+                "evaluation_recipe": {},
+            },
+        }
+    )
+
+    assert _find_bf16_config_key(recipe) == "full_precision"
+
+
+def test_find_bf16_config_key_inherits_training_when_evaluation_missing() -> None:
+    recipe = SimpleNamespace(configs={"bf16": {"training_recipe": {}}})
+
+    assert _find_bf16_config_key(recipe) == "bf16"
 
 
 def test_first_last_bf16_layers_reject_overlapping_global_ranges() -> None:

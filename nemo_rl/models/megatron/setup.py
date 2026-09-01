@@ -1085,22 +1085,34 @@ def _validate_te_precision_config(
         _quant_recipe_name(fp8_cfg.get("fp8_recipe")) if fp8_cfg_enabled else None
     )
 
-    # A recipe can store primary weights in FP8/FP4 through its own
-    # fp8_param/fp4_param fields, which are separate from fp8_cfg.fp8_param.
-    # NeMo-RL derives sequence padding, refit export, and reshard validation
-    # from fp8_cfg alone, so such weights would reach the inference engine as
-    # if they were BF16. Reject until the refit path understands them.
+    # Per-module parameter storage must agree with the outer refit contract,
+    # which drives padding, export, and reshard validation.
     for config_key in sorted({m.config_key for m in quant_recipe.matchers}):
         payload = quant_recipe.configs.get(config_key) or {}
         for block in ("training_recipe", "evaluation_recipe"):
             block_cfg = payload.get(block) or {}
-            if block_cfg.get("fp8_param") or block_cfg.get("fp4_param"):
+            if block_cfg.get("fp4_param"):
                 raise ValueError(
-                    "megatron_cfg.te_precision_config_file sets fp8_param or "
-                    f"fp4_param in '{config_key}.{block}'. NeMo-RL reads "
-                    "megatron_cfg.fp8_cfg for all FP8 behavior, so these "
-                    "weights would be sent to the inference engine as BF16. "
-                    "Use megatron_cfg.fp8_cfg for FP8 parameter storage."
+                    "megatron_cfg.te_precision_config_file sets fp4_param in "
+                    f"'{config_key}.{block}', but native FP4 parameter export "
+                    "is not supported."
+                )
+
+            block_fp8_recipe = _quant_recipe_name(
+                block_cfg.get("fp8_quantization_recipe")
+            )
+            if block_cfg.get("fp8_param") and not (
+                fp8_cfg_enabled
+                and fp8_cfg_recipe == "mxfp8"
+                and fp8_cfg is not None
+                and fp8_cfg.get("fp8_param", False)
+                and block_fp8_recipe == "mxfp8"
+            ):
+                raise ValueError(
+                    "megatron_cfg.te_precision_config_file sets fp8_param in "
+                    f"'{config_key}.{block}', but native parameter export requires "
+                    "megatron_cfg.fp8_cfg.enabled=true, fp8_param=true, and "
+                    "fp8_recipe='mxfp8' with the same per-module recipe."
                 )
 
             if not fp8_cfg_enabled:
@@ -1117,7 +1129,7 @@ def _validate_te_precision_config(
                     "recipes are not supported."
                 )
 
-            fp8_recipe = _quant_recipe_name(block_cfg.get("fp8_quantization_recipe"))
+            fp8_recipe = block_fp8_recipe
             if fp8_recipe is None:
                 continue
             if fp8_cfg_recipe is None:

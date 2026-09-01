@@ -297,94 +297,40 @@ def test_native_mxfp8_dense_fc1_split_and_fc2_direct_refresh() -> None:
     assert torch.equal(second.view(torch.uint8), replacement)
 
 
-@pytest.mark.parametrize("owns_grouped_params", [True, False])
-def test_native_mxfp8_build_refit_tasks_bypasses_strict_grouped_names(
-    monkeypatch: pytest.MonkeyPatch,
-    owns_grouped_params: bool,
-) -> None:
-    from contextlib import nullcontext
-
-    from megatron.bridge.models.conversion import model_bridge
-    from megatron.bridge.models.conversion.param_mapping import (
-        FusedExpertMapping,
-        FusedGatedExpertMapping,
-    )
-    from megatron.core import fp8_utils
-
-    from nemo_rl.models.megatron import draft
-
+def test_native_mxfp8_task_builder_delegates_and_classifies_grouped_tasks() -> None:
     fc1_name = "decoder.layers.0.mlp.experts.linear_fc1.weight"
     fc2_name = "decoder.layers.0.mlp.experts.linear_fc2.weight"
-    fc1_param = object()
-    fc2_param = object()
-    params = (
-        [(fc1_name, fc1_param), (fc2_name, fc2_param)] if owns_grouped_params else []
-    )
-    mappings = {
-        f"{fc1_name}0": FusedGatedExpertMapping(
-            f"{fc1_name}0", "model.layers.0.mlp.experts.gate_up_proj"
+    tasks = [
+        SimpleNamespace(
+            global_param_name="decoder.layers.0.self_attention.linear_qkv.weight"
         ),
-        f"{fc2_name}0": FusedExpertMapping(
-            f"{fc2_name}0", "model.layers.0.mlp.experts.down_proj"
-        ),
-    }
-    lookups = []
-
-    class FakeRegistry:
-        def megatron_to_hf_lookup(self, name: str):
-            lookups.append(name)
-            return mappings.get(name)
+        SimpleNamespace(global_param_name=fc1_name),
+        SimpleNamespace(global_param_name=f"{fc1_name}0"),
+        SimpleNamespace(global_param_name=fc2_name),
+    ]
+    hf_pretrained = object()
+    model = object()
+    calls: list[tuple[object, list[object]]] = []
 
     class FakeBridge:
-        def _unwrap_name(self, name: str) -> str:
-            return name
+        def build_export_mxfp8_tasks(
+            self, received_hf_pretrained: object, models: list[object]
+        ) -> list[SimpleNamespace]:
+            calls.append((received_hf_pretrained, models))
+            return tasks
 
-        def mapping_registry(self) -> FakeRegistry:
-            return FakeRegistry()
-
-        def _megatron_global_param_names_all_pp_ranks(self, _models):
-            return [fc1_name, fc2_name]
-
-    class FakeModel:
-        config = SimpleNamespace(moe_single_grouped_weight=True)
-
-        def named_parameters(self):
-            return iter(params)
-
-    strict_calls = []
-
-    def strict_get_conversion_tasks(_models):
-        strict_calls.append(True)
-        raise ValueError(f"No mapping found for {fc1_name}")
-
-    monkeypatch.setattr(draft, "draft_model_detached", lambda _models: nullcontext())
-    monkeypatch.setattr(
-        model_bridge,
-        "_megatron_local_name_to_global",
-        lambda _models, _config, local_name, _vp_stage: local_name,
-    )
-    monkeypatch.setattr(model_bridge, "_get_pp_rank", lambda _models: 0)
-    monkeypatch.setattr(
-        fp8_utils,
-        "is_grouped_mxfp8tensor",
-        lambda param: param in (fc1_param, fc2_param),
-    )
     worker = _native_worker([])
-    worker.model = FakeModel()
+    worker.model = model
     worker.megatron_bridge = SimpleNamespace(
         _model_bridge=FakeBridge(),
-        hf_pretrained=SimpleNamespace(),
-        get_conversion_tasks=strict_get_conversion_tasks,
+        hf_pretrained=hf_pretrained,
     )
 
-    tasks = worker._build_refit_conversion_tasks()
+    result = worker._build_native_mxfp8_conversion_tasks()
 
-    assert strict_calls == []
-    assert [task.global_param_name for task in tasks] == [fc1_name, fc2_name]
-    assert [task.param_weight for task in tasks] == (
-        [fc1_param, fc2_param] if owns_grouped_params else [None, None]
-    )
-    assert lookups == [f"{fc1_name}0", f"{fc2_name}0"]
+    assert calls == [(hf_pretrained, [model])]
+    assert result is tasks
+    assert worker._native_grouped_mxfp8_tasks == [tasks[1], tasks[3]]
 
 
 @pytest.mark.parametrize(
