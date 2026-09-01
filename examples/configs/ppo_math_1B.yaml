@@ -8,7 +8,9 @@ ppo:
   max_rollout_turns: 1
   max_num_epochs: 100000
   max_num_steps: 100000
-  ppo_epochs: 4
+  ppo_epochs: 4  # actor passes over each rollout batch
+  # Critic passes over each rollout batch; follows ppo_epochs unless overridden.
+  critic_ppo_epochs: ${ppo.ppo_epochs}
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
   # step_<n> dir of a critic-pretrain run whose value/ seeds the critic.
   # Only a fresh run reads it; a resume ignores it and restores the critic from
