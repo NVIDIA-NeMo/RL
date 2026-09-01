@@ -38,23 +38,27 @@ NIXL_VLLM_WORKER = "nemo_rl.models.generation.vllm.vllm_backend.NixlVllmWorker"
 _NIXL_CONFIG_KEY = "nemo_rl_checkpoint_engine"
 
 
+def _model_express_nixl_config(config: VllmConfig) -> dict[str, Any]:
+    refit_config = normalize_vllm_refit_config(config)
+    assert refit_config is not None
+    nixl_config = refit_config.nixl
+    return {
+        "backend": "nixl",
+        "update_weights_bucket_memory_ratio": (
+            nixl_config.update_weights_bucket_memory_ratio
+        ),
+        "engine_kwargs": {
+            "nixl": nixl_config.model_dump(
+                exclude={"update_weights_bucket_memory_ratio"}
+            )
+        },
+    }
+
+
 def configure_nixl_worker(config: VllmConfig, vllm_kwargs: dict[str, Any]) -> None:
     """Configure vLLM's worker hook for early NIXL initialization."""
     if config.get("refit_transport") == "model_express":
-        refit_config = normalize_vllm_refit_config(config)
-        assert refit_config is not None
-        nixl_config = refit_config.nixl
-        checkpoint_config = {
-            "backend": "nixl",
-            "update_weights_bucket_memory_ratio": (
-                nixl_config.update_weights_bucket_memory_ratio
-            ),
-            "engine_kwargs": {
-                "nixl": nixl_config.model_dump(
-                    exclude={"update_weights_bucket_memory_ratio"}
-                )
-            },
-        }
+        checkpoint_config = _model_express_nixl_config(config)
     else:
         checkpoint_config = checkpoint_engine_refit_config(config)
     if checkpoint_config is None or checkpoint_config["backend"] != "nixl":
