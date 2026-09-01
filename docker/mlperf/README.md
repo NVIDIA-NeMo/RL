@@ -148,13 +148,15 @@ the qualified `e0a5b1d` build with `a484936`.
 
 ## Prepare inputs
 
-See `data_scripts/README.md` (HF snapshot, mcore checkpoint cache, R2E-Gym
-SIF images, train/val jsonl). Keep site paths in an external, untracked data
-config and pass it with `--data-config`. The authoritative profile selects the
-`easy-curriculum-subset` training JSONL relative to that cluster's R2E-Gym
-artifact root; set `QWEN35_CURRICULUM_DATA_PATH` only when the same file is
-staged elsewhere. Its SHA-256 is
-`c07bcd64ed1c558e28d091239104e38295a5e696c1d21bb0b61f0346c7eaa0f7`.
+See `data_scripts/README.md` for the raw procedures that download the HF
+snapshot, build the mcore checkpoint cache and R2E-Gym SIF images, and produce
+the train/validation JSONL files. The committed instance lists produce 700
+training rows and 251 validation rows. Keep site paths in an external,
+untracked data config and pass it with `--data-config`. Set
+`QWEN35_CURRICULUM_DATA_PATH` to the generated
+`benchmark_r2e_gym_easy_train.jsonl` and
+`NEMO_GYM_SWE_VALIDATION_DATA_PATH` to
+`benchmark_r2e_gym_easy_val.jsonl`.
 
 # 4. Launch training
 
@@ -240,6 +242,8 @@ unless an allowlisted option is supplied.
 | Learning rate / gradient clip | selected by `_gbs*.yaml` |
 | Gym train/validation concurrency | 256 / 256 |
 | Train/validation agent timeout | 1800 s / 1800 s |
+| Train/validation test timeout | 60 s / 60 s |
+| Train/validation command timeout | 60 s / 60 s |
 | MoE dispatcher | `flex` / `hybridep`, 32 SMs |
 | CUDA graphs | `VLLM_COMPILE`, `FULL_AND_PIECEWISE` |
 | Prefix cache | enabled, reset after every refit |
