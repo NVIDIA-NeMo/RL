@@ -10,10 +10,10 @@ same activation-scaling granularity.
 
 The feature is designed around a reusable training-to-rollout contract: policy
 workers retain BF16 source weights, refit transports BF16, and rollout workers
-own quantization into their serving representation. The current implementation
-is intentionally guarded to the Qwen3 all-MoE layout that has been validated
-end to end. See [Validated Configuration](#validated-configuration) and
-[Current Limitations](#current-limitations) for the release boundary.
+own quantization into their serving representation. Eligibility is determined
+from the constructed vLLM model's routed-expert capabilities rather than an
+architecture-name allowlist. See [Validated Configuration](#validated-configuration)
+and [Current Limitations](#current-limitations) for the tested release boundary.
 
 The model keeps BF16 master parameters and FP32 optimizer states. Attention,
 routers, shared experts, embeddings, normalization layers, and selected
@@ -42,7 +42,8 @@ flowchart LR
 
 `policy.megatron_cfg.fp4_cfg` enables TE NVFP4, while
 `te_precision_config_file` selects which modules use it. The provided precision
-recipe applies NVFP4 to MLP linears and keeps attention linears in BF16.
+recipe applies NVFP4 only to routed-expert MLP linears and keeps attention,
+dense MLPs, and shared experts in BF16.
 
 `fp4_param` defaults to `false`, which keeps persistent model parameters in
 BF16. NVFP4 is used for the selected forward computations, while the optimizer
@@ -63,11 +64,12 @@ BF16-only run.
 Each vLLM engine receives the BF16 stream over CUDA IPC. NeMo RL converts each
 transport batch into owned checkpoint-format tensors and supplies one lazy
 iterator to vLLM's native `reload_weights` API. Routed-expert projections are
-quantized at load time, mirroring the fp8/mxfp8 real-quant rollout path. Gate
-and up projections are quantized together under one shared per-expert global
-scale because vLLM's fused-MoE loader keeps one gate/up scale per expert. Down
-projections are quantized independently. Ignored BF16 expert layers
-(`additional_ignore`) pass through unchanged.
+quantized at load time, mirroring the fp8/mxfp8 real-quant rollout path. NeMo RL
+resolves the destination `RoutedExperts` container and classifies W1/W2/W3 from
+that container's vLLM checkpoint mapping; it does not maintain model-family
+projection names. W1 and W3 (often gate and up) share one per-expert global
+scale, while W2 (often down) is quantized independently. BF16 boundary layers
+pass through unchanged.
 
 The IPC allocation is acknowledged only after quantization and passthrough
 copies no longer depend on it. The final COMPLETE message is acknowledged only
@@ -108,13 +110,6 @@ policy:
       enabled: true
     nvfp4_pertoken_rollout:
       enabled: true
-      additional_ignore:
-        - "*.layers.0.mlp.experts*"
-        - "*.layers.1.mlp.experts*"
-        - "*.layers.44.mlp.experts*"
-        - "*.layers.45.mlp.experts*"
-        - "*.layers.46.mlp.experts*"
-        - "*.layers.47.mlp.experts*"
     vllm_cfg:
       precision: bfloat16
       kv_cache_dtype: auto
@@ -137,11 +132,12 @@ policy:
       NVTE_BACKWARD_OVERRIDE: dequantized
 ```
 
-`additional_ignore` keeps complete routed-expert layers in BF16 during rollout.
-It must cover the same boundary layers selected by
+The rollout BF16 exclusions are derived from the effective
 `first_last_layers_bf16`, `num_layers_at_start_in_bf16`, and
-`num_layers_at_end_in_bf16`. Only complete expert-layer patterns in the form
-`*.layers.<index>.mlp.experts*` are accepted.
+`num_layers_at_end_in_bf16` settings, so recipes do not duplicate layer paths.
+For migration, an explicit `additional_ignore` is accepted only when it uses
+complete `*.layers.<index>.mlp.experts*` patterns and exactly matches that
+derived boundary.
 
 ## Validated Configuration
 
@@ -163,7 +159,9 @@ end-to-end validation:
 
 The validation recipe is a long-running configuration with periodic synchronous
 checkpoints. Short smoke coverage remains available in
-`grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick.yaml`.
+`grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick.yaml`. The generic
+checkpoint-mapping path also has a Qwen3.5-35B-A3B 20-step smoke recipe at
+`grpo-qwen3.5-35ba3b-4n4g-megatron-te-nvfp4-pertoken-quick.yaml`.
 
 ## Current Limitations
 
@@ -172,8 +170,9 @@ models, but this release has the following enforced or validated boundaries:
 
 | Area | Current limitation |
 |---|---|
-| Model layout | Runtime validation accepts only `Qwen3MoeForCausalLM` with `decoder_sparse_step=1` and no `mlp_only_layers` |
+| Model layout | Requires a vLLM `RoutedExperts` container with an unambiguous W1/W2/W3 checkpoint mapping; dense-only models are rejected |
 | Quantized modules | Routed-expert MLP projections only; dense MLPs, attention, routers, and shared experts remain BF16 |
+| Shared-expert fusion | A layout that fuses shared experts into the selected `RoutedExperts` container is rejected |
 | Hardware and kernel | NVIDIA Blackwell with the FlashInfer TRT-LLM NVFP4 fused-MoE backend; GB200 is validated |
 | Training precision | BF16 persistent parameters with `fp4_param=false`; backward computation uses TE's dequantized path |
 | Rollout placement | Colocated vLLM rollout only; standalone evaluation is not supported because the dummy-loaded engine requires a refit first |
@@ -181,11 +180,14 @@ models, but this release has the following enforced or validated boundaries:
 | Cache and decoding | `kv_cache_dtype=auto`; speculative decoding is not supported |
 | Refit transport | Default colocated CUDA IPC/ZMQ path (`refit_transport: null`) |
 | Configuration | `generation.quant_cfg`, `generation.real_quant`, and explicit vLLM quantization/load-format overrides are mutually exclusive with this mode |
-| Layer exclusions | `additional_ignore` can exclude only complete routed-expert layers and must match the BF16 boundary-layer selection |
+| Layer exclusions | Derived from the Megatron BF16 boundary; legacy `additional_ignore` must describe exactly the same complete expert layers |
 
-Extending the feature to another architecture requires validating its parameter
-names, MoE fusion and scale domains, vLLM kernel backend, and cold-load versus
-warm-refit equivalence before relaxing the model-layout guard.
+An additional architecture is eligible only when Megatron-Bridge can export its
+HF-named BF16 weights and the pinned vLLM model exposes a complete compatible
+`RoutedExperts` mapping. Constructed-model inventory and complete-refit checks
+fail closed on unsupported method assignment, fused shared experts, incomplete
+or duplicate projections, and incompatible block-16 tensor shapes. A new model
+should still receive an end-to-end smoke before being listed as validated.
 
 ## Performance and GPU Memory
 
@@ -268,8 +270,8 @@ validation is complete.
 - Reduce refit latency through the native layer-fused MoE parameter loader
   proposed in [vLLM issue #53687](https://github.com/vllm-project/vllm/issues/53687)
   and quantization before the expert-parallel gather.
-- Validate additional MoE architectures and layouts, then relax the Qwen3-only
-  runtime guard where their naming, fusion, and scale contracts are compatible.
+- Add end-to-end coverage for more mapping families and hybrid dense/MoE
+  layouts, including supported PP stages with no local NVFP4 targets.
 - Add native NVFP4 backward computation.
 - Complete longer stability and model-quality studies and publish the training
   curves.

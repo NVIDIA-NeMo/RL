@@ -18,19 +18,15 @@ from typing import Annotated
 
 from pydantic import AfterValidator, BaseModel, Field
 
-NVFP4_QUANT_PATTERNS = ["*.experts.*"]
 NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS = 600_000
-DEFAULT_NVFP4_IGNORE = [
-    "*lm_head*",
-    "*mlp.gate",
-    "*mlp.gate.*",
-    "*mlp.shared_expert*",
-    "*self_attn*",
-    "*embed_tokens*",
-    "*input_layernorm*",
-    "*post_attention_layernorm*",
-    "*norm*",
-]
+# Keep driver-side boundary normalization aligned with the defaults on MCore's
+# TransformerConfig.  The trainer later reads the effective values directly
+# from its instantiated model config.
+MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16 = 1
+MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16 = 1
+# Ordinary linears are BF16 by construction in NvFp4PerTokenConfig. Only
+# semantic BF16 decoder-layer boundaries belong in ModelOpt's ignore list.
+DEFAULT_NVFP4_IGNORE: list[str] = []
 
 _FULL_EXPERT_LAYER_IGNORE_RE = re.compile(r"^\*\.layers\.\d+\.mlp\.experts\*$")
 
@@ -50,6 +46,58 @@ def _require_full_expert_layer_ignores(value: list[str]) -> list[str]:
     return value
 
 
+def resolve_boundary_ignore_patterns(
+    *,
+    num_hidden_layers: int,
+    first_last_layers_bf16: bool,
+    num_layers_at_start_in_bf16: int,
+    num_layers_at_end_in_bf16: int,
+    legacy_additional_ignore: list[str] | None = None,
+) -> list[str]:
+    """Resolve semantic Megatron BF16 boundaries to rollout layer patterns.
+
+    ``additional_ignore`` is accepted for one-release migration only. When
+    present it must describe exactly the same complete decoder layers; it can
+    no longer establish an independent rollout precision boundary.
+    """
+    counts = (num_layers_at_start_in_bf16, num_layers_at_end_in_bf16)
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in counts
+    ):
+        raise ValueError(
+            "NVFP4 BF16 boundary layer counts must be non-negative integers"
+        )
+    if not isinstance(num_hidden_layers, int) or num_hidden_layers <= 0:
+        raise ValueError(
+            "NVFP4 BF16 boundary resolution requires num_hidden_layers > 0"
+        )
+    if not first_last_layers_bf16:
+        # MCore keeps non-zero count defaults even while the feature is off.
+        # They become effective only when first_last_layers_bf16 is enabled.
+        indices: set[int] = set()
+    else:
+        if sum(counts) > num_hidden_layers:
+            raise ValueError(
+                "NVFP4 BF16 boundary counts exceed the model's decoder layer count"
+            )
+        indices = set(range(num_layers_at_start_in_bf16))
+        indices.update(
+            range(num_hidden_layers - num_layers_at_end_in_bf16, num_hidden_layers)
+        )
+    resolved = [f"*.layers.{index}.mlp.experts*" for index in sorted(indices)]
+
+    if legacy_additional_ignore is not None:
+        _require_full_expert_layer_ignores(legacy_additional_ignore)
+        if set(legacy_additional_ignore) != set(resolved):
+            raise ValueError(
+                "generation.nvfp4_pertoken_rollout.additional_ignore must exactly "
+                "match the effective Megatron first/last BF16 layer boundary; "
+                f"expected {resolved}, got {legacy_additional_ignore}"
+            )
+    return resolved
+
+
 class NvFp4PerTokenRolloutConfig(BaseModel, extra="forbid"):
     """User configuration for the constrained per-token NVFP4 rollout."""
 
@@ -57,11 +105,6 @@ class NvFp4PerTokenRolloutConfig(BaseModel, extra="forbid"):
     additional_ignore: Annotated[
         list[str], AfterValidator(_require_full_expert_layer_ignores)
     ] = Field(default_factory=list)
-
-    @property
-    def quant_patterns(self) -> list[str]:
-        """Return the fixed expert-only producer selection."""
-        return list(NVFP4_QUANT_PATTERNS)
 
     def resolved_ignore(self) -> list[str]:
         return [*DEFAULT_NVFP4_IGNORE, *self.additional_ignore]

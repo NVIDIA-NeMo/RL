@@ -78,13 +78,6 @@ policy:
     max_new_tokens: 20480
     nvfp4_pertoken_rollout:
       enabled: true
-      additional_ignore:
-      - '*.layers.0.mlp.experts*'
-      - '*.layers.1.mlp.experts*'
-      - '*.layers.44.mlp.experts*'
-      - '*.layers.45.mlp.experts*'
-      - '*.layers.46.mlp.experts*'
-      - '*.layers.47.mlp.experts*'
     vllm_kwargs:
       moe_backend: auto
     vllm_cfg:

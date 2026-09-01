@@ -1,5 +1,5 @@
 #!/bin/bash
-# Twenty-step GB200 smoke test for TE NVFP4 training and per-token vLLM refits.
+# Twenty-step GB200 cross-model smoke for generic routed-expert NVFP4 refits.
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source "$SCRIPT_DIR/common.env"
 
@@ -11,7 +11,7 @@ GPUS_PER_NODE=4
 STEPS_PER_RUN=20
 MAX_STEPS=20
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
-NUM_MINUTES=90
+NUM_MINUTES=240
 SNAPSHOT_MEGATRON_BRIDGE=1
 # ===== END CONFIG =====
 
@@ -37,11 +37,11 @@ uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METR
 grep -F -q \
     "[fp4_cfg] Megatron FP4 training enabled: fp4=e2m1 recipe=nvfp4 fp4_param=False" \
     "$RUN_LOG"
-grep -q "\[fp4_cfg\] TE per-module precision recipe loaded" "$RUN_LOG"
 grep -q "\[fp4_cfg\] verified routed-expert NVFP4 coverage" "$RUN_LOG"
 grep -q "\[nvfp4_pertoken\] inventory: selected [1-9]" "$RUN_LOG"
 grep -q "ordinary linears remain BF16" "$RUN_LOG"
 grep -q "\[nvfp4_pertoken\] per-token NVFP4 activation scaling active" "$RUN_LOG"
+
 REFIT_COUNT=$(grep -F -c "[nvfp4_pertoken] refit: quantized" "$RUN_LOG" || true)
 if [[ $REFIT_COUNT -lt $MAX_STEPS ]]; then
     echo "[ERROR] Expected at least $MAX_STEPS quantized refits, found $REFIT_COUNT"

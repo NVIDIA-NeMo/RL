@@ -1,5 +1,6 @@
-# Keep attention projections in BF16 and apply the global NVFP4 recipe to MLP
-# linears. Initialization-time settings such as fp4_param belong in fp4_cfg.
+# Keep attention, dense MLPs, and shared experts in BF16. Apply NVFP4 only to
+# routed-expert linears. Initialization-time settings such as fp4_param belong
+# in fp4_cfg.
 configs:
   bf16:
     transformer_engine_config_type: "TEQuantizationParams"
@@ -23,10 +24,10 @@ matchers:
   mlp_fc1_nvfp4:
     config: "nvfp4"
     type: "glob"
-    pattern: "*.linear_fc1"
+    pattern: "*.experts.linear_fc1"
     enabled: true
   mlp_fc2_nvfp4:
     config: "nvfp4"
     type: "glob"
-    pattern: "*.linear_fc2"
+    pattern: "*.experts.linear_fc2"
     enabled: true

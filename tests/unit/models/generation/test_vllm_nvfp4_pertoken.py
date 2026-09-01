@@ -37,19 +37,40 @@ def nvfp4_module():
     yield M
 
 
-def _quantizer_with_layer_quantized(M, quantized: bool):
-    """Build a quantizer whose owning-module probe is stubbed to a fixed verdict.
-
-    Bypasses ``_is_quantized_layer``'s real ``get_module_from_param_name``
-    walk (which needs a live vLLM model tree) so ``process()`` can be tested
-    directly against synthetic weight names.
-    """
+def _quantizer_with_layer_quantized(M, quantized: bool, expected_roles=None):
+    """Build a quantizer around one synthetic Qwen-style target inventory."""
     quantizer = M.NvFp4PerTokenQuantizer.__new__(M.NvFp4PerTokenQuantizer)
     quantizer._model = None
+    owner = torch.nn.Module()
+    specs = tuple(
+        M.ExpertWeightSpec(
+            checkpoint_suffix=f"experts.0.{projection}.weight",
+            logical_key="experts.0.<projection>",
+            role=role,
+        )
+        for role, projection in (
+            ("w1", "gate_proj"),
+            ("w2", "down_proj"),
+            ("w3", "up_proj"),
+        )
+    )
+    if expected_roles is None:
+        expected_roles = {("experts.0.<projection>", spec.role) for spec in specs}
+    target = M.RoutedExpertTarget(
+        module=owner,
+        module_name="model.layers.0.mlp.experts",
+        specs=specs,
+        specs_by_suffix={spec.checkpoint_suffix: spec for spec in specs},
+        expected_roles=frozenset(expected_roles),
+    )
+    quantizer._targets = {id(owner): target} if quantized else {}
+    quantizer._all_target_suffixes = (
+        {spec.checkpoint_suffix for spec in specs} if quantized else set()
+    )
     quantizer._pending = {}
-    quantizer._quantized_layer = {}
+    quantizer._seen_roles = {}
     quantizer._quantized_events = 0
-    quantizer._is_quantized_layer = lambda _prefix: quantized
+    quantizer._resolve_module = lambda name: owner if ".experts." in name else None
     return quantizer
 
 
@@ -115,7 +136,7 @@ def test_pending_survives_batch_split(nvfp4_module, monkeypatch):
 
     out1 = quantizer.process([(f"{p}.gate_proj.weight", torch.randn(8, 32))])
     assert out1 == []
-    assert ("model.layers.0.mlp.experts", 0) in quantizer._pending
+    assert quantizer._pending
 
     out2 = dict(quantizer.process([(f"{p}.up_proj.weight", torch.randn(8, 32))]))
     assert f"{p}.gate_proj.weight" in out2
@@ -158,12 +179,32 @@ def test_finish_raises_on_unpaired_half(nvfp4_module, monkeypatch):
         quantizer.finish()
 
 
+def test_duplicate_projection_is_fatal(nvfp4_module, monkeypatch):
+    M = nvfp4_module
+    _fake_scaled_fp4_quant(monkeypatch, M)
+    quantizer = _quantizer_with_layer_quantized(M, True)
+    name = "model.layers.0.mlp.experts.0.down_proj.weight"
+
+    quantizer.process([(name, torch.randn(8, 32))])
+    with pytest.raises(RuntimeError, match="duplicate w2 checkpoint weight"):
+        quantizer.process([(name, torch.randn(8, 32))])
+
+
 def test_finish_raises_when_nothing_quantized(nvfp4_module):
     """A config/name mismatch must not silently degrade to an all-BF16 refit."""
     M = nvfp4_module
     quantizer = _quantizer_with_layer_quantized(M, True)
-    with pytest.raises(RuntimeError, match="quantized 0 params"):
+    with pytest.raises(RuntimeError, match="did not cover every selected"):
         quantizer.finish()
+
+
+def test_finish_allows_pipeline_stage_with_no_local_nvfp4_targets(nvfp4_module, capsys):
+    M = nvfp4_module
+    quantizer = _quantizer_with_layer_quantized(M, False)
+
+    quantizer.finish()
+
+    assert "across 0 RoutedExperts containers" in capsys.readouterr().out
 
 
 def test_finish_prints_liveness_line_on_success(nvfp4_module, monkeypatch, capsys):
@@ -172,11 +213,16 @@ def test_finish_prints_liveness_line_on_success(nvfp4_module, monkeypatch, capsy
     quantizer = _quantizer_with_layer_quantized(M, True)
 
     quantizer.process(
-        [("model.layers.0.mlp.experts.0.down_proj.weight", torch.randn(8, 32))]
+        [
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(8, 32)),
+            ("model.layers.0.mlp.experts.0.up_proj.weight", torch.randn(8, 32)),
+            ("model.layers.0.mlp.experts.0.down_proj.weight", torch.randn(8, 32)),
+        ]
     )
     quantizer.finish()
 
-    assert "[nvfp4_pertoken] refit: quantized 1" in capsys.readouterr().out
+    # One W1/W3 shared-scale pair plus one independent W2 tensor.
+    assert "[nvfp4_pertoken] refit: quantized 2" in capsys.readouterr().out
 
 
 def test_reset_clears_pending_after_failure_and_after_success(
@@ -246,7 +292,7 @@ def test_passthrough_clones_off_recycled_source_buffer(nvfp4_module):
     assert not quantizer._pending
 
 
-def test_emits_all_eight_names_per_expert(nvfp4_module, monkeypatch):
+def test_emits_weight_and_scale_names_per_expert(nvfp4_module, monkeypatch):
     M = nvfp4_module
     _fake_scaled_fp4_quant(monkeypatch, M)
     quantizer = _quantizer_with_layer_quantized(M, True)
@@ -257,7 +303,7 @@ def test_emits_all_eight_names_per_expert(nvfp4_module, monkeypatch):
             [
                 (f"{p}.gate_proj.weight", torch.randn(8, 32)),
                 (f"{p}.up_proj.weight", torch.randn(8, 32)),
-                (f"{p}.down_proj.weight", torch.randn(32, 8)),
+                (f"{p}.down_proj.weight", torch.randn(32, 16)),
             ]
         )
     )
@@ -295,6 +341,79 @@ def test_rejects_swizzled_scale_shape(nvfp4_module, monkeypatch):
         )
 
 
+@pytest.mark.parametrize("shape", [(2, 3, 32), (8, 30)])
+def test_rejects_unsupported_expert_weight_shape(nvfp4_module, monkeypatch, shape):
+    M = nvfp4_module
+    _fake_scaled_fp4_quant(monkeypatch, M)
+    quantizer = _quantizer_with_layer_quantized(M, True)
+
+    with pytest.raises(RuntimeError, match="block size 16"):
+        quantizer.process(
+            [
+                (
+                    "model.layers.0.mlp.experts.0.down_proj.weight",
+                    torch.randn(*shape),
+                )
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("projection_names", "checkpoint_names"),
+    [
+        (
+            ("gate_proj", "down_proj", "up_proj"),
+            ("gate_proj", "down_proj", "up_proj"),
+        ),
+        (("w1", "w2", "w3"), ("w1", "w2", "w3")),
+    ],
+    ids=["qwen-style", "w1-w2-w3-style"],
+)
+def test_vllm_mapping_classifies_projection_names_without_hardcoding(
+    nvfp4_module, projection_names, checkpoint_names
+):
+    M = nvfp4_module
+
+    class FakeRoutedExperts:
+        ckpt_gate_proj_name, ckpt_down_proj_name, ckpt_up_proj_name = projection_names
+
+        def get_expert_mapping(self):
+            gate, down, up = checkpoint_names
+            return [
+                ("experts.w13_", f"experts.0.{gate}.", 0, "w1"),
+                ("experts.w2_", f"experts.0.{down}.", 0, "w2"),
+                ("experts.w13_", f"experts.0.{up}.", 0, "w3"),
+            ]
+
+    target = M._build_expert_target("model.layers.0.mlp.experts", FakeRoutedExperts())
+    assert {spec.role for spec in target.specs} == {"w1", "w2", "w3"}
+    assert {spec.checkpoint_suffix for spec in target.specs} == {
+        f"experts.0.{name}.weight" for name in checkpoint_names
+    }
+    assert len({spec.logical_key for spec in target.specs}) == 1
+    assert set(target.specs_by_suffix) == {
+        f"experts.0.{name}.weight" for name in checkpoint_names
+    }
+
+
+def test_vllm_mapping_rejects_incomplete_projection_group(nvfp4_module):
+    M = nvfp4_module
+
+    class FakeRoutedExperts:
+        ckpt_gate_proj_name = "w1"
+        ckpt_down_proj_name = "w2"
+        ckpt_up_proj_name = "w3"
+
+        def get_expert_mapping(self):
+            return [
+                ("experts.w13_", "experts.0.w1.", 0, "w1"),
+                ("experts.w2_", "experts.0.w2.", 0, "w2"),
+            ]
+
+    with pytest.raises(RuntimeError, match="incomplete vLLM expert mapping"):
+        M._build_expert_target("model.layers.0.mlp.experts", FakeRoutedExperts())
+
+
 # ------------------------------------------------------------- config
 
 
@@ -302,8 +421,7 @@ def test_rollout_config_defaults(nvfp4_module):
     M = nvfp4_module
     cfg = M.NvFp4PerTokenRolloutConfig()
     assert cfg.enabled is False
-    assert cfg.quant_patterns == ["*.experts.*"]
-    assert cfg.resolved_ignore() == M.DEFAULT_NVFP4_IGNORE
+    assert cfg.resolved_ignore() == []
 
     layer_ignore = "*.layers.0.mlp.experts*"
     cfg2 = M.NvFp4PerTokenRolloutConfig.model_validate(
@@ -332,6 +450,196 @@ def test_rollout_config_rejects_partial_expert_ignore(nvfp4_module, pattern):
         M.NvFp4PerTokenRolloutConfig.model_validate(
             {"enabled": True, "additional_ignore": [pattern]}
         )
+
+
+def test_boundary_ignores_are_derived_and_legacy_patterns_require_parity(
+    nvfp4_module,
+):
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+        resolve_boundary_ignore_patterns,
+    )
+
+    expected = [
+        "*.layers.0.mlp.experts*",
+        "*.layers.1.mlp.experts*",
+        "*.layers.44.mlp.experts*",
+        "*.layers.45.mlp.experts*",
+        "*.layers.46.mlp.experts*",
+        "*.layers.47.mlp.experts*",
+    ]
+    assert (
+        resolve_boundary_ignore_patterns(
+            num_hidden_layers=48,
+            first_last_layers_bf16=True,
+            num_layers_at_start_in_bf16=2,
+            num_layers_at_end_in_bf16=4,
+            legacy_additional_ignore=expected,
+        )
+        == expected
+    )
+    with pytest.raises(ValueError, match="must exactly match"):
+        resolve_boundary_ignore_patterns(
+            num_hidden_layers=48,
+            first_last_layers_bf16=True,
+            num_layers_at_start_in_bf16=2,
+            num_layers_at_end_in_bf16=4,
+            legacy_additional_ignore=expected[:-1],
+        )
+
+
+def test_boundary_ignores_ignore_inactive_mcore_count_defaults(nvfp4_module):
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+        resolve_boundary_ignore_patterns,
+    )
+
+    assert (
+        resolve_boundary_ignore_patterns(
+            num_hidden_layers=48,
+            first_last_layers_bf16=False,
+            num_layers_at_start_in_bf16=1,
+            num_layers_at_end_in_bf16=1,
+        )
+        == []
+    )
+    with pytest.raises(ValueError, match="must exactly match"):
+        resolve_boundary_ignore_patterns(
+            num_hidden_layers=48,
+            first_last_layers_bf16=False,
+            num_layers_at_start_in_bf16=1,
+            num_layers_at_end_in_bf16=1,
+            legacy_additional_ignore=["*.layers.0.mlp.experts*"],
+        )
+
+
+def test_modelopt_parser_keeps_fixed_w4a4_block16_contract(nvfp4_module):
+    M = nvfp4_module
+    ignore = ["*.layers.0.mlp.experts*"]
+    parsed = M.NvFp4PerTokenConfig.from_config(
+        M.build_nvfp4_pertoken_hf_quant_config(ignore)
+    )
+
+    assert parsed.quant_method == "NVFP4"
+    assert parsed.group_size == 16
+    assert parsed.exclude_modules == ignore
+
+
+def test_quant_config_keeps_ordinary_linears_unquantized(nvfp4_module, monkeypatch):
+    M = nvfp4_module
+
+    class FakeLinear(torch.nn.Module):
+        pass
+
+    class FakeHead(torch.nn.Module):
+        pass
+
+    class FakeUnquantizedLinearMethod:
+        pass
+
+    monkeypatch.setattr(M, "LinearBase", FakeLinear)
+    monkeypatch.setattr(M, "ParallelLMHead", FakeHead)
+    monkeypatch.setattr(M, "UnquantizedLinearMethod", FakeUnquantizedLinearMethod)
+    config = M.NvFp4PerTokenConfig.from_config(
+        M.build_nvfp4_pertoken_hf_quant_config([])
+    )
+
+    assert isinstance(
+        config.get_quant_method(FakeLinear(), "model.layers.0.mlp.dense"),
+        FakeUnquantizedLinearMethod,
+    )
+    assert isinstance(
+        config.get_quant_method(FakeHead(), "lm_head"),
+        FakeUnquantizedLinearMethod,
+    )
+
+
+def test_quant_config_selects_only_supported_routed_experts(nvfp4_module, monkeypatch):
+    M = nvfp4_module
+
+    class FakeRoutedExperts(torch.nn.Module):
+        def __init__(self, *, num_fused_shared_experts=0):
+            super().__init__()
+            self.moe_config = object()
+            self.expert_map_manager = types.SimpleNamespace(
+                num_fused_shared_experts=num_fused_shared_experts
+            )
+
+    class FakeSelectedMethod:
+        def __init__(self, quant_config, moe_config):
+            self.quant_config = quant_config
+            self.moe_config = moe_config
+
+    class FakeUnquantizedMethod:
+        def __init__(self, moe_config):
+            self.moe_config = moe_config
+
+    monkeypatch.setattr(M, "RoutedExperts", FakeRoutedExperts)
+    monkeypatch.setattr(M, "UnquantizedFusedMoEMethod", FakeUnquantizedMethod)
+    config = M.NvFp4PerTokenConfig.from_config(
+        M.build_nvfp4_pertoken_hf_quant_config(["*.layers.0.mlp.experts*"])
+    )
+    config.FusedMoEMethodCls = FakeSelectedMethod
+
+    selected = config.get_quant_method(
+        FakeRoutedExperts(), "model.layers.1.mlp.experts"
+    )
+    excluded = config.get_quant_method(
+        FakeRoutedExperts(), "model.layers.0.mlp.experts"
+    )
+
+    assert isinstance(selected, FakeSelectedMethod)
+    assert isinstance(excluded, FakeUnquantizedMethod)
+    with pytest.raises(ValueError, match="fused shared experts"):
+        config.get_quant_method(
+            FakeRoutedExperts(num_fused_shared_experts=1),
+            "model.layers.1.mlp.experts",
+        )
+
+
+def test_shared_resolver_applies_full_mapper_and_packed_module_names(nvfp4_module):
+    from nemo_rl.models.generation.vllm.quantization.utils import (
+        resolve_module_from_param_name,
+    )
+
+    root = torch.nn.Module()
+    root.backbone = torch.nn.Module()
+    root.backbone.layers = torch.nn.ModuleList([torch.nn.Module()])
+    root.backbone.layers[0].mlp = torch.nn.Module()
+    expected = torch.nn.Module()
+    root.backbone.layers[0].mlp.gate_up_proj = expected
+    root.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    root.hf_to_vllm_mapper = types.SimpleNamespace(
+        orig_to_new_prefix={"model.language_model.": "backbone."},
+        orig_to_new_substr={".blocks.": ".layers."},
+    )
+
+    resolution = resolve_module_from_param_name(
+        root, "model.language_model.blocks.0.mlp.gate_proj.weight"
+    )
+
+    assert resolution is not None
+    assert resolution.module is expected
+    assert resolution.mapped_path == (
+        "backbone",
+        "layers",
+        "0",
+        "mlp",
+        "gate_up_proj",
+    )
+
+
+def test_shared_resolver_fails_closed_for_dropped_or_missing_paths(nvfp4_module):
+    from nemo_rl.models.generation.vllm.quantization.utils import (
+        resolve_module_from_param_name,
+    )
+
+    root = torch.nn.Module()
+    root.packed_modules_mapping = {}
+    root.hf_to_vllm_mapper = types.SimpleNamespace(
+        orig_to_new_prefix={"mtp.": None}, orig_to_new_substr={}
+    )
+
+    assert resolve_module_from_param_name(root, "mtp.layers.0.weight") is None
+    assert resolve_module_from_param_name(root, "model.missing.weight") is None
 
 
 # ------------------------------------------------------------- worker extension
@@ -404,7 +712,9 @@ def test_prequantized_extension_uses_native_ipc_reload(
     extension.zmq_socket = FakeSocket()
     extension.maybe_init_zmq = lambda: None
     extension._synchronize_before_ipc_data_ack = lambda: call_order.append("data_sync")
-    extension._quantizer = _quantizer_with_layer_quantized(M, True)
+    extension._quantizer = _quantizer_with_layer_quantized(
+        M, True, expected_roles={("experts.0.<projection>", "w2")}
+    )
 
     assert extension.update_weights_via_ipc_zmq() is True
 
