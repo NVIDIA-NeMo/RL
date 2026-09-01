@@ -8,8 +8,14 @@ ppo:
   max_rollout_turns: 1
   max_num_epochs: 100000
   max_num_steps: 100000
-  ppo_epochs: 4
+  ppo_epochs: 4  # actor passes over each rollout batch
+  # Critic passes over each rollout batch; follows ppo_epochs unless overridden.
+  critic_ppo_epochs: ${ppo.ppo_epochs}
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
+  # step_<n> dir of a critic-pretrain run whose value/ seeds the critic.
+  # Only a fresh run reads it; a resume ignores it and restores the critic from
+  # its own checkpoint, so it can stay set.
+  warm_start_value_checkpoint: null
   val_period: 20
   val_at_start: true
   val_at_end: false
@@ -266,16 +272,20 @@ policy:
     mcore_generation_config:
       buffer_size_gb: 20
       buffer_guaranteed_fraction: 0.1
-      cuda_graph_impl: "local"  # CUDA-graph implementation. Options: "none", "local", "transformer_engine", "full_iteration".
+      # Generation CUDA graphs. MCore accepts only these pairings:
+      #   cuda_graph_impl "none"  -> omit inference_cuda_graph_scope
+      #   cuda_graph_impl "local" -> inference_cuda_graph_scope "layer" or "block"
+      cuda_graph_impl: "local"
       cuda_graph_sizing_distribution: "linear"  # How captured CUDA-graph sizes are spaced. Options: "exponential" (log-spaced), "linear" (denser at the top end).
-      inference_cuda_graph_scope: "block"  # Inference CUDA-graph scope. Options: "none", "layer", "block".
+      inference_cuda_graph_scope: "block"
       num_cuda_graphs: -1  # Number of CUDA graphs to pre-compile for different batch sizes (-1 = auto).
       block_size_tokens: 256
       use_cuda_graphs_for_non_decode_steps: true
       enable_chunked_prefill: true
       unified_memory_level: 0
       max_tokens: 16384
-      refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo", "nccl", "nvshmem".
+      logprobs_mode: processed_logprobs
+      refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo", "nccl" ("nvshmem" is accepted but currently broken, see #3646).
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}

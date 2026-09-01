@@ -89,6 +89,7 @@ def test_dataplane_client_abc_surface() -> None:
         # direct-by-key
         "put_samples",
         "get_samples",
+        "list_sample_ids",
         "clear_samples",
         # lifecycle
         "close",
