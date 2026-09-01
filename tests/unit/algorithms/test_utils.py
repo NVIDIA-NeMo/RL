@@ -34,7 +34,6 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.policy import TokenizerConfig
 
 
 @pytest.fixture
