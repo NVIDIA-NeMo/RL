@@ -333,7 +333,7 @@ Generation-specific parameters are added under `policy.generation`:
 |---|---|
 | `quant_cfg` | ModelOpt recipe used only for simulated/fake-quant vLLM generation. Set it to `null` for real-quant rollout. |
 | `real_quant` | When `true`, vLLM uses native ModelOpt real-quant kernels and receives packed weights and deployment scales during refit. `policy.quant_cfg` selects the format; unsupported formats fail during setup. When unset or `false`, vLLM uses fake-quantized generation. |
-| `real_quant_export_cpu_offload` | Optional boolean, default `true`. When `true`, packed NVFP4 export tensors are copied to CPU before refit. Set to `false` only for colocated CUDA-IPC refit without an explicit `refit_transport`; this avoids the CPU round trip at the cost of transient GPU memory. |
+| `real_quant_export_cpu_offload` | Boolean required for real-quant rollout. When `true`, packed export tensors are copied to CPU before refit. Set to `false` only for colocated CUDA-IPC refit without an explicit `refit_transport`; this avoids the CPU round trip at the cost of transient GPU memory. |
 
 ## Megatron Checkpoint Directory
 
@@ -354,7 +354,7 @@ QARL (via ModelOpt) and NeMo RL's built-in [FP8 training](../fp8.md) (via Transf
 
 ## Supported Quantization Formats
 
-- **Weight quantization**: per-tensor, per-channel, and block-wise formats are supported by fake-quant rollout. Real-quant rollout specifically requires block-16 E2M1 NVFP4 weights with dynamic block scaling, packed on the policy side and streamed with FP8 block scales and global scales.
+- **Weight quantization**: per-tensor, per-channel, and block-wise formats are supported by fake-quant rollout. Real-quant rollout accepts only formats supported by both ModelOpt functional export and the pinned vLLM. Static NVFP4 preserves calibrated per-block and global amax state through distributed reconstruction.
 - **Input (activation) quantization**: fake-quant rollout supports the existing ModelOpt recipes. W4A4 real rollout specifically requires block-16 E2M1 NVFP4 inputs and streams one calibrated global input scale per dense projection or per expert projection.
 
 ## Exporting Megatron Checkpoints
@@ -389,5 +389,4 @@ uv run --extra mcore --extra modelopt \
 - **Real-quant rollout**: The native-loader path has end-to-end functional coverage for dense W4A16. W4A4, fused-MoE, and hybrid MoE/Mamba paths require architecture-specific revalidation; fused MoE currently requires all experts local to each vLLM rank. The policy recipe must leave unsupported or sensitive paths in BF16.
 - **Router Replay (R3)**: R3 is supported on the Megatron policy path.
 - **Input quantization**: W4A4 real rollout supports ModelOpt's block-16 E2M1 input format with a global scale per projection; other activation formats remain fake-quant only.
-- **Static NVFP4 weights**: The real-quant exporter rejects static weight quantizers because their calibrated per-block amax state cannot be reconstructed after distributed TP/EP gathering. Use the dynamic block-scaling recipes shown above.
 - **Model support**: Dense Transformer, MoE (Mixture of Experts), and hybrid MoE/Mamba models are supported on the Megatron policy + vLLM generation path when Megatron-Bridge and ModelOpt support the model architecture and quantization recipe.

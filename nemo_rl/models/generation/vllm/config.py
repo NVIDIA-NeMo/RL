@@ -184,8 +184,8 @@ class VllmConfig(GenerationConfig):
     # Initialize vLLM from the policy-produced ModelOpt deployment config and
     # stream canonical packed weights instead of simulated-quant tensors.
     real_quant: NotRequired[bool]
-    # CPU offload remains the default. Disabling it is supported only for
-    # colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
+    # Required when real_quant is true. Disabling CPU offload is supported only
+    # for colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
     real_quant_export_cpu_offload: NotRequired[bool]
 
 
