@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Mapping
 from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast, get_args
 
 from pydantic import (
@@ -283,7 +284,9 @@ def parse_nvfp4_pertoken_rollout(
     return parsed if parsed.enabled else None
 
 
-def normalize_nvfp4_pertoken_policy_config(policy_config: dict[str, Any]) -> None:
+def normalize_nvfp4_pertoken_policy_config(
+    policy_config: Mapping[str, Any],
+) -> None:
     """Derive rollout BF16 exclusions from the policy's Megatron boundary.
 
     This runs on the driver before generation workers are created so trainer
@@ -313,6 +316,11 @@ def normalize_nvfp4_pertoken_policy_config(policy_config: dict[str, Any]) -> Non
         num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
     if num_hidden_layers is None and text_config is not None:
         num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+    if num_hidden_layers is None:
+        raise ValueError(
+            "NVFP4 per-token boundary resolution requires num_hidden_layers "
+            "in the HF config"
+        )
 
     megatron_cfg = policy_config.get("megatron_cfg") or {}
     first_last_layers_bf16 = bool(megatron_cfg.get("first_last_layers_bf16", False))
@@ -335,7 +343,7 @@ def normalize_nvfp4_pertoken_policy_config(policy_config: dict[str, Any]) -> Non
         rollout.additional_ignore if "additional_ignore" in raw_rollout else None
     )
     resolved = resolve_boundary_ignore_patterns(
-        num_hidden_layers=num_hidden_layers,
+        num_hidden_layers=int(num_hidden_layers),
         first_last_layers_bf16=first_last_layers_bf16,
         num_layers_at_start_in_bf16=num_start,
         num_layers_at_end_in_bf16=num_end,

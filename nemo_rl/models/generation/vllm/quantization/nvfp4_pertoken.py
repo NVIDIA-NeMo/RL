@@ -41,8 +41,8 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
 )
-from vllm.model_executor.utils import replace_parameter
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.utils import replace_parameter
 
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     DEFAULT_NVFP4_IGNORE,
@@ -147,7 +147,7 @@ def _build_expert_target(module_name: str, module: RoutedExperts) -> RoutedExper
                 f"{module_name}: {checkpoint_suffix!r}."
             )
 
-    roles_by_key: dict[str, set[str]] = {}
+    roles_by_key: dict[str, set[ProjectionRole]] = {}
     for spec in specs_by_suffix.values():
         roles_by_key.setdefault(spec.logical_key, set()).add(spec.role)
     incomplete = {
@@ -195,7 +195,7 @@ class NvFp4PerTokenQuantizer:
         self._targets: dict[int, RoutedExpertTarget] = {}
         self._all_target_suffixes: set[str] = set()
         self._pending: dict[tuple[int, str], PendingHalf] = {}
-        self._seen_roles: dict[int, set[tuple[str, str]]] = {}
+        self._seen_roles: dict[int, set[tuple[str, ProjectionRole]]] = {}
         self._quantized_events = 0
         self._build_inventory()
 
