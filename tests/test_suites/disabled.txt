@@ -51,7 +51,7 @@ tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-ready-first-single-controll
 # Megatron-Core/Bridge bump-lane smoke legs. Not disabled: they run in the
 # bump-validation lanes via nightly_mcore{,_gb200}.txt rather than in the
 # recurring suites above, and are listed here to keep the accounting 1:1.
-tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-smoke.sh
-tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_colocated_reshard-async-gym-smoke.sh
-tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-async-gym-smoke.sh
-tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_colocated_reshard-async-gym-smoke.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-quick.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym-quick.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-async-gym-quick.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-colocated-reshard-async-gym-quick.sh

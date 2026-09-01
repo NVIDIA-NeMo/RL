@@ -11,7 +11,7 @@ grpo:
     in_flight_weight_updates: true
   overlong_filtering: false
 checkpointing:
-  checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-megatron_colocated_reshard-async-gym
+  checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
   tokenizer:
@@ -31,6 +31,6 @@ logger:
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-nanov3-30BA3B-2n8g-megatron_colocated_reshard-async-gym
+    name: grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym
 cluster:
   num_nodes: 2

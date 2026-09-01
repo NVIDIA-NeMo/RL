@@ -107,3 +107,10 @@ if ! grep -q "Keeping colocated engine asleep for checkpointing" $RUN_LOG; then
     echo "FAIL: deferred-wake log line not found (colocated checkpoint path not exercised)"
     exit 1
 fi
+
+# The dedicated inference model must actually be built — guard against this
+# leg silently degenerating to the matched-impl (reshardless) path.
+if ! grep -q "\[colocated-reshard\] building dedicated inference model" $RUN_LOG; then
+    echo "FAIL: dedicated-model build log line not found (reshard path not exercised)"
+    exit 1
+fi
