@@ -120,21 +120,12 @@ mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}"
          "${MEGATRON_CONFIG_LOCK_DIR}" "${HF_MODULES_CACHE_DIR}"
 export OMP_NUM_THREADS=16
 
-if [[ "${NO_SNAPSHOT:-0}" == "1" ]]; then
-    # Run the repo directly: uncommitted changes take effect, no snapshot
-    # refresh step. Results/logs land under the repo. Meant for fast
-    # iteration/diagnostics; production runs should keep snapshots so a
-    # queued job can't be changed underneath by later edits.
-    SNAPSHOT_DIR="${CODE_DIR}"
-    echo "NO_SNAPSHOT=1: running directly from ${CODE_DIR}"
-else
-    SNAPSHOT_DIR=$(realpath "$(bash "${CODE_DIR}/tools/code_snapshot.sh" "${EXP_NAME}")")
-    echo "Refreshing tracked files in code snapshot: ${SNAPSHOT_DIR}"
-    (
-        cd "${CODE_DIR}"
-        rsync -a --files-from=<(git ls-files --recurse-submodules --cached --full-name) ./ "${SNAPSHOT_DIR}/"
-    )
-fi
+SNAPSHOT_DIR=$(realpath "$(bash "${CODE_DIR}/tools/code_snapshot.sh" "${EXP_NAME}")")
+echo "Refreshing tracked files in code snapshot: ${SNAPSHOT_DIR}"
+(
+    cd "${CODE_DIR}"
+    rsync -a --files-from=<(git ls-files --recurse-submodules --cached --full-name) ./ "${SNAPSHOT_DIR}/"
+)
 cd "${SNAPSHOT_DIR}"
 
 # Megatron is imported from the checkout rather than the container's
@@ -150,7 +141,7 @@ export RAY_DEDUP_LOGS=1
 export LISTEN_PORT=6000
 export NGINX_PORT=6000
 export NEMO_SKILLS_SANDBOX_PORT=6000
-export SANDBOX_COMMAND="${SANDBOX_COMMAND:-/start-with-nginx.sh}"
+export SANDBOX_COMMAND="/start-with-nginx.sh"
 export SANDBOX_ENV_VARS="NEMO_SKILLS_SANDBOX_PORT=${NEMO_SKILLS_SANDBOX_PORT}"
 
 export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
@@ -244,12 +235,9 @@ SBATCH_ARGS=(
     --time="${SLURM_TIME_LIMIT}"
     --gres=gpu:"${SBATCH_GPUS_PER_NODE}"
     --exclusive
-    --dependency=singleton${SLURM_EXTRA_DEPENDENCY:+,${SLURM_EXTRA_DEPENDENCY}}
+    --dependency=singleton
+    ray.sub
 )
-if [[ -n "${SLURM_COMMENT:-}" ]]; then
-    SBATCH_ARGS+=(--comment="${SLURM_COMMENT}")
-fi
-SBATCH_ARGS+=(ray.sub)
 
 if [[ "${DRY_RUN}" == true ]]; then
     echo "[dry-run] COMMAND:"
