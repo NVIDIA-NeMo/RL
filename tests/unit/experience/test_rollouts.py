@@ -2080,10 +2080,11 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
                         "content": "answer",
                         "token_ids": torch.tensor([2]),
                         "generation_logprobs": torch.tensor([-0.1]),
-                        "reasoning_token_count": index,
-                        "response_token_count": 1,
                     },
                 ],
+                "reasoning_token_count": index,
+                "response_token_count": 1,
+                "token_extraction_valid": True,
                 "full_result": {
                     "reward": reward,
                     "reward_score_raw": reward,
@@ -2122,7 +2123,7 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     assert rollout_result.rollout_metrics["response_tokens_per_sample/mean"] == 1.0
     assert (
         rollout_result.rollout_metrics[
-            "reasoning_response_token_split_failure_rate"
+            "reasoning_response_token_extraction_failure_rate"
         ]
         == 0.0
     )

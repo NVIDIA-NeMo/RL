@@ -2670,21 +2670,9 @@ def _postprocess_single_nemo_gym_group(
                     ),
                     default=0,
                 ),
-                "reasoning_tokens": sum(
-                    m["reasoning_token_count"]
-                    for m in r["message_log"]
-                    if "reasoning_token_count" in m
-                ),
-                "response_tokens": sum(
-                    m["response_token_count"]
-                    for m in r["message_log"]
-                    if "response_token_count" in m
-                ),
-                "token_split_valid": all(
-                    "reasoning_token_count" in m and "response_token_count" in m
-                    for m in r["message_log"]
-                    if m["role"] == "assistant"
-                ),
+                "reasoning_tokens": r["reasoning_token_count"],
+                "response_tokens": r["response_token_count"],
+                "token_extraction_valid": r["token_extraction_valid"],
             }
             for r in results
         ]
@@ -2694,9 +2682,11 @@ def _postprocess_single_nemo_gym_group(
         max_gen_tokens_per_turn_values = [
             m["max_gen_tokens_per_turn"] for m in all_sample_metrics
         ]
-        valid_token_splits = [m for m in all_sample_metrics if m["token_split_valid"]]
-        reasoning_token_values = [m["reasoning_tokens"] for m in valid_token_splits]
-        response_token_values = [m["response_tokens"] for m in valid_token_splits]
+        valid_token_counts = [
+            m for m in all_sample_metrics if m["token_extraction_valid"]
+        ]
+        reasoning_token_values = [m["reasoning_tokens"] for m in valid_token_counts]
+        response_token_values = [m["response_tokens"] for m in valid_token_counts]
         rollout_metrics = {
             **calculate_single_metric(
                 turn_counts,
@@ -2732,8 +2722,8 @@ def _postprocess_single_nemo_gym_group(
             / batch_size,
             "truncation_rate": sum(m["hit_max_tokens"] for m in all_sample_metrics)
             / batch_size,
-            "reasoning_response_token_split_failure_rate": 1
-            - len(valid_token_splits) / batch_size,
+            "reasoning_response_token_extraction_failure_rate": 1
+            - len(valid_token_counts) / batch_size,
             # TODO enable this metric. We don't have a clear handle on which tokens are user or tool role.
             # We would probably need to re-tokenize the messages post-hoc to kind of figure this out.
             # "mean_env_tokens_per_sample": sum(
