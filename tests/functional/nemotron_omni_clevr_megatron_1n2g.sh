@@ -79,7 +79,7 @@ for path, count in ((os.environ["TRAIN_PATH"], 64), (os.environ["VAL_PATH"], 2))
 PY
 
 uv run --no-sync python examples/run_vlm_grpo.py \
-    --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n4g-megatron_generation.v1.yaml \
+    --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron_generation.v1.yaml \
     cluster.num_nodes=1 \
     cluster.gpus_per_node=2 \
     policy.megatron_cfg.env_vars.TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \

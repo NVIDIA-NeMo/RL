@@ -1,9 +1,10 @@
 defaults: ../../vlm_grpo_3B_megatron.yaml
 grpo:
-  num_prompts_per_step: 6
+  num_prompts_per_step: 12
   num_generations_per_prompt: 8
+  val_at_start: true
+  val_at_end: true
   val_batch_size: 64
-  max_val_samples: 64
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 2
@@ -37,25 +38,24 @@ policy:
   generation:
     backend: megatron
     max_new_tokens: 2048
-    stop_strings:
-    - <image>
-    - <img>
-    - </img>
-    - <so_embedding>
-    - <so_start>
-    - <so_end>
+    bad_words: null
     mcore_generation_config:
       buffer_size_gb: 8
+      async_sched_mode: async
       num_cuda_graphs: -1
+      use_cuda_graphs_for_non_decode_steps: false
       max_tokens: ${policy.max_total_sequence_length}
-      refit_backend: gloo
-      transformer_impl: transformer_engine
+      transformer_impl: inference_optimized
       activation_checkpointing: false
       tensor_model_parallel_size: 8
       expert_model_parallel_size: 8
       expert_tensor_parallel_size: 1
+      context_parallel_size: 1
       sequence_parallel: true
-      moe_pad_experts_for_cuda_graph_inference: true
+      moe_router_dtype: fp32
+      moe_pad_experts_for_cuda_graph_inference: false
+      mamba_inference_ssm_states_dtype: float32
+      mamba_inference_conv_states_dtype: float32
       image_dynamic_resolution: true
       logprobs_mode: raw_logprobs
       megatron_inference_wrapper: megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper
