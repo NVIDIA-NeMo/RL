@@ -1422,7 +1422,7 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def update_weights_via_ipc_zmq_async(
         self,
-        verify_digests: bool = False,
+        verify_digests: bool,
     ) -> bool:
         """Async version of update_weights_via_ipc_zmq."""
         try:

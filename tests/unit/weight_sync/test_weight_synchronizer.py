@@ -123,7 +123,7 @@ class TestIPCWeightSynchronizer:
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
 
         assert sync.is_stale
         sync.sync_weights()
@@ -141,7 +141,7 @@ class TestIPCWeightSynchronizer:
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
         kv_scales = {"layer.0": 0.5}
 
         sync.sync_weights(kv_scales=kv_scales)
@@ -165,11 +165,11 @@ class TestIPCWeightSynchronizer:
         assert gen.update_weights_via_ipc_zmq.call_args.kwargs["verify_digests"] is True
 
     @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
-    def test_sync_weights_default_leaves_verification_off(self, mock_ray):
+    def test_sync_weights_resolved_off_disables_verification(self, mock_ray):
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
 
         sync.sync_weights()
 
@@ -188,7 +188,7 @@ class TestIPCWeightSynchronizer:
         ]
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
 
         with pytest.raises(RuntimeError, match="Weight transfer failed"):
             sync.sync_weights()
@@ -198,7 +198,12 @@ class TestIPCWeightSynchronizer:
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen, refit_buffer_size_gb=2)
+        sync = IPCWeightSynchronizer(
+            policy,
+            gen,
+            refit_buffer_size_gb=2,
+            verify_mode="off",
+        )
 
         sync.sync_weights()
         call_kwargs = policy.stream_weights_via_ipc_zmq.call_args
@@ -211,7 +216,7 @@ class TestIPCWeightSynchronizer:
         policy = _mock_policy()
         policy.get_free_memory_bytes.return_value = 10 * (1024**3)
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
 
         sync.sync_weights()
         call_kwargs = policy.stream_weights_via_ipc_zmq.call_args
@@ -221,7 +226,7 @@ class TestIPCWeightSynchronizer:
     def test_init_communicator(self):
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
 
         sync.init_communicator()
         policy.prepare_refit_info.assert_called_once()
@@ -233,7 +238,7 @@ class TestIPCWeightSynchronizer:
         mock_ray.get.side_effect = RuntimeError("IPC transfer exploded")
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
 
         with pytest.raises(RuntimeError, match="IPC transfer exploded"):
             sync.sync_weights()
@@ -245,7 +250,12 @@ class TestIPCWeightSynchronizer:
     def test_negative_buffer_size_raises(self):
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen, refit_buffer_size_gb=-1)
+        sync = IPCWeightSynchronizer(
+            policy,
+            gen,
+            refit_buffer_size_gb=-1,
+            verify_mode="off",
+        )
         with pytest.raises(ValueError, match="refit_buffer_size_gb must be > 0"):
             sync._compute_buffer_size()
 
@@ -254,7 +264,7 @@ class TestIPCWeightSynchronizer:
         monkeypatch.setenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "not_a_number")
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
         with pytest.raises(ValueError, match="must be a valid float"):
             sync._compute_buffer_size()
 
@@ -263,7 +273,7 @@ class TestIPCWeightSynchronizer:
         monkeypatch.setenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0")
         policy = _mock_policy()
         gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
+        sync = IPCWeightSynchronizer(policy, gen, verify_mode="off")
         with pytest.raises(ValueError, match="must be > 0"):
             sync._compute_buffer_size()
 
@@ -899,6 +909,31 @@ class TestFactory:
             inference_cluster=_mock_cluster(),
         )
         assert isinstance(sync, CollectiveWeightSynchronizer)
+
+    @pytest.mark.parametrize("verify_mode", ["log", "enforce"])
+    @pytest.mark.parametrize("refit_transport", [None, "nccl_reshard"])
+    def test_non_colocated_vllm_rejects_refit_verification(
+        self, verify_mode: str, refit_transport: str | None
+    ) -> None:
+        gen = _mock_generation(
+            cfg={
+                "refit_transport": refit_transport,
+                "refit_cfg": {"verify": {"mode": verify_mode}},
+            }
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="supported only for colocated vLLM IPC weight synchronization",
+        ):
+            create_weight_synchronizer(
+                policy=_mock_policy(),
+                generation=gen,
+                generation_backend=VLLM_BACKEND,
+                colocated=False,
+                train_cluster=_mock_cluster(),
+                inference_cluster=_mock_cluster(),
+            )
 
     def test_non_colocated_dynamo_returns_collective(self):
         sync = create_weight_synchronizer(

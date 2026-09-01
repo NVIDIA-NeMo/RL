@@ -326,7 +326,7 @@ def test_ipc_refit_and_missing_worker_group():
     expected = [SimpleNamespace()]
     generation.worker_group.run_all_workers_single_data.return_value = expected
 
-    assert generation.update_weights_via_ipc_zmq() is expected
+    assert generation.update_weights_via_ipc_zmq(verify_digests=False) is expected
     generation.worker_group.run_all_workers_single_data.assert_called_once_with(
         "update_weights_via_ipc_zmq_async",
         run_rank_0_only_axes=["tensor_parallel"],
@@ -335,4 +335,16 @@ def test_ipc_refit_and_missing_worker_group():
     broken = _bare_generation(colocated=True)
     broken.worker_group.workers = []
     with pytest.raises(RuntimeError, match="Worker group not initialised"):
-        broken.update_weights_via_ipc_zmq()
+        broken.update_weights_via_ipc_zmq(verify_digests=False)
+
+
+def test_ipc_refit_rejects_digest_verification():
+    generation = _bare_generation(colocated=True)
+
+    with pytest.raises(
+        NotImplementedError,
+        match="TensorRT-LLM does not support IPC refit digest verification",
+    ):
+        generation.update_weights_via_ipc_zmq(verify_digests=True)
+
+    generation.worker_group.run_all_workers_single_data.assert_not_called()

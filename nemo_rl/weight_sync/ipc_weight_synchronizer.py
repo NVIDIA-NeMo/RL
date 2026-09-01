@@ -50,7 +50,7 @@ class IPCWeightSynchronizer(WeightSynchronizer):
             (concretely a VllmGeneration instance).
         refit_buffer_size_gb: Fixed buffer size in GB for weight staging.
             If None, buffer size is computed dynamically from free GPU memory.
-        verify_mode: Byte-level transfer verification mode ("off", "log",
+        verify_mode: Tensor byte and metadata verification mode ("off", "log",
             or "enforce"), resolved from
             ``policy.generation.refit_cfg.verify.mode``. Passed through to
             both the sending policy workers and the receiving vLLM workers.
@@ -61,7 +61,8 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         policy: Any,
         generation: Any,
         refit_buffer_size_gb: Optional[float | int] = None,
-        verify_mode: str = "off",
+        *,
+        verify_mode: str,
     ):
         self._policy = policy
         self._generation = generation

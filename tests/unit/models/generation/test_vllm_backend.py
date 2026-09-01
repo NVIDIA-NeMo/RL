@@ -982,7 +982,7 @@ def test_update_weights_via_ipc_acks_manifest_error_and_returns_false(monkeypatc
 
     ext._weight_update_lifecycle = lifecycle
 
-    assert ext.update_weights_via_ipc_zmq() is False
+    assert ext.update_weights_via_ipc_zmq(verify_digests=False) is False
     assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()]
 
 
@@ -1360,7 +1360,7 @@ def test_ipc_update_returns_received_digests_with_final_ack(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_ipc_update_default_keeps_plain_byte_acks(monkeypatch):
+def test_ipc_update_verify_off_keeps_plain_byte_acks(monkeypatch):
     """verify off must keep the wire format byte-for-byte as before."""
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.policy.utils import IPCProtocol
@@ -1377,6 +1377,6 @@ def test_ipc_update_default_keeps_plain_byte_acks(monkeypatch):
         vllm_backend, "rebuild_cuda_tensor_from_ipc", lambda handle, _index: handle
     )
 
-    assert ext.update_weights_via_ipc_zmq() is True
+    assert ext.update_weights_via_ipc_zmq(verify_digests=False) is True
     assert len(ext.zmq_socket.byte_acks) == 2
     assert ext.zmq_socket.pyobj_acks == []

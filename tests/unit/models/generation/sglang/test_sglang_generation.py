@@ -211,6 +211,18 @@ class _ImmediateAsyncLoop:
         pass
 
 
+def test_ipc_refit_rejects_digest_verification() -> None:
+    generation = SGLangGeneration.__new__(SGLangGeneration)
+
+    with pytest.raises(
+        NotImplementedError,
+        match="SGLang does not support IPC refit digest verification",
+    ):
+        generation.update_weights_via_ipc_zmq(verify_digests=True)
+
+    assert generation.update_weights_via_ipc_zmq(verify_digests=False) == []
+
+
 def _make_minimal_sglang_gen_for_clamp_test(
     *, context_length: int, max_new_tokens: int
 ):

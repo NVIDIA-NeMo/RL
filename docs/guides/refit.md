@@ -105,12 +105,12 @@ policy:
 
 ## Verify a Transfer
 
-The colocated CUDA-IPC transport can verify, per parameter, that the bytes
-loaded by the vLLM workers are exactly the bytes the policy workers sent.
-Both sides hash their view of the transfer with a deterministic integer
-digest (no floating-point reduction, so the check itself cannot be skewed
-by the nondeterminism it is meant to catch), and the sender compares the
-two sets after the final acknowledgment.
+The colocated CUDA-IPC transport can verify, per parameter, that the tensor
+loaded by the vLLM workers has the same bytes, dtype, and shape as the tensor
+the policy workers sent. Both sides hash their view of the transfer with a
+deterministic integer digest (no floating-point reduction, so the check itself
+cannot be skewed by the nondeterminism it is meant to catch), and the sender
+compares the two sets after the final acknowledgment.
 
 ```yaml
 policy:
@@ -125,11 +125,11 @@ policy:
 - `"enforce"`: raise on mismatch so a corrupted transfer fails the refit
   instead of silently skewing rollout logprobs.
 
-A mismatch means the received bytes differ from the sent bytes: a corrupted
-transfer, or `prepare_refit_info` metadata that no longer matches what the
-exporter streams. Verification covers transfer integrity only; it does not
-compare against the weights vLLM materializes after loading (fusion, TP
-sharding, and online quantization legitimately transform them).
+A mismatch means the received bytes, dtype, or shape differ from what was sent:
+a corrupted transfer, or `prepare_refit_info` metadata that no longer matches
+what the exporter streams. Verification covers transfer integrity only; it
+does not compare against the weights vLLM materializes after loading (fusion,
+TP sharding, and online quantization legitimately transform them).
 
 ## Learn More
 

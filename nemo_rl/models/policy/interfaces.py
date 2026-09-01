@@ -196,7 +196,8 @@ class ColocatablePolicyInterface(PolicyInterface):
         self,
         buffer_size_bytes: int,
         kv_scales: Optional[dict[str, float]] = None,
-        verify_mode: str = "off",
+        *,
+        verify_mode: str,
     ) -> list[ray.ObjectRef]:
         pass
 

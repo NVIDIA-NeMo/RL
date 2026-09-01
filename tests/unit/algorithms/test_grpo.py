@@ -192,8 +192,14 @@ def test_restore_async_replay_buffer_checkpoint_missing_file(tmp_path):
 
 
 @patch("nemo_rl.algorithms.grpo.ray")
-def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
+@pytest.mark.parametrize(
+    ("verify_mode", "verify_digests"),
+    [("off", False), ("enforce", True)],
+)
+def test_refit_policy_generation_forwards_resolved_ipc_config(
     mock_ray: MagicMock,
+    verify_mode: str,
+    verify_digests: bool,
 ) -> None:
     mock_ray.get.return_value = [True]
     policy = MagicMock()
@@ -202,6 +208,7 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
     # weight_synchronizer and refit_policy_generation would delegate to it instead
     # of taking the colocated IPC path under test.
     policy_generation.weight_synchronizer = None
+    policy_generation.cfg = {"refit_cfg": {"verify": {"mode": verify_mode}}}
     kv_scales = {"layer.0": 0.5}
 
     refit_policy_generation(
@@ -215,6 +222,10 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
     policy.stream_weights_via_ipc_zmq.assert_called_once_with(
         buffer_size_bytes=1024**3,
         kv_scales=kv_scales,
+        verify_mode=verify_mode,
+    )
+    policy_generation.update_weights_via_ipc_zmq.assert_called_once_with(
+        verify_digests=verify_digests
     )
 
 

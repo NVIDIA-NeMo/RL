@@ -14,26 +14,27 @@
 
 """Deterministic per-tensor digests for refit weight-transfer verification.
 
-The digest is a polynomial rolling hash over a tensor's flattened byte
-stream, computed in int64 with hardware wraparound (i.e. mod 2**64).
-Integer modular addition and multiplication are associative and
-commutative, so the result is bit-identical regardless of reduction
-order, chunking, or device -- unlike any floating-point checksum, which
-would itself be subject to the nondeterminism this module is meant to
-detect. Both ends of a transfer can therefore hash "the bytes they
-sent" and "the bytes they received" independently and compare exact
-integers.
+Each int64 lane is combined with its position and passed through a nonlinear
+64-bit mixer before reduction. Integer addition and multiplication use
+hardware wraparound (i.e. mod 2**64), so the result is bit-identical
+regardless of reduction order, chunking, or device. The tensor's dtype and
+shape are folded into the result as well as its bytes so stale refit metadata
+cannot reinterpret an otherwise identical byte stream undetected.
 """
+
+import hashlib
 
 import torch
 
-_FNV_PRIME = 0x100000001B3
-_FNV_OFFSET_BASIS = 0xCBF29CE484222325
 _U64 = 1 << 64
-# 1 Mi int64 lanes (8 MiB) hashed per chunk; bounds the cached power table.
+# SplitMix64 constants. Position-salting before the bijective finalizer avoids
+# the deterministic cancellation that a linear polynomial has for paired
+# high-bit flips in separate int64 lanes.
+_POSITION_SALT = 0x9E3779B97F4A7C15
+_MIX_MULTIPLIER_1 = 0xBF58476D1CE4E5B9
+_MIX_MULTIPLIER_2 = 0x94D049BB133111EB
+# 1 Mi int64 lanes (8 MiB) hashed per chunk.
 _CHUNK_LANES = 1 << 20
-
-_POW_CACHE: dict[str, torch.Tensor] = {}
 
 
 def _as_i64(value: int) -> int:
@@ -42,31 +43,40 @@ def _as_i64(value: int) -> int:
     return value - _U64 if value >= (1 << 63) else value
 
 
-def _descending_powers(device: torch.device) -> torch.Tensor:
-    """[R^(_CHUNK_LANES-1), ..., R^1, R^0] as int64, mod 2**64."""
-    key = str(device)
-    cached = _POW_CACHE.get(key)
-    if cached is None:
-        base = torch.full(
-            (_CHUNK_LANES,), _as_i64(_FNV_PRIME), dtype=torch.int64, device=device
-        )
-        base[0] = 1
-        cached = torch.cumprod(base, dim=0).flip(0)
-        _POW_CACHE[key] = cached
-    return cached
+def _logical_right_shift(value: torch.Tensor, bits: int) -> torch.Tensor:
+    """Shift an int64 tensor right as unsigned values."""
+    return (value >> bits) & ((1 << (64 - bits)) - 1)
+
+
+def _mix64(value: torch.Tensor) -> torch.Tensor:
+    """Apply the SplitMix64 finalizer with int64 wraparound arithmetic."""
+    value = (value ^ _logical_right_shift(value, 30)) * _as_i64(_MIX_MULTIPLIER_1)
+    value = (value ^ _logical_right_shift(value, 27)) * _as_i64(_MIX_MULTIPLIER_2)
+    return value ^ _logical_right_shift(value, 31)
+
+
+def _metadata_seed(tensor: torch.Tensor) -> int:
+    """Stable 64-bit seed covering the tensor's dtype, shape, and byte length."""
+    metadata = hashlib.blake2b(digest_size=8, person=b"NeMoRLrefit-v2")
+    dtype_name = str(tensor.dtype).encode("ascii")
+    metadata.update(len(dtype_name).to_bytes(2, byteorder="little"))
+    metadata.update(dtype_name)
+    metadata.update(tensor.ndim.to_bytes(8, byteorder="little"))
+    for dimension in tensor.shape:
+        metadata.update(dimension.to_bytes(8, byteorder="little"))
+    metadata.update(tensor.nbytes.to_bytes(8, byteorder="little"))
+    return int.from_bytes(metadata.digest(), byteorder="little")
 
 
 def tensor_digest(tensor: torch.Tensor) -> torch.Tensor:
     """Digest a tensor's logical byte stream into a 0-dim int64 tensor.
 
-    The hash covers exactly ``tensor.nbytes`` bytes in flattened logical
-    element order, with the byte length folded in at the end, so tensors
-    of different lengths (or trailing zero padding) cannot collide with
-    each other's prefixes.
+    The hash covers the tensor's dtype and shape followed by exactly
+    ``tensor.nbytes`` bytes in flattened logical element order.
 
     The result stays on ``tensor.device`` so callers can batch hashing on
     the active CUDA stream without a device sync per tensor; convert with
-    :func:`digest_to_int` only after the producing stream is synchronized.
+    :func:`digests_to_ints` only after the producing stream is synchronized.
     """
     data = tensor.detach().reshape(-1)
     if not data.is_contiguous():
@@ -83,27 +93,38 @@ def tensor_digest(tensor: torch.Tensor) -> torch.Tensor:
     lanes = raw.view(torch.int64)
 
     digest = torch.full(
-        (), _as_i64(_FNV_OFFSET_BASIS), dtype=torch.int64, device=lanes.device
+        (), _as_i64(_metadata_seed(tensor)), dtype=torch.int64, device=lanes.device
     )
-    powers = _descending_powers(lanes.device)
+    lane_offset = 0
     for chunk in lanes.split(_CHUNK_LANES):
         lanes_in_chunk = chunk.numel()
-        # H(prefix + chunk) = H(prefix) * R^len(chunk) + H(chunk), mod 2**64.
-        digest = digest * _as_i64(pow(_FNV_PRIME, lanes_in_chunk, _U64)) + (
-            chunk * powers[-lanes_in_chunk:]
-        ).sum(dtype=torch.int64)
-    return digest * _as_i64(_FNV_PRIME) + num_bytes
+        positions = torch.arange(
+            lane_offset + 1,
+            lane_offset + lanes_in_chunk + 1,
+            dtype=torch.int64,
+            device=lanes.device,
+        )
+        salted = chunk + positions * _as_i64(_POSITION_SALT)
+        digest = digest + _mix64(salted).sum(dtype=torch.int64)
+        lane_offset += lanes_in_chunk
+    return _mix64(digest)
 
 
 def digests_to_ints(digests: dict[str, torch.Tensor]) -> dict[str, int]:
     """Normalize digest tensors to unsigned Python ints (forces a device sync)."""
     if not digests:
         return {}
-    stacked = torch.stack(list(digests.values())).cpu()
-    return {
-        name: int(value) & (_U64 - 1)
-        for name, value in zip(digests.keys(), stacked.tolist())
-    }
+
+    device_batches: dict[torch.device, list[tuple[str, torch.Tensor]]] = {}
+    for name, digest in digests.items():
+        device_batches.setdefault(digest.device, []).append((name, digest))
+
+    normalized: dict[str, int] = {}
+    for batch in device_batches.values():
+        stacked = torch.stack([digest for _, digest in batch]).cpu()
+        for (name, _), value in zip(batch, stacked.tolist()):
+            normalized[name] = int(value) & (_U64 - 1)
+    return {name: normalized[name] for name in digests}
 
 
 def compare_digests(sender: dict[str, int], receiver: dict[str, int]) -> list[str]:

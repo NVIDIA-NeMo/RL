@@ -629,7 +629,11 @@ class DynamoGeneration(GenerationInterface):
             raise RuntimeError("Dynamo refit channel is unavailable")
         channel.prepare(state_dict_info)
 
-    def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
+    def update_weights_via_ipc_zmq(self, verify_digests: bool) -> list[ray.ObjectRef]:
+        if verify_digests:
+            raise NotImplementedError(
+                "DynamoGeneration does not support IPC refit digest verification."
+            )
         raise NotImplementedError(
             "DynamoGeneration only supports NCCL weight transfer."
         )

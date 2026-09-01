@@ -917,15 +917,15 @@ class VllmInternalWorkerExtension:
         torch.cuda.current_stream().synchronize()
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self, verify_digests: bool = False) -> bool:
+    def update_weights_via_ipc_zmq(self, verify_digests: bool) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
 
         Args:
-            verify_digests: When True, hash every received parameter's bytes
-                and return the digests to the sender with the final ACK (as a
-                pyobj instead of the plain byte ACK). The sender compares them
-                against its own hashes of the sent bytes. Must match the
-                sender's refit verify configuration.
+            verify_digests: When True, hash every received parameter's bytes,
+                dtype, and shape and return the digests to the sender with the
+                final ACK (as a pyobj instead of the plain byte ACK). The sender
+                compares them against its own hashes of the sent tensors. Must
+                match the sender's refit verify configuration.
 
         Returns:
             bool: True if weights were successfully updated.

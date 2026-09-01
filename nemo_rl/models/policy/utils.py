@@ -398,9 +398,9 @@ def _check_refit_digests(
     message = (
         f"{worker_name} (rank {rank}): refit digest mismatch for "
         f"{len(mismatched)}/{len(local_digests)} parameters: {shown}. "
-        "The bytes received by the generation worker differ from the bytes "
-        "sent by the policy worker (corrupted transfer or stale/desynced "
-        "refit metadata)."
+        "The tensor bytes, dtype, or shape received by the generation worker "
+        "differ from what the policy worker sent (corrupted transfer or "
+        "stale/desynced refit metadata)."
     )
     if verify_mode == "enforce":
         raise RuntimeError(message)
@@ -413,7 +413,8 @@ def stream_weights_via_ipc_zmq_impl(
     zmq_socket,
     rank: int,
     worker_name: str,
-    verify_mode: str = "off",
+    *,
+    verify_mode: str,
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 

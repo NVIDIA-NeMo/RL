@@ -166,12 +166,12 @@ class VllmCheckpointEnginePluginConfig(BaseModel, extra="allow"):
 
 
 class VllmRefitVerifyConfig(BaseModel, extra="allow"):
-    """Byte-level verification of refit weight transfers.
+    """Tensor byte and metadata verification for refit weight transfers.
 
     mode:
         - "off": no verification (default; zero overhead).
-        - "log": hash sent and received bytes per parameter, print a warning
-          listing mismatched parameters.
+        - "log": hash sent and received bytes, dtype, and shape per parameter;
+          print a warning listing mismatched parameters.
         - "enforce": like "log", but raise instead of warning so a corrupted
           transfer fails the refit rather than silently skewing rollouts.
     """

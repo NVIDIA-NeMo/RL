@@ -1271,7 +1271,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self, verify_digests: bool = False) -> bool:
+    def update_weights_via_ipc_zmq(self, verify_digests: bool) -> bool:
         """Update weights from IPC handles via ZMQ socket."""
         try:
             assert self.llm is not None, (

@@ -95,6 +95,16 @@ def _config(*, tp: int = 1, expose_http_server: bool = False) -> dict[str, Any]:
     }
 
 
+def test_ipc_refit_rejects_digest_verification() -> None:
+    generation = DynamoGeneration.__new__(DynamoGeneration)
+
+    with pytest.raises(
+        NotImplementedError,
+        match="DynamoGeneration does not support IPC refit digest verification",
+    ):
+        generation.update_weights_via_ipc_zmq(verify_digests=True)
+
+
 def _patch_runtime(
     monkeypatch: pytest.MonkeyPatch,
     workers: list[dict[str, Any]] | None = None,

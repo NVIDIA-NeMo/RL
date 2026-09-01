@@ -84,6 +84,7 @@ def _stream(monkeypatch, params, buffer_size_bytes=BUFFER_BYTES):
         zmq_socket=socket,
         rank=0,
         worker_name="test-worker",
+        verify_mode="off",
     )
     return socket
 
@@ -312,7 +313,7 @@ def test_verify_rejects_protocol_desync(monkeypatch):
 
 
 def test_verify_off_keeps_plain_byte_protocol(monkeypatch):
-    """The default mode must not switch the final ACK to a pyobj."""
+    """The resolved off mode must not switch the final ACK to a pyobj."""
     socket = _stream(monkeypatch, [_param("layer.0.weight", 512)])
     # _stream runs with verify_mode="off" and FakeSocket has no recv_pyobj;
     # reaching COMPLETE with all ACKs consumed proves the old protocol held.

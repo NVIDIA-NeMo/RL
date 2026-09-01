@@ -84,6 +84,21 @@ def create_weight_synchronizer(
             f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
         )
 
+    verify_mode = "off"
+    if generation_backend == VLLM_BACKEND:
+        from nemo_rl.models.generation.vllm.config import (
+            resolve_refit_verify_config,
+        )
+
+        verify_mode = resolve_refit_verify_config(generation.cfg).mode
+        if not colocated and verify_mode != "off":
+            raise NotImplementedError(
+                "Refit verification is currently supported only for colocated "
+                "vLLM IPC weight synchronization. Set "
+                "policy.generation.refit_cfg.verify.mode='off' or enable "
+                "policy.generation.colocated."
+            )
+
     checkpoint_engine_config = checkpoint_engine_refit_config(generation.cfg)
     if checkpoint_engine_config is not None:
         if colocated:
@@ -191,14 +206,6 @@ def create_weight_synchronizer(
     from nemo_rl.weight_sync.ipc_weight_synchronizer import (
         IPCWeightSynchronizer,
     )
-
-    verify_mode = "off"
-    if generation_backend == VLLM_BACKEND:
-        from nemo_rl.models.generation.vllm.config import (
-            resolve_refit_verify_config,
-        )
-
-        verify_mode = resolve_refit_verify_config(generation.cfg).mode
 
     return IPCWeightSynchronizer(
         policy=policy,

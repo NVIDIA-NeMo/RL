@@ -1189,9 +1189,7 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         ray.get(futures)
 
-    def update_weights_via_ipc_zmq(
-        self, verify_digests: bool = False
-    ) -> list[ray.ObjectRef]:
+    def update_weights_via_ipc_zmq(self, verify_digests: bool) -> list[ray.ObjectRef]:
         """Update weights of the policy using IPC handles via ZMQ socket."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
