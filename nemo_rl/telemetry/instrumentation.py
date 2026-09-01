@@ -29,33 +29,13 @@ from contextvars import ContextVar
 from enum import Enum
 from typing import Any, Iterator, Mapping, Optional
 
-try:
-    from nemo.lens import (
-        is_span_group_enabled,
-        span_cm,
-    )
-    from nemo.lens import (
-        managed_span as _managed_span,
-    )
-except ImportError:  # pragma: no cover — exercised only in lens-free envs
-    # Local copies of ``nemo.lens.fallbacks`` — that module is unimportable
-    # exactly when it is needed (lens absent from the venv). Telemetry cannot
-    # be enabled without lens, so no-ops are behaviour-exact here.
-
-    @contextmanager
-    def span_cm(  # type: ignore[misc]
-        name: str, tracer: Any = None, record_exception: bool = True, **attributes: Any
-    ) -> Iterator[None]:
-        yield None
-
-    @contextmanager
-    def _managed_span(
-        group: str, name: str, tracer: Any = None, **attributes: Any
-    ) -> Iterator[None]:
-        yield None
-
-    def is_span_group_enabled(group: str) -> bool:  # type: ignore[misc]
-        return False
+from nemo.lens import (
+    is_span_group_enabled,
+    span_cm,
+)
+from nemo.lens import (
+    managed_span as _managed_span,
+)
 
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 
@@ -277,10 +257,7 @@ def current_trace_carrier() -> dict[str, str]:
     # Via lens rather than opentelemetry.propagate directly: lens owns the
     # carrier format on both ends of a Ray hop, so a change there cannot leave
     # the two halves of this file's round-trip disagreeing.
-    try:
-        from nemo.lens.contrib.ray import inject_ray_context
-    except ImportError:  # pragma: no cover — exercised only in lens-free envs
-        return {}
+    from nemo.lens.contrib.ray import inject_ray_context
 
     return inject_ray_context()
 
@@ -300,15 +277,9 @@ def remote_trace_context(carrier: Optional[Mapping[str, str]]) -> Iterator[None]
         yield
         return
     # attach/detach come from opentelemetry because lens wraps the extraction
-    # but not the activation. A worker without lens cannot reopen the parent
-    # span, but it can still run — the carrier only came from a driver whose
-    # own telemetry the worker was never going to export to.
-    try:
-        from nemo.lens.contrib.ray import extract_ray_context
-        from opentelemetry import context as otel_ctx
-    except ImportError:  # pragma: no cover — exercised only in lens-free envs
-        yield
-        return
+    # but not the activation.
+    from nemo.lens.contrib.ray import extract_ray_context
+    from opentelemetry import context as otel_ctx
 
     token = otel_ctx.attach(extract_ray_context(dict(carrier)))
     try:

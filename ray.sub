@@ -616,17 +616,10 @@ fi
 # exit codes to stay non-fatal.
 set -o pipefail
 
-# If this node can't see the canary, LOG_DIR is not shared. Allow a bounded
-# grace period first: the canary is written on the submit host seconds before
-# this container starts, and Lustre metadata visibility can lag briefly. Then
-# fail instead of waiting forever for signal files this node can't read.
-_canary_wait=0
-while [[ ! -f "$LOG_DIR/.shared_fs_canary" && \$_canary_wait -lt 60 ]]; do
-  sleep 2
-  _canary_wait=\$(( _canary_wait + 2 ))
-done
+# If this node can't see the canary, LOG_DIR is not shared. Fail now instead of
+# waiting forever for signal files the submit host writes but this node can't read.
 if [[ ! -f "$LOG_DIR/.shared_fs_canary" ]]; then
-  echo "[ERROR] $LOG_DIR/.shared_fs_canary not visible on the head node after \${_canary_wait}s; LOG_DIR must be on a shared filesystem." >&2
+  echo "[ERROR] $LOG_DIR/.shared_fs_canary not visible on the head node; LOG_DIR must be on a shared filesystem." >&2
   touch "$LOG_DIR/ENDED" 2>/dev/null || true
   exit 1
 fi
@@ -859,15 +852,8 @@ echo "[INFO] Worker \$SLURM_PROCID on node \$SLURMD_NODENAME"
 
 # Fail fast if LOG_DIR is not actually shared with the submit host -- the worker
 # gates on STARTED_RAY_HEAD and other signal files that would otherwise never appear.
-# Bounded grace period first: Lustre metadata visibility can lag briefly behind
-# the submit-host write (see the head-container check above).
-_canary_wait=0
-while [[ ! -f "$LOG_DIR/.shared_fs_canary" && \$_canary_wait -lt 60 ]]; do
-  sleep 2
-  _canary_wait=\$(( _canary_wait + 2 ))
-done
 if [[ ! -f "$LOG_DIR/.shared_fs_canary" ]]; then
-  echo "[ERROR] Worker \$SLURM_PROCID: $LOG_DIR/.shared_fs_canary not visible after \${_canary_wait}s; LOG_DIR must be on a shared filesystem." >&2
+  echo "[ERROR] Worker \$SLURM_PROCID: $LOG_DIR/.shared_fs_canary not visible; LOG_DIR must be on a shared filesystem." >&2
   exit 1
 fi
 
@@ -1036,51 +1022,23 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     --ntasks-per-node=1 \
     --export="$SANDBOX_EXPORTS" \
     bash -xc '
-      # Sidecar startup flakes on a few % of nodes per run (nginx dies during
-      # bringup); with --kill-on-bad-exit=1 across all nodes, one flake kills
-      # the whole allocation (jobs 6573810/6585456). Retry the start, and
-      # supervise-restart after readiness so a mid-run death does not fail
-      # the step either.
-      start_sandbox() {
-        ('"$SANDBOX_COMMAND"') &
-        SANDBOX_PID=$!
-        local start=$SECONDS
-        while ! (echo > /dev/tcp/localhost/'"$SANDBOX_PORT"') 2>/dev/null; do
-          if ! kill -0 $SANDBOX_PID 2>/dev/null; then
-            echo "[WARN] Sandbox process died before becoming ready on $(hostname)"
-            return 1
-          fi
-          if (( SECONDS - start > 300 )); then
-            echo "[WARN] Sandbox not ready on $(hostname) after 5 min"
-            kill $SANDBOX_PID 2>/dev/null || true
-            return 1
-          fi
-          sleep 2
-        done
-        return 0
-      }
-      ready=0
-      for attempt in 1 2 3; do
-        if start_sandbox; then ready=1; break; fi
-        echo "[WARN] Sandbox start attempt $attempt failed on $(hostname); retrying"
-        sleep 5
+      ('"$SANDBOX_COMMAND"') &
+      SANDBOX_PID=$!
+      deadline=$((SECONDS + 300))
+      while ! (echo > /dev/tcp/localhost/'"$SANDBOX_PORT"') 2>/dev/null; do
+        if ! kill -0 $SANDBOX_PID 2>/dev/null; then
+          echo "[ERROR] Sandbox process died before becoming ready on $(hostname)"
+          exit 1
+        fi
+        if (( SECONDS > deadline )); then
+          echo "[ERROR] Sandbox not ready on $(hostname) after 5 min"
+          exit 1
+        fi
+        sleep 2
       done
-      if (( ! ready )); then
-        echo "[ERROR] Sandbox failed to start on $(hostname) after 3 attempts"
-        exit 1
-      fi
       touch '"$SANDBOX_PORTS_DIR"'/SANDBOX_READY_$(hostname)
       echo "[INFO] Sandbox ready on $(hostname):'"$SANDBOX_PORT"'"
-      while true; do
-        wait $SANDBOX_PID
-        echo "[WARN] Sandbox exited on $(hostname); restarting"
-        sleep 5
-        while ! start_sandbox; do
-          echo "[WARN] Sandbox restart failed on $(hostname); retrying in 15s"
-          sleep 15
-        done
-        echo "[INFO] Sandbox restarted on $(hostname):'"$SANDBOX_PORT"'"
-      done
+      wait $SANDBOX_PID
     ' &
   SRUN_PIDS["sandbox"]=$!
   echo "[INFO] Sandbox sidecar started in background (PID: ${SRUN_PIDS["sandbox"]})"
