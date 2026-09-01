@@ -45,6 +45,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
+    AsyncRolloutImpl,
     RolloutManager,
     RolloutOutcome,
     RolloutRetryPolicy,
@@ -780,6 +781,32 @@ def test_nemo_gym_reward_penalty_metrics_compute_fractional_rate():
 # ---------------------------------------------------------------------------
 # Tests for AsyncRolloutManager (native async path)
 # ---------------------------------------------------------------------------
+
+
+def test_native_rollout_worker_metrics_use_checkpoint_safe_string_keys():
+    impl = object.__new__(AsyncRolloutImpl)
+    completion = Completion(
+        message_log=[],
+        env_extras={},
+        truncated=False,
+        reward=1.0,
+    )
+    sample_metrics = {
+        "turn_count": 1,
+        "total_tokens": 3,
+        "assistant_tokens": 2,
+        "env_tokens": 1,
+        "terminated": True,
+        "max_turns_reached": False,
+        "turn_gen_tokens": [2],
+        "turn_input_tokens": [1],
+        "turn_total_tokens": [3],
+        "per_worker_token_counts": {0: 2},
+    }
+
+    metrics = impl._aggregate_rollout_metrics([completion], [sample_metrics])
+
+    assert metrics["per_worker_token_counts"] == {"0": 2}
 
 
 @pytest.fixture(scope="function")

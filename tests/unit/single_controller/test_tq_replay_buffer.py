@@ -938,7 +938,11 @@ class TestTQReplayBufferStateDict:
             _add_group(
                 buf,
                 weight=1,
-                rollout_metrics={"gen_tokens/min": 3, "total_turns": 2},
+                rollout_metrics={
+                    "gen_tokens/min": 3,
+                    "total_turns": 2,
+                    "per_worker_token_counts": {"0": 17},
+                },
             ),
             _add_group(buf, weight=2),
         ]
@@ -959,7 +963,11 @@ class TestTQReplayBufferStateDict:
             list(meta.sample_ids) for meta in metas
         ]
         assert restored_buf.meta_list[0].extra_info["rollout_metrics"] == [
-            {"gen_tokens/min": 3, "total_turns": 2}
+            {
+                "gen_tokens/min": 3,
+                "total_turns": 2,
+                "per_worker_token_counts": {"0": 17},
+            }
         ]
         assert restored_dp.put_calls == []
 
