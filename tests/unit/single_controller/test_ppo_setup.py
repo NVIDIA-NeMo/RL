@@ -238,6 +238,16 @@ class TestPPOValidation:
     def test_accepts_a_well_formed_ppo_config(self):
         validate_single_controller_config(_ppo_master_config())
 
+    def test_rejects_message_penalties_without_nemo_gym(self):
+        mc = _ppo_master_config()
+        assert mc.ppo is not None
+        mc.ppo.invalid_tool_call_advantage = -5.0
+
+        with pytest.raises(
+            ValueError, match="active algorithm block require the NeMo-Gym"
+        ):
+            validate_single_controller_config(mc)
+
     @pytest.mark.parametrize("missing", ["value", "value_loss_fn"])
     def test_rejects_ppo_without_its_critic_blocks(self, missing):
         mc = _ppo_master_config(**{missing: None})

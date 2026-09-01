@@ -93,6 +93,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
+    apply_message_level_advantage_penalties,
     fields_for_put,
     reduce_advantage_pump_metrics,
     squeeze_trailing_unit_dim,
@@ -201,6 +202,10 @@ class SingleControllerActor:
         self._is_ppo: bool = is_ppo_run(master_config)
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
+        self._message_level_advantage_penalties_enabled = (
+            self._algo_cfg.invalid_tool_call_advantage is not None
+            or self._algo_cfg.malformed_thinking_advantage is not None
+        )
 
         self._policy_logprobs_required = not (
             master_config.loss_fn.force_on_policy_ratio
@@ -3265,6 +3270,27 @@ class SingleControllerActor:
             if self._is_ppo:
                 returns = torch.zeros_like(mask)
 
+        if self._message_level_advantage_penalties_enabled:
+            # Sequence-error filtering and the pre-existing sample mask remain
+            # authoritative: a message penalty must not make a filtered token
+            # trainable again.
+            valid_tokens = mask.bool()
+            advantages = apply_message_level_advantage_penalties(
+                advantages,
+                invalid_tool_call_mask=(
+                    tensor_field(data, adv_cfg.invalid_tool_call_mask_field).bool()
+                    & valid_tokens
+                ),
+                malformed_thinking_mask=(
+                    tensor_field(data, adv_cfg.malformed_thinking_mask_field).bool()
+                    & valid_tokens
+                ),
+                invalid_tool_call_advantage=self._algo_cfg.invalid_tool_call_advantage,
+                malformed_thinking_advantage=(
+                    self._algo_cfg.malformed_thinking_advantage
+                ),
+            )
+
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
         self._step_log_dict["masked_advantages"].append(
@@ -3306,6 +3332,13 @@ class SingleControllerActor:
             adv_cfg.sample_mask_field,
             *adv_cfg.repeated_batch_fields,
         ]
+        if self._message_level_advantage_penalties_enabled:
+            fields.extend(
+                [
+                    adv_cfg.invalid_tool_call_mask_field,
+                    adv_cfg.malformed_thinking_mask_field,
+                ]
+            )
         if self._policy_logprobs_required:
             fields.append(adv_cfg.policy_logprobs_field)
         if self._policy_logprobs_required:

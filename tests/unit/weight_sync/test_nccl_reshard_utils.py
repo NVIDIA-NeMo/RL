@@ -761,22 +761,38 @@ def test_wire_safe_does_not_mutate_the_train_side_refit_info():
 
 
 def test_wire_safe_then_restore_reproduces_placements_and_meshes():
-    info = _refit_info_for_wire()
-
-    wire = pickle.loads(pickle.dumps(make_nccl_reshard_refit_info_wire_safe(info)))
+    # Keep this fixture independent from both the builder and wire encoder.
+    # Otherwise the test could reproduce the same serialization mistake on
+    # both sides and still pass.
+    wire = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": "model.layers.0.mlp.down_proj.weight",
+                    "src_mesh_info": {"mesh": [[0, 1], [2, 3]]},
+                    "dst_mesh_info": {"mesh": [[0, 1, 2, 3]]},
+                    "src_placements": [{"dim": 0}, {}],
+                    "dst_placements": [{"dim": 1}],
+                }
+            ]
+        },
+    }
     restored = restore_refit_info_placements(wire)
 
-    assert restored["layer_names"] == info["layer_names"]
-    for layer in info["layer_names"]:
-        original = {p["name"]: p for p in info["per_layer_params"][layer]}
-        assert len(restored["per_layer_params"][layer]) == len(original)
-        for p in restored["per_layer_params"][layer]:
-            o = original[p["name"]]
-            for key in ("src_mesh_info", "dst_mesh_info"):
-                assert isinstance(p[key], MeshInfo)
-                assert torch.equal(p[key].mesh, o[key].mesh)
-            for key in ("src_placements", "dst_placements"):
-                assert p[key] == o[key]
+    restored_param = restored["per_layer_params"]["model.layers.0"][0]
+    assert isinstance(restored_param["src_mesh_info"], MeshInfo)
+    assert isinstance(restored_param["dst_mesh_info"], MeshInfo)
+    assert torch.equal(
+        restored_param["src_mesh_info"].mesh,
+        torch.tensor([[0, 1], [2, 3]]),
+    )
+    assert torch.equal(
+        restored_param["dst_mesh_info"].mesh,
+        torch.tensor([[0, 1, 2, 3]]),
+    )
+    assert restored_param["src_placements"] == [Shard(0), Replicate()]
+    assert restored_param["dst_placements"] == [Shard(1)]
 
 
 def test_wire_safe_then_restore_reproduces_component_placements() -> None:
