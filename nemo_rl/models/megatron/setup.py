@@ -1766,6 +1766,64 @@ def build_inference_model(
     return inference_model
 
 
+def _assert_linear_ce_fusion_reaches_gpt_model(model: Any) -> None:
+    """Fail fast when linear CE fusion cannot safely use the patched GPTModel.
+
+    ``patch_gpt_model_forward_for_linear_ce_fusion()`` rebinds
+    ``GPTModel.forward``, so fusion only happens if a ``GPTModel`` is actually
+    reached. Two layouts work: the caller-facing module *is* the ``GPTModel``
+    (after ``Float16Module``/DDP-style ``.module`` unwrapping), or it is a VLM
+    wrapper holding one as ``.language_model`` -- ``model_forward()`` arms the
+    inner instance for those.
+
+    Anything else would reach the first forward pass and fail there with an
+    opaque ``TypeError``, i.e. after the full allocation and model load, so
+    surface it here instead, next to where the patch is applied.
+
+    Reaching GPTModel is not sufficient for models with logit softcapping:
+    fusion uses the output weight directly and bypasses output_layer.forward,
+    including its softcapping transform. Reject that configuration rather than
+    silently computing logprobs and gradients for a different distribution.
+    """
+    from megatron.core.models.gpt import GPTModel
+
+    from nemo_rl.models.megatron.train import find_linear_ce_fusion_target
+
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    for chunk in chunks:
+        module = chunk
+        while not isinstance(module, GPTModel) and hasattr(module, "module"):
+            module = module.module
+        # Either the invoked module is the patched GPTModel, or model_forward()
+        # can reach one behind a wrapper and arm it.
+        target = (
+            module
+            if isinstance(module, GPTModel)
+            else find_linear_ce_fusion_target(chunk)
+        )
+        if target is None:
+            raise NotImplementedError(
+                "policy.megatron_cfg.use_fused_linear_logprobs=true is not supported "
+                f"for {type(module).__name__}: linear CE fusion patches "
+                "GPTModel.forward, but no GPTModel is reachable on this module "
+                "(neither directly nor as '.language_model'), so the fused forward "
+                "would never run. Set "
+                "policy.megatron_cfg.use_fused_linear_logprobs=false."
+            )
+
+        # This optional provider field is absent on ordinary GPT configurations.
+        # Check every pipeline chunk, even those without a local output layer.
+        softcap = getattr(target.config, "final_logit_softcapping", None)
+        if softcap:
+            raise NotImplementedError(
+                "policy.megatron_cfg.use_fused_linear_logprobs=true is not supported "
+                f"for {type(module).__name__} with final_logit_softcapping={softcap}: "
+                "linear CE fusion bypasses output_layer.forward and its logit "
+                "softcapping, producing incorrect logprobs and gradients. Set "
+                "policy.megatron_cfg.use_fused_linear_logprobs=false."
+            )
+
+
 def setup_model_and_optimizer(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -2017,6 +2075,9 @@ def setup_model_and_optimizer(
         pg_collection=pg_collection,
         wrap_with_ddp=load_optimizer,
     )
+
+    if policy_cfg["megatron_cfg"].get("use_fused_linear_logprobs", False):
+        _assert_linear_ce_fusion_reaches_gpt_model(model)
 
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(

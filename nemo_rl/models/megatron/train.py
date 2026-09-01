@@ -116,6 +116,64 @@ def suspend_activation_offload_for_forward_only(
                 model_config.fine_grained_activation_offloading = original_value
 
 
+def find_linear_ce_fusion_target(model: Any, max_depth: int = 8) -> Optional[GPTModel]:
+    """Return the inner ``GPTModel`` when a wrapper hides it from the caller.
+
+    Linear CE fusion works by rebinding ``GPTModel.forward``, and only that
+    patched forward understands ``return_logprobs_for_linear_ce_fusion``. A VLM
+    checkpoint puts a wrapper in front of it -- Gemma-4 loads as
+    ``Gemma4ForConditionalGeneration``, so the invoked module is
+    ``Gemma4VLModel`` and the ``GPTModel`` is its ``.language_model``. The
+    wrapper's own ``forward()`` does not declare that kwarg, so passing it
+    raises ``TypeError``.
+
+    Returns ``None`` when the invoked module *is* the ``GPTModel`` (after
+    ``Float16Module``/DDP-style ``.module`` unwrapping), i.e. the kwarg can be
+    passed normally, and also when no ``GPTModel`` is reachable at all -- callers
+    then keep their existing behaviour instead of silently skipping fusion.
+
+    ``max_depth`` bounds the walk. Real stacks nest only a few levels, and an
+    unbounded loop would spin on objects that answer every attribute.
+    """
+    module = model
+    for _ in range(max_depth):
+        if isinstance(module, GPTModel):
+            # The invoked forward is the patched one; no arming needed.
+            return None
+        # Check before descending: a wrapper may expose both .language_model
+        # and a .module of its own.
+        inner = getattr(module, "language_model", None)
+        if isinstance(inner, GPTModel):
+            return inner
+        if not hasattr(module, "module"):
+            return None
+        module = module.module
+    return None
+
+
+@contextmanager
+def _armed_linear_ce_fusion(target: Optional[GPTModel]) -> Iterator[None]:
+    """Make ``target``'s patched forward return fused logprobs for this call.
+
+    Used when the kwarg cannot be threaded through an intervening wrapper. The
+    flag is set per-instance (not on the class) and always restored, so
+    concurrent models and the non-fused path are unaffected.
+    """
+    if target is None:
+        yield
+        return
+    sentinel = object()
+    previous = getattr(target, "_linear_ce_fusion_armed", sentinel)
+    target._linear_ce_fusion_armed = True
+    try:
+        yield
+    finally:
+        if previous is sentinel:
+            del target._linear_ce_fusion_armed
+        else:
+            target._linear_ce_fusion_armed = previous
+
+
 def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
@@ -173,20 +231,31 @@ def model_forward(
 
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
+
+    # The fusion patch rebinds GPTModel.forward, and the kwarg below is only
+    # understood by that patched forward. When the top-level module is a VLM
+    # wrapper (e.g. Gemma-4 loads as Gemma4ForConditionalGeneration, so the
+    # module is Gemma4VLModel and GPTModel is only its .language_model), the
+    # wrapper's own forward does not accept it. In that case arm the inner
+    # GPTModel for the duration of the call instead of passing the kwarg.
+    fusion_target = None
     if use_fused_linear_logprobs:
         additional_kwargs["labels"] = input_ids_cp_sharded
-        # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
-        # GPTModel.forward signatures do not accept it.
-        additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
+        fusion_target = find_linear_ce_fusion_target(model)
+        if fusion_target is None:
+            # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
+            # GPTModel.forward signatures do not accept it.
+            additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
 
     with straggler_timer() if straggler_timer is not None else nullcontext():
-        output_tensor = model(
-            input_ids=input_ids_cp_sharded,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            **additional_kwargs,
-            **multimodal_data,
-        )
+        with _armed_linear_ce_fusion(fusion_target):
+            output_tensor = model(
+                input_ids=input_ids_cp_sharded,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                **additional_kwargs,
+                **multimodal_data,
+            )
 
     # A model that slices context parallelism itself returns (output,
     # sliced_loss_mask) when it was handed a full-sequence loss_mask, so the

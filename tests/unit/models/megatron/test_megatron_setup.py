@@ -4040,3 +4040,146 @@ class TestForceSyncOptimizerFp32FromModel:
                 f"DistributedOptimizer no longer references {name!r}; "
                 "_force_sync_optimizer_fp32_from_model's level-1 sync is now a silent no-op."
             )
+
+
+@pytest.mark.mcore
+class TestAssertLinearCeFusionReachesGptModel:
+    """Linear CE fusion must reach the GPTModel whose forward was patched."""
+
+    @staticmethod
+    def _make_gpt_model():
+        from megatron.core.models.gpt import GPTModel
+
+        model = MagicMock(spec=GPTModel)
+        model.config = SimpleNamespace()
+        return model
+
+    @staticmethod
+    def _wrap_model(model: Any, layout: str) -> Any:
+        if layout == "bare":
+            return model
+        if layout == "module":
+            return SimpleNamespace(module=model)
+        wrapper = SimpleNamespace(language_model=model)
+        if layout == "vlm":
+            return wrapper
+        if layout == "wrapped_vlm":
+            return SimpleNamespace(module=SimpleNamespace(module=wrapper))
+        raise ValueError(f"Unknown model layout: {layout}")
+
+    @pytest.mark.parametrize("layout", ["bare", "module", "vlm", "wrapped_vlm"])
+    @pytest.mark.parametrize("softcap", [None, 0.0, 30.0])
+    def test_validates_logit_softcapping(
+        self, layout: str, softcap: float | None
+    ) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _assert_linear_ce_fusion_reaches_gpt_model,
+        )
+
+        model = self._make_gpt_model()
+        model.config.final_logit_softcapping = softcap
+        wrapped = self._wrap_model(model, layout)
+
+        if softcap:
+            with pytest.raises(
+                NotImplementedError, match="final_logit_softcapping=30.0"
+            ) as exc_info:
+                _assert_linear_ce_fusion_reaches_gpt_model(wrapped)
+            assert "output_layer.forward" in str(exc_info.value)
+            assert "policy.megatron_cfg.use_fused_linear_logprobs=false" in str(
+                exc_info.value
+            )
+        else:
+            _assert_linear_ce_fusion_reaches_gpt_model(wrapped)
+
+        # Disabling model softcapping would change the checkpoint's distribution.
+        assert model.config.final_logit_softcapping == softcap
+
+    @pytest.mark.parametrize("layout", ["bare", "module", "vlm", "wrapped_vlm"])
+    def test_accepts_model_without_softcapping_config(self, layout: str) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _assert_linear_ce_fusion_reaches_gpt_model,
+        )
+
+        _assert_linear_ce_fusion_reaches_gpt_model(
+            self._wrap_model(self._make_gpt_model(), layout)
+        )
+
+    @pytest.mark.parametrize("container", [list, tuple])
+    def test_checks_softcapping_on_later_pipeline_chunks(self, container: type) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _assert_linear_ce_fusion_reaches_gpt_model,
+        )
+
+        supported = self._make_gpt_model()
+        unsupported = self._make_gpt_model()
+        unsupported.config.final_logit_softcapping = 30.0
+        chunks = container([supported, self._wrap_model(unsupported, "wrapped_vlm")])
+
+        with pytest.raises(NotImplementedError, match="final_logit_softcapping"):
+            _assert_linear_ce_fusion_reaches_gpt_model(chunks)
+
+    def test_accepts_bare_gpt_model(self):
+        from nemo_rl.models.megatron.setup import (
+            _assert_linear_ce_fusion_reaches_gpt_model,
+        )
+
+        _assert_linear_ce_fusion_reaches_gpt_model(self._make_gpt_model())
+
+    def test_accepts_wrapped_gpt_model(self):
+        """Float16Module/DDP wrappers expose the inner model as `.module`."""
+        from nemo_rl.models.megatron.setup import (
+            _assert_linear_ce_fusion_reaches_gpt_model,
+        )
+
+        wrapped = SimpleNamespace(module=self._make_gpt_model())
+        _assert_linear_ce_fusion_reaches_gpt_model(wrapped)
+
+    def test_accepts_list_of_chunks(self):
+        """get_model() returns a list of chunks (virtual pipeline stages)."""
+        from nemo_rl.models.megatron.setup import (
+            _assert_linear_ce_fusion_reaches_gpt_model,
+        )
+
+        _assert_linear_ce_fusion_reaches_gpt_model(
+            [self._make_gpt_model(), self._make_gpt_model()]
+        )
+
+    def test_accepts_vlm_wrapper_holding_gpt_model(self):
+        """A VLM wrapper holds GPTModel under `.language_model`, not `.module`.
+
+        model_forward() arms that inner instance, so this layout is supported.
+        """
+        from nemo_rl.models.megatron.setup import (
+            _assert_linear_ce_fusion_reaches_gpt_model,
+        )
+
+        class Gemma4VLModel:
+            def __init__(self, language_model):
+                self.language_model = language_model
+
+        _assert_linear_ce_fusion_reaches_gpt_model(
+            Gemma4VLModel(self._make_gpt_model())
+        )
+
+    def test_rejects_module_with_no_reachable_gpt_model(self):
+        from nemo_rl.models.megatron.setup import (
+            _assert_linear_ce_fusion_reaches_gpt_model,
+        )
+
+        class SomeOtherModel:
+            pass
+
+        with pytest.raises(NotImplementedError, match="use_fused_linear_logprobs"):
+            _assert_linear_ce_fusion_reaches_gpt_model(SomeOtherModel())
+
+    def test_error_names_the_offending_type(self):
+        from nemo_rl.models.megatron.setup import (
+            _assert_linear_ce_fusion_reaches_gpt_model,
+        )
+
+        class SomeOtherModel:
+            pass
+
+        with pytest.raises(NotImplementedError, match="SomeOtherModel"):
+            _assert_linear_ce_fusion_reaches_gpt_model(SomeOtherModel())
