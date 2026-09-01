@@ -1,0 +1,55 @@
+defaults: ./mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller.yaml
+
+# Full-vocabulary MOPD. Replaces the sampled-token log-probability gap with the
+# exact reverse KL over the whole vocabulary,
+#
+#   L_t = sum_v p_student(v) * (log p_student(v) - log p_teacher(v))
+#
+# which is the K=V limit of the top-k estimator: the score-function tail term
+# vanishes, so the objective is exact, deterministic, and free of that
+# estimator's off-policy bias. Student and teacher are the same Qwen3-1.7B
+# checkpoint, so the divergence must stay ~0 -- a broken payload column, a
+# missed hidden-state gather under sequence parallelism, a mis-sharded teacher
+# LM head, or a mispaired next-token shift all show up as nonzero KL.
+on_policy_distillation:
+  full:
+    enabled: true
+    # The teacher ships its pre-LM-head hidden states (hidden_size wide) and the
+    # student projects them with an output-layer shard read from the teacher
+    # checkpoint, so teacher and student parallelism stay decoupled. The
+    # 'logits' payload is vocab_size wide (~74x larger here) and exists as a
+    # numerical reference, not as a production configuration.
+    teacher_payload: hidden_states
+    divergence: reverse_kl
+    payload_dtype: bfloat16
+    teacher_lm_head_lifecycle: offload
+    # Bounds the live fp32 vocabulary working set in the divergence kernels.
+    # Unchunked, one 8K row would materialize ~5 GB of fp32 log-softmax.
+    chunk_size: 1024
+    # Also report the reverse KL against its entropy / cross-entropy
+    # decomposition. Roughly doubles the divergence cost, but the residual is
+    # the sharpest correctness signal this recipe has.
+    validate_decomposition: true
+
+loss_fn:
+  # opd_full replaces the whole policy-gradient objective, so the ratio and
+  # importance-sampling machinery the base MOPD recipe turns on has no code path
+  # under it and is rejected at loss construction rather than silently ignored
+  # (see _validate_opd_full_loss_config in nemo_rl/algorithms/loss/loss_functions.py).
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_type: null
+
+policy:
+  # The teacher payload is per-token, so the base recipe's 32K window would move
+  # ~4 GB per enrichment batch. 8K keeps this sanity check inside the same
+  # wall-clock budget as its top-k sibling.
+  max_total_sequence_length: 8192
+
+checkpointing:
+  checkpoint_dir: results/mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller-fullvocab
+
+logger:
+  wandb:
+    name: mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller-fullvocab
+  mlflow:
+    run_name: mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller-fullvocab

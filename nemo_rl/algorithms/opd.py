@@ -24,15 +24,19 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import ray
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from nemo_rl.data_plane.column_io import read_columns, write_columns
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
-from nemo_rl.data_plane.schema import TEACHER_LP_FIELDS
+from nemo_rl.data_plane.schema import (
+    OPD_FULL_HIDDEN_STATES_FIELD,
+    OPD_FULL_LOGITS_FIELD,
+    TEACHER_LP_FIELDS,
+)
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     prepare_segment_topology,
@@ -72,6 +76,65 @@ class NonColocatedTeachersConfig(BaseModel, extra="allow"):
     teacher_overrides: dict[str, TeacherResourceConfig] = Field(default_factory=dict)
 
 
+class OnPolicyDistillationFullConfig(BaseModel, extra="allow"):
+    """Full-vocabulary MOPD (``opd_full``).
+
+    The student matches the teacher's entire next-token distribution through an
+    exact reverse KL instead of the sampled-token log-probability gap. This is
+    the full-vocabulary limit of the top-k estimator: with the support spanning
+    the whole vocabulary the score-function tail term vanishes, so the objective
+    is exact, deterministic, and free of the top-k estimator's off-policy bias.
+
+    Because the loss is the whole objective, the policy-gradient knobs on
+    ``ClippedPGLossConfig`` (ratio clipping, CISPO, importance-sampling
+    correction, truncated IS) have no code path here and are rejected at
+    construction rather than silently ignored. The OPD advantage estimator still
+    runs -- its output is unused by this loss, but ``advantages`` is a required
+    training column and its stage supplies the teacher/student gap diagnostic.
+    """
+
+    enabled: bool = False
+    # "hidden_states": the teacher ships its final pre-LM-head hidden states and
+    #   the student projects them with an output-layer weight shard loaded from
+    #   the teacher checkpoint. The payload is `hidden_size` wide, so teacher and
+    #   student parallelism stay fully decoupled. This is the production path.
+    # "logits": the teacher ships full-vocabulary logits and the student needs no
+    #   teacher LM head. The payload is `vocab_size` wide -- roughly 74x larger
+    #   for a 2k-hidden / 152k-vocab model -- so this is a numerical-reference and
+    #   fallback path, not a production configuration.
+    teacher_payload: Literal["hidden_states", "logits"] = "hidden_states"
+    divergence: Literal["reverse_kl"] = "reverse_kl"
+    payload_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
+    # Sequence-dimension chunk for the distributed divergence kernels, bounding
+    # the live fp32 vocabulary working set. None processes the sequence at once.
+    chunk_size: Optional[int] = None
+    # Student-side cache policy for the teacher LM-head shard (hidden path only).
+    #   none    -- keep resident on GPU for the whole run
+    #   offload -- park on CPU between train steps, stage back in per step
+    #   evict   -- free after every train step and reload from the checkpoint
+    teacher_lm_head_lifecycle: Literal["none", "offload", "evict"] = "offload"
+    # Refuse to start when the estimated teacher payload for one enrichment batch
+    # exceeds this. Guards the "logits" path against production-scale misuse.
+    max_payload_bytes_per_batch: int = 8 * 1024**3
+    # Also compute entropy and cross entropy and report their residual against
+    # the reverse KL. Roughly doubles the divergence cost; diagnostics only.
+    validate_decomposition: bool = False
+
+    @model_validator(mode="after")
+    def validate_positive_sizes(self) -> "OnPolicyDistillationFullConfig":
+        """Reject sizes that would make the divergence kernels or the guard useless."""
+        if self.chunk_size is not None and self.chunk_size < 1:
+            raise ValueError(
+                f"on_policy_distillation.full.chunk_size must be >= 1, got {self.chunk_size}."
+            )
+        if self.max_payload_bytes_per_batch < 1:
+            raise ValueError(
+                "on_policy_distillation.full.max_payload_bytes_per_batch must be >= 1, "
+                f"got {self.max_payload_bytes_per_batch}."
+            )
+        return self
+
+
 class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     """User-facing config for the top-level ``on_policy_distillation`` block."""
 
@@ -81,6 +144,7 @@ class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     strict_agent_name_match: bool = False
     deduplicate_shared_teacher_checkpoints: bool = True
     non_colocated_teachers: Optional[NonColocatedTeachersConfig] = None
+    full: Optional[OnPolicyDistillationFullConfig] = None
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +181,77 @@ def is_non_colocated_teachers_enabled(master_config: Any) -> bool:
         return False
     return bool(
         _opd_cfg(master_config).get("non_colocated_teachers", {}).get("enabled", False)
+    )
+
+
+def get_opd_full_config(master_config: Any) -> Optional[OnPolicyDistillationFullConfig]:
+    """Return the validated ``opd_full`` sub-config when the feature is enabled.
+
+    Args:
+        master_config: Full training configuration, a plain dict, or any object
+            without the field (non-OPD recipes).
+
+    Returns:
+        The full-vocabulary config when both OPD and ``full.enabled`` are on,
+        otherwise ``None``.
+    """
+    if not is_opd_enabled(master_config):
+        return None
+    full_cfg = _opd_cfg(master_config).get("full")
+    if full_cfg is None:
+        return None
+    if not isinstance(full_cfg, OnPolicyDistillationFullConfig):
+        full_cfg = OnPolicyDistillationFullConfig(**full_cfg)
+    return full_cfg if full_cfg.enabled else None
+
+
+def is_opd_full_enabled(master_config: Any) -> bool:
+    """Whether full-vocabulary on-policy distillation is enabled."""
+    return get_opd_full_config(master_config) is not None
+
+
+def opd_full_payload_field(full_cfg: OnPolicyDistillationFullConfig) -> str:
+    """Return the data-plane column name carrying this run's teacher payload."""
+    if full_cfg.teacher_payload == "hidden_states":
+        return OPD_FULL_HIDDEN_STATES_FIELD
+    return OPD_FULL_LOGITS_FIELD
+
+
+_PAYLOAD_DTYPE_ITEMSIZE = {"bfloat16": 2, "float16": 2, "float32": 4}
+
+
+def estimate_opd_full_payload_bytes(
+    *,
+    num_sequences: int,
+    padded_seq_len: int,
+    payload_width: int,
+    payload_dtype: str,
+) -> int:
+    """Estimate the teacher payload size for one enrichment batch.
+
+    Args:
+        num_sequences: Rows in the batch handed to the teacher.
+        padded_seq_len: Padded sequence width of those rows.
+        payload_width: ``hidden_size`` on the hidden-state path, ``vocab_size``
+            on the logits path.
+        payload_dtype: One of ``bfloat16``, ``float16``, ``float32``.
+
+    Returns:
+        Payload size in bytes.
+
+    Raises:
+        ValueError: If ``payload_dtype`` is not a supported payload dtype.
+    """
+    if payload_dtype not in _PAYLOAD_DTYPE_ITEMSIZE:
+        raise ValueError(
+            f"Unsupported opd_full payload dtype {payload_dtype!r}; expected one of "
+            f"{sorted(_PAYLOAD_DTYPE_ITEMSIZE)}."
+        )
+    return (
+        int(num_sequences)
+        * int(padded_seq_len)
+        * int(payload_width)
+        * _PAYLOAD_DTYPE_ITEMSIZE[payload_dtype]
     )
 
 
@@ -239,6 +374,15 @@ class TQTeacherLogprobCoordinator:
         self._teacher_worker_groups = dict(teacher_worker_groups)
         self._alias_to_group_alias = dict(alias_to_group_alias)
         self._opd_cfg = dict(on_policy_distillation_cfg)
+        # Set when full-vocabulary MOPD is on: the teacher then writes a second,
+        # per-token payload column that the training fetch must also see.
+        full_cfg = self._opd_cfg.get("full")
+        self._opd_full_field: Optional[str] = (
+            opd_full_payload_field(OnPolicyDistillationFullConfig(**full_cfg))
+            if full_cfg and full_cfg.get("enabled")
+            else None
+        )
+        self._teacher_full_payload_tokens = 0
         # Physical (deduplicated) groups own locks, not routing aliases. Two
         # aliases sharing one checkpoint therefore share one collective FIFO.
         self._teacher_locks = {
@@ -407,6 +551,10 @@ class TQTeacherLogprobCoordinator:
         self._teacher_logprob_time_s += total_time_s
         self._teacher_inference_time_s += inference_time_s
         self._teacher_lock_wait_time_s += lock_wait_s
+        if self._opd_full_field is not None:
+            self._teacher_full_payload_tokens += meta.size * max(
+                meta.sequence_lengths or [0]
+            )
         self._aliases_seen.add(alias)
         print(
             f"[teacher_logprob] group={group_alias} samples={meta.size} "
@@ -414,7 +562,10 @@ class TQTeacherLogprobCoordinator:
             f"total={total_time_s:.2f}s",
             flush=True,
         )
-        return meta.with_fields([self.teacher_logprobs_field])
+        enriched_fields = [self.teacher_logprobs_field]
+        if self._opd_full_field is not None:
+            enriched_fields.append(self._opd_full_field)
+        return meta.with_fields(enriched_fields)
 
     def drain_metrics(self) -> dict[str, float]:
         """Return and reset teacher activity accumulated since the last drain."""
@@ -425,6 +576,13 @@ class TQTeacherLogprobCoordinator:
             "on_policy_distillation/teacher_inference_time_s": self._teacher_inference_time_s,
             "on_policy_distillation/teacher_lock_wait_time_s": self._teacher_lock_wait_time_s,
         }
+        if self._opd_full_field is not None:
+            # Tokens rather than bytes: the coordinator does not know the payload
+            # width. Multiply by hidden_size (or vocab_size) times the payload
+            # dtype's itemsize -- see estimate_opd_full_payload_bytes.
+            metrics["on_policy_distillation/teacher_full_payload_tokens"] = float(
+                self._teacher_full_payload_tokens
+            )
         if self._teacher_batches:
             # Cardinality describes what ran. On an idle step, zero reads as
             # "zero teacher models" rather than "no teacher activity."
@@ -439,6 +597,7 @@ class TQTeacherLogprobCoordinator:
         self._teacher_logprob_time_s = 0.0
         self._teacher_inference_time_s = 0.0
         self._teacher_lock_wait_time_s = 0.0
+        self._teacher_full_payload_tokens = 0
         self._aliases_seen.clear()
         return metrics
 

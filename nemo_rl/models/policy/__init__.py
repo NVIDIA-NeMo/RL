@@ -582,6 +582,13 @@ class PolicyConfig(TypedDict):
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
     draft: NotRequired[DraftConfig | DraftConfigDisabled]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
+    # Transport envelope for full-vocabulary MOPD, resolved once by the driver and
+    # carried to the student workers and (via deepcopy) to the teacher group. It is
+    # a ``model_dump`` of ``OnPolicyDistillationFullConfig`` plus the resolved
+    # ``payload_field`` column name; that BaseModel remains the authoritative
+    # schema and the only place defaults are declared, so nothing here is a
+    # call-site default. Absent means full-vocabulary MOPD is off.
+    on_policy_distillation_full: NotRequired[dict[str, Any]]
     router_replay: NotRequired[RouterReplayConfig | RouterReplayConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled

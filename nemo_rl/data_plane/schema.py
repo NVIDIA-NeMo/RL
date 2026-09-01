@@ -13,7 +13,7 @@
 # limitations under the License.
 """Shared constants and type aliases for the data-plane meta contract."""
 
-from typing import Literal, Sequence
+from typing import Literal, Optional, Sequence
 
 # Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
 Layout = Literal["padded", "jagged"]
@@ -48,6 +48,15 @@ DP_TRAIN_FIELDS = (
     "sample_mask",
 )
 
+# Full-vocabulary MOPD teacher payload columns. Exactly one is written per run,
+# selected by ``on_policy_distillation.full.teacher_payload``. Both are per-token
+# ``[N, S, D]`` columns, so they are jagged-packed like the other token-aligned
+# fields; ``D`` is the teacher hidden size or the vocabulary size.
+OPD_FULL_HIDDEN_STATES_FIELD = "teacher_full_hidden_states"
+OPD_FULL_LOGITS_FIELD = "teacher_full_logits"
+OPD_FULL_FIELDS = (OPD_FULL_HIDDEN_STATES_FIELD, OPD_FULL_LOGITS_FIELD)
+
+
 # Full known tensor schema for SingleController's long-lived rollout partition.
 # The initial rollout put writes the first seven payload fields; later stages add
 # student/reference logprobs, advantages, PPO critic columns, and the MOPD teacher
@@ -60,6 +69,7 @@ SC_ROLLOUT_SCHEMA_FIELDS = (
     "values",
     "returns",
     "teacher_reference_logprobs",
+    *OPD_FULL_FIELDS,
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
 )
@@ -132,4 +142,28 @@ def fields_with_optional_routed_experts(
     out = list(fields)
     if enabled and ROUTED_EXPERTS_FIELD not in out:
         out.append(ROUTED_EXPERTS_FIELD)
+    return out
+
+
+def fields_with_optional_opd_full(
+    fields: Sequence[str],
+    *,
+    field: Optional[str],
+) -> list[str]:
+    """Return `fields` plus the full-vocabulary MOPD teacher payload column.
+
+    The column is added only when the run configures one. A GRPO run that
+    requested a column nobody wrote would error on read, which is why this is
+    never folded unconditionally into ``DP_TRAIN_FIELDS``.
+
+    Args:
+        fields: Base field list.
+        field: Payload column name, or ``None`` when opd_full is off.
+
+    Returns:
+        The field list, with the payload column appended when applicable.
+    """
+    out = list(fields)
+    if field is not None and field not in out:
+        out.append(field)
     return out
