@@ -18,7 +18,7 @@ These run in the default L0 suite. Keep this module free of heavy imports
 """
 
 import copy
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -207,6 +207,8 @@ def test_spinup_nemo_gym_actor(detected_uv_dirs, num_gpu_nodes):
     has colocated GPUs to land next to."""
     actor = MagicMock()
     actor._spinup.remote.return_value = "spinup-ref"
+    actor.set_tokenizer.remote.return_value = "tokenizer-ref"
+    tokenizer = MagicMock()
     runtime_env = {"py_executable": "/venv/bin/python"}
 
     with (
@@ -223,6 +225,7 @@ def test_spinup_nemo_gym_actor(detected_uv_dirs, num_gpu_nodes):
             _env_configs(num_gpu_nodes=num_gpu_nodes),
             base_urls=["http://vllm-0"],
             model_name="test-model",
+            tokenizer=tokenizer,
             use_fastokens=True,
         )
 
@@ -245,4 +248,5 @@ def test_spinup_nemo_gym_actor(detected_uv_dirs, num_gpu_nodes):
 
     # Spinup is deferred from __init__, so the factory must await it.
     actor._spinup.remote.assert_called_once_with()
-    mock_ray.get.assert_called_once_with("spinup-ref")
+    actor.set_tokenizer.remote.assert_called_once_with(tokenizer)
+    assert mock_ray.get.call_args_list == [call("spinup-ref"), call("tokenizer-ref")]
