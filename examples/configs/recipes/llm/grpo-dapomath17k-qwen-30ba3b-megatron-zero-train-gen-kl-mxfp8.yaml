@@ -1,4 +1,5 @@
 # Qwen3-30B-A3B DAPO 8K — colocated Megatron inference with zero train/gen KL
+# Layout: 1 node × 4 GPUs (colocated train + generation).
 defaults: ../../grpo_math_qwen30ba3b_megatron.yaml
 
 grpo:
@@ -30,7 +31,7 @@ policy:
     pipeline_model_parallel_size: 1
     context_parallel_size: 1
     expert_tensor_parallel_size: 1
-    expert_model_parallel_size: 8
+    expert_model_parallel_size: 4
     sequence_parallel: true
     moe_token_dispatcher_type: alltoall
     moe_router_dtype: fp32
@@ -74,3 +75,7 @@ env:
   math:
     math_verify_impl: dapo_math_verify
     dapo_long_cot: true
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1

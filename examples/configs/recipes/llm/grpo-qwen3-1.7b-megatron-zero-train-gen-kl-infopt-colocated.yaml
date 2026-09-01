@@ -1,4 +1,4 @@
-# Qwen2.5-1.5B — colocated Megatron inference with zero train/gen KL
+# Qwen3-1.7B — colocated Megatron inference with zero train/gen KL
 defaults: ../../grpo_math_1B_megatron.yaml
 
 grpo:
@@ -7,11 +7,13 @@ grpo:
   val_period: 10
 
 policy:
+  model_name: "Qwen/Qwen3-1.7B"
   max_total_sequence_length: 1024
   megatron_cfg:
     zero_train_gen_mismatch: true
     moe_permute_fusion: false
     cuda_graph_impl: none
+    mtp_num_layers: 0  # Qwen3-1.7B has no MTP layers
   generation:
     backend: megatron
     colocated:

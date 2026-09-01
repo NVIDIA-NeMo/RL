@@ -1,10 +1,12 @@
 # Qwen3-30B-A3B DAPO 8K — non-colocated Megatron inference with zero train/gen KL
+# Layout: 2 nodes × 4 GPUs (train node + dedicated inference node).
 defaults: grpo-dapomath17k-qwen-30ba3b-megatron-zero-train-gen-kl-mxfp8.yaml
 
 policy:
   megatron_cfg:
     zero_train_gen_mismatch: true
     moe_permute_fusion: false
+    expert_model_parallel_size: 4
     fp8_cfg:
       # mxfp8 is not supported for zero_train_gen_mismatch with inference_optimized mode
       enabled: false 
@@ -14,7 +16,7 @@ policy:
     colocated:
       enabled: false
       resources:
-        gpus_per_node: 8
+        gpus_per_node: ${cluster.gpus_per_node}
         num_nodes: 1      
     mcore_generation_config:
       transformer_impl: "inference_optimized"
@@ -37,5 +39,5 @@ policy:
       refit_backend: "nvshmem"
 
 cluster:
-  gpus_per_node: 8
+  gpus_per_node: 4
   num_nodes: 2
