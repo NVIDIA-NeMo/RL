@@ -35,14 +35,24 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     SamplerConfig,
     required_buffer_capacity_for_config,
 )
-from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
+from nemo_rl.algorithms.grpo import (
+    _REWARD_PENALTY_FLAGS,
+    GRPOConfig,
+    GRPOLoggerConfig,
+    RewardPenaltyConfig,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
+from nemo_rl.data_plane.schema import (
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
+)
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -586,6 +596,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
@@ -854,21 +865,19 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
-    if algo_cfg.ppo_epochs < 1:
-        raise ValueError("ppo.ppo_epochs must be at least 1")
-
-    # Without it the critic steps once per chunk and the policy once per step,
-    # which is two effective learning rates from one config, and no error.
+    # Each PPO epoch must consume the complete RL batch. Without this guard, every
+    # chunk would independently run the configured actor and critic optimizer steps.
     if async_config.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step:
         raise ValueError(
             "PPO on the SingleController path requires "
             "async_rl.min_groups_for_streaming_train "
             f"({async_config.min_groups_for_streaming_train}) == "
             f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) so that each RL "
-            "step is assembled from a single chunk: the critic steps its "
-            "optimizer once per chunk and the policy once per step. Streaming "
-            "PPO needs a split train API on the value workers, which they do "
-            "not have yet (#2625)."
+            "step is assembled from a single chunk. Otherwise each chunk would "
+            "run ppo.critic_ppo_epochs critic optimizer steps and ppo.ppo_epochs "
+            "policy optimizer steps on only part of the RL batch. Streaming PPO "
+            "needs a split train API on the value workers, which they do not have "
+            "yet (#2625)."
         )
 
     failure_config = async_config.rollout_failure
@@ -921,8 +930,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         raise ValueError(
             "num_prompts_per_step * num_generations_per_prompt "
             f"({rl_step_samples}) must equal value.train_global_batch_size "
-            f"({value_global_batch_size}) so that one RL step maps to exactly one "
-            "critic optimizer.step."
+            f"({value_global_batch_size}) so that each critic epoch consumes one "
+            "complete RL batch."
         )
 
 
@@ -932,6 +941,15 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+
+    reward_penalties_enabled = any(
+        getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
+    )
+    if reward_penalties_enabled and not master_config.env.get("should_use_nemo_gym"):
+        raise ValueError(
+            "reward_penalties require the NeMo-Gym rollout path "
+            "(env.should_use_nemo_gym=true) on SingleController"
+        )
 
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
         raise ValueError(
@@ -1020,9 +1038,35 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "loss_fn.reference_policy_kl_penalty=0."
         )
 
+    if (
+        master_config.loss_fn.use_kl_in_reward
+        and reference_policy_kl_penalty > 0
+        and master_config.loss_fn.force_on_policy_ratio
+        and algo_cfg.seq_logprob_error_threshold is None
+    ):
+        raise ValueError(
+            "loss_fn.use_kl_in_reward=true with a nonzero "
+            "loss_fn.reference_policy_kl_penalty requires policy logprobs, but "
+            "loss_fn.force_on_policy_ratio=true without "
+            "seq_logprob_error_threshold skips them. Set "
+            "loss_fn.force_on_policy_ratio=false or configure "
+            "seq_logprob_error_threshold."
+        )
+
     # ``env`` is required in production configs, but model_construct-based unit
     # configs can omit it. Only apply rollout-path validation when it is present.
     env_config = getattr(master_config, "env", None)
+
+    penalties_enabled = (
+        algo_cfg.invalid_tool_call_advantage is not None
+        or algo_cfg.malformed_thinking_advantage is not None
+    )
+    if penalties_enabled and not should_use_nemo_gym(master_config):
+        raise ValueError(
+            "invalid_tool_call_advantage and malformed_thinking_advantage on the "
+            "active algorithm block require the NeMo-Gym rollout path "
+            "(env.should_use_nemo_gym=true) on SingleController."
+        )
 
     opd_enabled = opd_module.is_opd_enabled(master_config)
     if opd_enabled and is_ppo_run(master_config):
@@ -1110,6 +1154,8 @@ class AdvantageConfig:
     reward_field: str = "total_reward"
     token_mask_field: str = "token_mask"
     sample_mask_field: str = "sample_mask"
+    invalid_tool_call_mask_field: str = INVALID_TOOL_CALL_MASK
+    malformed_thinking_mask_field: str = MALFORMED_THINKING_MASK
     repeated_batch_fields: list[str] = field(default_factory=list)
     policy_logprobs_field: str = "prev_logprobs"
     generation_logprobs_field: str = "generation_logprobs"

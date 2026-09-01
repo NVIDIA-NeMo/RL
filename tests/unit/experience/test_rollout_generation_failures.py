@@ -537,6 +537,8 @@ def _make_gym_impl(
     impl._stats = stats if stats is not None else RolloutStats()
     # Upstream default; this fixture is about re-dispatch, not sample masking.
     impl._mask_env_flagged_samples = True
+    # Reward penalties are off; direct construction must still satisfy the impl contract.
+    impl._reward_penalty_config = None
     # Effort-level reward shaping is off unless env.nemo_gym.effort_levels is set.
     impl._effort_config = None
     return impl
