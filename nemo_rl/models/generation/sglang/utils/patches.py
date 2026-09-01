@@ -90,7 +90,9 @@ def _patch_sglang_transformers_compat_bootstrap() -> None:
     with open(file_to_patch, "r") as f:
         content = f.read()
 
-    sentinel = "    import nemo_rl  # noqa: F401  # Install temporary Transformers patch.\n"
+    sentinel = (
+        "    import nemo_rl  # noqa: F401  # Install temporary Transformers patch.\n"
+    )
     if sentinel in content:
         return
 
