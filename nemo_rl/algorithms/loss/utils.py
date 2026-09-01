@@ -18,7 +18,7 @@ import torch
 
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
-from nemo_rl.utils.sequence_lengths import CpuIntTuple
+from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 
 
 def rescale_loss_metrics(
@@ -123,7 +123,9 @@ def pack_rolled_draft_token_mask(
     per-segment left shift.
     """
     packed = _pack_input_ids(
-        token_mask * sample_mask.unsqueeze(-1), cu_seqlens, cu_seqlens_padded
+        token_mask * sample_mask.unsqueeze(-1),
+        to_cpu_int_tuple(cu_seqlens),
+        to_cpu_int_tuple(cu_seqlens_padded),
     )
     return roll_packed_seq_dim(packed, cu_seqlens_padded, seq_dim=1)
 
