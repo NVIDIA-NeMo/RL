@@ -1015,7 +1015,7 @@ class TestApplyPrecisionConfig:
             assert model_cfg.pipeline_dtype == expected_dtype
 
     def test_applies_first_last_bf16_counts(self):
-        """First/last exclusions reach the Megatron provider."""
+        """First/last layer exclusions reach the Megatron provider."""
         from nemo_rl.models.megatron.setup import _apply_precision_config
 
         model_cfg = SimpleNamespace()

@@ -1182,7 +1182,6 @@ def _apply_precision_config(
     ):
         if field in megatron_cfg:
             setattr(model_cfg, field, megatron_cfg[field])
-
     te_precision_config_file = config["megatron_cfg"].get("te_precision_config_file")
     if te_precision_config_file is not None:
         te_precision_config_exists = os.path.isfile(te_precision_config_file)
