@@ -53,6 +53,7 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
+    AsyncRolloutImpl,
     RolloutManager,
     RolloutOutcome,
     RolloutRetryPolicy,
@@ -111,7 +112,7 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
                 }
             )
 
-    manager = object.__new__(RolloutManager)
+    manager = object.__new__(AsyncRolloutImpl)
     manager._policy_generation = _Generation()
     manager._tokenizer = SimpleNamespace(
         pad_token_id=0,

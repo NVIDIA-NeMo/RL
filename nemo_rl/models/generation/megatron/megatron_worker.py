@@ -504,55 +504,15 @@ class MegatronGenerationMixin:
             self.inference_client.suspend_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.SUSPENDED)
 
-    def _move_retained_vlm_media(self, device: torch.device) -> None:
-        """Move raw media retained by active Megatron requests to ``device``."""
-        engine = self.dynamic_inference_engine
-        if engine is None:
-            return
-
-        moved_tensors: dict[int, torch.Tensor] = {}
-        for entry in getattr(engine, "requests", {}).values():
-            record = getattr(entry, "record", None)
-            if not record:
-                continue
-            request = record[-1]
-            imgs = getattr(request, "imgs", None)
-            if not torch.is_tensor(imgs) or imgs.device == device:
-                continue
-
-            # Multiple sampled completions can retain the same source image.
-            # Preserve that sharing rather than allocating one copy per request.
-            moved = moved_tensors.get(id(imgs))
-            if moved is None:
-                moved = imgs.to(device=device)
-                moved_tensors[id(imgs)] = moved
-            request.imgs = moved
-
     def _wake(self) -> None:
         """Resume + unpause the engine. No-op if already awake."""
         if not self._inference_engine_asleep:
             return
-
-        # Megatron invalidates trainable vision projections during refit and
-        # recomputes them while resuming. Raw media retained by an active request
-        # may live on CPU, so make it device-local for that refresh. Move it back
-        # after the engine reaches RUNNING to avoid pinning image batches in HBM.
-        # HACK(@cspades): Revert this H2D-D2H code after this is merged:
-        # https://github.com/NVIDIA/Megatron-LM/pull/6976
-        cuda_device = torch.device("cuda", torch.cuda.current_device())
-        self._move_retained_vlm_media(cuda_device)
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._wake_engine(), self._inference_loop
-            )
-            future.result()
-            torch.distributed.barrier()
-        except BaseException:
-            # Best-effort cleanup if resume fails before _wake_engine reaches
-            # its normal post-refresh offload point.
-            self._move_retained_vlm_media(torch.device("cpu"))
-            raise
-
+        future = asyncio.run_coroutine_threadsafe(
+            self._wake_engine(), self._inference_loop
+        )
+        future.result()
+        torch.distributed.barrier()
         self._inference_engine_asleep = False
         print(f"[Rank {self.rank}] resumed inference engine")
 
@@ -560,13 +520,6 @@ class MegatronGenerationMixin:
         if torch.distributed.get_rank() == 0:
             self.inference_client.resume_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.RESUMED)
-
-        # DynamicInferenceEngine.resume() refreshes stale VLM embeddings before
-        # publishing RESUMED. The engine is still paused here, so raw media can
-        # be returned to CPU before any request is allowed to execute.
-        # HACK(@cspades): Revert this H2D-D2H code after this is merged:
-        # https://github.com/NVIDIA/Megatron-LM/pull/6976
-        self._move_retained_vlm_media(torch.device("cpu"))
 
         if torch.distributed.get_rank() == 0:
             self.inference_client.unpause_engines()
