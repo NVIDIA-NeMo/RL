@@ -1092,6 +1092,17 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
 
     token_capture_config = master_config.token_capture
+    recovery_config = master_config.rollout_recovery
+    if not token_capture_config.enabled and (
+        recovery_config.default_granularity is not RecoveryGranularity.SIBLING
+        or recovery_config.agent_granularity_overrides
+        or recovery_config.task_granularity_overrides
+    ):
+        raise ValueError(
+            "non-default rollout_recovery policies require "
+            "token_capture.enabled=true; without token capture, unfinished Gym "
+            "siblings have no durable receipts to recover"
+        )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled
     ):

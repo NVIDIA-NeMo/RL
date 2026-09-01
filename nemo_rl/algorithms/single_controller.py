@@ -107,7 +107,6 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
-from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
@@ -117,6 +116,7 @@ from nemo_rl.experience.rollout_recovery import (
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
 )
+from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -1280,6 +1280,10 @@ class SingleControllerActor:
             # The actor publishes canonical rows before returning metadata. Keep
             # the remote write, local replay-index update, and lineage hand-off in
             # one mutation cut so a TQ snapshot sees all of them or none of them.
+            # This deliberately makes checkpoint acquisition wait for the tail of
+            # every in-flight finalizer RPC. Releasing the cut across the await
+            # would let a snapshot preserve canonical rows without the matching
+            # replay index and lineage transition, which is not recoverable.
             async with self._data_plane_checkpoint_barrier.mutation() as cut:
                 ledger = self._rollout_recovery_ledger
                 ledger.mark_finalization_started(cut, request.group_id)
@@ -1526,6 +1530,8 @@ class SingleControllerActor:
                             request, target_step=target_step
                         )
                         if committed:
+                            # The non-actor generate_and_push path increments this
+                            # counter internally; actor finalization bypasses it.
                             self._rollout_manager.stats.committed += 1
                             # Canonical replay now owns the backpressure permit. The
                             # finalizer's mutation cut has already handed ownership
