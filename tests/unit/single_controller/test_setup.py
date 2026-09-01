@@ -1644,7 +1644,7 @@ class TestSetup:
         assert WIRE_MULTIMODAL_FIELDS.isdisjoint(partition_calls[1].kwargs["fields"])
 
     def test_nemo_gym_coverage_failure_shuts_down_shards(self, patched_factories):
-        mc = _make_master_config(colocated=True, backend="vllm")
+        mc = _make_master_config(colocated=False, backend="vllm")
         mc.policy["generation"]["model_name"] = "test-model"
         mc.policy["generation"]["stop_strings"] = None
         mc.policy["generation"]["stop_token_ids"] = None
